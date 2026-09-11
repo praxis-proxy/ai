@@ -68,8 +68,8 @@ pub(crate) fn event_local_tool_keys(payload: &Value) -> impl Iterator<Item = Str
     clippy::too_many_lines,
     reason = "linear sequence: opening + 3 progress events + done, each with its own payload construction"
 )]
-pub(crate) fn synthesize_private_complete(item: &Value, round_local_index: u64) -> Vec<(&'static str, Value)> {
-    let idx = || Value::Number(round_local_index.into());
+pub(crate) fn synthesize_private_complete(item: &Value, output_index: u64) -> Vec<(&'static str, Value)> {
+    let idx = || Value::Number(output_index.into());
 
     // Opening item: clone with status → "searching", results removed
     let mut opening_item = item.clone();
@@ -125,9 +125,9 @@ pub(crate) fn synthesize_private_complete(item: &Value, round_local_index: u64) 
 }
 
 /// Synthesize the tail of a native complete `file_search` (2 events: completed → done).
-/// Reuses the opening's `round_local_index`. Clone is necessary — synthesis payload.
-pub(crate) fn synthesize_native_complete_tail(item: &Value, round_local_index: u64) -> Vec<(&'static str, Value)> {
-    let idx = || Value::Number(round_local_index.into());
+/// Reuses the opening's `output_index`. Clone is necessary — synthesis payload.
+pub(crate) fn synthesize_native_complete_tail(item: &Value, output_index: u64) -> Vec<(&'static str, Value)> {
+    let idx = || Value::Number(output_index.into());
 
     let mut events = Vec::new();
 
@@ -166,12 +166,8 @@ pub(crate) fn synthesize_native_complete_tail(item: &Value, round_local_index: u
     clippy::too_many_lines,
     reason = "linear sequence: private branch (opening + 2 progress) + common terminal done; each with its own payload construction"
 )]
-pub(crate) fn synthesize_incomplete_tail(
-    item: &Value,
-    round_local_index: u64,
-    private: bool,
-) -> Vec<(&'static str, Value)> {
-    let idx = || Value::Number(round_local_index.into());
+pub(crate) fn synthesize_incomplete_tail(item: &Value, output_index: u64, private: bool) -> Vec<(&'static str, Value)> {
+    let idx = || Value::Number(output_index.into());
 
     // Build the incomplete item: clone with status → "incomplete", results removed
     let mut incomplete_item = item.clone();
@@ -233,15 +229,33 @@ pub(crate) fn synthesize_incomplete_tail(
     events
 }
 
-/// §4.2 precedence: pre-existing error → validate all → error-contract → clean-emit.
+/// Drain the `file_search` EOS synthesis queue, deferring items the dispatcher
+/// has not reconciled yet (#1046 §4.2 precedence).
+///
+/// The parse owner (`openai_agentic_loop`) queues each `file_search_call` by its
+/// absolute `accumulated_output` index during the round it *parses* the call, but
+/// the request-phase dispatcher (`openai_file_search_callout`) does not execute
+/// and reconcile that call until the *next* IRR re-entry's request-body EOS. So at
+/// the round-N finalize where the owner first queued it, the indexed item is still
+/// pending and its lifecycle cannot be synthesized. This finalizer runs at every
+/// round's response EOS, so it re-queues a still-pending item and synthesizes it at
+/// the finalize of the round that reconciles it (once the dispatcher has stamped a
+/// terminal `status` and attached results).
+///
+/// Absolute indices are stamped directly as `output_index` and normalized with a
+/// zero offset — identical to the #276 local-item path — because
+/// `accumulated_output` is the single logical response output array.
+///
 /// Takes only `&mut ctx`; `ResponsesState` is reacquired from ctx.extensions in
 /// phases so the two borrows never overlap.
 #[expect(
     clippy::too_many_lines,
-    reason = "linear sequence: drain queue → pre-existing error check → validate all indices → fail-closed error → clean emit; each phase isolated"
+    reason = "phased drain: partition ready vs deferred, then synthesize"
 )]
-pub(super) fn drain_local_tool_synthesis(ctx: &mut HttpFilterContext<'_>, output_index_offset: u64, out: &mut Vec<u8>) {
-    type SynthesisResolution = Result<Vec<(u64, SynthesisKind, Value)>, &'static str>;
+pub(super) fn drain_local_tool_synthesis(ctx: &mut HttpFilterContext<'_>, out: &mut Vec<u8>) {
+    type ResolvedItem = (u64, SynthesisKind, Value);
+    type DeferredItem = (usize, SynthesisKind);
+    type SynthesisResolution = Result<(Vec<ResolvedItem>, Vec<DeferredItem>), &'static str>;
 
     // Phase A — take the queue out (drain-once), releasing the state borrow.
     let queue = match ctx.extensions.get_mut::<ResponsesState>() {
@@ -255,56 +269,73 @@ pub(super) fn drain_local_tool_synthesis(ctx: &mut HttpFilterContext<'_>, output
     if ctx.get_metadata("responses.stream_error_code").is_some() {
         return;
     }
-    // Phase B — validate + resolve every index against the committed output,
-    // holding an immutable state borrow only for the duration of this block.
+    // Phase B — partition the queue into items the dispatcher has already
+    // reconciled (ready to synthesize now) and items still pending (re-queued for a
+    // later finalize). Holds an immutable state borrow only for this block.
     let resolved: SynthesisResolution = (|| {
         let state = ctx
             .extensions
             .get::<ResponsesState>()
             .ok_or("openai_stream_events: file_search synthesis missing state")?;
-        let mut resolved = Vec::with_capacity(queue.len());
+        let mut ready: Vec<ResolvedItem> = Vec::with_capacity(queue.len());
+        let mut deferred: Vec<DeferredItem> = Vec::new();
         for (absolute, kind) in &queue {
-            // Step 2: validate via checked u64 conversion + checked_sub + range.
-            let round_local = u64::try_from(*absolute)
-                .ok()
-                .and_then(|a| a.checked_sub(output_index_offset))
-                .ok_or("openai_stream_events: file_search synthesis index invariant")?;
             let item = state
                 .accumulated_output
                 .get(*absolute)
-                .cloned() // owned copy for the freshly-built synthesis payload; the
-                          // original stays in accumulated_output for the terminal frame.
                 .ok_or("openai_stream_events: file_search synthesis index out of range")?;
-            resolved.push((round_local, *kind, item));
+            // The dispatcher stamps a terminal status (`completed`/`incomplete`) in
+            // place once it executes the assigned call. Until then the owner's
+            // canonical placeholder is still pending, so defer synthesis.
+            let reconciled = matches!(
+                item.get("status").and_then(Value::as_str),
+                Some("completed" | "incomplete")
+            );
+            if reconciled {
+                let output_index = u64::try_from(*absolute)
+                    .map_err(|_overflow| "openai_stream_events: file_search synthesis index invariant")?;
+                // Owned copy for the freshly-built synthesis payload; the original
+                // stays in accumulated_output for the terminal frame.
+                ready.push((output_index, *kind, item.clone()));
+            } else {
+                deferred.push((*absolute, *kind));
+            }
         }
-        Ok(resolved)
+        Ok((ready, deferred))
     })();
-    let resolved = match resolved {
+    let (ready, deferred) = match resolved {
         Ok(resolved) => resolved,
-        // Step 3: invariant violation → five-write, discard, no frame.
+        // Invariant violation → five-write, discard, no frame.
         Err(message) => {
             fs_end_stream_with_error_ctx(ctx, "server_error", message);
             return;
         },
     };
-    // Step 4: clean path — build (kind from the queue), then normalize + encode.
-    // The state borrow is dropped; only &mut ctx is held here.
-    for (round_local, kind, item) in resolved {
-        for (event_type, mut payload) in select_builder(&item, round_local, kind) {
-            normalize_logical_payload(ctx, &mut payload, output_index_offset);
+    // Re-queue still-pending items so a later finalize (after the dispatcher
+    // reconciles them next round) synthesizes their lifecycle.
+    if !deferred.is_empty()
+        && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+    {
+        state.pending_local_tool_synthesis = deferred;
+    }
+    // Clean path — build, then normalize with a zero offset (indices are already
+    // absolute) + encode. The state borrow is dropped; only &mut ctx is held here.
+    for (output_index, kind, item) in ready {
+        for (event_type, mut payload) in select_builder(&item, output_index, kind) {
+            normalize_logical_payload(ctx, &mut payload, 0);
             encode_sse_event(event_type, &payload, out);
         }
     }
 }
 
 /// Dispatch to the Task 17 builders by origin `kind` + item `status`.
-fn select_builder(item: &Value, round_local: u64, kind: SynthesisKind) -> Vec<(&'static str, Value)> {
+fn select_builder(item: &Value, output_index: u64, kind: SynthesisKind) -> Vec<(&'static str, Value)> {
     let completed = item.get("status").and_then(Value::as_str) == Some("completed");
     match (kind, completed) {
-        (SynthesisKind::Private, true) => synthesize_private_complete(item, round_local),
-        (SynthesisKind::Native, true) => synthesize_native_complete_tail(item, round_local),
+        (SynthesisKind::Private, true) => synthesize_private_complete(item, output_index),
+        (SynthesisKind::Native, true) => synthesize_native_complete_tail(item, output_index),
         // Incomplete (terminalized / open-failure) tail; private replays its opening.
-        (kind, false) => synthesize_incomplete_tail(item, round_local, kind == SynthesisKind::Private),
+        (kind, false) => synthesize_incomplete_tail(item, output_index, kind == SynthesisKind::Private),
     }
 }
 

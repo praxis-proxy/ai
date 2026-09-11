@@ -3,21 +3,19 @@
 
 //! Web search filter for the Responses API agentic loop.
 //!
-//! Operates in two phases within the `iterative_request_router`:
-//!
-//! 1. **Response path** (`on_response_body`): detects `web_search_call` items in [`ResponsesState::web_search_calls`]
-//!    and writes `openai_web_search.action = "loop"` to [`filter_results`] for the IRR step transition.
-//! 2. **Request path** (`on_request_body`, re-entry): executes pending web searches via [`SearchClient`] and appends
-//!    results to `messages`, `persisted_messages`, and `accumulated_output`.
+//! Executes calls prepared by `openai_agentic_loop` during the request-body
+//! phase of the next `iterative_request_router` iteration. The owner performs
+//! response classification, admission, and the sole loop transition; this
+//! dispatcher only executes the admitted searches via [`SearchClient`] and
+//! appends their results to request-scoped state.
 //!
 //! # Pipeline dependencies
 //!
-//! - **`openai_agentic_loop`** must run before this filter in the response phase (after in YAML order) to extract
-//!   `web_search_call` items from the model response into [`ResponsesState::web_search_calls`].
-//! - The IRR transition must match `openai_web_search.action = "loop"` and target the same inference step.
+//! - **`openai_agentic_loop`** must run after this filter in request order, so response order is `openai_agentic_loop`
+//!   then `openai_web_search`.
+//! - The IRR transition must match `openai_agentic_loop.action = "loop"` and target the same inference step.
 //!
 //! [`ResponsesState::web_search_calls`]: super::state::ResponsesState
-//! [`filter_results`]: HttpFilterContext::filter_results
 //! [`SearchClient`]: crate::web_search::SearchClient
 
 #[cfg(test)]
@@ -45,10 +43,8 @@ use praxis_filter::{
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::{
-    mcp_dispatch::FILTER_RESULT_KEY as MCP_DISPATCH_FILTER_RESULT_KEY,
-    openai_mcp_tool_resolve::McpToolIndex,
-    state::{ResponsesState, consumed_builtin_tool_calls_before_current_round, current_round_tool_call_admissions},
+use super::state::{
+    ResponsesState, consumed_builtin_tool_calls_before_current_round, current_round_tool_call_admissions,
 };
 use crate::web_search::{
     OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, SearchResult,
@@ -59,14 +55,8 @@ use crate::web_search::{
 // Constants
 // -----------------------------------------------------------------------------
 
-/// Filter results key for the loop control action.
-const FILTER_RESULT_KEY: &str = "openai_web_search";
-
-/// Action value signalling a loop-back for web search dispatch.
-const ACTION_LOOP: &str = "loop";
-
-/// Action value signalling no web search dispatch needed.
-const ACTION_DONE: &str = "done";
+/// Step-local metadata carrying the configured response fan-out cap to the owner.
+const MAX_CALLS_METADATA: &str = "responses.web_search_max_calls_per_round";
 
 /// Include value that gates `action.sources` in the output item.
 const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
@@ -249,15 +239,13 @@ impl WebSearchFilter {
     /// Execute admitted web search `calls` up to the provider-request `budget`,
     /// then update the cumulative execution count and clear the pending queue.
     ///
-    /// Calls beyond `budget` are surfaced as incomplete without issuing a
-    /// (potentially paid) provider request, honoring the client's
-    /// `max_tool_calls` allowance and the per-continuation server cap. Only
     /// Calls rejected by the response-wide ordered admission pass receive a
     /// failed result and force local completion without another model round.
-    /// Separately, calls beyond the provider-request budget are surfaced as
-    /// incomplete. Only dispatched calls (a `Results` or `Failed` outcome) are
-    /// added to the cumulative provider counter; a missing-query call consumes
-    /// its model-call admission but does not issue a provider request.
+    /// Calls beyond the provider-request `budget` are surfaced as incomplete
+    /// without issuing a potentially paid provider request. Only dispatched
+    /// calls (a `Results` or `Failed` outcome) are added to the cumulative
+    /// provider counter; a missing-query call consumes its model-call admission
+    /// but does not issue a provider request.
     async fn execute_pending_searches(&self, ctx: &mut HttpFilterContext<'_>, batch: PendingSearchBatch<'_>) -> bool {
         let mut dispatched = 0_usize;
         let mut tool_limit_exceeded = false;
@@ -334,6 +322,7 @@ impl HttpFilter for WebSearchFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
+        ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
@@ -343,12 +332,9 @@ impl HttpFilter for WebSearchFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let admissions = state.max_tool_calls.map(|_| {
-            let tool_index = McpToolIndex::new(&state.mcp_tool_map);
-            current_round_tool_call_admissions(state, &state.web_search_calls, |item| {
-                is_mcp_function_call(&tool_index, item)
-            })
-        });
+        let admissions = state
+            .max_tool_calls
+            .map(|_| current_round_tool_call_admissions(state, &state.web_search_calls));
         let context_size = ctx
             .get_metadata("tool_parse.search_context_size")
             .or_else(|| web_search_context_size_from_state(state))
@@ -385,80 +371,16 @@ impl HttpFilter for WebSearchFilter {
                 },
             )
             .await;
-        if tool_limit_exceeded {
-            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-                state.deferred_tool_limit_completion = true;
-            }
-            set_action(ctx, ACTION_DONE)?;
+        if tool_limit_exceeded && let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.deferred_tool_limit_completion = true;
         }
-        Ok(FilterAction::Continue)
-    }
-
-    fn on_response_body(
-        &self,
-        ctx: &mut HttpFilterContext<'_>,
-        _body: &mut Option<Bytes>,
-        end_of_stream: bool,
-    ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream {
-            return Ok(FilterAction::Continue);
-        }
-
-        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
-            return Ok(FilterAction::Continue);
-        };
-
-        if state.web_search_calls.is_empty() {
-            set_action(ctx, ACTION_DONE)?;
-            return Ok(FilterAction::Continue);
-        }
-
-        if state.web_search_calls.len() > self.max_calls_per_round {
-            return oversized_web_search_batch(ctx);
-        }
-
-        debug!(
-            count = state.web_search_calls.len(),
-            "web search calls pending, signaling loop"
-        );
-        set_action(ctx, ACTION_LOOP)?;
         Ok(FilterAction::Continue)
     }
 }
 
-/// Reject a model response whose web-search fan-out exceeds the server cap.
-fn oversized_web_search_batch(ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-    const MESSAGE: &str = "model response exceeded the configured web-search call limit";
-    let streaming = ctx.extensions.get_mut::<ResponsesState>().is_some_and(|state| {
-        state.tool_calls.clear();
-        state.web_search_calls.clear();
-        state.request_body.get("stream").and_then(Value::as_bool) == Some(true)
-    });
-    if streaming {
-        ctx.set_metadata("responses.stream_error_code", "server_error");
-        ctx.set_metadata("responses.stream_error_message", MESSAGE);
-        ctx.set_metadata("responses.skip_persist", "true");
-        ctx.filter_results
-            .entry(MCP_DISPATCH_FILTER_RESULT_KEY)
-            .or_default()
-            .set("action", ACTION_DONE)?;
-        set_action(ctx, ACTION_DONE)?;
-        return Ok(FilterAction::Continue);
-    }
-    Ok(FilterAction::Reject(super::error::responses_error_rejection(
-        502,
-        "server_error",
-        MESSAGE,
-    )))
-}
-
-/// Return whether an output item is one of this request's resolved MCP calls.
-fn is_mcp_function_call(tool_index: &McpToolIndex<'_>, item: &Value) -> bool {
-    item.get("type").and_then(Value::as_str) == Some("function_call")
-        && item
-            .get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|encoded| tool_index.contains(encoded))
+/// Return the response fan-out cap this dispatcher published for the owner.
+pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
+    ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
 }
 
 /// Recover per-request search context after IRR resets step-local metadata.
@@ -510,7 +432,7 @@ impl<'a> SearchCallIds<'a> {
 /// again when a sibling dispatcher evaluates ordered admission. Matching calls
 /// copied between state owners are reconciled by occurrence multiplicity,
 /// mirroring
-/// [`remaining_file_search_call_budget`](super::file_search_callout).
+/// the owner-side ordered admission applied to file-search assignments.
 fn remaining_web_search_budget(state: &ResponsesState) -> usize {
     let used = consumed_builtin_tool_calls_before_current_round(state);
     let client_remaining = state.max_tool_calls.map_or(usize::MAX, |max| {
@@ -628,12 +550,10 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
         if let Some(id) = output_item.get("id").and_then(Value::as_str) {
             state.locally_executed_output_items.insert(id.to_owned());
         }
-        upsert_output_item(
-            &mut state.accumulated_output,
-            state.current_round_output_start,
-            index,
-            output_item,
-        );
+        let round_start = state
+            .current_round_output_start
+            .unwrap_or(state.accumulated_output.len());
+        upsert_output_item(&mut state.accumulated_output, round_start, index, output_item);
     }
 }
 
@@ -842,13 +762,4 @@ fn build_failed_tool_result_messages_with_output(call_id: &str, query: &str, out
             "output": output,
         }),
     ]
-}
-
-/// Write the loop control action to filter results.
-fn set_action(ctx: &mut HttpFilterContext<'_>, action: &'static str) -> Result<(), FilterError> {
-    ctx.filter_results
-        .entry(FILTER_RESULT_KEY)
-        .or_default()
-        .set("action", action)?;
-    Ok(())
 }

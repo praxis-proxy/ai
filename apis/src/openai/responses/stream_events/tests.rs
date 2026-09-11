@@ -19,7 +19,7 @@ use serde_json::json;
 
 use super::{
     ArmDecision, CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object,
-    arm_decision, encode_local_completion,
+    arm_decision, encode_local_completion, encode_local_error,
 };
 use crate::{
     openai::{
@@ -142,6 +142,85 @@ fn local_completion_preserves_deferred_done_sentinel() {
     assert!(
         encoded.ends_with(b"data: [DONE]\n\n"),
         "request-side completion must preserve the upstream sentinel"
+    );
+}
+
+#[test]
+fn local_completion_flushes_file_search_lifecycle_before_terminal() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        accumulated_output: vec![json!({
+            "type":"file_search_call",
+            "id":"fs_local",
+            "status":"completed",
+            "results":[]
+        })],
+        pending_local_tool_synthesis: vec![(0, SynthesisKind::Private)],
+        response_object: json!({
+            "id":"resp_local",
+            "object":"response",
+            "status":"completed",
+            "output":[]
+        }),
+        ..ResponsesState::default()
+    });
+
+    let encoded = encode_local_completion(&mut ctx).expect("local completion should encode");
+    let encoded = String::from_utf8(encoded.to_vec()).unwrap();
+
+    let done = encoded
+        .find("event: response.output_item.done")
+        .expect("the local file-search lifecycle should be flushed");
+    let terminal = encoded
+        .find("event: response.completed")
+        .expect("the response terminal should be emitted");
+    assert!(
+        done < terminal,
+        "the local tool lifecycle must precede response.completed"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .pending_local_tool_synthesis
+            .is_empty(),
+        "local completion must drain the synthesis queue exactly once"
+    );
+}
+
+#[test]
+fn local_error_flushes_file_search_lifecycle_before_terminal() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        accumulated_output: vec![json!({
+            "type":"file_search_call",
+            "id":"fs_local",
+            "status":"completed",
+            "results":[]
+        })],
+        pending_local_tool_synthesis: vec![(0, SynthesisKind::Private)],
+        ..ResponsesState::default()
+    });
+
+    let encoded = encode_local_error(&mut ctx, "server_error", "dispatch failed").expect("local error should encode");
+    let encoded = String::from_utf8(encoded.to_vec()).unwrap();
+
+    let done = encoded
+        .find("event: response.output_item.done")
+        .expect("the local file-search lifecycle should be flushed");
+    let terminal = encoded
+        .find("event: error")
+        .expect("the error terminal should be emitted");
+    assert!(done < terminal, "the local tool lifecycle must precede the SSE error");
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .pending_local_tool_synthesis
+            .is_empty(),
+        "local error must drain the synthesis queue exactly once"
     );
 }
 
@@ -396,8 +475,11 @@ async fn logical_stream_suppresses_intermediate_terminal_and_normalizes_resumed_
     ));
     filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
     assert!(terminal.is_none(), "the per-turn terminal must be withheld");
+    // After the #1046 unification the loop owner (`openai_agentic_loop`) is the
+    // single continuation authority: it records `action="loop"` for the
+    // MCP-classified call before the intermediate terminal is suppressed.
     ctx.filter_results
-        .entry("openai_mcp_dispatch")
+        .entry("openai_agentic_loop")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -412,7 +494,7 @@ async fn logical_stream_suppresses_intermediate_terminal_and_normalizes_resumed_
     state.iteration = 1;
     state.accumulated_output = vec![function_call, json!({"type": "mcp_call", "id": "mcp_1"})];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_mcp_dispatch");
+    ctx.filter_results.remove("openai_agentic_loop");
     filter.arm(&mut ctx);
 
     let mut resumed_created = Some(make_sse_chunk(
@@ -4115,35 +4197,31 @@ async fn logical_stream_finalize_clears_provider_streamed_terminal_ids() {
 }
 
 #[test]
-fn logical_stream_continues_recognizes_file_search_loop() {
+fn logical_stream_continues_recognizes_owner_loop() {
     use super::logical_stream_continues;
 
+    // After the #1046 unification the loop owner (`openai_agentic_loop`) is the
+    // single continuation authority: its `action="loop"` — covering pending
+    // file_search assignments, web_search calls, and MCP-classified tool calls
+    // alike — is what keeps the logical stream open.
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.filter_results
-        .entry("openai_file_search_callout")
+        .entry("openai_agentic_loop")
         .or_default()
         .set("action", "loop")
         .unwrap();
     assert!(
         logical_stream_continues(&ctx),
-        "file_search action=loop must continue the logical stream"
+        "owner action=loop must continue the logical stream"
     );
 }
 
 #[test]
-fn arm_publishes_file_search_marker_on_logical_stream() {
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    OpenaiStreamEventsFilter::test_filter().arm(&mut ctx);
-    assert_eq!(ctx.get_metadata("responses.logical_stream.file_search"), Some("true"));
-}
-
-#[test]
-fn drain_offset_discipline_emits_round_local_then_offset() {
-    // accumulated len 6; the synthesized call sits at absolute index 5. With
-    // output_index_offset 5, round_local = 5 - 5 = 0, and normalize re-adds the offset
-    // → wire output_index = 0 + 5 = 5 (no double-offset, no underflow).
+fn drain_emits_absolute_output_index() {
+    // accumulated len 6; the reconciled call sits at absolute index 5. The queue
+    // stores absolute indices and drain normalizes with a zero offset, so the wire
+    // `output_index` is the absolute 5 (no per-round offset arithmetic).
     let mut ctx = test_ctx_without_file_search_tool();
     let mut state = ResponsesState::default();
     state.accumulated_output = (0..6)
@@ -4152,11 +4230,33 @@ fn drain_offset_discipline_emits_round_local_then_offset() {
     state.pending_local_tool_synthesis = vec![(5, SynthesisKind::Native)];
     ctx.extensions.insert(state);
     let mut out = Vec::new();
-    super::local_tools::drain_local_tool_synthesis(&mut ctx, 5, &mut out);
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, &mut out);
     let emitted = String::from_utf8(out).unwrap();
     assert!(
         emitted.contains("\"output_index\":5"),
-        "absolute 5 with offset 5 → round_local 0 → wire output_index 5; got: {emitted}"
+        "absolute index 5 is emitted verbatim as the wire output_index; got: {emitted}"
+    );
+}
+
+#[test]
+fn drain_defers_still_pending_item() {
+    // A queued item whose owner placeholder is not yet reconciled (the dispatcher
+    // runs next round) is re-queued for a later finalize, not synthesized now.
+    let mut ctx = test_ctx_without_file_search_tool();
+    let mut state = ResponsesState::default();
+    state.accumulated_output = vec![json!({"type":"file_search_call","status":"in_progress"})];
+    state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Private)];
+    ctx.extensions.insert(state);
+    let mut out = Vec::new();
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, &mut out);
+    assert!(out.is_empty(), "a still-pending item emits no lifecycle yet");
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .pending_local_tool_synthesis,
+        vec![(0, SynthesisKind::Private)],
+        "the pending item is re-queued for the finalize that follows its reconciliation"
     );
 }
 
@@ -4169,7 +4269,7 @@ fn drain_pre_existing_error_suppresses_synthesis() {
     state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Native)]; // a VALID queued item
     ctx.extensions.insert(state);
     let mut out = Vec::new();
-    super::local_tools::drain_local_tool_synthesis(&mut ctx, 0, &mut out);
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, &mut out);
     assert!(
         out.is_empty(),
         "a valid queued item is discarded when an error is already committed"
@@ -4189,10 +4289,11 @@ fn drain_invalid_index_sets_error_and_no_gap() {
     let mut ctx = test_ctx_without_file_search_tool();
     let mut state = ResponsesState::default();
     state.accumulated_output = vec![json!({"type":"file_search_call","status":"completed","results":[]})];
-    state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Native)]; // offset 3 > absolute 0 → None
+    // Absolute index 5 is out of range for a one-item output → invariant failure.
+    state.pending_local_tool_synthesis = vec![(5, SynthesisKind::Native)];
     ctx.extensions.insert(state);
     let mut out = Vec::new();
-    super::local_tools::drain_local_tool_synthesis(&mut ctx, 3, &mut out);
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, &mut out);
     assert!(out.is_empty(), "no guessed frame on invariant failure");
     assert!(
         ctx.get_metadata("responses.stream_error_code").is_some(),
@@ -4285,15 +4386,17 @@ async fn native_progress_precedes_closed_error_ordering() {
 #[test]
 fn drain_atomicity_valid_item_before_invalid_both_suppressed() {
     let mut ctx = test_ctx_without_file_search_tool();
-    // accumulated len 6; queue [(5,Native)=valid round_local 0, (2,Native)=underflows with offset 5].
+    // accumulated len 6; queue [(5,Native)=valid, (99,Native)=out of range]. The
+    // resolution pass validates every index before emitting any frame, so the
+    // out-of-range item suppresses the valid one too.
     let mut state = ResponsesState::default();
     state.accumulated_output = (0..6)
         .map(|_| json!({"type":"file_search_call","status":"completed","results":[]}))
         .collect();
-    state.pending_local_tool_synthesis = vec![(5, SynthesisKind::Native), (2, SynthesisKind::Native)];
+    state.pending_local_tool_synthesis = vec![(5, SynthesisKind::Native), (99, SynthesisKind::Native)];
     ctx.extensions.insert(state);
     let mut out = Vec::new();
-    super::local_tools::drain_local_tool_synthesis(&mut ctx, 5, &mut out);
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, &mut out);
     assert!(
         out.is_empty(),
         "atomicity: the VALID item is not emitted when a later queued item is invalid"

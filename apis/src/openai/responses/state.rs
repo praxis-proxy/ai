@@ -13,6 +13,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
+use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
+
+use super::{bounded_json_size, error::responses_error_rejection, file_search_callout::citations::annotate_response};
 
 /// Maximum citation file mappings retained during one response execution.
 pub(crate) const MAX_CITATION_FILES: usize = 1_024;
@@ -29,10 +32,56 @@ pub(crate) enum SynthesisKind {
     Native,
 }
 
+/// One `file_search_call` the parse owner (`openai_agentic_loop`) accumulated
+/// this round and handed to `openai_file_search_callout` for execution.
+///
+/// The owner is the sole parser: it appends the canonical `file_search_call`
+/// output item to [`ResponsesState::accumulated_output`] and records its
+/// absolute index here plus the synthesis origin (private-normalized vs native).
+/// The dispatcher drains these at request-body EOS and mutates the indexed item
+/// in place — setting `completed`/`incomplete`, adding public results, and
+/// bridging model context — so the complete output item is never cloned into a
+/// second owner (avoids the payload duplication the "keep `Vec<Value>`" interface
+/// would incur; the recommended "store output indices" boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileSearchAssignment {
+    /// Absolute index into [`ResponsesState::accumulated_output`] of the
+    /// `file_search_call` item the dispatcher must execute and reconcile.
+    pub output_index: usize,
+    /// Whether the item was normalized from a private `function_call` this round
+    /// (`Private`, opening suppressed) or streamed natively (`Native`).
+    pub synthesis: SynthesisKind,
+}
+
+/// A terminal failure a request-phase dispatcher recorded in shared state.
+///
+/// A dispatcher (e.g. `openai_file_search_callout`) never rejects or rewrites a
+/// response itself — that would make it a second terminal-response owner. Instead
+/// it records the failure here and returns `Continue`; the parse owner
+/// (`openai_agentic_loop`), which runs next in the same request phase, converts it
+/// into a buffered JSON rejection before commitment or a logical-stream SSE error
+/// after commitment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DispatchFailure {
+    /// HTTP status for the buffered (pre-commitment) rejection envelope.
+    pub status: u16,
+    /// Stable error `code` for both the buffered envelope and the SSE error frame.
+    pub code: &'static str,
+    /// Human-readable, bounded failure message.
+    pub message: String,
+}
+
 /// Return whether an output item consumes the response-wide built-in tool-call budget.
 ///
 /// All local built-in dispatchers share this classifier so adding a provider
 /// call type cannot make their `max_tool_calls` accounting disagree.
+///
+/// MCP calls (`mcp_call`, `mcp_approval_request`, `mcp_list_tools`) and the
+/// pre-dispatch `function_call` items that encode them are deliberately absent:
+/// the OpenAI Responses API scopes `max_tool_calls` to *built-in* tools and
+/// keeps MCP tools on their own limits (see `openai_mcp_dispatch`'s
+/// `max_calls_per_round`). Counting MCP here would let it silently starve the
+/// built-in budget, which the provider contract forbids.
 pub(crate) fn is_builtin_tool_call(item: &serde_json::Value) -> bool {
     matches!(
         item.get("type").and_then(serde_json::Value::as_str),
@@ -44,7 +93,6 @@ pub(crate) fn is_builtin_tool_call(item: &serde_json::Value) -> bool {
                 | "file_search_call"
                 | "image_generation_call"
                 | "local_shell_call"
-                | "mcp_call"
                 | "multi_agent_call"
                 | "shell_call"
                 | "tool_search_call"
@@ -72,36 +120,18 @@ pub(crate) fn is_client_executed_tool_call(item: &serde_json::Value) -> bool {
     }
 }
 
-/// Count admitted built-in tool-call occurrences across every retained owner.
-///
-/// A call is charged when the model makes it, even when local execution later
-/// produces an `incomplete` result. Retained owners can echo the same call, so
-/// matching `(type, id)` multiplicities are merged by their maximum rather than
-/// summed. This preserves separate same-ID occurrences within one owner while
-/// avoiding double-counting a call copied between lifecycle stores.
-pub(crate) fn consumed_builtin_tool_calls(state: &ResponsesState) -> usize {
-    let owners = [
-        state.accumulated_output.as_slice(),
-        state.file_search_output_items.as_slice(),
-        state.output_items(),
-    ];
-    let web_calls = count_tool_call_occurrences(&owners, ToolCallClass::Web);
-    web_calls.saturating_add(count_tool_call_occurrences(&owners, ToolCallClass::NonWeb))
-}
-
 /// Count calls consumed before the current model round began.
 ///
 /// Current-round calls are admitted separately in model output order. This
 /// helper therefore excludes the current suffix of `accumulated_output` while
-/// still including moved file-search calls and prior web-search executions.
+/// still including prior file-search and web-search executions retained earlier
+/// in `accumulated_output`.
 pub(crate) fn consumed_builtin_tool_calls_before_current_round(state: &ResponsesState) -> usize {
-    let prior_end = if state.current_round_output_start == 0 && state.output_items().is_empty() {
-        state.accumulated_output.len()
-    } else {
-        state.current_round_output_start
-    };
+    let prior_end = state
+        .current_round_output_start
+        .unwrap_or(state.accumulated_output.len());
     let prior_agentic_output = state.accumulated_output.get(..prior_end).unwrap_or_default();
-    let owners = [prior_agentic_output, state.file_search_output_items.as_slice()];
+    let owners = [prior_agentic_output];
     let web_calls = count_tool_call_occurrences(&owners, ToolCallClass::Web);
     web_calls.saturating_add(count_tool_call_occurrences(&owners, ToolCallClass::NonWeb))
 }
@@ -180,8 +210,6 @@ pub(crate) enum McpApprovalState {
     ApprovalPendingThenReturn,
     /// Execute ungated siblings, then return the pending approval response.
     ExecuteUngatedThenReturn,
-    /// Execute the allowed prefix, then return calls rejected by `max_tool_calls`.
-    ToolLimitExceededThenReturn,
 }
 
 /// Request-scoped state shared across Responses API filters.
@@ -218,12 +246,6 @@ pub(crate) struct ResponsesState {
     /// stored conversation this request belongs to.
     pub conversation: Option<serde_json::Value>,
 
-    /// Public output retained across local file-search inference rounds.
-    ///
-    /// This is request-local continuation state. Private search context stays
-    /// in [`Self::messages`] and is never exposed through Conversations.
-    pub file_search_output_items: Vec<serde_json::Value>,
-
     /// Additional fields to include in the response.
     ///
     /// E.g. `["usage"]`, `["file_search_results"]`. Filters that
@@ -244,7 +266,7 @@ pub(crate) struct ResponsesState {
     /// sibling dispatcher has evaluated the round. Keeping the boundary
     /// explicitly prevents those local items from being mistaken for prior
     /// model output during response-wide tool-budget admission.
-    pub current_round_output_start: usize,
+    pub current_round_output_start: Option<usize>,
 
     /// Whether stored history was successfully resolved into this state.
     ///
@@ -395,6 +417,19 @@ pub(crate) struct ResponsesState {
     /// including calls whose local execution is incomplete.
     pub web_search_calls_executed: u32,
 
+    /// Absolute indices into [`Self::accumulated_output`] (+ synthesis origin)
+    /// of the `file_search_call` items `openai_agentic_loop` accumulated this
+    /// round for `openai_file_search_callout` to execute.
+    ///
+    /// The parse owner records one [`FileSearchAssignment`] per hosted file-search
+    /// call it appended to `accumulated_output` (including private
+    /// `function_call(name=file_search)` items it normalized into canonical
+    /// `file_search_call` shape). The dispatcher drains these exactly once at
+    /// request-body EOS and mutates the indexed item in place, so the call
+    /// payload is never cloned into a second owner. Cleared by draining, mirroring
+    /// [`Self::pending_local_tool_synthesis`].
+    pub file_search_assignments: Vec<FileSearchAssignment>,
+
     /// Tool choice setting. Reset to `"auto"` by `openai_agentic_loop`
     /// after the first iteration; the original value from the
     /// request only applies to the first inference call.
@@ -466,6 +501,15 @@ pub(crate) struct ResponsesState {
     /// against `max_state_bytes` in `continuation_state_fits` like every other
     /// request-scoped field (#313 P1 `DoS` bound).
     pub provider_streamed_terminal_ids: BTreeSet<String>,
+
+    /// A terminal failure a request-phase dispatcher recorded for the parse owner
+    /// to convert into the single client-facing rejection (buffered JSON before
+    /// commitment, logical-stream SSE error after). `None` on the happy path.
+    ///
+    /// Keeping the terminal decision with `openai_agentic_loop` prevents a
+    /// dispatcher from becoming a second terminal-response owner (see
+    /// [`DispatchFailure`]).
+    pub dispatch_failure: Option<DispatchFailure>,
 }
 
 /// Which client-visible lifecycle milestones a locally generated output item has
@@ -534,11 +578,10 @@ impl Default for ResponsesState {
             citation_files: HashMap::new(),
             context_management: None,
             conversation: None,
-            file_search_output_items: Vec::new(),
             include: Vec::new(),
             logical_stream_response_id: None,
             logical_stream_sequence: 0,
-            current_round_output_start: 0,
+            current_round_output_start: None,
             history_rehydrated: false,
             input: Vec::new(),
             iteration: 0,
@@ -564,6 +607,7 @@ impl Default for ResponsesState {
             tool_calls: Vec::new(),
             web_search_calls: Vec::new(),
             web_search_calls_executed: 0,
+            file_search_assignments: Vec::new(),
             tool_choice: serde_json::Value::String("auto".to_owned()),
             tools: Vec::new(),
             usage: serde_json::Value::Null,
@@ -572,6 +616,7 @@ impl Default for ResponsesState {
             locally_executed_output_items: HashSet::new(),
             pending_local_tool_synthesis: Vec::new(),
             provider_streamed_terminal_ids: BTreeSet::new(),
+            dispatch_failure: None,
         }
     }
 }
@@ -645,68 +690,148 @@ impl ResponsesState {
         self.request_body_rebuild == RequestBodyRebuild::Required
     }
 
-    /// Build the final response body from accumulated state.
+    /// Finalize the response into [`Self::response_object`] and serialize it to
+    /// `body`.
     ///
-    /// Replaces `response_object["output"]` with the full `accumulated_output`
-    /// (all rounds), stamps accumulated usage, and serializes back to body bytes.
-    pub(crate) fn finalize_response_body(&self, body: &mut Option<Bytes>) {
+    /// Moves the full multi-round [`Self::accumulated_output`] into
+    /// `response_object["output"]` via `mem::take` (avoiding a clone per the
+    /// data-ownership rule), stamps accumulated usage, applies bounded citation
+    /// annotation, enforces the JSON size bound, and writes the serialized bytes
+    /// back to `body`. Reflecting the merged output in `response_object` keeps
+    /// state-based consumers (streaming reader, persistence) consistent with the
+    /// body bytes, instead of leaving `response_object` holding only the last
+    /// round's output.
+    ///
+    /// Citation annotation is invoked **unconditionally**: the citations-present
+    /// gate lives inside [`annotate_response`], which is a strict no-op when
+    /// [`Self::citation_files`] is empty, so web- and MCP-only flows perform no
+    /// annotation and need no caller-side conditional.
+    ///
+    /// This is a **terminal** finalizer: it consumes `accumulated_output`, so it
+    /// must run only on a loop-exit transition, never on a loop-back round (a
+    /// loop-back round's serialized body is discarded by the router, so it is not
+    /// written at all).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FilterAction::Reject`] carrying an HTTP 502 error envelope on
+    /// citation-annotation failure, JSON size overflow, or serialization
+    /// failure, closing the prior fail-open serialization gap.
+    pub(crate) fn finalize_response_body(&mut self, body: &mut Option<Bytes>) -> Result<(), FilterAction> {
         if !self.response_object.is_object() {
-            return;
+            return Ok(());
         }
-        let mut response = self.response_object.clone();
-        if let Some(obj) = response.as_object_mut() {
+        if let Some(obj) = self.response_object.as_object_mut() {
             if !self.accumulated_output.is_empty() {
                 obj.insert(
                     "output".to_owned(),
-                    serde_json::Value::Array(self.accumulated_output.clone()),
+                    serde_json::Value::Array(std::mem::take(&mut self.accumulated_output)),
                 );
             }
             if !self.usage.is_null() {
                 obj.insert("usage".to_owned(), self.usage.clone());
             }
         }
-        if let Ok(serialized) = serde_json::to_vec(&response) {
-            *body = Some(Bytes::from(serialized));
-        }
+        annotate_response(&mut self.response_object, &self.citation_files).map_err(|error| {
+            tracing::warn!(%error, "failed to annotate final response");
+            finalize_rejection("failed to annotate final response")
+        })?;
+        bounded_json_size(&self.response_object, MAX_JSON_BODY_BYTES)
+            .ok()
+            .flatten()
+            .ok_or_else(|| finalize_rejection("final response exceeds the JSON response byte limit"))?;
+        let serialized = serde_json::to_vec(&self.response_object).map_err(|error| {
+            tracing::warn!(%error, "failed to encode final response");
+            finalize_rejection("failed to encode final response")
+        })?;
+        *body = Some(Bytes::from(serialized));
+        Ok(())
     }
 
     /// Move the pending local-tool synthesis queue out, leaving it empty.
     pub fn drain_pending_local_tool_synthesis(&mut self) -> Vec<(usize, SynthesisKind)> {
         std::mem::take(&mut self.pending_local_tool_synthesis)
     }
+
+    /// Move the file-search assignment queue out, leaving it empty.
+    ///
+    /// `openai_file_search_callout` drains this exactly once at request-body EOS
+    /// so each assigned `file_search_call` is executed and reconciled a single
+    /// time (drain-once), mirroring [`Self::drain_pending_local_tool_synthesis`].
+    pub fn drain_file_search_assignments(&mut self) -> Vec<FileSearchAssignment> {
+        std::mem::take(&mut self.file_search_assignments)
+    }
 }
 
-/// Return budget admission decisions for one kind of current-round local call.
+/// Build the HTTP 502 rejection returned by [`ResponsesState::finalize_response_body`]
+/// when the terminal response cannot be annotated, size-bounded, or serialized.
+fn finalize_rejection(message: &str) -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(502, "server_error", message))
+}
+
+/// Return budget admission decisions for one kind of current-round built-in call.
 ///
 /// Dispatch filters run independently on request re-entry, but the response-wide
-/// limit applies in model output order. Replaying the immutable current response
-/// here prevents pipeline order from letting a later web search displace an
-/// earlier MCP call (or vice versa).
+/// `max_tool_calls` limit applies in model output order. Replaying the immutable
+/// current response here prevents pipeline order from letting a later web search
+/// displace an earlier built-in call (or vice versa). MCP calls are exempt from
+/// this budget (see [`is_builtin_tool_call`]), so they never appear as budget
+/// consumers even when interleaved with the target calls in model output order.
 pub(crate) fn current_round_tool_call_admissions(
     state: &ResponsesState,
     target_calls: &[serde_json::Value],
-    is_mcp_function: impl Fn(&serde_json::Value) -> bool,
 ) -> Vec<bool> {
-    current_round_tool_call_admissions_by(
-        state,
-        target_calls.len(),
-        |index| target_calls.get(index),
-        is_mcp_function,
-    )
+    current_round_tool_call_admissions_by(state, target_calls.len(), |index| target_calls.get(index))
 }
 
-/// Return current-round admissions for callers that already borrow tool calls.
-pub(crate) fn current_round_borrowed_tool_call_admissions(
+/// Return budget admission decisions for file-search assignments in model order.
+///
+/// File-search dispatch uses absolute accumulator indices rather than cloned
+/// output items. Replaying those indices against the current-round suffix keeps
+/// its admission decisions identical to web search even when a streamed round
+/// has already been drained out of `response_object.output`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "ordered cross-dispatch admission is clearer as one linear model-output scan"
+)]
+pub(crate) fn current_round_file_search_admissions(
     state: &ResponsesState,
-    target_calls: &[&serde_json::Value],
-    is_mcp_function: impl Fn(&serde_json::Value) -> bool,
+    assignments: &[FileSearchAssignment],
 ) -> Vec<bool> {
-    current_round_tool_call_admissions_by(
-        state,
-        target_calls.len(),
-        |index| target_calls.get(index).copied(),
-        is_mcp_function,
-    )
+    let previous_calls = consumed_builtin_tool_calls_before_current_round(state);
+    let mut remaining = state.max_tool_calls.map_or(usize::MAX, |limit| {
+        usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(previous_calls)
+    });
+    let mut admissions = Vec::with_capacity(assignments.len());
+    let mut assignment_index = 0;
+    let round_start = state
+        .current_round_output_start
+        .unwrap_or(state.accumulated_output.len());
+
+    for (offset, item) in state
+        .accumulated_output
+        .get(round_start..)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        let consumes_budget = is_builtin_tool_call(item);
+        let admitted = !consumes_budget || remaining > 0;
+        if consumes_budget {
+            remaining = remaining.saturating_sub(1);
+        }
+        let absolute_index = round_start.saturating_add(offset);
+        if assignments
+            .get(assignment_index)
+            .is_some_and(|assignment| assignment.output_index == absolute_index)
+        {
+            admissions.push(admitted);
+            assignment_index = assignment_index.saturating_add(1);
+        }
+    }
+    admissions
 }
 
 /// Replay model output order against an arbitrary borrowed target-call view.
@@ -714,7 +839,6 @@ fn current_round_tool_call_admissions_by<'a>(
     state: &ResponsesState,
     target_count: usize,
     target_call: impl Fn(usize) -> Option<&'a serde_json::Value>,
-    is_mcp_function: impl Fn(&serde_json::Value) -> bool,
 ) -> Vec<bool> {
     let previous_calls = consumed_builtin_tool_calls_before_current_round(state);
     let mut remaining = state.max_tool_calls.map_or(usize::MAX, |limit| {
@@ -725,9 +849,11 @@ fn current_round_tool_call_admissions_by<'a>(
     let mut admissions = Vec::new();
     let mut target_index = 0;
 
-    for item in state.output_items() {
-        let mcp = is_mcp_function(item);
-        let consumes_budget = mcp || is_builtin_tool_call(item);
+    let round_start = state
+        .current_round_output_start
+        .unwrap_or(state.accumulated_output.len());
+    for item in state.accumulated_output.get(round_start..).unwrap_or_default() {
+        let consumes_budget = is_builtin_tool_call(item);
         let admitted = !consumes_budget || remaining > 0;
         if consumes_budget {
             remaining = remaining.saturating_sub(1);
@@ -1030,25 +1156,79 @@ mod tests {
     }
 
     #[test]
-    fn current_round_budget_admission_follows_model_output_order() {
+    fn mcp_calls_are_exempt_while_builtins_admit_in_output_order() {
         let mcp = json!({
             "type":"function_call", "call_id":"mcp_1",
             "name":"utilities__weather", "status":"completed"
         });
-        let web = json!({"type":"web_search_call", "id":"ws_1", "status":"completed"});
+        let web_first = json!({"type":"web_search_call", "id":"ws_1", "status":"completed"});
+        let web_second = json!({"type":"web_search_call", "id":"ws_2", "status":"completed"});
         let state = ResponsesState {
-            max_tool_calls: Some(2),
-            current_round_output_start: 1,
-            accumulated_output: vec![json!({"type":"mcp_call", "id":"prior"}), mcp.clone(), web.clone()],
-            response_object: json!({"output":[mcp, web]}),
+            max_tool_calls: Some(1),
+            current_round_output_start: Some(0),
+            accumulated_output: vec![mcp.clone(), web_first.clone(), web_second.clone()],
+            response_object: json!({"output":[mcp.clone(), web_first.clone(), web_second.clone()]}),
             ..ResponsesState::default()
         };
-        let is_mcp = |item: &serde_json::Value| {
-            item.get("name").and_then(serde_json::Value::as_str) == Some("utilities__weather")
+
+        // The MCP call precedes both built-ins in model output order but is
+        // exempt from `max_tool_calls`, so it never spends the single built-in
+        // slot. The first web search claims that slot and the second is
+        // rejected in order.
+        assert_eq!(current_round_tool_call_admissions(&state, &[mcp]), vec![true]);
+        assert_eq!(current_round_tool_call_admissions(&state, &[web_first]), vec![true]);
+        assert_eq!(current_round_tool_call_admissions(&state, &[web_second]), vec![false]);
+    }
+
+    #[test]
+    fn first_streamed_round_is_not_counted_as_prior_budget() {
+        let web = json!({"type":"web_search_call", "id":"ws_first", "status":"in_progress"});
+        let state = ResponsesState {
+            max_tool_calls: Some(1),
+            current_round_output_start: Some(0),
+            accumulated_output: vec![web.clone()],
+            response_object: json!({"output": []}),
+            ..ResponsesState::default()
         };
 
-        assert_eq!(current_round_tool_call_admissions(&state, &[mcp], is_mcp), vec![true]);
-        assert_eq!(current_round_tool_call_admissions(&state, &[web], is_mcp), vec![false]);
+        assert_eq!(
+            consumed_builtin_tool_calls_before_current_round(&state),
+            0,
+            "the explicit zero boundary keeps the first streamed round current"
+        );
+        assert_eq!(
+            current_round_tool_call_admissions(&state, &[web]),
+            vec![true],
+            "the first streamed web call must receive the available slot"
+        );
+    }
+
+    #[test]
+    fn file_and_web_calls_share_one_model_order_admission() {
+        let file = json!({"type":"file_search_call", "id":"fs_first", "status":"searching"});
+        let web = json!({"type":"web_search_call", "id":"ws_second", "status":"in_progress"});
+        let assignment = FileSearchAssignment {
+            output_index: 0,
+            synthesis: SynthesisKind::Native,
+        };
+        let state = ResponsesState {
+            max_tool_calls: Some(1),
+            current_round_output_start: Some(0),
+            accumulated_output: vec![file, web.clone()],
+            response_object: json!({"output": []}),
+            ..ResponsesState::default()
+        };
+
+        assert_eq!(
+            current_round_file_search_admissions(&state, &[assignment]),
+            vec![true],
+            "the earlier file call must receive the only built-in slot"
+        );
+        assert_eq!(
+            current_round_tool_call_admissions(&state, &[web]),
+            vec![false],
+            "the later web call must be rejected after the file call"
+        );
     }
 
     #[test]
@@ -1056,7 +1236,7 @@ mod tests {
         let next = json!({"type":"web_search_call", "id":"ws_next", "status":"in_progress"});
         let state = ResponsesState {
             max_tool_calls: Some(1),
-            current_round_output_start: 1,
+            current_round_output_start: Some(1),
             accumulated_output: vec![
                 json!({"type":"web_search_call", "id":"ws_malformed", "status":"incomplete"}),
                 next.clone(),
@@ -1067,7 +1247,7 @@ mod tests {
 
         assert_eq!(consumed_builtin_tool_calls_before_current_round(&state), 1);
         assert_eq!(
-            current_round_tool_call_admissions(&state, &[next], |_| false),
+            current_round_tool_call_admissions(&state, &[next]),
             vec![false],
             "an admitted call stays charged even when local execution was incomplete"
         );
@@ -1075,23 +1255,22 @@ mod tests {
 
     #[test]
     fn current_provider_execution_does_not_double_charge_round_admission() {
-        let web = json!({"type":"web_search_call", "id":"ws_current", "status":"completed"});
-        let mcp = json!({
-            "type":"function_call", "call_id":"mcp_current",
-            "name":"utilities__weather", "status":"completed"
-        });
+        let web_first = json!({"type":"web_search_call", "id":"ws_current", "status":"completed"});
+        let web_second = json!({"type":"web_search_call", "id":"ws_second", "status":"completed"});
         let state = ResponsesState {
             max_tool_calls: Some(2),
+            current_round_output_start: Some(0),
             web_search_calls_executed: 1,
-            accumulated_output: vec![web.clone(), mcp.clone()],
-            response_object: json!({"output":[web, mcp.clone()]}),
+            accumulated_output: vec![web_first.clone(), web_second.clone()],
+            response_object: json!({"output":[web_first, web_second.clone()]}),
             ..ResponsesState::default()
         };
 
+        // The cumulative execution counter must not shrink the current-round
+        // budget: both built-in web calls fit under `max_tool_calls` even
+        // though one already ran this round.
         assert_eq!(
-            current_round_tool_call_admissions(&state, &[mcp], |item| {
-                item.get("name").and_then(serde_json::Value::as_str) == Some("utilities__weather")
-            }),
+            current_round_tool_call_admissions(&state, &[web_second]),
             vec![true],
             "the execution counter must not charge a current web call before ordered admission"
         );
@@ -1103,13 +1282,14 @@ mod tests {
         let second = json!({"type":"file_search_call", "id":"fs_reused", "status":"incomplete"});
         let state = ResponsesState {
             accumulated_output: vec![first.clone(), second.clone()],
-            // Echoes in another lifecycle owner must not add two more calls.
-            file_search_output_items: vec![first, second],
+            // Echoes in the current response owner must not add two more calls.
+            response_object: json!({"output": [first, second]}),
+            current_round_output_start: Some(2),
             ..ResponsesState::default()
         };
 
         assert_eq!(
-            consumed_builtin_tool_calls(&state),
+            consumed_builtin_tool_calls_before_current_round(&state),
             2,
             "same-ID calls from separate rounds remain separate budget occurrences"
         );
@@ -1127,26 +1307,22 @@ mod tests {
             "name":"utilities__ungated", "status":"completed"
         });
         let state = ResponsesState {
-            max_tool_calls: Some(3),
+            max_tool_calls: Some(1),
+            current_round_output_start: Some(0),
             accumulated_output: vec![
                 web.clone(),
                 gated.clone(),
                 ungated.clone(),
                 json!({"type":"mcp_approval_request", "id":"mcp_gated"}),
             ],
-            response_object: json!({"output":[web, gated, ungated.clone()]}),
+            response_object: json!({"output":[web.clone(), gated, ungated]}),
             ..ResponsesState::default()
         };
-        let is_mcp = |item: &serde_json::Value| {
-            item.get("name")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|name| name.starts_with("utilities__"))
-        };
 
-        assert_eq!(
-            current_round_tool_call_admissions(&state, &[ungated], is_mcp),
-            vec![true]
-        );
+        // Admission replays model output, so the locally appended approval item
+        // and the exempt MCP siblings never spend the single built-in slot the
+        // web search claims.
+        assert_eq!(current_round_tool_call_admissions(&state, &[web]), vec![true]);
     }
 
     #[test]
@@ -1159,6 +1335,7 @@ mod tests {
     #[test]
     #[expect(
         clippy::cognitive_complexity,
+        clippy::too_many_lines,
         reason = "exhaustive one-assert-per-field check of every default value"
     )]
     fn default_produces_expected_values() {
@@ -1183,12 +1360,17 @@ mod tests {
         assert!(state.tool_calls.is_empty());
         assert!(state.web_search_calls.is_empty());
         assert_eq!(state.web_search_calls_executed, 0);
+        assert!(
+            state.file_search_assignments.is_empty(),
+            "file-search assignments must start empty"
+        );
         assert_eq!(state.tool_choice, json!("auto"));
         assert!(state.tools.is_empty());
         assert!(state.usage.is_null());
         assert!(state.accumulated_output.is_empty());
         assert!(state.emitted_output_items.is_empty());
         assert!(state.locally_executed_output_items.is_empty());
+        assert!(state.dispatch_failure.is_none(), "dispatch failure must start unset");
     }
 
     #[test]
@@ -1254,6 +1436,37 @@ mod tests {
     }
 
     #[test]
+    fn drain_file_search_assignments_moves_and_empties() {
+        let mut state = ResponsesState::default();
+        state.file_search_assignments.push(FileSearchAssignment {
+            output_index: 2,
+            synthesis: SynthesisKind::Private,
+        });
+        state.file_search_assignments.push(FileSearchAssignment {
+            output_index: 5,
+            synthesis: SynthesisKind::Native,
+        });
+        let drained = state.drain_file_search_assignments();
+        assert_eq!(
+            drained,
+            vec![
+                FileSearchAssignment {
+                    output_index: 2,
+                    synthesis: SynthesisKind::Private,
+                },
+                FileSearchAssignment {
+                    output_index: 5,
+                    synthesis: SynthesisKind::Native,
+                },
+            ]
+        );
+        assert!(
+            state.file_search_assignments.is_empty(),
+            "drain must leave the queue empty (drain-once)"
+        );
+    }
+
+    #[test]
     fn builtin_tool_call_classifier_covers_shared_dispatch_budget_types() {
         for call_type in [
             "apply_patch_call",
@@ -1263,7 +1476,6 @@ mod tests {
             "file_search_call",
             "image_generation_call",
             "local_shell_call",
-            "mcp_call",
             "multi_agent_call",
             "shell_call",
             "tool_search_call",
@@ -1272,6 +1484,14 @@ mod tests {
             assert!(
                 is_builtin_tool_call(&json!({"type":call_type})),
                 "{call_type} must consume the shared built-in tool-call budget"
+            );
+        }
+        // MCP calls are exempt from the built-in `max_tool_calls` budget; the
+        // OpenAI Responses API keeps MCP tools on their own per-round limit.
+        for call_type in ["mcp_call", "mcp_approval_request", "mcp_list_tools"] {
+            assert!(
+                !is_builtin_tool_call(&json!({"type":call_type})),
+                "{call_type} must not consume the built-in tool-call budget"
             );
         }
         assert!(!is_builtin_tool_call(&json!({"type":"function_call"})));
@@ -1304,5 +1524,166 @@ mod tests {
             &json!({"type":"shell_call", "environment":{"type":"container_reference", "container_id":"cntr_1"}})
         ));
         assert!(!is_client_executed_tool_call(&json!({"type":"web_search_call"})));
+    }
+
+    #[test]
+    fn finalize_response_body_moves_accumulated_output_into_response_object() {
+        let mut state = ResponsesState {
+            response_object: json!({"object": "response", "id": "resp_1", "output": [{"type": "reasoning"}]}),
+            accumulated_output: vec![
+                json!({"type": "message", "role": "assistant", "content": "hi"}),
+                json!({"type": "function_call", "name": "f"}),
+            ],
+            ..ResponsesState::default()
+        };
+        let mut body = None;
+        state.finalize_response_body(&mut body).expect("finalize succeeds");
+
+        assert!(
+            state.accumulated_output.is_empty(),
+            "accumulated_output must be moved out, not cloned"
+        );
+        let output = state.response_object["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2, "the full accumulated output replaces the last round");
+        assert_eq!(output[0]["content"], "hi");
+        let body_json: serde_json::Value = serde_json::from_slice(&body.expect("body written")).unwrap();
+        assert_eq!(
+            body_json, state.response_object,
+            "body must serialize the finalized object"
+        );
+        assert_eq!(body_json["id"], "resp_1", "prior response metadata is preserved");
+    }
+
+    #[test]
+    fn finalize_response_body_preserves_output_when_accumulated_empty() {
+        // Empty-output guard: an empty accumulator must not overwrite the
+        // existing `response_object["output"]`.
+        let mut state = ResponsesState {
+            response_object: json!({"object": "response", "output": [{"type": "message", "content": "kept"}]}),
+            accumulated_output: Vec::new(),
+            ..ResponsesState::default()
+        };
+        let mut body = None;
+        state.finalize_response_body(&mut body).expect("finalize succeeds");
+
+        let output = state.response_object["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1, "empty accumulated_output must not overwrite output");
+        assert_eq!(output[0]["content"], "kept");
+        assert!(body.is_some(), "the response is still serialized to the body");
+    }
+
+    #[test]
+    fn finalize_response_body_stamps_accumulated_usage() {
+        let mut state = ResponsesState {
+            response_object: json!({"object": "response", "output": []}),
+            accumulated_output: vec![json!({"type": "message"})],
+            usage: json!({"input_tokens": 3, "output_tokens": 5}),
+            ..ResponsesState::default()
+        };
+        let mut body = None;
+        state.finalize_response_body(&mut body).expect("finalize succeeds");
+        assert_eq!(state.response_object["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn finalize_response_body_noop_when_response_object_absent() {
+        let mut state = ResponsesState {
+            response_object: serde_json::Value::Null,
+            accumulated_output: vec![json!({"type": "message"})],
+            ..ResponsesState::default()
+        };
+        let mut body = None;
+        state.finalize_response_body(&mut body).expect("finalize succeeds");
+        assert!(body.is_none(), "a null response_object leaves the body untouched");
+        assert_eq!(
+            state.accumulated_output.len(),
+            1,
+            "nothing is moved when there is nothing to finalize"
+        );
+    }
+
+    #[test]
+    fn finalize_response_body_skips_citation_annotation_without_citation_files() {
+        // The web/MCP-only path registers no citation files, so unconditional
+        // annotation is a strict no-op and any marker-like text survives verbatim.
+        let text = "see [ref:file-1]";
+        let mut state = ResponsesState {
+            response_object: json!({"object": "response", "output": []}),
+            accumulated_output: vec![json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            })],
+            ..ResponsesState::default()
+        };
+        assert!(
+            state.citation_files.is_empty(),
+            "the no-citation regression requires an empty citation map"
+        );
+        let mut body = None;
+        state.finalize_response_body(&mut body).expect("finalize succeeds");
+
+        let part = &state.response_object["output"][0]["content"][0];
+        assert_eq!(part["text"], text, "marker text is untouched without citation files");
+        assert!(part.get("annotations").is_none(), "no annotations are added");
+    }
+
+    #[test]
+    fn finalize_response_body_fails_closed_when_annotation_exceeds_budget() {
+        // More citation markers than the bounded rewriter admits (its private
+        // `MAX_CITATION_MARKERS` is 4096) must surface as an HTTP 502 rather than
+        // silently emitting an un-annotated body. The registered citation file
+        // deliberately does not match the marker id, so the *marker* budget is the
+        // binding constraint and each part only consumes one marker.
+        const OVER_MARKER_BUDGET: usize = 5_000;
+        let content: Vec<serde_json::Value> = (0..OVER_MARKER_BUDGET)
+            .map(|_| json!({"type": "output_text", "text": "x <|file-a|>"}))
+            .collect();
+        let mut state = ResponsesState {
+            response_object: json!({"object": "response", "output": []}),
+            accumulated_output: vec![json!({
+                "type": "message",
+                "role": "assistant",
+                "content": content,
+            })],
+            citation_files: HashMap::from([("file-known".to_owned(), "known.txt".to_owned())]),
+            ..ResponsesState::default()
+        };
+        let mut body = None;
+        let FilterAction::Reject(rejection) = state
+            .finalize_response_body(&mut body)
+            .expect_err("annotation-budget overflow must fail closed")
+        else {
+            panic!("finalize must reject, not continue");
+        };
+        assert_eq!(rejection.status, 502, "annotation failure returns a server error");
+        assert!(body.is_none(), "no body is written on a finalize failure");
+    }
+
+    #[test]
+    fn finalize_response_body_fails_closed_when_output_exceeds_byte_limit() {
+        // A finalized response larger than `MAX_JSON_BODY_BYTES` must fail closed
+        // with an HTTP 502 instead of serializing an over-limit body. The oversized
+        // text carries no citation markers and no citation files are registered, so
+        // annotation is a no-op and the byte-limit guard is what rejects.
+        let oversized = "x".repeat(MAX_JSON_BODY_BYTES + 1);
+        let mut state = ResponsesState {
+            response_object: json!({"object": "response", "output": []}),
+            accumulated_output: vec![json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": oversized}],
+            })],
+            ..ResponsesState::default()
+        };
+        let mut body = None;
+        let FilterAction::Reject(rejection) = state
+            .finalize_response_body(&mut body)
+            .expect_err("over-limit response must fail closed")
+        else {
+            panic!("finalize must reject, not continue");
+        };
+        assert_eq!(rejection.status, 502, "size overflow returns a server error");
+        assert!(body.is_none(), "no body is written on a finalize failure");
     }
 }

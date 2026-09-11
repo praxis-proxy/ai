@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use super::super::state::ResponsesState;
 use crate::{
-    openai::responses::state::McpApprovalState,
+    openai::responses::state::{DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind},
     test_utils::{make_filter_context, make_request},
 };
 
@@ -616,7 +616,7 @@ fn streamed_web_search_call_is_available_to_dispatch_filter() {
 }
 
 #[test]
-fn multiple_streamed_client_function_calls_remain_dispatchable() {
+fn multiple_streamed_client_function_calls_end_done() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -637,12 +637,15 @@ fn multiple_streamed_client_function_calls_remain_dispatchable() {
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "a streamed batch must remain available to its owning dispatch filter"
+        "a streamed round of client calls completes like any other stream"
     );
-    assert_action(&ctx, "loop");
+    // Client `function_call`s resolve to no local dispatcher, so the owner ends
+    // the loop and returns the calls to the client rather than looping to the
+    // iteration cap (issue #1046 §3.4).
+    assert_action(&ctx, "done");
     assert!(
         ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.len() == 2,
-        "both streamed calls must remain available"
+        "both client calls must remain visible for the client to execute"
     );
     assert_eq!(ctx.get_metadata("responses.stream_error_code"), None);
 }
@@ -698,10 +701,15 @@ fn streaming_iteration_limit_ends_with_sse_error() {
         "stream": true
     }));
     state.iteration = 1;
+    // A dispatchable MCP call so the round would loop but for the iteration cap.
+    state.mcp_tool_map.insert(
+        ("server".to_owned(), "lookup".to_owned()),
+        json!({"server_label": "server", "server_url": "http://example.com", "require_approval": "never"}),
+    );
     state.tool_calls = vec![json!({
         "type": "function_call",
         "call_id": "call_limit",
-        "name": "must_not_run",
+        "name": "server__lookup",
         "status": "completed"
     })];
     state.response_object = json!({"id": "resp_limit", "object": "response", "status": "completed", "output": []});
@@ -762,6 +770,104 @@ fn state_survives_done_path() {
 }
 
 #[test]
+fn buffered_terminal_rewrite_clears_stale_representation_headers() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut response = crate::test_utils::make_response();
+    for (name, value) in [
+        (http::header::CONTENT_ENCODING, "gzip"),
+        (http::header::CONTENT_LENGTH, "123"),
+        (http::header::CONTENT_RANGE, "bytes 0-122/123"),
+        (http::header::ETAG, "\"upstream\""),
+        (http::header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT"),
+    ] {
+        response.headers.insert(name, value.parse().unwrap());
+    }
+    let mut ctx = make_filter_context(&req);
+    ctx.response_header = Some(&mut response);
+    ctx.extensions.insert(ResponsesState::default());
+    let response_body = json!({
+        "id":"resp_headers",
+        "object":"response",
+        "status":"completed",
+        "output":[]
+    });
+    let mut body = Some(Bytes::from(response_body.to_string()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a buffered terminal response should continue after finalization"
+    );
+    assert!(
+        ctx.response_headers_modified,
+        "rewriting the buffered representation must signal header mutation"
+    );
+    for name in [
+        http::header::CONTENT_ENCODING,
+        http::header::CONTENT_LENGTH,
+        http::header::CONTENT_RANGE,
+        http::header::ETAG,
+        http::header::LAST_MODIFIED,
+    ] {
+        assert!(
+            ctx.response_header
+                .as_ref()
+                .is_some_and(|response| !response.headers.contains_key(&name)),
+            "rewritten response retained stale representation header {name}"
+        );
+    }
+}
+
+#[test]
+fn buffered_parse_failure_preserves_body_and_representation_headers() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut response = crate::test_utils::make_response();
+    for (name, value) in [
+        (http::header::CONTENT_ENCODING, "gzip"),
+        (http::header::CONTENT_LENGTH, "5"),
+        (http::header::CONTENT_RANGE, "bytes 0-4/5"),
+        (http::header::ETAG, "\"upstream\""),
+        (http::header::LAST_MODIFIED, "Wed, 21 Oct 2015 07:28:00 GMT"),
+    ] {
+        response.headers.insert(name, value.parse().unwrap());
+    }
+    let mut ctx = make_filter_context(&req);
+    ctx.response_header = Some(&mut response);
+    ctx.extensions.insert(ResponsesState::default());
+    let original = Bytes::from_static(b"opaque upstream bytes");
+    let mut body = Some(original.clone());
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an unrecognized buffered response should pass through"
+    );
+    assert_eq!(body, Some(original), "passthrough must preserve the upstream body");
+    assert!(
+        !ctx.response_headers_modified,
+        "passthrough must not report a representation-header rewrite"
+    );
+    for name in [
+        http::header::CONTENT_ENCODING,
+        http::header::CONTENT_LENGTH,
+        http::header::CONTENT_RANGE,
+        http::header::ETAG,
+        http::header::LAST_MODIFIED,
+    ] {
+        assert!(
+            ctx.response_header
+                .as_ref()
+                .is_some_and(|response| response.headers.contains_key(&name)),
+            "passthrough removed upstream representation header {name}"
+        );
+    }
+}
+
+#[test]
 fn non_end_of_stream_passes_through() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
@@ -792,12 +898,7 @@ fn tool_calls_set_loop() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
 
-    let state = make_state_with_tool_calls(vec![json!({
-        "type": "function",
-        "call_id": "call_1",
-        "name": "get_weather",
-        "arguments": "{}",
-    })]);
+    let state = make_state_with_mcp_tool_calls(vec![mcp_tool_call("call_1")]);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -809,21 +910,57 @@ fn tool_calls_set_loop() {
 }
 
 #[test]
-fn any_tool_type_sets_loop() {
-    for tool_type in ["function", "mcp", "web_search", "file_search", "custom_tool"] {
+fn any_dispatchable_call_type_sets_loop() {
+    // An MCP `function_call`, a hosted `web_search_call`, and a hosted
+    // `file_search_call` each resolve to a local dispatcher, so any one of them
+    // must signal `loop`. Client (non-MCP) `function_call`s are covered by the
+    // done-path tests: they resolve to no dispatcher and must not loop.
+    let mcp = make_state_with_mcp_tool_calls(vec![mcp_tool_call("call_1")]);
+
+    let mut web = make_state_with_tool_calls(vec![]);
+    web.web_search_calls = vec![json!({"type": "web_search_call", "id": "ws_1", "status": "completed"})];
+
+    // A pending hosted file_search_call is recorded by the parse owner as a
+    // `FileSearchAssignment` (issue #1046), so drive it through the response
+    // object the owner drains rather than a removed state vector.
+    let mut file = make_state_with_tool_calls(vec![]);
+    file.response_object = json!({
+        "object": "response",
+        "status": "completed",
+        "output": [{"type": "file_search_call", "id": "fs_1", "status": "searching"}],
+    });
+
+    for state in [mcp, web, file] {
         let filter = make_filter();
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = make_filter_context(&req);
-
-        let state = make_state_with_tool_calls(vec![json!({
-            "type": tool_type,
-            "call_id": "call_1",
-        })]);
         ctx.extensions.insert(state);
 
         drop(filter.on_response_body(&mut ctx, &mut None, true).unwrap());
         assert_action(&ctx, "loop");
     }
+}
+
+#[test]
+fn completed_file_search_call_sets_done() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    // A completed file_search_call is already terminal: the parse owner records
+    // no `FileSearchAssignment` for it, so `has_dispatchable_calls` exits the loop
+    // (issue #1046).
+    let mut state = make_state_with_tool_calls(vec![]);
+    state.response_object = json!({
+        "id":"resp_1", "object":"response", "status":"completed",
+        "output": [{"type": "file_search_call", "id": "fs_1", "status": "completed"}]
+    });
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_action(&ctx, "done");
+    assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().iteration, 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -836,11 +973,7 @@ fn default_config_has_max_infer_iters_ten() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
 
-    let mut state = make_state_with_tool_calls(vec![json!({
-        "type": "function",
-        "call_id": "call_1",
-        "name": "test",
-    })]);
+    let mut state = make_state_with_mcp_tool_calls(vec![mcp_tool_call("call_1")]);
     state.iteration = 9;
     ctx.extensions.insert(state);
 
@@ -849,7 +982,7 @@ fn default_config_has_max_infer_iters_ten() {
 
     let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
     assert_eq!(state.iteration, 10, "iteration should have incremented to 10");
-    state.tool_calls = vec![json!({"type": "function", "call_id": "call_2", "name": "test"})];
+    state.tool_calls = vec![mcp_tool_call("call_2")];
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -870,11 +1003,7 @@ fn max_infer_iters_one_allows_exactly_one_loop() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
 
-    let state = make_state_with_tool_calls(vec![json!({
-        "type": "function",
-        "call_id": "call_1",
-        "name": "test",
-    })]);
+    let state = make_state_with_mcp_tool_calls(vec![mcp_tool_call("call_1")]);
     ctx.extensions.insert(state);
 
     drop(filter.on_response_body(&mut ctx, &mut None, true).unwrap());
@@ -883,7 +1012,7 @@ fn max_infer_iters_one_allows_exactly_one_loop() {
     let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
     assert_eq!(state.iteration, 1, "should have incremented to 1");
 
-    state.tool_calls = vec![json!({"type": "function", "call_id": "call_2", "name": "test"})];
+    state.tool_calls = vec![mcp_tool_call("call_2")];
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -900,11 +1029,7 @@ fn iteration_limit_returns_508_error() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
 
-    let mut state = make_state_with_tool_calls(vec![json!({
-        "type": "function",
-        "call_id": "call_1",
-        "name": "test",
-    })]);
+    let mut state = make_state_with_mcp_tool_calls(vec![mcp_tool_call("call_1")]);
     state.iteration = 2;
     ctx.extensions.insert(state);
 
@@ -962,6 +1087,9 @@ fn multiple_client_function_calls_are_preserved() {
         matches!(&action, FilterAction::Continue),
         "multiple client function calls should be returned without rejection"
     );
+    // Both calls are client-owned (no MCP tool map), so the loop ends and
+    // returns them to the client rather than looping (issue #1046 §3.4).
+    assert_action(&ctx, "done");
     assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.len(), 2);
 }
 
@@ -1045,7 +1173,12 @@ fn all_client_executed_call_types_conflict_with_mcp_dispatch() {
             ("server".to_owned(), "lookup".to_owned()),
             json!({"server_label":"server", "server_url":"http://example.com"}),
         );
-        state.response_object = json!({"output":[client_call.clone()]});
+        // The owner scans this round's accumulated output (the parse owner drains
+        // the streamed round out of `response_object` before the check runs), so
+        // the client-owned call must sit in `accumulated_output` from index
+        // the explicit `current_round_output_start` onward.
+        state.accumulated_output = vec![client_call.clone()];
+        state.current_round_output_start = Some(0);
 
         assert!(
             super::has_mixed_function_call_ownership(&state),
@@ -1063,12 +1196,19 @@ fn hosted_container_shell_call_does_not_conflict_with_mcp_dispatch() {
         ("server".to_owned(), "lookup".to_owned()),
         json!({"server_label":"server", "server_url":"http://example.com"}),
     );
-    state.response_object = json!({"output":[{
+    // A container-referenced shell_call is hosted, not client-executed, so even
+    // in this round's accumulated output it must not trip the mixed-ownership
+    // guard.
+    state.accumulated_output = vec![json!({
         "type":"shell_call", "call_id":"c2",
         "environment":{"type":"container_reference", "container_id":"cntr_1"}
-    }]});
+    })];
+    state.current_round_output_start = Some(0);
 
-    assert!(!super::has_mixed_function_call_ownership(&state));
+    assert!(
+        !super::has_mixed_function_call_ownership(&state),
+        "a hosted container shell call must remain server-owned"
+    );
 }
 
 #[test]
@@ -1255,11 +1395,7 @@ fn iteration_incremented_on_loop() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
 
-    let state = make_state_with_tool_calls(vec![json!({
-        "type": "function",
-        "call_id": "call_1",
-        "name": "test",
-    })]);
+    let state = make_state_with_mcp_tool_calls(vec![mcp_tool_call("call_1")]);
     ctx.extensions.insert(state);
 
     drop(filter.on_response_body(&mut ctx, &mut None, true).unwrap());
@@ -1328,7 +1464,9 @@ fn extracts_tool_calls_from_non_streaming_body() {
     let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
 
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
-    assert_action(&ctx, "loop");
+    // The call is extracted regardless of ownership; being client-owned it ends
+    // the loop as `done` rather than looping (issue #1046 §3.4).
+    assert_action(&ctx, "done");
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.tool_calls.len(), 1);
@@ -1486,7 +1624,8 @@ fn accumulates_usage_across_rounds() {
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
 
-    let state = make_state_with_tool_calls(vec![]);
+    // A dispatchable MCP call so round 1 loops and usage carries into round 2.
+    let state = make_state_with_mcp_tool_calls(vec![]);
     ctx.extensions.insert(state);
 
     let round1 = json!({
@@ -1496,7 +1635,7 @@ fn accumulates_usage_across_rounds() {
             "type": "function_call",
             "id": "fc_1",
             "call_id": "call_1",
-            "name": "get_weather",
+            "name": "server__lookup",
             "arguments": "{}",
             "status": "completed"
         }],
@@ -1692,6 +1831,32 @@ fn mixed_client_function_and_web_search_calls_fail_before_dispatch() {
 }
 
 #[test]
+fn mixed_client_function_and_pending_file_search_fail_before_dispatch() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(make_state_with_tool_calls(vec![]));
+    let response_body = json!({
+        "id":"resp_1", "object":"response", "status":"completed",
+        "output":[
+            {
+                "type":"function_call", "id":"fc_1", "call_id":"call_1",
+                "name":"get_weather", "arguments":"{}", "status":"completed"
+            },
+            {"type":"file_search_call", "id":"fs_1", "status":"searching"}
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(
+        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 502),
+        "mixed client/file-search ownership must fail before local side effects"
+    );
+}
+
+#[test]
 fn web_search_call_subject_to_iteration_limit() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 2").unwrap();
     let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
@@ -1878,7 +2043,10 @@ fn status_less_function_call_is_collected() {
         1,
         "Status-less function call should be extracted to tool_calls"
     );
-    assert_eq!(action, "loop", "Agentic loop action should be 'loop'");
+    assert_eq!(
+        action, "done",
+        "an unresolved client-owned function call must be returned without a server loop"
+    );
 }
 
 #[test]
@@ -1918,7 +2086,10 @@ fn status_null_function_call_is_collected() {
         1,
         "Function call with null status should be extracted to tool_calls"
     );
-    assert_eq!(action, "loop", "Agentic loop action should be 'loop'");
+    assert_eq!(
+        action, "done",
+        "an unresolved client-owned function call must be returned without a server loop"
+    );
 }
 
 #[test]
@@ -1967,6 +2138,265 @@ fn malformed_function_call_status_is_ignored() {
 }
 
 // -----------------------------------------------------------------------------
+// on_response_body: Cross-Dispatcher Ordering (#1046)
+// -----------------------------------------------------------------------------
+
+/// Boundary test 4: one model round emitting a `web_search_call`, a private
+/// `function_call(name=file_search)`, and an MCP `function_call`, in that order,
+/// is parsed by the sole owner so that `accumulated_output` preserves the model's
+/// ordering while each dispatcher's target is recorded against the correct
+/// absolute index. Proves model output ordering survives all three dispatchers.
+#[test]
+fn model_output_ordering_survives_all_three_dispatchers() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    // A configured hosted file-search tool so the owner normalizes the private
+    // `function_call(name=file_search)` into a canonical `file_search_call`.
+    let mut state = make_state_with_mcp_tool_calls(vec![]);
+    state.tools = vec![json!({"type": "file_search", "vector_store_ids": ["vs_1"]})];
+    ctx.extensions.insert(state);
+
+    let response_body = json!({
+        "id": "resp_ordering",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+            {
+                "type": "function_call",
+                "id": "fc_fs",
+                "call_id": "call_fs",
+                "name": "file_search",
+                "arguments": "{\"query\": \"quarterly revenue\"}",
+                "status": "completed"
+            },
+            {
+                "type": "function_call",
+                "id": "fc_mcp",
+                "call_id": "call_mcp",
+                "name": "server__lookup",
+                "arguments": "{}",
+                "status": "completed"
+            }
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a round with dispatchable calls continues into request re-entry"
+    );
+    // Every dispatcher has work, so the sole owner signals one continuation.
+    assert_action(&ctx, "loop");
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+
+    // Accumulator preserves the model's emission order verbatim.
+    assert_eq!(state.accumulated_output.len(), 3);
+    assert_eq!(state.accumulated_output[0]["type"], "web_search_call");
+    assert_eq!(state.accumulated_output[0]["id"], "ws_1");
+    // The private function_call was normalized in place, keeping its position.
+    assert_eq!(state.accumulated_output[1]["type"], "file_search_call");
+    assert_eq!(state.accumulated_output[1]["id"], "fc_fs");
+    assert_eq!(state.accumulated_output[1]["status"], "searching");
+    assert_eq!(state.accumulated_output[1]["queries"][0], "quarterly revenue");
+    assert_eq!(state.accumulated_output[2]["type"], "function_call");
+    assert_eq!(state.accumulated_output[2]["id"], "fc_mcp");
+
+    // Each dispatcher's target is recorded against its absolute index.
+    assert_eq!(state.web_search_calls.len(), 1, "web_search dispatcher target recorded");
+    assert_eq!(state.web_search_calls[0]["id"], "ws_1");
+    assert_eq!(
+        state.file_search_assignments.len(),
+        1,
+        "file_search dispatcher target recorded"
+    );
+    assert_eq!(
+        state.file_search_assignments[0].output_index, 1,
+        "file_search assignment points at its absolute accumulator index"
+    );
+    assert_eq!(
+        state.file_search_assignments[0].synthesis,
+        SynthesisKind::Private,
+        "a normalized private call records the private synthesis origin"
+    );
+    assert_eq!(state.tool_calls.len(), 1, "MCP dispatcher target recorded");
+    assert_eq!(state.tool_calls[0]["name"], "server__lookup");
+}
+
+/// Regression (#955): the sole owner stamps a stable synthetic id on every
+/// id-less output item before accumulation, so the public response never ships an
+/// item without an id. A private `function_call(name=file_search)` that arrives
+/// without an id keeps a durable identity derived from its `call_id`.
+#[test]
+fn owner_assigns_ids_to_id_less_output_items() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    // A configured hosted file-search tool so the owner normalizes the private
+    // `function_call(name=file_search)` into a canonical `file_search_call`.
+    let mut state = make_state_with_mcp_tool_calls(vec![]);
+    state.tools = vec![json!({"type": "file_search", "vector_store_ids": ["vs_1"]})];
+    ctx.extensions.insert(state);
+
+    let response_body = json!({
+        "id": "resp_idless",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {"type": "reasoning", "summary": []},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "answer"}]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_fs",
+                "name": "file_search",
+                "arguments": "{\"query\": \"revenue\"}",
+                "status": "completed"
+            }
+        ]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
+
+    let _action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+
+    assert_eq!(state.accumulated_output.len(), 3);
+    assert!(
+        state.accumulated_output[0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("rs_")),
+        "id-less reasoning item receives a synthetic rs_ id, got: {:?}",
+        state.accumulated_output[0]["id"]
+    );
+    assert!(
+        state.accumulated_output[1]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_")),
+        "id-less message item receives a synthetic msg_ id, got: {:?}",
+        state.accumulated_output[1]["id"]
+    );
+    // The normalized file-search call keeps a durable id derived from its call_id.
+    assert_eq!(
+        state.accumulated_output[2]["type"], "file_search_call",
+        "the private function_call was normalized in place"
+    );
+    assert_eq!(
+        state.accumulated_output[2]["id"], "fs_call_fs",
+        "a normalized id-less file-search call keeps an id derived from its call_id"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// on_request_body: Dispatch Failure Conversion (#1046)
+// -----------------------------------------------------------------------------
+
+/// Boundary test 7 (buffered): a request-phase dispatcher's recorded
+/// [`DispatchFailure`] is converted by the sole owner, before the next inference
+/// request, into a buffered JSON rejection carrying the dispatcher's status/code
+/// and clearing this round's dispatch bookkeeping. A `Reject` here short-circuits
+/// the IRR before any further backend call.
+#[tokio::test]
+async fn dispatch_failure_buffered_rejects_with_json_envelope() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "test"}));
+    // Stale per-round bookkeeping the conversion must drop.
+    state.tool_calls = vec![json!({"type": "function_call", "name": "server__lookup", "status": "completed"})];
+    state.web_search_calls = vec![json!({"type": "web_search_call", "id": "ws_1"})];
+    state.file_search_assignments = vec![FileSearchAssignment {
+        output_index: 0,
+        synthesis: SynthesisKind::Native,
+    }];
+    state.dispatch_failure = Some(DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "vector store search failed".to_owned(),
+    });
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    let FilterAction::Reject(response) = action else {
+        panic!("a recorded dispatch failure must reject before the next inference call");
+    };
+    assert_eq!(response.status, 502);
+    let body: Value = serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "server_error");
+    assert_eq!(body["error"]["message"], "vector store search failed");
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.tool_calls.is_empty(), "dispatch failure clears stale tool_calls");
+    assert!(
+        state.web_search_calls.is_empty(),
+        "dispatch failure clears stale web_search_calls"
+    );
+    assert!(
+        state.file_search_assignments.is_empty(),
+        "dispatch failure clears stale file_search assignments"
+    );
+}
+
+/// Boundary test 7 (streaming): once `text/event-stream` is committed, the owner
+/// converts a recorded [`DispatchFailure`] into a terminal SSE `error` frame on
+/// the live logical stream (never a JSON envelope) and suppresses persistence of
+/// the failed round. The `Reject` still short-circuits before the next inference
+/// call.
+#[tokio::test]
+async fn dispatch_failure_streaming_emits_sse_error_frame() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "stream": true
+    }));
+    state.dispatch_failure = Some(DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "vector store search failed".to_owned(),
+    });
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    let FilterAction::Reject(response) = action else {
+        panic!("a committed stream must terminate through an SSE error reject");
+    };
+    assert_eq!(response.status, 200, "a committed stream keeps its 200 status");
+    let content_type = response.headers.iter().find(|(k, _)| k == "content-type");
+    assert_eq!(content_type.map(|(_, v)| v.as_str()), Some("text/event-stream"));
+    let body = String::from_utf8(response.body.as_ref().unwrap().to_vec()).unwrap();
+    assert!(body.contains("event: error"), "terminal frame is an SSE error: {body}");
+    assert!(
+        body.contains("vector store search failed"),
+        "SSE error carries the dispatcher message: {body}"
+    );
+    assert!(
+        !body.contains("[DONE]"),
+        "an SSE error frame terminates the stream without a [DONE] sentinel: {body}"
+    );
+    assert_eq!(ctx.filter_results["openai_agentic_loop"].get("action"), Some("done"));
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "the failed streamed round must not be persisted"
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
@@ -1978,6 +2408,33 @@ fn make_state_with_tool_calls(tool_calls: Vec<Value>) -> ResponsesState {
     let body = json!({"model": "gpt-4o", "input": "test"});
     let mut state = ResponsesState::from_request_body(body);
     state.tool_calls = tool_calls;
+    state
+}
+
+/// A completed `function_call` whose encoded name (`server__lookup`) resolves to
+/// the MCP tool registered by [`make_state_with_mcp_tool_calls`], so the owner
+/// classifies it as a dispatchable server-owned call and signals `loop`.
+fn mcp_tool_call(call_id: &str) -> Value {
+    json!({
+        "type": "function_call",
+        "call_id": call_id,
+        "name": "server__lookup",
+        "arguments": "{}",
+        "status": "completed",
+    })
+}
+
+/// State carrying dispatchable MCP tool calls: the given calls plus a one-entry
+/// `mcp_tool_map` so `server__lookup` resolves under an auto-approval policy.
+///
+/// Client (non-MCP) `function_call`s resolve to no dispatcher and signal `done`;
+/// tests that need the loop to continue must drive it with a dispatchable call.
+fn make_state_with_mcp_tool_calls(tool_calls: Vec<Value>) -> ResponsesState {
+    let mut state = make_state_with_tool_calls(tool_calls);
+    state.mcp_tool_map.insert(
+        ("server".to_owned(), "lookup".to_owned()),
+        json!({"server_label": "server", "server_url": "http://example.com", "require_approval": "never"}),
+    );
     state
 }
 

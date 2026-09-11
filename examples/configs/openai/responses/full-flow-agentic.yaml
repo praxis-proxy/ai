@@ -7,14 +7,13 @@
 # context back for a second model inference before returning the
 # final Responses API object.
 #
-# This config does NOT support streaming or WebSocket in the agentic
-# loop: openai_file_search_callout shares its IRR step with
-# openai_agentic_loop, which fully buffers each model response. For
-# streaming without hosted file_search, see full-flow.yaml. For
-# streaming hosted file_search (without the agentic loop), see
-# file-search-streaming.yaml. file_search_callout cannot share an IRR
-# step with openai_agentic_loop due to competing accumulated_output
-# ownership.
+# This config buffers each model response (no streaming): the step has
+# no openai_stream_events arm, so openai_agentic_loop fails closed on an
+# effective stream:true request rather than pass an unsupervised stream.
+# For streaming hosted file_search, see file-search-streaming.yaml,
+# which arms the logical stream. openai_agentic_loop is the sole loop
+# owner; openai_file_search_callout is a request-phase dispatcher that
+# executes the owner's file-search assignments (#1046).
 #
 # Pre-IRR filters run once on the client request to set up shared
 # state (ResponsesState) which persists across all IRR iterations
@@ -41,11 +40,13 @@
 # IRR inference filter chain (all routing lives inside the IRR step
 # because the IRR must be the terminal filter in the chain):
 #   Request phase (forward):
-#     openai_file_search_callout → openai_responses_proxy
-#       → headers → router → load_balancer
+#     openai_file_search_callout → openai_agentic_loop
+#       → openai_responses_proxy → headers → router → load_balancer
 #   Response phase (reverse):
 #     load_balancer → router → headers → openai_responses_proxy
-#       → openai_file_search_callout
+#       → openai_agentic_loop
+#   openai_file_search_callout has no response phase: it dispatches the
+#   owner's assigned file-search calls at request-body EOS on re-entry.
 #
 # Only Responses API traffic (/v1/responses) is routed by this
 # config. Non-Responses paths (/v1/prompts, /v1/embeddings, etc.)
@@ -53,8 +54,8 @@
 # non-Responses traffic, see full-flow.yaml (without IRR).
 #
 # Transition rules (evaluated after each step's response-body):
-#   openai_file_search_callout.pending = "true" → next: inference
-#   default                                     → done (exit to client)
+#   openai_agentic_loop.action = "loop" → next: inference
+#   default                             → done (exit to client)
 #
 # Model responses that combine file_search_call with a client-executed
 # function_call are rejected until cross-request continuation state
@@ -149,6 +150,11 @@ filter_chains:
         steps:
           - name: inference
             filters:
+              # Request-phase dispatcher: at request-body EOS on each IRR
+              # re-entry it executes the file_search_call items the loop owner
+              # assigned in the prior response, reconciling each in place inside
+              # ResponsesState.accumulated_output. It never parses the response
+              # body and never decides whether another round runs.
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:3002
                 allow_private_url: true
@@ -159,6 +165,12 @@ filter_chains:
                 on_failure: closed
                 forward_headers:
                   - authorization
+              # Sole loop owner: parses each model response, records file-search
+              # assignments for the dispatcher, and publishes the single
+              # continuation signal (action=loop|done). max_infer_iters must stay
+              # below the IRR max_iterations safety cap (7 + 1 = 8).
+              - filter: openai_agentic_loop
+                max_infer_iters: 7
               - filter: openai_responses_proxy
                 name: inference
               - filter: headers
@@ -175,9 +187,9 @@ filter_chains:
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:
-              - filter: openai_file_search_callout
-                key: pending
-                value: "true"
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
                 next: inference
               - default: true
                 done: true

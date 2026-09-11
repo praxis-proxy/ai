@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    ProxyGuard, free_port, http_send, json_post, parse_body, parse_status, patch_yaml, start_backend_with_shutdown,
-    start_capturing_backend, start_proxy, start_stateful_backend,
+    ProxyGuard, free_port, http_send, json_post, parse_body, parse_header, parse_status, patch_yaml,
+    start_backend_with_shutdown, start_capturing_backend, start_proxy, start_stateful_backend,
 };
 use serde_json::{Value, json};
 
@@ -222,16 +222,32 @@ fn file_search_callout_example_without_tools_passthrough() {
 
     assert_eq!(parse_status(&raw), 200, "request failed: {raw}");
     assert_eq!(parse_body(&raw), response, "request should reach inference backend");
+    // #1046 boundary test 2: with no file-search tool the dispatcher records no
+    // assignment, so it must leave the upstream response bytes AND headers
+    // untouched. The body equality above covers the bytes; assert the upstream
+    // `Server` header survives and the `Content-Length` still matches the
+    // original body — the dispatcher neither strips headers nor rewrites the body.
+    assert_eq!(
+        parse_header(&raw, "server").as_deref(),
+        Some("praxis-test-backend"),
+        "no assignment must pass upstream response headers through untouched: {raw}"
+    );
+    assert_eq!(
+        parse_header(&raw, "content-length").as_deref(),
+        Some(response.len().to_string().as_str()),
+        "no assignment must not rewrite the body or restate its Content-Length: {raw}"
+    );
 }
 
-// #313 §7.1: the buffered file-search-callout example fails closed on `stream:true`.
-// The old `unsupported_streaming_rejection` (400) was removed; the proxy now auto-derives
-// the streaming transport from the client's `stream:true`, so `openai_file_search_callout`
-// runs in a Streaming subrequest mode. Because this buffered pipeline has no
-// `openai_stream_events` ahead of the callout, the logical stream is never armed, and the
-// on_request streaming-arm guard fails closed with a 500 rather than silently passing an
-// unsupervised stream through. Streaming file_search lives in the separate
-// file-search-streaming example, which arms the logical stream.
+// #313 §7.1 / #1046: the buffered file-search-callout example fails closed on
+// `stream:true`. The proxy auto-derives the streaming transport from the
+// client's `stream:true`, so `openai_responses_proxy` runs a Streaming
+// sub-request. Because this buffered pipeline has no `openai_stream_events` in
+// the step, a loop-terminal error could not reach the client after the stream
+// commits, so the loop owner (`openai_agentic_loop`) fails closed with a 500
+// before any backend request rather than pass an unsupervised stream through.
+// Streaming file_search lives in the separate file-search-streaming example,
+// which arms the logical stream.
 #[test]
 fn file_search_callout_example_fails_closed_on_unarmed_streaming() {
     let response = r#"{"id":"resp_789","object":"response","output":[{"id":"msg_789","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Hi","annotations":[]}]}]}"#;
@@ -249,7 +265,7 @@ fn file_search_callout_example_fails_closed_on_unarmed_streaming() {
         "buffered example fails closed on unarmed streaming (§7.1): {raw}"
     );
     assert!(
-        parse_body(&raw).contains("logical stream not armed by openai_stream_events"),
+        parse_body(&raw).contains("requires openai_stream_events in the same step"),
         "rejection should explain the missing openai_stream_events arm: {raw}"
     );
 }
@@ -304,7 +320,7 @@ fn file_search_callout_example_rejects_parallel_client_function_call() {
     assert!(
         response["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("cannot combine")),
+            .is_some_and(|message| message.contains("mixed server-owned and client-owned tool calls")),
         "rejection should explain the unsupported combination: {response}"
     );
     let inference_calls = model

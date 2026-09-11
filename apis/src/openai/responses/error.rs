@@ -35,16 +35,6 @@ fn responses_error_body_with_code(error_type: &str, code: &str, message: &str) -
     )
 }
 
-/// Build the SSE `error` event frame at a logical-stream sequence number.
-///
-/// Produces `event: error\ndata: <ResponseErrorEvent json>\n\n`. Used by
-/// dispatch filters that finalize an already-committed stream directly, without
-/// a downstream `stream_events` finalizer.
-pub(crate) fn responses_error_sse_body_at_sequence(code: &str, message: &str, sequence_number: u64) -> Bytes {
-    let json = responses_error_sse_payload_at_sequence(code, message, sequence_number);
-    Bytes::from(format!("event: error\ndata: {json}\n\n"))
-}
-
 /// Build the JSON payload for a Responses API SSE `error` event.
 ///
 /// Matches the pinned OpenAI `ResponseErrorEvent` schema: `type` (always
@@ -187,46 +177,6 @@ mod tests {
                 .collect(),
             "payload must contain only the schema-defined top-level fields"
         );
-    }
-
-    #[test]
-    fn sse_body_contains_valid_json() {
-        let body = responses_error_sse_body_at_sequence("invalid_request_error", "missing field", 0);
-        let text = std::str::from_utf8(&body).unwrap();
-
-        let data_line = text
-            .lines()
-            .find(|l| l.starts_with("data: "))
-            .unwrap()
-            .strip_prefix("data: ")
-            .unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(data_line).unwrap();
-
-        assert_eq!(parsed["type"], "error", "SSE event type should be error");
-        assert_eq!(parsed["sequence_number"], 0, "SSE error should include sequence number");
-        assert_eq!(
-            parsed["code"], "invalid_request_error",
-            "SSE error code should be a top-level field"
-        );
-        assert_eq!(
-            parsed["message"], "missing field",
-            "SSE error message should be a top-level field"
-        );
-        assert!(parsed["param"].is_null(), "SSE error param should be a top-level null");
-        assert!(
-            parsed.get("error").is_none(),
-            "an SSE error event must not nest fields under an \"error\" object"
-        );
-    }
-
-    #[test]
-    fn sse_body_preserves_logical_sequence() {
-        let body = responses_error_sse_body_at_sequence("server_error", "oops", 7);
-        let text = std::str::from_utf8(&body).unwrap();
-        let data = text.lines().find_map(|line| line.strip_prefix("data: ")).unwrap();
-        let payload: serde_json::Value = serde_json::from_str(data).unwrap();
-
-        assert_eq!(payload["sequence_number"], 7);
     }
 
     #[test]
