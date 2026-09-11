@@ -54,32 +54,11 @@ impl TempWorkspace {
             fs::set_permissions(&verify_path, perms)?;
         }
 
-        drop(Command::new("git").arg("init").current_dir(dir.path()).status());
-        drop(
-            Command::new("git")
-                .arg("config")
-                .arg("user.name")
-                .arg("Test")
-                .current_dir(dir.path())
-                .status(),
-        );
-        drop(
-            Command::new("git")
-                .arg("config")
-                .arg("user.email")
-                .arg("test@example.com")
-                .current_dir(dir.path())
-                .status(),
-        );
-        drop(Command::new("git").arg("add").arg(".").current_dir(dir.path()).status());
-        drop(
-            Command::new("git")
-                .arg("commit")
-                .arg("-m")
-                .arg("initial")
-                .current_dir(dir.path())
-                .status(),
-        );
+        run_git_cmd(&["init"], dir.path());
+        run_git_cmd(&["config", "user.name", "Test"], dir.path());
+        run_git_cmd(&["config", "user.email", "test@example.com"], dir.path());
+        run_git_cmd(&["add", "."], dir.path());
+        run_git_cmd(&["commit", "-m", "initial"], dir.path());
 
         Ok(Self { dir, expected_content })
     }
@@ -121,4 +100,18 @@ impl TempWorkspace {
             status.code()
         );
     }
+}
+
+fn run_git_cmd(args: &[&str], dir: &Path) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .expect("git command should execute");
+    assert!(
+        status.success(),
+        "git command `git {}` should exit with status 0, got: {:?}",
+        args.join(" "),
+        status.code()
+    );
 }
