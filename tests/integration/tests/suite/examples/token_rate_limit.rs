@@ -7,7 +7,8 @@
 //! (`00121_token-rate-limiting.md` in `praxis-proxy/enhancements`, epic
 //! `ai#121`): reservation-based admission, 429 rejection with
 //! token-denominated headers, and reconciliation against actual
-//! provider-reported usage (`token_count`'s `token.total`) once the
+//! provider-reported usage (`token_count`'s typed `token.*` metadata,
+//! weighted per M4, falling back to `token.total`) once the
 //! response completes.
 //!
 //! `mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas`
@@ -51,6 +52,11 @@ fn json_post_with_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> S
 /// OpenAI-shaped response reporting 10 total tokens used.
 const OPENAI_LOW_USAGE_JSON: &str =
     r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":5,"total_tokens":10}}"#;
+
+/// OpenAI-shaped response with a 90% prompt-cache hit: 1000 input (900
+/// cached) + 50 output. Unweighted `token.total` is 1050; with the
+/// example's `cached_input: 0.1` the partitioned cost is 240.
+const OPENAI_CACHED_USAGE_JSON: &str = r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050,"prompt_tokens_details":{"cached_tokens":900}}}"#;
 
 /// Plain-text response with no token usage: `token_count` extracts
 /// nothing, so `token_rate_limit`'s reservation is never reconciled.
@@ -175,6 +181,32 @@ fn reconciliation_frees_budget_for_next_request_after_low_actual_usage() {
         parse_status(&third),
         429,
         "after two admissions the bucket should be down to 10 remaining, rejecting a third 40-token request"
+    );
+}
+
+#[test]
+fn reconciliation_applies_cached_input_weight_from_the_example_config() {
+    let backend = Backend::fixed(OPENAI_CACHED_USAGE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    // capacity=1000, estimate=500. Cached usage weights to 240
+    // (100 uncached + 900*0.1 + 50 output), so each request nets 240
+    // against the window. Unweighted token.total=1050 would overshoot
+    // on the first reconcile and deny the second 500-token reserve.
+    //   first:  reserve 500, reconcile to 240 → 760 remain  [200]
+    //   second: reserve 500 (760>=500)                       [200]
+    let config = token_rate_limit_config(proxy_port, backend.port(), 1000, 500);
+    let proxy = start_proxy(&config);
+
+    let first = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(parse_status(&first), 200, "first cached request should be admitted");
+
+    let second = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&second),
+        200,
+        "weighted cache cost 240 of 1000 must leave room for a second 500-token reservation"
     );
 }
 

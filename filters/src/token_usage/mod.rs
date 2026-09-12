@@ -17,44 +17,41 @@ pub use headers::TokenUsageHeadersFilter;
 use praxis_filter::HttpFilterContext;
 
 /// Metadata key for the input token count.
-const META_TOKEN_INPUT: &str = "token.input";
+///
+/// `pub(crate)` so `token_rate_limit` can weight this key without
+/// duplicating the string — see [`ai#351`](https://github.com/praxis-proxy/ai/issues/351).
+pub(crate) const META_TOKEN_INPUT: &str = "token.input";
 
 /// Metadata key for the output token count.
-const META_TOKEN_OUTPUT: &str = "token.output";
+pub(crate) const META_TOKEN_OUTPUT: &str = "token.output";
 
 /// Metadata key for the total token count.
 ///
-/// `pub(crate)` only under `token-rate-limit-filter`, so that experimental
-/// filter's reconciliation path can reference this constant directly
-/// instead of duplicating the string literal — see the duplication risk
-/// this avoids: [`ai#351`](https://github.com/praxis-proxy/ai/issues/351)
+/// `pub(crate)` so `token_rate_limit`'s reconciliation path can reference
+/// this constant directly instead of duplicating the string literal — see
+/// the duplication risk this avoids: [`ai#351`](https://github.com/praxis-proxy/ai/issues/351)
 /// (cached-token double-counting caused by a second, independent parsing
-/// path drifting from this one). Private otherwise, so this stable filter's
-/// public surface is unaffected when the experimental feature is disabled.
-#[cfg(feature = "token-rate-limit-filter")]
+/// path drifting from this one).
 pub(crate) const META_TOKEN_TOTAL: &str = "token.total";
-/// Metadata key for the total token count.
-#[cfg(not(feature = "token-rate-limit-filter"))]
-const META_TOKEN_TOTAL: &str = "token.total";
 
 /// Metadata key signaling that usage could not be captured because the
 /// response exceeded the configured capture limit. Absent on success,
 /// including when the provider genuinely reported no usage — consumers
 /// must not treat "no counts" the same as "counts unavailable."
-const META_TOKEN_STATUS: &str = "token.status";
+pub(crate) const META_TOKEN_STATUS: &str = "token.status";
 
 /// Value of [`META_TOKEN_STATUS`] when capture was abandoned due to
 /// exceeding the configured size limit.
-const TOKEN_STATUS_OVERFLOW: &str = "overflow";
+pub(crate) const TOKEN_STATUS_OVERFLOW: &str = "overflow";
 
 /// Metadata key for input tokens served from the provider's prompt cache.
-const META_TOKEN_CACHE_READ: &str = "token.cache_read";
+pub(crate) const META_TOKEN_CACHE_READ: &str = "token.cache_read";
 
 /// Metadata key for input tokens written to the provider's prompt cache.
-const META_TOKEN_CACHE_WRITE: &str = "token.cache_write";
+pub(crate) const META_TOKEN_CACHE_WRITE: &str = "token.cache_write";
 
 /// Metadata key for reasoning / thinking tokens reported by the provider.
-const META_TOKEN_REASONING: &str = "token.reasoning";
+pub(crate) const META_TOKEN_REASONING: &str = "token.reasoning";
 
 /// Unified token usage extracted from an AI provider response.
 ///

@@ -54,8 +54,6 @@
 //!   whatever header value an upstream component has already put there.
 //! - **Configurable estimation (M3)**: `reserved_tokens` is a fixed constant per rule, not derived from request
 //!   metadata (e.g. `max_tokens`).
-//! - **Token-type-aware accounting (M4)**: reconciles against `token.total` only; per-type (input/output/cached)
-//!   weighting is not modeled yet.
 //! - **Multiple budgets per rule, soft-limit tiers**: the proposal allows several `token_budgets` (e.g. hourly + daily)
 //!   and graduated tiers per rule; this milestone admits exactly one budget per rule with a hard deny at capacity.
 //! - **Observability (M7/M8) and metering (S3)**: out of scope here -- both are recommended to split into their own
@@ -72,20 +70,34 @@
 //! both backends behave identically here rather than diverging by
 //! backend.
 //!
+//! Token-type-aware accounting (M4) applies configurable per-type weights at
+//! reconciliation (see [`weights`]). Cache read/write are partitioned out of
+//! `token.input`; reasoning is nested in `token.output` on OpenAI/Anthropic and
+//! additive on Google. Typed parents missing falls back to `token.total` at
+//! weight 1.0; if that is missing too, the reservation estimate stands.
+//! Admission still reserves `reserved_tokens` unweighted (M3).
+//!
 //! Depends on `token_count` running earlier in the response phase to
-//! populate `token.total` in `filter_metadata`; if that metadata is
+//! populate `token.*` in `filter_metadata`; if that metadata is
 //! absent when the response completes, the reservation is left as
 //! final rather than guessed at.
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, reason = "tests")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_lines,
+    reason = "tests"
+)]
 mod tests;
 
 mod backend;
 mod config;
 mod ledger;
 mod token_bucket_ledger;
+mod weights;
 
 use std::{collections::HashSet, sync::Arc, time::Instant};
 
@@ -110,8 +122,8 @@ use self::{
     },
     ledger::{Budget, Ledger, LedgerConfig},
     token_bucket_ledger::{TokenBucketConfig, TokenBucketLedger},
+    weights::{TokenWeights, UsageCounts, weighted_cost},
 };
-use crate::token_usage::META_TOKEN_TOTAL;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -315,6 +327,10 @@ struct CompiledRule {
 
     /// Fixed token cost reserved at admission (M3 placeholder).
     reserved_tokens: u64,
+
+    /// Resolved per-type weights for this rule (filter defaults overlaid
+    /// with the rule's `weights:`). Applied only at reconciliation.
+    weights: TokenWeights,
 }
 
 impl CompiledRule {
@@ -445,19 +461,27 @@ fn build_rule_backend(
 ///
 /// Returns [`FilterError`] if `capacity` is zero, `reserved_tokens` is
 /// zero or exceeds `capacity`, `window`/`reservation_timeout` aren't
-/// valid durations, a `match` header name is invalid, or the rule's
-/// backend fails to construct (see [`build_rule_backend`]).
-fn compile_rule(rule: RuleConfig, backend: &BackendResource) -> Result<CompiledRule, FilterError> {
+/// valid durations, a `match` header name is invalid, a weight is
+/// negative or non-finite, or the rule's backend fails to construct
+/// (see [`build_rule_backend`]).
+fn compile_rule(
+    rule: RuleConfig,
+    backend: &BackendResource,
+    filter_defaults: TokenWeights,
+) -> Result<CompiledRule, FilterError> {
     let capacity = rule.algorithm.capacity();
     let reservation_timeout_ms = validate_rule_bounds(&rule, capacity)?;
     let backend = build_rule_backend(&rule.algorithm, backend, &rule.name, reservation_timeout_ms)?;
     let matcher = compile_matcher(&rule.name, rule.r#match)?;
+    let loc = format!("rule '{}'", rule.name);
+    let weights = filter_defaults.overlay(&rule.weights, &loc)?;
 
     Ok(CompiledRule {
         name: rule.name,
         matcher,
         backend,
         reserved_tokens: rule.reserved_tokens,
+        weights,
     })
 }
 
@@ -478,6 +502,12 @@ fn compile_rule(rule: RuleConfig, backend: &BackendResource) -> Result<CompiledR
 ///   kind: valkey                      # memory (default) | valkey
 ///   url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
 ///   namespace: praxis:token_rate_limit
+/// default_weights:                   # optional: omitted types default to 1.0
+///   input: 1.0
+///   output: 1.0
+///   cached_input: 0.1                # prompt-cache hits (token.cache_read)
+///   cache_write: 1.25                # prompt-cache writes (token.cache_write)
+///   reasoning: 0.9                   # thinking tokens (token.reasoning)
 /// rules:
 ///   - name: team-alpha                 # human-readable, unique per filter instance
 ///     match:                           # optional: omit for a catch-all rule
@@ -487,6 +517,8 @@ fn compile_rule(rule: RuleConfig, backend: &BackendResource) -> Result<CompiledR
 ///     window: 1h                       # sliding_window only: window duration
 ///     capacity: 100000                 # max tokens admitted (sliding_window) or held (token_bucket)
 ///     reserved_tokens: 500             # fixed cost reserved per request at admission
+///     weights:                         # optional per-rule overlay on default_weights
+///       cached_input: 0.05
 ///   - name: team-beta
 ///     match:
 ///       headers:
@@ -530,10 +562,11 @@ impl TokenRateLimitFilter {
         }
 
         let backend = build_backend_resource(&cfg.backend)?;
+        let filter_defaults = TokenWeights::UNITY.overlay(&cfg.default_weights, "default_weights")?;
         let rules = cfg
             .rules
             .into_iter()
-            .map(|rule| compile_rule(rule, &backend))
+            .map(|rule| compile_rule(rule, &backend, filter_defaults))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Box::new(Self {
@@ -654,9 +687,9 @@ impl TokenRateLimitFilter {
             .get_metadata(META_RULE_INDEX)
             .and_then(|v| v.parse::<usize>().ok())
             .and_then(|index| self.rules.get(index))?;
-        let actual = ctx.get_metadata(META_TOKEN_TOTAL).and_then(|v| v.parse::<u64>().ok());
+        let actual = weighted_cost(UsageCounts::from_context(ctx), rule.weights);
         if actual.is_none() {
-            tracing::trace!("token_rate_limit: no token.total metadata at end of stream, charging at estimate");
+            tracing::trace!("token_rate_limit: no usable token usage metadata at end of stream, charging at estimate");
         }
         let request = ReconcileRequest {
             key,
@@ -938,6 +971,7 @@ mod backend_injection_tests {
                 matcher: None,
                 backend: std::sync::Arc::new(EnqueueAlwaysFailsBackend),
                 reserved_tokens: 1,
+                weights: super::TokenWeights::UNITY,
             }],
             epoch: std::time::Instant::now(),
         };
