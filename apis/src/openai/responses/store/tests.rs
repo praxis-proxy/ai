@@ -495,7 +495,7 @@ async fn on_request_body_registers_store_for_previous_response_id_even_when_stor
 async fn on_request_body_does_not_initialize_store_for_store_false_without_previous_response() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.set_metadata("openai_responses_format.store", "false");
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi","store":false}"#));
@@ -840,6 +840,8 @@ async fn on_response_body_persists_streaming_response_at_eos() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let owner = crate::StateOwner::from_trusted_parts("tenant-stream", "issuer-a", "alice").unwrap();
+    ctx.extensions.insert(owner.clone());
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.set_metadata("openai_responses_format.stream", "true");
     run_request_phase(&filter, &mut ctx).await;
@@ -869,7 +871,7 @@ async fn on_response_body_persists_streaming_response_at_eos() {
 
     let store = store_opt.as_ref().unwrap();
     let record = store
-        .get_response(&crate::test_utils::test_owner("default"), "resp_stream_unit")
+        .get_response(&owner, "resp_stream_unit")
         .await
         .expect("get_response should succeed")
         .expect("record should exist after streaming persist");
@@ -878,9 +880,17 @@ async fn on_response_body_persists_streaming_response_at_eos() {
     assert_eq!(record.created_at, 1_719_900_000, "persisted created_at should match");
     assert_eq!(record.model, "gpt-4.1", "persisted model should match");
     assert_eq!(
-        record.owner.tenant_id(),
-        "default",
-        "persisted tenant_id should be default"
+        record.owner, owner,
+        "streaming persistence must retain the initiating owner"
+    );
+    let same_tenant_other = crate::StateOwner::from_trusted_parts("tenant-stream", "issuer-a", "bob").unwrap();
+    assert!(
+        store
+            .get_response(&same_tenant_other, "resp_stream_unit")
+            .await
+            .expect("cross-owner lookup should succeed")
+            .is_none(),
+        "streaming state must be hidden from another owner in the same tenant"
     );
     assert_eq!(
         record.response_object, response_json,
@@ -3103,6 +3113,74 @@ async fn get_response_tenant_isolation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_endpoints_hide_same_tenant_cross_owner_resources() {
+    let filter = make_filter();
+    let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
+    init_store_and_seed_owner(
+        &filter,
+        "resp_owner_private",
+        owner.clone(),
+        json!([{"id": "item_private", "type": "message"}]),
+    )
+    .await;
+
+    for (method, path) in [
+        (http::Method::GET, "/v1/responses/resp_owner_private"),
+        (http::Method::GET, "/v1/responses/resp_owner_private/input_items"),
+        (http::Method::DELETE, "/v1/responses/resp_owner_private"),
+    ] {
+        let req = crate::test_utils::make_request(method, path);
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.extensions.insert(other.clone());
+        let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+        assert_eq!(rejection.status, 404, "wrong-owner access must look absent: {path}");
+    }
+
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_owner_private");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(owner);
+    let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+    assert_eq!(rejection.status, 200, "wrong-owner delete must not mutate the response");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_state_access_fails_closed_without_an_owner() {
+    let filter = make_filter();
+    init_store(&filter).await;
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_private");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
+
+    assert_eq!(rejection.status, 401);
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "missing_state_owner");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthorized_and_missing_responses_are_externally_identical() {
+    let owned_filter = make_filter();
+    let empty_filter = make_filter();
+    let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
+    init_store_and_seed_owner(&owned_filter, "resp_indistinguishable", owner, json!([])).await;
+    init_store(&empty_filter).await;
+    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_indistinguishable");
+
+    let mut unauthorized_ctx = crate::test_utils::make_filter_context(&req);
+    unauthorized_ctx.extensions.insert(other.clone());
+    let unauthorized = expect_reject(owned_filter.on_request(&mut unauthorized_ctx).await.unwrap());
+    let mut missing_ctx = crate::test_utils::make_filter_context(&req);
+    missing_ctx.extensions.insert(other);
+    let missing = expect_reject(empty_filter.on_request(&mut missing_ctx).await.unwrap());
+
+    assert_eq!(unauthorized.status, missing.status);
+    assert_eq!(unauthorized.headers, missing.headers);
+    assert_eq!(unauthorized.body, missing.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_trailing_slash_handled() {
     let filter = make_filter();
     init_store_and_seed(&filter, "resp_slash", "default", json!([])).await;
@@ -4747,8 +4825,11 @@ async fn on_response_body_persists_uses_trusted_owner_context() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.extensions.insert(crate::test_utils::test_owner("custom_tenant"));
+    let owner = crate::StateOwner::from_trusted_parts("custom_tenant", "issuer-a", "alice").unwrap();
+    ctx.extensions.insert(owner.clone());
     drop(filter.on_request(&mut ctx).await.unwrap());
+    let same_tenant_other = crate::StateOwner::from_trusted_parts("custom_tenant", "issuer-a", "bob").unwrap();
+    ctx.extensions.insert(same_tenant_other.clone());
 
     let body_json = json!({
         "id": "resp_tenant_body",
@@ -4764,17 +4845,20 @@ async fn on_response_body_persists_uses_trusted_owner_context() {
 
     let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
-        .get_response(&crate::test_utils::test_owner("custom_tenant"), "resp_tenant_body")
+        .get_response(&owner, "resp_tenant_body")
         .await
         .unwrap()
         .expect("record should exist under custom tenant");
-    assert_eq!(record.owner.tenant_id(), "custom_tenant");
+    assert_eq!(record.owner, owner);
 
-    let default_record = store
-        .get_response(&crate::test_utils::test_owner("default"), "resp_tenant_body")
+    let outsider_record = store
+        .get_response(&same_tenant_other, "resp_tenant_body")
         .await
         .unwrap();
-    assert!(default_record.is_none(), "record should not exist under default tenant");
+    assert!(
+        outsider_record.is_none(),
+        "buffered response must retain the complete initiating owner"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -5408,6 +5492,15 @@ async fn init_store(filter: &ResponseStoreFilter) {
 }
 
 async fn init_store_and_seed(filter: &ResponseStoreFilter, id: &str, tenant_id: &str, input: serde_json::Value) {
+    init_store_and_seed_owner(filter, id, crate::test_utils::test_owner(tenant_id), input).await;
+}
+
+async fn init_store_and_seed_owner(
+    filter: &ResponseStoreFilter,
+    id: &str,
+    owner: crate::StateOwner,
+    input: serde_json::Value,
+) {
     let store_opt = filter
         .store
         .get_or_init(|| async { Box::pin(filter.build_store()).await.ok() })
@@ -5415,7 +5508,7 @@ async fn init_store_and_seed(filter: &ResponseStoreFilter, id: &str, tenant_id: 
     let store = store_opt.as_ref().expect("store should be initialized");
     let record = ResponseRecord {
         id: id.to_owned(),
-        owner: crate::test_utils::test_owner(tenant_id),
+        owner,
         created_at: 1000,
         model: "gpt-4.1".to_owned(),
         response_object: json!({"status": "completed"}),

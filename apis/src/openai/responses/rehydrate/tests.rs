@@ -420,6 +420,37 @@ async fn rejects_when_previous_response_not_found() {
 }
 
 #[tokio::test]
+async fn body_first_previous_response_lookup_is_exact_owner_scoped() {
+    let owner = crate::test_utils::test_owner("default");
+    let other = crate::StateOwner::from_trusted_parts("default", owner.issuer(), "other-subject").unwrap();
+    let registry = setup_registry(MockStore::with_status("resp_private", "completed"));
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let request_body = r#"{"input":"Continue","previous_response_id":"resp_private"}"#;
+
+    let mut wrong_ctx = crate::test_utils::make_filter_context(&req);
+    wrong_ctx.extensions.insert(other);
+    wrong_ctx.extensions.insert(registry.clone());
+    wrong_ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(request_body));
+    let rejection = match filter.on_request_body(&mut wrong_ctx, &mut body, true).await.unwrap() {
+        FilterAction::Reject(rejection) => rejection,
+        other => panic!("expected wrong-owner rejection, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 400, "wrong-owner response must look absent");
+    assert!(wrong_ctx.extensions.get::<ResponsesState>().is_none());
+
+    let mut owner_ctx = crate::test_utils::make_filter_context(&req);
+    owner_ctx.extensions.insert(owner);
+    owner_ctx.extensions.insert(registry);
+    owner_ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(request_body));
+    let action = filter.on_request_body(&mut owner_ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    assert!(owner_ctx.extensions.get::<ResponsesState>().is_some());
+}
+
+#[tokio::test]
 async fn rejects_when_status_not_completed() {
     let store = MockStore::with_status("resp_123", "in_progress");
     let registry = setup_registry(store);

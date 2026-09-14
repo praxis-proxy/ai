@@ -2026,6 +2026,16 @@ const APPROVAL_PREV_ID: &str = "resp_prev";
 /// server-owned, never inferred from conversation history.
 async fn seed_weather_approval(store: &dyn ResponseStore, response_id: &str, id: &str, arguments: &str) {
     let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    seed_weather_approval_for_owner(store, &owner, response_id, id, arguments).await;
+}
+
+async fn seed_weather_approval_for_owner(
+    store: &dyn ResponseStore,
+    owner: &crate::StateOwner,
+    response_id: &str,
+    id: &str,
+    arguments: &str,
+) {
     store
         .upsert_response(&ResponseRecord {
             id: response_id.to_owned(),
@@ -2046,7 +2056,7 @@ async fn seed_weather_approval(store: &dyn ResponseStore, response_id: &str, id:
         target_fingerprint(&weather_entry()),
     );
     store
-        .record_pending_approvals(&owner, response_id, std::slice::from_ref(&record), 1000)
+        .record_pending_approvals(owner, response_id, std::slice::from_ref(&record), 1000)
         .await
         .expect("seeding the pending approval should succeed");
 }
@@ -2131,6 +2141,43 @@ async fn resume_approval_approve_executes_once_and_preserves_call() {
         "mcp_call must reference the authorizing approval"
     );
     assert!(state.tool_calls.is_empty(), "executed approved call must be cleared");
+}
+
+#[tokio::test]
+async fn resume_approval_is_hidden_from_another_owner_in_the_same_tenant() {
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let other = crate::StateOwner::from_trusted_parts(DEFAULT_TENANT_ID, owner.issuer(), "other-subject").unwrap();
+    ctx.extensions.insert(other);
+    let store = make_approval_store().await;
+    seed_weather_approval_for_owner(store.as_ref(), &owner, APPROVAL_PREV_ID, "call_private", "{}").await;
+    register_store(&mut ctx, Arc::clone(&store));
+    ctx.extensions.insert(ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_private", true, None)],
+        ..ResponsesState::default()
+    });
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let rejection = expect_reject(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    assert_eq!(rejection.status, 400, "wrong-owner approval must look unknown");
+    assert!(reject_message(&rejection).contains("no pending approval request"));
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .accumulated_output
+            .is_empty()
+    );
+    let claim = store
+        .consume_approvals(&owner, APPROVAL_PREV_ID, &["call_private"], 2_000)
+        .await
+        .unwrap();
+    assert_eq!(claim, None, "wrong-owner attempt must leave the approval claimable");
 }
 
 #[tokio::test]
