@@ -223,20 +223,33 @@ pub(super) async fn handle_update_conversation(
 
     let metadata = input.metadata.into_value();
 
-    let record = ConversationRecord {
-        conversation_id: conversation_id.to_owned(),
-        tenant_id: tenant_id.to_owned(),
-        created_at: existing.created_at,
-        metadata,
-        messages: existing.messages,
-    };
-
-    if let Err(e) = store.upsert_conversation(&record).await {
-        return Ok(FilterAction::Reject(store_error_response(&e)?));
+    // Update only the metadata column. Round-tripping the whole record through
+    // `upsert_conversation` would write back the `messages` snapshot read above,
+    // clobbering a denormalized cache that a concurrent item append rebuilt in the
+    // meantime and dropping those committed items from conversation-backed
+    // rehydration (#1144). `created_at` is immutable, so the read above still
+    // supplies it for the response.
+    match store
+        .update_conversation_metadata(tenant_id, conversation_id, &metadata)
+        .await
+    {
+        Ok(true) => {},
+        Ok(false) => {
+            // The conversation was deleted between the read above and this write.
+            debug!(conversation_id, "conversation not found for update");
+            return Ok(FilterAction::Reject(not_found_response(&format!(
+                "No conversation found with id: '{conversation_id}'."
+            ))?));
+        },
+        Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     }
     debug!(conversation_id, tenant_id, "conversation updated");
 
-    let body = conversation_response(record);
+    let body = ConversationResource::new(
+        conversation_id.to_owned(),
+        existing.created_at,
+        Metadata::from_value(metadata),
+    );
     Ok(FilterAction::Reject(json_response(200, &body)?))
 }
 
@@ -1786,6 +1799,17 @@ mod tests {
         ) -> Result<bool, StoreError> {
             self.inner
                 .update_conversation_messages(tenant_id, conversation_id, messages)
+                .await
+        }
+
+        async fn update_conversation_metadata(
+            &self,
+            tenant_id: &str,
+            conversation_id: &str,
+            metadata: &Value,
+        ) -> Result<bool, StoreError> {
+            self.inner
+                .update_conversation_metadata(tenant_id, conversation_id, metadata)
                 .await
         }
 

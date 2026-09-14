@@ -1353,7 +1353,12 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     if !state.response_object.is_object() {
         state.response_object = std::mem::take(&mut state.local_completion_response_template);
     }
-    canonicalize_logical_response(state);
+    // A local completion synthesizes both the wire terminal (below) and the store
+    // source from this same `response_object`, so they cannot diverge; restore the
+    // caller id on any rehydrated turn — there is no separate upstream wire whose
+    // narrower eligibility to match.
+    let restore_previous_response_id = state.history_rehydrated;
+    canonicalize_logical_response(state, restore_previous_response_id);
     if !state.response_object.is_object() {
         return None;
     }
@@ -1493,7 +1498,11 @@ fn emit_deferred_terminal(
     // loop without a resumed round) before the terminal snapshot.
     flush_local_output_items(ctx, output);
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
-    let (accumulated_output, usage) = canonicalize_logical_response(state);
+    // The upstream event stream is the client-visible terminal, rewritten (or left
+    // untouched) by `openai_responses_rehydrate`; match its wire-rewrite decision so
+    // the persisted store source cannot disagree with the streamed frame (#1150).
+    let restore_previous_response_id = state.previous_response_id_stream_restore_armed;
+    let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id);
     if let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut) {
         response.insert("output".to_owned(), Value::Array(accumulated_output));
         if !usage.is_null() {
@@ -1529,9 +1538,29 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 }
 
 /// Make the response-store source agree with the logical SSE terminal.
-fn canonicalize_logical_response(state: &mut ResponsesState) -> (Vec<Value>, Value) {
+///
+/// `restore_previous_response_id` decides whether to repair the id the backend
+/// echoed as `null` after a rehydrated turn stripped it from the upstream request
+/// (#1150). It MUST mirror whichever path owns the client-visible terminal, or a
+/// later GET disagrees with what the client streamed:
+/// - upstream streaming: the wire is rewritten by `openai_responses_rehydrate`, so the caller passes
+///   `state.previous_response_id_stream_restore_armed` — the filter's own `eligible_previous_response_id_stream`
+///   decision, which declines validator-bearing and non-200 streams the store must therefore also leave alone (issue
+///   #1150 review);
+/// - local completion: this function's output *is* the wire terminal, so the two cannot diverge and the caller restores
+///   on `history_rehydrated` alone.
+///
+/// Either way the id is only ever restored, never fabricated: a non-rehydrated
+/// turn keeps the real value the backend echoed.
+fn canonicalize_logical_response(
+    state: &mut ResponsesState,
+    restore_previous_response_id: bool,
+) -> (Vec<Value>, Value) {
     let logical_id = state.logical_stream_response_id.clone();
     let usage = state.usage.clone();
+    let restored_previous_response_id = restore_previous_response_id
+        .then(|| state.previous_response_id.clone())
+        .flatten();
     // Prefer the cross-round accumulator populated by dispatch/loop filters
     // (agentic pipelines). When no such filter ran — a plain one-round logical
     // stream — it stays empty, so fall back to the terminal event's own output
@@ -1558,6 +1587,9 @@ fn canonicalize_logical_response(state: &mut ResponsesState) -> (Vec<Value>, Val
     if let Some(response) = state.response_object.as_object_mut() {
         if let Some(logical_id) = logical_id {
             response.insert("id".to_owned(), Value::String(logical_id));
+        }
+        if let Some(prev_id) = restored_previous_response_id {
+            response.insert("previous_response_id".to_owned(), Value::String(prev_id));
         }
         response.insert("output".to_owned(), Value::Array(output.clone()));
         if !usage.is_null() {

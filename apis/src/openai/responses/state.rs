@@ -227,8 +227,8 @@ pub(crate) enum McpApprovalState {
     clippy::struct_excessive_bools,
     reason = "request-scoped state bag; the request, transport, and deferred \
               lifecycle bool flags (history_rehydrated, parallel_tool_calls, \
-              store_persist_armed) are independent request facts, not a state \
-              machine or refactorable enum"
+              store_persist_armed, previous_response_id_stream_restore_armed) are \
+              independent request facts, not a state machine or refactorable enum"
 )]
 pub(crate) struct ResponsesState {
     /// Maps file IDs to filenames for citation annotation extraction.
@@ -358,6 +358,20 @@ pub(crate) struct ResponsesState {
     /// narrower residual is unsupported for approval pipelines and still fails
     /// closed at resume.
     pub store_persist_armed: bool,
+
+    /// Whether the streaming `previous_response_id` wire rewrite was armed.
+    ///
+    /// Set in the response header phase by `openai_responses_rehydrate`
+    /// (`arm_streaming_restore`) to the result of `eligible_previous_response_id_stream`:
+    /// `true` only for a `200 OK`, identity-coded, validator-free event stream from
+    /// a rehydrated turn carrying a caller id. The persistence source
+    /// (`canonicalize_logical_response`) runs in the body phase, where the response
+    /// header is gone, so it reads this precomputed flag to restore the id into the
+    /// stored `response_object` on exactly the streams whose client-visible frames
+    /// the wire path rewrote — never on a validator-bearing or non-200 stream the
+    /// wire path left untouched, which would make a later GET disagree with the
+    /// terminal frame (issue #1150 review).
+    pub previous_response_id_stream_restore_armed: bool,
 
     /// ID of a previous response to continue from.
     ///
@@ -605,6 +619,7 @@ impl Default for ResponsesState {
             persisted_messages: Vec::new(),
             pending_approvals: Vec::new(),
             store_persist_armed: false,
+            previous_response_id_stream_restore_armed: false,
             previous_response_id: None,
             previous_tools: Vec::new(),
             previous_usage: None,
