@@ -15,7 +15,7 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
-  VLLM_IMAGE: "docker.io/vllm/vllm-openai:v0.22.1-cu129@sha256:e1668bce9790a4b86682f8fcc99678153a13e12dc70e05348d8e239ffa474b05"
+  VLLM_IMAGE: "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
 
 jobs:
