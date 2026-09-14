@@ -18,11 +18,12 @@
 //! | `intelligent_route.credential.key` | `"token"` |
 //!
 //! This filter reads those keys, looks up the matching token in its configured
-//! credential map, removes the incoming `Authorization` and `x-api-key` values,
-//! and sets exactly one provider credential header on the upstream request:
-//! `Authorization: Bearer <token>` for `bearer_token`, or the raw token in the
-//! configured `header` (default `x-api-key`) for `apikey`. The filter must
-//! appear after the routing filter in the filter chain.
+//! credential map, removes the incoming `Authorization`, `x-api-key`, and
+//! configured injection-header values, and sets exactly one provider credential
+//! header on the upstream request: `Authorization: Bearer <token>` for
+//! `bearer_token`, or the raw token in the configured `header` (default
+//! `x-api-key`) for `apikey`. The filter must appear after the routing filter
+//! in the filter chain.
 //!
 //! # Behaviour
 //!
@@ -90,9 +91,12 @@ use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Re
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use super::metadata::{
-    CREDENTIAL_KEY, CREDENTIAL_NAME, CREDENTIAL_NAMESPACE, CREDENTIAL_STRATEGY, STRATEGY_APIKEY, STRATEGY_BEARER_TOKEN,
-    is_supported_strategy,
+use super::{
+    descriptor::RESERVED_HEADER_PREFIXES,
+    metadata::{
+        CREDENTIAL_KEY, CREDENTIAL_NAME, CREDENTIAL_NAMESPACE, CREDENTIAL_STRATEGY, STRATEGY_APIKEY,
+        STRATEGY_BEARER_TOKEN, is_supported_strategy,
+    },
 };
 
 /// Maximum credential references accepted by one filter instance.
@@ -146,7 +150,9 @@ struct CredentialEntryConfig {
 
     /// Injection header for `strategy: apikey`.  Defaults to `x-api-key`.
     /// Mutually exclusive with `strategy: bearer_token`, which always injects
-    /// `Authorization`.
+    /// `Authorization`.  Reserved internal header prefixes (`x-praxis-`,
+    /// `x-mcp-`) and `authorization` itself are rejected: the Praxis upstream
+    /// boundary would strip the injected credential in flight.
     #[serde(default)]
     header: Option<String>,
 
@@ -434,8 +440,11 @@ impl HttpFilter for CredentialInjectFilter {
         let header_value = HeaderValue::from_str(cred.header_value.as_str()).map_err(|e| -> FilterError {
             format!("credential_inject: invalid resolved credential header: {e}").into()
         })?;
+        // Strip every credential-bearing header the caller could smuggle:
+        // the standard pair plus this entry's configured injection header.
         ctx.request_headers_to_remove.push(AUTHORIZATION);
         ctx.request_headers_to_remove.push(HeaderName::from_static("x-api-key"));
+        ctx.request_headers_to_remove.push(cred.header_name.clone());
         ctx.request_headers_to_set
             .push((cred.header_name.clone(), header_value));
 
@@ -518,7 +527,13 @@ fn strategy_label(strategy: &str) -> &'static str {
 ///
 /// `bearer_token` always injects `Authorization` and rejects a configured
 /// `header`; `apikey` injects the configured `header`, defaulting to
-/// `x-api-key`.
+/// `x-api-key`.  Reserved internal header prefixes are rejected because the
+/// Praxis upstream boundary would strip the injected credential in flight,
+/// and `authorization` stays owned by the `bearer_token` strategy.
+#[expect(
+    clippy::too_many_lines,
+    reason = "injection header selection and validation is intentionally kept together"
+)]
 fn resolve_header_name(entry: &CredentialEntryConfig) -> Result<HeaderName, FilterError> {
     if entry.strategy == STRATEGY_BEARER_TOKEN {
         if entry.header.is_some() {
@@ -533,13 +548,31 @@ fn resolve_header_name(entry: &CredentialEntryConfig) -> Result<HeaderName, Filt
     match &entry.header {
         Some(header) => {
             validate_bounded("header", header, MAX_SOURCE_LEN)?;
-            HeaderName::from_bytes(header.as_bytes()).map_err(|error| -> FilterError {
+            let name: HeaderName = header.parse().map_err(|error| -> FilterError {
                 format!(
                     "credential_inject: invalid header '{header}' for '{}/{}/{}': {error}",
                     entry.name, entry.namespace, entry.key
                 )
                 .into()
-            })
+            })?;
+            if RESERVED_HEADER_PREFIXES
+                .iter()
+                .any(|prefix| name.as_str().starts_with(prefix))
+            {
+                return Err(format!(
+                    "credential_inject: header '{header}' for '{}/{}/{}' must not use a reserved internal header prefix",
+                    entry.name, entry.namespace, entry.key
+                )
+                .into());
+            }
+            if name == AUTHORIZATION {
+                return Err(format!(
+                    "credential_inject: header 'authorization' for '{}/{}/{}' must use strategy 'bearer_token'",
+                    entry.name, entry.namespace, entry.key
+                )
+                .into());
+            }
+            Ok(name)
         },
         None => Ok(HeaderName::from_static(DEFAULT_APIKEY_HEADER)),
     }
@@ -951,6 +984,32 @@ mod tests {
     }
 
     #[test]
+    fn apikey_reserved_prefix_header_rejected() {
+        for header in ["x-praxis-token", "x-mcp-key"] {
+            let yaml = format!(
+                "credentials:\n  - name: s\n    namespace: ns\n    key: k\n    strategy: apikey\n    value: tok\n    header: {header}"
+            );
+            let err = parse(&yaml).err().expect("reserved-prefix header must be rejected");
+            assert!(
+                err.to_string().contains("reserved internal header prefix"),
+                "{header} must be rejected as a reserved injection header: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn apikey_authorization_header_rejected() {
+        // HeaderName normalizes case, so 'Authorization' must hit the same guard.
+        let err = parse_err(
+            "credentials:\n  - name: s\n    namespace: ns\n    key: k\n    strategy: apikey\n    value: tok\n    header: Authorization",
+        );
+        assert!(
+            err.to_string().contains("must use strategy 'bearer_token'"),
+            "authorization must stay owned by the bearer strategy: {err}"
+        );
+    }
+
+    #[test]
     fn valid_minimal_config() {
         let f = parse("credentials:\n  - name: s\n    namespace: ns\n    key: k\n    value: tok");
         assert!(f.is_ok(), "valid config must parse");
@@ -1097,6 +1156,35 @@ mod tests {
 
         let action = f.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue), "custom header must route");
+        assert_eq!(ctx.request_headers_to_set.len(), 1);
+        assert_eq!(ctx.request_headers_to_set[0].0.as_str(), "x-custom-key");
+        assert_eq!(ctx.request_headers_to_set[0].1.to_str().unwrap(), "sk-live-123");
+    }
+
+    #[tokio::test]
+    async fn apikey_strips_caller_value_in_configured_header() {
+        let yaml = concat!(
+            "credentials:\n",
+            "  - name: s\n    namespace: ns\n    key: k\n",
+            "    strategy: apikey\n    header: x-custom-key\n    value: sk-live-123\n",
+        );
+        let f = parse(yaml).unwrap();
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert("x-custom-key", HeaderValue::from_static("caller-smuggled-key"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "apikey", "s", "ns", "k");
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "matched credential must continue"
+        );
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static("x-custom-key")),
+            "the configured injection header must be stripped from caller-supplied values"
+        );
         assert_eq!(ctx.request_headers_to_set.len(), 1);
         assert_eq!(ctx.request_headers_to_set[0].0.as_str(), "x-custom-key");
         assert_eq!(ctx.request_headers_to_set[0].1.to_str().unwrap(), "sk-live-123");
