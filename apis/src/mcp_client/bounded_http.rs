@@ -22,7 +22,7 @@ use rmcp::{
 use sse_stream::{Sse, SseStream};
 
 /// Wire-size allowance for MCP initialization and control responses.
-const MAX_CONTROL_RESPONSE_BYTES: usize = 1_048_576;
+pub(super) const MAX_CONTROL_RESPONSE_BYTES: usize = 1_048_576;
 /// JSON-RPC envelope allowance above the configured retained tool-result cap.
 const MAX_TOOL_RESULT_ENVELOPE_BYTES: usize = 65_536;
 /// Worst-case JSON string encoding expansion (`\u00XX` for one input byte).

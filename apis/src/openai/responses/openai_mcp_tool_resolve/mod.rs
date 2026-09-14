@@ -739,6 +739,7 @@ fn is_mcp_listing_runtime_failure(err: &ResolveError) -> bool {
             | mcp_client::McpClientError::Timeout { .. }
             | mcp_client::McpClientError::Serialization(_)
             | mcp_client::McpClientError::TooManyTools { .. }
+            | mcp_client::McpClientError::ListingTooLarge { .. }
     )
 }
 
