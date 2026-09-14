@@ -12,7 +12,7 @@ use crate::test_utils::{make_filter_context, make_request};
 const HEADER: &str = "x-test-state-owner";
 
 fn filter() -> Box<dyn praxis_filter::HttpFilter> {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("header: {HEADER}")).unwrap();
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("mode: trusted_owner\nheader: {HEADER}")).unwrap();
     OpenAiStateOwnerFilter::from_config(&yaml).unwrap()
 }
 
@@ -40,7 +40,12 @@ fn rejection_code(action: FilterAction) -> String {
 
 #[test]
 fn configuration_requires_valid_header_name() {
-    for yaml in ["{}", "header: ''", "header: 'not a header'"] {
+    for yaml in [
+        "{}",
+        "mode: trusted_owner",
+        "mode: trusted_owner\nheader: ''",
+        "mode: trusted_owner\nheader: 'not a header'",
+    ] {
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
         assert!(
             OpenAiStateOwnerFilter::from_config(&value).is_err(),
@@ -51,8 +56,43 @@ fn configuration_requires_valid_header_name() {
 
 #[test]
 fn configuration_rejects_unknown_fields() {
-    let value: serde_yaml::Value = serde_yaml::from_str("header: x-owner\nunknown: true").unwrap();
+    let value: serde_yaml::Value = serde_yaml::from_str("mode: trusted_owner\nheader: x-owner\nunknown: true").unwrap();
     assert!(OpenAiStateOwnerFilter::from_config(&value).is_err());
+}
+
+#[test]
+fn policy_mode_is_reserved_and_fails_configuration() {
+    let value: serde_yaml::Value = serde_yaml::from_str("mode: policy\nheader: x-owner").unwrap();
+    let error = match OpenAiStateOwnerFilter::from_config(&value) {
+        Ok(_) => panic!("policy mode must remain unavailable without PPE"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("requires the PPE integration"));
+}
+
+#[tokio::test]
+async fn explicit_single_tenant_mode_installs_shared_owner_without_a_header() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("mode: single_tenant\ntenant_id: local").unwrap();
+    let filter = OpenAiStateOwnerFilter::from_config(&yaml).unwrap();
+    let request = make_request(Method::GET, "/v1/responses/resp_known");
+    let mut ctx = make_filter_context(&request);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let owner = ctx.extensions.get::<OpenAiStateOwner>().unwrap();
+    assert_eq!(owner.tenant_id(), "local");
+    assert_eq!(owner.issuer(), "urn:praxis:single-tenant");
+    assert_eq!(owner.subject(), "shared");
+    assert!(ctx.request_headers_to_remove.is_empty());
+}
+
+#[test]
+fn single_tenant_mode_requires_a_valid_namespace() {
+    for yaml in ["mode: single_tenant", "mode: single_tenant\ntenant_id: ''"] {
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(OpenAiStateOwnerFilter::from_config(&value).is_err());
+    }
 }
 
 #[tokio::test]
@@ -155,4 +195,5 @@ async fn installed_context_is_not_reparsed_or_replaced() {
 
     assert!(matches!(action, FilterAction::Continue));
     assert_eq!(ctx.extensions.get::<OpenAiStateOwner>().unwrap().subject(), "alice");
+    assert!(ctx.request_headers_to_remove.iter().any(|name| name == HEADER));
 }

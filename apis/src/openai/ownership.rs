@@ -33,6 +33,12 @@ const MAX_COMPONENT_BYTES: usize = 1_024;
 /// Supported assertion envelope version.
 const ASSERTION_VERSION_PREFIX: &str = "v1.";
 
+/// Stable issuer used by the explicit shared-owner compatibility mode.
+const SINGLE_TENANT_ISSUER: &str = "urn:praxis:single-tenant";
+
+/// Stable subject used by the explicit shared-owner compatibility mode.
+const SINGLE_TENANT_SUBJECT: &str = "shared";
+
 /// Immutable owner of OpenAI persisted state.
 ///
 /// Tenant, issuer, and subject together form the ownership identity. A subject
@@ -85,10 +91,31 @@ impl OpenAiStateOwner {
 
 /// Configuration for [`OpenAiStateOwnerFilter`].
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OpenAiStateOwnerConfig {
-    /// Exact header name carrying the versioned assertion.
-    header: String,
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum OpenAiStateOwnerConfig {
+    /// Explicit compatibility mode sharing one owner within a tenant namespace.
+    SingleTenant {
+        /// Stable namespace assigned to every request in this pipeline.
+        tenant_id: String,
+    },
+    /// Strict owner isolation sourced from a trusted assertion header.
+    TrustedOwner {
+        /// Exact header name carrying the versioned assertion.
+        header: String,
+    },
+    /// Reserved for the later PPE-backed authorization integration.
+    Policy {
+        /// Exact header name that will carry the current caller assertion.
+        header: String,
+    },
+}
+
+/// Configured source of the normalized owner context.
+enum OwnerSource {
+    /// One shared owner for an explicitly configured tenant namespace.
+    Static(OpenAiStateOwner),
+    /// Versioned assertion from a trusted upstream boundary.
+    TrustedHeader(HeaderName),
 }
 
 /// Decodes a trusted owner assertion into [`OpenAiStateOwner`].
@@ -100,11 +127,20 @@ struct OpenAiStateOwnerConfig {
 ///
 /// ```yaml
 /// filter: openai_state_owner
+/// mode: trusted_owner
 /// header: x-praxis-state-owner
 /// ```
+///
+/// Explicit single-tenant compatibility mode does not consume a header:
+///
+/// ```yaml
+/// filter: openai_state_owner
+/// mode: single_tenant
+/// tenant_id: local
+/// ```
 pub struct OpenAiStateOwnerFilter {
-    /// Validated assertion header name.
-    header: HeaderName,
+    /// Validated source used to populate the request context.
+    source: OwnerSource,
 }
 
 impl OpenAiStateOwnerFilter {
@@ -112,27 +148,50 @@ impl OpenAiStateOwnerFilter {
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] when `header` is empty or is not a valid HTTP
-    /// header name.
+    /// Returns [`FilterError`] when the selected mode is incomplete or invalid.
+    /// `policy` is intentionally rejected until the PPE integration is present,
+    /// so selecting it can never silently degrade to owner-only authorization.
     pub fn from_config(value: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let config: OpenAiStateOwnerConfig = parse_filter_config("openai_state_owner", value)?;
-        if config.header.is_empty() {
-            return Err("openai_state_owner: 'header' must not be empty".into());
-        }
-        let header = HeaderName::from_bytes(config.header.as_bytes())
-            .map_err(|e| format!("openai_state_owner: invalid 'header': {e}"))?;
-        Ok(Box::new(Self { header }))
+        let source = match config {
+            OpenAiStateOwnerConfig::SingleTenant { tenant_id } => {
+                let owner = OpenAiStateOwner::from_trusted_parts(
+                    tenant_id,
+                    SINGLE_TENANT_ISSUER.to_owned(),
+                    SINGLE_TENANT_SUBJECT.to_owned(),
+                )
+                .map_err(|error| format!("openai_state_owner: {}", error.client_message()))?;
+                OwnerSource::Static(owner)
+            },
+            OpenAiStateOwnerConfig::TrustedOwner { header } => OwnerSource::TrustedHeader(parse_header_name(&header)?),
+            OpenAiStateOwnerConfig::Policy { header } => {
+                // Validate the complete adapter config before reporting the
+                // reserved mode, so a future implementation inherits the same
+                // strict header contract.
+                drop(parse_header_name(&header)?);
+                return Err("openai_state_owner: 'policy' mode requires the PPE integration".into());
+            },
+        };
+        Ok(Box::new(Self { source }))
     }
 
     /// Resolve and install the owner, rejecting invalid or absent assertions.
     fn resolve(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) -> FilterAction {
+        self.queue_header_removal(ctx, body_phase);
+
         if ctx.extensions.get::<OpenAiStateOwner>().is_some() {
             return FilterAction::Continue;
         }
 
-        self.queue_header_removal(ctx, body_phase);
+        let header = match &self.source {
+            OwnerSource::Static(owner) => {
+                ctx.extensions.insert(owner.clone());
+                return FilterAction::Continue;
+            },
+            OwnerSource::TrustedHeader(header) => header,
+        };
 
-        let mut values = ctx.request.headers.get_all(&self.header).iter();
+        let mut values = ctx.request.headers.get_all(header).iter();
         let Some(value) = values.next() else {
             return reject_owner(401, "missing_state_owner", "trusted state owner assertion is required");
         };
@@ -162,13 +221,24 @@ impl OpenAiStateOwnerFilter {
 
     /// Queue removal using the mutation channel appropriate for the lifecycle.
     fn queue_header_removal(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) {
+        let OwnerSource::TrustedHeader(header) = &self.source else {
+            return;
+        };
         if body_phase {
             ctx.pre_read_mutations
-                .push(TrustedHeaderMutation::Remove(self.header.clone()));
+                .push(TrustedHeaderMutation::Remove(header.clone()));
         } else {
-            ctx.request_headers_to_remove.push(self.header.clone());
+            ctx.request_headers_to_remove.push(header.clone());
         }
     }
+}
+
+/// Parse a nonempty assertion header name.
+fn parse_header_name(header: &str) -> Result<HeaderName, FilterError> {
+    if header.is_empty() {
+        return Err("openai_state_owner: 'header' must not be empty".into());
+    }
+    HeaderName::from_bytes(header.as_bytes()).map_err(|e| format!("openai_state_owner: invalid 'header': {e}").into())
 }
 
 #[async_trait]
