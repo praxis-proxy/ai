@@ -47,6 +47,7 @@ LLM_KATAN_API_KEY = os.environ.get(
 )
 LLM_KATAN_MODEL = os.environ.get("LLM_KATAN_MODEL", "llm-katan-echo")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
+CONFIG_PATH = "examples/configs/anthropic/request-validate.yaml"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -95,42 +96,39 @@ def _llm_katan_reachable() -> bool:
 
 
 def _write_config(proxy_port: int) -> str:
+    """Patch the shipped request-validate example for testing.
+
+    Exercises the real example config (per repo test requirements) with
+    only retargeting — listener at a free port, backend at llm-katan —
+    mirroring _write_file_search_chat_config in the OpenAI SDK tests.
+    The example's format+validate chain is what
+    test_malformed_json_rejected asserts: the proxy, not the backend,
+    rejects malformed bodies with invalid_request_error.
+    """
     host, port, tls = _parse_llm_katan_url()
-    tls_block = f"""
+    with open(CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{proxy_port}")
+
+    tls_block = (
+        f'''\n
             tls:
-              sni: "{host}" """ if tls else ""
-    # Inline config: no matching example config exists for the
-    # format+validate+protocol+token_count pipeline used here.
-    config = f"""\
-listeners:
-  - name: test
-    address: "127.0.0.1:{proxy_port}"
-    filter_chains: [anthropic]
+              sni: "{host}"'''
+        if tls
+        else ""
+    )
+    replaced = config.replace(
+        '          - name: "anthropic-backend"\n'
+        "            endpoints:\n"
+        '              - "127.0.0.1:3001"',
+        '          - name: "anthropic-backend"\n'
+        "            endpoints:\n"
+        f'              - "{host}:{port}"{tls_block}',
+    )
+    assert replaced != config, f"example drift: backend block not found in {CONFIG_PATH}"
+    config = replaced
 
-filter_chains:
-  - name: anthropic
-    filters:
-      - filter: anthropic_messages_format
-        on_invalid: continue
-      - filter: anthropic_validate
-      - filter: anthropic_messages_protocol
-        default_version: "2023-06-01"
-      - filter: token_count
-        provider: anthropic
-      - filter: token_usage_headers
-      - filter: router
-        routes:
-          - path_prefix: "/"
-            cluster: llm-katan
-      - filter: load_balancer
-        clusters:
-          - name: llm-katan
-            endpoints:
-              - "{host}:{port}"{tls_block}
-
-insecure_options:
-  allow_private_endpoints: true # llm-katan typically runs on localhost
-"""
     fd, path = tempfile.mkstemp(suffix=".yaml")
     with os.fdopen(fd, "w") as f:
         f.write(config)
