@@ -220,10 +220,16 @@ fn parse_display_url(server_url: &str) -> McpDisplayUrl {
 /// `previous_tools` cache in `ResponsesState` prevents redundant
 /// calls across request continuations.
 ///
+/// The transport is size-bounded: `initialize` and `tools/list`
+/// bodies are rejected before deserialization once they cross the
+/// control-response ceiling, so an untrusted server cannot exhaust
+/// proxy memory with an oversized response. `max_tools` remains a
+/// second, post-deserialization limit on the tool *count*.
+///
 /// # Errors
 ///
-/// Returns [`McpClientError`] on connection failure, timeout, or
-/// invalid server response.
+/// Returns [`McpClientError`] on connection failure, timeout, an
+/// oversized response, or an otherwise invalid server response.
 #[expect(clippy::too_many_arguments, reason = "allow_loopback extends the existing param set")]
 pub(crate) async fn list_tools(
     server_url: &str,
@@ -237,9 +243,15 @@ pub(crate) async fn list_tools(
 
     let work = async {
         let resolved = resolve_and_validate(server_url, timeout, allow_loopback).await?;
+        // Bound `initialize` and `tools/list` bodies before deserialization.
+        // Without this an untrusted server could return an arbitrarily large
+        // response that is buffered in full before `max_tools` (a count-only
+        // limit) is ever evaluated, exhausting proxy memory under concurrency.
+        let bounded_client = BoundedMcpHttpClient::control_only(build_pinned_client(&resolved)?);
+        let max_sse_event_size = bounded_client.max_sse_event_size();
         let transport = StreamableHttpClientTransport::with_client(
-            build_pinned_client(&resolved)?,
-            build_transport_config(server_url, headers, authorization)?,
+            bounded_client,
+            build_transport_config(server_url, headers, authorization)?.max_sse_event_size(max_sse_event_size),
         );
         let display_url = resolved.display_url;
         let client = Box::pin(().serve(transport))

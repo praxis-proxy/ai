@@ -1143,3 +1143,79 @@ async fn list_tools_cumulative_pagination_timeout() {
     let msg = err.to_string();
     assert!(msg.contains("timed out"), "error should mention timeout: {msg}");
 }
+
+/// MCP server whose `tools/list` returns a single tool carrying an oversized
+/// description, used to prove `list_tools` bounds the response body before it
+/// is buffered and deserialized.
+#[derive(Debug, Clone)]
+struct OversizedListToolsMcpServer {
+    /// Byte length of the description attached to the one returned tool.
+    description_bytes: usize,
+}
+
+impl ServerHandler for OversizedListToolsMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let tool = rmcp::model::Tool::new(
+            "dummy".to_owned(),
+            "x".repeat(self.description_bytes),
+            std::sync::Arc::new(serde_json::Map::new()),
+        );
+        Ok(rmcp::model::ListToolsResult::with_all_items(vec![tool]))
+    }
+}
+
+async fn start_oversized_list_mcp_server(description_bytes: usize) -> (String, tokio_util::sync::CancellationToken) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+
+    let service: StreamableHttpService<OversizedListToolsMcpServer, LocalSessionManager> = StreamableHttpService::new(
+        move || Ok(OversizedListToolsMcpServer { description_bytes }),
+        std::sync::Arc::default(),
+        config,
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+
+    (format!("http://{addr}/mcp"), ct)
+}
+
+#[tokio::test]
+async fn list_tools_rejects_oversized_response() {
+    // A single tool whose description alone dwarfs the 1 MiB control-response
+    // ceiling. `max_tools` caps only the tool *count* (here just 1), so before
+    // the transport was size-bounded the entire body was downloaded and
+    // deserialized regardless — the memory-exhaustion vector this guards.
+    let (url, ct) = start_oversized_list_mcp_server(2 * 1024 * 1024).await;
+    let result = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 128, true).await;
+    ct.cancel();
+
+    let err = result.expect_err("oversized tools/list response must be rejected before buffering");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tools/list failed"),
+        "oversized response should surface as a tools/list failure: {msg}"
+    );
+}

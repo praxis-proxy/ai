@@ -48,6 +48,20 @@ impl BoundedMcpHttpClient {
         }
     }
 
+    /// Wrap a pinned reqwest client for the control-plane exchanges performed
+    /// by [`list_tools`](super::list_tools): `initialize` and `tools/list`.
+    ///
+    /// No `tools/call` result flows over this transport, so every response —
+    /// JSON body, per-event SSE, and the session GET stream — is bounded to
+    /// [`MAX_CONTROL_RESPONSE_BYTES`] before deserialization. The semantic
+    /// `max_tools` count check still applies after decoding as a second limit.
+    pub(super) fn control_only(inner: reqwest::Client) -> Self {
+        Self {
+            inner,
+            max_tool_response_bytes: MAX_CONTROL_RESPONSE_BYTES,
+        }
+    }
+
     /// Largest SSE event accepted by the underlying RMCP transport.
     pub(super) fn max_sse_event_size(&self) -> usize {
         self.max_tool_response_bytes.max(MAX_CONTROL_RESPONSE_BYTES)
@@ -592,6 +606,34 @@ mod tests {
             client.max_sse_event_size(),
             MAX_CONTROL_RESPONSE_BYTES,
             "session GET delivery must retain the control-event allowance"
+        );
+    }
+
+    #[test]
+    fn control_only_bounds_every_response_to_the_control_ceiling() {
+        let client = BoundedMcpHttpClient::control_only(reqwest::Client::new());
+        let initialize: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize",
+            "params":{"protocolVersion":"2025-03-26", "capabilities":{}, "clientInfo":{"name":"test", "version":"1"}}
+        }))
+        .expect("initialize request should deserialize");
+        let list: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc":"2.0", "id":2, "method":"tools/list", "params":{}
+        }))
+        .expect("tools/list request should deserialize");
+
+        // No tool-result allowance is granted: initialize, tools/list, and even
+        // an (unreachable) tools/call are all pinned to the control ceiling, and
+        // the session GET stream inherits the same bound.
+        assert_eq!(
+            client.response_limit(&initialize, usize::MAX),
+            MAX_CONTROL_RESPONSE_BYTES
+        );
+        assert_eq!(client.response_limit(&list, usize::MAX), MAX_CONTROL_RESPONSE_BYTES);
+        assert_eq!(
+            client.max_sse_event_size(),
+            MAX_CONTROL_RESPONSE_BYTES,
+            "list_tools transport must bound the session GET stream to the control ceiling, not rmcp's 16 MiB default"
         );
     }
 
