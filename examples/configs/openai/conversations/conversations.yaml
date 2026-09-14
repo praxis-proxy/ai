@@ -11,6 +11,10 @@
 #
 # Usage:
 #   cargo run -p praxis-ai-proxy -- -c examples/configs/openai/conversations/conversations.yaml
+#
+# This local example deliberately uses one shared owner. Deployments with
+# multiple authenticated users must use `trusted_owner`; see the
+# `openai/responses/state-ownership.yaml` example.
 
 listeners:
   - name: conversations-gateway

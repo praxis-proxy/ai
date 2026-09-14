@@ -31,15 +31,18 @@
 #   # Streaming with persistence (store defaults to true)
 #   curl -N http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
+#     -H "x-authenticated-state-owner: v1.<base64url assertion>" \
 #     -d '{"model":"Qwen/Qwen3-0.6B","input":"Say hello","stream":true}'
 #
 #   # Non-streaming (still persisted via the buffered path)
 #   curl http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
+#     -H "x-authenticated-state-owner: v1.<base64url assertion>" \
 #     -d '{"model":"Qwen/Qwen3-0.6B","input":"Say hello"}'
 #
 #   # Retrieve stored response
-#   curl http://localhost:8080/v1/responses/<response-id>
+#   curl http://localhost:8080/v1/responses/<response-id> \
+#     -H "x-authenticated-state-owner: v1.<base64url assertion>"
 #
 # Requires the ai-inference feature:
 #   cargo build -p praxis --features ai-inference
@@ -52,6 +55,10 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
+      - filter: state_owner
+        mode: trusted_owner
+        header: x-authenticated-state-owner
+
       - filter: openai_responses_format
         on_invalid: reject
         headers:

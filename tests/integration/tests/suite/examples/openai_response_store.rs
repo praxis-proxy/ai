@@ -73,7 +73,7 @@ async fn response_store_persists_response_to_sqlite() {
     let model: String = row.get("model");
 
     assert_eq!(id, "resp_abc", "persisted id should match response");
-    assert_eq!(tenant_id, "default", "default tenant should be used");
+    assert_eq!(tenant_id, "local", "configured single-tenant namespace should be used");
     assert_eq!(created_at, 1000, "persisted created_at should match response");
     assert_eq!(model, "gpt-4.1", "persisted model should match response");
 

@@ -1099,6 +1099,18 @@ def openai_client(praxis_proxy):
 
 
 @pytest.fixture(scope="session")
+def other_owner_openai_client(praxis_proxy):
+    """Return a same-tenant Responses client with another subject."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
+        api_key="test",
+        default_headers={**TRUSTED_OWNER_HEADERS, "x-auth-user": "other-test-user"},
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
 def irr_streaming_client(irr_streaming_proxy):
     """Return an OpenAI client using the terminal-streaming IRR proxy."""
     return OpenAI(
@@ -1232,6 +1244,33 @@ class TestOpenAIResponsesVLLM:
         assert retrieved.status == "completed"
         assert retrieved.output_text == response.output_text
         _assert_usage(retrieved.usage)
+
+    def test_same_tenant_other_owner_cannot_access_response(
+        self, openai_client, other_owner_openai_client
+    ):
+        response = openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: OWNER-PRIVATE /no_think",
+            temperature=0,
+            store=True,
+            max_output_tokens=128,
+        )
+
+        with pytest.raises(NotFoundError):
+            other_owner_openai_client.responses.retrieve(response.id)
+        with pytest.raises(NotFoundError):
+            other_owner_openai_client.responses.input_items.list(response.id)
+        with pytest.raises(NotFoundError):
+            other_owner_openai_client.responses.delete(response.id)
+        with pytest.raises(BadRequestError):
+            other_owner_openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="This must not use another owner's state.",
+                previous_response_id=response.id,
+                store=True,
+            )
+
+        assert openai_client.responses.retrieve(response.id).id == response.id
 
     def test_stored_input_items_pagination_and_delete(self, openai_client):
         response = openai_client.responses.create(

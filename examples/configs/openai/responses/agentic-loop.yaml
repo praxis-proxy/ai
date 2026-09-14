@@ -29,6 +29,7 @@
 #   Filters listed first in the YAML run last in the response phase.
 #
 # Pipeline ordering (pre-IRR, runs once):
+#   0. state_owner — installs the explicit shared local owner
 #   1. openai_responses_format — classifies body, promotes metadata
 #   2. openai_responses_validate — validates parameters, generates IDs
 #   3. openai_response_store — registers the store backend
@@ -152,6 +153,10 @@ listeners:
 filter_chains:
   - name: agentic-pipeline
     filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: local
+
       - filter: openai_responses_format
         on_invalid: reject
         headers:

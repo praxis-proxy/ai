@@ -684,7 +684,10 @@ async fn compact_explicit_endpoint() {
 
     let tenant_id: String = row.get("tenant_id");
     let model: String = row.get("model");
-    assert_eq!(tenant_id, "default", "compaction record should use the default tenant");
+    assert_eq!(
+        tenant_id, "local",
+        "compaction record should use the configured local owner"
+    );
     assert_eq!(model, "gpt-4.1", "compaction record should persist the request model");
 
     let stored_object: serde_json::Value =

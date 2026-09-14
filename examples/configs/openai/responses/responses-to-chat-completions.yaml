@@ -5,6 +5,7 @@
 # /v1/chat/completions.
 #
 # Request order:
+#   0. state_owner installs the explicit shared local owner.
 #   1. openai_responses_format classifies the client request.
 #   2. openai_responses_validate performs the canonical JSON parse and
 #      creates ResponsesState for downstream enrichment and translation.
@@ -43,6 +44,10 @@ listeners:
 filter_chains:
   - name: responses-chat-translation
     filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: local
+
       - filter: openai_responses_format
         on_invalid: reject
         headers:

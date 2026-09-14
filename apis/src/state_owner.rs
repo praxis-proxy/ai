@@ -152,9 +152,10 @@ pub fn project_state_owner(parent: &RequestExtensions, child: &mut RequestExtens
 /// Request-driven persisted-state filters fail closed when the security filter
 /// is absent or incorrectly ordered.
 pub(crate) fn require_state_owner<'a>(ctx: &'a HttpFilterContext<'_>) -> Result<&'a StateOwner, FilterAction> {
-    ctx.extensions
-        .get::<StateOwner>()
-        .ok_or_else(|| reject_owner(401, "missing_state_owner", "trusted state owner assertion is required"))
+    ctx.extensions.get::<StateOwner>().ok_or_else(|| {
+        log_owner_decision("deny", "request_context", "missing_owner");
+        reject_owner(401, "missing_state_owner", "trusted state owner assertion is required")
+    })
 }
 
 /// Configuration for [`StateOwnerFilter`].
@@ -370,10 +371,10 @@ impl StateOwnerFilter {
             return FilterAction::Continue;
         }
 
-        let owner = match &self.source {
-            OwnerSource::Static(owner) => owner.clone(),
+        let (owner, source) = match &self.source {
+            OwnerSource::Static(owner) => (owner.clone(), "single_tenant"),
             OwnerSource::TrustedHeader(header) => match resolve_trusted_header(ctx, header, body_phase) {
-                Ok(owner) => owner,
+                Ok(owner) => (owner, "trusted_header"),
                 Err(action) => return action,
             },
             OwnerSource::TrustedComponents {
@@ -381,7 +382,7 @@ impl StateOwnerFilter {
                 issuer,
                 subject,
             } => match resolve_trusted_components(ctx, tenant, issuer, subject, body_phase) {
-                Ok(owner) => owner,
+                Ok(owner) => (owner, "trusted_headers"),
                 Err(action) => return action,
             },
         };
@@ -389,6 +390,7 @@ impl StateOwnerFilter {
         ctx.extensions
             .insert(StateOwnerIngressHeaders(Arc::clone(&self.ingress_headers)));
         self.queue_header_removal(ctx, body_phase);
+        log_owner_decision("allow", source, "valid");
         FilterAction::Continue
     }
 
@@ -463,6 +465,7 @@ fn resolve_trusted_header(
 ) -> Result<StateOwner, FilterAction> {
     let value = exactly_one_header_value(ctx, header, body_phase)?;
     if value.as_bytes().len() > MAX_ASSERTION_BYTES {
+        log_owner_decision("deny", "trusted_header", "oversized");
         return Err(reject_owner(
             400,
             "invalid_state_owner",
@@ -470,6 +473,7 @@ fn resolve_trusted_header(
         ));
     }
     let Ok(value) = value.to_str() else {
+        log_owner_decision("deny", "trusted_header", "non_text");
         return Err(reject_owner(
             400,
             "invalid_state_owner",
@@ -479,7 +483,7 @@ fn resolve_trusted_header(
     match decode_assertion(value) {
         Ok(owner) => Ok(owner),
         Err(error) => {
-            tracing::debug!(reason = error.category(), "rejected trusted state owner assertion");
+            log_owner_decision("deny", "trusted_header", error.category());
             Err(reject_owner(400, "invalid_state_owner", error.client_message()))
         },
     }
@@ -500,6 +504,7 @@ fn resolve_trusted_components(
     let issuer = resolve_owner_component(ctx, "issuer", issuer, body_phase)?;
     let subject = resolve_owner_component(ctx, "subject", subject, body_phase)?;
     StateOwner::from_trusted_parts(tenant_id, issuer, subject).map_err(|error| {
+        log_owner_decision("deny", "trusted_headers", "invalid_component");
         let error = OwnerAssertionError::InvalidComponent(error.component());
         reject_owner(400, "invalid_state_owner", error.client_message())
     })
@@ -519,6 +524,7 @@ fn resolve_owner_component(
 
     let value = exactly_one_component_header_value(ctx, component, header, body_phase)?;
     let Ok(value) = value.to_str() else {
+        log_owner_decision("deny", "trusted_headers", "non_text");
         return Err(reject_owner(
             400,
             "invalid_state_owner",
@@ -526,6 +532,7 @@ fn resolve_owner_component(
         ));
     };
     validate_component(component, value).map_err(|error| {
+        log_owner_decision("deny", "trusted_headers", "invalid_component");
         let error = OwnerAssertionError::InvalidComponent(error.component());
         reject_owner(400, "invalid_state_owner", error.client_message())
     })?;
@@ -541,6 +548,7 @@ fn exactly_one_component_header_value(
 ) -> Result<http::HeaderValue, FilterAction> {
     let mut values = effective_owner_header_values(ctx, header, body_phase).into_iter();
     let Some(value) = values.next() else {
+        log_owner_decision("deny", "trusted_headers", "missing");
         return Err(reject_owner(
             401,
             "missing_state_owner",
@@ -548,6 +556,7 @@ fn exactly_one_component_header_value(
         ));
     };
     if values.next().is_some() {
+        log_owner_decision("deny", "trusted_headers", "duplicate");
         return Err(reject_owner(
             400,
             "invalid_state_owner",
@@ -565,6 +574,7 @@ fn exactly_one_header_value(
 ) -> Result<http::HeaderValue, FilterAction> {
     let mut values = effective_owner_header_values(ctx, header, body_phase).into_iter();
     let Some(value) = values.next() else {
+        log_owner_decision("deny", "trusted_header", "missing");
         return Err(reject_owner(
             401,
             "missing_state_owner",
@@ -572,6 +582,7 @@ fn exactly_one_header_value(
         ));
     };
     if values.next().is_some() {
+        log_owner_decision("deny", "trusted_header", "duplicate");
         return Err(reject_owner(
             400,
             "invalid_state_owner",
@@ -786,4 +797,9 @@ pub(crate) fn reject_owner(status: u16, code: &str, message: &str) -> FilterActi
             .with_header("content-type", "application/json")
             .with_body(serde_json::to_vec(&body).unwrap_or_default()),
     )
+}
+
+/// Emit only low-cardinality decision categories, never identity contents.
+fn log_owner_decision(outcome: &'static str, source: &'static str, reason: &'static str) {
+    tracing::debug!(outcome, source, reason, "state owner decision");
 }
