@@ -98,9 +98,10 @@ pub(crate) fn run(args: &Args) {
 struct ExampleEntry {
     /// One-line description extracted from the header comment.
     description: String,
-    /// Filename only (e.g. `full-flow.yaml`).
+    /// Filename only (e.g. `full-flow-agentic.yaml`).
     filename: String,
-    /// Relative link path from `examples/` (e.g. `configs/ai/full-flow.yaml`).
+    /// Relative link path from `examples/` (e.g.
+    /// `configs/openai/responses/full-flow-agentic.yaml`).
     link_path: String,
 }
 

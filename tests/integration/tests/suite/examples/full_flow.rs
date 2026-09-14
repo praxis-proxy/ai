@@ -8,8 +8,8 @@ use std::{collections::HashMap, time::Duration};
 use futures::{SinkExt as _, StreamExt as _};
 use praxis_test_utils::{
     Backend, CapturedWsMessage, TempSqlite, WsBackendEvent, WsServerAction, example_config_path, free_port, http_get,
-    http_send, json_post, load_example_config, parse_body, parse_header, parse_status, patch_yaml,
-    start_backend_with_shutdown, start_echo_backend, start_proxy, start_scripted_websocket_backend,
+    http_send, json_post, parse_body, parse_header, parse_status, patch_yaml, start_backend_with_shutdown,
+    start_echo_backend, start_proxy, start_scripted_websocket_backend,
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
@@ -64,10 +64,12 @@ fn load_full_flow_config_with_db(
     db: &TempSqlite,
     port_map: &HashMap<&str, u16>,
 ) -> praxis_core::config::Config {
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        &yaml
+            .replace("sqlite://responses.db?mode=rwc", db.url())
+            .replace("${WEB_SEARCH_API_KEY}", "test-key"),
         proxy_port,
         port_map,
     );
@@ -85,7 +87,7 @@ async fn full_flow_resolves_rehydrated_files_before_proxy() {
     let proxy_port = free_port();
     let db = TempSqlite::new("full_flow_file_resolve");
 
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml
@@ -247,11 +249,12 @@ fn full_flow_stateless_valid_request_reaches_same_backend() {
 fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
     let backend_guard = start_backend_with_shutdown("inference-backend");
     let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_chat_body_404");
 
-    let config = load_example_config(
-        "openai/responses/full-flow.yaml",
+    let config = load_full_flow_config_with_db(
         proxy_port,
-        HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
     );
     let proxy = start_proxy(&config);
 
@@ -263,10 +266,46 @@ fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
         ),
     );
 
+    // The bypass carrier's `unless` gate is a positive allow-list of one
+    // format: a Chat Completions body is not classified openai_responses, so it
+    // runs the carrier and hits the bypass route-miss (no WebSocket Upgrade
+    // header on POST /v1/responses) rather than reaching the IRR.
     assert_eq!(
         parse_status(&raw),
         404,
-        "non-Responses body should not match the format-constrained route"
+        "a Chat Completions body must not match the format-constrained route"
+    );
+}
+
+#[test]
+fn full_flow_anthropic_messages_body_on_responses_path_does_not_reach_backend() {
+    let backend_guard = start_backend_with_shutdown("inference-backend");
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_anthropic_body_404");
+
+    let config = load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    // An Anthropic Messages body posted to /v1/responses is classified
+    // anthropic_messages, not openai_responses. The same allow-list gate that
+    // rejects a Chat Completions body must reject this one — the catch-all is
+    // structural (allow only openai_responses), not a per-format reject rule.
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"claude-3-5-sonnet","max_tokens":16,"messages":[{"role":"user","content":"Hi"}]}"#,
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        404,
+        "an Anthropic Messages body must not match the format-constrained route"
     );
 }
 
@@ -372,7 +411,7 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_prev");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -453,7 +492,7 @@ async fn full_flow_previous_response_id_restored_in_client_response() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_prev_restore");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -527,7 +566,7 @@ async fn full_flow_previous_response_id_restored_in_streaming_response() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_prev_restore_stream");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -614,7 +653,7 @@ async fn full_flow_encoded_response_passes_through_untouched() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_encoded_passthrough");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -676,17 +715,20 @@ async fn full_flow_encoded_response_passes_through_untouched() {
 }
 
 /// A rehydrated turn whose backend response carries a body validator (`ETag`,
-/// digest, `Last-Modified`, ...) must pass through unrewritten: those headers
-/// describe the exact upstream bytes and cannot survive a re-serialization, but
-/// the proxy commits response headers before it sees the body, so it declines the
-/// response at eligibility instead of stripping validators and shipping a body
-/// they no longer match. The result is a byte-identical passthrough with the
-/// validators intact — the cosmetic `previous_response_id` echo is forgone rather
-/// than trading it for a mismatched validator (regression test for the issue #932
-/// stale-validator finding and its follow-up: never drop a validator from an
-/// unrewritten body).
+/// digest, `Last-Modified`, ...) must never ship that validator alongside a body
+/// it no longer matches. Under the unified agentic gateway the IRR's
+/// openai_agentic_loop is the sole finalizer: it re-serializes the buffered
+/// `object: response` body to restore the cosmetic `previous_response_id` echo,
+/// and in doing so it correctly DROPS the now-invalid `ETag` rather than leaving
+/// a stale validator on rewritten bytes. Unrelated caching-policy headers that do
+/// not describe the exact bytes (`Cache-Control`) survive. This is the same
+/// stale-validator invariant the pre-IRR pipeline satisfied by declining the
+/// rewrite entirely; the agentic loop satisfies it by removing the validator when
+/// it takes ownership of the body (regression test for the issue #932
+/// stale-validator finding: never ship a validator that no longer matches the
+/// body).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn full_flow_response_with_validators_passes_through_unrewritten() {
+async fn full_flow_response_with_validators_drops_stale_validator_on_rewrite() {
     // Turn 1: store a first response so turn 2 rehydrates history.
     let backend_guard = Backend::fixed(FIRST_RESPONSE_JSON)
         .header("content-type", "application/json")
@@ -694,7 +736,7 @@ async fn full_flow_response_with_validators_passes_through_unrewritten() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_validators_passthrough");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -714,8 +756,9 @@ async fn full_flow_response_with_validators_passes_through_unrewritten() {
     drop(backend_guard);
 
     // Turn 2: the backend echoes `previous_response_id: null` and carries an
-    // `ETag` validator plus an unrelated `Cache-Control` policy header. The ETag
-    // makes the response ineligible, so it is passed through untouched.
+    // `ETag` validator plus an unrelated `Cache-Control` policy header. The
+    // agentic loop finalizes the body (restoring the echo), so the ETag — which
+    // described the pre-rewrite bytes — is dropped while Cache-Control survives.
     let backend_guard2 = Backend::fixed(SECOND_RESPONSE_JSON)
         .header("content-type", "application/json")
         .header("etag", "\"upstream-v1\"")
@@ -743,18 +786,18 @@ async fn full_flow_response_with_validators_passes_through_unrewritten() {
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw2)).expect("client response should be JSON");
     assert_eq!(
         response["previous_response_id"],
-        serde_json::Value::Null,
-        "a validator-bearing response is declined, so the backend's null id passes through unrewritten"
+        serde_json::json!("resp_first"),
+        "the agentic loop finalizes the body and restores the previous_response_id echo"
     );
     assert_eq!(
         parse_header(&raw2, "etag").as_deref(),
-        Some("\"upstream-v1\""),
-        "the upstream ETag must be preserved: the validator-bearing response is passed through untouched"
+        None,
+        "the ETag validator must be dropped when the loop re-serializes the body: a validator that no longer matches the shipped bytes must never survive the rewrite (issue #932)"
     );
     assert_eq!(
         parse_header(&raw2, "cache-control").as_deref(),
         Some("no-store"),
-        "unrelated caching-policy headers must be preserved"
+        "a caching-policy header does not describe the exact bytes and must survive the rewrite"
     );
 
     drop(proxy2);
@@ -1133,7 +1176,7 @@ fn ws_full_flow_config(
     ports: &HashMap<&str, u16>,
 ) -> (praxis_core::config::Config, TempSqlite) {
     let db = TempSqlite::new(test_name);
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml
         .replace("sqlite://responses.db?mode=rwc", db.url())

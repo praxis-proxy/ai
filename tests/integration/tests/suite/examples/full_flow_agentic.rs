@@ -22,7 +22,9 @@ fn load_full_flow_agentic_config(
     let db = TempSqlite::new("full_flow_agentic");
     let path = example_config_path("openai/responses/full-flow-agentic.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db.url());
+    let yaml = yaml
+        .replace("sqlite://responses.db?mode=rwc", db.url())
+        .replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(&yaml, proxy_port, port_map);
     let config = praxis_core::config::Config::from_yaml(&patched)
         .unwrap_or_else(|e| panic!("parse full-flow-agentic.yaml: {e}"));
@@ -155,17 +157,65 @@ fn full_flow_agentic_without_tools_passthrough() {
 }
 
 #[test]
-fn full_flow_agentic_rejects_non_responses_path() {
-    let backend =
-        start_backend_with_shutdown(r#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#);
+fn full_flow_agentic_non_responses_path_bypasses_irr() {
+    // A GET /v1/prompts request is not a classified `POST /v1/responses`
+    // create, so the carrier's `unless` gate does not skip it: it runs the
+    // bypass branch, whose router maps /v1/prompts to the prompts-api cluster
+    // (127.0.0.1:9998) and rejoins at `terminal`, forwarding directly upstream.
+    // Mapping that cluster to a live backend proves the B-shaped gateway routes
+    // dedicated-service traffic around the IRR rather than into it.
+    let backend = start_backend_with_shutdown(r#"{"object":"list","data":[]}"#);
     let proxy_port = free_port();
-    let (config, _db) = load_full_flow_agentic_config(proxy_port, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let (config, _db) = load_full_flow_agentic_config(proxy_port, &HashMap::from([("127.0.0.1:9998", backend.port())]));
     let proxy = start_proxy(&config);
 
     let raw = http_send(proxy.addr(), "GET /v1/prompts HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
 
-    let status = parse_status(&raw);
-    assert_ne!(status, 200, "non-responses path should not reach a backend: {raw}");
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "the prompts-api path should bypass the IRR and reach the prompts backend: {raw}"
+    );
+    assert_eq!(
+        parse_body(&raw),
+        r#"{"object":"list","data":[]}"#,
+        "the bypass branch should forward the prompts backend response verbatim"
+    );
+}
+
+#[test]
+fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
+    // The agentic IRR must execute every hosted tool the loop owner can
+    // assign: file_search, web_search, and MCP. Guard the inference step's
+    // filter set so a future edit cannot silently drop a dispatcher and leave
+    // the loop owner assigning calls no filter will execute.
+    let path = example_config_path("openai/responses/full-flow-agentic.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("config should be valid YAML");
+    let irr = config["filter_chains"][0]["filters"]
+        .as_sequence()
+        .expect("filter chain should contain filters")
+        .iter()
+        .find(|filter| filter["filter"].as_str() == Some("iterative_request_router"))
+        .expect("config should contain an iterative_request_router");
+    let step_filters: Vec<&str> = irr["steps"][0]["filters"]
+        .as_sequence()
+        .expect("IRR step should contain filters")
+        .iter()
+        .filter_map(|filter| filter["filter"].as_str())
+        .collect();
+
+    for dispatcher in [
+        "openai_web_search",
+        "openai_mcp_dispatch",
+        "openai_file_search_callout",
+        "openai_agentic_loop",
+    ] {
+        assert!(
+            step_filters.contains(&dispatcher),
+            "IRR inference step must contain {dispatcher}, found: {step_filters:?}"
+        );
+    }
 }
 
 #[test]
