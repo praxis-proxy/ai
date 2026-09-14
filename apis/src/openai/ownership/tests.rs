@@ -63,9 +63,8 @@ fn configuration_rejects_unknown_fields() {
 #[test]
 fn policy_mode_is_reserved_and_fails_configuration() {
     let value: serde_yaml::Value = serde_yaml::from_str("mode: policy\nheader: x-owner").unwrap();
-    let error = match OpenAiStateOwnerFilter::from_config(&value) {
-        Ok(_) => panic!("policy mode must remain unavailable without PPE"),
-        Err(error) => error,
+    let Err(error) = OpenAiStateOwnerFilter::from_config(&value) else {
+        panic!("policy mode must remain unavailable without PPE");
     };
     assert!(error.to_string().contains("requires the PPE integration"));
 }

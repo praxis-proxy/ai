@@ -190,30 +190,9 @@ impl OpenAiStateOwnerFilter {
             },
             OwnerSource::TrustedHeader(header) => header,
         };
-
-        let mut values = ctx.request.headers.get_all(header).iter();
-        let Some(value) = values.next() else {
-            return reject_owner(401, "missing_state_owner", "trusted state owner assertion is required");
-        };
-        if values.next().is_some() {
-            return reject_owner(
-                400,
-                "invalid_state_owner",
-                "trusted state owner assertion must appear exactly once",
-            );
-        }
-        if value.as_bytes().len() > MAX_ASSERTION_BYTES {
-            return reject_owner(400, "invalid_state_owner", "trusted state owner assertion is too large");
-        }
-        let Ok(value) = value.to_str() else {
-            return reject_owner(400, "invalid_state_owner", "trusted state owner assertion must be text");
-        };
-        let owner = match decode_assertion(value) {
+        let owner = match resolve_trusted_header(ctx, header) {
             Ok(owner) => owner,
-            Err(error) => {
-                tracing::debug!(reason = error.category(), "rejected trusted state owner assertion");
-                return reject_owner(400, "invalid_state_owner", error.client_message());
-            },
+            Err(action) => return action,
         };
         ctx.extensions.insert(owner);
         FilterAction::Continue
@@ -231,6 +210,55 @@ impl OpenAiStateOwnerFilter {
             ctx.request_headers_to_remove.push(header.clone());
         }
     }
+}
+
+/// Parse the trusted assertion header into a complete owner.
+fn resolve_trusted_header(ctx: &HttpFilterContext<'_>, header: &HeaderName) -> Result<OpenAiStateOwner, FilterAction> {
+    let value = exactly_one_header_value(ctx, header)?;
+    if value.as_bytes().len() > MAX_ASSERTION_BYTES {
+        return Err(reject_owner(
+            400,
+            "invalid_state_owner",
+            "trusted state owner assertion is too large",
+        ));
+    }
+    let Ok(value) = value.to_str() else {
+        return Err(reject_owner(
+            400,
+            "invalid_state_owner",
+            "trusted state owner assertion must be text",
+        ));
+    };
+    match decode_assertion(value) {
+        Ok(owner) => Ok(owner),
+        Err(error) => {
+            tracing::debug!(reason = error.category(), "rejected trusted state owner assertion");
+            Err(reject_owner(400, "invalid_state_owner", error.client_message()))
+        },
+    }
+}
+
+/// Require exactly one value for the configured assertion header.
+fn exactly_one_header_value<'a>(
+    ctx: &'a HttpFilterContext<'_>,
+    header: &HeaderName,
+) -> Result<&'a http::HeaderValue, FilterAction> {
+    let mut values = ctx.request.headers.get_all(header).iter();
+    let Some(value) = values.next() else {
+        return Err(reject_owner(
+            401,
+            "missing_state_owner",
+            "trusted state owner assertion is required",
+        ));
+    };
+    if values.next().is_some() {
+        return Err(reject_owner(
+            400,
+            "invalid_state_owner",
+            "trusted state owner assertion must appear exactly once",
+        ));
+    }
+    Ok(value)
 }
 
 /// Parse a nonempty assertion header name.
