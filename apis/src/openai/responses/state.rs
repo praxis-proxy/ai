@@ -393,6 +393,16 @@ pub(crate) struct ResponsesState {
     /// The constructed response object for the current iteration.
     pub response_object: serde_json::Value,
 
+    /// Prior streamed terminal response retained across request-side re-entry.
+    ///
+    /// `openai_stream_events` invalidates [`Self::response_object`] before the
+    /// next inference round so an upstream error cannot persist stale success.
+    /// A dispatcher can instead complete locally before that inference starts
+    /// (for example, an MCP approval or exhausted tool budget), so the prior
+    /// response metadata is moved here until the new upstream response begins.
+    /// Its output has already been drained into [`Self::accumulated_output`].
+    pub local_completion_response_template: serde_json::Value,
+
     /// Tool calls from the current inference response only.
     ///
     /// Cleared by `openai_agentic_loop` at the start of each iteration
@@ -604,6 +614,7 @@ impl Default for ResponsesState {
             request_body: serde_json::Value::Null,
             request_body_rebuild: RequestBodyRebuild::PreserveOriginal,
             response_object: serde_json::Value::Null,
+            local_completion_response_template: serde_json::Value::Null,
             tool_calls: Vec::new(),
             web_search_calls: Vec::new(),
             web_search_calls_executed: 0,

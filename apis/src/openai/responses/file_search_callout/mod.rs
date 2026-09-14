@@ -444,6 +444,7 @@ fn continuation_state_fits(
     for value in [
         &state.request_body,
         &state.response_object,
+        &state.local_completion_response_template,
         &state.tool_choice,
         &state.usage,
     ] {

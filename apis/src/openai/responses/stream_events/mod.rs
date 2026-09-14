@@ -166,11 +166,17 @@ impl OpenaiStreamEventsFilter {
         let (iteration, output_index_offset) = ctx.extensions.get_mut::<ResponsesState>().map_or((0, 0), |state| {
             let output_index_offset = u64::try_from(state.accumulated_output.len()).unwrap_or(u64::MAX);
             // Invalidate the previous round's terminal response object before a
-            // resumed round begins. Only this round's own terminal event may
-            // repopulate it; otherwise a provider `error` in the resumed round
-            // would leave the prior round's completed response live and let the
-            // store persist stale success as the logical result.
-            state.response_object = Value::Null;
+            // resumed round begins. Move it instead of dropping it: a request-side
+            // dispatcher can terminate locally (approval/tool limit) before a new
+            // upstream response exists and still needs the response metadata to
+            // encode `response.completed`. Once upstream response headers arrive,
+            // `on_response` drops this fallback so a later provider `error` cannot
+            // persist stale success as the logical result.
+            if state.response_object.is_object() {
+                state.local_completion_response_template = std::mem::take(&mut state.response_object);
+            } else {
+                state.response_object = Value::Null;
+            }
             (state.iteration, output_index_offset)
         });
         ctx.insert_filter_state(StreamEventsState {
@@ -330,6 +336,13 @@ impl HttpFilter for OpenaiStreamEventsFilter {
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if !Self::is_armed(ctx) {
             return Ok(FilterAction::Continue);
+        }
+
+        // A real upstream response now owns this round's terminal lifecycle.
+        // The request-side fallback is no longer reachable and retaining it
+        // could leave stale success metadata live after an upstream error.
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.local_completion_response_template = Value::Null;
         }
 
         if !is_success_sse_response(ctx) {
@@ -1337,6 +1350,9 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     let mut output = prepare_local_terminal_events(ctx);
     let state = ctx.extensions.get_mut::<ResponsesState>()?;
     let deferred_done = state.deferred_stream_done || parser_deferred_done;
+    if !state.response_object.is_object() {
+        state.response_object = std::mem::take(&mut state.local_completion_response_template);
+    }
     canonicalize_logical_response(state);
     if !state.response_object.is_object() {
         return None;

@@ -104,6 +104,47 @@ async fn deferred_tool_limit_completes_after_request_side_dispatchers() {
 }
 
 #[tokio::test]
+async fn streamed_tool_limit_completion_restores_reentry_response_template() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        deferred_tool_limit_completion: true,
+        deferred_stream_done: true,
+        request_body: json!({"stream": true}),
+        response_object: Value::Null,
+        local_completion_response_template: json!({
+            "id":"resp_limit", "object":"response", "status":"completed", "output":[]
+        }),
+        accumulated_output: vec![json!({
+            "type":"web_search_call", "id":"ws_rejected", "status":"failed",
+            "error":"max_tool_calls exhausted"
+        })],
+        ..ResponsesState::default()
+    });
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    let FilterAction::Reject(response) = action else {
+        panic!("the streaming tool-limit response must complete locally");
+    };
+    assert_eq!(response.status, 200);
+    let body = std::str::from_utf8(response.body.as_deref().unwrap()).unwrap();
+    assert!(
+        body.contains("event: response.completed"),
+        "the local stream must include a response.completed terminal: {body}"
+    );
+    assert!(
+        body.contains("\"id\":\"ws_rejected\""),
+        "the terminal snapshot must include accumulated output: {body}"
+    );
+    assert!(
+        body.ends_with("data: [DONE]\n\n"),
+        "the local stream must preserve the deferred done sentinel: {body}"
+    );
+}
+
+#[tokio::test]
 async fn deferred_mcp_approval_completes_after_sibling_dispatchers() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
@@ -129,6 +170,41 @@ async fn deferred_mcp_approval_completes_after_sibling_dispatchers() {
     assert_eq!(
         ctx.extensions.get::<ResponsesState>().unwrap().mcp_approval_state,
         McpApprovalState::None
+    );
+}
+
+#[tokio::test]
+async fn streamed_mcp_approval_completion_restores_reentry_response_template() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        mcp_approval_state: McpApprovalState::ApprovalPendingThenReturn,
+        request_body: json!({"stream": true}),
+        response_object: Value::Null,
+        local_completion_response_template: json!({
+            "id":"resp_approval", "object":"response", "status":"completed", "output":[]
+        }),
+        accumulated_output: vec![json!({
+            "type":"mcp_approval_request", "id":"approval_1", "name":"dangerous"
+        })],
+        ..ResponsesState::default()
+    });
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    let FilterAction::Reject(response) = action else {
+        panic!("the streaming approval response must complete locally");
+    };
+    assert_eq!(response.status, 200);
+    let body = std::str::from_utf8(response.body.as_deref().unwrap()).unwrap();
+    assert!(
+        body.contains("event: response.completed"),
+        "the local stream must include a response.completed terminal: {body}"
+    );
+    assert!(
+        body.contains("\"id\":\"approval_1\""),
+        "the terminal snapshot must include the approval request: {body}"
     );
 }
 

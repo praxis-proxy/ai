@@ -1756,3 +1756,27 @@ fn continuation_state_charges_provider_streamed_terminal_ids() {
         "a large observation set is charged and overflows the ceiling (P1 DoS bound)"
     );
 }
+
+#[test]
+fn continuation_state_charges_local_completion_response_template() {
+    let mut state = ResponsesState {
+        local_completion_response_template: json!({
+            "id": "resp_prior",
+            "object": "response",
+            "status": "completed",
+            "metadata": "x".repeat(128),
+            "output": []
+        }),
+        ..ResponsesState::default()
+    };
+    assert!(
+        !continuation_state_fits(0, &state, 64, 0),
+        "the re-entry response template must remain inside the continuation ceiling"
+    );
+
+    state.local_completion_response_template = Value::Null;
+    assert!(
+        continuation_state_fits(0, &state, 64, 0),
+        "clearing the response template must release its continuation-state charge"
+    );
+}

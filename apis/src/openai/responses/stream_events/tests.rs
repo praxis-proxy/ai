@@ -129,6 +129,42 @@ fn local_completion_encodes_canonical_logical_sse_terminal() {
 }
 
 #[test]
+fn reentry_arm_preserves_response_template_for_local_completion() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        logical_stream_response_id: Some("resp_logical".to_owned()),
+        accumulated_output: vec![json!({"type":"mcp_approval_request", "id":"approval_1"})],
+        response_object: json!({
+            "id":"resp_upstream", "object":"response", "status":"completed", "output":[]
+        }),
+        ..ResponsesState::default()
+    });
+
+    filter.arm(&mut ctx);
+
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .response_object
+            .is_null(),
+        "re-entry must invalidate the prior upstream terminal"
+    );
+    let encoded = encode_local_completion(&mut ctx).expect("the preserved response template should encode");
+    let encoded = std::str::from_utf8(&encoded).unwrap();
+    assert!(
+        encoded.contains("event: response.completed"),
+        "local completion must restore a terminal response after re-entry: {encoded}"
+    );
+    assert!(
+        encoded.contains("\"id\":\"approval_1\""),
+        "the restored terminal must contain accumulated output: {encoded}"
+    );
+}
+
+#[test]
 fn local_completion_preserves_deferred_done_sentinel() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -3812,6 +3848,12 @@ async fn on_response_disarms_for_non_sse_content_type() {
 #[tokio::test]
 async fn on_response_stays_armed_for_sse_with_charset() {
     let (filter, mut ctx) = make_armed_context();
+    ctx.extensions.insert(ResponsesState {
+        local_completion_response_template: json!({
+            "id":"resp_prior", "object":"response", "status":"completed", "output":[]
+        }),
+        ..ResponsesState::default()
+    });
 
     let resp = Box::leak(Box::new(crate::test_utils::make_response()));
     resp.headers.insert(
@@ -3825,6 +3867,14 @@ async fn on_response_stays_armed_for_sse_with_charset() {
     assert!(
         ctx.get_filter_state::<StreamEventsState>().is_some(),
         "filter should stay armed for text/event-stream with charset parameter"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .local_completion_response_template
+            .is_null(),
+        "upstream response headers make the request-side fallback unreachable"
     );
 }
 
