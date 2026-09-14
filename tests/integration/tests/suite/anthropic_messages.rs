@@ -13,6 +13,11 @@ use praxis_test_utils::{
     start_backend_with_shutdown, start_proxy,
 };
 
+/// A minimal streaming Anthropic Messages request body shared by the
+/// malformed-SSE and lone-`[DONE]` streaming transform tests.
+const STREAM_REQUEST: &str =
+    r#"{"model":"mock-model","messages":[{"role":"user","content":"hi"}],"max_tokens":64,"stream":true}"#;
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -256,6 +261,102 @@ fn streaming_tool_calls_exceeding_cap_fails_closed() {
     assert!(
         !body.contains("event: message_stop"),
         "exceeding max_tool_blocks should fail the stream closed before message_stop; body: {body}"
+    );
+}
+
+#[test]
+fn streaming_malformed_first_data_event_fails_closed() {
+    // The first upstream SSE data event is neither `[DONE]` nor valid JSON. The
+    // transform must fail closed rather than silently drop it: because the error
+    // is raised before any client bytes are committed, Praxis renders a
+    // well-formed Anthropic error envelope, and the client never observes a
+    // successful `message_stop` nor the raw malformed payload.
+    let backend = Backend::fixed("data: not-json\n\n")
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = Config::from_yaml(&transform_yaml(proxy_port, backend.port(), 5)).unwrap();
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &anthropic_post("/v1/messages", STREAM_REQUEST));
+    let body = parse_body(&raw);
+
+    assert!(
+        !body.contains("event: message_stop"),
+        "a malformed first data event must fail closed before message_stop; body: {body}"
+    );
+    assert!(
+        !body.contains("not-json"),
+        "the malformed upstream payload must not be forwarded to the client; body: {body}"
+    );
+    let data: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("client should receive a JSON error envelope, got {body}: {e}"));
+    assert_eq!(
+        data["type"], "error",
+        "fail-closed client body should be an error envelope"
+    );
+    assert_eq!(
+        data["error"]["type"], "api_error",
+        "error envelope should use the api_error type"
+    );
+}
+
+#[test]
+fn streaming_malformed_mid_stream_data_event_fails_closed() {
+    // A valid delta arrives first, then a malformed data event. Even with a
+    // successfully-transformed prefix, the malformed event must fail the whole
+    // stream closed: the client must never observe a successful `message_stop`,
+    // and the raw malformed payload must not leak downstream. (Delivery timing
+    // decides whether the client sees an error envelope or a truncated prefix;
+    // either way the terminal event never appears.)
+    let backend = Backend::chunked(vec![
+        "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\n"
+            .to_owned(),
+        "data: not-json\n\n".to_owned(),
+    ])
+    .header("content-type", "text/event-stream")
+    .header("cache-control", "no-cache")
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = Config::from_yaml(&transform_yaml(proxy_port, backend.port(), 5)).unwrap();
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &anthropic_post("/v1/messages", STREAM_REQUEST));
+    let body = parse_body(&raw);
+
+    assert!(
+        !body.contains("event: message_stop"),
+        "a malformed mid-stream data event must fail closed before message_stop; body: {body}"
+    );
+    assert!(
+        !body.contains("not-json"),
+        "the malformed upstream payload must not be forwarded to the client; body: {body}"
+    );
+}
+
+#[test]
+fn streaming_lone_done_yields_wellformed_stream() {
+    // A lone `[DONE]` with no preceding chunk must still produce a structurally
+    // valid Anthropic stream for the client: a synthesized `message_start`
+    // precedes the terminal `message_delta` and `message_stop`.
+    let backend = Backend::fixed("data: [DONE]\n\n")
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = Config::from_yaml(&transform_yaml(proxy_port, backend.port(), 5)).unwrap();
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(proxy.addr(), &anthropic_post("/v1/messages", STREAM_REQUEST));
+    let body = parse_body(&raw);
+
+    let start = body.find("event: message_start");
+    let delta = body.find("event: message_delta");
+    let stop = body.find("event: message_stop");
+    assert!(
+        matches!((start, delta, stop), (Some(s), Some(d), Some(t)) if s < d && d < t),
+        "lone [DONE] must yield message_start before message_delta before message_stop; body: {body}"
     );
 }
 
