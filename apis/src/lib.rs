@@ -135,6 +135,10 @@ pub(crate) mod test_utils {
         let mut registry = praxis_filter::FilterRegistry::with_builtins();
         praxis_filter::register_filters!(
             @register registry,
+            http "openai_state_owner" => crate::openai::OpenAiStateOwnerFilter::from_config
+        );
+        praxis_filter::register_filters!(
+            @register registry,
             http "openai_responses_format" => crate::openai::ResponsesFormatFilter::from_config
         );
         praxis_filter::register_filters!(

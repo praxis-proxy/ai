@@ -235,6 +235,7 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
 
 /// Register OpenAI Responses API request-path filters.
 fn register_openai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    register_openai_state_owner(registry);
     register_openai_responses_filters(registry, subrequest_client);
     praxis_filter::register_filters!(
         @register registry,
@@ -244,6 +245,20 @@ fn register_openai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
         @register registry,
         http "openai_operation" => praxis_ai_apis::openai::OpenaiOperationFilter::from_config
     );
+}
+
+/// Register the trusted OpenAI state owner adapter as security-critical.
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_openai_state_owner(registry: &mut FilterRegistry) {
+    registry
+        .register_with_class(
+            "openai_state_owner",
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(
+                praxis_ai_apis::openai::OpenAiStateOwnerFilter::from_config,
+            )),
+            praxis_filter::SecurityClass::Security,
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_state_owner'"));
 }
 
 /// Register OpenAI Responses API filters.
@@ -468,6 +483,7 @@ mod tests {
             "ai_guardrails",
             "identity_header_guard",
             "llmisvc_model_provider_resolver",
+            "openai_state_owner",
             "openai_responses_validate",
             "responses_to_chat_completions",
             "a2a",
