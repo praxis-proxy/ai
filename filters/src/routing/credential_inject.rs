@@ -12,14 +12,16 @@
 //!
 //! | Metadata key | Example value |
 //! |---|---|
-//! | `intelligent_route.credential.strategy` | `"bearer_token"` |
+//! | `intelligent_route.credential.strategy` | `"bearer_token"` or `"apikey"` |
 //! | `intelligent_route.credential.name` | `"my-api-secret"` |
 //! | `intelligent_route.credential.namespace` | `"grid-system"` |
 //! | `intelligent_route.credential.key` | `"token"` |
 //!
 //! This filter reads those keys, looks up the matching token in its configured
-//! credential map, removes the incoming `Authorization` value, and sets
-//! `Authorization: Bearer <token>` on the upstream request. The filter must
+//! credential map, removes the incoming `Authorization` and `x-api-key` values,
+//! and sets exactly one provider credential header on the upstream request:
+//! `Authorization: Bearer <token>` for `bearer_token`, or the raw token in the
+//! configured `header` (default `x-api-key`) for `apikey`. The filter must
 //! appear after the routing filter in the filter chain.
 //!
 //! # Behaviour
@@ -27,9 +29,10 @@
 //! | State | Action |
 //! |---|---|
 //! | No `intelligent_route.credential.name` metadata | No-op — candidate has no credential |
-//! | Metadata present, matching entry found | Inject `Authorization: Bearer <token>` |
+//! | Metadata present, matching entry found | Inject the configured credential header |
 //! | Metadata present, no matching entry | Reject 503 (fail closed) |
-//! | Strategy not `"bearer_token"` | Reject 503 (fail closed) |
+//! | Overlay strategy differs from the configured strategy | Reject 503 (fail closed) |
+//! | Strategy not `"bearer_token"` or `"apikey"` | Reject 503 (fail closed) |
 //!
 //! # Security
 //!
@@ -61,7 +64,8 @@
 //!   - name: other-secret
 //!     namespace: default
 //!     key: api-key
-//!     strategy: bearer_token
+//!     strategy: apikey            # raw token in a header instead of Authorization
+//!     header: x-api-key           # optional, defaults to x-api-key
 //!     env_var: OTHER_API_TOKEN    # token from environment variable
 //! ```
 //!
@@ -87,7 +91,8 @@ use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use super::metadata::{
-    CREDENTIAL_KEY, CREDENTIAL_NAME, CREDENTIAL_NAMESPACE, CREDENTIAL_STRATEGY, STRATEGY_BEARER_TOKEN,
+    CREDENTIAL_KEY, CREDENTIAL_NAME, CREDENTIAL_NAMESPACE, CREDENTIAL_STRATEGY, STRATEGY_APIKEY, STRATEGY_BEARER_TOKEN,
+    is_supported_strategy,
 };
 
 /// Maximum credential references accepted by one filter instance.
@@ -104,6 +109,9 @@ const MAX_TOKEN_BYTES: usize = 16 * 1024;
 
 /// Maximum bytes read to distinguish an exact-limit file from an oversized one.
 const MAX_TOKEN_READ_BYTES: u64 = 16 * 1024 + 1;
+
+/// Default injection header for the `apikey` strategy.
+const DEFAULT_APIKEY_HEADER: &str = "x-api-key";
 
 // -----------------------------------------------------------------------------
 // Config
@@ -130,9 +138,17 @@ struct CredentialEntryConfig {
     /// Key within `Secret.data` — must match `intelligent_route.credential.key`.
     key: String,
 
-    /// Credential strategy.  Currently only `"bearer_token"` is supported.
+    /// Credential strategy.  Supports `"bearer_token"` (injects
+    /// `Authorization: Bearer <token>`) and `"apikey"` (injects the raw token
+    /// into `header`).
     #[serde(default = "default_strategy")]
     strategy: String,
+
+    /// Injection header for `strategy: apikey`.  Defaults to `x-api-key`.
+    /// Mutually exclusive with `strategy: bearer_token`, which always injects
+    /// `Authorization`.
+    #[serde(default)]
+    header: Option<String>,
 
     /// Inline token value.  Mutually exclusive with `env_var` and `file`.
     #[serde(default)]
@@ -180,7 +196,14 @@ struct CredentialRef {
 /// Resolved credential ready for request-time injection.
 #[derive(Clone)]
 struct ResolvedCredential {
-    /// Full `Authorization` header value ("Bearer {token}"), zeroized on drop.
+    /// Strategy this credential injects under, cross-checked against the
+    /// strategy declared by the overlay candidate.
+    strategy: &'static str,
+
+    /// Header receiving the value (`Authorization`, or the configured apikey header).
+    header_name: HeaderName,
+
+    /// Complete header value ("Bearer {token}" or the raw token), zeroized on drop.
     ///
     /// A non-zeroized copy is created per-request for `HeaderValue`; it lives
     /// until the request context is dropped.  This is the same accepted residual
@@ -210,6 +233,10 @@ struct WatchedCredential {
     path: PathBuf,
     /// Secret reference used for safe diagnostics.
     reference: CredentialRef,
+    /// Injection strategy preserved so reloads rebuild the same header form.
+    strategy: &'static str,
+    /// Injection header preserved so reloads rebuild the same header form.
+    header_name: HeaderName,
     /// Snapshot published to requests.
     snapshot: Arc<ArcSwap<CredentialSnapshot>>,
 }
@@ -250,9 +277,10 @@ impl Drop for CredentialReloadHandle {
 ///
 /// Reads `intelligent_route.credential.*` filter metadata written by the preceding
 /// routing filter, looks up the configured token, removes caller authorization,
-/// and sets exactly one `Authorization: Bearer <token>` value. Token values are
-/// never written to metadata, traces, or error bodies. See the module
-/// documentation for the complete data flow and configuration.
+/// and sets exactly one provider credential header (a bearer `Authorization`
+/// value, or the raw token in the configured `header` for `apikey`). Token
+/// values are never written to metadata, traces, or error bodies. See the
+/// module documentation for the complete data flow and configuration.
 pub struct CredentialInjectFilter {
     /// Credential reference → resolved injectable credential.
     credentials: HashMap<CredentialRef, ConfiguredCredential>,
@@ -275,7 +303,8 @@ impl CredentialInjectFilter {
     /// - any entry has more than one token source (`value`, `env_var`, `file`) or none
     /// - any `env_var` is not set in the environment
     /// - any `file` does not exist, is unreadable, or is empty
-    /// - any strategy is not `"bearer_token"`
+    /// - any strategy is not `"bearer_token"` or `"apikey"`
+    /// - any entry sets `header` with the `bearer_token` strategy, or names an unparseable header
     /// - the assembled header value is not valid HTTP
     #[expect(
         clippy::too_many_lines,
@@ -294,6 +323,8 @@ impl CredentialInjectFilter {
         for entry in &cfg.credentials {
             validate_strategy(&entry.strategy)?;
             validate_credential_ref(entry)?;
+            let strategy = strategy_label(&entry.strategy);
+            let header_name = resolve_header_name(entry)?;
             let cred_ref = CredentialRef {
                 name: entry.name.clone(),
                 namespace: entry.namespace.clone(),
@@ -302,9 +333,9 @@ impl CredentialInjectFilter {
             let resolved = match (&entry.value, &entry.env_var, &entry.file) {
                 (None, None, Some(path)) => {
                     validate_bounded("file", path, MAX_SOURCE_LEN)?;
-                    resolve_file_credential(path, &cred_ref)?
+                    resolve_file_credential(path, &cred_ref, strategy, &header_name)?
                 },
-                _ => resolve_credential(entry)?,
+                _ => resolve_credential(entry, strategy, &header_name)?,
             };
             if credentials.contains_key(&cred_ref) {
                 return Err(format!(
@@ -320,6 +351,8 @@ impl CredentialInjectFilter {
                 watched.push(WatchedCredential {
                     path: PathBuf::from(path),
                     reference: cred_ref.clone(),
+                    strategy,
+                    header_name,
                     snapshot: Arc::clone(&snapshot),
                 });
             }
@@ -354,16 +387,16 @@ impl HttpFilter for CredentialInjectFilter {
             tracing::debug!("credential_inject: no selected credential; skipping");
             return Ok(FilterAction::Continue);
         };
-        let Ok(cred_ref) = selected else {
+        let Ok(selected) = selected else {
             return Ok(FilterAction::Reject(Rejection::status(503)));
         };
 
-        let Some(configured) = self.credentials.get(&cred_ref) else {
+        let Some(configured) = self.credentials.get(&selected.reference) else {
             // Log the reference identity (not the token) to assist debugging.
             tracing::debug!(
-                name = %cred_ref.name,
-                namespace = %cred_ref.namespace,
-                key = %cred_ref.key,
+                name = %selected.reference.name,
+                namespace = %selected.reference.namespace,
+                key = %selected.reference.key,
                 "credential_inject: no configured token for selected credential; failing closed"
             );
             return Ok(FilterAction::Reject(Rejection::status(503)));
@@ -377,19 +410,34 @@ impl HttpFilter for CredentialInjectFilter {
             return Ok(FilterAction::Reject(Rejection::status(503)));
         };
 
+        // The overlay candidate and the configured entry must agree on how this
+        // secret is injected. A producer/config disagreement fails closed
+        // rather than sending a bearer token where an apikey header is expected.
+        if cred.strategy != selected.strategy {
+            tracing::debug!(
+                name = %selected.reference.name,
+                namespace = %selected.reference.namespace,
+                key = %selected.reference.key,
+                "credential_inject: overlay strategy does not match configured strategy; failing closed"
+            );
+            return Ok(FilterAction::Reject(Rejection::status(503)));
+        }
+
         tracing::debug!(
-            name = %cred_ref.name,
-            namespace = %cred_ref.namespace,
-            key = %cred_ref.key,
-            "credential_inject: injecting bearer credential"
+            name = %selected.reference.name,
+            namespace = %selected.reference.namespace,
+            key = %selected.reference.key,
+            strategy = cred.strategy,
+            "credential_inject: injecting provider credential"
         );
 
         let header_value = HeaderValue::from_str(cred.header_value.as_str()).map_err(|e| -> FilterError {
-            format!("credential_inject: invalid resolved Authorization header: {e}").into()
+            format!("credential_inject: invalid resolved credential header: {e}").into()
         })?;
         ctx.request_headers_to_remove.push(AUTHORIZATION);
         ctx.request_headers_to_remove.push(HeaderName::from_static("x-api-key"));
-        ctx.request_headers_to_set.push((AUTHORIZATION, header_value));
+        ctx.request_headers_to_set
+            .push((cred.header_name.clone(), header_value));
 
         Ok(FilterAction::Continue)
     }
@@ -399,11 +447,19 @@ impl HttpFilter for CredentialInjectFilter {
 // Helpers
 // -----------------------------------------------------------------------------
 
+/// Credential reference selected by the routing filter, with its strategy.
+struct SelectedCredential {
+    /// Strategy declared by the selected route candidate.
+    strategy: &'static str,
+    /// Secret locator written by the routing filter.
+    reference: CredentialRef,
+}
+
 /// Read one complete credential reference from filter metadata.
 ///
 /// Absence of all four fields means that the selected route requires no
 /// credential. Any partial or unsupported reference fails closed.
-fn selected_credential_ref(ctx: &HttpFilterContext<'_>) -> Option<Result<CredentialRef, ()>> {
+fn selected_credential_ref(ctx: &HttpFilterContext<'_>) -> Option<Result<SelectedCredential, ()>> {
     let strategy = ctx.get_metadata(CREDENTIAL_STRATEGY);
     let name = ctx.get_metadata(CREDENTIAL_NAME);
     let namespace = ctx.get_metadata(CREDENTIAL_NAMESPACE);
@@ -412,7 +468,7 @@ fn selected_credential_ref(ctx: &HttpFilterContext<'_>) -> Option<Result<Credent
     if strategy.is_none() && name.is_none() && namespace.is_none() && key.is_none() {
         return None;
     }
-    if strategy != Some(STRATEGY_BEARER_TOKEN) || name.is_none() || namespace.is_none() || key.is_none() {
+    if !strategy.is_some_and(is_supported_strategy) || name.is_none() || namespace.is_none() || key.is_none() {
         tracing::debug!(
             strategy = strategy.unwrap_or("missing"),
             "credential_inject: incomplete or unsupported credential reference; failing closed"
@@ -420,23 +476,73 @@ fn selected_credential_ref(ctx: &HttpFilterContext<'_>) -> Option<Result<Credent
         return Some(Err(()));
     }
 
-    Some(Ok(CredentialRef {
-        name: name.unwrap_or_default().to_owned(),
-        namespace: namespace.unwrap_or_default().to_owned(),
-        key: key.unwrap_or_default().to_owned(),
+    Some(Ok(SelectedCredential {
+        // The guard above guarantees a supported strategy is present.
+        strategy: match strategy {
+            Some(STRATEGY_BEARER_TOKEN) => STRATEGY_BEARER_TOKEN,
+            _ => STRATEGY_APIKEY,
+        },
+        reference: CredentialRef {
+            name: name.unwrap_or_default().to_owned(),
+            namespace: namespace.unwrap_or_default().to_owned(),
+            key: key.unwrap_or_default().to_owned(),
+        },
     }))
 }
 
 /// Validate that the strategy is supported.
 fn validate_strategy(strategy: &str) -> Result<(), FilterError> {
-    if strategy == STRATEGY_BEARER_TOKEN {
+    if is_supported_strategy(strategy) {
         return Ok(());
     }
     Err(format!(
         "credential_inject: unsupported strategy '{strategy}' \
-         (only 'bearer_token' is currently supported)"
+         (supported strategies are 'bearer_token' and 'apikey')"
     )
     .into())
+}
+
+/// Map a validated strategy string to its static label.
+///
+/// Callers must run [`validate_strategy`] first; any other string maps to the
+/// `apikey` label.
+fn strategy_label(strategy: &str) -> &'static str {
+    if strategy == STRATEGY_BEARER_TOKEN {
+        STRATEGY_BEARER_TOKEN
+    } else {
+        STRATEGY_APIKEY
+    }
+}
+
+/// Determine the injection header for one configured entry.
+///
+/// `bearer_token` always injects `Authorization` and rejects a configured
+/// `header`; `apikey` injects the configured `header`, defaulting to
+/// `x-api-key`.
+fn resolve_header_name(entry: &CredentialEntryConfig) -> Result<HeaderName, FilterError> {
+    if entry.strategy == STRATEGY_BEARER_TOKEN {
+        if entry.header.is_some() {
+            return Err(format!(
+                "credential_inject: 'header' is not valid for strategy 'bearer_token' for '{}/{}/{}'",
+                entry.name, entry.namespace, entry.key
+            )
+            .into());
+        }
+        return Ok(AUTHORIZATION);
+    }
+    match &entry.header {
+        Some(header) => {
+            validate_bounded("header", header, MAX_SOURCE_LEN)?;
+            HeaderName::from_bytes(header.as_bytes()).map_err(|error| -> FilterError {
+                format!(
+                    "credential_inject: invalid header '{header}' for '{}/{}/{}': {error}",
+                    entry.name, entry.namespace, entry.key
+                )
+                .into()
+            })
+        },
+        None => Ok(HeaderName::from_static(DEFAULT_APIKEY_HEADER)),
+    }
 }
 
 /// Validate the bounded Secret locator fields used as the lookup key.
@@ -446,11 +552,27 @@ fn validate_credential_ref(entry: &CredentialEntryConfig) -> Result<(), FilterEr
     validate_bounded("key", &entry.key, MAX_REFERENCE_LEN)
 }
 
+/// Assemble the complete injection header value for one strategy.
+///
+/// `bearer_token` produces the `Authorization` form; every other (validated)
+/// strategy injects the raw token.
+fn assemble_header_value(strategy: &str, token: &str) -> String {
+    if strategy == STRATEGY_BEARER_TOKEN {
+        format!("Bearer {token}")
+    } else {
+        token.to_owned()
+    }
+}
+
 /// Resolve and validate one configured credential.
-fn resolve_credential(entry: &CredentialEntryConfig) -> Result<ResolvedCredential, FilterError> {
+fn resolve_credential(
+    entry: &CredentialEntryConfig,
+    strategy: &'static str,
+    header_name: &HeaderName,
+) -> Result<ResolvedCredential, FilterError> {
     let token = resolve_token(entry)?;
     validate_token(&token)?;
-    let header_value_str = format!("Bearer {}", &*token);
+    let header_value_str = assemble_header_value(strategy, &token);
     HeaderValue::from_str(&header_value_str).map_err(|e| -> FilterError {
         format!(
             "credential_inject: assembled header value invalid for '{}/{}/{}': {e}",
@@ -459,15 +581,22 @@ fn resolve_credential(entry: &CredentialEntryConfig) -> Result<ResolvedCredentia
         .into()
     })?;
     Ok(ResolvedCredential {
+        strategy,
+        header_name: header_name.clone(),
         header_value: Zeroizing::new(header_value_str),
     })
 }
 
 /// Resolve a credential from one projected Secret file.
-fn resolve_file_credential(path: &str, reference: &CredentialRef) -> Result<ResolvedCredential, FilterError> {
+fn resolve_file_credential(
+    path: &str,
+    reference: &CredentialRef,
+    strategy: &'static str,
+    header_name: &HeaderName,
+) -> Result<ResolvedCredential, FilterError> {
     let token = read_projected_token(path, reference)?;
     validate_token(&token)?;
-    let header_value = format!("Bearer {}", &*token);
+    let header_value = assemble_header_value(strategy, &token);
     HeaderValue::from_str(&header_value).map_err(|error| {
         format!(
             "credential_inject: projected credential is not valid for '{}/{}/{}': {error}",
@@ -475,6 +604,8 @@ fn resolve_file_credential(path: &str, reference: &CredentialRef) -> Result<Reso
         )
     })?;
     Ok(ResolvedCredential {
+        strategy,
+        header_name: header_name.clone(),
         header_value: Zeroizing::new(header_value),
     })
 }
@@ -508,7 +639,12 @@ fn read_projected_token(path: &str, reference: &CredentialRef) -> Result<Zeroizi
 /// Publish the current file state, failing closed when it cannot be read or
 /// validated.
 fn reload_credential(item: &WatchedCredential) {
-    let credential = match resolve_file_credential(item.path.to_string_lossy().as_ref(), &item.reference) {
+    let credential = match resolve_file_credential(
+        item.path.to_string_lossy().as_ref(),
+        &item.reference,
+        item.strategy,
+        &item.header_name,
+    ) {
         Ok(credential) => Some(credential),
         Err(error) => {
             tracing::warn!(
@@ -601,7 +737,12 @@ fn spawn_credential_watcher(watched: Vec<WatchedCredential>) -> Result<Credentia
             // complete startup snapshot.
             let mut initial = Vec::with_capacity(watched.len());
             for item in &watched {
-                match resolve_file_credential(item.path.to_string_lossy().as_ref(), &item.reference) {
+                match resolve_file_credential(
+                    item.path.to_string_lossy().as_ref(),
+                    &item.reference,
+                    item.strategy,
+                    &item.header_name,
+                ) {
                     Ok(credential) => initial.push((Arc::clone(&item.snapshot), credential)),
                     Err(error) => {
                         drop(ready_tx.send(Err(format!("failed authoritative credential read: {error}"))));
@@ -771,6 +912,45 @@ mod tests {
     }
 
     #[test]
+    fn apikey_strategy_in_config_accepted() {
+        let f = parse("credentials:\n  - name: s\n    namespace: ns\n    key: k\n    strategy: apikey\n    value: tok");
+        assert!(f.is_ok(), "apikey must be a supported strategy");
+    }
+
+    #[test]
+    fn bearer_token_with_header_rejected() {
+        let err = parse_err(
+            "credentials:\n  - name: s\n    namespace: ns\n    key: k\n    value: tok\n    header: x-custom-key",
+        );
+        assert!(
+            err.to_string().contains("not valid for strategy 'bearer_token'"),
+            "header must be rejected with the default bearer strategy: {err}"
+        );
+    }
+
+    #[test]
+    fn bearer_token_with_explicit_strategy_and_header_rejected() {
+        let err = parse_err(
+            "credentials:\n  - name: s\n    namespace: ns\n    key: k\n    strategy: bearer_token\n    value: tok\n    header: x-custom-key",
+        );
+        assert!(
+            err.to_string().contains("not valid for strategy 'bearer_token'"),
+            "header must be rejected with an explicit bearer strategy: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_apikey_header_rejected() {
+        let err = parse_err(
+            "credentials:\n  - name: s\n    namespace: ns\n    key: k\n    strategy: apikey\n    value: tok\n    header: 'x bad name'",
+        );
+        assert!(
+            err.to_string().contains("invalid header"),
+            "unparseable header must be rejected: {err}"
+        );
+    }
+
+    #[test]
     fn valid_minimal_config() {
         let f = parse("credentials:\n  - name: s\n    namespace: ns\n    key: k\n    value: tok");
         assert!(f.is_ok(), "valid config must parse");
@@ -851,6 +1031,102 @@ mod tests {
             header_value.to_str().unwrap(),
             "Bearer sk-abc123",
             "must inject correct Bearer value"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Apikey Injection
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "injection test asserts header, value, and caller-header removal as one operation"
+    )]
+    async fn apikey_injects_default_x_api_key_header() {
+        let yaml =
+            "credentials:\n  - name: s\n    namespace: ns\n    key: k\n    strategy: apikey\n    value: sk-live-123";
+        let f = parse(yaml).unwrap();
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert(AUTHORIZATION, HeaderValue::from_static("Bearer customer-token"));
+        req.headers
+            .insert("x-api-key", HeaderValue::from_static("customer-key"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "apikey", "s", "ns", "k");
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "matched apikey credential must continue"
+        );
+        assert!(
+            ctx.request_headers_to_remove.contains(&AUTHORIZATION),
+            "caller Authorization must be removed"
+        );
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static("x-api-key")),
+            "caller x-api-key must be removed"
+        );
+        assert_eq!(ctx.request_headers_to_set.len(), 1, "exactly one header injected");
+        let (header_name, header_value) = &ctx.request_headers_to_set[0];
+        assert_eq!(
+            header_name.as_str(),
+            "x-api-key",
+            "apikey must inject the default header"
+        );
+        assert_eq!(
+            header_value.to_str().unwrap(),
+            "sk-live-123",
+            "apikey must inject the raw token without a bearer prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn apikey_injects_configured_custom_header() {
+        let yaml = concat!(
+            "credentials:\n",
+            "  - name: s\n    namespace: ns\n    key: k\n",
+            "    strategy: apikey\n    header: x-custom-key\n    value: sk-live-123\n",
+        );
+        let f = parse(yaml).unwrap();
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "apikey", "s", "ns", "k");
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue), "custom header must route");
+        assert_eq!(ctx.request_headers_to_set.len(), 1);
+        assert_eq!(ctx.request_headers_to_set[0].0.as_str(), "x-custom-key");
+        assert_eq!(ctx.request_headers_to_set[0].1.to_str().unwrap(), "sk-live-123");
+    }
+
+    #[tokio::test]
+    async fn apikey_file_source_injects_raw_token_in_custom_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-key");
+        std::fs::write(&path, "file-sourced-key\n").unwrap();
+        let yaml = format!(
+            "credentials:\n  - name: s\n    namespace: ns\n    key: k\n    strategy: apikey\n    header: x-provider-key\n    file: {}",
+            path.display()
+        );
+        let f = parse(&yaml).unwrap();
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "apikey", "s", "ns", "k");
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "file apikey credential must route"
+        );
+        assert_eq!(ctx.request_headers_to_set.len(), 1);
+        assert_eq!(ctx.request_headers_to_set[0].0.as_str(), "x-provider-key");
+        assert_eq!(
+            ctx.request_headers_to_set[0].1.to_str().unwrap(),
+            "file-sourced-key",
+            "file-sourced apikey must be injected (whitespace trimmed)"
         );
     }
 
@@ -1159,6 +1435,86 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn overlay_apikey_over_configured_bearer_fails_closed_503() {
+        let f = make_filter_with_value("sec", "ns", "key", "tok");
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "apikey", "sec", "ns", "key");
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 503),
+            "overlay strategy over configured strategy must fail closed 503"
+        );
+        assert!(
+            ctx.request_headers_to_set.is_empty(),
+            "no credential on strategy-mismatch path"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlay_bearer_over_configured_apikey_fails_closed_503() {
+        let yaml = "credentials:\n  - name: sec\n    namespace: ns\n    key: key\n    strategy: apikey\n    value: tok";
+        let f = parse(yaml).unwrap();
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "bearer_token", "sec", "ns", "key");
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 503),
+            "configured strategy mismatch must fail closed in both directions"
+        );
+        assert!(
+            ctx.request_headers_to_set.is_empty(),
+            "no credential on strategy-mismatch path"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "rotation test covers construction, atomic replacement, and convergence"
+    )]
+    async fn apikey_rotation_publishes_new_value_in_configured_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-key");
+        std::fs::write(&path, "key-a\n").unwrap();
+        let yaml = format!(
+            "credentials:\n  - name: s\n    namespace: ns\n    key: k\n    strategy: apikey\n    header: x-provider-key\n    file: {}",
+            path.display()
+        );
+        let f = parse(&yaml).unwrap();
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+
+        let mut first = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut first, "apikey", "s", "ns", "k");
+        drop(f.on_request(&mut first).await.unwrap());
+        assert_eq!(first.request_headers_to_set[0].1, "key-a");
+
+        // A projected Secret update replaces the complete file atomically.
+        let replacement = dir.path().join("api-key.next");
+        std::fs::write(&replacement, "key-b\n").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+
+        let mut second = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut second, "apikey", "s", "ns", "k");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                second.request_headers_to_set.clear();
+                drop(f.on_request(&mut second).await.unwrap());
+                if second.request_headers_to_set[0].1 == "key-b" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("apikey watcher did not publish the replacement");
+        assert_eq!(second.request_headers_to_set[0].0.as_str(), "x-provider-key");
+    }
+
     // -------------------------------------------------------------------------
     // Security: Token Not In Metadata
     // -------------------------------------------------------------------------
@@ -1179,6 +1535,33 @@ mod tests {
                 "token must not appear in filter_metadata; found in: {value}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn apikey_token_not_in_filter_metadata_after_injection() {
+        let yaml = concat!(
+            "credentials:\n",
+            "  - name: sec\n    namespace: ns\n    key: key\n",
+            "    strategy: apikey\n    header: x-custom-key\n    value: super-secret-api-key\n",
+        );
+        let f = parse(yaml).unwrap();
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "apikey", "sec", "ns", "key");
+
+        let _unused = f.on_request(&mut ctx).await.unwrap();
+
+        // Token must not appear anywhere in filter_metadata, only in the header.
+        for value in ctx.filter_metadata.values() {
+            assert!(
+                !value.contains("super-secret-api-key"),
+                "apikey token must not appear in filter_metadata; found in: {value}"
+            );
+        }
+        assert_eq!(
+            ctx.request_headers_to_set[0].1.to_str().unwrap(),
+            "super-secret-api-key"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -1236,7 +1619,15 @@ mod tests {
     fn initial_snapshot(path: &Path, name: &str) -> Arc<ArcSwap<CredentialSnapshot>> {
         let reference = credential_reference(name);
         Arc::new(ArcSwap::from_pointee(CredentialSnapshot {
-            credential: Some(resolve_file_credential(path.to_string_lossy().as_ref(), &reference).unwrap()),
+            credential: Some(
+                resolve_file_credential(
+                    path.to_string_lossy().as_ref(),
+                    &reference,
+                    STRATEGY_BEARER_TOKEN,
+                    &AUTHORIZATION,
+                )
+                .unwrap(),
+            ),
         }))
     }
 
@@ -1244,6 +1635,8 @@ mod tests {
         WatchedCredential {
             path,
             reference: credential_reference(name),
+            strategy: STRATEGY_BEARER_TOKEN,
+            header_name: AUTHORIZATION,
             snapshot: Arc::clone(snapshot),
         }
     }

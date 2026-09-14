@@ -387,7 +387,7 @@ fn validate_route(route: &ProviderRouteConfig) -> Result<(), FilterError> {
         validate_value("credential.secretRef.name", &credential.secret_ref.name)?;
         validate_value("credential.secretRef.namespace", &credential.secret_ref.namespace)?;
         validate_value("credential.secretRef.key", &credential.secret_ref.key)?;
-        if credential.strategy != super::metadata::STRATEGY_BEARER_TOKEN {
+        if !super::metadata::is_supported_strategy(&credential.strategy) {
             return Err("provider_route: unsupported credential strategy".into());
         }
     }
@@ -1044,6 +1044,29 @@ mod tests {
         let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
         let config = provider_config("a", "m", &path_refs, "c");
         assert!(ProviderRouteFilter::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn apikey_credential_strategy_accepted() {
+        let yaml = "provider_id: p\nroutes:\n  - candidate_id: a\n    model: m\n    paths: [/x]\n    cluster: c\n    credential:\n      strategy: apikey\n      secretRef:\n        name: provider-token\n        namespace: grid-system\n        key: api-key\n";
+        let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            ProviderRouteFilter::from_config(&val).is_ok(),
+            "apikey must be an accepted credential strategy"
+        );
+    }
+
+    #[test]
+    fn unsupported_credential_strategy_rejected() {
+        let yaml = "provider_id: p\nroutes:\n  - candidate_id: a\n    model: m\n    paths: [/x]\n    cluster: c\n    credential:\n      strategy: oauth2\n      secretRef:\n        name: provider-token\n        namespace: grid-system\n        key: token\n";
+        let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let err = ProviderRouteFilter::from_config(&val)
+            .err()
+            .expect("oauth2 credential must be rejected");
+        assert!(
+            err.to_string().contains("unsupported credential strategy"),
+            "unsupported strategy must report the unsupported error: {err}"
+        );
     }
 
     #[test]
