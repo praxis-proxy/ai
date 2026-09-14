@@ -9,7 +9,7 @@ Rebuilds the request body from `ResponsesState` when present.
 
 Reads the assembled conversation history from `ResponsesState::messages` and replaces the `input` field in the outbound body when it differs from the original normalized input. Strips `previous_response_id` after Praxis resolves it locally via the rehydrate filter.
 
-When no `ResponsesState` exists, preserves the request body apart from removing the Praxis-owned `conversation` field.
+When no `ResponsesState` exists, preserves the request body unchanged.
 
 This filter always advertises the Praxis streaming capability. When the effective outbound body contains `"stream": true` it selects Praxis's streaming transport; otherwise it selects the buffered transport. There is no operator opt-in — the removed `terminal_streaming` flag is rejected via `deny_unknown_fields` so stale configs fail to build. Classifier metadata remains descriptive client intent; this final serializer owns the transport decision. IRR can resume one downstream stream across response-dependent transitions, but every response-body filter in a step composed with this filter must use `BodyMode::Stream` (or explicitly reject streaming requests) rather than silently buffering them.
 
