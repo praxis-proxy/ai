@@ -49,6 +49,18 @@ filter_chains:
                 namespace: grid-demo
                 key: token
 
+          - candidate_id: inference_model/mock-anthropic-model/site-us-west/provider-us-west
+            model: mock-anthropic-model
+            paths:
+              - /v1/messages
+            cluster: mock-backend
+            credential:
+              strategy: apikey
+              secretRef:
+                name: anthropic-provider
+                namespace: grid-demo
+                key: api-key
+
       # Provider credentials are mounted as files and resolved at startup.
       - filter: credential_inject
         credentials:
@@ -57,6 +69,13 @@ filter_chains:
             namespace: grid-demo
             key: token
             file: /run/secrets/provider-credentials/openai-provider/token
+
+          # strategy: apikey injects the raw token into `header` (default x-api-key).
+          - strategy: apikey
+            name: anthropic-provider
+            namespace: grid-demo
+            key: api-key
+            file: /run/secrets/provider-credentials/anthropic-provider/api-key
 
       - filter: load_balancer
         clusters:

@@ -16,7 +16,7 @@ use praxis_filter::FilterError;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use super::metadata::{CandidateCredential, STRATEGY_BEARER_TOKEN};
+use super::metadata::{CandidateCredential, is_supported_strategy};
 
 /// Maximum number of route candidates.
 const MAX_CANDIDATES: usize = 1024;
@@ -325,7 +325,7 @@ fn validate_credential(index: usize, credential: Option<&CandidateCredential>) -
     let Some(credential) = credential else {
         return Ok(());
     };
-    if credential.strategy != STRATEGY_BEARER_TOKEN {
+    if !is_supported_strategy(&credential.strategy) {
         return Err(format!("routing: candidates[{index}].credential.strategy is unsupported").into());
     }
     validate_name(
@@ -391,6 +391,7 @@ fn validate_name(field: &str, value: &str) -> Result<(), FilterError> {
 )]
 mod tests {
     use super::*;
+    use crate::routing::metadata::{CredentialRef, STRATEGY_APIKEY, STRATEGY_BEARER_TOKEN};
 
     // -------------------------------------------------------------------------
     // Valid Configs
@@ -573,6 +574,72 @@ mod tests {
         let yaml = "- kind: inference_model\n  name: x\n  site: s\n  cluster: c\n  extra: bad";
         let err: Result<Vec<CandidateConfig>, _> = serde_yaml::from_str(yaml);
         assert!(err.is_err(), "unknown fields should be rejected");
+    }
+
+    // -------------------------------------------------------------------------
+    // Credential Reference Validation
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn supported_credential_strategies_accepted() {
+        for strategy in [STRATEGY_BEARER_TOKEN, STRATEGY_APIKEY] {
+            let mut entry = candidate("inference_model", "llama", "site-a", "c1");
+            entry.credential = Some(CandidateCredential {
+                strategy: strategy.to_owned(),
+                secret_ref: CredentialRef {
+                    name: "provider-token".to_owned(),
+                    namespace: "grid-system".to_owned(),
+                    key: "token".to_owned(),
+                },
+            });
+            validate_candidates(vec![entry]).unwrap_or_else(|err| panic!("{strategy} credential must validate: {err}"));
+        }
+    }
+
+    #[test]
+    fn unsupported_credential_strategy_rejected() {
+        let mut entry = candidate("inference_model", "llama", "site-a", "c1");
+        entry.credential = Some(CandidateCredential {
+            strategy: "oauth2".to_owned(),
+            secret_ref: CredentialRef {
+                name: "provider-token".to_owned(),
+                namespace: "grid-system".to_owned(),
+                key: "token".to_owned(),
+            },
+        });
+        let err = validate_candidates(vec![entry]).expect_err("oauth2 credential must be rejected");
+        assert!(
+            err.to_string().contains("credential.strategy is unsupported"),
+            "unsupported strategy must report the unsupported error: {err}"
+        );
+    }
+
+    #[test]
+    fn credential_secret_ref_fields_must_be_valid_names() {
+        for field_value in ["", &"x".repeat(MAX_NAME_LEN + 1)] {
+            for field in ["name", "namespace", "key"] {
+                let mut secret_ref = CredentialRef {
+                    name: "provider-token".to_owned(),
+                    namespace: "grid-system".to_owned(),
+                    key: "token".to_owned(),
+                };
+                match field {
+                    "name" => secret_ref.name = field_value.to_owned(),
+                    "namespace" => secret_ref.namespace = field_value.to_owned(),
+                    _ => secret_ref.key = field_value.to_owned(),
+                }
+                let mut entry = candidate("inference_model", "llama", "site-a", "c1");
+                entry.credential = Some(CandidateCredential {
+                    strategy: STRATEGY_APIKEY.to_owned(),
+                    secret_ref,
+                });
+                let err = validate_candidates(vec![entry]).expect_err("invalid secretRef field must be rejected");
+                assert!(
+                    err.to_string().contains(&format!("credential.secretRef.{field}")),
+                    "error must name the invalid field {field}: {err}"
+                );
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
