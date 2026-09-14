@@ -1,0 +1,301 @@
+name: vLLM GPU Container
+
+# ------------------------------------------------------------------------------
+# Build the model-baked vLLM GPU image, prove it serves Praxis traffic on a real
+# GPU, and only then publish it.
+#
+# The gate is the repository's own live-vLLM coverage -- the `critical_vllm`
+# subset of tests/integration/sdk/openai/test_openai_responses_vllm.py, run with
+# VLLM_TEST_BACKEND=live, exactly as the vllm-live-cpu job in
+# vllm-integration.yaml runs it against the CPU image. That drives real
+# Responses API traffic through Praxis into this image (including the OGX
+# file_search / file_resolve paths), rather than curling the backend directly.
+# ------------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "vllm/Containerfile"
+      - ".github/actions/start-vllm/**"
+      - ".github/actions/wait-vllm/**"
+      - ".github/workflows/vllm-gpu-container.yaml"
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "vllm/Containerfile"
+      - ".github/actions/start-vllm/**"
+      - ".github/actions/wait-vllm/**"
+      - ".github/workflows/vllm-gpu-container.yaml"
+  merge_group:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      inference_model:
+        description: "Inference model (HuggingFace ID) — default is Qwen/Qwen3-8B-AWQ"
+        type: string
+      runner:
+        description: "GitHub Actions runner label for the GPU host"
+        required: false
+        default: gpu-t4-4-core
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ghcr.io/praxis-proxy/vllm-gpu
+  # Qwen3-8B, in the only form that fits the T4 runner. The bf16 checkpoint is
+  # 8.19B params = 15.3 GiB of weights, which does not fit a 16 GiB T4 before
+  # any KV cache, and the FP8 checkpoint needs sm_89+ hardware the T4 does not
+  # have. AWQ int4 is ~5.7 GiB and is a supported quantization on Turing, so it
+  # is the variant that leaves room for a usable KV cache.
+  INFERENCE_MODEL: ${{ inputs.inference_model || 'Qwen/Qwen3-8B-AWQ' }}
+  # The T4 is Turing (sm_75), which has no bfloat16. vLLM would downcast with a
+  # warning; pin it so the run is deterministic rather than dtype-dependent.
+  MODEL_DTYPE: float16
+  # ~5.7 GiB of int4 weights on a 16 GiB card. The CPU job runs at 0.5; giving
+  # vLLM 0.9 here leaves roughly 7 GiB of KV cache for the live suite.
+  GPU_MEMORY_UTILIZATION: "0.9"
+  # OGX + transformers pins live in tests/integration/ogx-constraints.txt (with
+  # the rationale for each pin), single-sourced so the uv download cache key
+  # depends only on the pins. Same file the vllm-integration jobs install from.
+  OGX_CONSTRAINTS: "tests/integration/ogx-constraints.txt"
+
+jobs:
+  changes:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect relevant path changes
+        id: filter
+        env:
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
+            'vllm/Containerfile' \
+            '.github/actions/start-vllm/' \
+            '.github/actions/wait-vllm/' \
+            '.github/workflows/vllm-gpu-container.yaml')
+          if [ -n "$CHANGED" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-test:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    # `inputs` is empty for push / pull_request / merge_group, so those events
+    # fall back to the default GPU label; workflow_dispatch can override it.
+    runs-on: ${{ inputs.runner || 'gpu-t4-4-core' }}
+    # Covers the CUDA base image pull, the model download baked into the build,
+    # the OGX dependency closure, a debug Praxis build, and the live suite.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set image tag
+        run: echo "IMAGE_TAG=${INFERENCE_MODEL#*/}" >> "$GITHUB_ENV"
+
+      - name: Verify GPU and select container runtime
+        run: |
+          set -euo pipefail
+          # Fail here, before a 10+ GiB build, if the runner label resolved to a
+          # host without a usable GPU.
+          nvidia-smi
+          if command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
+            echo "GPU_DEVICE_ARGS=--gpus all" >> "$GITHUB_ENV"
+          elif command -v podman > /dev/null 2>&1 && podman info > /dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
+            echo "GPU_DEVICE_ARGS=--device nvidia.com/gpu=all" >> "$GITHUB_ENV"
+          else
+            echo "::error::neither docker nor podman is usable on this runner"
+            exit 1
+          fi
+
+      - name: Free disk space
+        run: |
+          # The CUDA base image plus the baked model weights need tens of GiB.
+          # This assumes an ephemeral runner; the prune keeps the runner's own
+          # images so a self-hosted host is not left without them.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          # Prefer the filtered prune so a runner's own images survive. Podman
+          # does not accept the `label!=` negation, so fall back to a plain
+          # prune there rather than silently skipping it and running out of disk.
+          "$CONTAINER_RUNTIME" system prune -af --filter "label!=com.github.actions.runner" \
+            || "$CONTAINER_RUNTIME" system prune -af \
+            || true
+          df -h /
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          # Key ONLY on the pins file, matching vllm-integration.yaml: setup-uv
+          # has no restore-key fallback, so globbing anything else would force a
+          # cold multi-GB OGX re-download whenever this workflow is edited.
+          enable-cache: true
+          cache-dependency-glob: |
+            tests/integration/ogx-constraints.txt
+
+      - name: Build image
+        env:
+          DOCKER_BUILDKIT: "1"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          BUILD_ARGS=(
+            --build-arg "INFERENCE_MODEL=${INFERENCE_MODEL}"
+            --tag "${IMAGE_NAME}:${IMAGE_TAG}"
+            --file vllm/Containerfile
+          )
+          if [ -n "${HF_TOKEN}" ]; then
+            BUILD_ARGS+=(--secret "id=hf_token,env=HF_TOKEN")
+          fi
+          "$CONTAINER_RUNTIME" build "${BUILD_ARGS[@]}" .
+
+      - name: Start vLLM on GPU
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          # Serve under the full HuggingFace id so the test harness's VLLM_MODEL
+          # matches the CPU job's. The short form is only the image tag.
+          model: ${{ env.INFERENCE_MODEL }}
+          model-path: /opt/vllm/models/${{ env.INFERENCE_MODEL }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          # Built locally in the step above; there is nothing to pull.
+          pull: "false"
+          device-args: ${{ env.GPU_DEVICE_ARGS }}
+          gpu-memory-utilization: ${{ env.GPU_MEMORY_UTILIZATION }}
+          dtype: ${{ env.MODEL_DTYPE }}
+
+      - name: Pre-install OGX dependencies
+        run: |
+          # Resolve + download the full OGX closure synchronously and OFF the
+          # readiness clock, so it never races the "Wait for OGX readiness"
+          # window under network variance.
+          uv run --with-requirements "$OGX_CONSTRAINTS" ogx --help > /dev/null
+
+      - name: Start OGX
+        run: |
+          uv run --with-requirements "$OGX_CONSTRAINTS" ogx run starter --insecure > /tmp/ogx.log 2>&1 &
+          echo $! > /tmp/ogx.pid
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy --no-default-features --features store-sqlite
+
+      - name: Wait for vLLM readiness
+        uses: ./.github/actions/wait-vllm
+        with:
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          # No pull window to absorb: only the GPU model load.
+          timeout: "600"
+
+      - name: Wait for OGX readiness
+        run: |
+          dump_ogx_log() {
+            echo "----- /tmp/ogx.log (tail -n 200) -----"
+            tail -n 200 /tmp/ogx.log 2>/dev/null || echo "No OGX log found"
+          }
+          OGX_PID="$(cat /tmp/ogx.pid)"
+          deadline=$((SECONDS + 300))
+          until curl -sf http://127.0.0.1:8321/v1/files > /dev/null 2>&1; do
+            if ! kill -0 "$OGX_PID" 2>/dev/null; then
+              echo "::error::OGX process (pid $OGX_PID) exited before binding port 8321"
+              dump_ogx_log
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::OGX did not become ready within 300s"
+              dump_ogx_log
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "OGX is ready"
+
+      - name: Run critical live vLLM tests against the GPU image
+        env:
+          VLLM_TEST_BACKEND: live
+          VLLM_MODEL: ${{ env.INFERENCE_MODEL }}
+        run: |
+          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py \
+            -s -m "critical_vllm"
+
+      - name: vLLM container logs
+        if: failure()
+        run: |
+          "$CONTAINER_RUNTIME" logs vllm 2>&1 || echo "(no vllm container)"
+
+      - name: OGX logs
+        if: failure()
+        run: cat /tmp/ogx.log 2>/dev/null || echo "No OGX log found"
+
+      - name: Stop vLLM
+        if: always()
+        run: |
+          "$CONTAINER_RUNTIME" rm -f vllm || true
+
+      - name: Stop OGX
+        if: always()
+        run: |
+          if [ -f /tmp/ogx.pid ]; then
+            kill "$(cat /tmp/ogx.pid)" 2>/dev/null || true
+          fi
+
+      # Publishing runs only after the live suite passed: these steps carry the
+      # implicit success() condition, so a failed test skips the push.
+      - name: Log in to GHCR (docker)
+        if: contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name) && env.CONTAINER_RUNTIME == 'docker'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to GHCR (podman)
+        if: contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name) && env.CONTAINER_RUNTIME == 'podman'
+        env:
+          # docker/login-action shells out to the docker CLI, which a
+          # podman-only runner does not have.
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | podman login "$REGISTRY" \
+            --username "$GHCR_USERNAME" --password-stdin
+
+      - name: Push image
+        if: contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name)
+        run: |
+          set -euo pipefail
+          "$CONTAINER_RUNTIME" push "${IMAGE_NAME}:${IMAGE_TAG}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            "$CONTAINER_RUNTIME" tag "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest"
+            "$CONTAINER_RUNTIME" push "${IMAGE_NAME}:latest"
+          fi
