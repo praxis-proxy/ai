@@ -1387,6 +1387,38 @@ async fn tenant_mismatch_rejects_conversation() {
 }
 
 #[tokio::test]
+async fn same_tenant_different_owner_rejects_conversation() {
+    let store = MockStore::with_conversation("conv_abc", json!([{"role": "user", "content": "hello"}]));
+    let registry = setup_registry(store);
+
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.extensions.insert(
+        crate::StateOwner::from_trusted_parts("default", "test-issuer", "other-subject")
+            .expect("test owner should be valid"),
+    );
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_abc"}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    match action {
+        FilterAction::Reject(rejection) => assert_eq!(
+            rejection.status, 400,
+            "conversation stored under another subject must not be found"
+        ),
+        other => panic!("expected Reject for owner mismatch, got {other:?}"),
+    }
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "no state should be produced for another owner"
+    );
+}
+
+#[tokio::test]
 async fn rejects_malformed_conversation_empty_object() {
     let store = MockStore::empty();
     let registry = setup_registry(store);

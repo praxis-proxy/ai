@@ -3016,6 +3016,127 @@ async fn cross_tenant_delete_item_returns_404() {
     assert_eq!(rejection.status, 404, "cross-tenant item DELETE should return 404");
 }
 
+#[tokio::test]
+async fn same_tenant_different_owner_cannot_access_or_mutate_conversation() {
+    let filter = build_test_filter();
+    let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let other_subject = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-b").unwrap();
+    let conversation_id = create_test_conversation_as(
+        filter.as_ref(),
+        serde_json::json!({"visibility": "private"}),
+        owner.clone(),
+    )
+    .await;
+
+    let create_path = format!("/v1/conversations/{conversation_id}/items");
+    let req = make_request(Method::POST, &create_path);
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(owner.clone());
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from_static(
+        br#"{"items":[{"id":"item_private","type":"message","role":"user","content":"secret"}]}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected local create-items response");
+    };
+    assert_eq!(rejection.status, 200);
+
+    for path in [
+        format!("/v1/conversations/{conversation_id}"),
+        format!("/v1/conversations/{conversation_id}/items"),
+        format!("/v1/conversations/{conversation_id}/items/item_private"),
+    ] {
+        let req = make_request(Method::GET, &path);
+        let mut ctx = make_owned_filter_context(&req);
+        ctx.extensions.insert(other_subject.clone());
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        let FilterAction::Reject(rejection) = action else {
+            panic!("expected owner-scoped GET rejection for {path}");
+        };
+        assert_eq!(rejection.status, 404, "foreign owner must not discover {path}");
+    }
+
+    for path in [
+        format!("/v1/conversations/{conversation_id}/items/item_private"),
+        format!("/v1/conversations/{conversation_id}"),
+    ] {
+        let req = make_request(Method::DELETE, &path);
+        let mut ctx = make_owned_filter_context(&req);
+        ctx.extensions.insert(other_subject.clone());
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        let FilterAction::Reject(rejection) = action else {
+            panic!("expected owner-scoped DELETE rejection for {path}");
+        };
+        assert_eq!(rejection.status, 404, "foreign owner must not mutate {path}");
+    }
+
+    let update_path = format!("/v1/conversations/{conversation_id}");
+    let req = make_request(Method::POST, &update_path);
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(other_subject.clone());
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from_static(br#"{"metadata":{"visibility":"public"}}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected owner-scoped update rejection");
+    };
+    assert_eq!(rejection.status, 404);
+
+    let req = make_request(Method::POST, &create_path);
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(other_subject);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from_static(
+        br#"{"items":[{"id":"item_intruder","type":"message","role":"user","content":"intruder"}]}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected owner-scoped create-items rejection");
+    };
+    assert_eq!(rejection.status, 404);
+
+    let req = make_request(Method::GET, &format!("/v1/conversations/{conversation_id}"));
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(owner.clone());
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected owner GET response");
+    };
+    assert_eq!(rejection.status, 200);
+    assert_eq!(rejection_body(&rejection)["metadata"]["visibility"], "private");
+
+    let req = make_request(
+        Method::GET,
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+    );
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(owner);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected owner item-list response");
+    };
+    let items = rejection_body(&rejection);
+    assert_eq!(items["data"].as_array().unwrap().len(), 1);
+    assert_eq!(items["data"][0]["id"], "item_private");
+}
+
+#[tokio::test]
+async fn missing_owner_rejects_conversation_access() {
+    let filter = build_test_filter();
+    let conversation_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
+    let req = make_request(Method::GET, &format!("/v1/conversations/{conversation_id}"));
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.remove::<crate::StateOwner>();
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected missing owner rejection");
+    };
+    assert_eq!(rejection.status, 401);
+    assert_eq!(rejection_body(&rejection)["error"]["code"], "missing_state_owner");
+}
+
 // -----------------------------------------------------------------------------
 // Handler Tests — Delete Item Syncs Conversation Messages
 // -----------------------------------------------------------------------------
@@ -3187,6 +3308,11 @@ fn set_append_back_metadata(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
     ctx.set_metadata("responses.conversation_id", "conv_test_123");
 }
 
+async fn capture_append_owner_for_test(filter: &dyn HttpFilter, ctx: &mut praxis_filter::HttpFilterContext<'_>) {
+    let action = filter.on_request(ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_not_armed_without_conversation_metadata() {
     let filter = build_test_filter();
@@ -3196,6 +3322,22 @@ async fn on_response_not_armed_without_conversation_metadata() {
 
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn append_back_request_requires_owner_before_inference() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.remove::<crate::StateOwner>();
+    set_append_back_metadata(&mut ctx);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected missing owner rejection");
+    };
+    assert_eq!(rejection.status, 401);
+    assert_eq!(rejection_body(&rejection)["error"]["code"], "missing_state_owner");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3265,6 +3407,7 @@ async fn on_response_armed_for_json_200() {
     ctx.current_filter_id = Some(0);
     ctx.response_body_mode = filter.response_body_mode();
     set_append_back_metadata(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
 
     let mut resp = make_response();
     resp.headers
@@ -3320,6 +3463,7 @@ async fn on_response_body_continues_when_not_end_of_stream() {
     let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
 
     let mut resp = make_response();
     resp.headers
@@ -3339,6 +3483,7 @@ async fn on_response_body_skips_non_completed_status() {
     let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
 
     let mut resp = make_response();
     resp.headers
@@ -3362,6 +3507,7 @@ async fn on_response_body_skips_invalid_json() {
     let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
 
     let mut resp = make_response();
     resp.headers
@@ -3381,6 +3527,7 @@ async fn on_response_body_skips_empty_items() {
     let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
 
     let mut resp = make_response();
     resp.headers
@@ -3404,6 +3551,7 @@ async fn on_response_body_skips_empty_body() {
     let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
 
     let mut resp = make_response();
     resp.headers
@@ -3438,6 +3586,10 @@ async fn on_response_body_appends_completed_response() {
     });
 
     drop(filter.on_request(&mut ctx).await.unwrap());
+    let initiating_owner = crate::test_utils::test_owner(DEFAULT_TENANT_ID);
+    let replaced_owner =
+        crate::StateOwner::from_trusted_parts(DEFAULT_TENANT_ID, initiating_owner.issuer(), "other-subject").unwrap();
+    ctx.extensions.insert(replaced_owner);
 
     let mut resp = make_response();
     resp.headers
@@ -3489,6 +3641,55 @@ async fn on_response_body_appends_completed_response() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn append_back_cannot_write_another_owners_conversation() {
+    let filter = build_test_filter();
+    let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let other_subject = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-b").unwrap();
+    let conversation_id = create_test_conversation_as(filter.as_ref(), serde_json::json!({}), owner.clone()).await;
+
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(other_subject);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conversation_id);
+    ctx.extensions.insert(ResponsesState {
+        input: vec![serde_json::json!({"type": "message", "role": "user", "content": "intruder"})],
+        ..ResponsesState::default()
+    });
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from_static(
+        br#"{"status":"completed","output":[{"type":"message","role":"assistant","content":"not yours"}]}"#,
+    ));
+
+    let result = filter.on_response_body(&mut ctx, &mut body, true);
+    assert!(result.is_err(), "foreign append-back must fail closed");
+
+    let req = make_request(
+        Method::GET,
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+    );
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(owner);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected owner item-list response");
+    };
+    assert_eq!(rejection.status, 200);
+    assert!(
+        rejection_body(&rejection)["data"].as_array().unwrap().is_empty(),
+        "foreign append-back must not change the conversation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_surfaces_item_insert_failure() {
     let filter = build_failing_filter(FailingItemStore {
         append_failure: AppendFailure::CreateItems,
@@ -3500,6 +3701,7 @@ async fn on_response_body_surfaces_item_insert_failure() {
     let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
+    capture_append_owner_for_test(&filter, &mut ctx).await;
     ctx.extensions.insert(ResponsesState {
         input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})],
         ..ResponsesState::default()
@@ -3541,6 +3743,7 @@ async fn on_response_body_surfaces_transaction_failure() {
     let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
+    capture_append_owner_for_test(&filter, &mut ctx).await;
     ctx.extensions.insert(ResponsesState {
         input: vec![serde_json::json!({"type": "message", "role": "user", "content": "hello from append"})],
         ..ResponsesState::default()
@@ -3781,8 +3984,13 @@ fn build_test_filter() -> Box<dyn HttpFilter> {
 }
 
 async fn create_test_conversation(filter: &dyn HttpFilter, metadata: Value) -> String {
+    create_test_conversation_as(filter, metadata, crate::test_utils::test_owner("default")).await
+}
+
+async fn create_test_conversation_as(filter: &dyn HttpFilter, metadata: Value, owner: crate::StateOwner) -> String {
     let req = make_request(Method::POST, "/v1/conversations");
     let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(owner);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"metadata": metadata});
