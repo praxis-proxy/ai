@@ -1052,6 +1052,79 @@ async fn update_conversation_messages_preserves_metadata() {
 }
 
 #[tokio::test]
+async fn update_conversation_metadata_preserves_messages() {
+    let store = make_store().await;
+    let record = ConversationRecord {
+        conversation_id: "conv_1".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({"version": "v1"}),
+        messages: json!([{"role": "user", "content": "keep me"}]),
+    };
+    store.upsert_conversation(&record).await.expect("upsert should succeed");
+
+    let updated = store
+        .update_conversation_metadata("tenant_a", "conv_1", &json!({"version": "v2"}))
+        .await
+        .expect("metadata update should succeed");
+    assert!(updated, "conversation should be updated");
+
+    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+        .await
+        .expect("get should succeed")
+        .expect("record should exist");
+
+    assert_eq!(fetched.metadata, json!({"version": "v2"}), "metadata should be updated");
+    assert_eq!(
+        fetched.messages,
+        json!([{"role": "user", "content": "keep me"}]),
+        "messages must be untouched by a metadata-only update"
+    );
+    assert_eq!(fetched.created_at, 1000, "created_at should be preserved");
+}
+
+#[tokio::test]
+async fn update_conversation_metadata_nonexistent_returns_false() {
+    let store = make_store().await;
+
+    let updated = store
+        .update_conversation_metadata("tenant_a", "nonexistent", &json!({"topic": "x"}))
+        .await
+        .expect("update should succeed");
+
+    assert!(!updated, "updating nonexistent conversation should return false");
+}
+
+#[tokio::test]
+async fn update_conversation_metadata_tenant_isolation() {
+    let store = make_store().await;
+    let record = ConversationRecord {
+        conversation_id: "conv_1".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({"owner": "a"}),
+        messages: json!([{"role": "user", "content": "original"}]),
+    };
+    store.upsert_conversation(&record).await.expect("upsert should succeed");
+
+    let updated = store
+        .update_conversation_metadata("tenant_b", "conv_1", &json!({"owner": "hijack"}))
+        .await
+        .expect("cross-tenant update should succeed");
+    assert!(!updated, "tenant_b should not be able to update tenant_a metadata");
+
+    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+        .await
+        .expect("get should succeed")
+        .expect("record should exist");
+    assert_eq!(
+        fetched.metadata,
+        json!({"owner": "a"}),
+        "metadata should not have changed across tenants"
+    );
+}
+
+#[tokio::test]
 async fn compare_and_swap_conversation_messages_rejects_stale_snapshot() {
     let store = make_store().await;
     let initial = json!([{"role":"user","content":"initial"}]);
@@ -3112,6 +3185,40 @@ async fn pg_update_conversation_messages_preserves_metadata() {
         json!([{"role": "assistant", "content": "v2"}]),
         "messages should be updated"
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_update_conversation_metadata_preserves_messages() {
+    let store = make_pg_store().await;
+
+    let record = ConversationRecord {
+        conversation_id: "conv_1".to_owned(),
+        tenant_id: "tenant_a".to_owned(),
+        created_at: 1000,
+        metadata: json!({"version": "v1"}),
+        messages: json!([{"role": "user", "content": "keep me"}]),
+    };
+    store.upsert_conversation(&record).await.expect("upsert should succeed");
+
+    let updated = store
+        .update_conversation_metadata("tenant_a", "conv_1", &json!({"version": "v2"}))
+        .await
+        .expect("metadata update should succeed");
+    assert!(updated, "conversation should be updated");
+
+    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+        .await
+        .expect("get should succeed")
+        .expect("record should exist");
+
+    assert_eq!(fetched.metadata, json!({"version": "v2"}), "metadata should be updated");
+    assert_eq!(
+        fetched.messages,
+        json!([{"role": "user", "content": "keep me"}]),
+        "messages must be untouched by a metadata-only update"
+    );
+    assert_eq!(fetched.created_at, 1000, "created_at should be preserved");
 }
 
 #[tokio::test]

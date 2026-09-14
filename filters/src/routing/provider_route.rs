@@ -307,6 +307,7 @@ fn strip_edge_headers(ctx: &mut HttpFilterContext<'_>) {
     ctx.request_headers_to_remove
         .push(HeaderName::from_static(PROVIDER_INFERENCE_RESPONSE_HEADER));
     ctx.request_headers_to_remove.push(AUTHORIZATION);
+    ctx.request_headers_to_remove.push(HeaderName::from_static("x-api-key"));
 }
 
 /// Set provider request ID and attribution headers on the backend request.
@@ -458,6 +459,11 @@ mod tests {
         assert!(
             ctx.request_headers_to_remove.contains(&AUTHORIZATION),
             "must remove customer Authorization"
+        );
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static("x-api-key")),
+            "must remove customer x-api-key"
         );
     }
 

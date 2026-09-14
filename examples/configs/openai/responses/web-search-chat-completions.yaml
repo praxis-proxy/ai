@@ -111,7 +111,12 @@ filter_chains:
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:
-              - filter: openai_web_search
+              # openai_agentic_loop is the sole loop authority (issue #1046): it
+              # parses each model response, records the assignment consumed by
+              # the request-phase openai_web_search dispatcher, and publishes the
+              # single continuation signal. The IRR transitions only on the
+              # owner's action, never on a dispatcher's.
+              - filter: openai_agentic_loop
                 key: action
                 value: loop
                 next: inference

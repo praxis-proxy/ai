@@ -1336,58 +1336,6 @@ async fn rehydrates_from_conversation_object_form() {
 }
 
 #[tokio::test]
-async fn previous_response_id_takes_precedence_over_conversation() {
-    let response_messages = json!([
-        {"role": "user", "content": "from response"},
-        {"role": "assistant", "content": "response reply"}
-    ]);
-    let mut store = MockStore::with_completed_response("resp_win", json!("from response"), response_messages);
-    store.conversations.insert(
-        "conv_lose".to_owned(),
-        ConversationRecord {
-            conversation_id: "conv_lose".to_owned(),
-            tenant_id: "default".to_owned(),
-            created_at: 1000,
-            metadata: json!({}),
-            messages: json!([
-                {"role": "user", "content": "from conversation"},
-                {"role": "assistant", "content": "conversation reply"}
-            ]),
-        },
-    );
-    let registry = setup_registry(store);
-
-    let filter = default_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    let mut body = Some(Bytes::from(
-        r#"{"model":"gpt-4.1","input":"next","previous_response_id":"resp_win","conversation":"conv_lose"}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Release),
-        "should release after rehydration"
-    );
-
-    let state = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .expect("ResponsesState should be populated");
-    assert_eq!(
-        state.messages[0]["content"], "from response",
-        "previous_response_id should take precedence over conversation"
-    );
-    assert_eq!(
-        ctx.get_metadata("responses.previous_response_id"),
-        Some("resp_win"),
-        "previous_response_id metadata should be set"
-    );
-}
-
-#[tokio::test]
 async fn rejects_when_conversation_not_found() {
     let store = MockStore::empty();
     let registry = setup_registry(store);
@@ -1775,6 +1723,15 @@ async fn restores_for_streaming_response() {
         matches!(action, FilterAction::Continue),
         "on_response should continue and arm the streaming restore"
     );
+    // #1150: an eligible stream also arms the persistence-source restore so
+    // `canonicalize_logical_response` repairs the stored `response_object` to match
+    // these rewritten wire frames.
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.previous_response_id_stream_restore_armed),
+        "an eligible streaming restore must arm the store-source restore flag"
+    );
 
     let input = concat!(
         "event: response.created\n",
@@ -1998,6 +1955,15 @@ async fn does_not_restore_for_encoded_streaming_response() {
             .is_some_and(|resp| resp.headers.contains_key(http::header::CONTENT_ENCODING)),
         "Content-Encoding must be preserved so the client can still decode the stream"
     );
+    // #1150 review: an encoded stream is passed through verbatim, so the
+    // persistence-source restore must stay disarmed to match the untouched wire.
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .expect("state should be present")
+            .previous_response_id_stream_restore_armed,
+        "an encoded event stream must not arm the store-source restore flag"
+    );
 
     let original = concat!(
         "event: response.completed\n",
@@ -2034,6 +2000,16 @@ async fn does_not_restore_for_non_ok_streaming_response() {
     assert!(
         !ctx.response_headers_modified,
         "a non-200 event stream must not be rewritten"
+    );
+    // #1150 review: the wire is left untouched, so the persistence-source restore
+    // must stay disarmed or a later GET would report a previous_response_id the
+    // streamed response never carried.
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .expect("state should be present")
+            .previous_response_id_stream_restore_armed,
+        "a non-200 event stream must not arm the store-source restore flag"
     );
 
     let original = concat!(
@@ -2098,6 +2074,17 @@ async fn declines_streaming_response_with_body_validators() {
     assert!(
         !ctx.response_headers_modified,
         "a validator-bearing event stream must be declined as an untouched passthrough"
+    );
+    // #1150 review: because the wire frames are passed through with the backend's
+    // null previous_response_id intact, the persistence-source restore must stay
+    // disarmed so `canonicalize_logical_response` cannot rewrite the stored record
+    // into disagreeing with the streamed terminal.
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .expect("state should be present")
+            .previous_response_id_stream_restore_armed,
+        "a validator-bearing event stream must not arm the store-source restore flag"
     );
 
     let headers = &ctx

@@ -104,6 +104,7 @@ pub(super) fn accumulate_response_object(
             replace_completed_tool_calls(state, output);
         }
         state.response_object = response;
+        state.local_completion_response_template = Value::Null;
         had_prior_usage
     };
     ctx.set_metadata("responses.status", status.clone());

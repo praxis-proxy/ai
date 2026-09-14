@@ -571,6 +571,29 @@ impl ConversationItemStore for SqliteResponseStore {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn update_conversation_metadata(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<bool, StoreError> {
+        let metadata = serde_json::to_string(metadata).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let sql = format!(
+            "UPDATE {} SET metadata = ? WHERE conversation_id = ? AND tenant_id = ?",
+            self.tables.conversations
+        );
+
+        let result = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&metadata)
+            .bind(conversation_id)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn compare_and_swap_conversation_messages(
         &self,
         tenant_id: &str,

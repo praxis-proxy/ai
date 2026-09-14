@@ -88,7 +88,7 @@ async fn rehydrates_from_conversation_object_form() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn previous_response_id_takes_precedence_over_conversation() {
+async fn rejects_conflicting_history_selectors() {
     let (proxy, _backend, _db) = start_test_env();
 
     let conv_id = create_conversation(
@@ -109,10 +109,16 @@ async fn previous_response_id_takes_precedence_over_conversation() {
         &json_post("/v1/responses", &serde_json::to_string(&body).unwrap()),
     );
 
-    let status = parse_status(&raw);
-    assert!(
-        status == 400 || status == 404,
-        "should reject with error when previous_response_id is invalid (got {status})"
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "conflicting history selectors should be rejected"
+    );
+    let error: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        error["error"]["message"],
+        "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'."
     );
 }
 

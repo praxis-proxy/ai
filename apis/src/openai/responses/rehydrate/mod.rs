@@ -102,8 +102,8 @@ impl RehydrateFilter {
     /// `conversation`), and populate [`ResponsesState`] with the full
     /// conversation history.
     ///
-    /// `previous_response_id` takes precedence when both fields are
-    /// present.
+    /// The upstream `openai_responses_validate` filter rejects requests that
+    /// supply both selectors; the resolution order here is a silent fallback.
     async fn rehydrate(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -340,7 +340,17 @@ fn arm_json_restore(ctx: &mut HttpFilterContext<'_>) -> bool {
 /// recompute. (SSE normally carries none, so this is usually a no-op;
 /// `response_headers_modified` is flipped only when a header actually changed.)
 fn arm_streaming_restore(ctx: &mut HttpFilterContext<'_>) -> bool {
-    let Some(prev_id) = eligible_previous_response_id_stream(ctx) else {
+    let eligible = eligible_previous_response_id_stream(ctx);
+    // Record the wire-rewrite eligibility for the persistence source. The stored
+    // `response_object` is finalized by `canonicalize_logical_response` in the
+    // response body phase, where the header is gone; this flag lets it restore
+    // `previous_response_id` on exactly the streams whose client-visible frames
+    // this filter rewrites — and skip it on the validator-bearing / non-200 streams
+    // declined below — so a later GET agrees with the terminal frame (issue #1150).
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.previous_response_id_stream_restore_armed = eligible.is_some();
+    }
+    let Some(prev_id) = eligible else {
         return false;
     };
 
