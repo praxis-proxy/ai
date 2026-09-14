@@ -1,15 +1,21 @@
 # File Search Callout Filter
 #
-# Demonstrates the `openai_file_search_callout` filter configuration.
-# The filter validates its URL, timeout, and response-size
-# settings at startup. The iterative request router sends the request to the
-# model, executes any returned `file_search_call` through the vector store, and sends the
-# search context through a second model inference before returning the final
-# Responses API object.
-# Model responses that combine `file_search_call` with a client-executed
-# `function_call` are rejected until cross-request continuation state exists.
+# Demonstrates hosted `file_search` execution under the unified agentic loop
+# (#1046). `openai_agentic_loop` is the sole loop owner: it parses each model
+# response, records the `file_search_call` items it sees as assignments, and
+# publishes the single continuation signal (`action=loop|done`).
+# `openai_file_search_callout` is a pure request-phase dispatcher: at request-
+# body EOS on each IRR re-entry it executes the assigned calls against the
+# vector store and reconciles each item in place, then the owner prepares the
+# next inference request. The dispatcher never parses the response body and
+# never decides whether another round runs.
 #
-# Configuration:
+# The dispatcher validates its URL, timeout, and response-size settings at
+# startup. Model responses that combine `file_search_call` with a client-
+# executed `function_call` are rejected (the owner fails closed before any
+# server-side dispatch).
+#
+# Configuration (dispatcher):
 #   vector_store_url:         Vector store API base URL
 #   allow_private_url:        Permit local-sensitive targets for development only
 #   timeout_ms:               Whole-call timeout in milliseconds
@@ -19,9 +25,13 @@
 #   forward_headers:          Headers to forward from the client request
 #                             (e.g. Authorization) to the vector store API
 #
+# Transition rule (evaluated after each step's response-body):
+#   openai_agentic_loop.action = "loop" → next: inference
+#   default                             → done (exit to client)
+#
 # Shared sub-request connector settings under `runtime` are restart-required.
 # When `runtime.subrequest_circuit_breaker` is set, client-aware filters such
-# as this one inherit peer-level failure isolation from the shared client:
+# as the dispatcher inherit peer-level failure isolation from the shared client:
 #
 # runtime:
 #   subrequest_circuit_breaker:
@@ -50,6 +60,11 @@ filter_chains:
         steps:
           - name: inference
             filters:
+              # Request-phase dispatcher: at request-body EOS on each IRR
+              # re-entry it executes the file_search_call items the loop owner
+              # assigned in the prior response, mutating each in place inside
+              # ResponsesState.accumulated_output. It never parses the response
+              # body and never decides whether another round runs.
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:8001
                 allow_private_url: true
@@ -62,6 +77,12 @@ filter_chains:
                 on_failure: closed
                 forward_headers:
                   - authorization
+              # Sole loop owner: parses each model response, records file-search
+              # assignments for the dispatcher, and publishes the single
+              # continuation signal (action=loop|done). max_infer_iters must stay
+              # below the IRR max_iterations safety cap (7 + 1 = 8).
+              - filter: openai_agentic_loop
+                max_infer_iters: 7
               - filter: openai_responses_proxy
                 name: inference
               - filter: headers
@@ -78,9 +99,9 @@ filter_chains:
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:
-              - filter: openai_file_search_callout
-                key: pending
-                value: "true"
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
                 next: inference
               - default: true
                 done: true

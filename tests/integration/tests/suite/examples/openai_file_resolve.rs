@@ -432,7 +432,7 @@ pub(super) fn start_files_api_stub() -> u16 {
 }
 
 fn handle_files_api_request_auth(mut stream: std::net::TcpStream) {
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
 
     let mut data = Vec::new();
     let mut buf = [0_u8; 4096];
@@ -486,7 +486,7 @@ fn handle_files_api_request_auth(mut stream: std::net::TcpStream) {
 }
 
 fn handle_files_api_request(mut stream: std::net::TcpStream) {
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
 
     let mut data = Vec::new();
     let mut buf = [0_u8; 4096];

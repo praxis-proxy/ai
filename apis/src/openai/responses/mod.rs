@@ -19,8 +19,9 @@
 //! request body.
 //!
 //! The `openai_responses_validate` filter runs after the classifier
-//! to validate JSON syntax and extract additional fields without
-//! rejecting provider-owned parameter combinations.
+//! to validate JSON syntax, reject conflicting history selectors, and
+//! extract additional fields without rejecting provider-owned parameter
+//! combinations.
 
 pub(crate) mod agentic_loop;
 mod body_limits;
@@ -31,6 +32,7 @@ pub(crate) mod error;
 pub(crate) mod file_resolve;
 /// Executes hosted file-search calls against an OGX vector store API.
 pub(crate) mod file_search_callout;
+pub(crate) mod mcp_classify;
 pub(crate) mod mcp_dispatch;
 pub(crate) mod model_rewrite;
 pub(crate) mod openai_mcp_tool_resolve;
@@ -612,8 +614,15 @@ pub(crate) fn streamed_round_is_dispatchable(ctx: &HttpFilterContext<'_>, state:
 /// EVERY terminal path — including when an error was already recorded — so a
 /// stale `action="loop"` from a prior round cannot suppress the error frame or
 /// trigger another IRR round (#313 P1). Idempotent.
+///
+/// After the #1046 unification the single continuation authority is the owner
+/// (`openai_agentic_loop`): `logical_stream_continues` and the config-driven IRR
+/// `on_result` both key on the owner's `action`/`pending`, so the stop is armed
+/// on the owner's result set. This also covers the oversized `web_search` batch
+/// (the owner records `action="loop"` before `web_search` caps the batch and
+/// records the terminal error).
 pub(crate) fn fs_arm_stream_stop(ctx: &mut HttpFilterContext<'_>) {
-    let results = ctx.filter_results.entry("openai_file_search_callout").or_default();
+    let results = ctx.filter_results.entry("openai_agentic_loop").or_default();
     drop(results.set("action", "done"));
     drop(results.set("pending", "false"));
 }
