@@ -109,7 +109,9 @@ def _write_config(proxy_port: int) -> str:
     with open(CONFIG_PATH) as f:
         config = f.read()
 
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{proxy_port}")
+    replaced = config.replace("127.0.0.1:8080", f"127.0.0.1:{proxy_port}")
+    assert replaced != config, f"example drift: listener address not found in {CONFIG_PATH}"
+    config = replaced
 
     tls_block = (
         f'''\n
