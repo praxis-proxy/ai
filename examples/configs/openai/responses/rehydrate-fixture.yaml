@@ -8,17 +8,17 @@
 # store -> rehydrate -> proxy path deterministically.
 #
 # Pipeline ordering:
-#   1. openai_responses_format   — classifies body, promotes metadata
-#   2. openai_responses_validate — parses JSON, enriches metadata, IDs
-#   3. openai_response_store     — initializes store, registers in ctx
-#   4. openai_responses_rehydrate — resolves previous_response_id into
+#   1. openai_format   — classifies body, promotes metadata
+#   2. openai_validate — parses JSON, enriches metadata, IDs
+#   3. openai_store     — initializes store, registers in ctx
+#   4. openai_rehydrate — resolves previous_response_id into
 #      the message history and, on the response path, restores the
 #      caller's previous_response_id into the client body — both native
 #      JSON responses and streaming SSE lifecycle frames (issue #932)
-#   5. openai_responses_proxy    — rebuilds the outbound body from the
+#   5. openai_proxy    — rebuilds the outbound body from the
 #      resolved history and strips previous_response_id upstream
 #
-# The response_store filter must appear before openai_responses_rehydrate
+# The response_store filter must appear before openai_rehydrate
 # so its store backend is registered in `ctx.response_stores` during
 # `on_request`.
 #
@@ -33,20 +33,20 @@ listeners:
 filter_chains:
   - name: responses-rehydrate-fixture
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
         name: inference
 
       - filter: router

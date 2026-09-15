@@ -477,7 +477,7 @@ filter_chains:
         allow_pre_security_callout: true
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
 "#,
         )
         .unwrap();

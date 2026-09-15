@@ -538,10 +538,10 @@ impl HttpFilter for OpenaiConversationsFilter {
 /// Whether this request should trigger conversation append-back on
 /// the response path.
 fn should_append_back(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.has_conversation") == Some("true")
+    ctx.get_metadata("openai_format.has_conversation") == Some("true")
         && ctx.get_metadata("responses.conversation_id").is_some()
-        && ctx.get_metadata("openai_responses_format.stream") != Some("true")
-        && ctx.get_metadata("openai_responses_format.background") != Some("true")
+        && ctx.get_metadata("openai_format.stream") != Some("true")
+        && ctx.get_metadata("openai_format.background") != Some("true")
 }
 
 // -----------------------------------------------------------------------------

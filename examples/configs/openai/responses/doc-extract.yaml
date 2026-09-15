@@ -7,7 +7,7 @@
 # forwarded as plain text.
 #
 # Pipeline order:
-#   1. openai_responses_format  — classify the request
+#   1. openai_format  — classify the request
 #   2. openai_file_resolve      — resolve file_id → inline file_data
 #   3. openai_doc_extract       — convert input_file → input_text
 #   4. router + load_balancer   — forward to vLLM backend
@@ -26,7 +26,7 @@ listeners:
 filter_chains:
   - name: doc-extract-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format

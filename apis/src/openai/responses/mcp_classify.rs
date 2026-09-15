@@ -9,7 +9,7 @@
 //! be returned to the client for approval. It exposes a deliberately narrow
 //! surface — the [`McpDisposition`] enum and the [`classify_mcp`] function —
 //! so the agentic loop owner and every dispatcher (`openai_mcp_dispatch`,
-//! `openai_file_search_callout`) can agree on the disposition of a call
+//! `openai_file_search_dispatch`) can agree on the disposition of a call
 //! without any dispatcher importing another dispatcher's internals.
 //!
 //! The approval-policy helpers ([`parse_approval_policy`], [`requires_approval`])
@@ -19,7 +19,7 @@
 //!
 //! [`PendingApproval`]: super::mcp_dispatch
 
-use super::openai_mcp_tool_resolve::{McpToolIndex, McpToolMatch};
+use super::mcp_tool_resolve::{McpToolIndex, McpToolMatch};
 
 /// Disposition of a single model-emitted tool call relative to the resolved MCP
 /// tool map.
@@ -174,7 +174,7 @@ mod tests {
     use serde_json::json;
 
     use super::{McpDisposition, classify_mcp};
-    use crate::openai::responses::openai_mcp_tool_resolve::McpToolIndex;
+    use crate::openai::responses::mcp_tool_resolve::McpToolIndex;
 
     /// Build a one-entry tool map for `(label, tool)` with the given approval policy.
     fn tool_map_with_policy(

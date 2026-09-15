@@ -1473,7 +1473,9 @@ impl StreamConverter {
             // cannot be emitted; continuing would forward split or injected
             // upstream data. Fail the transport so the proxy tears the stream down.
             warn!("provider sent data after a terminal streaming event; failing the stream");
-            return Err("responses_to_chat_completions: upstream sent data after a terminal streaming event".into());
+            return Err(
+                "openai_responses_to_chat_completions: upstream sent data after a terminal streaming event".into(),
+            );
         }
         if matches!(self.phase, Phase::EmittedTerminal | Phase::Failed) {
             warn!(error = ?error, "streaming translation error after a terminal event; dropping");
@@ -1754,7 +1756,7 @@ fn logprobs_byte_cost(logprobs: &Value) -> usize {
 
 /// Build a filter error for an internal serialization failure.
 fn serialize_filter_error(error: &serde_json::Error) -> FilterError {
-    format!("responses_to_chat_completions: {error}").into()
+    format!("openai_responses_to_chat_completions: {error}").into()
 }
 
 /// Build a constant-bounded `response.failed` resource.

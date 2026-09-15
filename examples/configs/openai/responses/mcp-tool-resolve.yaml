@@ -6,7 +6,7 @@
 # server.
 #
 # The filter runs after `openai_tool_parse` (gated on `openai_tool_parse.has_mcp`)
-# and before `openai_responses_proxy`. It reads MCP entries from the
+# and before `openai_proxy`. It reads MCP entries from the
 # buffered request body, checks `previous_tools` for cached
 # listings, calls `tools/list` via the `mcp_client` module, and
 # writes `mcp_tool_map` to `ResponsesState`.
@@ -14,12 +14,6 @@
 # returned as a Responses SSE lifecycle containing
 # `response.mcp_list_tools.failed` and terminal `response.failed` events.
 # Local request-policy failures such as SSRF blocking remain HTTP errors.
-#
-# Configured `connector_id` plus `defer_loading: true` is validated
-# here when the request also includes `tool_search`: the ID is resolved
-# locally and stripped from the backend body, but this pipeline does
-# **not** load tools. Deferred discovery requires `openai_mcp_dispatch`
-# inside an agentic loop — see agentic-loop.yaml.
 #
 # On SUCCESS, the filter seeds one `mcp_list_tools` output item per
 # resolved server into the response state, but — unlike the failure
@@ -39,7 +33,7 @@
 # response store), see full-flow-agentic.yaml.
 #
 # For cross-request caching via `previous_tools`, add
-# `openai_responses_rehydrate` before this filter so that
+# `openai_rehydrate` before this filter so that
 # `ResponsesState.previous_tools` is populated from the stored
 # previous response.
 #
@@ -89,7 +83,7 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -107,7 +101,7 @@ filter_chains:
           - id: internal_search
             server_url: https://search-mcp.internal:8443/mcp
 
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
         name: inference
 
       - filter: router

@@ -553,7 +553,7 @@ listeners:
 filter_chains:
   - name: file-resolve-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -647,7 +647,7 @@ listeners:
 filter_chains:
   - name: file-resolve-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -729,18 +729,16 @@ fn example_config_rejects_ssrf_blocked_file_url_with_403() {
             "role": "user",
             "content": [{
                 "type": "input_file",
-                "file_url": "http://192.0.2.1/latest/meta-data/"
+                "file_url": "http://169.254.169.254/latest/meta-data/"
             }]
         }]
     }"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
-    let status = parse_status(&raw);
 
     assert_eq!(
-        status,
+        parse_status(&raw),
         403,
-        "documentation-range file_url should be rejected before proxying, body: {}",
-        parse_body(&raw)
+        "metadata file_url should be rejected before proxying"
     );
     let error: serde_json::Value =
         serde_json::from_str(&parse_body(&raw)).expect("error response should be valid JSON");
@@ -775,7 +773,7 @@ listeners:
 filter_chains:
   - name: file-resolve-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format

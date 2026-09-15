@@ -18,13 +18,13 @@
 #      path it appends input+output items back to the conversation after
 #      a successful non-streaming response.
 #
-#   2. openai_responses_format classifies the request and promotes
+#   2. openai_format classifies the request and promotes
 #      format, model, stream, and mode to internal routing headers.
 #      on_invalid is left at the default (passthrough) so that
 #      Conversations API traffic is not rejected before the conversations
 #      filter can handle it in the body phase.
 #
-#   3. openai_responses_validate checks JSON syntax, generates response
+#   3. openai_validate checks JSON syntax, generates response
 #      and conversation IDs, and writes responses.* metadata for
 #      downstream filters. Provider-owned parameter combinations pass
 #      through.
@@ -34,7 +34,7 @@
 #      has_web_search, tool_choice, function_count, etc.) to metadata and
 #      filter results. Does not mutate the request body.
 #
-#   5. openai_response_store persists responses to SQLite and registers
+#   5. openai_store persists responses to SQLite and registers
 #      the store backend so downstream filters (rehydrate, compact) can
 #      read from it. It runs PRE-IRR (before the iterative_request_router
 #      below), so on the response path — which runs in reverse config
@@ -43,7 +43,7 @@
 #      reads the accumulated response object that openai_stream_events
 #      builds inside the IRR.
 #
-#   6. openai_responses_rehydrate loads conversation context from
+#   6. openai_rehydrate loads conversation context from
 #      previous_response_id or conversation field by fetching stored
 #      responses/conversations and prepending their message history to the
 #      current request. previous_response_id takes precedence when both
@@ -95,7 +95,7 @@
 #      selected cluster is forwarded upstream directly.
 #
 #   11. The iterative_request_router owns the agentic loop for classified
-#      openai_responses create requests. openai_responses_proxy rebuilds
+#      openai_responses create requests. openai_proxy rebuilds
 #      the outbound body from ResponsesState and automatically selects the
 #      typed streaming transport for an effective `stream: true` request,
 #      so each backend SSE chunk reaches openai_stream_events
@@ -114,15 +114,15 @@
 #
 # IRR inference filter chain (canonical #1046 order):
 #   Request phase (forward):
-#     openai_stream_events → openai_web_search → openai_mcp_dispatch
-#       → openai_file_search_callout → openai_agentic_loop
-#       → openai_responses_proxy → headers → router → load_balancer
+#     openai_stream_events → openai_web_search_dispatch → openai_mcp_dispatch
+#       → openai_file_search_dispatch → openai_agentic_loop
+#       → openai_proxy → headers → router → load_balancer
 #   Response phase (reverse):
-#     load_balancer → router → headers → openai_responses_proxy
+#     load_balancer → router → headers → openai_proxy
 #       → openai_agentic_loop → (dispatchers have no response phase)
 #       → openai_stream_events
-#   The three dispatchers (openai_web_search, openai_mcp_dispatch,
-#   openai_file_search_callout) have no response phase: each executes the
+#   The three dispatchers (openai_web_search_dispatch, openai_mcp_dispatch,
+#   openai_file_search_dispatch) have no response phase: each executes the
 #   loop owner's assigned calls at request-body EOS on the next iteration,
 #   reconciling results in place inside ResponsesState.accumulated_output.
 #   Each is inert unless the model emits the matching hosted tool call.
@@ -141,11 +141,11 @@
 #                    7 + 1 = 8.
 #
 # Streaming persistence:
-#   Removing openai_stream_events (or moving openai_response_store after
+#   Removing openai_stream_events (or moving openai_store after
 #   the IRR) silently breaks streaming persistence: the store persists
 #   ResponsesState.response_object, and only openai_stream_events
 #   populates it for `stream: true` responses. openai_stream_events is
-#   also REQUIRED for loop correctness — openai_responses_proxy selects
+#   also REQUIRED for loop correctness — openai_proxy selects
 #   typed streaming automatically for `stream: true`, which commits
 #   `response.completed` to the client as it arrives, so a loop-terminal
 #   error detected by openai_agentic_loop can only reach the client
@@ -154,7 +154,7 @@
 #   any backend request. Keep the store PRE-IRR and openai_stream_events
 #   INSIDE the IRR step so both buffered and streaming responses are
 #   persisted and retrievable via GET /v1/responses/{id} (served pre-IRR
-#   by openai_response_store).
+#   by openai_store).
 #
 # Security: StreamBuffer body callouts run before this listener's
 # header-phase filters. Deploy this example behind an outer authentication
@@ -222,7 +222,7 @@
 #     ws://localhost:8080/v1/responses
 #
 # Web search requires a provider API key. Set WEB_SEARCH_API_KEY in the
-# environment before starting the proxy; openai_web_search stays inert
+# environment before starting the proxy; openai_web_search_dispatch stays inert
 # until the model emits a web_search_call.
 #
 # Listener and cluster transport timeouts are intentionally omitted.
@@ -277,7 +277,7 @@ filter_chains:
         conversations_table: openai_conversations
         items_table: openai_conversation_items
 
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -285,11 +285,11 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: openai_tool_parse
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         # In-memory:
         #   database_url: "sqlite::memory:"
@@ -298,7 +298,7 @@ filter_chains:
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
@@ -389,7 +389,7 @@ filter_chains:
       # streams through openai_stream_events, the three request-phase
       # dispatchers execute the loop owner's assigned hosted-tool calls, and
       # openai_agentic_loop parses each response and publishes the single
-      # loop/done transition. The pre-IRR openai_response_store persists the
+      # loop/done transition. The pre-IRR openai_store persists the
       # composed object on the response path (reverse order). The step
       # router is path-only because the IRR strips x-praxis-* headers from
       # its sub-request; the bypass carrier above has already excluded
@@ -425,7 +425,7 @@ filter_chains:
               # Request-phase dispatcher: runs first on re-entry to execute
               # web_search_call assignments prepared by the loop owner. Inert
               # until the model emits a web_search_call.
-              - filter: openai_web_search
+              - filter: openai_web_search_dispatch
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
                 max_calls_per_round: 32
@@ -443,7 +443,7 @@ filter_chains:
               # inside ResponsesState.accumulated_output. It never parses the
               # response body and never decides whether another round runs,
               # so it is inert unless the model emits a hosted file_search_call.
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 vector_store_url: http://127.0.0.1:3002
                 allow_private_url: true
                 timeout_ms: 5000
@@ -461,7 +461,7 @@ filter_chains:
                 max_infer_iters: 7
               # Selects typed streaming automatically when the effective
               # outbound body carries `"stream": true`; otherwise buffers.
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
               - filter: headers
                 request_set:
                   - name: Content-Type
@@ -484,8 +484,8 @@ filter_chains:
             on_result:
               # openai_agentic_loop is the sole loop authority (issue #1046):
               # it parses each model response, records assignments for the
-              # request-phase dispatchers (web_search, mcp_dispatch,
-              # file_search_callout), and publishes the single continuation
+              # request-phase dispatchers (web_search_dispatch, mcp_dispatch,
+              # file_search_dispatch), and publishes the single continuation
               # signal. The IRR transitions only on the owner's action, never
               # on a dispatcher's.
               - filter: openai_agentic_loop

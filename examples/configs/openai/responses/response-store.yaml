@@ -10,13 +10,13 @@
 #   GET  /v1/responses/{id}/input_items — paginated input items
 #   DELETE /v1/responses/{id}   — deleted from local store (200 or 404)
 #
-# The `openai_responses_format` filter must run first to classify
-# the request body — `openai_response_store` reads its metadata
+# The `openai_format` filter must run first to classify
+# the request body — `openai_store` reads its metadata
 # to decide whether to persist POST responses.
 #
 # POST persistence:
-#   The `openai_responses_format` filter must run first to
-#   classify the request body — `openai_response_store` reads its
+#   The `openai_format` filter must run first to
+#   classify the request body — `openai_store` reads its
 #   metadata to decide whether to persist. Streaming responses
 #   (`stream: true`) are skipped; streaming persistence will be
 #   handled by a separate filter. Non-2xx responses and non-JSON
@@ -41,9 +41,9 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         # In-memory:
         #   database_url: "sqlite::memory:"

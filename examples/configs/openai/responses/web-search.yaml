@@ -1,6 +1,6 @@
 # Web Search Filter
 #
-# Demonstrates the `openai_web_search` filter configuration. The filter
+# Demonstrates the `openai_web_search_dispatch` filter configuration. The filter
 # validates its configuration (provider, API key, timeouts) and
 # constructs a search client at startup but does not execute searches
 # at runtime. When `tool_dispatch` (#26) and branch re-entrance land
@@ -28,7 +28,7 @@ filter_chains:
   - name: web-search-pipeline
     filters:
       - filter: openai_tool_parse
-      - filter: openai_web_search
+      - filter: openai_web_search_dispatch
         provider: brave
         api_key: ${WEB_SEARCH_API_KEY}
         default_context_size: medium

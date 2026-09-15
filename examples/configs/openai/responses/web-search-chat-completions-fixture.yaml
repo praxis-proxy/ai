@@ -14,16 +14,16 @@ listeners:
 filter_chains:
   - name: responses-web-search-chat-fixture
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
-      - filter: responses_to_chat_completions
+      - filter: openai_responses_to_chat_completions
         max_rewritten_body_bytes: 67108864
 
       - filter: path_rewrite

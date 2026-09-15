@@ -5,12 +5,12 @@
 # Build:
 #   cargo build -p praxis-ai-proxy
 #
-# The openai_responses_format classifier must run before openai_responses_validate.
+# The openai_format classifier must run before openai_validate.
 # It buffers the body, classifies the request as Responses API, and
-# promotes model/stream/store/background to openai_responses_format.*
-# metadata that openai_responses_validate copies into responses.* metadata.
+# promotes model/stream/store/background to openai_format.*
+# metadata that openai_validate copies into responses.* metadata.
 #
-# openai_responses_validate then extracts conversation.id when present,
+# openai_validate then extracts conversation.id when present,
 # generates response and conversation IDs, and writes responses.*
 # metadata for downstream pipeline filters.
 #
@@ -45,9 +45,9 @@ listeners:
 filter_chains:
   - name: validate-and-route
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
-      - filter: openai_responses_validate
+      - filter: openai_validate
       - filter: router
         routes:
           - path: "/v1/responses"

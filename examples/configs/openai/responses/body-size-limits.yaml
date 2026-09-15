@@ -5,7 +5,7 @@
 #
 # Every body-buffering Responses filter (openai_file_resolve,
 # openai_doc_extract, openai_tool_parse, openai_mcp_tool_resolve,
-# openai_responses_proxy) declares a StreamBuffer body mode with a
+# openai_proxy) declares a StreamBuffer body mode with a
 # fixed 64 MiB ceiling. Praxis core merges those per-filter modes per
 # direction, keeping the largest, then clamps the merged mode to the
 # listener's transport ceiling. That transport ceiling — and only that
@@ -70,7 +70,7 @@ filter_chains:
 
       - filter: openai_mcp_tool_resolve
 
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
 
       - filter: router
         routes:

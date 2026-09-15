@@ -397,7 +397,7 @@ mod tests {
         let mut body = Some(Bytes::from_static(b"{}"));
         let bytes = Bytes::from(serde_json::to_vec(&json!({"a": 1})).unwrap());
 
-        let mutation = SerializedJson::from_bytes(bytes.clone()).commit(&mut body, "openai_responses_proxy", "body");
+        let mutation = SerializedJson::from_bytes(bytes.clone()).commit(&mut body, "openai_proxy", "body");
 
         assert_eq!(mutation.new_len(), bytes.len());
         assert_eq!(body.as_ref().unwrap(), &bytes);

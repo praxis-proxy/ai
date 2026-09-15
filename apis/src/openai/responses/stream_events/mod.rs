@@ -138,7 +138,7 @@ pub(super) struct StreamEventsState {
 /// # max_accumulated_bytes: 67108864
 /// # max_output_items: 100000
 /// ```
-pub struct OpenaiStreamEventsFilter {
+pub struct StreamEventsFilter {
     /// Configuration for the SSE frame parser.
     parser_config: SseParserConfig,
     /// Cap on accumulated bytes per tool-call argument string.
@@ -149,7 +149,7 @@ pub struct OpenaiStreamEventsFilter {
     max_output_items: usize,
 }
 
-impl OpenaiStreamEventsFilter {
+impl StreamEventsFilter {
     /// Create a filter from parsed YAML config.
     ///
     /// # Errors
@@ -277,7 +277,7 @@ impl OpenaiStreamEventsFilter {
 
 /// Outcome of the request-phase IRR-placement guard.
 ///
-/// Factored out of [`OpenaiStreamEventsFilter`]'s `on_request` so the guard's
+/// Factored out of [`StreamEventsFilter`]'s `on_request` so the guard's
 /// fail-closed decision table — the invariant that logical composition only
 /// arms inside an `iterative_request_router` step — is exhaustively unit
 /// testable. The runtime signal it depends on, an [`IterationState`] in request
@@ -308,7 +308,7 @@ const fn arm_decision(is_streaming_responses: bool, inside_irr: bool) -> ArmDeci
 }
 
 #[async_trait]
-impl HttpFilter for OpenaiStreamEventsFilter {
+impl HttpFilter for StreamEventsFilter {
     fn name(&self) -> &'static str {
         "openai_stream_events"
     }
@@ -335,10 +335,10 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         let typed_streaming = ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming;
         // The `iterative_request_router` runner moves request extensions into
         // each step but builds a fresh `filter_metadata` map, so metadata set by
-        // pre-IRR filters (e.g. `openai_responses_format`) is not visible here.
+        // pre-IRR filters (e.g. `openai_format`) is not visible here.
         // `ResponsesState` is created pre-IRR and travels through extensions, so
         // fall back to it for format and stream detection — mirroring how
-        // `responses_to_chat_completions` resolves `request_is_streaming`.
+        // `openai_responses_to_chat_completions` resolves `request_is_streaming`.
         let responses_state = ctx.extensions.get::<ResponsesState>();
         let has_responses_state = responses_state.is_some();
         let body_stream = responses_state
@@ -347,10 +347,9 @@ impl HttpFilter for OpenaiStreamEventsFilter {
             .unwrap_or(false);
         let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
             && (typed_streaming
-                || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+                || ctx.get_metadata("openai_format.format") == Some("openai_responses")
                 || has_responses_state);
-        let is_streaming =
-            typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
+        let is_streaming = typed_streaming || ctx.get_metadata("openai_format.stream") == Some("true") || body_stream;
         // `IterationState` is inserted by the IRR runner before the request phase
         // of every iteration (including iteration 0), so its presence is the
         // runtime signal that the filter is placed inside an IRR step.
@@ -776,11 +775,11 @@ fn append_logical_event(
     let file_search_active = ctx
         .extensions
         .get::<ResponsesState>()
-        .is_some_and(crate::openai::responses::file_search_callout::has_file_search_tool);
+        .is_some_and(crate::openai::responses::file_search_dispatch::has_file_search_tool);
     if file_search_active && event.event_type() == "response.output_item.added" {
         let payload = event.payload();
         if let Some(item) = payload.get("item") {
-            use crate::openai::responses::file_search_callout::{
+            use crate::openai::responses::file_search_dispatch::{
                 is_file_search_function_call, is_pending_file_search_call,
             };
             if is_file_search_function_call(item) {
@@ -879,17 +878,16 @@ fn commit_local_tool_milestones(
     // Record which client-visible milestones the model backend streamed for this
     // item. `output_item.added`/`.done` mark it announced (so a later flush does
     // not re-emit `output_item.added`); an actual `response.web_search_call.*` /
-    // `response.mcp_call.*` / `response.mcp_list_tools.*` progress event marks
-    // the lifecycle as already streamed in-band (so the flush does not
-    // re-synthesize it). Persisted across rounds via `emitted_output_items`,
-    // this is what a resumed round's flush consults.
+    // `response.mcp_call.*` progress event marks the lifecycle as already streamed
+    // in-band (so the flush does not re-synthesize it). Persisted across rounds
+    // via `emitted_output_items`, this is what a resumed round's flush consults.
     record_model_output_item(ctx, event);
 
     // #276: ahead of the first model output *content* event, stream any locally
-    // generated tool items (MCP calls/approvals/listings, or web searches
-    // absent from the upstream stream) that the tool-dispatch filters appended
-    // to `accumulated_output` but never emitted incrementally. They must
-    // precede the resumed model output and occupy their reserved output indices.
+    // generated tool items (MCP calls/approvals, or web searches absent from the
+    // upstream stream) that the tool-dispatch filters appended to
+    // `accumulated_output` but never emitted incrementally. They must precede the
+    // resumed model output and occupy their reserved output indices.
     // `accumulated_output` is fixed for the round, so the flush runs once here
     // rather than re-serializing every local item ahead of each event; the EOS
     // flush still catches items whose round produced no resumed model event.
@@ -953,12 +951,11 @@ fn mark_local_done_delivered(ctx: &mut HttpFilterContext<'_>, event: &ResponsesE
 /// its latest content, but prove nothing about the tool-specific progress
 /// lifecycle: a backend may stream `added` then `done` with no progress events in
 /// between, or only some of them (e.g. `in_progress` then `done`). Only observing
-/// an actual `response.web_search_call.*` / `response.mcp_call.*` /
-/// `response.mcp_list_tools.*` event proves that specific phase reached the
-/// client, so each is recorded individually by its event type. Deriving the
-/// lifecycle from `done` would suppress the synthesized progress a partial
-/// `added → in_progress → done` sequence still owes for its missing
-/// `searching`/`completed` phases.
+/// an actual `response.web_search_call.*` / `response.mcp_call.*` event proves
+/// that specific phase reached the client, so each is recorded individually by
+/// its event type. Deriving the lifecycle from `done` would suppress the
+/// synthesized progress a partial `added → in_progress → done` sequence still
+/// owes for its missing `searching`/`completed` phases.
 fn record_model_output_item(ctx: &mut HttpFilterContext<'_>, event: &ResponsesEvent) {
     match event {
         ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {
@@ -1073,7 +1070,7 @@ fn is_local_tool_item(item: &Value) -> bool {
 /// envelope.
 ///
 /// The whole item is hashed rather than keyed on `type|status` alone so a payload
-/// the model never streamed — e.g. the `action.sources` list `openai_web_search`
+/// the model never streamed — e.g. the `action.sources` list `openai_web_search_dispatch`
 /// adds to a `web_search_call` after local execution — is detected as a change even
 /// when the item's type and status are unchanged.
 ///
@@ -1654,7 +1651,7 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     // Preserve any non-terminal logical events `process_chunk` already emitted
     // for this final chunk, then append synthesized local-tool events and the
     // deferred terminal. A transport that reassembles the whole stream before
-    // releasing it (e.g. `responses_to_chat_completions`) delivers the
+    // releasing it (e.g. `openai_responses_to_chat_completions`) delivers the
     // created/delta events and deferred terminal together in the end-of-stream
     // chunk; starting from an empty buffer here would drop those earlier events.
     let mut output = body.take().map_or_else(Vec::new, |bytes| bytes.to_vec());
@@ -1724,7 +1721,7 @@ fn emit_deferred_terminal(
     flush_local_output_items(ctx, output);
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
     // The upstream event stream is the client-visible terminal, rewritten (or left
-    // untouched) by `openai_responses_rehydrate`; match its wire-rewrite decision so
+    // untouched) by `openai_rehydrate`; match its wire-rewrite decision so
     // the persisted store source cannot disagree with the streamed frame (#1150).
     let restore_previous_response_id = state.previous_response_id_stream_restore_armed;
     let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id);
@@ -1768,7 +1765,7 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 /// echoed as `null` after a rehydrated turn stripped it from the upstream request
 /// (#1150). It MUST mirror whichever path owns the client-visible terminal, or a
 /// later GET disagrees with what the client streamed:
-/// - upstream streaming: the wire is rewritten by `openai_responses_rehydrate`, so the caller passes
+/// - upstream streaming: the wire is rewritten by `openai_rehydrate`, so the caller passes
 ///   `state.previous_response_id_stream_restore_armed` — the filter's own `eligible_previous_response_id_stream`
 ///   decision, which declines validator-bearing and non-200 streams the store must therefore also leave alone (issue
 ///   #1150 review);
@@ -1803,7 +1800,7 @@ fn canonicalize_logical_response(
     // No-op when no dispatcher recorded citation files. Best-effort: the logical
     // stream is already committed here, so a malformed marker degrades to
     // un-annotated text rather than aborting the terminal.
-    if let Err(error) = crate::openai::responses::file_search_callout::citations::annotate_output_items(
+    if let Err(error) = crate::openai::responses::file_search_dispatch::citations::annotate_output_items(
         &mut output,
         &state.citation_files,
     ) {
