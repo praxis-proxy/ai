@@ -97,6 +97,17 @@ const MAX_CALLS_METADATA: &str = "responses.mcp_max_calls_per_round";
 /// unbounded batch could otherwise overflow into an HTTP 500.
 const MAX_APPROVAL_RESPONSES: usize = 1;
 
+/// Whether this internally resolved tool entry names a configured connector.
+///
+/// Optional fields are serialized into the tool map as JSON `null`, so field
+/// presence alone is not sufficient to distinguish a request-selected URL.
+pub(super) fn is_connector_tool_entry(entry: &serde_json::Value) -> bool {
+    entry
+        .get("connector_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|connector_id| !connector_id.is_empty())
+}
+
 // -----------------------------------------------------------------------------
 // McpDispatchFilter
 // -----------------------------------------------------------------------------
@@ -1403,9 +1414,7 @@ async fn execute_single_call(
         .unwrap_or("unknown");
     let headers = entry.get("headers");
     let authorization = entry.get("authorization").and_then(serde_json::Value::as_str);
-    let forwarded_headers = entry
-        .get("connector_id")
-        .is_some()
+    let forwarded_headers = is_connector_tool_entry(entry)
         .then_some(options.forwarded_headers)
         .flatten();
     let (arguments, arguments_string) = match parse_call_arguments(

@@ -299,7 +299,7 @@ pub(crate) fn target_fingerprint(entry: &serde_json::Value) -> String {
 /// continuation state. Direct client-selected URLs never receive ambient
 /// headers and therefore carry no binding.
 pub(crate) fn bind_forwarded_header_context(entry: &mut serde_json::Value, headers: &http::HeaderMap) {
-    let connector = entry.get("connector_id").is_some_and(|value| !value.is_null());
+    let connector = super::is_connector_tool_entry(entry);
     let Some(object) = entry.as_object_mut() else {
         return;
     };

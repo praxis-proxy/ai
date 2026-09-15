@@ -12,9 +12,9 @@ use serde_json::json;
 use super::{
     McpDispatchFilter, McpExecutionOptions, admitted_result_limits, build_error_result, build_success_result,
     content_blocks_to_output, execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id,
-    extract_mcp_tool_calls, find_by_encoded_name, is_mcp_tool_call, mcp_call_ids_are_unique_and_new,
-    normalize_arguments, parse_call_arguments, partition_calls_by_approval, prepare_response_round,
-    process_call_result, resolve_tool_entry, result_payload_limit,
+    extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry, is_mcp_tool_call,
+    mcp_call_ids_are_unique_and_new, normalize_arguments, parse_call_arguments, partition_calls_by_approval,
+    prepare_response_round, process_call_result, resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     openai::responses::{
@@ -43,6 +43,19 @@ fn call_refs(calls: &[serde_json::Value]) -> Vec<&serde_json::Value> {
 
 const TEST_MAX_RESULT_BYTES: usize = 1_048_576;
 const TEST_MAX_TOTAL_RESULT_BYTES: usize = 8_388_608;
+
+#[test]
+fn only_nonempty_string_connector_ids_enable_ambient_headers() {
+    assert!(is_connector_tool_entry(&json!({"connector_id": "configured"})));
+    for direct_or_invalid in [
+        json!({}),
+        json!({"connector_id": null}),
+        json!({"connector_id": ""}),
+        json!({"connector_id": true}),
+    ] {
+        assert!(!is_connector_tool_entry(&direct_or_invalid));
+    }
+}
 
 #[test]
 fn rejected_calls_do_not_dilute_admitted_result_allowance() {

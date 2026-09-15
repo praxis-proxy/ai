@@ -292,7 +292,7 @@ fn round_trip_captures_tool_and_model_requests() {
     });
 
     let proxy_port = free_port();
-    let config = load_loopback_mcp_config(proxy_port, model.port());
+    let config = load_loopback_mcp_forward_headers_config(proxy_port, model.port());
     let proxy = start_proxy(&config);
 
     let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
@@ -308,10 +308,12 @@ fn round_trip_captures_tool_and_model_requests() {
             "require_approval": "never"
         }]
     });
-    let raw = http_send(
-        proxy.addr(),
-        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    let request = json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()).replacen(
+        "Content-Type: application/json",
+        "x-tenant-id: tenant-a\r\nContent-Type: application/json",
+        1,
     );
+    let raw = http_send(proxy.addr(), &request);
 
     assert_eq!(parse_status(&raw), 200, "round-trip should return 200");
     let body = parse_body(&raw);
@@ -336,6 +338,12 @@ fn round_trip_captures_tool_and_model_requests() {
         .iter()
         .find(|request| request.json_rpc_method.as_deref() == Some("tools/call"))
         .expect("MCP server should receive tools/call");
+    assert!(
+        call.headers
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("x-tenant-id")),
+        "ambient identity must not cross the request-selected MCP URL boundary"
+    );
     let call_body: serde_json::Value = serde_json::from_str(&call.body).expect("tools/call body should be JSON");
     assert_eq!(call_body["params"]["arguments"]["location"], "SF");
 
@@ -6784,6 +6792,18 @@ fn load_agentic_rejection_config(proxy_port: u16, model_port: u16) -> praxis_cor
 }
 
 fn load_loopback_mcp_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+    load_loopback_mcp_config_inner(proxy_port, model_port, false)
+}
+
+fn load_loopback_mcp_forward_headers_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+    load_loopback_mcp_config_inner(proxy_port, model_port, true)
+}
+
+fn load_loopback_mcp_config_inner(
+    proxy_port: u16,
+    model_port: u16,
+    forward_headers: bool,
+) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
@@ -6798,6 +6818,20 @@ fn load_loopback_mcp_config(proxy_port: u16, model_port: u16) -> praxis_core::co
         "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
         1,
     );
+    let yaml = if forward_headers {
+        yaml.replacen(
+            "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
+            "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n        forward_headers: [x-tenant-id]\n",
+            1,
+        )
+        .replacen(
+            "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
+            "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n                forward_headers: [x-tenant-id]\n",
+            1,
+        )
+    } else {
+        yaml
+    };
     praxis_core::config::Config::from_yaml(&yaml).expect("parse loopback MCP config")
 }
 
