@@ -128,7 +128,7 @@ enum OwnerSource {
 /// ```yaml
 /// filter: openai_state_owner
 /// mode: trusted_owner
-/// header: x-praxis-state-owner
+/// header: x-authenticated-state-owner
 /// ```
 ///
 /// Explicit single-tenant compatibility mode does not consume a header:
