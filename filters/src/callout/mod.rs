@@ -21,7 +21,7 @@ mod extract;
 #[cfg(test)]
 mod tests;
 
-use std::time::Duration;
+use std::{borrow::Cow, time::Duration};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -29,6 +29,7 @@ use config::{HttpCalloutConfig, Phase, expand_env_vars, validate_callout_url};
 use extract::{BodyShaper, CompiledExtraction};
 use http::HeaderMap;
 use praxis_ai_apis::{
+    callout_headers::effective_callout_headers,
     callout_policy::{OnFailure, validate_status_on_error},
     callout_target::{AddressPolicy, validate_configured_http_target},
     http_hop::{connection_nominates_header, is_hop_by_hop},
@@ -207,6 +208,7 @@ impl HttpCalloutFilter {
     /// safely-forwarded client headers, and the target-bound `Host`.
     fn build_callout_headers(&self, ctx: &HttpFilterContext<'_>) -> HeaderMap {
         let mut headers = HeaderMap::new();
+        let request_headers = effective_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers));
 
         // Static configured headers.
         for (name, value) in &self.headers {
@@ -215,10 +217,10 @@ impl HttpCalloutFilter {
 
         // Forward allowed client headers, skipping hop-by-hop/sensitive ones.
         for name in &self.forward_headers {
-            if is_disallowed_forward_header(name) || connection_nominates_header(&ctx.request.headers, name) {
+            if is_disallowed_forward_header(name) || connection_nominates_header(&request_headers, name) {
                 continue;
             }
-            if let Some(value) = ctx.request.headers.get(name) {
+            if let Some(value) = request_headers.get(name) {
                 headers.insert(name.clone(), value.clone());
             }
         }
