@@ -27,11 +27,12 @@ use serde::Deserialize;
 /// Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting`
 /// proposal in `praxis-proxy/enhancements`, scoped to this milestone's
 /// static header-value matchers and per-rule algorithm choice. CEL
-/// matchers, soft-limit tiers, weighted per-type accounting, and
-/// configurable estimation strategies are still out of scope (see the
-/// module doc comment) -- upstream itself defers the first two; the
-/// latter two are deferred to a separate follow-up by design, not by
-/// upstream mandate.
+/// matchers, soft-limit tiers, and weighted per-type accounting are
+/// still out of scope (see the module doc comment) -- upstream itself
+/// defers the first two; per-type accounting is deferred to a separate
+/// follow-up by design, not by upstream mandate. Configurable
+/// estimation strategies (M3) are now supported via the `estimation:`
+/// block (see [`EstimationConfig`]).
 ///
 /// Assumes request identity has already been resolved upstream (this
 /// filter doesn't authenticate callers) -- a catch-all rule (no
@@ -104,11 +105,23 @@ pub(super) struct RuleConfig {
     /// Fixed token cost reserved at admission time, before actual usage
     /// is known.
     ///
-    /// Placeholder pending M3 (configurable estimation strategies).
-    /// Real deployments will want this derived from request metadata
-    /// (e.g. `max_tokens`) rather than a single fixed constant -- that's
-    /// out of scope for this milestone.
-    pub reserved_tokens: u64,
+    /// Legacy field, retained for backward compatibility: a bare
+    /// `reserved_tokens: N` is equivalent to
+    /// `estimation: { strategy: fixed, fallback_estimate: N }`.
+    /// Mutually exclusive with [`estimation`](Self::estimation) --
+    /// specifying both on the same rule is a config error.
+    #[serde(default)]
+    pub reserved_tokens: Option<u64>,
+
+    /// Configurable estimation strategy for computing the token cost
+    /// reserved at admission time. Replaces the legacy `reserved_tokens`
+    /// field with request-metadata-aware strategies.
+    ///
+    /// Mutually exclusive with [`reserved_tokens`](Self::reserved_tokens) --
+    /// specifying both on the same rule is a config error. Omitting both
+    /// is also an error.
+    #[serde(default)]
+    pub estimation: Option<EstimationConfig>,
 
     /// How long an admitted-but-never-reconciled reservation (lost
     /// request: timeout, connection reset, upstream crash) is tracked as
@@ -210,6 +223,63 @@ pub(super) enum BackendKind {
     Valkey,
 }
 
+/// Configurable estimation strategy for computing the token cost
+/// reserved at admission time, per rule.
+///
+/// Replaces the fixed `reserved_tokens` field with request-metadata-aware
+/// strategies. The operator picks one strategy per rule; all budgets on
+/// that rule share the same cost model.
+///
+/// Experimental: the `strategy` tag is intentionally extensible —
+/// future variants (e.g. `cel`) can be added without changing
+/// existing configurations.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "strategy", rename_all = "snake_case")]
+pub(super) enum EstimationStrategy {
+    /// Constant per request (equivalent to the legacy `reserved_tokens`).
+    Fixed,
+    /// Extracted from the request body's `max_tokens` field.
+    MaxTokens,
+    /// Content-Length-based input estimate plus `max_tokens`.
+    InputPlusMaxTokens,
+    /// `max_tokens` scaled by a per-model multiplier.
+    ModelScaled,
+}
+
+/// Full estimation configuration block, combining a strategy tag with
+/// shared tuning knobs.
+#[derive(Debug, Deserialize)]
+pub(super) struct EstimationConfig {
+    /// Which strategy to use for this rule's cost estimation.
+    #[serde(flatten)]
+    pub strategy: EstimationStrategy,
+
+    /// Safety-margin multiplier applied to the computed estimate.
+    /// Defaults to 1.0 (no margin). Must be positive and finite.
+    #[serde(default)]
+    pub multiplier: Option<f64>,
+
+    /// Token count to use when `max_tokens` is absent from the request.
+    /// Required for `fixed`; optional for body-dependent strategies
+    /// (if unset and the strategy can't extract a value, the request is
+    /// admitted without a reservation).
+    #[serde(default)]
+    pub fallback_estimate: Option<u64>,
+
+    /// Per-model multiplier map for `model_scaled` strategy.
+    #[serde(default)]
+    pub model_multipliers: Option<BTreeMap<String, f64>>,
+
+    /// Default multiplier for models not listed in `model_multipliers`.
+    #[serde(default)]
+    pub default_multiplier: Option<f64>,
+
+    /// Approximate bytes-per-token ratio for `input_plus_max_tokens`.
+    /// Defaults to 4.0.
+    #[serde(default)]
+    pub bytes_per_token: Option<f64>,
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -242,7 +312,7 @@ mod tests {
             rule.algorithm,
             RuleAlgorithm::SlidingWindow { capacity: 1000, .. }
         ));
-        assert_eq!(rule.reserved_tokens, 50);
+        assert_eq!(rule.reserved_tokens, Some(50));
     }
 
     #[test]

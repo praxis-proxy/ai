@@ -52,8 +52,8 @@
 //!   `ai#123`/`ai#232`); `ai#129`'s single-header-value keying (one budget applied uniformly per key, fallback to
 //!   global) is implemented per rule, and intentionally does not resolve identity to a key itself -- it keys off
 //!   whatever header value an upstream component has already put there.
-//! - **Configurable estimation (M3)**: `reserved_tokens` is a fixed constant per rule, not derived from request
-//!   metadata (e.g. `max_tokens`).
+//! - **Configurable estimation (M3)**: implemented -- per-rule `estimation:` block with pluggable strategies (`fixed`,
+//!   `max_tokens`, `input_plus_max_tokens`, `model_scaled`). See [`config::EstimationConfig`].
 //! - **Token-type-aware accounting (M4)**: reconciles against `token.total` only; per-type (input/output/cached)
 //!   weighting is not modeled yet.
 //! - **Multiple budgets per rule, soft-limit tiers**: the proposal allows several `token_budgets` (e.g. hourly + daily)
@@ -87,7 +87,11 @@ mod config;
 mod ledger;
 mod token_bucket_ledger;
 
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+    time::Instant,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -105,8 +109,8 @@ use self::{
         ValkeyTokenRateLimitBackend,
     },
     config::{
-        BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, MatchConfig, RuleAlgorithm, RuleConfig,
-        TokenRateLimitConfig,
+        BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, EstimationConfig, EstimationStrategy, MatchConfig,
+        RuleAlgorithm, RuleConfig, TokenRateLimitConfig,
     },
     ledger::{Budget, Ledger, LedgerConfig},
     token_bucket_ledger::{TokenBucketConfig, TokenBucketLedger},
@@ -131,6 +135,11 @@ const META_BUCKET_KEY: &str = "token_rate_limit.bucket_key";
 /// backend/estimate even when other rules exist.
 const META_RULE_INDEX: &str = "token_rate_limit.rule_index";
 
+/// Metadata key stashing this request's computed estimate, so
+/// reconciliation can use the actual per-request estimate (not just
+/// the compiled default) for its settlement math.
+const META_ESTIMATE: &str = "token_rate_limit.estimate";
+
 /// The single budget key every request resolves to in this milestone: all
 /// requests matching a rule share one budget. Kept as a named sentinel
 /// (rather than threading `Option<String>`/`&str` through the backend
@@ -151,6 +160,12 @@ const MAX_KEY_LENGTH: usize = 256;
 
 /// Bound on reservations awaiting reconciliation across all keys, per rule.
 const MAX_ACTIVE_RESERVATIONS: usize = 200_000;
+
+/// Maximum request body bytes buffered for body-dependent estimation
+/// strategies. 2 MiB -- generous enough for the largest realistic
+/// inference request body, small enough not to materially affect
+/// memory pressure.
+const MAX_ESTIMATION_BODY_BYTES: usize = 2_097_152;
 
 /// Rate limit header: configured token budget.
 ///
@@ -295,6 +310,161 @@ fn build_token_bucket_backend(
 }
 
 // -----------------------------------------------------------------------------
+// Estimation
+// -----------------------------------------------------------------------------
+
+/// Minimal serde struct for probing request-body fields needed by
+/// body-dependent estimation strategies, without deserializing the
+/// entire request payload.
+#[derive(serde::Deserialize)]
+struct BodyProbe {
+    /// OpenAI-style `max_tokens` field (preferred over `max_completion_tokens`).
+    max_tokens: Option<u64>,
+    /// OpenAI-style `max_completion_tokens` fallback field.
+    max_completion_tokens: Option<u64>,
+    /// Model identifier, used by `model_scaled` strategy.
+    model: Option<String>,
+}
+
+/// Compiled, ready-to-use estimation strategy for one rule.
+///
+/// Built once at filter construction from the deserialized
+/// [`EstimationConfig`]; all per-request math runs against this
+/// pre-validated form.
+enum CompiledEstimation {
+    /// Constant per request (the legacy `reserved_tokens` path, plus
+    /// the `estimation: { strategy: fixed }` equivalent).
+    Fixed {
+        /// Pre-computed token estimate (already incorporates any multiplier).
+        estimate: u64,
+    },
+
+    /// From request body `max_tokens` (or `max_completion_tokens`).
+    MaxTokens {
+        /// Fallback when body has no `max_tokens`/`max_completion_tokens`.
+        fallback_estimate: Option<u64>,
+        /// Safety-margin multiplier applied to the extracted value.
+        multiplier: f64,
+    },
+
+    /// Content-Length-based input estimate plus `max_tokens` from body.
+    InputPlusMaxTokens {
+        /// Fallback for the output portion when `max_tokens` is absent.
+        fallback_estimate: Option<u64>,
+        /// Safety-margin multiplier applied to the total.
+        multiplier: f64,
+        /// Approximate bytes-per-token ratio for input estimation.
+        bytes_per_token: f64,
+    },
+
+    /// `max_tokens` scaled by a per-model multiplier.
+    ModelScaled {
+        /// Fallback when body has no `max_tokens`/`max_completion_tokens`.
+        fallback_estimate: Option<u64>,
+        /// Per-model multiplier overrides.
+        model_multipliers: BTreeMap<String, f64>,
+        /// Multiplier for models not in `model_multipliers`.
+        default_multiplier: f64,
+    },
+}
+
+impl CompiledEstimation {
+    /// Whether this strategy requires access to the request body.
+    fn needs_body(&self) -> bool {
+        !matches!(self, Self::Fixed { .. })
+    }
+
+    /// Compute the token estimate for a single request.
+    ///
+    /// Returns `None` when the strategy cannot extract the needed
+    /// value (e.g. `max_tokens` absent from the body) and no
+    /// `fallback_estimate` is configured -- the caller should admit
+    /// without a reservation in that case.
+    fn estimate(&self, headers: &http::HeaderMap, body_probe: Option<&BodyProbe>) -> Option<u64> {
+        match self {
+            Self::Fixed { estimate } => Some(*estimate),
+            Self::MaxTokens {
+                fallback_estimate,
+                multiplier,
+            } => {
+                let raw = extract_max_tokens(body_probe, *fallback_estimate)?;
+                Some(apply_multiplier(raw, *multiplier))
+            },
+            Self::InputPlusMaxTokens {
+                fallback_estimate,
+                multiplier,
+                bytes_per_token,
+            } => {
+                let input = content_length_tokens(headers, *bytes_per_token);
+                let output = extract_max_tokens(body_probe, *fallback_estimate)?;
+                Some(apply_multiplier(input.saturating_add(output), *multiplier))
+            },
+            Self::ModelScaled {
+                fallback_estimate,
+                model_multipliers,
+                default_multiplier,
+            } => {
+                let raw = extract_max_tokens(body_probe, *fallback_estimate)?;
+                let model_mult = resolve_model_multiplier(body_probe, headers, model_multipliers, *default_multiplier);
+                Some(apply_multiplier(raw, model_mult))
+            },
+        }
+    }
+}
+
+/// Extract `max_tokens` (preferred) or `max_completion_tokens` from a
+/// body probe, falling back to `fallback` if neither is present.
+fn extract_max_tokens(body_probe: Option<&BodyProbe>, fallback: Option<u64>) -> Option<u64> {
+    body_probe
+        .and_then(|bp| bp.max_tokens.or(bp.max_completion_tokens))
+        .or(fallback)
+}
+
+/// Apply a safety-margin `multiplier` to a raw token count, rounding up.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "token estimates are bounded by config-validated capacity (u64-safe)"
+)]
+fn apply_multiplier(raw: u64, multiplier: f64) -> u64 {
+    ((raw as f64) * multiplier).ceil() as u64
+}
+
+/// Estimate input tokens from `Content-Length` and `bytes_per_token`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "token estimates are bounded by config-validated capacity (u64-safe)"
+)]
+fn content_length_tokens(headers: &http::HeaderMap, bytes_per_token: f64) -> u64 {
+    let content_length = headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    (content_length as f64 / bytes_per_token).ceil() as u64
+}
+
+/// Resolve the model multiplier: body `model` field preferred, then
+/// `x-model` header, then `default_multiplier`.
+fn resolve_model_multiplier(
+    body_probe: Option<&BodyProbe>,
+    headers: &http::HeaderMap,
+    model_multipliers: &BTreeMap<String, f64>,
+    default_multiplier: f64,
+) -> f64 {
+    let model_name = body_probe
+        .and_then(|bp| bp.model.as_deref())
+        .or_else(|| headers.get("x-model").and_then(|v| v.to_str().ok()));
+    model_name
+        .and_then(|name| model_multipliers.get(name))
+        .copied()
+        .unwrap_or(default_multiplier)
+}
+
+// -----------------------------------------------------------------------------
 // CompiledRule
 // -----------------------------------------------------------------------------
 
@@ -313,8 +483,8 @@ struct CompiledRule {
     /// Valkey; sliding-window or token-bucket.
     backend: Arc<dyn TokenRateLimitStateBackend>,
 
-    /// Fixed token cost reserved at admission (M3 placeholder).
-    reserved_tokens: u64,
+    /// Compiled estimation strategy for this rule.
+    estimation: CompiledEstimation,
 }
 
 impl CompiledRule {
@@ -339,19 +509,21 @@ impl CompiledRule {
 /// `capacity`, or `reservation_timeout` isn't a valid duration.
 fn validate_rule_bounds(rule: &RuleConfig, capacity: u64) -> Result<u64, FilterError> {
     validate_capacity_safe_integer_bound(&rule.name, capacity)?;
-    if rule.reserved_tokens == 0 {
-        return Err(format!(
-            "token_rate_limit: rule '{}': reserved_tokens must be greater than 0",
-            rule.name
-        )
-        .into());
-    }
-    if rule.reserved_tokens > capacity {
-        return Err(format!(
-            "token_rate_limit: rule '{}': reserved_tokens must not exceed capacity",
-            rule.name
-        )
-        .into());
+    if let Some(reserved) = rule.reserved_tokens {
+        if reserved == 0 {
+            return Err(format!(
+                "token_rate_limit: rule '{}': reserved_tokens must be greater than 0",
+                rule.name
+            )
+            .into());
+        }
+        if reserved > capacity {
+            return Err(format!(
+                "token_rate_limit: rule '{}': reserved_tokens must not exceed capacity",
+                rule.name
+            )
+            .into());
+        }
     }
     parse_duration_ms(
         rule.reservation_timeout
@@ -438,6 +610,211 @@ fn build_rule_backend(
     }
 }
 
+/// Validate and compile the estimation configuration for one rule,
+/// enforcing mutual exclusion between `reserved_tokens` and `estimation`.
+fn compile_estimation(
+    rule_name: &str,
+    reserved_tokens: Option<u64>,
+    estimation: Option<EstimationConfig>,
+    capacity: u64,
+) -> Result<CompiledEstimation, FilterError> {
+    if reserved_tokens.is_some() && estimation.is_some() {
+        return Err(format!(
+            "token_rate_limit: rule '{rule_name}': cannot specify both reserved_tokens and estimation"
+        )
+        .into());
+    }
+    if let Some(est) = estimation {
+        compile_estimation_config(rule_name, est, capacity)
+    } else if let Some(reserved) = reserved_tokens {
+        Ok(CompiledEstimation::Fixed { estimate: reserved })
+    } else {
+        Err(format!("token_rate_limit: rule '{rule_name}': must have either reserved_tokens or estimation").into())
+    }
+}
+
+/// Compile a deserialized [`EstimationConfig`] into a [`CompiledEstimation`],
+/// validating all strategy-specific invariants.
+fn compile_estimation_config(
+    rule_name: &str,
+    est: EstimationConfig,
+    capacity: u64,
+) -> Result<CompiledEstimation, FilterError> {
+    let multiplier = est.multiplier.unwrap_or(1.0);
+    validate_positive_finite(rule_name, "estimation.multiplier", multiplier)?;
+    match est.strategy {
+        EstimationStrategy::Fixed => compile_fixed_estimation(rule_name, &est, multiplier, capacity),
+        EstimationStrategy::MaxTokens => compile_max_tokens_estimation(rule_name, &est, multiplier, capacity),
+        EstimationStrategy::InputPlusMaxTokens => compile_input_plus_estimation(rule_name, &est, multiplier, capacity),
+        EstimationStrategy::ModelScaled => compile_model_scaled_estimation(rule_name, est, multiplier, capacity),
+    }
+}
+
+/// Compile a `fixed` estimation strategy.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "token estimates are bounded by config-validated capacity (u64-safe)"
+)]
+fn compile_fixed_estimation(
+    rule_name: &str,
+    est: &EstimationConfig,
+    multiplier: f64,
+    capacity: u64,
+) -> Result<CompiledEstimation, FilterError> {
+    reject_unused_estimation_fields(
+        rule_name,
+        "fixed",
+        &[
+            ("model_multipliers", est.model_multipliers.is_some()),
+            ("default_multiplier", est.default_multiplier.is_some()),
+            ("bytes_per_token", est.bytes_per_token.is_some()),
+        ],
+    )?;
+    let estimate = est.fallback_estimate.ok_or_else(|| {
+        FilterError::from(format!(
+            "token_rate_limit: rule '{rule_name}': fixed strategy requires fallback_estimate"
+        ))
+    })?;
+    let effective = ((estimate as f64) * multiplier).ceil() as u64;
+    if effective == 0 {
+        return Err(
+            format!("token_rate_limit: rule '{rule_name}': effective fixed estimate must be greater than 0").into(),
+        );
+    }
+    if effective > capacity {
+        return Err(
+            format!("token_rate_limit: rule '{rule_name}': effective fixed estimate must not exceed capacity").into(),
+        );
+    }
+    Ok(CompiledEstimation::Fixed { estimate: effective })
+}
+
+/// Compile a `max_tokens` estimation strategy.
+fn compile_max_tokens_estimation(
+    rule_name: &str,
+    est: &EstimationConfig,
+    multiplier: f64,
+    capacity: u64,
+) -> Result<CompiledEstimation, FilterError> {
+    reject_unused_estimation_fields(
+        rule_name,
+        "max_tokens",
+        &[
+            ("model_multipliers", est.model_multipliers.is_some()),
+            ("default_multiplier", est.default_multiplier.is_some()),
+            ("bytes_per_token", est.bytes_per_token.is_some()),
+        ],
+    )?;
+    validate_fallback_within_capacity(rule_name, est.fallback_estimate, capacity)?;
+    Ok(CompiledEstimation::MaxTokens {
+        fallback_estimate: est.fallback_estimate,
+        multiplier,
+    })
+}
+
+/// Compile an `input_plus_max_tokens` estimation strategy.
+fn compile_input_plus_estimation(
+    rule_name: &str,
+    est: &EstimationConfig,
+    multiplier: f64,
+    capacity: u64,
+) -> Result<CompiledEstimation, FilterError> {
+    reject_unused_estimation_fields(
+        rule_name,
+        "input_plus_max_tokens",
+        &[
+            ("model_multipliers", est.model_multipliers.is_some()),
+            ("default_multiplier", est.default_multiplier.is_some()),
+        ],
+    )?;
+    let bytes_per_token = est.bytes_per_token.unwrap_or(4.0);
+    validate_positive_finite(rule_name, "estimation.bytes_per_token", bytes_per_token)?;
+    validate_fallback_within_capacity(rule_name, est.fallback_estimate, capacity)?;
+    Ok(CompiledEstimation::InputPlusMaxTokens {
+        fallback_estimate: est.fallback_estimate,
+        multiplier,
+        bytes_per_token,
+    })
+}
+
+/// Compile a `model_scaled` estimation strategy.
+fn compile_model_scaled_estimation(
+    rule_name: &str,
+    est: EstimationConfig,
+    multiplier: f64,
+    capacity: u64,
+) -> Result<CompiledEstimation, FilterError> {
+    reject_unused_estimation_fields(
+        rule_name,
+        "model_scaled",
+        &[("bytes_per_token", est.bytes_per_token.is_some())],
+    )?;
+    let default_multiplier = est.default_multiplier.unwrap_or(1.0) * multiplier;
+    validate_positive_finite(rule_name, "estimation.default_multiplier", default_multiplier)?;
+    let model_multipliers: BTreeMap<String, f64> = est
+        .model_multipliers
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(model, mult)| (model, mult * multiplier))
+        .collect();
+    for (model, &mult) in &model_multipliers {
+        if !mult.is_finite() || mult <= 0.0 {
+            return Err(format!(
+                "token_rate_limit: rule '{rule_name}': model_multipliers['{model}'] must be finite and positive"
+            )
+            .into());
+        }
+    }
+    validate_fallback_within_capacity(rule_name, est.fallback_estimate, capacity)?;
+    Ok(CompiledEstimation::ModelScaled {
+        fallback_estimate: est.fallback_estimate,
+        model_multipliers,
+        default_multiplier,
+    })
+}
+
+/// Reject strategy-irrelevant `estimation:` fields so a leftover knob from
+/// a previous strategy is a config error instead of a silent no-op.
+fn reject_unused_estimation_fields(
+    rule_name: &str,
+    strategy: &str,
+    unused: &[(&str, bool)],
+) -> Result<(), FilterError> {
+    let names: Vec<&str> = unused
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(name, _)| *name)
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "token_rate_limit: rule '{rule_name}': {strategy} strategy does not accept {}",
+        names.join(", ")
+    )
+    .into())
+}
+
+/// Validate that a named f64 parameter is finite and positive.
+fn validate_positive_finite(rule_name: &str, param: &str, value: f64) -> Result<(), FilterError> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("token_rate_limit: rule '{rule_name}': {param} must be finite and positive").into());
+    }
+    Ok(())
+}
+
+/// Validate that a `fallback_estimate`, if set, doesn't exceed `capacity`.
+fn validate_fallback_within_capacity(rule_name: &str, fallback: Option<u64>, capacity: u64) -> Result<(), FilterError> {
+    if let Some(fb) = fallback
+        && fb > capacity
+    {
+        return Err(format!("token_rate_limit: rule '{rule_name}': fallback_estimate must not exceed capacity").into());
+    }
+    Ok(())
+}
+
 /// Compile one YAML `rules:` entry into a [`CompiledRule`], validating
 /// and constructing its backend.
 ///
@@ -450,6 +827,7 @@ fn build_rule_backend(
 fn compile_rule(rule: RuleConfig, backend: &BackendResource) -> Result<CompiledRule, FilterError> {
     let capacity = rule.algorithm.capacity();
     let reservation_timeout_ms = validate_rule_bounds(&rule, capacity)?;
+    let estimation = compile_estimation(&rule.name, rule.reserved_tokens, rule.estimation, capacity)?;
     let backend = build_rule_backend(&rule.algorithm, backend, &rule.name, reservation_timeout_ms)?;
     let matcher = compile_matcher(&rule.name, rule.r#match)?;
 
@@ -457,7 +835,7 @@ fn compile_rule(rule: RuleConfig, backend: &BackendResource) -> Result<CompiledR
         name: rule.name,
         matcher,
         backend,
-        reserved_tokens: rule.reserved_tokens,
+        estimation,
     })
 }
 
@@ -486,7 +864,10 @@ fn compile_rule(rule: RuleConfig, backend: &BackendResource) -> Result<CompiledR
 ///     algorithm: sliding_window        # sliding_window | token_bucket
 ///     window: 1h                       # sliding_window only: window duration
 ///     capacity: 100000                 # max tokens admitted (sliding_window) or held (token_bucket)
-///     reserved_tokens: 500             # fixed cost reserved per request at admission
+///     estimation:                      # M3: configurable estimation strategy
+///       strategy: max_tokens           # fixed | max_tokens | input_plus_max_tokens | model_scaled
+///       multiplier: 1.2                # optional safety margin (default: 1.0)
+///       fallback_estimate: 500         # used when max_tokens absent from request
 ///   - name: team-beta
 ///     match:
 ///       headers:
@@ -494,7 +875,7 @@ fn compile_rule(rule: RuleConfig, backend: &BackendResource) -> Result<CompiledR
 ///     algorithm: token_bucket
 ///     capacity: 50000
 ///     refill_rate: 50                  # token_bucket only: tokens refilled per second
-///     reserved_tokens: 200
+///     reserved_tokens: 200             # legacy: equivalent to estimation: { strategy: fixed, fallback_estimate: 200 }
 /// ```
 ///
 /// Rules are evaluated in order; the first whose `match` is satisfied
@@ -504,6 +885,11 @@ fn compile_rule(rule: RuleConfig, backend: &BackendResource) -> Result<CompiledR
 pub struct TokenRateLimitFilter {
     /// Compiled rules, evaluated in configured order.
     rules: Vec<CompiledRule>,
+
+    /// Whether any rule uses a body-dependent estimation strategy.
+    /// When `true`, `on_request` defers reservation to `on_request_body`
+    /// and the pipeline buffers the request body for inspection.
+    needs_body: bool,
 
     /// Monotonic clock reference; all timestamps are offsets from this.
     epoch: Instant,
@@ -536,8 +922,11 @@ impl TokenRateLimitFilter {
             .map(|rule| compile_rule(rule, &backend))
             .collect::<Result<Vec<_>, _>>()?;
 
+        let needs_body = rules.iter().any(|r| r.estimation.needs_body());
+
         Ok(Box::new(Self {
             rules,
+            needs_body,
             epoch: Instant::now(),
         }))
     }
@@ -608,7 +997,7 @@ impl TokenRateLimitFilter {
         ctx: &mut HttpFilterContext<'_>,
         rule_index: usize,
         rule: &CompiledRule,
-        key: String,
+        pending: PendingReservation,
         outcome: Result<BackendReserve, BackendError>,
     ) -> FilterAction {
         match outcome {
@@ -617,17 +1006,18 @@ impl TokenRateLimitFilter {
                 estimate,
             }) => {
                 let admitted = AdmittedReservation {
-                    key,
+                    key: pending.key,
                     reservation_id,
                     estimate,
                 };
                 Self::record_admission(ctx, rule_index, rule, admitted);
+                ctx.set_metadata(META_ESTIMATE, pending.request_estimate.to_string());
                 FilterAction::Continue
             },
             Ok(BackendReserve::Denied { retry_after_ms }) => {
                 tracing::info!(
-                    estimate = rule.reserved_tokens,
-                    key,
+                    estimate = pending.request_estimate,
+                    key = pending.key,
                     rule = rule.name,
                     "token_rate_limit: rejecting request (429)"
                 );
@@ -658,11 +1048,15 @@ impl TokenRateLimitFilter {
         if actual.is_none() {
             tracing::trace!("token_rate_limit: no token.total metadata at end of stream, charging at estimate");
         }
+        let Some(estimate) = ctx.get_metadata(META_ESTIMATE).and_then(|v| v.parse::<u64>().ok()) else {
+            tracing::warn!("token_rate_limit: META_ESTIMATE missing at reconciliation, skipping");
+            return None;
+        };
         let request = ReconcileRequest {
             key,
             reservation_id,
             actual,
-            estimate: rule.reserved_tokens,
+            estimate,
             now_ms: self.now_ms(),
         };
         Some((request, rule))
@@ -700,6 +1094,16 @@ impl TokenRateLimitFilter {
     }
 }
 
+/// Bundle for the budget key and computed estimate awaiting a backend
+/// `reserve()` call, keeping [`TokenRateLimitFilter::handle_reserve_outcome`]
+/// within clippy's argument-count budget.
+struct PendingReservation {
+    /// The budget key this reservation will use.
+    key: String,
+    /// The computed token estimate for this request.
+    request_estimate: u64,
+}
+
 /// The bucket key, reservation ID, and estimate an admitted
 /// [`BackendReserve::Admitted`] carries, bundled so
 /// [`TokenRateLimitFilter::record_admission`] stays within clippy's
@@ -710,7 +1114,7 @@ struct AdmittedReservation {
     key: String,
     /// The backend-issued reservation ID, stashed for later reconciliation.
     reservation_id: u64,
-    /// Tokens reserved at admission (the rule's `reserved_tokens`, echoed
+    /// Tokens reserved at admission (the rule's computed estimate, echoed
     /// back by the backend).
     estimate: u64,
 }
@@ -757,6 +1161,24 @@ impl HttpFilter for TokenRateLimitFilter {
         "token_rate_limit"
     }
 
+    fn request_body_access(&self) -> BodyAccess {
+        if self.needs_body {
+            BodyAccess::ReadOnly
+        } else {
+            BodyAccess::None
+        }
+    }
+
+    fn request_body_mode(&self) -> BodyMode {
+        if self.needs_body {
+            BodyMode::StreamBuffer {
+                max_bytes: Some(MAX_ESTIMATION_BODY_BYTES),
+            }
+        } else {
+            BodyMode::Stream
+        }
+    }
+
     fn response_body_access(&self) -> BodyAccess {
         BodyAccess::ReadOnly
     }
@@ -766,24 +1188,72 @@ impl HttpFilter for TokenRateLimitFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if self.needs_body {
+            return Ok(FilterAction::Continue);
+        }
         let now_ms = self.now_ms();
         let Some((rule_index, rule)) = self.matching_rule(&ctx.request.headers) else {
-            // No configured rule applies to this request -- not rate
-            // limited by this filter instance. Operators wanting a
-            // catch-all budget add a trailing rule with no `match`.
             return Ok(FilterAction::Continue);
         };
         Self::cleanup_and_record_state(rule, now_ms);
+        let estimate = rule.estimation.estimate(&ctx.request.headers, None);
+        let Some(estimate) = estimate else {
+            return Ok(FilterAction::Continue);
+        };
         let key = FALLBACK_KEY.to_owned();
         let outcome = rule
             .backend
             .reserve(ReserveRequest {
                 key: key.clone(),
-                estimate: rule.reserved_tokens,
+                estimate,
                 now_ms,
             })
             .await;
-        Ok(Self::handle_reserve_outcome(ctx, rule_index, rule, key, outcome))
+        let pending = PendingReservation {
+            key,
+            request_estimate: estimate,
+        };
+        Ok(Self::handle_reserve_outcome(ctx, rule_index, rule, pending, outcome))
+    }
+
+    async fn on_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream || !self.needs_body {
+            return Ok(FilterAction::Continue);
+        }
+        let now_ms = self.now_ms();
+        let Some((rule_index, rule)) = self.matching_rule(&ctx.request.headers) else {
+            return Ok(FilterAction::Continue);
+        };
+        Self::cleanup_and_record_state(rule, now_ms);
+
+        let body_probe = body
+            .as_ref()
+            .and_then(|raw| serde_json::from_slice::<BodyProbe>(raw).ok());
+        let estimate = rule.estimation.estimate(&ctx.request.headers, body_probe.as_ref());
+
+        let Some(estimate) = estimate else {
+            return Ok(FilterAction::Continue);
+        };
+
+        let key = FALLBACK_KEY.to_owned();
+        let outcome = rule
+            .backend
+            .reserve(ReserveRequest {
+                key: key.clone(),
+                estimate,
+                now_ms,
+            })
+            .await;
+        let pending = PendingReservation {
+            key,
+            request_estimate: estimate,
+        };
+        Ok(Self::handle_reserve_outcome(ctx, rule_index, rule, pending, outcome))
     }
 
     fn on_response_body(
@@ -797,6 +1267,7 @@ impl HttpFilter for TokenRateLimitFilter {
             ctx.filter_metadata.remove(META_RESERVATION_ID);
             ctx.filter_metadata.remove(META_BUCKET_KEY);
             ctx.filter_metadata.remove(META_RULE_INDEX);
+            ctx.filter_metadata.remove(META_ESTIMATE);
         }
         Ok(FilterAction::Continue)
     }
@@ -884,7 +1355,7 @@ mod backend_injection_tests {
     use praxis_filter::HttpFilter as _;
 
     use super::{
-        CompiledRule, TokenRateLimitFilter,
+        CompiledEstimation, CompiledRule, TokenRateLimitFilter,
         backend::{
             BackendError, BackendReserve, BackendSettlement, ReconcileRequest, ReserveRequest,
             TokenRateLimitStateBackend,
@@ -937,8 +1408,9 @@ mod backend_injection_tests {
                 name: "default".to_owned(),
                 matcher: None,
                 backend: std::sync::Arc::new(EnqueueAlwaysFailsBackend),
-                reserved_tokens: 1,
+                estimation: CompiledEstimation::Fixed { estimate: 1 },
             }],
+            needs_body: false,
             epoch: std::time::Instant::now(),
         };
 
