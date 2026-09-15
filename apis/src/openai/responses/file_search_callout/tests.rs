@@ -19,7 +19,7 @@ use super::{
     client::{
         ContentChunk, ContentChunkType, FileSearchClient, FileSearchClientConfig, MAX_CONCURRENT_SEARCHES,
         MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchResult, VectorStoreSearchRequest,
-        VectorStoreSearchResponse, request_error,
+        request_error,
     },
     config::{FileSearchFilterConfig, ValidatedConfig, build_config, build_config_with_client},
     *,
@@ -228,28 +228,18 @@ fn hybrid_ranking_translation_rejects_untranslatable_weights() {
 }
 
 #[test]
-fn search_response_requires_page_data_and_result_content() {
-    let response: VectorStoreSearchResponse = serde_json::from_value(json!({
-        "data": [{
-            "file_id": "file-a",
-            "filename": "a.txt",
-            "score": 0.5,
-            "content": []
-        }]
+fn search_result_requires_content() {
+    let response: SearchResult = serde_json::from_value(json!({
+        "file_id": "file-a",
+        "filename": "a.txt",
+        "score": 0.5,
+        "content": []
     }))
     .unwrap();
-    assert!(response.data[0].content.is_empty());
-    assert!(response.data[0].attributes.is_none());
-
+    assert!(response.content.is_empty());
+    assert!(response.attributes.is_none());
     assert!(
-        serde_json::from_value::<VectorStoreSearchResponse>(json!({})).is_err(),
-        "page data is required"
-    );
-    assert!(
-        serde_json::from_value::<VectorStoreSearchResponse>(json!({
-            "data": [{"file_id":"file-a","filename":"a.txt","score":0.5}]
-        }))
-        .is_err(),
+        serde_json::from_value::<SearchResult>(json!({"file_id":"file-a","filename":"a.txt","score":0.5})).is_err(),
         "result content is required"
     );
 }

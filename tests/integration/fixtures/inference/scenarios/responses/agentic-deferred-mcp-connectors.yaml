@@ -1,0 +1,42 @@
+version: 1
+id: responses/agentic-deferred-mcp-connectors
+description: Deferred MCP connectors are sanitized on the first inference round without listing tools.
+protocol: openai_responses
+example_config: openai/responses/agentic-loop-deferred-mcp-fixture.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.agentic.deferred_mcp_connectors
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Reply with exactly `4` and nothing else.
+          store: false
+          stream: false
+          tools:
+            - type: tool_search
+            - type: mcp
+              server_label: drive
+              connector_id: corp_drive
+              defer_loading: true
+              server_description: Search the corporate drive
+              allowed_callers:
+                - assistant
+              allowed_tools:
+                - search
+              require_approval: never
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

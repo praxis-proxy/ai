@@ -4366,7 +4366,7 @@ class TestFileSearchVLLM:
         translates to file_search_call, executes the OGX search callout,
         and returns results to the client.
         """
-        store_id, _marker = vector_store
+        store_id, marker = vector_store
         response = file_search_client.responses.create(
             model=VLLM_MODEL,
             input=(
@@ -4402,6 +4402,20 @@ class TestFileSearchVLLM:
             assert item.status in ("completed", "incomplete"), (
                 f"file_search_call status should be terminal; got: {item.status}"
             )
+
+        decoded_results = [
+            result
+            for item in file_search_items
+            for result in (item.results or [])
+        ]
+        assert decoded_results, "included file_search_call results should be decoded"
+        assert any(marker in result.text for result in decoded_results), (
+            "decoded file-search results should contain the indexed marker"
+        )
+        assert all(
+            result.file_id and result.filename and result.score is not None
+            for result in decoded_results
+        ), "decoded file-search results should retain typed result metadata"
 
 
 # ---------------------------------------------------------------------------

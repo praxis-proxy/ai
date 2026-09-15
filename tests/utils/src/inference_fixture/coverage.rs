@@ -1245,6 +1245,7 @@ mod tests {
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
+                vec!["responses_agentic_loop"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
@@ -1281,15 +1282,16 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 26);
-        assert_eq!(report.scenarios_total, 25);
-        assert_eq!(report.recordings_total, 30);
+        assert_eq!(report.features_total, 27);
+        assert_eq!(report.scenarios_total, 26);
+        assert_eq!(report.recordings_total, 31);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1302,6 +1304,7 @@ mod tests {
                 "messages/native-tool-use",
                 "messages/typed-server-tools",
                 "messages/upstream-error",
+                "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-status-less-function-call",
                 "responses/chat-basic-nonstream",
@@ -1320,7 +1323,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 26);
+        assert_eq!(manifest.features.len(), 27);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1446,6 +1449,10 @@ mod tests {
                     &vec!["responses/irr-terminal-streaming".to_owned()]
                 ),
                 (
+                    &"responses.agentic.deferred_mcp_connectors".to_owned(),
+                    &vec!["responses/agentic-deferred-mcp-connectors".to_owned()]
+                ),
+                (
                     &"responses.chat.continuation".to_owned(),
                     &vec!["responses/chat-basic-nonstream".to_owned()]
                 ),
@@ -1551,7 +1558,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[13..22] {
+        for feature in &manifest.features[13..23] {
             assert_eq!(
                 feature
                     .providers
@@ -1561,7 +1568,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[22..24] {
+        for feature in &manifest.features[23..25] {
             assert_eq!(
                 feature
                     .providers
@@ -1571,7 +1578,7 @@ mod tests {
                 vec![("vllm", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[24..] {
+        for feature in &manifest.features[25..] {
             assert_eq!(
                 feature
                     .providers

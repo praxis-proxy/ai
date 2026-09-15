@@ -322,14 +322,20 @@ pub enum OpenAiApiFamily {
 }
 
 impl OpenAiApiFamily {
-    /// Stable label published to downstream filters and routing headers.
+    /// Application-protocol identifier published to downstream filters and
+    /// routing headers.
+    ///
+    /// Values are provider-qualified so one identifier space can describe
+    /// every AI application protocol the proxy classifies, not only OpenAI's.
+    /// This matches the cluster-side `application_protocol` vocabulary in
+    /// praxis-proxy/praxis#1106.
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub const fn application_protocol(self) -> &'static str {
         match self {
-            Self::Responses => "responses",
-            Self::Conversations => "conversations",
-            Self::Files => "files",
-            Self::VectorStores => "vector_stores",
+            Self::Responses => "openai_responses",
+            Self::Conversations => "openai_conversations",
+            Self::Files => "openai_files",
+            Self::VectorStores => "openai_vector_stores",
         }
     }
 }
@@ -906,11 +912,17 @@ mod tests {
     }
 
     #[test]
-    fn family_label_is_stable() {
-        assert_eq!(OpenAiApiFamily::Responses.as_str(), "responses");
-        assert_eq!(OpenAiApiFamily::Conversations.as_str(), "conversations");
-        assert_eq!(OpenAiApiFamily::Files.as_str(), "files");
-        assert_eq!(OpenAiApiFamily::VectorStores.as_str(), "vector_stores");
+    fn application_protocol_label_is_stable_and_provider_qualified() {
+        assert_eq!(OpenAiApiFamily::Responses.application_protocol(), "openai_responses");
+        assert_eq!(
+            OpenAiApiFamily::Conversations.application_protocol(),
+            "openai_conversations"
+        );
+        assert_eq!(OpenAiApiFamily::Files.application_protocol(), "openai_files");
+        assert_eq!(
+            OpenAiApiFamily::VectorStores.application_protocol(),
+            "openai_vector_stores"
+        );
         assert_eq!(OpenAiTransport::Http.as_str(), "http");
         assert_eq!(OpenAiTransport::WebSocket.as_str(), "websocket");
     }

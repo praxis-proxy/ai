@@ -11,8 +11,11 @@ use std::{
 
 use bytes::Bytes;
 use http::HeaderMap;
-use serde::{Deserialize, Serialize, de::Visitor};
-use serde_json::Value;
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
+};
+use serde_json::{Value, value::RawValue};
 
 use crate::{callout_policy::OnFailure, openai::api_client::ApiClient};
 
@@ -41,8 +44,26 @@ pub(super) const MAX_VECTOR_STORE_ID_BYTES: usize = 512;
 /// Allocation unit used by global collected-response admission.
 const RESPONSE_BODY_BUDGET_UNIT_BYTES: usize = 1_048_576; // 1 MiB
 
-/// Charge both the collected body and its decoded representation.
-const RESPONSE_DECODE_MEMORY_MULTIPLIER: usize = 2;
+/// Charge wire bodies, parser scratch, and retained decoded storage.
+const RESPONSE_ADMISSION_WIRE_MULTIPLIER: usize = 4;
+
+/// Decoded-storage headroom reserved for each response in one execution.
+const RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES: usize = 65_536; // 64 KiB
+
+/// Conservative fixed storage charge for one retained result.
+const DECODED_RESULT_BYTES: usize = 256;
+
+/// Conservative fixed storage charge for one retained content chunk.
+const DECODED_CONTENT_CHUNK_BYTES: usize = 128;
+
+/// Conservative fixed storage charge for one retained attribute value.
+const DECODED_ATTRIBUTE_VALUE_BYTES: usize = 128;
+
+/// Conservative fixed storage charge for one retained attribute object member.
+const DECODED_ATTRIBUTE_MEMBER_BYTES: usize = 128;
+
+/// Round owned strings and keys to conservative allocator-sized units.
+const DECODED_STRING_ROUND_BYTES: usize = 16;
 
 /// Process-wide response bytes reserved across all configured clients.
 const GLOBAL_RESPONSE_BODY_BUDGET_UNITS: usize = 512; // 512 MiB
@@ -154,13 +175,6 @@ struct TranslatedRankingOptions<'a> {
     search_mode: Option<&'static str>,
 }
 
-/// Response from vector store search.
-#[derive(Debug, Deserialize)]
-pub(crate) struct VectorStoreSearchResponse {
-    /// Search results.
-    pub data: Vec<SearchResult>,
-}
-
 /// Single search result from a vector store.
 #[derive(Debug, Deserialize)]
 pub(crate) struct SearchResult {
@@ -202,7 +216,7 @@ pub(crate) enum ContentChunkType {
 impl<'de> Deserialize<'de> for ContentChunkType {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         deserializer.deserialize_str(ContentChunkTypeVisitor)
     }
@@ -218,7 +232,7 @@ impl Visitor<'_> for ContentChunkTypeVisitor {
         formatter.write_str("the supported vector-store content chunk type")
     }
 
-    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
         if v == "text" {
             Ok(ContentChunkType::Text)
         } else {
@@ -226,7 +240,7 @@ impl Visitor<'_> for ContentChunkTypeVisitor {
         }
     }
 
-    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
         self.visit_str(&v)
     }
 }
@@ -613,6 +627,752 @@ struct ResponseAdmission {
     _body_budget: tokio::sync::OwnedSemaphorePermit,
 }
 
+/// Remaining allocation budget for retained typed response values.
+///
+/// Retained results are first walked as borrowed `RawValue`s to validate their
+/// schema and charge the estimated owned storage for strings, attributes, and
+/// content, then deserialized into `SearchResult`. Those representations can
+/// briefly coexist, so `RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES` also provides
+/// headroom for the duplicate allocations and parser scratch during that handoff.
+struct DecodedBudget {
+    /// Bytes that may still be represented by owned decoded values.
+    remaining: usize,
+}
+
+impl DecodedBudget {
+    /// Create the per-response decoded allocation allowance.
+    fn for_body(body_bytes: usize) -> Result<Self, &'static str> {
+        let remaining = body_bytes
+            .checked_add(RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES)
+            .ok_or("decoded response budget is too large")?;
+        Ok(Self { remaining })
+    }
+
+    /// Reserve a conservative amount before constructing an owned value.
+    fn charge(&mut self, bytes: usize) -> Result<(), &'static str> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes)
+            .ok_or("decoded response exceeds its allocation budget")?;
+        Ok(())
+    }
+
+    /// Reserve an allocator-rounded owned string or object key.
+    fn charge_string(&mut self, bytes: usize) -> Result<(), &'static str> {
+        let rounded = bytes
+            .checked_add(DECODED_STRING_ROUND_BYTES - 1)
+            .ok_or("decoded response allocation accounting overflow")?
+            / DECODED_STRING_ROUND_BYTES
+            * DECODED_STRING_ROUND_BYTES;
+        self.charge(rounded)
+    }
+}
+
+/// Root response fields recognized without allocating map keys.
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum ResponseField {
+    /// Required result sequence.
+    Data,
+
+    /// Provider extension ignored for compatibility.
+    #[serde(other)]
+    Other,
+}
+
+/// Result fields recognized during allocation-free validation.
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum ResultField {
+    /// Optional arbitrary attributes.
+    Attributes,
+
+    /// Required content sequence.
+    Content,
+
+    /// Required file identifier.
+    FileId,
+
+    /// Required filename.
+    Filename,
+
+    /// Required relevance score.
+    Score,
+
+    /// Provider extension ignored for compatibility.
+    #[serde(other)]
+    Other,
+}
+
+/// Content fields recognized during allocation-free validation.
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum ContentField {
+    /// Required chunk type.
+    #[serde(rename = "type")]
+    ChunkType,
+
+    /// Required chunk text.
+    Text,
+
+    /// Provider extension ignored for compatibility.
+    #[serde(other)]
+    Other,
+}
+
+/// Incremental root response decoder.
+struct SearchResponseSeed<'a> {
+    /// Shared budget charged by the retained result candidates.
+    decoded_budget: &'a mut DecodedBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for SearchResponseSeed<'_> {
+    type Value = Vec<SearchResult>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(SearchResponseVisitor {
+            decoded_budget: self.decoded_budget,
+        })
+    }
+}
+
+/// Root visitor that preserves required and duplicate `data` handling.
+struct SearchResponseVisitor<'a> {
+    /// Shared budget charged by the retained result candidates.
+    decoded_budget: &'a mut DecodedBudget,
+}
+
+impl<'de> Visitor<'de> for SearchResponseVisitor<'_> {
+    type Value = Vec<SearchResult>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a vector-store search response object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut data = None;
+        while let Some(field) = map.next_key::<ResponseField>()? {
+            match field {
+                ResponseField::Data => {
+                    if data.is_some() {
+                        return Err(de::Error::duplicate_field("data"));
+                    }
+                    data = Some(map.next_value_seed(SearchResultsSeed {
+                        decoded_budget: self.decoded_budget,
+                    })?);
+                },
+                ResponseField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                },
+            }
+        }
+        data.ok_or_else(|| de::Error::missing_field("data"))
+    }
+}
+
+/// Incremental `data` sequence decoder.
+struct SearchResultsSeed<'a> {
+    /// Shared budget charged by the retained result candidates.
+    decoded_budget: &'a mut DecodedBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for SearchResultsSeed<'_> {
+    type Value = Vec<SearchResult>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(SearchResultsVisitor {
+            decoded_budget: self.decoded_budget,
+        })
+    }
+}
+
+/// Retain the first bounded candidates and allocation-free validate the rest.
+struct SearchResultsVisitor<'a> {
+    /// Shared budget charged by the retained result candidates.
+    decoded_budget: &'a mut DecodedBudget,
+}
+
+impl<'de> Visitor<'de> for SearchResultsVisitor<'_> {
+    type Value = Vec<SearchResult>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a vector-store search result array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut retained = Vec::with_capacity(MAX_NUM_RESULTS);
+        while let Some(raw) = seq.next_element::<&'de RawValue>()? {
+            if retained.len() < MAX_NUM_RESULTS {
+                validate_search_result(raw.get(), Some(self.decoded_budget))
+                    .map_err(|_error| de::Error::custom("invalid retained vector-store search result"))?;
+                let result = serde_json::from_str::<SearchResult>(raw.get()).map_err(|error| {
+                    de::Error::custom(format!("invalid retained vector-store search result: {error}"))
+                })?;
+                retained.push(result);
+            } else {
+                validate_search_result(raw.get(), None)
+                    .map_err(|_error| de::Error::custom("invalid discarded vector-store search result"))?;
+            }
+        }
+        Ok(retained)
+    }
+}
+
+/// Validate one result, optionally charging all retained owned storage.
+struct ResultValidationSeed<'a> {
+    /// Budget is absent for entries beyond the retained candidate set.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+}
+
+impl<'de> DeserializeSeed<'de> for ResultValidationSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(mut self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if let Some(budget) = self.decoded_budget.as_deref_mut() {
+            budget.charge(DECODED_RESULT_BYTES).map_err(de::Error::custom)?;
+        }
+        deserializer.deserialize_map(ResultValidationVisitor {
+            decoded_budget: self.decoded_budget,
+        })
+    }
+}
+
+/// Validate the typed result schema without constructing its owned values.
+struct ResultValidationVisitor<'a> {
+    /// Budget is absent for entries beyond the retained candidate set.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+}
+
+impl<'de> Visitor<'de> for ResultValidationVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a vector-store search result object")
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "required and duplicate result fields share allocation accounting"
+    )]
+    fn visit_map<A>(mut self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut attributes_seen = false;
+        let mut content_seen = false;
+        let mut file_id = None;
+        let mut filename_seen = false;
+        let mut score_seen = false;
+        let mut attribute_file_id_bytes = None;
+
+        while let Some(field) = map.next_key::<ResultField>()? {
+            match field {
+                ResultField::Attributes => {
+                    if attributes_seen {
+                        return Err(de::Error::duplicate_field("attributes"));
+                    }
+                    attributes_seen = true;
+                    attribute_file_id_bytes = map.next_value_seed(OptionalAttributesSeed {
+                        decoded_budget: self.decoded_budget.as_deref_mut(),
+                    })?;
+                },
+                ResultField::Content => {
+                    if content_seen {
+                        return Err(de::Error::duplicate_field("content"));
+                    }
+                    content_seen = true;
+                    map.next_value_seed(ContentSequenceSeed {
+                        decoded_budget: self.decoded_budget.as_deref_mut(),
+                    })?;
+                },
+                ResultField::FileId => {
+                    if file_id.is_some() {
+                        return Err(de::Error::duplicate_field("file_id"));
+                    }
+                    file_id = Some(map.next_value_seed(MeasuredStringSeed {
+                        decoded_budget: self.decoded_budget.as_deref_mut(),
+                    })?);
+                },
+                ResultField::Filename => {
+                    if filename_seen {
+                        return Err(de::Error::duplicate_field("filename"));
+                    }
+                    filename_seen = true;
+                    map.next_value_seed(MeasuredStringSeed {
+                        decoded_budget: self.decoded_budget.as_deref_mut(),
+                    })?;
+                },
+                ResultField::Score => {
+                    if score_seen {
+                        return Err(de::Error::duplicate_field("score"));
+                    }
+                    score_seen = true;
+                    map.next_value::<f64>()?;
+                },
+                ResultField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                },
+            }
+        }
+
+        if !content_seen {
+            return Err(de::Error::missing_field("content"));
+        }
+        let file_id = file_id.ok_or_else(|| de::Error::missing_field("file_id"))?;
+        if !filename_seen {
+            return Err(de::Error::missing_field("filename"));
+        }
+        if !score_seen {
+            return Err(de::Error::missing_field("score"));
+        }
+        if !file_id.canonical_file_id
+            && let (Some(bytes), Some(budget)) = (attribute_file_id_bytes, self.decoded_budget.as_deref_mut())
+        {
+            budget.charge_string(bytes).map_err(de::Error::custom)?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Result of inspecting a borrowed string.
+#[derive(Clone, Copy)]
+struct MeasuredString {
+    /// Whether the string is a non-empty OpenAI file identifier.
+    canonical_file_id: bool,
+}
+
+/// Validate a string while charging the allocation made by typed decoding.
+struct MeasuredStringSeed<'a> {
+    /// Budget is absent while validating discarded results.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+}
+
+impl<'de> DeserializeSeed<'de> for MeasuredStringSeed<'_> {
+    type Value = MeasuredString;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(MeasuredStringVisitor {
+            decoded_budget: self.decoded_budget,
+        })
+    }
+}
+
+/// Borrow string contents even when Serde JSON must use transient escape scratch.
+struct MeasuredStringVisitor<'a> {
+    /// Budget is absent while validating discarded results.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+}
+
+impl Visitor<'_> for MeasuredStringVisitor<'_> {
+    type Value = MeasuredString;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a string")
+    }
+
+    fn visit_str<E>(mut self, v: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if let Some(budget) = self.decoded_budget.as_deref_mut() {
+            budget.charge_string(v.len()).map_err(E::custom)?;
+        }
+        Ok(MeasuredString {
+            canonical_file_id: v.strip_prefix("file-").is_some_and(|suffix| !suffix.is_empty()),
+        })
+    }
+
+    fn visit_borrowed_str<E>(self, v: &'_ str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(v)
+    }
+}
+
+/// Treat JSON `null` attributes as `None`, matching `Option<Value>`.
+struct OptionalAttributesSeed<'a> {
+    /// Budget is absent while validating discarded results.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+}
+
+impl<'de> DeserializeSeed<'de> for OptionalAttributesSeed<'_> {
+    type Value = Option<usize>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_option(OptionalAttributesVisitor {
+            decoded_budget: self.decoded_budget,
+        })
+    }
+}
+
+/// Optional attribute wrapper used to avoid charging a non-retained null value.
+struct OptionalAttributesVisitor<'a> {
+    /// Budget is absent while validating discarded results.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+}
+
+impl<'de> Visitor<'de> for OptionalAttributesVisitor<'_> {
+    type Value = Option<usize>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an arbitrary JSON attribute value or null")
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        AttributeValueSeed {
+            decoded_budget: self.decoded_budget,
+            capture_canonical_file_id: false,
+            direct_attributes_object: true,
+        }
+        .deserialize(deserializer)
+    }
+}
+
+/// Recursively validate arbitrary attributes and charge their owned `Value` shape.
+struct AttributeValueSeed<'a> {
+    /// Budget is absent while validating discarded results.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+
+    /// Return a canonical string length for direct `attributes.file_id`.
+    capture_canonical_file_id: bool,
+
+    /// Recognize `file_id` only on the root attributes object.
+    direct_attributes_object: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for AttributeValueSeed<'_> {
+    type Value = Option<usize>;
+
+    fn deserialize<D>(mut self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if let Some(budget) = self.decoded_budget.as_deref_mut() {
+            budget
+                .charge(DECODED_ATTRIBUTE_VALUE_BYTES)
+                .map_err(de::Error::custom)?;
+        }
+        deserializer.deserialize_any(AttributeValueVisitor {
+            decoded_budget: self.decoded_budget,
+            capture_canonical_file_id: self.capture_canonical_file_id,
+            direct_attributes_object: self.direct_attributes_object,
+        })
+    }
+}
+
+/// Allocation-free arbitrary-JSON visitor used by the attribute preflight.
+struct AttributeValueVisitor<'a> {
+    /// Budget is absent while validating discarded results.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+
+    /// Return a canonical string length for direct `attributes.file_id`.
+    capture_canonical_file_id: bool,
+
+    /// Recognize `file_id` only on the root attributes object.
+    direct_attributes_object: bool,
+}
+
+/// Implement an allocation-free scalar attribute visitor method.
+macro_rules! visit_attribute_scalar {
+    ($method:ident, $type:ty) => {
+        fn $method<E>(self, _value: $type) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    };
+}
+
+impl<'de> Visitor<'de> for AttributeValueVisitor<'_> {
+    type Value = Option<usize>;
+
+    visit_attribute_scalar!(visit_bool, bool);
+
+    visit_attribute_scalar!(visit_i64, i64);
+
+    visit_attribute_scalar!(visit_u64, u64);
+
+    visit_attribute_scalar!(visit_f64, f64);
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an arbitrary JSON attribute value")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(None)
+    }
+
+    fn visit_str<E>(mut self, v: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if let Some(budget) = self.decoded_budget.as_deref_mut() {
+            budget.charge_string(v.len()).map_err(E::custom)?;
+        }
+        Ok(
+            (self.capture_canonical_file_id && v.strip_prefix("file-").is_some_and(|suffix| !suffix.is_empty()))
+                .then_some(v.len()),
+        )
+    }
+
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(v)
+    }
+
+    fn visit_seq<A>(mut self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq
+            .next_element_seed(AttributeValueSeed {
+                decoded_budget: self.decoded_budget.as_deref_mut(),
+                capture_canonical_file_id: false,
+                direct_attributes_object: false,
+            })?
+            .is_some()
+        {}
+        Ok(None)
+    }
+
+    fn visit_map<A>(mut self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut captured_file_id = None;
+        while let Some(is_file_id) = map.next_key_seed(AttributeKeySeed {
+            decoded_budget: self.decoded_budget.as_deref_mut(),
+        })? {
+            if let Some(budget) = self.decoded_budget.as_deref_mut() {
+                budget
+                    .charge(DECODED_ATTRIBUTE_MEMBER_BYTES)
+                    .map_err(de::Error::custom)?;
+            }
+            let candidate = map.next_value_seed(AttributeValueSeed {
+                decoded_budget: self.decoded_budget.as_deref_mut(),
+                capture_canonical_file_id: self.direct_attributes_object && is_file_id,
+                direct_attributes_object: false,
+            })?;
+            if self.direct_attributes_object && is_file_id {
+                captured_file_id = candidate;
+            }
+        }
+        Ok(captured_file_id)
+    }
+}
+
+/// Borrow and charge an attribute object key without retaining it.
+struct AttributeKeySeed<'a> {
+    /// Budget is absent while validating discarded results.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+}
+
+impl<'de> DeserializeSeed<'de> for AttributeKeySeed<'_> {
+    type Value = bool;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(AttributeKeyVisitor {
+            decoded_budget: self.decoded_budget,
+        })
+    }
+}
+
+/// Attribute key visitor returning only whether the key is `file_id`.
+struct AttributeKeyVisitor<'a> {
+    /// Budget is absent while validating discarded results.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+}
+
+impl Visitor<'_> for AttributeKeyVisitor<'_> {
+    type Value = bool;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an attribute object key")
+    }
+
+    fn visit_str<E>(mut self, v: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if let Some(budget) = self.decoded_budget.as_deref_mut() {
+            budget.charge_string(v.len()).map_err(E::custom)?;
+        }
+        Ok(v == "file_id")
+    }
+
+    fn visit_borrowed_str<E>(self, v: &'_ str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(v)
+    }
+}
+
+/// Validate and account for a result content sequence.
+struct ContentSequenceSeed<'a> {
+    /// Budget is absent while validating discarded results.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+}
+
+impl<'de> DeserializeSeed<'de> for ContentSequenceSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(ContentSequenceVisitor {
+            decoded_budget: self.decoded_budget,
+        })
+    }
+}
+
+/// Consume every content chunk without constructing a temporary vector.
+struct ContentSequenceVisitor<'a> {
+    /// Budget is absent while validating discarded results.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+}
+
+impl<'de> Visitor<'de> for ContentSequenceVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a vector-store content array")
+    }
+
+    fn visit_seq<A>(mut self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq
+            .next_element_seed(ContentChunkSeed {
+                decoded_budget: self.decoded_budget.as_deref_mut(),
+            })?
+            .is_some()
+        {}
+        Ok(())
+    }
+}
+
+/// Validate and account for one content chunk.
+struct ContentChunkSeed<'a> {
+    /// Budget is absent while validating discarded results.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+}
+
+impl<'de> DeserializeSeed<'de> for ContentChunkSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(mut self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if let Some(budget) = self.decoded_budget.as_deref_mut() {
+            budget.charge(DECODED_CONTENT_CHUNK_BYTES).map_err(de::Error::custom)?;
+        }
+        deserializer.deserialize_map(ContentChunkVisitor {
+            decoded_budget: self.decoded_budget,
+        })
+    }
+}
+
+/// Validate required and duplicate content fields without retaining them.
+struct ContentChunkVisitor<'a> {
+    /// Budget is absent while validating discarded results.
+    decoded_budget: Option<&'a mut DecodedBudget>,
+}
+
+impl<'de> Visitor<'de> for ContentChunkVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a vector-store content chunk object")
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "required and duplicate chunk fields are validated together"
+    )]
+    fn visit_map<A>(mut self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut chunk_type_seen = false;
+        let mut text_seen = false;
+        while let Some(field) = map.next_key::<ContentField>()? {
+            match field {
+                ContentField::ChunkType => {
+                    if chunk_type_seen {
+                        return Err(de::Error::duplicate_field("type"));
+                    }
+                    chunk_type_seen = true;
+                    map.next_value::<ContentChunkType>()?;
+                },
+                ContentField::Text => {
+                    if text_seen {
+                        return Err(de::Error::duplicate_field("text"));
+                    }
+                    text_seen = true;
+                    map.next_value_seed(MeasuredStringSeed {
+                        decoded_budget: self.decoded_budget.as_deref_mut(),
+                    })?;
+                },
+                ContentField::Other => {
+                    map.next_value::<IgnoredAny>()?;
+                },
+            }
+        }
+        if !chunk_type_seen {
+            return Err(de::Error::missing_field("type"));
+        }
+        if !text_seen {
+            return Err(de::Error::missing_field("text"));
+        }
+        Ok(())
+    }
+}
+
 /// JSON writer that never retains more than the outbound request limit.
 struct BoundedRequestWriter {
     /// Serialized bytes retained so far.
@@ -762,14 +1522,23 @@ fn response_admission_units(
     max_total_response_bytes: usize,
     spec_count: usize,
 ) -> Result<u32, &'static str> {
-    let aggregate_bytes = max_response_bytes
-        .saturating_mul(spec_count)
+    let aggregate_wire_bytes = max_response_bytes
+        .checked_mul(spec_count)
+        .ok_or("response admission is too large")?
         .min(max_total_response_bytes);
-    let admitted_bytes = aggregate_bytes
-        .checked_mul(RESPONSE_DECODE_MEMORY_MULTIPLIER)
+    let decoded_overhead_bytes = RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES
+        .checked_mul(spec_count)
         .ok_or("response admission is too large")?;
-    u32::try_from(admitted_bytes.div_ceil(RESPONSE_BODY_BUDGET_UNIT_BYTES))
-        .map_err(|_overflow| "response admission is too large")
+    let admitted_bytes = aggregate_wire_bytes
+        .checked_mul(RESPONSE_ADMISSION_WIRE_MULTIPLIER)
+        .and_then(|bytes| bytes.checked_add(decoded_overhead_bytes))
+        .ok_or("response admission is too large")?;
+    let units = u32::try_from(admitted_bytes.div_ceil(RESPONSE_BODY_BUDGET_UNIT_BYTES))
+        .map_err(|_overflow| "response admission is too large")?;
+    if usize::try_from(units).map_or(true, |units| units > GLOBAL_RESPONSE_BODY_BUDGET_UNITS) {
+        return Err("response admission exceeds the process-wide budget");
+    }
+    Ok(units)
 }
 
 /// Serialize one request without ever retaining an oversized body.
@@ -885,14 +1654,27 @@ fn parse_response_body(body: &[u8], store_id: &str, result_limit: usize) -> Resu
 
 /// Deserialize the response page, apply file-ID fixups, and retain top-k.
 fn deserialize_search_results(body: &[u8], result_limit: usize) -> Result<Vec<SearchResult>, serde_json::Error> {
-    let mut response = serde_json::from_slice::<VectorStoreSearchResponse>(body)?;
-    response.data.truncate(MAX_NUM_RESULTS);
-    for result in &mut response.data {
+    let mut decoded_budget =
+        DecodedBudget::for_body(body.len()).map_err(|message| serde_json::Error::io(io::Error::other(message)))?;
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let mut data = SearchResponseSeed {
+        decoded_budget: &mut decoded_budget,
+    }
+    .deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    for result in &mut data {
         fixup_file_id(result);
     }
-    response.data.sort_by(|left, right| right.score.total_cmp(&left.score));
-    response.data.truncate(result_limit);
-    Ok(response.data)
+    data.sort_by(|left, right| right.score.total_cmp(&left.score));
+    data.truncate(result_limit);
+    Ok(data)
+}
+
+/// Validate one borrowed result without allocating its typed representation.
+fn validate_search_result(raw: &str, decoded_budget: Option<&mut DecodedBudget>) -> Result<(), serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    ResultValidationSeed { decoded_budget }.deserialize(&mut deserializer)?;
+    deserializer.end()
 }
 
 /// Replace the backend's internal document UUID with the OpenAI Files API ID.
@@ -1071,12 +1853,16 @@ mod tests {
         time::Duration,
     };
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
-        FileSearchError, SearchResult, SearchSpec, VectorStoreSearchRequest, append_unprocessed_deadline_failures,
-        deserialize_search_results, merge_top_results, parse_response_body, response_admission_units,
+        FileSearchError, GLOBAL_RESPONSE_BODY_BUDGET_UNITS, RESPONSE_BODY_BUDGET_UNIT_BYTES,
+        RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES, SearchResult, SearchSpec, VectorStoreSearchRequest,
+        append_unprocessed_deadline_failures, deserialize_search_results, merge_top_results, parse_response_body,
+        response_admission_units,
     };
+
+    const MINIMAL_RESULT: &[u8] = br#"{"content":[],"file_id":"","filename":"","score":0}"#;
 
     fn decode(body: &[u8], limit: usize) -> Result<Vec<SearchResult>, serde_json::Error> {
         deserialize_search_results(body, limit)
@@ -1134,10 +1920,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn aggregate_admission_serializes_whole_many_spec_executions() {
         let units = response_admission_units(10_485_760, 67_108_864, 64).expect("admission must fit");
-        assert_eq!(units, 128);
-        let budget = Arc::new(tokio::sync::Semaphore::new(
-            usize::try_from(units).expect("u32 units must fit usize") * 2,
-        ));
+        assert_eq!(units, 260);
+        let budget = Arc::new(tokio::sync::Semaphore::new(GLOBAL_RESPONSE_BODY_BUDGET_UNITS));
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let tasks = (0..3).map(|_| {
@@ -1159,7 +1943,23 @@ mod tests {
         for result in futures::future::join_all(tasks).await {
             result.expect("admission task must complete");
         }
-        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn admission_charge_covers_wire_and_per_response_decode_allowances() {
+        let per_call = 10_485_760;
+        let total = 67_108_864;
+        let spec_count = 64;
+        let units = usize::try_from(response_admission_units(per_call, total, spec_count).expect("admission must fit"))
+            .expect("admission units must fit usize");
+        let charged = units * RESPONSE_BODY_BUDGET_UNIT_BYTES;
+        let required = 4 * total + RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES * spec_count;
+
+        assert!(charged >= required);
+        assert!(charged - required < RESPONSE_BODY_BUDGET_UNIT_BYTES);
+        assert!(units <= GLOBAL_RESPONSE_BODY_BUDGET_UNITS);
+        assert!(response_admission_units(usize::MAX, usize::MAX, 2).is_err());
     }
 
     #[test]
@@ -1232,6 +2032,65 @@ mod tests {
     fn deserializer_requires_data_array() {
         assert!(decode(b"{}", 10).is_err(), "empty object must fail without data field");
         assert!(decode(br#"{"data":null}"#, 10).is_err(), "null data must fail");
+        assert!(
+            decode(br#"{"data":[],"data":[]}"#, 10).is_err(),
+            "duplicate data must fail"
+        );
+        assert!(
+            decode(br#"{"object":"list","data":[],"has_more":false}"#, 10)
+                .expect("unknown response fields remain compatible")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn retained_and_discarded_results_remain_schema_validated() {
+        assert!(
+            decode(br#"{"data":[{"file_id":"file-a","filename":"a.txt","score":0.5}]}"#, 10).is_err(),
+            "a retained result missing content must fail"
+        );
+
+        let mut body = br#"{"data":["#.to_vec();
+        for index in 0..50 {
+            if index != 0 {
+                body.push(b',');
+            }
+            body.extend_from_slice(MINIMAL_RESULT);
+        }
+        body.extend_from_slice(br#",{"content":[],"file_id":"","filename":"","score":"bad"}]}"#);
+
+        assert!(
+            decode(&body, 10).is_err(),
+            "a malformed result after entry 50 must fail"
+        );
+    }
+
+    #[test]
+    fn entries_after_fifty_do_not_enter_the_ranked_candidate_set() {
+        let mut results = (0..50)
+            .map(|index| {
+                json!({
+                    "content": [],
+                    "file_id": format!("file-{index}"),
+                    "filename": format!("{index}.txt"),
+                    "score": f64::from(index),
+                })
+            })
+            .collect::<Vec<_>>();
+        results.push(json!({
+            "attributes": {"file_id": "file-discarded"},
+            "content": [],
+            "file_id": "internal-discarded",
+            "filename": "discarded.txt",
+            "score": 10_000.0,
+        }));
+        let body = serde_json::to_vec(&json!({"data": results})).expect("test response must serialize");
+
+        let decoded = decode(&body, 5).expect("all results are schema-valid");
+
+        assert_eq!(decoded.len(), 5);
+        assert_eq!(decoded.first().map(|result| result.file_id.as_str()), Some("file-49"));
+        assert!(decoded.iter().all(|result| result.file_id != "file-discarded"));
     }
 
     #[test]
@@ -1271,6 +2130,99 @@ mod tests {
         let mut decoded = decoded.into_iter();
         assert_eq!(decoded.next().map(|r| r.file_id).as_deref(), Some("file-source"));
         assert_eq!(decoded.next().map(|r| r.file_id).as_deref(), Some("file-canonical"));
+    }
+
+    #[test]
+    fn escaped_retained_strings_decode_within_the_allocation_budget() {
+        let escaped = r"\u0061".repeat(20_000);
+        let body = format!(
+            r#"{{"data":[{{"content":[{{"type":"text","text":"{escaped}"}}],"file_id":"file-a","filename":"a.txt","score":1}}]}}"#
+        );
+
+        let decoded = decode(body.as_bytes(), 1).expect("escaped string must fit its charged budget");
+
+        let text = decoded
+            .first()
+            .and_then(|result| result.content.first())
+            .map(|chunk| chunk.text.as_str());
+        assert_eq!(text.map(str::len), Some(20_000));
+    }
+
+    #[test]
+    fn oversized_single_result_attributes_fail_preflight() {
+        let mut nested = Value::Null;
+        for _ in 0..64 {
+            let mut values = vec![Value::Null; 8];
+            values.push(nested);
+            nested = Value::Array(values);
+        }
+        let body = serde_json::to_vec(&json!({
+            "data": [{
+                "attributes": nested,
+                "content": [],
+                "file_id": "file-a",
+                "filename": "a.txt",
+                "score": 1.0,
+            }]
+        }))
+        .expect("test response must serialize");
+
+        assert!(
+            decode(&body, 1).is_err(),
+            "decoded attribute structure must not exceed body bytes plus fixed headroom"
+        );
+    }
+
+    #[test]
+    fn oversized_single_result_content_cardinality_fails_preflight() {
+        let content = (0..1_000)
+            .map(|_| json!({"type": "text", "text": ""}))
+            .collect::<Vec<_>>();
+        let body = serde_json::to_vec(&json!({
+            "data": [{
+                "content": content,
+                "file_id": "file-a",
+                "filename": "a.txt",
+                "score": 1.0,
+            }]
+        }))
+        .expect("test response must serialize");
+
+        assert!(
+            decode(&body, 1).is_err(),
+            "retained chunk storage must not exceed body bytes plus fixed headroom"
+        );
+    }
+
+    #[test]
+    fn high_cardinality_decode_has_constant_scale_peak_allocation() {
+        let result_count = 100_000;
+        let mut body = Vec::with_capacity(MINIMAL_RESULT.len() * result_count + result_count + 10);
+        body.extend_from_slice(br#"{"data":["#);
+        for index in 0..result_count {
+            if index != 0 {
+                body.push(b',');
+            }
+            body.extend_from_slice(MINIMAL_RESULT);
+        }
+        body.extend_from_slice(b"]}");
+
+        let mut decoded_len = 0;
+        let allocations = allocation_counter::measure(|| {
+            let decoded = decode(&body, 50).expect("minimal results must decode");
+            decoded_len = decoded.len();
+            std::hint::black_box(&decoded);
+        });
+
+        assert_eq!(decoded_len, 50);
+        assert!(
+            allocations.bytes_max <= RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES as u64,
+            "peak live decoder allocation must remain constant-scale: {allocations:?}"
+        );
+        assert!(
+            allocations.bytes_max <= (body.len() + RESPONSE_RETAINED_DECODE_OVERHEAD_BYTES) as u64,
+            "peak live decoder allocation must fit the charged decoded allowance: {allocations:?}"
+        );
     }
 
     #[test]
