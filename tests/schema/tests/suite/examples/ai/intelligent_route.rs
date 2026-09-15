@@ -282,6 +282,20 @@ fn intelligent_route_all_capabilities_preserves_mcp_candidate_order() {
 }
 
 // -----------------------------------------------------------------------------
+// Load-signal scoring
+// -----------------------------------------------------------------------------
+
+/// The intelligent-route-load-scoring.yaml example (the `signals` block) parses.
+#[test]
+fn intelligent_route_load_scoring_example_parses() {
+    let path = format!(
+        "{}/../../examples/configs/intelligent-route-load-scoring.yaml",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    Config::from_file(std::path::Path::new(&path)).unwrap_or_else(|e| panic!("{path}: {e}"));
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 

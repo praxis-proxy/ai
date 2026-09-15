@@ -11,19 +11,30 @@ use super::{
     descriptor::{AdmissionState, CapabilityKind, RouteCandidate},
     group_index::{GroupIndex, SelectionGroup},
     overlay::PickerPolicy,
+    scoring::{self, Scorer},
 };
 
 /// Select a candidate from the lowest viable producer-defined group.
+///
+/// `scorers` refine the choice inside the winning group by live load. Empty, or
+/// silent for this group, the selection is exactly the policy's: load never
+/// crosses a group, so locality still leads.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pick reads several immutable inputs by borrow; a struct would not simplify the call"
+)]
 pub(crate) fn select_candidate<'a>(
     candidates: &'a [RouteCandidate],
     groups: &GroupIndex,
     kind: CapabilityKind,
     name: &str,
     policy: PickerPolicy,
+    scorers: &[Box<dyn Scorer>],
+    now_ms: i64,
 ) -> Option<(&'a RouteCandidate, Option<u32>)> {
     if let Some(capability_groups) = groups.get(&kind).and_then(|by_name| by_name.get(name)) {
         for group in capability_groups {
-            if let Some(candidate) = select_from_group(candidates, group, policy) {
+            if let Some(candidate) = select_from_group(candidates, group, policy, scorers, now_ms) {
                 return Some((candidate, Some(group.number)));
             }
         }
@@ -42,13 +53,30 @@ fn select_legacy<'a>(candidates: &'a [RouteCandidate], kind: CapabilityKind, nam
 }
 
 /// Select one member of a prevalidated, uniformly admitted group.
+///
+/// When `scorers` rate this group's members, the best-scored wins. A group they
+/// say nothing about falls back to `policy`, so a group with no signal behaves
+/// exactly as before.
 fn select_from_group<'a>(
     candidates: &'a [RouteCandidate],
     group: &SelectionGroup,
     policy: PickerPolicy,
+    scorers: &[Box<dyn Scorer>],
+    now_ms: i64,
 ) -> Option<&'a RouteCandidate> {
     if group.admission_state != AdmissionState::NewAndExisting {
         return None;
+    }
+    if !scorers.is_empty() {
+        let members: Vec<&RouteCandidate> = group
+            .candidate_indexes
+            .iter()
+            .filter_map(|&index| candidates.get(index))
+            .collect();
+        let scores = scoring::score_all(scorers, &members, now_ms);
+        if let Some(best) = scoring::pick(&members, &scores) {
+            return Some(best);
+        }
     }
     let index = choose_candidate_index(policy, group, &group.next)?;
     candidates.get(index)
@@ -116,6 +144,7 @@ mod tests {
             selection_tier: None,
             site: Arc::from("site"),
             stable_id: Arc::from(cluster),
+            load_key: format!("site/{cluster}").into(),
         }
     }
 
@@ -135,6 +164,8 @@ mod tests {
                     CapabilityKind::InferenceModel,
                     "model",
                     PickerPolicy::RoundRobin,
+                    &[],
+                    0,
                 )
                 .map(|(candidate, _)| candidate.cluster.to_string())
                 .unwrap_or_default()
@@ -156,6 +187,8 @@ mod tests {
             CapabilityKind::InferenceModel,
             "model",
             PickerPolicy::RoundRobin,
+            &[],
+            0,
         );
         assert_eq!(selected.map(|(candidate, _)| &*candidate.cluster), Some("fallback"));
     }
@@ -174,6 +207,8 @@ mod tests {
             CapabilityKind::InferenceModel,
             "model",
             PickerPolicy::RoundRobin,
+            &[],
+            0,
         );
 
         assert!(selected.is_none());
@@ -192,6 +227,8 @@ mod tests {
             CapabilityKind::InferenceModel,
             "model",
             PickerPolicy::RoundRobin,
+            &[],
+            0,
         );
         assert_eq!(selected.map(|(candidate, _)| &*candidate.cluster), Some("a"));
     }
@@ -211,6 +248,8 @@ mod tests {
                 CapabilityKind::InferenceModel,
                 "model",
                 PickerPolicy::Deterministic,
+                &[],
+                0,
             );
             assert_eq!(selected.map(|(candidate, _)| &*candidate.cluster), Some("a"));
         }
@@ -232,6 +271,8 @@ mod tests {
                 CapabilityKind::InferenceModel,
                 "model",
                 PickerPolicy::Random,
+                &[],
+                0,
             )
             .unwrap();
 
@@ -307,6 +348,8 @@ mod tests {
             CapabilityKind::InferenceModel,
             "model",
             PickerPolicy::RoundRobin,
+            &[],
+            0,
         )
         .unwrap();
         let first_other = select_candidate(
@@ -315,6 +358,8 @@ mod tests {
             CapabilityKind::InferenceModel,
             "other-model",
             PickerPolicy::RoundRobin,
+            &[],
+            0,
         )
         .unwrap();
         let second_model = select_candidate(
@@ -323,6 +368,8 @@ mod tests {
             CapabilityKind::InferenceModel,
             "model",
             PickerPolicy::RoundRobin,
+            &[],
+            0,
         )
         .unwrap();
 
@@ -354,6 +401,8 @@ mod tests {
                                 CapabilityKind::InferenceModel,
                                 "model",
                                 PickerPolicy::RoundRobin,
+                                &[],
+                                0,
                             )
                             .unwrap();
                             let cluster = selected.0.cluster.as_ref();

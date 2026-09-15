@@ -784,6 +784,7 @@ fn overlay_to_candidates(doc: &OverlayDocument) -> Result<Vec<RouteCandidate>, F
                 fresh: oc.fresh,
                 kind,
                 name: oc.name.clone(),
+                provider: None,
                 site: oc.site.clone(),
                 traffic_weight: oc.traffic_weight,
             })
@@ -2445,6 +2446,8 @@ mod tests {
             CapabilityKind::InferenceModel,
             "m",
             snapshot.selection_mode,
+            &[],
+            0,
         )
         .unwrap()
         .0

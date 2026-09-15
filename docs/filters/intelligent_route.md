@@ -54,6 +54,7 @@ Supports two modes:
 | `candidates[].fresh` | bool | no | Whether this candidate is fresh (default: `true`). |
 | `candidates[].kind` | `inference_model` \| `mcp_tool` | yes | Capability kind. |
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |
+| `candidates[].provider` | string | no | Load-signal provider key. Defaults to `cluster` when unset. |
 | `candidates[].site` | string | yes | Site that owns this capability. |
 | `candidates[].traffic_weight` | integer | no | Optional bounded weight used only by weighted selection. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
@@ -73,3 +74,19 @@ Supports two modes:
 | `session_affinity.enabled` | bool | no | Whether session affinity is enabled (default: `false`). |
 | `session_affinity.header` | string | no | Header name to extract the session key from. |
 | `session_affinity.ttl_secs` | integer | no | Binding TTL in seconds (default: 3600, max: 86400). |
+| `signals` | LoadConfig | no | Live load scoring (disabled by default). Present, a background collector polls the endpoint and the choice within a group is refined by load; an empty block (`signals: {}`) opts in on defaults. |
+| `signals.endpoint` | string | no | Signals endpoint on the local operator (e.g. `.../metrics`). Unqualified it carries the local site and every collected peer. Adding `?target=<site>` narrows it to one and leaves remote candidates unscored. |
+| `signals.interval_ms` | integer | no | Poll interval, in milliseconds. |
+| `signals.window_secs` | integer | no | Retention per series, in seconds. |
+| `signals.max_age_ms` | integer | no | Liveness bound, in milliseconds: past this a sample is ignored, so a dead operator stops pinning routing to values that no longer describe anything. Rejected at parse time when negative, which would empty the freshness window and silently mark every sample stale. |
+| `signals.timeout_ms` | integer | no | Request timeout, in milliseconds. |
+| `signals.tls` | LoadTls | no | TLS material for the endpoint. Without it the collector is a plain client, with no grid CA trust and indistinguishable from any other caller. |
+| `signals.tls.ca_path` | string | yes | CA bundle the endpoint certificate is verified against. |
+| `signals.tls.cert_path` | string | no | Certificate presented to the endpoint. Omitted, an access-enforcing listener refuses the unidentified collector. |
+| `signals.tls.key_path` | string | no | Private key for `cert_path`. |
+| `signals.signals` | SignalConfig[] | no | Signals to score candidates on. Also the metric names polled, so an unlisted signal is neither collected nor scored. |
+| `signals.signals[].key` | string | yes | The signal's name in the publishing source's keyspace. A key the source does not publish is not an error: that signal says nothing, and the others decide the route. |
+| `signals.signals[].weight` | number | no | Relative weight in the combined score. |
+| `signals.signals[].lower_is_better` | bool | no | Whether a lower reading is better. True for queue depth and utilisation, so it is the default. |
+| `signals.signals[].scale` | `relative` \| `ratio` | no | How the reading becomes a rating. |
+| `signals.signals[].deadband` | number | no | Spread below which candidates tie on this signal, in the signal's own units. Relative scaling stretches any spread to 0..1, so without a deadband half a queued request reads as decisively as two hundred. Below it the signal expresses no preference and the decision falls to the other signals, then to overlay (locality) order. The value should clear the move's network cost, `(L_remote - L_local) / T_service` in queue units, and the drift in the difference within one poll. |

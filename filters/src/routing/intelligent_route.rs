@@ -18,9 +18,10 @@
 //! policy is configured. A versioned overlay may define priority groups and a
 //! local deterministic, random, or round-robin mode within the first viable
 //! group.
-//! The filter does not recompute source geography, load, or scoring.
 //!
-//! No request-time metrics or control-plane lookups are performed.
+//! Load scoring is off unless a `signals` block is configured. When it is, the
+//! choice within the winning group is refined by live load read from a store a
+//! background collector fills; the group order, and so locality, still leads.
 
 use std::{
     collections::BTreeSet,
@@ -38,6 +39,7 @@ use serde::Deserialize;
 
 use super::{
     descriptor::{self, AdmissionState, CandidateConfig, CapabilityKind, RouteCandidate},
+    load::{self, LoadCollector, LoadConfig},
     metadata::{
         OVERLAY_REVISION_HEADER, PROVIDER_HOP_REQUEST_ID_HEADER, ROUTE_ADMISSION_STATE, ROUTE_CLUSTER, ROUTE_KIND,
         ROUTE_LOCAL_SITE, ROUTE_NAME, ROUTE_PROVIDER_HOP_REQUEST_ID, ROUTE_RANK, ROUTE_SELECTION_GROUP,
@@ -46,6 +48,7 @@ use super::{
     },
     overlay::{self, ExpectedOverlayScope, OverlayReloadHandle, PickerPolicy, RouteSnapshot},
     picker,
+    scoring::{self, Scorer},
 };
 
 // -----------------------------------------------------------------------------
@@ -140,6 +143,12 @@ struct IntelligentRouteConfig {
 
     /// Session affinity configuration (disabled by default).
     session_affinity: Option<SessionAffinityConfig>,
+
+    /// Live load scoring (disabled by default). Present, a background collector
+    /// polls the endpoint and the choice within a group is refined by load; an
+    /// empty block (`signals: {}`) opts in on defaults.
+    #[serde(default)]
+    signals: Option<LoadConfig>,
 }
 
 /// Hot reload settings for overlay file watching.
@@ -416,6 +425,30 @@ pub struct IntelligentRouteFilter {
     session_affinity: Option<SessionAffinity>,
     /// Atomic snapshot of routing state (candidates + `local_site`).
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
+    /// Live load scoring (None when no `signals` block is configured).
+    load: Option<LoadRouting>,
+}
+
+/// Live load scoring held by the filter: the store a background collector fills
+/// and the scorers that read it. The collector stops when this is dropped.
+struct LoadRouting {
+    /// Scorers reading the store, one per configured signal.
+    scorers: Vec<Box<dyn Scorer>>,
+    /// Running collector, kept alive for the filter's lifetime.
+    _collector: LoadCollector,
+}
+
+impl LoadRouting {
+    /// Start the collector and build the scorers from a `signals` block.
+    fn build(cfg: &LoadConfig) -> Result<Self, FilterError> {
+        let collect: Vec<String> = cfg.signals.iter().map(|s| s.key.clone()).collect();
+        let (store, collector) = load::spawn(cfg, &collect)?;
+        let scorers = scoring::scorers_from(&store, &cfg.signals, cfg.max_age_ms);
+        Ok(Self {
+            scorers,
+            _collector: collector,
+        })
+    }
 }
 
 impl IntelligentRouteFilter {
@@ -461,6 +494,7 @@ impl IntelligentRouteFilter {
 
         let session_affinity = build_session_affinity(cfg.session_affinity)?;
         let provider_hop_clusters = validate_provider_hop_clusters(cfg.provider_hop_clusters)?;
+        let load = cfg.signals.as_ref().map(LoadRouting::build).transpose()?;
 
         Ok(Box::new(Self {
             model_header,
@@ -468,6 +502,7 @@ impl IntelligentRouteFilter {
             provider_hop_clusters,
             session_affinity,
             snapshot,
+            load,
         }))
     }
 
@@ -500,9 +535,18 @@ impl IntelligentRouteFilter {
             );
         }
         let failover = matches!(outcome, AffinityOutcome::Failover);
-        let Some((c, selection_group)) =
-            picker::select_candidate(&snap.candidates, &snap.group_index, kind, name, snap.selection_mode)
-        else {
+        let scorers = self.load.as_ref().map_or(&[][..], |l| l.scorers.as_slice());
+        // Read the clock once, and only when scoring will use it.
+        let now_ms = if scorers.is_empty() { 0 } else { load::now_ms() };
+        let Some((c, selection_group)) = picker::select_candidate(
+            &snap.candidates,
+            &snap.group_index,
+            kind,
+            name,
+            snap.selection_mode,
+            scorers,
+            now_ms,
+        ) else {
             tracing::debug!(kind = kind.as_str(), name = %name, "intelligent_route: no candidate");
             return Ok(FilterAction::Reject(Rejection::status(404)));
         };
@@ -1633,6 +1677,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
+            load: None,
         };
 
         assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-v1"));
@@ -1785,6 +1830,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
+            load: None,
         };
         assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-a"));
 
@@ -2489,6 +2535,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::from(["provider-gateway".to_owned()]),
             session_affinity: Some(make_test_affinity()),
             snapshot,
+            load: None,
         };
 
         let mut first = crate::test_utils::make_request(Method::POST, "/chat");
@@ -2535,6 +2582,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::from(["cluster-a".to_owned()]),
             session_affinity: None,
             snapshot: shared,
+            load: None,
         };
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
         req.headers.insert("X-Model", HeaderValue::from_static("model-a"));
@@ -2728,6 +2776,7 @@ mod tests {
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
+                    provider: None,
                     site: site1.to_owned(),
                     traffic_weight: None,
                 },
@@ -2737,6 +2786,7 @@ mod tests {
                     fresh: true,
                     kind: CapabilityKind::InferenceModel,
                     name: "llama".to_owned(),
+                    provider: None,
                     site: site2.to_owned(),
                     traffic_weight: None,
                 },
@@ -2754,6 +2804,7 @@ mod tests {
                 fresh: true,
                 kind: CapabilityKind::InferenceModel,
                 name: "llama".to_owned(),
+                provider: None,
                 site: "site-a".to_owned(),
                 traffic_weight: None,
             }])
@@ -2789,6 +2840,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity,
             snapshot,
+            load: None,
         }
     }
 
@@ -2808,6 +2860,7 @@ mod tests {
                 selection_tier: None,
                 site: Arc::from("s"),
                 stable_id: descriptor::default_stable_id(CapabilityKind::InferenceModel, "llama", "s", cluster),
+                load_key: format!("s/{cluster}").into(),
             });
         }
         RouteSnapshot::from_static(route_candidates, Arc::from("site-a"))

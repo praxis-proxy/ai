@@ -16,7 +16,10 @@ use praxis_filter::FilterError;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use super::metadata::{CandidateCredential, STRATEGY_BEARER_TOKEN};
+use super::{
+    load::LoadStore,
+    metadata::{CandidateCredential, STRATEGY_BEARER_TOKEN},
+};
 
 /// Maximum number of route candidates.
 const MAX_CANDIDATES: usize = 1024;
@@ -158,6 +161,10 @@ pub(crate) struct CandidateConfig {
     /// Capability name (model name, tool name, or agent name).
     pub name: String,
 
+    /// Load-signal provider key. Defaults to `cluster` when unset.
+    #[serde(default)]
+    pub provider: Option<String>,
+
     /// Site that owns this capability.
     pub site: String,
 
@@ -229,6 +236,10 @@ pub(crate) struct RouteCandidate {
 
     /// Deterministic identifier for session affinity binding.
     pub stable_id: Arc<str>,
+
+    /// Precomputed `site/provider` load-store key, built once here so the
+    /// request path scores load with no per-candidate allocation.
+    pub load_key: Box<str>,
 }
 
 // -----------------------------------------------------------------------------
@@ -301,6 +312,8 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
         }
 
         let stable_id = default_stable_id(c.kind, &c.name, &c.site, &c.cluster);
+        let provider = c.provider.as_deref().unwrap_or(c.cluster.as_str());
+        let load_key = LoadStore::key(&c.site, provider);
         candidates.push(RouteCandidate {
             admission_state: AdmissionState::default(),
             cluster: Arc::from(c.cluster.as_str()),
@@ -314,6 +327,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             selection_tier: None,
             site: Arc::from(c.site.as_str()),
             stable_id,
+            load_key,
         });
     }
 
@@ -623,6 +637,7 @@ mod tests {
             fresh: true,
             kind,
             name: name.to_owned(),
+            provider: None,
             site: site.to_owned(),
             traffic_weight: None,
         }

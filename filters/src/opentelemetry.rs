@@ -259,6 +259,7 @@ mod tests {
             selection_tier: Some(Arc::from("same_region")),
             site: Arc::from("site-a"),
             stable_id: Arc::from("stable-a"),
+            load_key: "site-a/provider-a".into(),
         }
     }
 }
