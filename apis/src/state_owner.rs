@@ -17,8 +17,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::header::HeaderName;
 use praxis_filter::{
-    BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, TrustedHeaderMutation,
-    parse_filter_config,
+    BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, RequestExtensions,
+    TrustedHeaderMutation, parse_filter_config,
 };
 use serde::Deserialize;
 
@@ -85,6 +85,26 @@ impl StateOwner {
             subject,
         })
     }
+}
+
+/// Explicitly copy the normalized owner into an isolated subrequest context.
+///
+/// Filtered subrequests inherit no parent extensions by default. A callout
+/// whose configured destination is authorized to receive identity can use
+/// this helper while assembling the child [`RequestExtensions`], then place
+/// `state_owner_headers` in that outbound chain to choose the wire names.
+/// Raw credentials and inbound headers are intentionally not copied.
+///
+/// Returns `true` when an owner was present and projected.
+pub fn project_state_owner(parent: &RequestExtensions, child: &mut RequestExtensions) -> bool {
+    let Some(owner) = parent.get::<StateOwner>() else {
+        return false;
+    };
+    // The child context must own its request-scoped identity independently of
+    // the parent filtered-subrequest lifecycle. This bounded three-string copy
+    // is the ownership boundary; no request or header collection is cloned.
+    child.insert(owner.clone());
+    true
 }
 
 /// Configuration for [`StateOwnerFilter`].

@@ -4,11 +4,11 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::{HeaderValue, Method};
-use praxis_filter::{FilterAction, TrustedHeaderMutation};
+use praxis_filter::{FilterAction, RequestExtensions, TrustedHeaderMutation};
 
 use super::{StateOwner, StateOwnerFilter};
 use crate::{
-    StateOwnerHeadersFilter,
+    StateOwnerHeadersFilter, project_state_owner,
     test_utils::{make_filter_context, make_request},
 };
 
@@ -19,6 +19,24 @@ const SUBJECT_HEADER: &str = "x-maas-user";
 fn filter() -> Box<dyn praxis_filter::HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("mode: trusted_owner\nheader: {HEADER}")).unwrap();
     StateOwnerFilter::from_config(&yaml).unwrap()
+}
+
+#[test]
+fn filtered_subrequest_projection_copies_only_normalized_owner() {
+    let mut parent = RequestExtensions::new();
+    parent.insert(StateOwner::from_trusted_parts("tenant-a".into(), "issuer-a".into(), "alice".into()).unwrap());
+    let mut child = RequestExtensions::new();
+
+    assert!(project_state_owner(&parent, &mut child));
+    assert_eq!(parent.get::<StateOwner>().unwrap().subject(), "alice");
+    let projected = child.get::<StateOwner>().unwrap();
+    assert_eq!(projected.tenant_id(), "tenant-a");
+    assert_eq!(projected.issuer(), "issuer-a");
+    assert_eq!(projected.subject(), "alice");
+
+    let empty = RequestExtensions::new();
+    assert!(!project_state_owner(&empty, &mut child));
+    assert_eq!(child.get::<StateOwner>().unwrap().subject(), "alice");
 }
 
 fn mapped_filter() -> Box<dyn praxis_filter::HttpFilter> {

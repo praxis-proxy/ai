@@ -27,7 +27,7 @@ pub mod subrequest;
 pub mod token_cache;
 pub(crate) mod web_search;
 
-pub use state_owner::{StateOwner, StateOwnerFilter};
+pub use state_owner::{StateOwner, StateOwnerFilter, project_state_owner};
 pub use state_owner_headers::StateOwnerHeadersFilter;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
