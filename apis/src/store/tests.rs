@@ -4485,6 +4485,46 @@ async fn compression_is_backward_compatible_with_plain_rows() {
     assert_eq!(fetched.messages, record.messages, "messages readable");
 }
 
+#[tokio::test]
+async fn plain_store_reads_zstd_rows_after_disabling_compression() {
+    let dir = tempfile::tempdir().expect("tempdir should be created");
+    let db_path = dir.path().join("disable_compression.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let compressed = SqliteResponseStore::new(
+        &url,
+        "dc_responses",
+        "dc_conversations",
+        None,
+        None,
+        Some(&zstd_compression()),
+    )
+    .await
+    .expect("compressed store creation should succeed");
+    let record = make_response_record("resp_zstd", "tenant_a", 1000);
+    compressed
+        .upsert_response(&record)
+        .await
+        .expect("upsert should succeed");
+    drop(compressed);
+
+    let plain = SqliteResponseStore::new(&url, "dc_responses", "dc_conversations", None, None, None)
+        .await
+        .expect("plain store creation should succeed");
+
+    let fetched = plain
+        .get_response("tenant_a", "resp_zstd")
+        .await
+        .expect("get should succeed")
+        .expect("compressed record should remain readable after compression is disabled");
+    assert_eq!(
+        fetched.response_object, record.response_object,
+        "response_object readable"
+    );
+    assert_eq!(fetched.input, record.input, "input readable");
+    assert_eq!(fetched.messages, record.messages, "messages readable");
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
