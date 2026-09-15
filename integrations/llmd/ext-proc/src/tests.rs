@@ -2471,6 +2471,7 @@ fn make_ctx(req: &praxis_filter::Request) -> HttpFilterContext<'_> {
         filter_metadata: HashMap::new(),
         structured_metadata: HashMap::new(),
         pre_read_mutations: Vec::new(),
+        prior_pre_read_mutations: Vec::new(),
         filter_results: HashMap::new(),
         filter_state: HashMap::new(),
         health_registry: None,
@@ -2500,6 +2501,7 @@ fn make_ctx(req: &praxis_filter::Request) -> HttpFilterContext<'_> {
         selected_endpoint_index: None,
         time_source: &praxis_core::time::SystemTimeSource,
         upstream: None,
+        upstream_reached: false,
     }
 }
 
