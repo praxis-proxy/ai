@@ -422,7 +422,7 @@ async fn rejects_when_previous_response_not_found() {
 #[tokio::test]
 async fn body_first_previous_response_lookup_is_exact_owner_scoped() {
     let owner = crate::test_utils::test_owner("default");
-    let other = crate::StateOwner::from_trusted_parts("default", owner.issuer(), "other-subject").unwrap();
+    let other = StateOwner::from_trusted_parts("default", owner.issuer(), "other-subject").unwrap();
     let registry = setup_registry(MockStore::with_status("resp_private", "completed"));
     let filter = default_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");

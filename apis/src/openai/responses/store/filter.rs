@@ -349,7 +349,7 @@ struct ResponseStoreRequestState {
     /// Original `input` value from the Responses API create request.
     input: Option<Value>,
     /// Owner captured before inference begins.
-    owner: Option<OpenAiStateOwner>,
+    owner: Option<StateOwner>,
 }
 
 /// Capture the immutable owner once, before inference or a body-first consumer.

@@ -989,8 +989,8 @@ async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
             .await
             .unwrap(),
     );
-    let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
-    let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let other = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
     backend
         .upsert_response(&ResponseRecord {
             id: "resp_private".to_owned(),
