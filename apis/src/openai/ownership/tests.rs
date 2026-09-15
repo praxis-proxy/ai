@@ -10,10 +10,37 @@ use super::{OpenAiStateOwner, OpenAiStateOwnerFilter};
 use crate::test_utils::{make_filter_context, make_request};
 
 const HEADER: &str = "x-test-state-owner";
+const TENANT_HEADER: &str = "x-maas-tenant";
+const SUBJECT_HEADER: &str = "x-maas-user";
 
 fn filter() -> Box<dyn praxis_filter::HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("mode: trusted_owner\nheader: {HEADER}")).unwrap();
     OpenAiStateOwnerFilter::from_config(&yaml).unwrap()
+}
+
+fn mapped_filter() -> Box<dyn praxis_filter::HttpFilter> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "mode: trusted_headers
+tenant:
+  header: x-maas-tenant
+issuer:
+  static: https://authorino.example
+subject:
+  header: x-maas-user",
+    )
+    .unwrap();
+    OpenAiStateOwnerFilter::from_config(&yaml).unwrap()
+}
+
+fn mapped_request(tenant: &str, subject: &str) -> praxis_filter::Request {
+    let mut request = make_request(Method::POST, "/v1/responses");
+    request
+        .headers
+        .insert(TENANT_HEADER, HeaderValue::from_str(tenant).unwrap());
+    request
+        .headers
+        .insert(SUBJECT_HEADER, HeaderValue::from_str(subject).unwrap());
+    request
 }
 
 fn assertion(parts: [&str; 3]) -> String {
@@ -92,6 +119,81 @@ fn single_tenant_mode_requires_a_valid_namespace() {
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
         assert!(OpenAiStateOwnerFilter::from_config(&value).is_err());
     }
+}
+
+#[test]
+fn trusted_headers_configuration_rejects_ambiguous_or_invalid_sources() {
+    for yaml in [
+        "mode: trusted_headers\ntenant: {header: x-owner}\nissuer: {static: issuer}\nsubject: {header: x-owner}",
+        "mode: trusted_headers\ntenant: {header: x-tenant, static: tenant}\nissuer: {static: issuer}\nsubject: {header: x-user}",
+        "mode: trusted_headers\ntenant: {header: ''}\nissuer: {static: issuer}\nsubject: {header: x-user}",
+        "mode: trusted_headers\ntenant: {header: x-tenant}\nissuer: {static: ''}\nsubject: {header: x-user}",
+    ] {
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            OpenAiStateOwnerFilter::from_config(&value).is_err(),
+            "should reject {yaml}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn trusted_headers_mode_maps_static_and_header_components() {
+    let request = mapped_request("tenant-a", "alice");
+    let mut ctx = make_filter_context(&request);
+
+    let action = mapped_filter().on_request(&mut ctx).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let owner = ctx.extensions.get::<OpenAiStateOwner>().unwrap();
+    assert_eq!(owner.tenant_id(), "tenant-a");
+    assert_eq!(owner.issuer(), "https://authorino.example");
+    assert_eq!(owner.subject(), "alice");
+    assert!(ctx.request_headers_to_remove.iter().any(|name| name == TENANT_HEADER));
+    assert!(ctx.request_headers_to_remove.iter().any(|name| name == SUBJECT_HEADER));
+}
+
+#[tokio::test]
+async fn trusted_headers_mode_queues_all_header_removals_in_body_phase() {
+    let request = mapped_request("tenant-a", "alice");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hi"}"#));
+
+    let action = mapped_filter()
+        .on_request_body(&mut ctx, &mut body, false)
+        .await
+        .unwrap();
+
+    assert!(matches!(action, FilterAction::BodyDone));
+    for expected in [TENANT_HEADER, SUBJECT_HEADER] {
+        assert!(
+            ctx.pre_read_mutations
+                .iter()
+                .any(|mutation| matches!(mutation, TrustedHeaderMutation::Remove(name) if name == expected))
+        );
+    }
+}
+
+#[tokio::test]
+async fn trusted_headers_mode_fails_closed_on_missing_or_duplicate_components() {
+    let mut missing = mapped_request("tenant-a", "alice");
+    missing.headers.remove(SUBJECT_HEADER);
+    let mut missing_ctx = make_filter_context(&missing);
+    let missing_action = mapped_filter().on_request(&mut missing_ctx).await.unwrap();
+    assert_eq!(rejection_code(missing_action), "missing_state_owner");
+
+    let mut duplicate = mapped_request("tenant-a", "alice");
+    duplicate
+        .headers
+        .append(SUBJECT_HEADER, HeaderValue::from_static("bob"));
+    let mut duplicate_ctx = make_filter_context(&duplicate);
+    let duplicate_action = mapped_filter().on_request(&mut duplicate_ctx).await.unwrap();
+    assert_eq!(rejection_code(duplicate_action), "invalid_state_owner");
+
+    let invalid = mapped_request("", "alice");
+    let mut invalid_ctx = make_filter_context(&invalid);
+    let invalid_action = mapped_filter().on_request(&mut invalid_ctx).await.unwrap();
+    assert_eq!(rejection_code(invalid_action), "invalid_state_owner");
 }
 
 #[tokio::test]

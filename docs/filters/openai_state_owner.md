@@ -3,16 +3,39 @@
 
 # `openai_state_owner`
 
-Decodes a trusted owner assertion into [`OpenAiStateOwner`].
+Establishes a normalized [`OpenAiStateOwner`] from trusted identity sources.
 
 ## Configuration Notes
 
-The configured header must be governed by a trusted upstream boundary. This filter validates and strips it; it does not authenticate its producer.
+Every configured header must be governed by a trusted upstream boundary. This filter validates and strips consumed headers; it does not authenticate their producer. In `trusted_headers` mode each component must select exactly one `header` or `static` source, and component header names must be distinct.
 
-## Example
+## Examples
+
+### Example 1
 
 ```yaml
 filter: openai_state_owner
 mode: trusted_owner
 header: x-authenticated-state-owner
+```
+
+### Example 2
+
+```yaml
+filter: openai_state_owner
+mode: trusted_headers
+tenant:
+  header: x-maas-tenant
+issuer:
+  static: https://authorino.example
+subject:
+  header: x-maas-user
+```
+
+### Example 3
+
+```yaml
+filter: openai_state_owner
+mode: single_tenant
+tenant_id: local
 ```
