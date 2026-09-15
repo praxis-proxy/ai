@@ -6,10 +6,11 @@
 # response-phase behavior in isolation.
 #
 #   Response phase:
-#     success  - response forwarded to the client unchanged
+#     passed   - response forwarded to the client unchanged
 #     blocked  - response body replaced with a JSON error payload
 #                (status remains 200 because headers are already committed)
-#     error    - response body replaced with a JSON error payload
+#     modified - forwarded unchanged until redaction support lands
+#     provider HTTP error - response body replaced with a JSON error payload
 #                (same as blocked; headers are already committed)
 
 listeners:
@@ -24,7 +25,7 @@ filter_chains:
       - filter: ai_guardrails
         provider:
           type: nemo
-          endpoint: "http://127.0.0.1:3001/v1/guardrail/checks"
+          endpoint: "http://127.0.0.1:3001/v1/checks"
           allow_private_endpoint: true
           timeout_ms: 5000
         phase:
