@@ -27,8 +27,14 @@
 # share every rule's budget across every gateway instance/replica over
 # one shared connection.
 #
+# Set `key: authenticated_subject` on token_rate_limit to give every
+# verified Praxis subject an independent budget within each matching
+# rule. It fails closed when no authenticated identity is present and
+# hashes the subject before using it as a backend key. The default is
+# `key: global`, preserving one shared budget per rule.
+#
 # Deliberately not yet built (see filters/src/token_rate_limit/mod.rs
-# for the full rationale): CEL/composite bucket keys, configurable
+# for the full rationale): arbitrary CEL/composite bucket keys, configurable
 # estimation strategies (M3, `reserved_tokens` below is a fixed
 # placeholder), token-type-aware accounting (M4), and
 # observability/metering (M7/M8/S3).
@@ -70,6 +76,7 @@ filter_chains:
             cluster: backend
 
       - filter: token_rate_limit
+        key: global
         rules:
           - name: default
             algorithm: sliding_window

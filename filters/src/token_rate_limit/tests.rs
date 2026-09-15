@@ -55,6 +55,42 @@ fn from_config_parses_valid_config() {
 }
 
 #[test]
+fn from_config_accepts_authenticated_subject_keying() {
+    let yaml = single_rule_yaml_with(
+        "key: authenticated_subject",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100000\nreserved_tokens: 500",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn subject_bucket_keys_are_stable_distinct_and_opaque() {
+    let first = super::subject_bucket_key("application-a");
+    let repeated = super::subject_bucket_key("application-a");
+    let second = super::subject_bucket_key("application-b");
+
+    assert_eq!(first, repeated);
+    assert_ne!(first, second);
+    assert!(!first.contains("application-a"));
+    assert_eq!(first.len(), "subject:v1:".len() + 43);
+}
+
+#[tokio::test]
+async fn authenticated_subject_keying_fails_closed_without_identity() {
+    let yaml = single_rule_yaml_with(
+        "key: authenticated_subject",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401));
+}
+
+#[test]
 fn from_config_rejects_an_empty_rules_list() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("rules: []\n").unwrap();
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
@@ -651,6 +687,7 @@ fn debug_format_lists_configured_rule_names() {
         .unwrap();
     let filter = TokenRateLimitFilter {
         rules,
+        key_source: cfg.key,
         epoch: std::time::Instant::now(),
     };
     let debug = format!("{filter:?}");

@@ -18,6 +18,9 @@ azure-ad-filter = ["praxis-ai-proxy/azure-ad-filter"]
 # Experimental: gates the gcp_adc example test, which needs the gcp_adc
 # filter registered in the in-process proxy registry.
 gcp-adc-filter = ["praxis-ai-proxy/gcp-adc-filter"]
+# Experimental: gates authenticated-subject token-rate-limit tests, which need
+# Praxis's released Basic Auth filter registered in the in-process registry.
+basic-auth-filter = ["praxis-ai-proxy/basic-auth-filter"]
 # Experimental: gates the token_rate_limit example tests, which need the
 # token_rate_limit filter registered in the in-process proxy registry.
 token-rate-limit-filter = ["praxis-ai-proxy/token-rate-limit-filter"]

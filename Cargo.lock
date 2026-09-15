@@ -3041,6 +3041,7 @@ checksum = "98c84f1ccd01894ba939685446f0a433303eefb691cacd746b38513821408ccc"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64 0.23.1",
  "bytes",
  "dashmap 6.2.1",
  "http 1.5.0",
@@ -3054,7 +3055,9 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "smallvec",
+ "subtle",
  "thiserror 2.0.20",
  "tokio",
  "tracing",

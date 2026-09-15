@@ -49,6 +49,11 @@ pub(super) struct TokenRateLimitConfig {
     /// a catch-all budget instead.
     pub rules: Vec<RuleConfig>,
 
+    /// Trusted request identity used to partition each rule's budget.
+    /// The default preserves the historical single global bucket.
+    #[serde(default)]
+    pub key: KeySource,
+
     /// Where every rule's admission state lives: in-process (default,
     /// one budget per gateway instance) or a shared Valkey backend (one
     /// budget shared across every gateway instance/replica). One
@@ -60,6 +65,18 @@ pub(super) struct TokenRateLimitConfig {
     /// in-process and Valkey rules in one filter instance.
     #[serde(default)]
     pub backend: BackendConfig,
+}
+
+/// Trusted source used to partition a rule's token budget.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum KeySource {
+    /// Every request matching a rule shares that rule's budget.
+    #[default]
+    Global,
+
+    /// Partition the rule by Praxis's verified request subject.
+    AuthenticatedSubject,
 }
 
 /// One `rules:` entry: an optional match condition, an algorithm choice
@@ -243,6 +260,26 @@ mod tests {
             RuleAlgorithm::SlidingWindow { capacity: 1000, .. }
         ));
         assert_eq!(rule.reserved_tokens, 50);
+        assert_eq!(cfg.key, KeySource::Global);
+    }
+
+    #[test]
+    fn parses_authenticated_subject_key_source() {
+        let cfg = parse(
+            "key: authenticated_subject\nrules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    reserved_tokens: 50\n",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.key, KeySource::AuthenticatedSubject);
+    }
+
+    #[test]
+    fn rejects_unknown_key_source() {
+        let result = parse(
+            "key: request_header\nrules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    reserved_tokens: 50\n",
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
