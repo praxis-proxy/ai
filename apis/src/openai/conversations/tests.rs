@@ -3648,6 +3648,7 @@ async fn update_conversation_metadata_does_not_clobber_concurrent_append() {
             "test_conversations",
             Some("test_items"),
             None,
+            None,
         )
         .await
         .expect("store creation should succeed"),

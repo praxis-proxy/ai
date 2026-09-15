@@ -97,17 +97,17 @@ async fn response_store_persists_response_to_postgres() {
     assert_eq!(created_at, 2000, "persisted created_at should match response");
     assert_eq!(model, "gpt-4.1", "persisted model should match response");
 
-    let input_raw: String = row.get("input");
-    let input: serde_json::Value = serde_json::from_str(&input_raw).expect("input column should be valid JSON");
+    let input_raw: Vec<u8> = row.get("input");
+    let input: serde_json::Value = serde_json::from_slice(&input_raw).expect("input column should be valid JSON");
     assert_eq!(
         input,
         serde_json::json!("Hello from postgres"),
         "input should match the response's input field"
     );
 
-    let messages_raw: String = row.get("messages");
+    let messages_raw: Vec<u8> = row.get("messages");
     let messages: serde_json::Value =
-        serde_json::from_str(&messages_raw).expect("messages column should be valid JSON");
+        serde_json::from_slice(&messages_raw).expect("messages column should be valid JSON");
     let items = messages.as_array().expect("messages should be an array");
     assert_eq!(
         items.len(),
@@ -119,6 +119,87 @@ async fn response_store_persists_response_to_postgres() {
         serde_json::json!({"type": "message", "role": "user", "content": "Hello from postgres"}),
         "first message should be the normalized user input"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires container engine (podman or docker)"]
+async fn response_store_persists_compressed_payload_to_postgres() {
+    let pg = start_postgres();
+
+    let backend_guard = Backend::fixed(RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let suffix = unique_suffix();
+    let responses_table = format!("openai_responses_{suffix}");
+    let conversations_table = format!("openai_conversations_{suffix}");
+
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/response-store.yaml"))
+        .expect("example config should exist");
+    let patched = patch_yaml(
+        &yaml
+            .replace("backend: sqlite", "backend: postgres")
+            .replace(
+                "database_url: \"sqlite://responses.db?mode=rwc\"",
+                &format!("database_url: \"{}\"", pg.url()),
+            )
+            .replace(
+                "        responses_table: openai_responses",
+                &format!("        responses_table: {responses_table}"),
+            )
+            .replace(
+                "        conversations_table: openai_conversations",
+                &format!(
+                    "        conversations_table: {conversations_table}\n        allow_private_database_url: true\n        ssl_mode: disable\n        compression:\n          algorithm: zstd\n          level: 3"
+                ),
+            ),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello from postgres"}"#),
+    );
+    assert_eq!(parse_status(&raw), 200, "Responses API POST should return 200");
+
+    // The stored columns must be raw zstd frames (magic 0x28 0xB5 0x2F 0xFD),
+    // not plain JSON.
+    const ZSTD_MAGIC: &[u8] = &[0x28, 0xB5, 0x2F, 0xFD];
+    let pool = Box::pin(sqlx::PgPool::connect(&pg.url()))
+        .await
+        .expect("should connect to test database");
+    let sql = format!("SELECT input, messages FROM {responses_table} WHERE id = $1");
+    let row: sqlx::postgres::PgRow = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind("resp_pg_abc")
+        .fetch_one(&pool)
+        .await
+        .expect("persisted record should exist in database");
+    pool.close().await;
+
+    let input_raw: Vec<u8> = row.get("input");
+    let messages_raw: Vec<u8> = row.get("messages");
+    assert!(
+        input_raw.starts_with(ZSTD_MAGIC),
+        "input column should be a zstd frame, got prefix: {:?}",
+        &input_raw[..input_raw.len().min(4)]
+    );
+    assert!(
+        messages_raw.starts_with(ZSTD_MAGIC),
+        "messages column should be a zstd frame, got prefix: {:?}",
+        &messages_raw[..messages_raw.len().min(4)]
+    );
+
+    // The GET endpoint must transparently decompress and return the response.
+    let (status, body) = praxis_test_utils::http_get(proxy.addr(), "/v1/responses/resp_pg_abc", None);
+    assert_eq!(status, 200, "GET of stored response should return 200");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("body should be valid JSON");
+    assert_eq!(parsed["id"], "resp_pg_abc", "decompressed response id should match");
+    assert_eq!(parsed["model"], "gpt-4.1", "decompressed model should match");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

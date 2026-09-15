@@ -17,6 +17,7 @@ Persists Responses API responses to the configured response store backend.
 | `ssl_root_cert` | string (secret) | no | Path to a PEM-encoded root CA certificate for `PostgreSQL` TLS verification. Only valid when `backend` is `postgres` and the effective SSL mode is `verify-ca` or `verify-full`. |
 | `allow_private_database_url` | bool | no | Allow `PostgreSQL` URLs that target local-sensitive addresses. By default, DNS names, localhost, loopback, private, link-local, cloud metadata, unspecified, and Unix socket targets are rejected. This opt-in is intended for local development and tests. |
 | `pool` | PoolConfig | no | Connection pool tuning options. When omitted, sqlx defaults apply (`max_connections = 10`, `idle_timeout = 600s`, `acquire_timeout = 30s`). |
+| `compression` | StoreCompressionConfig | no | Optional payload compression for stored JSON columns. When omitted, payloads are stored uncompressed. Reads auto-detect the format, so enabling compression keeps existing uncompressed records readable. |
 
 ## Example
 

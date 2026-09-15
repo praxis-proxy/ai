@@ -54,3 +54,7 @@ docs/**/
 !docs/filters/tcp/*/
 !docs/operating/
 !docs/proposals/
+!docs/store/
+
+# macOS
+.DS_Store

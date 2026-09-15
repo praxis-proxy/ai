@@ -127,17 +127,17 @@ async fn stream_events_accumulates_state_and_persists_response_to_sqlite() {
     assert_eq!(created_at, 1000, "persisted created_at should match stream");
     assert_eq!(model, "gpt-4.1", "persisted model should match stream");
 
-    let input_raw: String = row.get("input");
-    let input: serde_json::Value = serde_json::from_str(&input_raw).expect("input column should be valid JSON");
+    let input_raw: Vec<u8> = row.get("input");
+    let input: serde_json::Value = serde_json::from_slice(&input_raw).expect("input column should be valid JSON");
     assert_eq!(
         input,
         serde_json::json!("Hello streaming"),
         "persisted input should match terminal response"
     );
 
-    let messages_raw: String = row.get("messages");
+    let messages_raw: Vec<u8> = row.get("messages");
     let messages: serde_json::Value =
-        serde_json::from_str(&messages_raw).expect("messages column should be valid JSON");
+        serde_json::from_slice(&messages_raw).expect("messages column should be valid JSON");
     let items = messages.as_array().expect("messages should be an array");
     assert_eq!(
         items.len(),
