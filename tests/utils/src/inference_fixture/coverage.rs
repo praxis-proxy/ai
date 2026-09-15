@@ -1249,6 +1249,7 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1283,11 +1284,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 25);
-        assert_eq!(report.scenarios_total, 25);
-        assert_eq!(report.recordings_total, 30);
+        assert_eq!(report.features_total, 26);
+        assert_eq!(report.scenarios_total, 26);
+        assert_eq!(report.recordings_total, 31);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1308,6 +1310,7 @@ mod tests {
                 "responses/chat-file-search",
                 "responses/chat-malformed-compaction",
                 "responses/chat-tool-echo",
+                "responses/chat-unrepresentable-parameters",
                 "responses/chat-web-search",
                 "responses/chat-web-search-stream",
                 "responses/irr-terminal-streaming",
@@ -1318,7 +1321,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 25);
+        assert_eq!(manifest.features.len(), 26);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1454,6 +1457,10 @@ mod tests {
                 (
                     &"responses.chat.malformed_compaction".to_owned(),
                     &vec!["responses/chat-malformed-compaction".to_owned()]
+                ),
+                (
+                    &"responses.chat.unrepresentable_parameters".to_owned(),
+                    &vec!["responses/chat-unrepresentable-parameters".to_owned()]
                 ),
                 (
                     &"responses.chat.tools.function_echo".to_owned(),

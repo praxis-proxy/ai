@@ -1,0 +1,137 @@
+{
+  "version": 1,
+  "scenario_id": "responses/chat-unrepresentable-parameters",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-unrepresentable-parameters-model",
+    "source_id": "controlled-unrepresentable-background-and-truncation"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {}
+  },
+  "turns": [
+    {
+      "name": "background",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": true,
+              "input": "Run this later.",
+              "model": "synthetic-unrepresentable-parameters-model",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "code": "invalid_request_error",
+                "message": "Responses `background` value true has no Chat Completions representation; this adapter supports only `background` false",
+                "param": null,
+                "type": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
+      "name": "truncation",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "Summarize a very long conversation.",
+              "model": "synthetic-unrepresentable-parameters-model",
+              "store": false,
+              "stream": false,
+              "truncation": "auto"
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "code": "invalid_request_error",
+                "message": "Responses `truncation` value \"auto\" has no Chat Completions representation; this adapter supports only `truncation` \"disabled\"",
+                "param": null,
+                "type": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    }
+  ]
+}
