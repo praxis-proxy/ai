@@ -86,6 +86,12 @@ fn configure_pipeline(
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
     pipeline.set_subrequest_client(subrequest_client.clone());
     pipeline.apply_insecure_options(&config.insecure_options);
+    // Propagate the operator's SSRF posture into every pipeline, including the
+    // outbound chains bound by chain-binding filters (e.g. web search). The
+    // filtered-subrequest executor consults `allow_private_upstreams()` on the
+    // outbound pipeline at connect time, so a private-destination callout is
+    // rejected unless the operator opted in here.
+    pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     Ok(())
 }
 

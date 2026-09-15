@@ -344,24 +344,32 @@ fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Opti
 
 /// Register `anthropic_web_search` with the shared client when
 /// available, otherwise fall back to an isolated per-filter connector.
+///
+/// Registered as a chain-binding filter so each provider callout executes
+/// through the operator-configured `outbound_chain`.
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
 fn register_anthropic_web_search(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
-    if let Some(client) = subrequest_client {
+    let factory: praxis_filter::ChainBindingHttpFactory = if let Some(client) = subrequest_client {
         let client = client.clone();
-        registry
-            .register(
-                "anthropic_web_search",
-                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
-                    praxis_ai_apis::anthropic::AnthropicWebSearchFilter::from_config_with_client(config, client.clone())
-                })),
-            )
-            .unwrap_or_else(|_| panic!("duplicate filter name: 'anthropic_web_search'"));
+        std::sync::Arc::new(
+            move |config: &serde_yaml::Value, ctx: &praxis_filter::ChainBindingContext<'_>| {
+                praxis_ai_apis::anthropic::AnthropicWebSearchFilter::from_chain_binding_with_client(
+                    config,
+                    client.clone(),
+                    ctx,
+                )
+            },
+        )
     } else {
-        praxis_filter::register_filters!(
-            @register registry,
-            http "anthropic_web_search" => praxis_ai_apis::anthropic::AnthropicWebSearchFilter::from_config
-        );
-    }
+        std::sync::Arc::new(
+            |config: &serde_yaml::Value, ctx: &praxis_filter::ChainBindingContext<'_>| {
+                praxis_ai_apis::anthropic::AnthropicWebSearchFilter::from_chain_binding(config, ctx)
+            },
+        )
+    };
+    registry
+        .register_chain_binding("anthropic_web_search", factory)
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'anthropic_web_search'"));
 }
 
 /// Register `openai_file_resolve` with the shared client when
@@ -432,24 +440,28 @@ fn register_file_search_callout(registry: &mut FilterRegistry, subrequest_client
 
 /// Register `openai_web_search` with the shared client when
 /// available, otherwise fall back to an isolated per-filter connector.
+///
+/// Registered as a chain-binding filter so each provider callout executes
+/// through the operator-configured `outbound_chain`.
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
 fn register_web_search(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
-    if let Some(client) = subrequest_client {
+    let factory: praxis_filter::ChainBindingHttpFactory = if let Some(client) = subrequest_client {
         let client = client.clone();
-        registry
-            .register(
-                "openai_web_search",
-                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
-                    praxis_ai_apis::openai::WebSearchFilter::from_config_with_client(config, client.clone())
-                })),
-            )
-            .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_web_search'"));
+        std::sync::Arc::new(
+            move |config: &serde_yaml::Value, ctx: &praxis_filter::ChainBindingContext<'_>| {
+                praxis_ai_apis::openai::WebSearchFilter::from_chain_binding_with_client(config, client.clone(), ctx)
+            },
+        )
     } else {
-        praxis_filter::register_filters!(
-            @register registry,
-            http "openai_web_search" => praxis_ai_apis::openai::WebSearchFilter::from_config
-        );
-    }
+        std::sync::Arc::new(
+            |config: &serde_yaml::Value, ctx: &praxis_filter::ChainBindingContext<'_>| {
+                praxis_ai_apis::openai::WebSearchFilter::from_chain_binding(config, ctx)
+            },
+        )
+    };
+    registry
+        .register_chain_binding("openai_web_search", factory)
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_web_search'"));
 }
 
 // -----------------------------------------------------------------------------

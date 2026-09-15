@@ -3,6 +3,7 @@
 
 //! Configuration for protocol-neutral web-search providers.
 
+use praxis_core::config::ChainRef;
 use praxis_filter::{
     FilterError, body::MAX_JSON_BODY_BYTES,
     builtins::http::payload_processing::config_validation::validate_max_body_bytes,
@@ -123,14 +124,23 @@ pub(crate) struct WebSearchFilterConfig {
     #[serde(default)]
     pub(crate) base_url: Option<String>,
 
-    /// Allow a `base_url` that targets local-sensitive addresses.
+    /// Outbound filter chain the provider callout executes through.
     ///
-    /// DNS names are resolved once per request and every result is checked
-    /// immediately before the transport connects. By default, any private,
-    /// loopback, link-local, or otherwise non-public result rejects the
-    /// callout. Enable this only for a trusted private provider endpoint.
-    #[serde(default)]
-    pub(crate) allow_private_base_url: bool,
+    /// **Define this chain inline.** Both web-search filters run as steps of an
+    /// `iterative_request_router` (the agentic loop). A chain-binding filter
+    /// nested inside an IRR step resolves its `outbound_chain` against the step
+    /// pipeline's chain map, which is empty — top-level `filter_chains` are not
+    /// in scope there — so a named reference fails to bind and the build is
+    /// rejected. A named reference only resolves for a top-level (non-IRR)
+    /// placement, which these filters do not use. An inline definition embeds
+    /// the filters directly and always binds.
+    ///
+    /// The chain carries cross-cutting concerns (observability, security,
+    /// credential injection) and is bound once at pipeline-build time — a chain
+    /// that cannot be built fails config validation. Destination authority,
+    /// DNS/SSRF, TLS/SNI, and `Host` are enforced centrally by the executor,
+    /// gated by `insecure_options.allow_private_upstreams`.
+    pub(crate) outbound_chain: ChainRef,
 
     /// Select Praxis streaming transport for effective `stream: true`
     /// Messages requests. When enabled, the terminal inference response is
@@ -179,14 +189,11 @@ pub(crate) struct OpenAiWebSearchConfig {
     #[serde(default)]
     base_url: Option<String>,
 
-    /// Allow a `base_url` that targets local-sensitive addresses.
+    /// Outbound filter chain the provider callout executes through.
     ///
-    /// DNS names are resolved once per request and every result is checked
-    /// immediately before the transport connects. By default, any private,
-    /// loopback, link-local, or otherwise non-public result rejects the
-    /// callout. Enable this only for a trusted private provider endpoint.
-    #[serde(default)]
-    allow_private_base_url: bool,
+    /// See [`WebSearchFilterConfig::outbound_chain`]; the two configs stay in
+    /// sync so both providers route through a bound outbound chain.
+    pub(crate) outbound_chain: ChainRef,
 }
 
 /// Default value for `OpenAiWebSearchConfig::max_calls_per_round`.
@@ -208,7 +215,7 @@ impl OpenAiWebSearchConfig {
             timeout_ms: self.timeout_ms,
             max_body_bytes: None,
             base_url: self.base_url,
-            allow_private_base_url: self.allow_private_base_url,
+            outbound_chain: self.outbound_chain,
             // `openai_web_search` has no terminal_streaming knob; its own
             // deny_unknown_fields config never accepts the field, so the
             // shared validated form is always off for it.
@@ -242,9 +249,6 @@ pub(crate) struct ValidatedConfig {
     /// Override the provider's default API base URL.
     pub base_url: Option<String>,
 
-    /// Connect-time private-address policy for the provider target.
-    pub allow_private_base_url: bool,
-
     /// Whether to stream the terminal Messages response incrementally.
     pub terminal_streaming: bool,
 }
@@ -258,7 +262,6 @@ impl std::fmt::Debug for ValidatedConfig {
             .field("timeout_ms", &self.timeout_ms)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("base_url", &self.base_url)
-            .field("allow_private_base_url", &self.allow_private_base_url)
             .field("terminal_streaming", &self.terminal_streaming)
             .finish()
     }
@@ -288,7 +291,14 @@ fn build_validated_config(
     api_key: String,
 ) -> Result<ValidatedConfig, FilterError> {
     if let Some(base_url) = raw.base_url.as_deref() {
-        crate::openai::api_client::validate_base_url(filter_name, base_url, raw.allow_private_base_url)?;
+        // Structural checks only (scheme, embedded credentials, path). Private-
+        // address / SSRF enforcement is deferred to the outbound executor's
+        // connect-time `build_peer`, gated by
+        // `insecure_options.allow_private_upstreams`. Pass `allow_private = true`
+        // here so config validation does not duplicate (or contradict) that
+        // runtime gate; `validate_base_url` is shared with other filters and its
+        // signature must stay stable.
+        crate::openai::api_client::validate_base_url(filter_name, base_url, true)?;
     }
     Ok(ValidatedConfig {
         provider: raw.provider,
@@ -297,7 +307,6 @@ fn build_validated_config(
         timeout_ms: callout_policy::validate_timeout_ms(filter_name, raw.timeout_ms, DEFAULT_TIMEOUT_MS)?,
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
         base_url: raw.base_url.clone(),
-        allow_private_base_url: raw.allow_private_base_url,
         terminal_streaming: raw.terminal_streaming,
     })
 }
@@ -364,7 +373,7 @@ mod tests {
             timeout_ms: None,
             max_body_bytes: None,
             base_url: None,
-            allow_private_base_url: false,
+            outbound_chain: ChainRef::Named("web_search_outbound".to_owned()),
             terminal_streaming: false,
         }
     }
@@ -380,10 +389,22 @@ mod tests {
 
     #[test]
     fn parse_config_reads_terminal_streaming() {
-        let yaml = serde_yaml::from_str("provider: you\napi_key: k\nterminal_streaming: true").unwrap();
+        let yaml = serde_yaml::from_str(
+            "provider: you\napi_key: k\noutbound_chain: web_search_outbound\nterminal_streaming: true",
+        )
+        .unwrap();
         let raw = parse_filter_config::<WebSearchFilterConfig>("anthropic_web_search", &yaml).unwrap();
         let validated = build_config("anthropic_web_search", &raw).unwrap();
         assert!(validated.terminal_streaming);
+    }
+
+    #[test]
+    fn parse_config_rejects_missing_outbound_chain() {
+        let yaml = serde_yaml::from_str("provider: you\napi_key: k").unwrap();
+        assert!(
+            parse_filter_config::<WebSearchFilterConfig>("anthropic_web_search", &yaml).is_err(),
+            "outbound_chain is required; a config omitting it must fail to parse"
+        );
     }
 
     #[test]
@@ -457,7 +478,6 @@ mod tests {
     fn build_config_base_url_threaded_through() {
         let mut cfg = base_config();
         cfg.base_url = Some("http://localhost:9999".into());
-        cfg.allow_private_base_url = true;
         let validated = build_config("openai_web_search", &cfg).unwrap();
         assert_eq!(validated.base_url.as_deref(), Some("http://localhost:9999"));
     }
@@ -469,40 +489,25 @@ mod tests {
     }
 
     #[test]
-    fn build_config_rejects_loopback_base_url() {
-        let mut cfg = base_config();
-        cfg.base_url = Some("http://127.0.0.1:9999".into());
-        assert!(
-            build_config("openai_web_search", &cfg).is_err(),
-            "loopback base_url must be rejected without allow_private_base_url (SSRF/credential disclosure)"
-        );
-    }
-
-    #[test]
-    fn build_config_rejects_localhost_base_url() {
-        let mut cfg = base_config();
-        cfg.base_url = Some("http://localhost:9999".into());
-        assert!(
-            build_config("openai_web_search", &cfg).is_err(),
-            "localhost base_url must be rejected without allow_private_base_url"
-        );
-    }
-
-    #[test]
-    fn build_config_rejects_cloud_metadata_base_url() {
-        let mut cfg = base_config();
-        cfg.base_url = Some("http://169.254.169.254".into());
-        assert!(
-            build_config("openai_web_search", &cfg).is_err(),
-            "link-local cloud-metadata base_url must be rejected without allow_private_base_url"
-        );
-    }
-
-    #[test]
-    fn build_config_accepts_dns_base_url_for_connect_time_validation() {
-        let mut cfg = base_config();
-        cfg.base_url = Some("http://internal.search.example:8080".into());
-        assert!(build_config("openai_web_search", &cfg).is_ok());
+    fn build_config_accepts_private_base_url_ssrf_deferred_to_executor() {
+        // Private/loopback/link-local destinations are no longer rejected at
+        // config-validation time: SSRF enforcement moved to the outbound
+        // executor's connect-time `build_peer`, gated by
+        // `insecure_options.allow_private_upstreams`. Config validation keeps
+        // only structural checks.
+        for url in [
+            "http://127.0.0.1:9999",
+            "http://localhost:9999",
+            "http://169.254.169.254",
+            "http://internal.search.example:8080",
+        ] {
+            let mut cfg = base_config();
+            cfg.base_url = Some(url.into());
+            assert!(
+                build_config("openai_web_search", &cfg).is_ok(),
+                "private base_url `{url}` must pass structural validation; SSRF is enforced at connect time"
+            );
+        }
     }
 
     #[test]
@@ -519,10 +524,9 @@ mod tests {
     fn build_config_rejects_base_url_with_embedded_credentials() {
         let mut cfg = base_config();
         cfg.base_url = Some("http://user:pass@8.8.8.8".into());
-        cfg.allow_private_base_url = true;
         assert!(
             build_config("openai_web_search", &cfg).is_err(),
-            "base_url with embedded credentials must be rejected even with allow_private_base_url"
+            "base_url with embedded credentials must be rejected (structural check)"
         );
     }
 
@@ -539,10 +543,9 @@ mod tests {
     }
 
     #[test]
-    fn build_config_allows_private_base_url_with_opt_in() {
+    fn build_config_allows_private_base_url() {
         let mut cfg = base_config();
         cfg.base_url = Some("http://127.0.0.1:9999".into());
-        cfg.allow_private_base_url = true;
         let validated = build_config("openai_web_search", &cfg).unwrap();
         assert_eq!(validated.base_url.as_deref(), Some("http://127.0.0.1:9999"));
     }

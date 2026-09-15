@@ -79,6 +79,10 @@ fn resolve_listener_pipeline(
         .unwrap();
     pipeline.set_subrequest_client(client.clone());
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
+    // Mirror the server: propagate the SSRF posture into outbound chains bound by
+    // chain-binding filters so private-destination callouts obey the operator's
+    // `insecure_options.allow_private_upstreams` opt-in.
+    pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     Arc::new(pipeline)
 }
 

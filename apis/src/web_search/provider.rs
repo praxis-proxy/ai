@@ -8,11 +8,18 @@
 //!
 //! [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
 
-use std::time::Duration;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use http::HeaderMap;
-use praxis_filter::FilterError;
+use praxis_core::connectivity::{PreparedSubrequest, PreparedTarget, prepare_url_target};
+use praxis_filter::{
+    CalloutResponse, DeferredCredential, FilterError, FilterPipeline, FilteredSubrequestExecutor, HttpFilterContext,
+    IterationState, PendingCredentials, RequestExtensions, StagedUpstream, StagedUpstreamFallback, SubrequestRuntime,
+};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -21,10 +28,7 @@ use super::{
     ValidatedConfig,
     config::{SearchContextSize, SearchProvider},
 };
-use crate::{
-    callout_target::AddressPolicy,
-    subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
-};
+use crate::subrequest::{SubRequest, SubRequestClient, SubResponse};
 
 /// Response body cap for search callouts (1 MiB). Distinct from
 /// `max_body_bytes` which governs inbound request buffering.
@@ -61,6 +65,75 @@ pub(crate) enum SearchOutcome {
 }
 
 // -----------------------------------------------------------------------------
+// CalloutContext
+// -----------------------------------------------------------------------------
+
+/// Downstream caller attributes and outbound recursion depth captured for one
+/// web-search callout.
+///
+/// The owning filter builds this from its [`HttpFilterContext`] so the outbound
+/// chain and the [`FilteredSubrequestExecutor`] observe the *originating*
+/// request rather than a synthetic anonymous caller at depth zero:
+///
+/// - `runtime` forwards the client address, downstream TLS state, peer identity, and request-start instant, so outbound
+///   security and observability filters see the real client and duration accounting stays consistent.
+/// - `depth` carries the request's current outbound recursion depth (read from the IRR-owned [`IterationState`] in
+///   request extensions), so the executor stamps the callout at `depth + 1` and a recursive target remains accountable
+///   to the IRR depth ceiling instead of resetting the count.
+///
+/// [`FilteredSubrequestExecutor`]: praxis_filter::FilteredSubrequestExecutor
+pub(crate) struct CalloutContext {
+    /// Downstream attributes forwarded to the outbound chain.
+    runtime: SubrequestRuntime,
+    /// Current outbound recursion depth of the owning request.
+    depth: u8,
+}
+
+impl CalloutContext {
+    /// Capture the caller context and current outbound depth from the owning
+    /// filter's request context.
+    ///
+    /// The `peer_identity` `Arc` is cloned at this ownership boundary because
+    /// [`SubrequestRuntime`] owns the forwarded identity for the callout's
+    /// lifetime; the clone only bumps a refcount.
+    pub(crate) fn from_filter_context(ctx: &HttpFilterContext<'_>) -> Self {
+        Self {
+            runtime: SubrequestRuntime::new(
+                ctx.client_addr,
+                ctx.downstream_tls,
+                ctx.peer_identity.clone(),
+                ctx.request_start,
+            ),
+            depth: current_outbound_depth(ctx),
+        }
+    }
+
+    /// Build a synthetic top-level callout context for tests: an anonymous
+    /// caller (no client address, plaintext downstream, no peer identity) at
+    /// outbound depth zero.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            runtime: SubrequestRuntime::new(None, false, None, Instant::now()),
+            depth: 0,
+        }
+    }
+}
+
+/// Read the request's current outbound recursion depth from the IRR-owned
+/// [`IterationState`] in request extensions.
+///
+/// The `iterative_request_router` captures the inbound `x-praxis-iterative-depth`
+/// framework header into [`IterationState`] and then strips every reserved
+/// `x-praxis-*` header before it builds each step's context, so a step filter can
+/// no longer read the depth from the request headers — it must read the state the
+/// router injected. A request with no [`IterationState`] (a top-level, non-IRR
+/// placement such as the standalone `web-search.yaml`) is at depth zero.
+fn current_outbound_depth(ctx: &HttpFilterContext<'_>) -> u8 {
+    ctx.extensions.get::<IterationState>().map_or(0, IterationState::depth)
+}
+
+// -----------------------------------------------------------------------------
 // SearchClient
 // -----------------------------------------------------------------------------
 
@@ -80,8 +153,6 @@ pub(crate) struct SearchClient {
     default_context_size: SearchContextSize,
     /// Override the provider's default API base URL.
     base_url: Option<String>,
-    /// Connect-time private-address policy for the provider target.
-    address_policy: AddressPolicy,
 }
 
 impl std::fmt::Debug for SearchClient {
@@ -93,7 +164,6 @@ impl std::fmt::Debug for SearchClient {
             .field("api_key", &"[REDACTED]")
             .field("default_context_size", &self.default_context_size)
             .field("base_url", &self.base_url)
-            .field("address_policy", &self.address_policy)
             .finish()
     }
 }
@@ -119,12 +189,23 @@ impl SearchClient {
             api_key: config.api_key.clone(),
             default_context_size: config.default_context_size,
             base_url: config.base_url.clone(),
-            address_policy: AddressPolicy::from_allow_private(config.allow_private_base_url),
         })
     }
 
-    /// Execute a web search query.
-    pub(crate) async fn search(&self, query: &str, context_size: Option<SearchContextSize>) -> SearchOutcome {
+    /// Execute a web search query through the bound outbound filter chain.
+    ///
+    /// `outbound` is the provider callout's prebuilt outbound chain (bound once
+    /// at pipeline-build time via `ChainBindingContext::bind_chain`). The chain
+    /// carries cross-cutting concerns (observability, security, credential
+    /// injection); destination authority, DNS/SSRF, TLS/SNI, and `Host` are
+    /// enforced centrally by the executor at transport time.
+    pub(crate) async fn search(
+        &self,
+        outbound: &Arc<FilterPipeline>,
+        callout: CalloutContext,
+        query: &str,
+        context_size: Option<SearchContextSize>,
+    ) -> SearchOutcome {
         let size = context_size.unwrap_or(self.default_context_size);
         let count = size.result_count();
         debug!(
@@ -138,37 +219,184 @@ impl SearchClient {
             SearchProvider::Tavily => self.build_tavily_request(query, size),
             SearchProvider::You => self.build_you_request(query, count),
         };
-        self.execute_search(&url, request).await
+        self.execute_search(outbound, callout, &url, request).await
     }
 
-    /// Execute a search request and map the result to a
-    /// [`SearchOutcome`].
-    async fn execute_search(&self, url: &str, request: SubRequest) -> SearchOutcome {
-        let result = subrequest::execute_url(
-            &self.client,
-            url,
-            request,
+    /// Execute a search request through the outbound chain and map the response
+    /// to a [`SearchOutcome`].
+    ///
+    /// The provider destination is resolved with [`prepare_url_target`] (a
+    /// permissive validation hook — private-address/SSRF enforcement is deferred
+    /// to the executor's connect-time `build_peer`, gated by
+    /// `insecure_options.allow_private_upstreams`) and staged as a
+    /// [`StagedUpstream`] so the outbound chain needs no upstream-selecting
+    /// filter. The full validated address set is additionally staged as a
+    /// [`StagedUpstreamFallback`] so a connection refusal on the pinned primary
+    /// address falls back to the next resolved address without re-resolving DNS.
+    /// [`PreparedTarget::bind`] rewrites the request `Host` to the URL authority
+    /// and its target to the origin-form path+query.
+    ///
+    /// [`PreparedTarget::bind`]: praxis_core::connectivity::PreparedTarget::bind
+    async fn execute_search(
+        &self,
+        outbound: &Arc<FilterPipeline>,
+        callout: CalloutContext,
+        url: &str,
+        request: SubRequest,
+    ) -> SearchOutcome {
+        let deadline = Instant::now() + self.timeout;
+        let Some((prepared, extensions)) = self.prepare_staged_request(url, request, deadline).await else {
+            return SearchOutcome::Failed;
+        };
+        // Build the executor here (a small struct) so the caller context is
+        // consumed at the staging boundary; the large `run` future stays boxed
+        // inside `dispatch_callout`.
+        let executor = FilteredSubrequestExecutor::for_callout(
+            self.client.clone(),
+            callout.runtime,
+            callout.depth,
             MAX_SEARCH_RESPONSE_BYTES,
             self.timeout,
-            self.address_policy,
-        )
-        .await;
-        self.map_search_result(result)
+        );
+        let result = Self::dispatch_callout(executor, outbound, prepared.request(), extensions, deadline).await;
+        self.map_callout_response(result)
     }
 
-    /// Map a sub-request result to a [`SearchOutcome`].
+    /// Resolve and stage the provider destination for a callout.
     ///
-    /// Non-2xx statuses and transport errors (including timeouts and
-    /// oversized responses) map to [`SearchOutcome::Failed`]. Detailed
-    /// diagnostics are logged; provider specifics never reach the client.
-    fn map_search_result(&self, result: Result<SubResponse, SubRequestError>) -> SearchOutcome {
+    /// Returns the bound request and the executor extensions: the pinned primary
+    /// [`StagedUpstream`], the full [`StagedUpstreamFallback`] address set, and —
+    /// for a header-authenticated provider — the API key staged as an
+    /// authority-bound [`PendingCredentials`]. A resolution or staging failure
+    /// logs and returns `None`, which the caller maps to [`SearchOutcome::Failed`].
+    async fn prepare_staged_request(
+        &self,
+        url: &str,
+        request: SubRequest,
+        deadline: Instant,
+    ) -> Option<(PreparedSubrequest, RequestExtensions)> {
+        // Private-address / SSRF enforcement is deferred to the executor's
+        // connect-time `build_peer`, so this hook is permissive.
+        let target = match prepare_url_target(url, deadline, |_addrs| Ok(())).await {
+            Ok(target) => target,
+            Err(e) => {
+                warn!(provider = self.provider.as_str(), error = %e, "search callout target preparation failed");
+                return None;
+            },
+        };
+        // Assemble the executor extensions while `target` is still owned, then
+        // let `bind` consume it into the origin-form request.
+        let extensions = self.stage_extensions(&target, url)?;
+        Some((target.bind(request), extensions))
+    }
+
+    /// Assemble the executor extensions for a resolved target: the pinned primary
+    /// [`StagedUpstream`], the full [`StagedUpstreamFallback`] address set, and —
+    /// for a header-authenticated provider — the API key staged as an
+    /// authority-bound [`PendingCredentials`]. Any staging failure logs and
+    /// returns `None` (fail-closed) rather than dialing the provider degraded.
+    fn stage_extensions(&self, target: &PreparedTarget, url: &str) -> Option<RequestExtensions> {
+        // Stage the resolved upstream, pinned to the primary validated address.
+        let staged = match StagedUpstream::from_prepared_target(target) {
+            Ok(staged) => staged,
+            Err(e) => {
+                warn!(provider = self.provider.as_str(), error = %e, "search callout upstream staging failed");
+                return None;
+            },
+        };
+        // Stage the full validated address set so a connection refusal on the
+        // pinned primary address falls back to the next resolved address, matching
+        // the DNS fallback the low-level transport performs. Every address was
+        // SSRF-validated together above and each is re-checked at connect time.
+        let fallback = StagedUpstreamFallback::from_prepared_target(target);
+        // Stage the provider's static API credential so the executor injects it
+        // only after it has resolved and pinned the destination. A staging
+        // failure for a header-authenticated provider fails the callout closed
+        // rather than dialing the provider unauthenticated.
+        let pending = match self.staged_credentials(url) {
+            Ok(pending) => pending,
+            Err(e) => {
+                warn!(provider = self.provider.as_str(), error = %e, "search callout credential staging failed");
+                return None;
+            },
+        };
+        let mut extensions = RequestExtensions::default();
+        extensions.insert(staged);
+        extensions.insert(fallback);
+        if let Some(pending) = pending {
+            extensions.insert(pending);
+        }
+        Some(extensions)
+    }
+
+    /// The request header a header-authenticated provider carries its API key in,
+    /// or `None` for a body-authenticated provider (Tavily, whose key travels in
+    /// the request body and is protected instead by the executor re-pinning the
+    /// staged upstream against mid-chain retargeting).
+    fn auth_header(&self) -> Option<http::HeaderName> {
+        match self.provider {
+            SearchProvider::Brave => Some(http::HeaderName::from_static("x-subscription-token")),
+            SearchProvider::You => Some(http::HeaderName::from_static("x-api-key")),
+            SearchProvider::Tavily => None,
+        }
+    }
+
+    /// Stage a header-authenticated provider's API key as an authority-bound
+    /// [`DeferredCredential`].
+    ///
+    /// Deferring the secret keeps it out of the outbound chain entirely: the
+    /// executor injects it only after it resolves the destination and only into a
+    /// request bound for the URL's host, so a chain filter can neither observe the
+    /// secret (it is never present on the in-chain request) nor exfiltrate it by
+    /// retargeting `ctx.upstream` to another authority (the credential is bound to
+    /// the provider host and is dropped, zeroized, on any authority mismatch). The
+    /// credential is bound host-wildcard so it matches the executor's resolved
+    /// destination whether the URL used the provider default port or a `base_url`
+    /// override with an explicit port.
+    ///
+    /// Returns `Ok(None)` for a body-authenticated provider (Tavily) and
+    /// `Err(_)` if the URL has no host or the key is not a valid header value.
+    fn staged_credentials(&self, url: &str) -> Result<Option<PendingCredentials>, FilterError> {
+        let Some(header) = self.auth_header() else {
+            return Ok(None);
+        };
+        let host = http::Uri::try_from(url)
+            .ok()
+            .and_then(|uri| uri.host().map(str::to_owned))
+            .ok_or_else(|| FilterError::from("search callout URL has no host for credential binding".to_owned()))?;
+        let credential = DeferredCredential::new_host_wildcard(&host, header, self.api_key.expose_secret())?;
+        let mut pending = PendingCredentials::new();
+        pending.push(credential);
+        Ok(Some(pending))
+    }
+
+    /// Run the prepared callout through the outbound chain executor.
+    ///
+    /// Kept as a dedicated leaf so the executor's large run future is boxed in a
+    /// minimal frame: the box keeps this future's state machine small (satisfies
+    /// `large_futures`) while the surrounding locals stay off the stack that
+    /// materializes the box (satisfies `large_stack_frames`).
+    async fn dispatch_callout(
+        executor: FilteredSubrequestExecutor,
+        outbound: &Arc<FilterPipeline>,
+        request: &SubRequest,
+        extensions: RequestExtensions,
+        deadline: Instant,
+    ) -> Result<CalloutResponse, FilterError> {
+        Box::pin(executor.run(outbound, request, extensions, deadline)).await
+    }
+
+    /// Map the executor's callout result to a [`SearchOutcome`].
+    ///
+    /// A streaming response is a misconfiguration for a bounded search callout,
+    /// and any error fails closed; provider specifics never reach the client.
+    fn map_callout_response(&self, result: Result<CalloutResponse, FilterError>) -> SearchOutcome {
         match result {
-            Ok(response) if (200..300).contains(&(response.status as usize)) => self.parse_response(&response.body),
-            Ok(response) => {
+            Ok(CalloutResponse::Buffered(response)) => self.map_search_result(&response),
+            Ok(CalloutResponse::Streaming { .. }) => {
                 warn!(
                     provider = self.provider.as_str(),
-                    status = response.status,
-                    "search callout returned non-2xx"
+                    "search callout produced a streaming response; treating as failed"
                 );
                 SearchOutcome::Failed
             },
@@ -179,19 +407,36 @@ impl SearchClient {
         }
     }
 
+    /// Map a buffered sub-request response to a [`SearchOutcome`].
+    ///
+    /// Non-2xx statuses map to [`SearchOutcome::Failed`]. Detailed diagnostics
+    /// are logged; provider specifics never reach the client.
+    fn map_search_result(&self, response: &SubResponse) -> SearchOutcome {
+        if (200..300).contains(&(response.status as usize)) {
+            self.parse_response(&response.body)
+        } else {
+            warn!(
+                provider = self.provider.as_str(),
+                status = response.status,
+                "search callout returned non-2xx"
+            );
+            SearchOutcome::Failed
+        }
+    }
+
     /// Build a Brave Search API request.
     fn build_brave_request(&self, query: &str, count: u32) -> (String, SubRequest) {
         let encoded_query = percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC);
         let base = self.base_url.as_deref().unwrap_or("https://api.search.brave.com");
         let url = format!("{base}/res/v1/web/search?q={encoded_query}&count={count}");
 
+        // The API key is NOT set here: it is staged as an authority-bound
+        // `DeferredCredential` (`x-subscription-token`) in `prepare_staged_request`
+        // and injected by the executor only after it resolves and pins the
+        // destination, so the outbound chain never observes the secret and it can
+        // only reach the provider host it was prepared for.
         let mut headers = HeaderMap::new();
         headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
-        headers.insert(
-            http::HeaderName::from_static("x-subscription-token"),
-            http::HeaderValue::from_str(self.api_key.expose_secret())
-                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
-        );
 
         (
             url,
@@ -246,17 +491,17 @@ impl SearchClient {
             "count": count,
         });
 
+        // The API key is NOT set here: it is staged as an authority-bound
+        // `DeferredCredential` (`x-api-key`) in `prepare_staged_request` and
+        // injected by the executor only after it resolves and pins the
+        // destination, so the outbound chain never observes the secret and it can
+        // only reach the provider host it was prepared for.
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::CONTENT_TYPE,
             http::HeaderValue::from_static("application/json"),
         );
         headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
-        headers.insert(
-            http::HeaderName::from_static("x-api-key"),
-            http::HeaderValue::from_str(self.api_key.expose_secret())
-                .unwrap_or_else(|_| http::HeaderValue::from_static("")),
-        );
 
         let base = self.base_url.as_deref().unwrap_or("https://api.you.com");
         let url = format!("{base}/v1/search");
@@ -494,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn build_you_request_sends_api_key_and_body() {
+    fn build_you_request_defers_api_key_and_sends_body() {
         let config = ValidatedConfig {
             provider: SearchProvider::You,
             api_key: SecretString::from("test-key".to_owned()),
@@ -502,7 +747,6 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
-            allow_private_base_url: false,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -511,13 +755,68 @@ mod tests {
 
         assert_eq!(url, "https://api.you.com/v1/search");
         assert_eq!(request.method, http::Method::POST);
+        // The API key must NOT ride on the in-chain request: it is deferred and
+        // injected by the executor only after the destination is resolved and
+        // pinned, so the outbound chain never observes the secret.
         assert!(
-            request.headers.get("x-api-key").is_some_and(|v| v == "test-key"),
-            "You.com requests must send X-API-Key"
+            request.headers.get("x-api-key").is_none(),
+            "You.com API key must be deferred, not set on the in-chain request"
         );
         assert_eq!(
             serde_json::from_slice::<Value>(&request.body).unwrap(),
             json!({"query": "Praxis proxy", "count": 5})
+        );
+
+        // The deferred credential is staged bound to the provider host so the
+        // executor injects it at transport time.
+        let pending = client
+            .staged_credentials(&url)
+            .expect("staging a valid You.com credential must succeed")
+            .expect("You.com authenticates via a header credential");
+        assert!(!pending.is_empty(), "You.com must stage a deferred credential");
+    }
+
+    fn test_client_for(provider: SearchProvider) -> SearchClient {
+        let config = ValidatedConfig {
+            provider,
+            api_key: SecretString::from("test-key".to_owned()),
+            default_context_size: SearchContextSize::Medium,
+            timeout_ms: 5000,
+            max_body_bytes: 64 * 1024 * 1024,
+            base_url: None,
+            terminal_streaming: false,
+        };
+        SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
+    }
+
+    #[test]
+    fn brave_defers_credential_off_the_in_chain_request() {
+        let brave = test_client_for(SearchProvider::Brave);
+        let (url, request) = brave.build_brave_request("test", 5);
+        assert!(
+            request.headers.get("x-subscription-token").is_none(),
+            "Brave API key must be deferred, not set on the in-chain request"
+        );
+        assert!(
+            brave
+                .staged_credentials(&url)
+                .expect("staging a valid Brave credential must succeed")
+                .is_some_and(|pending| !pending.is_empty()),
+            "Brave must stage a deferred credential"
+        );
+    }
+
+    #[test]
+    fn tavily_stages_no_header_credential() {
+        // Tavily carries its key in the body, so it stages no header credential.
+        let tavily = test_client_for(SearchProvider::Tavily);
+        let (url, _) = tavily.build_tavily_request("test", SearchContextSize::Medium);
+        assert!(
+            tavily
+                .staged_credentials(&url)
+                .expect("Tavily credential staging must not error")
+                .is_none(),
+            "Tavily authenticates via the body and must not stage a header credential"
         );
     }
 
@@ -560,7 +859,6 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
-            allow_private_base_url: false,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client());
@@ -576,7 +874,6 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
-            allow_private_base_url: false,
             terminal_streaming: false,
         };
 
@@ -599,7 +896,6 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: Some("http://localhost:9999".into()),
-            allow_private_base_url: true,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -619,7 +915,6 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: Some("http://localhost:9999".into()),
-            allow_private_base_url: true,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -639,7 +934,6 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: Some("http://localhost:9999".into()),
-            allow_private_base_url: true,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -659,7 +953,6 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
-            allow_private_base_url: false,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -679,7 +972,6 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
-            allow_private_base_url: false,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -698,10 +990,23 @@ mod tests {
             timeout_ms: 1000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
-            allow_private_base_url: true,
             terminal_streaming: false,
         };
         SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
+    }
+
+    /// Build a minimal bound outbound chain for callout tests.
+    ///
+    /// A single observable `request_id` builtin stands in for the cross-cutting
+    /// filters a real deployment binds. `allow_private_upstreams` is enabled
+    /// because these tests dial `127.0.0.1`; production drives that flag from
+    /// `insecure_options.allow_private_upstreams`.
+    fn test_outbound() -> Arc<FilterPipeline> {
+        let registry = praxis_filter::FilterRegistry::with_builtins();
+        let mut entries: Vec<praxis_filter::FilterEntry> = serde_yaml::from_str("- filter: request_id\n").unwrap();
+        let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+        pipeline.set_allow_private_upstreams(true);
+        Arc::new(pipeline)
     }
 
     fn spawn_http_server(listener: TcpListener, status: u16, body: &str) {
@@ -740,7 +1045,9 @@ mod tests {
             body: Bytes::new(),
         };
 
-        let outcome = client.execute_search(&url, request).await;
+        let outcome = client
+            .execute_search(&test_outbound(), CalloutContext::for_test(), &url, request)
+            .await;
         assert!(
             matches!(&outcome, SearchOutcome::Results(r) if r.len() == 1),
             "2xx with valid JSON should return results: {outcome:?}"
@@ -762,7 +1069,9 @@ mod tests {
             body: Bytes::new(),
         };
 
-        let outcome = client.execute_search(&url, request).await;
+        let outcome = client
+            .execute_search(&test_outbound(), CalloutContext::for_test(), &url, request)
+            .await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
             "a non-2xx status should map to Failed: {outcome:?}"
@@ -787,7 +1096,9 @@ mod tests {
             body: Bytes::new(),
         };
 
-        let outcome = client.execute_search(&url, request).await;
+        let outcome = client
+            .execute_search(&test_outbound(), CalloutContext::for_test(), &url, request)
+            .await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
             "a transport failure should map to Failed: {outcome:?}"
@@ -813,7 +1124,9 @@ mod tests {
             body: Bytes::new(),
         };
 
-        let outcome = client.execute_search(&url, request).await;
+        let outcome = client
+            .execute_search(&test_outbound(), CalloutContext::for_test(), &url, request)
+            .await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
             "a timeout should map to Failed: {outcome:?}"
@@ -846,10 +1159,219 @@ mod tests {
             body: Bytes::new(),
         };
 
-        let outcome = client.execute_search(&url, request).await;
+        let outcome = client
+            .execute_search(&test_outbound(), CalloutContext::for_test(), &url, request)
+            .await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
             "an oversized response should map to Failed: {outcome:?}"
+        );
+    }
+
+    /// Outbound filter that rejects every request, standing in for a security or
+    /// policy filter that denies the callout before it can reach the provider.
+    struct RejectingFilter;
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for RejectingFilter {
+        fn name(&self) -> &'static str {
+            "reject_all"
+        }
+
+        async fn on_request(
+            &self,
+            _ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<praxis_filter::FilterAction, FilterError> {
+            Ok(praxis_filter::FilterAction::Reject(praxis_filter::Rejection::status(
+                403,
+            )))
+        }
+    }
+
+    /// Build a bound outbound chain whose sole filter rejects every callout, so
+    /// the executor short-circuits before dialing the provider.
+    fn rejecting_outbound() -> Arc<FilterPipeline> {
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "reject_all",
+                praxis_filter::FilterFactory::Http(Arc::new(|_config| Ok(Box::new(RejectingFilter)))),
+            )
+            .unwrap();
+        let mut entries: Vec<praxis_filter::FilterEntry> = serde_yaml::from_str("- filter: reject_all\n").unwrap();
+        let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+        pipeline.set_allow_private_upstreams(true);
+        Arc::new(pipeline)
+    }
+
+    #[tokio::test]
+    async fn search_reject_from_outbound_chain_returns_failed() {
+        // Positive control: `search_2xx_with_valid_json_returns_results` proves
+        // this same server and request return results through a non-rejecting
+        // chain. An outbound filter returning `FilterAction::Reject` must
+        // short-circuit that callout to a failed outcome instead.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        spawn_http_server(
+            listener,
+            200,
+            &json!({
+                "web": {"results": [{"title": "Hit", "url": "https://hit.example", "description": "found"}]}
+            })
+            .to_string(),
+        );
+
+        let client = test_search_client();
+        let url = format!("http://{addr}/res/v1/web/search?q=test&count=5");
+        let request = SubRequest {
+            method: http::Method::GET,
+            uri: "/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        };
+
+        let outcome = client
+            .execute_search(&rejecting_outbound(), CalloutContext::for_test(), &url, request)
+            .await;
+        assert!(
+            matches!(outcome, SearchOutcome::Failed),
+            "an outbound filter rejecting the callout must map to Failed: {outcome:?}"
+        );
+    }
+
+    /// Spawn a one-shot HTTP server that records the raw request bytes it
+    /// receives before replying with `status`/`body`. The returned receiver
+    /// yields the received request once (and only if) a client connects, so a
+    /// test can assert both what a backend saw and that it was reached at all.
+    fn spawn_recording_server(listener: TcpListener, status: u16, body: &str) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let body = body.to_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let _unused = tx.send(buf[..n].to_vec());
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _unused = stream.write_all(response.as_bytes());
+        });
+        rx
+    }
+
+    /// Outbound filter that overwrites the callout's staged upstream, standing in
+    /// for a compromised or misconfigured chain filter (e.g. an
+    /// `endpoint_selector`) that tries to retarget an already-resolved callout to
+    /// a different backend so it can exfiltrate the provider credential.
+    struct RetargetingFilter {
+        attacker: praxis_core::connectivity::Upstream,
+    }
+
+    #[async_trait::async_trait]
+    impl praxis_filter::HttpFilter for RetargetingFilter {
+        fn name(&self) -> &'static str {
+            "retarget_attacker"
+        }
+
+        async fn on_request(
+            &self,
+            ctx: &mut HttpFilterContext<'_>,
+        ) -> Result<praxis_filter::FilterAction, FilterError> {
+            ctx.upstream = Some(self.attacker.clone());
+            Ok(praxis_filter::FilterAction::Continue)
+        }
+    }
+
+    /// Build a bound outbound chain whose sole filter retargets every callout to
+    /// `attacker`, so the test can prove the executor re-pins the resolved
+    /// destination instead of honoring the mid-chain rewrite.
+    fn retargeting_outbound(attacker: praxis_core::connectivity::Upstream) -> Arc<FilterPipeline> {
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        registry
+            .register(
+                "retarget_attacker",
+                praxis_filter::FilterFactory::Http(Arc::new(move |_config| {
+                    Ok(Box::new(RetargetingFilter {
+                        attacker: attacker.clone(),
+                    }))
+                })),
+            )
+            .unwrap();
+        let mut entries: Vec<praxis_filter::FilterEntry> =
+            serde_yaml::from_str("- filter: retarget_attacker\n").unwrap();
+        let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+        pipeline.set_allow_private_upstreams(true);
+        Arc::new(pipeline)
+    }
+
+    /// Set up a provider backend, an attacker backend, and a retargeting outbound
+    /// chain that redirects the callout from the provider to the attacker.
+    ///
+    /// Returns the provider URL, the retargeting chain, and the recording
+    /// receivers for the provider and attacker backends.
+    async fn retarget_scenario() -> (
+        String,
+        Arc<FilterPipeline>,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let provider_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let provider_addr = provider_listener.local_addr().unwrap();
+        let provider_rx = spawn_recording_server(
+            provider_listener,
+            200,
+            &json!({"web": {"results": [{"title": "Hit", "url": "https://hit.example", "description": "ok"}]}})
+                .to_string(),
+        );
+        let attacker_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let attacker_addr = attacker_listener.local_addr().unwrap();
+        let attacker_rx = spawn_recording_server(attacker_listener, 200, "{}");
+        let attacker_url = format!("http://{attacker_addr}/");
+        let attacker_target =
+            prepare_url_target(&attacker_url, Instant::now() + Duration::from_secs(5), |_addrs| Ok(()))
+                .await
+                .unwrap();
+        let attacker_upstream = StagedUpstream::from_prepared_target(&attacker_target).unwrap().0;
+        let url = format!("http://{provider_addr}/res/v1/web/search?q=test&count=5");
+        (url, retargeting_outbound(attacker_upstream), provider_rx, attacker_rx)
+    }
+
+    #[tokio::test]
+    async fn search_chain_retarget_cannot_exfiltrate_credential_to_alternate_backend() {
+        let (url, outbound, provider_rx, attacker_rx) = retarget_scenario().await;
+        // Brave client: the API key is deferred and injected by the executor only
+        // at the resolved, pinned destination.
+        let client = test_search_client();
+        let request = SubRequest {
+            method: http::Method::GET,
+            uri: "/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        };
+
+        let outcome = client
+            .execute_search(&outbound, CalloutContext::for_test(), &url, request)
+            .await;
+
+        // The pinned provider still served the callout despite the retarget, the
+        // attacker backend was never reached, and the deferred credential was
+        // injected only at the pinned provider.
+        assert!(
+            matches!(&outcome, SearchOutcome::Results(r) if r.len() == 1),
+            "the pinned provider must still serve the callout despite chain retargeting: {outcome:?}"
+        );
+        assert!(
+            attacker_rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "a retargeted callout must not reach the alternate backend"
+        );
+        let provider_request = provider_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the provider must have received the callout");
+        let provider_request = String::from_utf8_lossy(&provider_request).to_ascii_lowercase();
+        assert!(
+            provider_request.contains("x-subscription-token") && provider_request.contains("test-key"),
+            "the deferred credential must be injected only at the pinned provider: {provider_request}"
         );
     }
 }

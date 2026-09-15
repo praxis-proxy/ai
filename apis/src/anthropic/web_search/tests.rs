@@ -50,7 +50,7 @@ provider: you
 api_key: test-key
 default_context_size: medium
 base_url: "{base_url}"
-allow_private_base_url: true
+outbound_chain: web_search_outbound
 "#,
     ))
     .unwrap();
@@ -58,11 +58,17 @@ allow_private_base_url: true
     let validated = build_config(FILTER_NAME, &config).unwrap();
     let client = crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
     let search_client = SearchClient::from_config(FILTER_NAME, &validated, client).unwrap();
+    // Bind an empty outbound chain; the executor enforces SSRF/TLS/Host, and
+    // private upstreams are permitted so the test can dial its loopback mock.
+    let registry = praxis_filter::FilterRegistry::with_builtins();
+    let mut outbound = FilterPipeline::build(&mut Vec::new(), &registry).unwrap();
+    outbound.set_allow_private_upstreams(true);
     AnthropicWebSearchFilter {
         default_context_size: validated.default_context_size,
         max_body_bytes: validated.max_body_bytes,
         terminal_streaming: validated.terminal_streaming,
         search_client,
+        outbound: Arc::new(outbound),
     }
 }
 
@@ -608,7 +614,9 @@ async fn pending_search_executes_and_appends_tool_result() {
     let filter = test_filter_impl_with_base_url(search.base_url());
     let pending = pending_search("potato");
 
-    let outcome = filter.execute_pending_search(&pending).await;
+    let outcome = filter
+        .execute_pending_search(CalloutContext::for_test(), &pending)
+        .await;
     let mut rebuilt = base_request();
     append_search_turns(&mut rebuilt, assistant_content("potato"), pending, &outcome).unwrap();
 
@@ -649,7 +657,9 @@ async fn provider_failure_appends_is_error_tool_result() {
     let filter = test_filter_impl_with_base_url(search.base_url());
     let pending = pending_search("potato");
 
-    let outcome = filter.execute_pending_search(&pending).await;
+    let outcome = filter
+        .execute_pending_search(CalloutContext::for_test(), &pending)
+        .await;
     assert!(
         matches!(&outcome, SearchOutcome::Failed),
         "a provider 5xx must map to a failed outcome, got {outcome:?}"
@@ -674,7 +684,9 @@ async fn empty_results_appends_no_results_tool_result() {
     let filter = test_filter_impl_with_base_url(search.base_url());
     let pending = pending_search("potato");
 
-    let outcome = filter.execute_pending_search(&pending).await;
+    let outcome = filter
+        .execute_pending_search(CalloutContext::for_test(), &pending)
+        .await;
     assert!(
         matches!(&outcome, SearchOutcome::Results(results) if results.is_empty()),
         "a successful empty search must be a zero-result outcome, got {outcome:?}"

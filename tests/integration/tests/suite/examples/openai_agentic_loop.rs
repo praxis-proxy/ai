@@ -3316,6 +3316,77 @@ fn web_search_round_trip_executes_and_re_enters_inference() {
     );
 }
 
+/// #958: the web-search provider callout is dispatched through the filtered
+/// subrequest executor, so the filters configured in the web-search filter's
+/// `outbound_chain` run on the outbound request. The example's outbound chain
+/// contains a `request_id` filter, which injects an `X-Request-ID` header — its
+/// presence on the provider callout is observable proof the outbound chain
+/// executed (rather than the callout bypassing the configured chain).
+#[test]
+fn web_search_callout_executes_outbound_chain_filters() {
+    let first_response = serde_json::json!({
+        "id": "resp_ws_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "Rust 2025 edition"}
+        }]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_ws_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Rust 2025 brings great features."}]
+        }]
+    });
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&second_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let captured = spawn_capturing_search_mock(search_listener);
+
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model.port(), search_port);
+    let proxy = start_proxy(&config);
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for Rust 2025 edition features",
+        "tools": [{"type": "web_search_preview"}]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+    assert_eq!(parse_status(&raw), 200, "web search round-trip should return 200");
+
+    // Copy the captured requests out and release the lock before asserting.
+    let requests = captured.lock().expect("capture lock").clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "provider should be hit exactly once, got: {requests:?}"
+    );
+    let head = requests[0].to_ascii_lowercase();
+    assert!(
+        head.contains("x-request-id:"),
+        "the outbound_chain's request_id filter must inject X-Request-ID on the provider callout, \
+         proving the configured outbound chain executed: {}",
+        requests[0]
+    );
+}
+
 /// #1046 boundary test 3: a single model round emitting a `web_search_call`, a
 /// hosted `file_search_call`, and an MCP `function_call` is resolved by all three
 /// request-phase dispatchers in ONE IRR continuation — the model is called
@@ -4655,6 +4726,45 @@ fn spawn_search_mock(listener: TcpListener) -> Arc<AtomicUsize> {
     connections
 }
 
+/// Serve web-search results and capture the raw request line + headers of every
+/// provider callout.
+///
+/// The returned buffer lets a test prove that the filters configured in the
+/// web-search filter's `outbound_chain` actually ran on the provider callout:
+/// the `request_id` filter injects an `X-Request-ID` header, so its presence in
+/// the captured request is observable evidence the outbound chain executed.
+fn spawn_capturing_search_mock(listener: TcpListener) -> Arc<Mutex<Vec<String>>> {
+    use std::io::{Read as _, Write as _};
+    let body = serde_json::json!({
+        "web": {
+            "results": [{
+                "title": "Rust 2025 Edition",
+                "url": "https://blog.rust-lang.org/2025",
+                "description": "The Rust 2025 edition is here."
+            }]
+        }
+    })
+    .to_string();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+    thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            // Capture the request head (request line + headers) so the test can
+            // assert the injected outbound-chain header is present.
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            sink.lock().expect("capture lock").push(request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _written = stream.write_all(response.as_bytes());
+        }
+    });
+    captured
+}
+
 /// Vector-store mock for hosted file search: serves every connection with a
 /// fixed `{"data": [...]}` result set and counts dispatched requests so a test
 /// can assert exactly how many vector-store callouts the file-search dispatcher
@@ -5355,9 +5465,13 @@ fn load_web_search_config(proxy_port: u16, model_port: u16, search_port: u16) ->
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = yaml.replace(
         "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!(
-            "api_key: test-key\n                base_url: http://127.0.0.1:{search_port}\n                allow_private_base_url: true"
-        ),
+        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+    );
+    // The provider callout targets a loopback mock, so the executor's SSRF check
+    // requires the operator opt-in on the outbound pipeline.
+    let yaml = yaml.replace(
+        "allow_private_endpoints: true",
+        "allow_private_endpoints: true\n  allow_private_upstreams: true",
     );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse web search config")
 }
@@ -5383,9 +5497,13 @@ fn load_unified_dispatch_config(
     // Point the brave web-search provider at the local search mock.
     let yaml = yaml.replace(
         "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!(
-            "api_key: test-key\n                base_url: http://127.0.0.1:{search_port}\n                allow_private_base_url: true"
-        ),
+        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+    );
+    // The provider callout targets a loopback mock, so the executor's SSRF check
+    // requires the operator opt-in on the outbound pipeline.
+    let yaml = yaml.replace(
+        "allow_private_endpoints: true",
+        "allow_private_endpoints: true\n  allow_private_upstreams: true",
     );
     // Allow loopback MCP resolution and dispatch against the in-test MCP server.
     let yaml = yaml.replacen(

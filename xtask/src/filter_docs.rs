@@ -1461,6 +1461,9 @@ fn render_type_path(tp: &syn::TypePath, enums: &BTreeMap<String, EnumInfo>) -> S
         "BTreeMap" | "HashMap" => render_map_type(last, enums),
         "String" => "string".to_owned(),
         "SecretString" => "string (secret)".to_owned(),
+        // `ChainRef` (praxis-core) is an untagged enum: a bare string names a
+        // top-level `filter_chains` entry, a mapping inlines the filters.
+        "ChainRef" => "string \\| object".to_owned(),
         "Value" => "any".to_owned(),
         "bool" => ident,
         "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize" => "integer".to_owned(),
@@ -2714,6 +2717,12 @@ mod tests {
     fn zeroizing_wrapper_renders_its_yaml_value_type() {
         let ty: syn::Type = syn::parse_str("Option<Zeroizing<String>>").unwrap();
         assert_eq!(render_type(&ty, &BTreeMap::new()), "string");
+    }
+
+    #[test]
+    fn chain_ref_renders_named_or_inline_yaml_shape() {
+        let ty: syn::Type = syn::parse_str("ChainRef").unwrap();
+        assert_eq!(render_type(&ty, &BTreeMap::new()), "string \\| object");
     }
 
     /// Build a sample [`FilterEntry`] for rendering tests.

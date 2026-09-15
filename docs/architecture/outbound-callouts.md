@@ -19,7 +19,7 @@ origin.
 
 | Callout | Target source | Private opt-in | Redirect policy | Authentication mode |
 | --- | --- | --- | --- | --- |
-| `openai_web_search`, `anthropic_web_search` | Provider default or configured `base_url` | `allow_private_base_url` | No-follow | Configured provider API key; validated origin only |
+| `openai_web_search`, `anthropic_web_search` | Provider default or configured `base_url`, executed through the `outbound_chain` filtered-subrequest executor | `insecure_options.allow_private_upstreams` (executor-gated on the bound outbound chain) | No-follow | Configured provider API key; validated origin only |
 | `openai_file_resolve` Files API | Configured `files_api_url` | `allow_private_files_api_url` | No-follow | Only headers named by `forward_headers` |
 | `openai_file_resolve` `file_url` fetch | Request-derived URL | Exact `allowed_file_url_origins` | No-follow | Anonymous; no downstream headers |
 | `openai_file_search_callout` | Configured `vector_store_url` | `allow_private_url` | No-follow | Only headers named by `forward_headers` |

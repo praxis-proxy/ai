@@ -5,6 +5,10 @@
 
 Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
 
+## Configuration Notes
+
+Each provider request is executed through the configured `outbound_chain` so operator-managed cross-cutting filters run on the callout; destination authority, DNS/SSRF, TLS/SNI, and `Host` are enforced centrally by the filtered-subrequest executor.
+
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -15,7 +19,7 @@ Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
 | `max_body_bytes` | integer | no | Maximum request body bytes to buffer. |
 | `base_url` | string | no | Override the provider's default API base URL. |
-| `allow_private_base_url` | bool | no | Allow a `base_url` that targets local-sensitive addresses. DNS names are resolved once per request and every result is checked immediately before the transport connects. By default, any private, loopback, link-local, or otherwise non-public result rejects the callout. Enable this only for a trusted private provider endpoint. |
+| `outbound_chain` | string \| object | yes | Outbound filter chain the provider callout executes through. A named reference resolves against top-level `filter_chains`; an inline definition embeds the filters directly. The chain carries cross-cutting concerns (observability, security, credential injection) and is bound once at pipeline-build time — a chain that cannot be built fails config validation. Destination authority, DNS/SSRF, TLS/SNI, and `Host` are enforced centrally by the executor, gated by `insecure_options.allow_private_upstreams`. |
 | `terminal_streaming` | bool | no | Select Praxis streaming transport for effective `stream: true` Messages requests. When enabled, the terminal inference response is streamed incrementally as one coherent client-visible SSE lifecycle while intermediate tool/search transitions stay internal. This knob is anthropic-only; `openai_web_search` does not accept it. |
 
 ## Examples
@@ -26,6 +30,7 @@ Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
 filter: anthropic_web_search
 provider: you
 api_key: ${WEB_SEARCH_API_KEY}
+outbound_chain: web_search_outbound
 ```
 
 ### Example 2
@@ -34,6 +39,7 @@ api_key: ${WEB_SEARCH_API_KEY}
 filter: anthropic_web_search
 provider: you
 api_key: ${WEB_SEARCH_API_KEY}
+outbound_chain: web_search_outbound
 default_context_size: medium
 timeout_ms: 10000
 max_body_bytes: 67108864

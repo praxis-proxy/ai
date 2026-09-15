@@ -5,21 +5,22 @@
 
 mod streaming;
 
-use std::{borrow::Cow, time::Instant};
+use std::{borrow::Cow, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState, NextIterationBody,
-    Rejection, StreamTerminationCause, SubRequestResponseMode, parse_filter_config,
+    BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
+    HttpFilterContext, IterationState, NextIterationBody, Rejection, StreamTerminationCause, SubRequestResponseMode,
+    parse_filter_config,
 };
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
 use crate::web_search::{
-    SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, WebSearchFilterConfig, build_config,
-    format_search_results,
+    CalloutContext, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, WebSearchFilterConfig,
+    build_config, format_search_results,
 };
 
 /// Registry name and filter-results namespace.
@@ -145,12 +146,18 @@ struct ResponseEnvelope<'a> {
 
 /// Executes server-owned `WebSearch` tool calls in an Anthropic Messages loop.
 ///
+/// Each provider request is executed through the configured `outbound_chain`
+/// so operator-managed cross-cutting filters run on the callout; destination
+/// authority, DNS/SSRF, TLS/SNI, and `Host` are enforced centrally by the
+/// filtered-subrequest executor.
+///
 /// # YAML
 ///
 /// ```yaml
 /// filter: anthropic_web_search
 /// provider: you
 /// api_key: ${WEB_SEARCH_API_KEY}
+/// outbound_chain: web_search_outbound
 /// ```
 ///
 /// # Full YAML
@@ -159,6 +166,7 @@ struct ResponseEnvelope<'a> {
 /// filter: anthropic_web_search
 /// provider: you
 /// api_key: ${WEB_SEARCH_API_KEY}
+/// outbound_chain: web_search_outbound
 /// default_context_size: medium
 /// timeout_ms: 10000
 /// max_body_bytes: 67108864
@@ -188,46 +196,111 @@ pub struct AnthropicWebSearchFilter {
     terminal_streaming: bool,
     /// Shared provider client used for You.com callouts.
     search_client: SearchClient,
+    /// Prebuilt outbound filter chain each provider request executes through.
+    outbound: Arc<FilterPipeline>,
 }
 
 impl AnthropicWebSearchFilter {
-    /// Create a filter with an isolated subrequest client.
+    /// Create a filter with an isolated subrequest client, binding its
+    /// configured outbound chain through `ctx`.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] when the filter configuration is invalid.
-    pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+    /// Returns [`FilterError`] when the configuration is invalid or the
+    /// outbound chain cannot be bound.
+    pub fn from_chain_binding(
+        config: &serde_yaml::Value,
+        ctx: &ChainBindingContext<'_>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let client =
             crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
-        Self::build(config, client)
+        Self::build(config, client, ctx)
     }
 
-    /// Create a filter with the server's shared subrequest client.
+    /// Create a filter with the server's shared subrequest client, binding its
+    /// configured outbound chain through `ctx`.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] when the filter configuration is invalid.
-    pub fn from_config_with_client(
+    /// Returns [`FilterError`] when the configuration is invalid or the
+    /// outbound chain cannot be bound.
+    pub fn from_chain_binding_with_client(
         config: &serde_yaml::Value,
         client: crate::subrequest::SubRequestClient,
+        ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        Self::build(config, client)
+        Self::build(config, client, ctx)
     }
 
-    /// Build the filter around the supplied subrequest client.
+    /// Build the filter around the supplied subrequest client, binding the
+    /// outbound chain once via [`ChainBindingContext::bind_chain`].
     fn build(
         config: &serde_yaml::Value,
         client: crate::subrequest::SubRequestClient,
+        ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let config: WebSearchFilterConfig = parse_filter_config(FILTER_NAME, config)?;
-        let validated = build_config(FILTER_NAME, &config)?;
+        let outbound = Arc::new(ctx.bind_chain(&config.outbound_chain)?);
+        Self::assemble(&config, client, outbound)
+    }
+
+    /// Validate the parsed config and assemble the filter around an
+    /// already-bound outbound pipeline.
+    fn assemble(
+        config: &WebSearchFilterConfig,
+        client: crate::subrequest::SubRequestClient,
+        outbound: Arc<FilterPipeline>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let validated = build_config(FILTER_NAME, config)?;
         let search_client = SearchClient::from_config(FILTER_NAME, &validated, client)?;
         Ok(Box::new(Self {
             default_context_size: validated.default_context_size,
             max_body_bytes: validated.max_body_bytes,
             terminal_streaming: validated.terminal_streaming,
             search_client,
+            outbound,
         }))
+    }
+
+    /// Test-only convenience constructor binding an empty outbound chain.
+    ///
+    /// Production registers `anthropic_web_search` as a chain-binding filter and
+    /// supplies the operator-configured outbound chain (see
+    /// [`from_chain_binding`](Self::from_chain_binding)); unit tests that only
+    /// exercise loop logic bind an empty chain, since the
+    /// [`FilteredSubrequestExecutor`] still enforces destination authority,
+    /// DNS/SSRF, TLS/SNI, and `Host` centrally.
+    ///
+    /// [`FilteredSubrequestExecutor`]: praxis_filter::FilteredSubrequestExecutor
+    #[cfg(test)]
+    fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client =
+            crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+        Self::from_config_with_client(config, client)
+    }
+
+    /// Test-only convenience constructor (shared client, empty outbound chain).
+    ///
+    /// See [`from_config`](Self::from_config).
+    #[cfg(test)]
+    fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: crate::subrequest::SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        // Fixtures predate the required `outbound_chain`; inject a placeholder
+        // so existing YAML parses, then bind an empty pipeline (the executor
+        // still enforces SSRF/TLS/Host regardless of chain contents). Private
+        // upstreams are permitted so tests can dial loopback mocks.
+        let mut config = config.clone();
+        if let Some(map) = config.as_mapping_mut() {
+            map.entry(serde_yaml::Value::from("outbound_chain"))
+                .or_insert_with(|| serde_yaml::Value::from("__test_outbound__"));
+        }
+        let config: WebSearchFilterConfig = parse_filter_config(FILTER_NAME, &config)?;
+        let registry = praxis_filter::FilterRegistry::with_builtins();
+        let mut outbound = FilterPipeline::build(&mut Vec::new(), &registry)?;
+        outbound.set_allow_private_upstreams(true);
+        Self::assemble(&config, client, Arc::new(outbound))
     }
 
     /// Align the Praxis subrequest response transport with the outbound body.
@@ -253,9 +326,13 @@ impl AnthropicWebSearchFilter {
     ///
     /// A provider failure never rejects the Messages response: the caller
     /// appends a truthful `is_error` tool result so the loop can continue.
-    async fn execute_pending_search(&self, pending: &PendingSearch) -> SearchOutcome {
+    ///
+    /// `callout` carries the originating client's attributes and the request's
+    /// current outbound depth so the callout's outbound chain sees the real
+    /// caller and the executor continues this request's depth accounting.
+    async fn execute_pending_search(&self, callout: CalloutContext, pending: &PendingSearch) -> SearchOutcome {
         self.search_client
-            .search(&pending.query, Some(self.default_context_size))
+            .search(&self.outbound, callout, &pending.query, Some(self.default_context_size))
             .await
     }
 
@@ -318,7 +395,11 @@ impl AnthropicWebSearchFilter {
                 "messages must be an array for web search re-entry",
             )));
         }
-        let outcome = self.execute_pending_search(&pending).await;
+        // Capture the caller's attributes and this request's outbound depth
+        // before mutating the context so the callout's outbound chain sees the
+        // real client and the executor continues this request's depth accounting.
+        let callout = CalloutContext::from_filter_context(ctx);
+        let outcome = self.execute_pending_search(callout, &pending).await;
         if let Err(rejection) = append_search_turns(&mut request, assistant_content, pending, &outcome) {
             return Ok(FilterAction::Reject(rejection));
         }
@@ -418,6 +499,25 @@ impl AnthropicWebSearchFilter {
 impl HttpFilter for AnthropicWebSearchFilter {
     fn name(&self) -> &'static str {
         "anthropic_web_search"
+    }
+
+    fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
+        if let Some(pipeline) = Arc::get_mut(&mut self.outbound) {
+            visitor(pipeline);
+        } else {
+            debug_assert!(
+                false,
+                "anthropic_web_search outbound pipeline must be uniquely owned during configuration"
+            );
+        }
+    }
+
+    fn referenced_files(&self) -> Vec<std::path::PathBuf> {
+        self.outbound.referenced_files()
+    }
+
+    fn apply_insecure_options(&self, options: &praxis_core::config::InsecureOptions) {
+        self.outbound.apply_insecure_options(options);
     }
 
     fn request_body_access(&self) -> BodyAccess {

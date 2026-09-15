@@ -203,11 +203,15 @@ fn search_results() -> Value {
 fn base_example_yaml(proxy_port: u16, model_port: u16, search_port: u16) -> String {
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("read full-flow-agentic example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8000", model_port)]));
-    yaml.replace(
+    let yaml = yaml.replace(
         "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!(
-            "api_key: test-key\n                base_url: http://127.0.0.1:{search_port}\n                allow_private_base_url: true"
-        ),
+        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+    );
+    // The provider callout targets a loopback mock, so the executor's SSRF check
+    // requires the operator opt-in on the outbound pipeline.
+    yaml.replace(
+        "allow_private_endpoints: true",
+        "allow_private_endpoints: true\n  allow_private_upstreams: true",
     )
 }
 
@@ -540,6 +544,40 @@ fn messages_web_search_round_trip_re_enters_the_model() {
             .last_request()
             .to_ascii_lowercase()
             .contains("x-api-key: test-key")
+    );
+}
+
+/// #958: the Messages web-search provider callout is dispatched through the
+/// filtered subrequest executor, so the filters in the web-search filter's
+/// `outbound_chain` run on the outbound request. The example's outbound chain
+/// contains a `request_id` filter, which injects an `X-Request-ID` header — its
+/// presence on the provider callout is observable proof the outbound chain
+/// executed rather than the callout bypassing the configured chain.
+#[test]
+fn messages_web_search_callout_executes_outbound_chain_filters() {
+    let fixture = fixture();
+    let model = StatefulCapturingBackend::new(vec![
+        (200, fixture["first_model_response"].to_string()),
+        (200, fixture["final_model_response"].to_string()),
+    ])
+    .start_with_shutdown();
+    let search = SearchStub::start(&fixture["search_response"]);
+    let proxy_port = free_port();
+    let proxy = start_proxy(&load_config(proxy_port, model.port(), search.port()));
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/messages", &fixture["initial_request"].to_string()),
+    );
+
+    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(search.request_count(), 1, "provider should be hit exactly once");
+    let head = search.last_request().to_ascii_lowercase();
+    assert!(
+        head.contains("x-request-id:"),
+        "the outbound_chain's request_id filter must inject X-Request-ID on the provider callout, \
+         proving the configured outbound chain executed: {}",
+        search.last_request()
     );
 }
 

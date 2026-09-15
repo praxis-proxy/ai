@@ -429,6 +429,13 @@ filter_chains:
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
                 max_calls_per_round: 32
+                # Each provider callout executes through this outbound chain; the
+                # filtered-subrequest executor enforces destination authority,
+                # DNS/SSRF, TLS/SNI, and Host centrally.
+                outbound_chain:
+                  name: web-search-outbound
+                  filters:
+                    - filter: request_id
               # Request-phase dispatcher: runs second on re-entry to execute
               # MCP calls prepared and classified by the loop owner. Inert
               # until the model emits an MCP tool call.
