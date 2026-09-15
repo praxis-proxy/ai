@@ -18,14 +18,19 @@ use super::contracts::{
     ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
     CreateConversationRequest, DeletedConversationResource, ItemOrder, UpdateConversationRequest,
 };
-use crate::openai::{
-    include::IncludeField,
-    operation::{
-        MediaTypeSpec, OpenAiApiFamily, OpenAiHandlingMode, OpenAiHttpMethod, OpenAiOperationSpec, OpenAiRequestBody,
-        OpenAiTransport, OperationEntry, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec,
-        ResponseSpec, RouteParams, match_operation, schema_binding,
+use crate::{
+    openai::{
+        include::IncludeField,
+        operation::{
+            MediaTypeSpec, OpenAiOperationSpec, OwnedOperationContract, ParameterLocation, ParameterSpec,
+            RequestBodySpec, ResponseSpec, schema_binding,
+        },
+        responses::store::DEFAULT_PAGE_LIMIT,
     },
-    responses::store::DEFAULT_PAGE_LIMIT,
+    operation::{
+        ApplicationProtocol, HandlingMode, HttpMethod, OperationEntry, OperationSpec, RequestBody, RouteParams,
+        Transport, match_operation,
+    },
 };
 
 /// JSON media type used by all Conversations bodies.
@@ -49,8 +54,8 @@ impl Deref for ConversationOperationSpec {
 }
 
 impl OperationEntry for ConversationOperationSpec {
-    fn spec(&self) -> &OpenAiOperationSpec {
-        &self.definition
+    fn spec(&self) -> &OperationSpec {
+        &self.definition.runtime
     }
 }
 
@@ -104,16 +109,16 @@ macro_rules! operation_contract {
 /// Derive the runtime request-body shape from a registry request declaration.
 ///
 /// All Conversations bodies are JSON; other families supply multipart or binary
-/// shapes through the same shared [`OpenAiRequestBody`] type.
+/// shapes through the same shared [`RequestBody`] type.
 macro_rules! request_body_shape {
     ([none]) => {
-        OpenAiRequestBody::None
+        RequestBody::None
     };
     ([required $schema:ty]) => {
-        OpenAiRequestBody::Json { required: true }
+        RequestBody::Json { required: true }
     };
     ([optional $schema:ty]) => {
-        OpenAiRequestBody::Json { required: false }
+        RequestBody::Json { required: false }
     };
 }
 
@@ -127,7 +132,7 @@ macro_rules! request_body_shape {
 )]
 macro_rules! contract_request_body {
     (none {}) => {
-        OpenAiRequestBody::None
+        RequestBody::None
     };
     (owned { parameters: [$($parameter:expr),* $(,)?],request: $request:tt,response: $response:ty $(,)? }) => {
         request_body_shape!($request)
@@ -211,14 +216,16 @@ macro_rules! conversation_operations {
                 ConversationOperationSpec {
                     operation: ConversationOperation::$operation,
                     definition: OpenAiOperationSpec {
-                        family: OpenAiApiFamily::Conversations,
-                        operation_id: $operation_id,
-                        method: OpenAiHttpMethod::$method,
-                        transport: OpenAiTransport::Http,
+                        runtime: OperationSpec {
+                            application_protocol: ApplicationProtocol::OPENAI_CONVERSATIONS,
+                            operation_id: $operation_id,
+                            method: HttpMethod::$method,
+                            transport: Transport::Http,
+                            runtime_path: concat!("/v1", $path),
+                            mode: HandlingMode::$mode,
+                            request_body: contract_request_body!($contract_kind $contract),
+                        },
                         spec_path: $path,
-                        runtime_path: concat!("/v1", $path),
-                        mode: OpenAiHandlingMode::$mode,
-                        request_body: contract_request_body!($contract_kind $contract),
                         owned_contract: operation_contract!($contract_kind $contract),
                     },
                 },
@@ -399,7 +406,7 @@ pub const fn operation_specs() -> &'static [ConversationOperationSpec] {
 /// Conversations is reached over plain HTTP only; matching rules, precedence,
 /// and path normalization live in the shared operation module.
 pub(crate) fn match_route<'a>(method: &str, path: &'a str) -> Option<MatchedConversationRoute<'a>> {
-    match_operation(OPERATION_SPECS, method, path, OpenAiTransport::Http).map(|matched| MatchedConversationRoute {
+    match_operation(OPERATION_SPECS, method, path, Transport::Http).map(|matched| MatchedConversationRoute {
         spec: matched.spec,
         params: matched.params,
     })
@@ -412,7 +419,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::openai::operation::MAX_PATH_PARAMS;
+    use crate::operation::MAX_PATH_PARAMS;
 
     #[test]
     fn registry_has_unique_local_conversations_operations() {
@@ -420,16 +427,16 @@ mod tests {
 
         let operation_keys = OPERATION_SPECS
             .iter()
-            .map(|spec| (spec.method, spec.spec_path))
+            .map(|spec| (spec.method(), spec.spec_path))
             .collect::<BTreeSet<_>>();
         assert_eq!(operation_keys.len(), OPERATION_SPECS.len());
         let operation_ids = OPERATION_SPECS
             .iter()
-            .map(|spec| spec.operation_id)
+            .map(|spec| spec.operation_id())
             .collect::<BTreeSet<_>>();
         assert_eq!(operation_ids.len(), OPERATION_SPECS.len());
-        assert!(OPERATION_SPECS.iter().all(|spec| spec.mode == OpenAiHandlingMode::Local
-            && spec.mode.owns_contract()
+        assert!(OPERATION_SPECS.iter().all(|spec| spec.mode() == HandlingMode::Local
+            && spec.mode().owns_contract()
             && spec.owned_contract().is_some()));
     }
 
@@ -438,14 +445,14 @@ mod tests {
         for spec in OPERATION_SPECS {
             let contract_has_body = spec.owned_contract().is_some_and(|contract| contract.request.is_some());
             assert_eq!(
-                spec.request_body.is_present(),
+                spec.request_body().is_present(),
                 contract_has_body,
                 "request_body shape drifted from the generated contract for {:?}",
                 spec.operation
             );
             if let Some(request) = spec.owned_contract().and_then(|contract| contract.request) {
                 assert_eq!(
-                    spec.request_body.is_required(),
+                    spec.request_body().is_required(),
                     request.required,
                     "required flag drifted from the generated contract for {:?}",
                     spec.operation
@@ -459,22 +466,22 @@ mod tests {
         for spec in OPERATION_SPECS {
             match spec.operation {
                 ConversationOperation::CreateConversation => {
-                    assert_eq!(spec.request_body, OpenAiRequestBody::Json { required: false });
+                    assert_eq!(spec.request_body(), RequestBody::Json { required: false });
                 },
                 ConversationOperation::UpdateConversation | ConversationOperation::CreateConversationItems => {
-                    assert_eq!(spec.request_body, OpenAiRequestBody::Json { required: true });
+                    assert_eq!(spec.request_body(), RequestBody::Json { required: true });
                 },
-                _ => assert_eq!(spec.request_body, OpenAiRequestBody::None),
+                _ => assert_eq!(spec.request_body(), RequestBody::None),
             }
         }
     }
 
     #[test]
     fn handling_modes_classify_contract_ownership() {
-        assert!(!OpenAiHandlingMode::Passthrough.owns_contract());
-        assert!(!OpenAiHandlingMode::Inspect.owns_contract());
-        assert!(OpenAiHandlingMode::Transform.owns_contract());
-        assert!(OpenAiHandlingMode::Local.owns_contract());
+        assert!(!HandlingMode::Passthrough.owns_contract());
+        assert!(!HandlingMode::Inspect.owns_contract());
+        assert!(HandlingMode::Transform.owns_contract());
+        assert!(HandlingMode::Local.owns_contract());
     }
 
     #[test]
@@ -496,10 +503,10 @@ mod tests {
     fn every_registry_runtime_template_matches_its_operation() {
         for spec in OPERATION_SPECS {
             let path = spec
-                .runtime_path
+                .runtime_path()
                 .replace("{conversation_id}", "conv_test")
                 .replace("{item_id}", "item_test");
-            let route = match_route(spec.method.as_str(), &path).unwrap();
+            let route = match_route(spec.method().as_str(), &path).unwrap();
             assert_eq!(route.spec.operation, spec.operation);
         }
     }
@@ -512,11 +519,11 @@ mod tests {
     #[test]
     fn template_parameters_fit_capacity() {
         for spec in OPERATION_SPECS {
-            let declared = spec.runtime_path.split('/').filter(|s| s.starts_with('{')).count();
+            let declared = spec.runtime_path().split('/').filter(|s| s.starts_with('{')).count();
             assert!(
                 declared <= MAX_PATH_PARAMS,
                 "{} declares {declared} path parameters, above the {MAX_PATH_PARAMS} capacity",
-                spec.runtime_path
+                spec.runtime_path()
             );
         }
     }

@@ -225,10 +225,10 @@ fn conversations_supported_operations() -> Vec<SupportedOperation> {
     praxis_ai_apis::openai::conversations_operation_specs()
         .iter()
         .map(|spec| SupportedOperation {
-            method: spec.method.as_str().to_owned(),
+            method: spec.method().as_str().to_owned(),
             path: spec.spec_path.to_owned(),
             area: "Conversations".to_owned(),
-            mode: coverage_mode(spec.mode),
+            mode: coverage_mode(spec.mode()),
             evidence: format!(
                 "praxis_ai_apis::openai::conversations_operation_specs::{:?}",
                 spec.operation
@@ -238,11 +238,11 @@ fn conversations_supported_operations() -> Vec<SupportedOperation> {
 }
 
 /// Convert shared runtime handling metadata into the report model.
-const fn coverage_mode(mode: praxis_ai_apis::openai::OpenAiHandlingMode) -> CoverageMode {
+const fn coverage_mode(mode: praxis_ai_apis::operation::HandlingMode) -> CoverageMode {
     match mode {
-        praxis_ai_apis::openai::OpenAiHandlingMode::Passthrough => CoverageMode::Passthrough,
-        praxis_ai_apis::openai::OpenAiHandlingMode::Inspect => CoverageMode::Inspect,
-        praxis_ai_apis::openai::OpenAiHandlingMode::Transform => CoverageMode::Transform,
-        praxis_ai_apis::openai::OpenAiHandlingMode::Local => CoverageMode::Local,
+        praxis_ai_apis::operation::HandlingMode::Passthrough => CoverageMode::Passthrough,
+        praxis_ai_apis::operation::HandlingMode::Inspect => CoverageMode::Inspect,
+        praxis_ai_apis::operation::HandlingMode::Transform => CoverageMode::Transform,
+        praxis_ai_apis::operation::HandlingMode::Local => CoverageMode::Local,
     }
 }

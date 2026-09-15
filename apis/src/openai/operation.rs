@@ -7,98 +7,19 @@ use std::borrow::{Borrow, Cow};
 
 use utoipa::openapi::{
     Components, Content, Info, OpenApi, Paths, Ref, RefOr, Required, Tag,
-    path::{HttpMethod, Operation, OperationBuilder, Parameter, ParameterBuilder, ParameterIn},
+    path::{HttpMethod as OpenApiHttpMethod, Operation, OperationBuilder, Parameter, ParameterBuilder, ParameterIn},
     request_body::RequestBodyBuilder,
     response::ResponseBuilder,
     schema::Schema,
 };
 
+use crate::operation::{
+    ApplicationProtocol, HandlingMode, HttpMethod, OperationEntry, OperationSpec, RequestBody, Transport,
+};
+
 /// Component schemas recursively referenced by one contract type.
 type ReferencedSchemas = Vec<(String, RefOr<Schema>)>;
 
-/// How Praxis handles an operation at the proxy boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OpenAiHandlingMode {
-    /// Forward the operation without inspecting its payload.
-    Passthrough,
-    /// Read selected fields while preserving the forwarded payload.
-    Inspect,
-    /// Rewrite the operation between input and output contracts.
-    Transform,
-    /// Terminate the request and produce the response locally.
-    Local,
-}
-
-/// HTTP method recognized by an OpenAI operation registry.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum OpenAiHttpMethod {
-    /// `GET`.
-    Get,
-    /// `POST`.
-    Post,
-    /// `PUT`.
-    Put,
-    /// `DELETE`.
-    Delete,
-    /// `PATCH`.
-    Patch,
-    /// `HEAD`.
-    Head,
-    /// `OPTIONS`.
-    Options,
-    /// `TRACE`.
-    Trace,
-}
-
-impl OpenAiHttpMethod {
-    /// Stable uppercase spelling used by runtime matching and reports.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Get => "GET",
-            Self::Post => "POST",
-            Self::Put => "PUT",
-            Self::Delete => "DELETE",
-            Self::Patch => "PATCH",
-            Self::Head => "HEAD",
-            Self::Options => "OPTIONS",
-            Self::Trace => "TRACE",
-        }
-    }
-
-    /// Convert to Utoipa's `OpenAPI` method representation.
-    const fn as_openapi(self) -> HttpMethod {
-        match self {
-            Self::Get => HttpMethod::Get,
-            Self::Post => HttpMethod::Post,
-            Self::Put => HttpMethod::Put,
-            Self::Delete => HttpMethod::Delete,
-            Self::Patch => HttpMethod::Patch,
-            Self::Head => HttpMethod::Head,
-            Self::Options => HttpMethod::Options,
-            Self::Trace => HttpMethod::Trace,
-        }
-    }
-}
-
-impl OpenAiHandlingMode {
-    /// Stable label used by conformance reports.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Passthrough => "passthrough",
-            Self::Inspect => "inspect",
-            Self::Transform => "transform",
-            Self::Local => "local",
-        }
-    }
-
-    /// Whether Praxis owns the operation's externally visible contract.
-    #[must_use]
-    pub const fn owns_contract(self) -> bool {
-        matches!(self, Self::Transform | Self::Local)
-    }
-}
 
 /// Type-erased access to one concrete `ToSchema` implementation.
 #[derive(Clone, Copy)]
@@ -238,61 +159,6 @@ pub(crate) struct ResponseSpec {
     pub(crate) content: &'static [MediaTypeSpec],
 }
 
-/// Runtime shape of an operation's request body.
-///
-/// This is deliberately independent of the owned `OpenAPI` contract. Praxis owns
-/// the external contract only for operations it terminates or rewrites, but it
-/// still needs the body shape of operations it merely proxies: a multipart file
-/// upload has a body whether or not Praxis describes that body in a generated
-/// `OpenAPI` document.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OpenAiRequestBody {
-    /// Operation takes no request body.
-    None,
-    /// `application/json` body.
-    Json {
-        /// Whether the body must be present.
-        required: bool,
-    },
-    /// `multipart/form-data` body.
-    Multipart {
-        /// Whether the body must be present.
-        required: bool,
-    },
-    /// Opaque binary body.
-    Binary {
-        /// Whether the body must be present.
-        required: bool,
-    },
-}
-
-impl OpenAiRequestBody {
-    /// Whether the operation carries a request body at all.
-    #[must_use]
-    pub const fn is_present(self) -> bool {
-        !matches!(self, Self::None)
-    }
-
-    /// Whether a request body must be supplied by the client.
-    #[must_use]
-    pub const fn is_required(self) -> bool {
-        match self {
-            Self::None => false,
-            Self::Json { required } | Self::Multipart { required } | Self::Binary { required } => required,
-        }
-    }
-
-    /// Stable label used by reports and tracing.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Json { .. } => "json",
-            Self::Multipart { .. } => "multipart",
-            Self::Binary { .. } => "binary",
-        }
-    }
-}
 
 /// `OpenAPI` contract owned by one local or transforming operation.
 #[derive(Clone, Copy)]
@@ -305,250 +171,101 @@ pub(crate) struct OwnedOperationContract {
     pub(crate) responses: &'static [ResponseSpec],
 }
 
-/// API family that owns one operation.
+/// One OpenAI operation: shared runtime identity plus OpenAI-owned contract.
 ///
-/// Families are declared by the registry rather than inferred from the path, so
-/// routing can key on a proxy-owned fact instead of a path prefix.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum OpenAiApiFamily {
-    /// `OpenAI` Responses API.
-    Responses,
-    /// `OpenAI` Conversations API.
-    Conversations,
-    /// `OpenAI` Files API.
-    Files,
-    /// `OpenAI` Vector Stores API.
-    VectorStores,
-}
-
-impl OpenAiApiFamily {
-    /// Application-protocol identifier published to downstream filters and
-    /// routing headers.
-    ///
-    /// Values are provider-qualified so one identifier space can describe
-    /// every AI application protocol the proxy classifies, not only OpenAI's.
-    /// This matches the cluster-side `application_protocol` vocabulary in
-    /// praxis-proxy/praxis#1106.
-    #[must_use]
-    pub const fn application_protocol(self) -> &'static str {
-        match self {
-            Self::Responses => "openai_responses",
-            Self::Conversations => "openai_conversations",
-            Self::Files => "openai_files",
-            Self::VectorStores => "openai_vector_stores",
-        }
-    }
-}
-
-/// Transport an operation is reached over.
-///
-/// Method and path alone cannot separate a plain `GET` from a `WebSocket`
-/// handshake at the same address, so transport is part of operation identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OpenAiTransport {
-    /// Ordinary HTTP request.
-    Http,
-    /// `WebSocket` handshake, identified by protocol upgrade headers.
-    WebSocket,
-}
-
-impl OpenAiTransport {
-    /// Stable label used by reports and tracing.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Http => "http",
-            Self::WebSocket => "websocket",
-        }
-    }
-}
-
-/// Provider-neutral metadata shared by runtime registries and conformance.
+/// The runtime half is [`OperationSpec`], which the shared matcher understands
+/// and every protocol registry uses. The remaining fields are OpenAI's own:
+/// where the operation appears in the pinned OpenAI specification, and the
+/// contract Praxis generates into its implementation `OpenAPI` document. Keeping
+/// them here is what lets the matcher stay provider-neutral while `OpenAPI`
+/// generation stays provider-owned.
 #[derive(Clone, Copy)]
 pub struct OpenAiOperationSpec {
-    /// API family that owns the operation.
-    pub family: OpenAiApiFamily,
-    /// Stable `OpenAPI` operation ID.
-    pub operation_id: &'static str,
-    /// Typed HTTP method.
-    pub method: OpenAiHttpMethod,
-    /// Transport the operation is reached over.
-    pub transport: OpenAiTransport,
+    /// Runtime identity shared with every other protocol registry.
+    pub runtime: OperationSpec,
     /// Path as it appears in the OpenAI spec, without `/v1`.
     pub spec_path: &'static str,
-    /// Runtime path template handled by Praxis.
-    pub runtime_path: &'static str,
-    /// Proxy handling mode.
-    pub mode: OpenAiHandlingMode,
-    /// Runtime request-body shape, independent of contract ownership.
-    pub request_body: OpenAiRequestBody,
     /// Contract generated into the implementation `OpenAPI` document.
     pub(crate) owned_contract: Option<OwnedOperationContract>,
 }
 
 impl OpenAiOperationSpec {
+    /// Stable `OpenAPI` operation ID.
+    #[must_use]
+    pub const fn operation_id(&self) -> &'static str {
+        self.runtime.operation_id
+    }
+
+    /// Typed HTTP method.
+    #[must_use]
+    pub const fn method(&self) -> HttpMethod {
+        self.runtime.method
+    }
+
+    /// Application protocol that owns the operation.
+    #[must_use]
+    pub const fn application_protocol(&self) -> ApplicationProtocol {
+        self.runtime.application_protocol
+    }
+
+    /// Transport the operation is reached over.
+    #[must_use]
+    pub const fn transport(&self) -> Transport {
+        self.runtime.transport
+    }
+
+    /// Runtime path template handled by Praxis.
+    #[must_use]
+    pub const fn runtime_path(&self) -> &'static str {
+        self.runtime.runtime_path
+    }
+
+    /// Runtime request-body shape.
+    #[must_use]
+    pub const fn request_body(&self) -> RequestBody {
+        self.runtime.request_body
+    }
+
+    /// Proxy handling mode.
+    #[must_use]
+    pub const fn mode(&self) -> HandlingMode {
+        self.runtime.mode
+    }
+
     /// Whether this operation consumes a request body.
     ///
     /// Answers the runtime question directly rather than inferring it from
     /// contract ownership, so proxied operations report their real body shape.
     pub(crate) const fn has_request_body(&self) -> bool {
-        self.request_body.is_present()
+        self.runtime.has_request_body()
     }
 
     /// Return the locally owned `OpenAPI` contract, when applicable.
     pub(crate) const fn owned_contract(&self) -> Option<OwnedOperationContract> {
         self.owned_contract
     }
-
-    /// Number of literal segments in the runtime path template.
-    ///
-    /// Used to rank candidates so a literal segment always outranks a
-    /// parameter, independent of the order operations were declared in.
-    fn static_segment_count(&self) -> usize {
-        self.runtime_path
-            .split('/')
-            .filter(|segment| !is_parameter_segment(segment))
-            .count()
-    }
-}
-
-/// Maximum path parameters captured from any one operation template.
-///
-/// The deepest OpenAI path templates carry two parameters. The headroom keeps
-/// the capacity from binding as other API families register their operations,
-/// and a registry test fails if a template ever exceeds it.
-pub(crate) const MAX_PATH_PARAMS: usize = 4;
-
-/// Path parameters borrowed directly from the request URI.
-///
-/// Parameters are held as name/value pairs rather than named fields so that one
-/// matcher can serve every API family. The fixed-capacity array keeps matching
-/// allocation-free on the request path.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct RouteParams<'a> {
-    /// Captured parameter names paired with their borrowed path segments.
-    pairs: [(&'static str, &'a str); MAX_PATH_PARAMS],
-    /// Number of populated entries in `pairs`.
-    len: usize,
-}
-
-impl<'a> RouteParams<'a> {
-    /// Record one captured path parameter.
-    ///
-    /// Returns `None` when a template repeats a parameter name or declares more
-    /// parameters than the shared capacity allows, so either mistake surfaces as
-    /// a failed match rather than a silently overwritten value.
-    fn insert(&mut self, name: &'static str, value: &'a str) -> Option<()> {
-        if self.get(name).is_some() {
-            return None;
-        }
-        *self.pairs.get_mut(self.len)? = (name, value);
-        self.len += 1;
-        Some(())
-    }
-
-    /// Return the segment captured for one parameter name.
-    pub(crate) fn get(&self, name: &str) -> Option<&'a str> {
-        self.pairs
-            .get(..self.len)?
-            .iter()
-            .find(|(candidate, _)| *candidate == name)
-            .map(|&(_, value)| value)
-    }
-}
-
-/// One operation matched from a request head.
-#[derive(Clone, Copy)]
-pub(crate) struct MatchedOperation<'a, T: 'static> {
-    /// Matched registry entry, in the family's own wrapper type.
-    pub(crate) spec: &'static T,
-    /// Borrowed path parameters.
-    pub(crate) params: RouteParams<'a>,
-}
-
-/// One entry in a family's operation registry.
-///
-/// Families may register bare [`OpenAiOperationSpec`] values or wrap them in a
-/// richer type carrying family-specific data, so the shared matcher reads the
-/// shared metadata through this trait rather than requiring one representation.
-pub(crate) trait OperationEntry {
-    /// Borrow the shared operation metadata for this entry.
-    fn spec(&self) -> &OpenAiOperationSpec;
 }
 
 impl OperationEntry for OpenAiOperationSpec {
-    fn spec(&self) -> &Self {
-        self
+    fn spec(&self) -> &OperationSpec {
+        &self.runtime
     }
 }
 
-/// Whether one template segment declares a path parameter.
-fn is_parameter_segment(segment: &str) -> bool {
-    segment.starts_with('{') && segment.ends_with('}')
-}
-
-/// Normalize a request path before matching.
+/// Convert a runtime method into Utoipa's `OpenAPI` representation.
 ///
-/// Applies the shared policy: any query string is ignored, and exactly one
-/// trailing slash is tolerated on a non-root path. Callers that already pass a
-/// query-free path are unaffected.
-fn normalize_path(path: &str) -> &str {
-    let path = path.split('?').next().unwrap_or(path);
-    path.strip_suffix('/').filter(|path| !path.is_empty()).unwrap_or(path)
-}
-
-/// Match a request head against one family's operation registry.
-///
-/// Methods and transports must match exactly. Among templates that match the
-/// path, the one with the most literal segments wins, so a static endpoint is
-/// never consumed as a path parameter regardless of declaration order.
-pub(crate) fn match_operation<'a, T>(
-    specs: &'static [T],
-    method: &str,
-    path: &'a str,
-    transport: OpenAiTransport,
-) -> Option<MatchedOperation<'a, T>>
-where
-    T: OperationEntry,
-{
-    let path = normalize_path(path);
-    specs
-        .iter()
-        .filter(|entry| {
-            let spec = entry.spec();
-            spec.method.as_str() == method && spec.transport == transport
-        })
-        .filter_map(|entry| match_path_template(entry.spec().runtime_path, path).map(|params| (entry, params)))
-        .max_by_key(|(entry, _)| entry.spec().static_segment_count())
-        .map(|(spec, params)| MatchedOperation { spec, params })
-}
-
-/// Match one path against a template with `{param}` placeholders.
-///
-/// Each parameter matches exactly one non-empty segment.
-fn match_path_template<'a>(template: &'static str, path: &'a str) -> Option<RouteParams<'a>> {
-    let mut template_segments = template.split('/');
-    let mut path_segments = path.split('/');
-    let mut params = RouteParams::default();
-
-    loop {
-        match (template_segments.next(), path_segments.next()) {
-            (None, None) => return Some(params),
-            (Some(template_segment), Some(path_segment)) => {
-                if let Some(name) = template_segment
-                    .strip_prefix('{')
-                    .and_then(|segment| segment.strip_suffix('}'))
-                {
-                    if path_segment.is_empty() {
-                        return None;
-                    }
-                    params.insert(name, path_segment)?;
-                } else if template_segment != path_segment {
-                    return None;
-                }
-            },
-            _ => return None,
-        }
+/// The runtime enum is provider-neutral and carries no `OpenAPI` dependency, so
+/// the mapping lives here with the generator that needs it.
+const fn openapi_method(method: HttpMethod) -> OpenApiHttpMethod {
+    match method {
+        HttpMethod::Get => OpenApiHttpMethod::Get,
+        HttpMethod::Post => OpenApiHttpMethod::Post,
+        HttpMethod::Put => OpenApiHttpMethod::Put,
+        HttpMethod::Delete => OpenApiHttpMethod::Delete,
+        HttpMethod::Patch => OpenApiHttpMethod::Patch,
+        HttpMethod::Head => OpenApiHttpMethod::Head,
+        HttpMethod::Options => OpenApiHttpMethod::Options,
+        HttpMethod::Trace => OpenApiHttpMethod::Trace,
     }
 }
 
@@ -567,14 +284,14 @@ where
         let Some(contract) = spec.owned_contract() else {
             continue;
         };
-        if !spec.mode.owns_contract() {
+        if !spec.mode().owns_contract() {
             continue;
         }
 
         register_contract_schemas(&mut components, contract);
         openapi.paths.add_path_operation(
             spec.spec_path,
-            vec![spec.method.as_openapi()],
+            vec![openapi_method(spec.method())],
             build_operation(spec, contract, tag),
         );
     }
@@ -607,7 +324,7 @@ fn register_schema(components: &mut Components, binding: SchemaBinding) {
 
 /// Build one `OpenAPI` operation from its registry metadata.
 fn build_operation(spec: &OpenAiOperationSpec, contract: OwnedOperationContract, tag: &str) -> Operation {
-    let mut operation = OperationBuilder::new().operation_id(Some(spec.operation_id)).tag(tag);
+    let mut operation = OperationBuilder::new().operation_id(Some(spec.operation_id())).tag(tag);
 
     for response in contract.responses {
         let mut builder = ResponseBuilder::new().description(response.description);
@@ -683,14 +400,16 @@ mod tests {
 
     /// Files-like operation exercising non-JSON and multiple response shapes.
     const FILE_OPERATION: OpenAiOperationSpec = OpenAiOperationSpec {
-        family: OpenAiApiFamily::Files,
-        operation_id: "createFile",
-        method: OpenAiHttpMethod::Post,
-        transport: OpenAiTransport::Http,
+        runtime: OperationSpec {
+            application_protocol: ApplicationProtocol::OPENAI_FILES,
+            operation_id: "createFile",
+            method: HttpMethod::Post,
+            transport: Transport::Http,
+            runtime_path: "/v1/files",
+            mode: HandlingMode::Local,
+            request_body: RequestBody::Multipart { required: true },
+        },
         spec_path: "/files",
-        runtime_path: "/v1/files",
-        mode: OpenAiHandlingMode::Local,
-        request_body: OpenAiRequestBody::Multipart { required: true },
         owned_contract: Some(OwnedOperationContract {
             parameters: &[],
             request: Some(RequestBodySpec {
@@ -714,48 +433,52 @@ mod tests {
 
     /// Proxied upload: a real multipart body with no Praxis-owned contract.
     const PROXIED_UPLOAD: OpenAiOperationSpec = OpenAiOperationSpec {
-        family: OpenAiApiFamily::Files,
-        operation_id: "createUpload",
-        method: OpenAiHttpMethod::Post,
-        transport: OpenAiTransport::Http,
+        runtime: OperationSpec {
+            application_protocol: ApplicationProtocol::OPENAI_FILES,
+            operation_id: "createUpload",
+            method: HttpMethod::Post,
+            transport: Transport::Http,
+            runtime_path: "/v1/uploads",
+            mode: HandlingMode::Passthrough,
+            request_body: RequestBody::Multipart { required: true },
+        },
         spec_path: "/uploads",
-        runtime_path: "/v1/uploads",
-        mode: OpenAiHandlingMode::Passthrough,
-        request_body: OpenAiRequestBody::Multipart { required: true },
         owned_contract: None,
     };
 
     /// Proxied bodyless read.
     const PROXIED_GET: OpenAiOperationSpec = OpenAiOperationSpec {
-        family: OpenAiApiFamily::Files,
-        operation_id: "getUpload",
-        method: OpenAiHttpMethod::Get,
-        transport: OpenAiTransport::Http,
+        runtime: OperationSpec {
+            application_protocol: ApplicationProtocol::OPENAI_FILES,
+            operation_id: "getUpload",
+            method: HttpMethod::Get,
+            transport: Transport::Http,
+            runtime_path: "/v1/uploads/{upload_id}",
+            mode: HandlingMode::Passthrough,
+            request_body: RequestBody::None,
+        },
         spec_path: "/uploads/{upload_id}",
-        runtime_path: "/v1/uploads/{upload_id}",
-        mode: OpenAiHandlingMode::Passthrough,
-        request_body: OpenAiRequestBody::None,
         owned_contract: None,
     };
 
     #[test]
     fn request_body_shape_is_independent_of_contract_ownership() {
-        assert!(!PROXIED_UPLOAD.mode.owns_contract());
+        assert!(!PROXIED_UPLOAD.mode().owns_contract());
         assert!(PROXIED_UPLOAD.owned_contract().is_none());
         assert!(
             PROXIED_UPLOAD.has_request_body(),
             "a proxied multipart upload must report its body without owning a contract"
         );
-        assert!(PROXIED_UPLOAD.request_body.is_required());
-        assert_eq!(PROXIED_UPLOAD.request_body.as_str(), "multipart");
+        assert!(PROXIED_UPLOAD.request_body().is_required());
+        assert_eq!(PROXIED_UPLOAD.request_body().as_str(), "multipart");
 
         assert!(!PROXIED_GET.has_request_body());
-        assert!(!PROXIED_GET.request_body.is_required());
+        assert!(!PROXIED_GET.request_body().is_required());
     }
 
     #[test]
     fn optional_body_is_present_but_not_required() {
-        let body = OpenAiRequestBody::Json { required: false };
+        let body = RequestBody::Json { required: false };
         assert!(body.is_present());
         assert!(!body.is_required());
         assert_eq!(body.as_str(), "json");
@@ -787,180 +510,5 @@ mod tests {
                 .is_some()
         );
         assert!(value.pointer("/paths/~1files/post/responses/204/content").is_none());
-    }
-
-    /// Registry reproducing the collision the precedence rule exists to prevent.
-    ///
-    /// The parameter template is declared *first* on purpose: without a
-    /// precedence rule the static endpoint below it is unreachable.
-    const PRECEDENCE_SPECS: &[OpenAiOperationSpec] = &[
-        OpenAiOperationSpec {
-            family: OpenAiApiFamily::Responses,
-            operation_id: "getResponse",
-            method: OpenAiHttpMethod::Get,
-            transport: OpenAiTransport::Http,
-            spec_path: "/responses/{response_id}",
-            runtime_path: "/v1/responses/{response_id}",
-            mode: OpenAiHandlingMode::Passthrough,
-            request_body: OpenAiRequestBody::None,
-            owned_contract: None,
-        },
-        OpenAiOperationSpec {
-            family: OpenAiApiFamily::Responses,
-            operation_id: "countInputTokens",
-            method: OpenAiHttpMethod::Get,
-            transport: OpenAiTransport::Http,
-            spec_path: "/responses/input_tokens",
-            runtime_path: "/v1/responses/input_tokens",
-            mode: OpenAiHandlingMode::Passthrough,
-            request_body: OpenAiRequestBody::None,
-            owned_contract: None,
-        },
-    ];
-
-    /// `WebSocket` creation sharing a method and path with an HTTP operation.
-    const TRANSPORT_SPECS: &[OpenAiOperationSpec] = &[
-        OpenAiOperationSpec {
-            family: OpenAiApiFamily::Responses,
-            operation_id: "listResponses",
-            method: OpenAiHttpMethod::Get,
-            transport: OpenAiTransport::Http,
-            spec_path: "/responses",
-            runtime_path: "/v1/responses",
-            mode: OpenAiHandlingMode::Passthrough,
-            request_body: OpenAiRequestBody::None,
-            owned_contract: None,
-        },
-        OpenAiOperationSpec {
-            family: OpenAiApiFamily::Responses,
-            operation_id: "createResponseWebSocket",
-            method: OpenAiHttpMethod::Get,
-            transport: OpenAiTransport::WebSocket,
-            spec_path: "/responses",
-            runtime_path: "/v1/responses",
-            mode: OpenAiHandlingMode::Passthrough,
-            request_body: OpenAiRequestBody::None,
-            owned_contract: None,
-        },
-    ];
-
-    #[test]
-    fn static_segment_outranks_parameter_regardless_of_declaration_order() {
-        let matched = match_operation(
-            PRECEDENCE_SPECS,
-            "GET",
-            "/v1/responses/input_tokens",
-            OpenAiTransport::Http,
-        )
-        .unwrap();
-        assert_eq!(
-            matched.spec.operation_id, "countInputTokens",
-            "a literal segment must outrank a parameter even when declared later"
-        );
-        assert_eq!(matched.params.get("response_id"), None);
-    }
-
-    #[test]
-    fn parameter_still_matches_a_genuine_identifier() {
-        let matched =
-            match_operation(PRECEDENCE_SPECS, "GET", "/v1/responses/resp_abc", OpenAiTransport::Http).unwrap();
-        assert_eq!(matched.spec.operation_id, "getResponse");
-        assert_eq!(matched.params.get("response_id"), Some("resp_abc"));
-    }
-
-    #[test]
-    fn transport_separates_operations_sharing_method_and_path() {
-        let http = match_operation(TRANSPORT_SPECS, "GET", "/v1/responses", OpenAiTransport::Http).unwrap();
-        assert_eq!(http.spec.operation_id, "listResponses");
-
-        let websocket = match_operation(TRANSPORT_SPECS, "GET", "/v1/responses", OpenAiTransport::WebSocket).unwrap();
-        assert_eq!(websocket.spec.operation_id, "createResponseWebSocket");
-    }
-
-    #[test]
-    fn unsupported_method_does_not_match() {
-        assert!(match_operation(PRECEDENCE_SPECS, "PUT", "/v1/responses/resp_abc", OpenAiTransport::Http).is_none());
-        assert!(match_operation(TRANSPORT_SPECS, "DELETE", "/v1/responses", OpenAiTransport::Http).is_none());
-    }
-
-    #[test]
-    fn query_string_and_trailing_slash_are_normalized() {
-        for path in [
-            "/v1/responses/input_tokens",
-            "/v1/responses/input_tokens/",
-            "/v1/responses/input_tokens?limit=5",
-            "/v1/responses/input_tokens/?limit=5&order=asc",
-        ] {
-            let matched = match_operation(PRECEDENCE_SPECS, "GET", path, OpenAiTransport::Http).unwrap();
-            assert_eq!(matched.spec.operation_id, "countInputTokens", "{path}");
-        }
-    }
-
-    #[test]
-    fn extra_and_missing_segments_do_not_match() {
-        assert!(match_operation(PRECEDENCE_SPECS, "GET", "/v1/responses", OpenAiTransport::Http).is_none());
-        assert!(
-            match_operation(
-                PRECEDENCE_SPECS,
-                "GET",
-                "/v1/responses/resp_abc/extra",
-                OpenAiTransport::Http
-            )
-            .is_none()
-        );
-        assert!(match_operation(PRECEDENCE_SPECS, "GET", "/v1/responses//", OpenAiTransport::Http).is_none());
-    }
-
-    #[test]
-    fn application_protocol_label_is_stable_and_provider_qualified() {
-        assert_eq!(OpenAiApiFamily::Responses.application_protocol(), "openai_responses");
-        assert_eq!(
-            OpenAiApiFamily::Conversations.application_protocol(),
-            "openai_conversations"
-        );
-        assert_eq!(OpenAiApiFamily::Files.application_protocol(), "openai_files");
-        assert_eq!(
-            OpenAiApiFamily::VectorStores.application_protocol(),
-            "openai_vector_stores"
-        );
-        assert_eq!(OpenAiTransport::Http.as_str(), "http");
-        assert_eq!(OpenAiTransport::WebSocket.as_str(), "websocket");
-    }
-
-    #[test]
-    fn captures_parameters_by_name_regardless_of_family() {
-        let mut params = RouteParams::default();
-        assert!(params.insert("vector_store_id", "vs_123").is_some());
-        assert!(params.insert("file_id", "file_456").is_some());
-
-        assert_eq!(params.get("vector_store_id"), Some("vs_123"));
-        assert_eq!(params.get("file_id"), Some("file_456"));
-        assert_eq!(params.get("conversation_id"), None);
-    }
-
-    #[test]
-    fn rejects_duplicate_parameter_name() {
-        let mut params = RouteParams::default();
-        assert!(params.insert("id", "first").is_some());
-        assert!(
-            params.insert("id", "second").is_none(),
-            "a repeated parameter name must fail the match rather than overwrite"
-        );
-        assert_eq!(params.get("id"), Some("first"));
-    }
-
-    #[test]
-    fn rejects_more_parameters_than_capacity() {
-        let names = ["a", "b", "c", "d"];
-        assert_eq!(names.len(), MAX_PATH_PARAMS, "this test must fill exactly the capacity");
-
-        let mut params = RouteParams::default();
-        for name in names {
-            assert!(params.insert(name, "value").is_some());
-        }
-        assert!(
-            params.insert("overflow", "value").is_none(),
-            "exceeding capacity must fail the match rather than drop a parameter"
-        );
     }
 }

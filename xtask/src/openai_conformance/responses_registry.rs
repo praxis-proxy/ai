@@ -76,7 +76,7 @@ fn tally(operations: &[super::model::SpecOperation]) -> Tally {
 
     for spec in praxis_ai_apis::openai::responses_operation_specs() {
         let is_extension =
-            praxis_ai_apis::openai::RESPONSES_PROTOCOL_EXTENSION_OPERATION_IDS.contains(&spec.operation_id);
+            praxis_ai_apis::openai::RESPONSES_PROTOCOL_EXTENSION_OPERATION_IDS.contains(&spec.operation_id());
         if is_extension {
             tally.extensions += 1;
         } else {
@@ -85,13 +85,13 @@ fn tally(operations: &[super::model::SpecOperation]) -> Tally {
 
         let found = operations
             .iter()
-            .find(|candidate| candidate.key.method == spec.method.as_str() && candidate.key.path == spec.spec_path)
+            .find(|candidate| candidate.key.method == spec.method().as_str() && candidate.key.path == spec.spec_path)
             .and_then(|candidate| candidate.operation_id.as_deref());
 
         if let Comparison::Drifted(reason) = compare(
-            spec.method.as_str(),
+            spec.method().as_str(),
             spec.spec_path,
-            spec.operation_id,
+            spec.operation_id(),
             found,
             is_extension,
         ) {

@@ -28,7 +28,7 @@ pub use conversations::{
     ConversationOperation, ConversationOperationSpec, OpenaiConversationsFilter,
     implementation_openapi_json as conversations_openapi_json, operation_specs as conversations_operation_specs,
 };
-pub use operation::{OpenAiHandlingMode, OpenAiOperationSpec, OpenAiRequestBody};
+pub use operation::OpenAiOperationSpec;
 pub use operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter};
 pub use responses::{
     AgenticLoopFilter, CompactFilter, DocExtractFilter, FileResolveFilter, FileSearchCalloutFilter, McpDispatchFilter,
