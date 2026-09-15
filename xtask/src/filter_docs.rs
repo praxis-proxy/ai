@@ -314,7 +314,7 @@ fn parse_shared_config_items(root: &Path) -> ModuleItems {
     let mut items = ModuleItems::new();
     let praxis_root = root.join("../praxis");
     let dirs = if praxis_root.is_dir() {
-        vec![praxis_root.join("filter/src/builtins/http/payload_processing")]
+        vec![praxis_root.join("crates/filter/src/builtins/http/payload_processing")]
     } else {
         resolve_praxis_source_dirs()
     };
