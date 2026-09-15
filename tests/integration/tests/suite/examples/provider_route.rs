@@ -143,20 +143,20 @@ fn provider_route_example_accepts_authenticated_route_and_replaces_credential() 
         "caller authorization must not reach the private backend: {body}"
     );
 
-    let apikey = praxis_test_utils::https_send(
+    let anthropic = praxis_test_utils::https_send(
         proxy.addr(),
         &provider_request_for(ANTHROPIC_CANDIDATE_ID, "/v1/messages", "mock-anthropic-model"),
         &request_client,
     );
-    assert_eq!(praxis_test_utils::parse_status(&apikey), 200, "{apikey}");
-    let apikey_body = praxis_test_utils::parse_body(&apikey);
+    assert_eq!(praxis_test_utils::parse_status(&anthropic), 200, "{anthropic}");
+    let anthropic_body = praxis_test_utils::parse_body(&anthropic);
     assert!(
-        apikey_body.contains("x-api-key: provider-api-key"),
-        "apikey credential must be injected into the default header: {apikey_body}"
+        anthropic_body.contains("x-api-key: provider-api-key"),
+        "apikey credential must be injected into the default header: {anthropic_body}"
     );
     assert!(
-        !apikey_body.contains("caller-secret") && !apikey_body.contains("authorization:"),
-        "apikey injection must strip the caller authorization: {apikey_body}"
+        !anthropic_body.contains("caller-secret") && !anthropic_body.contains("authorization:"),
+        "apikey injection must strip the caller authorization: {anthropic_body}"
     );
 
     let unauthenticated_client = certificates.raw_tls_client_config();
