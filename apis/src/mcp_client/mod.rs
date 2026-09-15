@@ -278,6 +278,7 @@ pub(crate) async fn list_tools(
         server_url,
         headers,
         authorization,
+        &[],
         None,
         timeout,
         max_tools,
@@ -292,10 +293,12 @@ pub(crate) async fn list_tools(
     clippy::too_many_arguments,
     reason = "trusted forwarded headers extend the existing API"
 )]
+#[expect(clippy::too_many_lines, reason = "transport setup and bounded listing are linear")]
 pub(crate) async fn list_tools_with_forwarded_headers(
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
     forwarded_headers: Option<&http::HeaderMap>,
     timeout: Duration,
     max_tools: usize,
@@ -313,8 +316,14 @@ pub(crate) async fn list_tools_with_forwarded_headers(
         let max_sse_event_size = bounded_client.max_sse_event_size();
         let transport = StreamableHttpClientTransport::with_client(
             bounded_client,
-            build_transport_config_with_forwarded_headers(server_url, headers, authorization, forwarded_headers)?
-                .max_sse_event_size(max_sse_event_size),
+            build_transport_config_with_forwarded_headers(
+                server_url,
+                headers,
+                authorization,
+                forwarded_header_names,
+                forwarded_headers,
+            )?
+            .max_sse_event_size(max_sse_event_size),
         );
         let display_url = resolved.display_url;
         let client = Box::pin(().serve(transport))
@@ -360,6 +369,7 @@ pub(crate) async fn call_tool(
         server_url,
         headers,
         authorization,
+        &[],
         None,
         tool_name,
         arguments,
@@ -382,6 +392,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
     forwarded_headers: Option<&http::HeaderMap>,
     tool_name: &str,
     arguments: serde_json::Value,
@@ -397,8 +408,14 @@ pub(crate) async fn call_tool_with_forwarded_headers(
         let max_sse_event_size = bounded_client.max_sse_event_size();
         let transport = StreamableHttpClientTransport::with_client(
             bounded_client,
-            build_transport_config_with_forwarded_headers(server_url, headers, authorization, forwarded_headers)?
-                .max_sse_event_size(max_sse_event_size),
+            build_transport_config_with_forwarded_headers(
+                server_url,
+                headers,
+                authorization,
+                forwarded_header_names,
+                forwarded_headers,
+            )?
+            .max_sse_event_size(max_sse_event_size),
         );
         let display_url = resolved.display_url;
 
@@ -496,14 +513,24 @@ fn build_transport_config(
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
 ) -> Result<StreamableHttpClientTransportConfig, McpClientError> {
-    build_transport_config_with_forwarded_headers(server_url, headers, authorization, None)
+    build_transport_config_with_forwarded_headers(server_url, headers, authorization, &[], None)
 }
 
 /// Build transport config and overlay trusted, operator-allowlisted headers.
+///
+/// Every configured forwarded name is removed from client tool-entry headers
+/// even when no trusted value is available or the target is a direct URL. This
+/// prevents client-controlled headers from impersonating ambient identity at a
+/// connector endpoint reached through an equivalent direct URL.
+#[expect(
+    clippy::too_many_lines,
+    reason = "client filtering and trusted overlay are one security boundary"
+)]
 fn build_transport_config_with_forwarded_headers(
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
     forwarded_headers: Option<&http::HeaderMap>,
 ) -> Result<StreamableHttpClientTransportConfig, McpClientError> {
     let mut config = StreamableHttpClientTransportConfig::with_uri(server_url);
@@ -515,6 +542,7 @@ fn build_transport_config_with_forwarded_headers(
             if let Some(value_str) = value.as_str()
                 && let Ok(name) = key.parse::<http::HeaderName>()
                 && !is_blocked_mcp_header(&name)
+                && !forwarded_header_names.contains(&name)
                 && !nominated.contains(&name)
                 && let Ok(val) = http::HeaderValue::from_str(value_str)
             {

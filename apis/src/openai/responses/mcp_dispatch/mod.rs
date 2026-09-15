@@ -207,6 +207,7 @@ impl McpDispatchFilter {
             max_total_result_bytes: execution_batch_limit,
             timeout: self.timeout,
             allow_loopback: self.allow_loopback,
+            forwarded_header_names: &self.forward_headers,
             forwarded_headers: Some(forwarded_headers),
         };
         execute_mcp_calls(mcp_calls, tool_index, options).await
@@ -1175,6 +1176,8 @@ struct McpExecutionOptions<'a> {
     timeout: Duration,
     /// Whether MCP endpoints may resolve to loopback addresses.
     allow_loopback: bool,
+    /// Names reserved for trusted forwarding, including when values are absent.
+    forwarded_header_names: &'a [http::HeaderName],
     /// Trusted request headers selected by operator configuration.
     forwarded_headers: Option<&'a http::HeaderMap>,
 }
@@ -1454,6 +1457,7 @@ async fn execute_single_call(
         server_url,
         headers,
         authorization,
+        options.forwarded_header_names,
         forwarded_headers,
         original_tool_name,
         arguments,

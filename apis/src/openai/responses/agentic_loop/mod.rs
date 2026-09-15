@@ -131,7 +131,7 @@ use bytes::Bytes;
 use http::header::{CONTENT_TYPE, HeaderValue};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState, Rejection,
-    SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    SubRequestResponseMode, TrustedHeaderMutation, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::{Value, json};
 use tracing::{debug, trace};
@@ -583,8 +583,7 @@ fn prepare_iteration(ctx: &mut HttpFilterContext<'_>, state: &mut ResponsesState
         state.original_tool_choice.get_or_insert(original);
         set_request_body_field(state, "tool_choice", json!("auto"));
         preserve_original_request_headers(ctx);
-        ctx.request_headers_to_set
-            .push((CONTENT_TYPE, HeaderValue::from_static("application/json")));
+        queue_continuation_header(ctx, CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
 }
 
@@ -609,7 +608,22 @@ fn preserve_original_request_headers(ctx: &mut HttpFilterContext<'_>) {
         })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<Vec<_>>();
-    ctx.request_headers_to_set.extend(headers);
+    for (name, value) in headers {
+        queue_continuation_header(ctx, name, value);
+    }
+}
+
+/// Queue a continuation header in both representations used by Core pre-read.
+///
+/// Owner projection or another provenance-aware filter may already have
+/// activated the ordered mutation log. Once active, Core intentionally ignores
+/// the legacy grouped queues for this pass, so replayed credentials must join
+/// that log as well as remaining available to the normal request phase.
+fn queue_continuation_header(ctx: &mut HttpFilterContext<'_>, name: http::HeaderName, value: HeaderValue) {
+    ctx.request_headers_to_set.push((name.clone(), value.clone()));
+    if !ctx.pre_read_mutations.is_empty() {
+        ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(name, value));
+    }
 }
 
 /// Whether a header remains valid after the continuation body is rewritten.

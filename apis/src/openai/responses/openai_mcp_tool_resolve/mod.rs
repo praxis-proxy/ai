@@ -1489,6 +1489,7 @@ async fn fetch_tools(
         server_url,
         entry.get("headers"),
         auth,
+        &filter.forward_headers,
         forwarded_headers,
         filter.timeout,
         filter.max_tools,

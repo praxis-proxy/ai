@@ -94,6 +94,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
         timeout,
         allow_loopback: true,
+        forwarded_header_names: &[],
         forwarded_headers: None,
     }
 }

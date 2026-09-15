@@ -1258,6 +1258,10 @@ fn full_flow_agentic_file_search_round_trip() {
     for request in model.requests() {
         let headers = request.headers.to_lowercase();
         assert!(
+            headers.contains("authorization: bearer search-key"),
+            "every inference round should retain client authorization: {headers}"
+        );
+        assert!(
             headers.contains("x-tenant-id: integration-tenant"),
             "inference should receive the projected tenant: {headers}"
         );
