@@ -4,6 +4,7 @@
 //! HTTP backends for integration testing.
 
 mod echo;
+mod scripted_http;
 mod simple;
 mod specialized;
 mod websocket;
@@ -11,6 +12,10 @@ mod websocket;
 pub use echo::{
     CapturingBackendGuard, start_capturing_backend, start_echo_backend, start_header_echo_backend,
     start_uri_echo_backend,
+};
+pub use scripted_http::{
+    CapturedHttpRequest, HttpBackendEvent, HttpBackendGuard, HttpServerAction, start_scripted_http_backend,
+    start_scripted_http_backend_turns,
 };
 pub use simple::{
     Backend, CapturedRequest, ChunkedBackend, RoutedBackend, StatefulBackend, StatefulCapturingBackend,

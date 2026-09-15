@@ -1,0 +1,63 @@
+# HTTP-only Responses API passthrough
+#
+# The strict-HTTP acceptance test for pinned Codex CLI
+# for GitHub issue #870 drives the proxy over
+# `POST /v1/responses` and any other Responses API paths the
+# client may probe. This pipeline does the minimum work required
+# to classify and route the traffic:
+#
+#   1. `openai_responses_format` classifies the request and
+#      promotes `x-praxis-ai-format: openai_responses` for the
+#      router. `on_invalid: continue` lets non-Responses traffic
+#      reach the router without being rejected.
+#   2. The router sends every `/v1/responses*` request to the
+#      `inference-backend` cluster.
+#   3. The load balancer points at the test backend (and any
+#      additional inference endpoints the test wires up).
+#
+# No state, persistence, or WebSocket is enabled. WebSocket upgrades
+# fail at the listener because the test config does not register
+# a WebSocket-aware filter chain. The acceptance test asserts that
+# the pinned Codex client never attempts a WebSocket upgrade when
+# configured with `wire_api = "responses"` and no `supports_websockets`
+# flag.
+#
+# Example request:
+#
+#   curl -N http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -H "Authorization: Bearer token" \
+#     -d '{"model":"gpt-4.1","input":"Hello","stream":true}'
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-pipeline]
+
+filter_chains:
+  - name: responses-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+          mode: x-praxis-responses-mode
+
+      - filter: router
+        routes:
+          - path_prefix: "/v1/responses"
+            cluster: "inference-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
