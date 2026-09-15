@@ -74,7 +74,7 @@ struct ConversationResponseState {
 }
 
 /// Owner captured on the request path before inference begins.
-struct CapturedAppendOwner(OpenAiStateOwner);
+struct CapturedAppendOwner(StateOwner);
 
 /// Capture the append-back owner once for the lifetime of the exchange.
 fn capture_append_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterAction> {
