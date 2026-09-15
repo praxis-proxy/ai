@@ -367,7 +367,16 @@ impl McpToolResolveFilter {
             return Ok(Some(cached));
         }
         let forwarded_headers = is_connector.then_some(forwarded_headers);
-        let tools = fetch_tools(entry, server_url, self, forwarded_headers).await?;
+        let tools = fetch_tools(
+            entry,
+            server_url,
+            &self.forward_headers,
+            forwarded_headers,
+            self.timeout,
+            self.max_tools,
+            self.allow_loopback,
+        )
+        .await?;
         Ok(Some(tools))
     }
 }
@@ -1479,8 +1488,11 @@ fn count_distinct_servers(entries: &[serde_json::Value]) -> usize {
 async fn fetch_tools(
     entry: &serde_json::Value,
     server_url: &str,
-    filter: &McpToolResolveFilter,
+    forwarded_header_names: &[http::HeaderName],
     forwarded_headers: Option<&http::HeaderMap>,
+    timeout: Duration,
+    max_tools: usize,
+    allow_loopback: bool,
 ) -> Result<Vec<serde_json::Value>, ResolveError> {
     let display_url = mcp_client::parse_display_url(server_url);
     debug!(label = server_label(entry), url = %display_url, "calling MCP tools/list");
@@ -1489,11 +1501,11 @@ async fn fetch_tools(
         server_url,
         entry.get("headers"),
         auth,
-        &filter.forward_headers,
+        forwarded_header_names,
         forwarded_headers,
-        filter.timeout,
-        filter.max_tools,
-        filter.allow_loopback,
+        timeout,
+        max_tools,
+        allow_loopback,
     )
     .await
     .map_err(|source| ResolveError::Client {
@@ -2076,6 +2088,12 @@ pub(crate) fn has_pending_deferred_discovery(state: &ResponsesState) -> bool {
         && super::state::tool_search_discovery_is_within_budget(state)
 }
 
+/// Test helper for deferred discovery without ambient request headers.
+#[cfg(test)]
+async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), ResolveError> {
+    discover_deferred_connectors_with_forwarded_headers(state, &[], &http::HeaderMap::new()).await
+}
+
 /// Load tools for deferred connectors after a `tool_search_call`.
 ///
 /// Lists every pending connector before mutating state. Applies
@@ -2084,13 +2102,17 @@ pub(crate) fn has_pending_deferred_discovery(state: &ResponsesState) -> bool {
 /// sanitized deferred MCP entries with function tools. An exhausted
 /// `max_tool_calls` budget skips `tools/list` and leaves connectors
 /// pending so the round can return to the caller.
-pub(crate) async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), ResolveError> {
+pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
+    state: &mut ResponsesState,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
+) -> Result<(), ResolveError> {
     if state.deferred_mcp.is_empty() || !super::state::tool_search_discovery_is_within_budget(state) {
         return Ok(());
     }
 
     let pending = std::mem::take(&mut state.deferred_mcp);
-    let prepared = match prepare_deferred_listings(&pending).await {
+    let prepared = match prepare_deferred_listings(&pending, forwarded_header_names, forwarded_headers).await {
         Ok(prepared) => prepared,
         Err(err) => {
             state.deferred_mcp = pending;
@@ -2125,16 +2147,27 @@ struct PreparedDeferredListing {
 ///
 /// Independent servers are listed concurrently so total latency is bounded by
 /// the slowest connector rather than the sum of per-server timeouts. Commit
-/// remains transactional in [`discover_deferred_connectors`].
+/// remains transactional in [`discover_deferred_connectors_with_forwarded_headers`].
 async fn prepare_deferred_listings(
     pending: &[DeferredMcpConnector],
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
 ) -> Result<Vec<PreparedDeferredListing>, ResolveError> {
-    futures::future::try_join_all(pending.iter().map(prepare_deferred_listing)).await
+    futures::future::try_join_all(
+        pending
+            .iter()
+            .map(|connector| prepare_deferred_listing(connector, forwarded_header_names, forwarded_headers)),
+    )
+    .await
 }
 
 /// List and rewrite one deferred connector without mutating shared state.
-async fn prepare_deferred_listing(connector: &DeferredMcpConnector) -> Result<PreparedDeferredListing, ResolveError> {
-    let listing = list_deferred_connector(connector).await?;
+async fn prepare_deferred_listing(
+    connector: &DeferredMcpConnector,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
+) -> Result<PreparedDeferredListing, ResolveError> {
+    let listing = list_deferred_connector(connector, forwarded_header_names, forwarded_headers).await?;
     let entry = deferred_entry_view(connector);
     let allowed = extract_allowed_tools(&entry);
     let filtered = apply_allowed_tools_filter(listing, &allowed);
@@ -2220,7 +2253,11 @@ fn check_json_body_size(body: &serde_json::Value, max_rewritten_body_bytes: usiz
 }
 
 /// Call `tools/list` for one deferred connector, redacting URLs on error.
-async fn list_deferred_connector(connector: &DeferredMcpConnector) -> Result<Vec<serde_json::Value>, ResolveError> {
+async fn list_deferred_connector(
+    connector: &DeferredMcpConnector,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
+) -> Result<Vec<serde_json::Value>, ResolveError> {
     let entry = deferred_entry_view(connector);
     mcp_client::validate_mcp_url(&connector.server_url, connector.timeout, connector.allow_loopback)
         .await
@@ -2228,6 +2265,8 @@ async fn list_deferred_connector(connector: &DeferredMcpConnector) -> Result<Vec
     fetch_tools(
         &entry,
         &connector.server_url,
+        forwarded_header_names,
+        Some(forwarded_headers),
         connector.timeout,
         connector.max_tools,
         connector.allow_loopback,

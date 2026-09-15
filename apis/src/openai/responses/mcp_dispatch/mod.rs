@@ -71,8 +71,8 @@ use super::{
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
     openai_mcp_tool_resolve::{
-        McpToolIndex, McpToolMatch, consume_pending_list_tools_failure, discover_deferred_connectors,
-        has_pending_deferred_discovery, resolve_error_action,
+        McpToolIndex, McpToolMatch, consume_pending_list_tools_failure,
+        discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
     },
     state::{DispatchFailure, McpApprovalState, ResponsesState},
 };
@@ -712,7 +712,7 @@ impl HttpFilter for McpDispatchFilter {
                 .as_ref()
                 .filter(|bytes| !bytes.is_empty())
                 .map_or(fallback.as_slice(), |bytes| bytes.as_ref());
-            let action = discover_pending_connectors(ctx, bytes).await?;
+            let action = discover_pending_connectors(ctx, bytes, &self.forward_headers, &forwarded_headers).await?;
             if !matches!(action, FilterAction::Continue) {
                 return Ok(action);
             }
@@ -748,12 +748,14 @@ impl HttpFilter for McpDispatchFilter {
 async fn discover_pending_connectors(
     ctx: &mut HttpFilterContext<'_>,
     body: &[u8],
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
 ) -> Result<FilterAction, FilterError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
         warn!("ResponsesState missing when discovering deferred MCP connectors");
         return Ok(FilterAction::Continue);
     };
-    match discover_deferred_connectors(state).await {
+    match discover_deferred_connectors_with_forwarded_headers(state, forwarded_header_names, forwarded_headers).await {
         Ok(()) => Ok(FilterAction::Continue),
         Err(err) => {
             let streaming = ctx
