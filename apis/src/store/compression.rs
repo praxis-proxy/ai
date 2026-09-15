@@ -13,6 +13,9 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 /// Default zstd compression level when unspecified.
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
+/// Upper bound on the bytes for decompressing a stored zstd frame.
+const MAX_DECOMPRESSED_SIZE: u64 = 256 * 1024 * 1024;
+
 // -----------------------------------------------------------------------------
 // CompressionAlgorithm
 // -----------------------------------------------------------------------------
@@ -106,7 +109,22 @@ impl StoreCompressionConfig {
 /// readable after compression is enabled.
 pub(crate) fn decode(stored: &[u8]) -> Result<serde_json::Value, StoreError> {
     if stored.starts_with(&ZSTD_MAGIC) {
-        let json = zstd::decode_all(stored).map_err(|e| StoreError::Serialization(format!("zstd decompress: {e}")))?;
+        use std::io::Read as _;
+
+        let decoder =
+            zstd::Decoder::new(stored).map_err(|e| StoreError::Serialization(format!("zstd decompress: {e}")))?;
+        // Read one byte past the cap so a payload sitting exactly at the limit is
+        // accepted while anything larger is rejected.
+        let mut json = Vec::new();
+        decoder
+            .take(MAX_DECOMPRESSED_SIZE + 1)
+            .read_to_end(&mut json)
+            .map_err(|e| StoreError::Serialization(format!("zstd decompress: {e}")))?;
+        if json.len() as u64 > MAX_DECOMPRESSED_SIZE {
+            return Err(StoreError::Serialization(
+                "zstd decompress: decompressed payload exceeds size limit".to_owned(),
+            ));
+        }
         serde_json::from_slice(&json).map_err(|e| StoreError::Serialization(e.to_string()))
     } else {
         serde_json::from_slice(stored).map_err(|e| StoreError::Serialization(e.to_string()))
