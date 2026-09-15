@@ -210,6 +210,12 @@ fn dispatch_request_header(
 /// Core treats a non-empty ordered log as authoritative for the entire
 /// pre-read pass. Seed it from the grouped queues before the first ext-proc
 /// mutation so filters that ran earlier are not silently discarded.
+///
+/// This does not make later legacy producers composable with ordered mode;
+/// ext-proc already activated that mode before this bridge existed. Unifying
+/// the two mutation APIs is owned by Praxis Core issue #1072. This bridge is
+/// deliberately limited to retaining mutations that are knowable when
+/// ext-proc crosses the existing ordered-mode boundary.
 pub(crate) fn begin_ordered_pre_read_mutations(ctx: &mut HttpFilterContext<'_>) {
     if !ctx.pre_read_mutations.is_empty() {
         return;
