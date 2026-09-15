@@ -298,7 +298,11 @@ pub(crate) fn target_fingerprint(entry: &serde_json::Value) -> String {
 /// Only a digest is retained, so trusted identity values do not enter persisted
 /// continuation state. Direct client-selected URLs never receive ambient
 /// headers and therefore carry no binding.
-pub(crate) fn bind_forwarded_header_context(entry: &mut serde_json::Value, headers: &http::HeaderMap) {
+pub(crate) fn bind_forwarded_header_context(
+    entry: &mut serde_json::Value,
+    configured_names: &[http::HeaderName],
+    headers: &http::HeaderMap,
+) {
     let connector = super::is_connector_tool_entry(entry);
     let Some(object) = entry.as_object_mut() else {
         return;
@@ -306,17 +310,17 @@ pub(crate) fn bind_forwarded_header_context(entry: &mut serde_json::Value, heade
     if connector {
         object.insert(
             FORWARDED_HEADERS_FINGERPRINT.to_owned(),
-            serde_json::Value::String(forwarded_header_fingerprint(headers)),
+            serde_json::Value::String(forwarded_header_fingerprint(configured_names, headers)),
         );
     } else {
         object.remove(FORWARDED_HEADERS_FINGERPRINT);
     }
 }
 
-/// Deterministically hash the selected outbound header names and wire values.
-fn forwarded_header_fingerprint(headers: &http::HeaderMap) -> String {
+/// Deterministically hash every reserved name and its optional wire values.
+fn forwarded_header_fingerprint(configured_names: &[http::HeaderName], headers: &http::HeaderMap) -> String {
     let mut hasher = Sha256::new();
-    let mut names: Vec<_> = headers.keys().collect();
+    let mut names: Vec<_> = configured_names.iter().collect();
     names.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
     for name in names {
         hash_segment(&mut hasher, name.as_str().as_bytes());

@@ -957,13 +957,12 @@ fn no_credentials_with_empty_headers() {
 }
 
 #[test]
-fn connector_cache_is_disabled_when_request_headers_are_forwarded() {
+fn connector_cache_is_disabled_across_forwarding_reloads() {
     let connector = serde_json::json!({"connector_id": "trusted", "server_label": "tools"});
-    assert!(!can_reuse_cached_listing(&connector, true, true));
-    assert!(can_reuse_cached_listing(&connector, true, false));
+    assert!(!can_reuse_cached_listing(&connector, true));
 
     let direct = serde_json::json!({"server_url": "https://mcp.example.test"});
-    assert!(can_reuse_cached_listing(&direct, false, true));
+    assert!(can_reuse_cached_listing(&direct, false));
 }
 
 #[test]

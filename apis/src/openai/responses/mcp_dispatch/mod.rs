@@ -226,12 +226,12 @@ impl McpDispatchFilter {
     }
 
     /// Bind connector approvals to the ambient headers this request will send.
-    fn bind_request_forwarded_header_context(ctx: &mut HttpFilterContext<'_>, headers: &http::HeaderMap) {
+    fn bind_request_forwarded_header_context(&self, ctx: &mut HttpFilterContext<'_>, headers: &http::HeaderMap) {
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return;
         };
         for entry in state.mcp_tool_map.values_mut() {
-            bind_forwarded_header_context(entry, headers);
+            bind_forwarded_header_context(entry, &self.forward_headers, headers);
         }
     }
 
@@ -682,7 +682,7 @@ impl HttpFilter for McpDispatchFilter {
         }
         ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
         let forwarded_headers = self.forwarded_headers(ctx);
-        Self::bind_request_forwarded_header_context(ctx, &forwarded_headers);
+        self.bind_request_forwarded_header_context(ctx, &forwarded_headers);
 
         // Resume approvals from the previous turn before executing any calls.
         // On approval this injects a function-call-shaped tool call that the

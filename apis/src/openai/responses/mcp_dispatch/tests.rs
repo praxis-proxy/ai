@@ -2766,13 +2766,14 @@ fn resolve_approval_rejects_changed_forwarded_connector_identity() {
     approved["connector_id"] = json!("trusted");
     let mut approved_headers = http::HeaderMap::new();
     approved_headers.insert("x-tenant-id", "tenant-a".parse().unwrap());
-    bind_forwarded_header_context(&mut approved, &approved_headers);
+    let names = [http::HeaderName::from_static("x-tenant-id")];
+    bind_forwarded_header_context(&mut approved, &names, &approved_headers);
 
     let pending = pending_record("call_1", "weather", "get_weather", "{}", target_fingerprint(&approved));
     let mut current = approved;
     let mut current_headers = http::HeaderMap::new();
     current_headers.insert("x-tenant-id", "tenant-b".parse().unwrap());
-    bind_forwarded_header_context(&mut current, &current_headers);
+    bind_forwarded_header_context(&mut current, &names, &current_headers);
     let map = HashMap::from([(("weather".to_owned(), "get_weather".to_owned()), current)]);
     let input = parse_approval_response(&approval_response("call_1", true, None)).expect("parse");
 
@@ -2781,6 +2782,27 @@ fn resolve_approval_rejects_changed_forwarded_connector_identity() {
         matches!(err, ApprovalError::TargetIdentityMismatch(_)),
         "an approval resumed under another connector identity must fail closed: {err:?}"
     );
+}
+
+#[test]
+fn resolve_approval_rejects_changed_forwarded_name_set_when_values_are_absent() {
+    let mut approved = weather_entry();
+    approved["connector_id"] = json!("trusted");
+    let empty_headers = http::HeaderMap::new();
+    bind_forwarded_header_context(
+        &mut approved,
+        &[http::HeaderName::from_static("x-tenant-id")],
+        &empty_headers,
+    );
+
+    let pending = pending_record("call_1", "weather", "get_weather", "{}", target_fingerprint(&approved));
+    let mut current = approved;
+    bind_forwarded_header_context(&mut current, &[], &empty_headers);
+    let map = HashMap::from([(("weather".to_owned(), "get_weather".to_owned()), current)]);
+    let input = parse_approval_response(&approval_response("call_1", true, None)).expect("parse");
+
+    let err = resolve_approval(&input, &pending, &map).unwrap_err();
+    assert!(matches!(err, ApprovalError::TargetIdentityMismatch(_)));
 }
 
 #[test]
