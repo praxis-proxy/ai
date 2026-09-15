@@ -47,7 +47,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 pingora-core = { workspace = true }
-tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "sync"] }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "sync", "process"] }
 tokio-stream = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 tracing = { workspace = true }
@@ -55,3 +55,6 @@ url = { workspace = true }
 futures = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }

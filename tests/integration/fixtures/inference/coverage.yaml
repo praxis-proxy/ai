@@ -107,6 +107,15 @@ features:
     providers:
       anthropic:
         status: live_covered
+  - id: messages.native.count_tokens
+    scopes:
+      - messages_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - messages/native-count-tokens
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.native.request
     scopes:
       - responses_native_passthrough
