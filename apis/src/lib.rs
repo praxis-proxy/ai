@@ -20,6 +20,7 @@ pub(crate) mod mcp_client;
 pub mod openai;
 pub mod promotion;
 mod state_owner;
+mod state_owner_headers;
 #[cfg(feature = "store")]
 pub mod store;
 pub mod subrequest;
@@ -27,6 +28,7 @@ pub mod token_cache;
 pub(crate) mod web_search;
 
 pub use state_owner::{StateOwner, StateOwnerFilter};
+pub use state_owner_headers::StateOwnerHeadersFilter;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -139,6 +141,10 @@ pub(crate) mod test_utils {
         praxis_filter::register_filters!(
             @register registry,
             http "state_owner" => crate::StateOwnerFilter::from_config
+        );
+        praxis_filter::register_filters!(
+            @register registry,
+            http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,

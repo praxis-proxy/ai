@@ -13,7 +13,11 @@
 # swapping:
 #
 #   0. state_owner installs the explicit shared local owner used
-#      by all persisted state filters in this example.
+#      by all persisted state filters in this standalone example. Production
+#      deployments behind a trusted authenticator should use trusted_headers;
+#      a destination-bound state_owner_headers filter can then project the
+#      normalized tenant and subject into an OGX-facing chain without exposing
+#      the raw ingress assertions to unrelated inference backends.
 #
 #   1. openai_conversations handles CRUD for the Conversations API
 #      (/v1/conversations) and sets has_conversation metadata when a

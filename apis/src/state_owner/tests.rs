@@ -7,7 +7,10 @@ use http::{HeaderValue, Method};
 use praxis_filter::{FilterAction, TrustedHeaderMutation};
 
 use super::{StateOwner, StateOwnerFilter};
-use crate::test_utils::{make_filter_context, make_request};
+use crate::{
+    StateOwnerHeadersFilter,
+    test_utils::{make_filter_context, make_request},
+};
 
 const HEADER: &str = "x-test-state-owner";
 const TENANT_HEADER: &str = "x-maas-tenant";
@@ -30,6 +33,16 @@ subject:
     )
     .unwrap();
     StateOwnerFilter::from_config(&yaml).unwrap()
+}
+
+fn projection_filter() -> Box<dyn praxis_filter::HttpFilter> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "tenant_header: x-tenant-id
+subject_header: x-user-id
+issuer_header: x-identity-issuer",
+    )
+    .unwrap();
+    StateOwnerHeadersFilter::from_config(&yaml).unwrap()
 }
 
 fn mapped_request(tenant: &str, subject: &str) -> praxis_filter::Request {
@@ -173,6 +186,98 @@ async fn trusted_headers_mode_maps_static_and_header_components() {
     assert_eq!(owner.subject(), "alice");
     assert!(ctx.request_headers_to_remove.iter().any(|name| name == TENANT_HEADER));
     assert!(ctx.request_headers_to_remove.iter().any(|name| name == SUBJECT_HEADER));
+}
+
+#[test]
+fn projection_configuration_rejects_invalid_or_ambiguous_headers() {
+    for yaml in [
+        "tenant_header: x-tenant-id",
+        "tenant_header: x-tenant-id\nsubject_header: x-tenant-id",
+        "tenant_header: host\nsubject_header: x-user-id",
+        "tenant_header: x-praxis-owner\nsubject_header: x-user-id",
+        "tenant_header: x-tenant-id\nsubject_header: 'not a header'",
+    ] {
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            StateOwnerHeadersFilter::from_config(&value).is_err(),
+            "should reject {yaml}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn projection_overwrites_ingress_headers_from_normalized_owner() {
+    let mut request = mapped_request("tenant-a", "alice");
+    request
+        .headers
+        .insert("x-tenant-id", HeaderValue::from_static("spoofed-tenant"));
+    request
+        .headers
+        .insert("x-user-id", HeaderValue::from_static("spoofed-user"));
+    let mut ctx = make_filter_context(&request);
+
+    assert!(matches!(
+        mapped_filter().on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        projection_filter().on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let projected = |name: &str| {
+        ctx.request_headers_to_set
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.to_str().unwrap())
+    };
+    assert_eq!(projected("x-tenant-id"), Some("tenant-a"));
+    assert_eq!(projected("x-user-id"), Some("alice"));
+    assert_eq!(projected("x-identity-issuer"), Some("https://authorino.example"));
+}
+
+#[tokio::test]
+async fn projection_runs_during_body_pre_read_after_owner_capture() {
+    let request = mapped_request("tenant-a", "alice");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hi"}"#));
+
+    assert!(matches!(
+        mapped_filter()
+            .on_request_body(&mut ctx, &mut body, false)
+            .await
+            .unwrap(),
+        FilterAction::BodyDone
+    ));
+    assert!(matches!(
+        projection_filter()
+            .on_request_body(&mut ctx, &mut body, false)
+            .await
+            .unwrap(),
+        FilterAction::BodyDone
+    ));
+
+    for (name, expected) in [
+        ("x-tenant-id", "tenant-a"),
+        ("x-user-id", "alice"),
+        ("x-identity-issuer", "https://authorino.example"),
+    ] {
+        assert!(ctx.pre_read_mutations.iter().any(|mutation| {
+            matches!(mutation, TrustedHeaderMutation::Set(header, value)
+                if header == name && value == HeaderValue::from_static(expected))
+        }));
+    }
+}
+
+#[tokio::test]
+async fn projection_fails_closed_without_normalized_owner() {
+    let request = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&request);
+
+    let action = projection_filter().on_request(&mut ctx).await.unwrap();
+
+    assert_eq!(rejection_code(action), "missing_state_owner");
+    assert!(ctx.request_headers_to_set.is_empty());
 }
 
 #[tokio::test]

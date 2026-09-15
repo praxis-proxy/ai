@@ -581,7 +581,7 @@ fn validate_component(name: &'static str, value: &str) -> Result<(), OwnerAssert
 }
 
 /// Build a bounded rejection compatible with OpenAI and Anthropic clients.
-fn reject_owner(status: u16, code: &str, message: &str) -> FilterAction {
+pub(crate) fn reject_owner(status: u16, code: &str, message: &str) -> FilterAction {
     let error_type = if status == 401 {
         "authentication_error"
     } else {
