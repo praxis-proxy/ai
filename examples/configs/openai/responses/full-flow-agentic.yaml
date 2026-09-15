@@ -12,12 +12,12 @@
 # (ResponsesState) which persists across all IRR iterations via extension
 # swapping:
 #
-#   0. state_owner installs the explicit shared local owner used
-#      by all persisted state filters in this standalone example. Production
-#      deployments behind a trusted authenticator should use trusted_headers;
-#      a destination-bound state_owner_headers filter can then project the
-#      normalized tenant and subject into an OGX-facing chain without exposing
-#      the raw ingress assertions to unrelated inference backends.
+#   0. state_owner maps deployment-specific trusted ingress headers into one
+#      normalized tenant/issuer/subject context used by persisted state.
+#      state_owner_headers then projects that context as x-tenant-id and
+#      x-user-id for OGX and explicitly allowlisted callouts. The raw ingress
+#      names are stripped, and the projection is repeated inside the IRR step
+#      because it owns a separate destination request lifecycle.
 #
 #   1. openai_conversations handles CRUD for the Conversations API
 #      (/v1/conversations) and sets has_conversation metadata when a
@@ -74,6 +74,8 @@
 #      array by calling tools/list on each upstream MCP server. Runs after
 #      rehydrate so previous_tools is available for cross-request caching.
 #      Writes mcp_tool_map to ResponsesState for downstream tool dispatch.
+#      Projected identity headers are forwarded only to operator-configured
+#      connector_id targets, never arbitrary client-selected server_url values.
 #
 #   10. The bypass gateway (a no-op `headers` carrier hosting a
 #      branch_chains bypass) routes everything EXCEPT a classified
@@ -279,8 +281,22 @@ filter_chains:
   - name: full-flow-agentic-pipeline
     filters:
       - filter: state_owner
-        mode: single_tenant
-        tenant_id: local
+        # These source names are deployment-specific. The authentication
+        # boundary must overwrite them and prevent clients from bypassing it.
+        mode: trusted_headers
+        tenant:
+          header: x-auth-tenant
+        issuer:
+          static: urn:example:gateway
+        subject:
+          header: x-auth-user
+
+      # Emit the normalized owner in the contract expected by OGX and by the
+      # explicitly configured downstream callouts below. Raw x-auth-* inputs
+      # are stripped and never used directly as destination assertions.
+      - filter: state_owner_headers
+        tenant_header: x-tenant-id
+        subject_header: x-user-id
 
       - filter: openai_conversations
         backend: sqlite
@@ -318,6 +334,7 @@ filter_chains:
         forward_headers:
           - authorization
           - x-tenant-id
+          - x-user-id
         on_missing: reject
         timeout_ms: 10000
 
@@ -326,6 +343,15 @@ filter_chains:
         on_unsupported: continue
 
       - filter: openai_mcp_tool_resolve
+        forward_headers:
+          - x-tenant-id
+          - x-user-id
+        # Ambient trusted headers are forwarded only for connector-backed MCP
+        # entries; arbitrary client-supplied server_url targets never receive
+        # them. Clients reference this destination with connector_id.
+        connectors:
+          - id: trusted-mcp
+            server_url: http://127.0.0.1:8001/mcp
 
       # Bypass gateway: a no-op carrier that runs for everything EXCEPT a
       # classified `POST /v1/responses` create request. When it runs, its
@@ -421,6 +447,14 @@ filter_chains:
         steps:
           - name: inference
             filters:
+              # Re-project inside the destination-owned subrequest. Core moves
+              # the normalized StateOwner extension into each IRR step; this
+              # strips any still-uncommitted raw ingress identity headers and
+              # recreates only the OGX/callout contract.
+              - filter: state_owner_headers
+                tenant_header: x-tenant-id
+                subject_header: x-user-id
+
               # Composes every inference SSE stream into one logical
               # Responses lifecycle: preserves one response identity across
               # rounds and withholds per-round terminal events until the IRR
@@ -444,6 +478,9 @@ filter_chains:
               # MCP calls prepared and classified by the loop owner. Inert
               # until the model emits an MCP tool call.
               - filter: openai_mcp_dispatch
+                forward_headers:
+                  - x-tenant-id
+                  - x-user-id
                 max_calls_per_round: 32
                 max_parallel_calls: 8
                 max_result_bytes: 1048576
@@ -464,6 +501,8 @@ filter_chains:
                 on_failure: closed
                 forward_headers:
                   - authorization
+                  - x-tenant-id
+                  - x-user-id
               # Sole loop owner: parses each model response, records the
               # hosted-tool assignments for the dispatchers, and publishes the
               # single continuation signal (action=loop|done). max_infer_iters

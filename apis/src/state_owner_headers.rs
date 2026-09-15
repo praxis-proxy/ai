@@ -3,15 +3,15 @@
 
 //! Destination-bound header projection for trusted state ownership.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue};
-use praxis_filter::{
-    BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext, TrustedHeaderMutation, parse_filter_config,
-};
+use praxis_filter::{BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
 use serde::Deserialize;
 
-use crate::state_owner::{StateOwner, reject_owner};
+use crate::state_owner::{StateOwner, StateOwnerIngressHeaders, reject_owner};
 
 /// Configuration for [`StateOwnerHeadersFilter`].
 #[derive(Debug, Deserialize)]
@@ -31,7 +31,9 @@ struct StateOwnerHeadersConfig {
 /// Place this filter only in a chain whose destination is authorized to receive
 /// identity. The ingress `state_owner` filter removes its assertion headers;
 /// this filter recreates configured headers from the validated, immutable
-/// context, so client-supplied values cannot shadow the trusted projection.
+/// context, so client-supplied values cannot shadow the trusted projection. In
+/// an IRR step it also strips the raw ingress names carried as bounded transport
+/// metadata before the child request is dispatched.
 ///
 /// # OGX YAML configuration
 ///
@@ -85,7 +87,7 @@ impl StateOwnerHeadersFilter {
     }
 
     /// Queue destination-bound headers from the normalized owner context.
-    fn project(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) -> FilterAction {
+    fn project(&self, ctx: &mut HttpFilterContext<'_>) -> FilterAction {
         let Some(owner) = ctx.extensions.get::<StateOwner>() else {
             return reject_owner(
                 401,
@@ -110,12 +112,28 @@ impl StateOwnerHeadersFilter {
             None => None,
         };
 
-        queue_projection(ctx, &self.tenant_header, tenant, body_phase);
-        queue_projection(ctx, &self.subject_header, subject, body_phase);
+        // IRR carries extensions into each step, but its initial request can
+        // still contain the uncommitted ingress identity headers. Strip those
+        // raw inputs in the destination chain before emitting only its
+        // explicitly configured identity contract.
+        strip_ingress_headers(ctx);
+        queue_projection(ctx, &self.tenant_header, tenant);
+        queue_projection(ctx, &self.subject_header, subject);
         if let (Some(header), Some(value)) = (&self.issuer_header, issuer) {
-            queue_projection(ctx, header, value, body_phase);
+            queue_projection(ctx, header, value);
         }
         FilterAction::Continue
+    }
+}
+
+/// Remove raw transport assertions before projecting destination identity.
+fn strip_ingress_headers(ctx: &mut HttpFilterContext<'_>) {
+    let ingress_headers = ctx
+        .extensions
+        .get::<StateOwnerIngressHeaders>()
+        .map(|headers| Arc::clone(&headers.0));
+    if let Some(headers) = ingress_headers {
+        ctx.request_headers_to_remove.extend(headers.iter().cloned());
     }
 }
 
@@ -164,13 +182,8 @@ fn projection_value(component: &str, value: &str) -> Result<HeaderValue, FilterA
 }
 
 /// Queue an overwrite in the mutation channel for the active lifecycle phase.
-fn queue_projection(ctx: &mut HttpFilterContext<'_>, header: &HeaderName, value: HeaderValue, body_phase: bool) {
-    if body_phase {
-        ctx.pre_read_mutations
-            .push(TrustedHeaderMutation::Set(header.clone(), value));
-    } else {
-        ctx.request_headers_to_set.push((header.clone(), value));
-    }
+fn queue_projection(ctx: &mut HttpFilterContext<'_>, header: &HeaderName, value: HeaderValue) {
+    ctx.request_headers_to_set.push((header.clone(), value));
 }
 
 #[async_trait]
@@ -186,7 +199,7 @@ impl HttpFilter for StateOwnerHeadersFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        Ok(self.project(ctx, false))
+        Ok(self.project(ctx))
     }
 
     async fn on_request_body(
@@ -195,7 +208,7 @@ impl HttpFilter for StateOwnerHeadersFilter {
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        Ok(match self.project(ctx, true) {
+        Ok(match self.project(ctx) {
             FilterAction::Continue => FilterAction::BodyDone,
             action => action,
         })

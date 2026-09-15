@@ -3390,7 +3390,7 @@ fn all_three_dispatchers_execute_in_one_irr_continuation() {
     let vector_calls = spawn_vector_store_mock(vector_listener);
 
     let proxy_port = free_port();
-    let config = load_unified_dispatch_config(proxy_port, model.port(), search_port, vector_port);
+    let config = load_unified_dispatch_config(proxy_port, model.port(), search_port, vector_port, mcp.port());
     let proxy = start_proxy(&config);
 
     let request_body = serde_json::json!({
@@ -3404,16 +3404,18 @@ fn all_three_dispatchers_execute_in_one_irr_continuation() {
             {
                 "type": "mcp",
                 "server_label": "weather",
-                "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather"],
                 "require_approval": "never"
             }
         ]
     });
-    let raw = http_send(
-        proxy.addr(),
-        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    let request = json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()).replacen(
+        "Content-Type: application/json",
+        "x-tenant-id: tenant-a\r\nContent-Type: application/json",
+        1,
     );
+    let raw = http_send(proxy.addr(), &request);
 
     assert_eq!(parse_status(&raw), 200, "unified round-trip should return 200: {raw}");
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
@@ -3445,6 +3447,19 @@ fn all_three_dispatchers_execute_in_one_irr_continuation() {
         "MCP tool must be dispatched exactly once"
     );
     assert_eq!(mcp.last_tool_call_name().as_deref(), Some("get_weather"));
+    let mcp_requests = mcp.received_requests();
+    for method in ["tools/list", "tools/call"] {
+        assert!(
+            mcp_requests.iter().any(|request| {
+                request.json_rpc_method.as_deref() == Some(method)
+                    && request
+                        .headers
+                        .iter()
+                        .any(|(name, value)| name.eq_ignore_ascii_case("x-tenant-id") && value == "tenant-a")
+            }),
+            "{method} should receive the configured trusted header: {mcp_requests:#?}"
+        );
+    }
 
     // Every server-owned call is reconciled to a completed public output item.
     let output = response["output"].as_array().expect("final response output array");
@@ -5371,6 +5386,7 @@ fn load_unified_dispatch_config(
     model_port: u16,
     search_port: u16,
     vector_port: u16,
+    mcp_port: u16,
 ) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
@@ -5390,12 +5406,14 @@ fn load_unified_dispatch_config(
     // Allow loopback MCP resolution and dispatch against the in-test MCP server.
     let yaml = yaml.replacen(
         "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
+        &format!(
+            "      - filter: state_owner\n        mode: trusted_headers\n        tenant: {{header: x-tenant-id}}\n        issuer: {{static: urn:test}}\n        subject: {{static: test-user}}\n      - filter: state_owner_headers\n        tenant_header: x-tenant-id\n        subject_header: x-user-id\n      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n        forward_headers: [x-tenant-id]\n        connectors:\n          - id: trusted-mcp\n            server_url: http://127.0.0.1:{mcp_port}/mcp\n"
+        ),
         1,
     );
     let yaml = yaml.replacen(
         "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
+        "              - filter: state_owner_headers\n                tenant_header: x-tenant-id\n                subject_header: x-user-id\n              - filter: openai_mcp_dispatch\n                allow_loopback: true\n                forward_headers: [x-tenant-id]\n",
         1,
     );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse unified dispatch config")

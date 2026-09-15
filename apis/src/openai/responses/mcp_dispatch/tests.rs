@@ -73,7 +73,7 @@ fn mcp_call_ids_must_be_present_nonempty_and_unique() {
     ));
 }
 
-fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecutionOptions {
+fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecutionOptions<'static> {
     McpExecutionOptions {
         parallel,
         max_parallel_calls: 8,
@@ -81,6 +81,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
         timeout,
         allow_loopback: true,
+        forwarded_headers: None,
     }
 }
 
@@ -596,6 +597,22 @@ fn config_custom_timeout() {
 }
 
 #[test]
+fn config_validates_forward_headers() {
+    let cfg = serde_yaml::from_str::<McpDispatchConfig>("forward_headers: [X-Tenant-ID, x-user-id]").unwrap();
+    let validated = build_config(cfg).unwrap();
+    assert_eq!(validated.forward_headers, ["x-tenant-id", "x-user-id"]);
+
+    for yaml in [
+        "forward_headers: [host]",
+        "forward_headers: [authorization]",
+        "forward_headers: [x-user-id, X-User-ID]",
+    ] {
+        let cfg = serde_yaml::from_str::<McpDispatchConfig>(yaml).unwrap();
+        assert!(build_config(cfg).is_err(), "should reject {yaml}");
+    }
+}
+
+#[test]
 fn config_rejects_unknown_fields() {
     let result = serde_yaml::from_str::<McpDispatchConfig>("unknown_field: true");
     assert!(result.is_err(), "should reject unknown fields");
@@ -1070,8 +1087,9 @@ async fn execute_single_call_missing_name_returns_none() {
     let map = sample_tool_map();
     let tc = json!({"call_id": "c1"});
     let timeout = std::time::Duration::from_millis(100);
+    let options = execution_options(false, timeout);
     assert!(
-        execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
+        execute_single_call(&tc, &McpToolIndex::new(&map), &options)
             .await
             .is_none()
     );
@@ -1082,8 +1100,9 @@ async fn execute_single_call_unknown_tool_returns_none() {
     let map = sample_tool_map();
     let tc = json!({"name": "nonexistent", "call_id": "c1"});
     let timeout = std::time::Duration::from_millis(100);
+    let options = execution_options(false, timeout);
     assert!(
-        execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
+        execute_single_call(&tc, &McpToolIndex::new(&map), &options)
             .await
             .is_none()
     );
@@ -1094,7 +1113,8 @@ async fn execute_single_call_ambiguous_returns_error() {
     let map = lossy_collision_tool_map();
     let tc = json!({"name": "my_server__get", "call_id": "c1"});
     let timeout = std::time::Duration::from_millis(100);
-    let result = execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
+    let options = execution_options(false, timeout);
+    let result = execute_single_call(&tc, &McpToolIndex::new(&map), &options)
         .await
         .unwrap();
     assert!(result.output_item["error"].as_str().unwrap().contains("ambiguous"));
@@ -1105,7 +1125,8 @@ async fn execute_single_call_malformed_args_returns_error() {
     let map = sample_tool_map();
     let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": "not-json"});
     let timeout = std::time::Duration::from_millis(100);
-    let result = execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
+    let options = execution_options(false, timeout);
+    let result = execute_single_call(&tc, &McpToolIndex::new(&map), &options)
         .await
         .unwrap();
     assert!(result.output_item["error"].as_str().unwrap().contains("malformed"));
@@ -1116,7 +1137,8 @@ async fn execute_single_call_connection_error() {
     let map = sample_tool_map();
     let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {"city": "Paris"}});
     let timeout = std::time::Duration::from_millis(200);
-    let result = execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
+    let options = execution_options(false, timeout);
+    let result = execute_single_call(&tc, &McpToolIndex::new(&map), &options)
         .await
         .unwrap();
     assert!(

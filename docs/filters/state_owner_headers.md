@@ -7,7 +7,7 @@ Projects a normalized [`StateOwner`] into destination-specific HTTP headers.
 
 ## Configuration Notes
 
-Place this filter only in a chain whose destination is authorized to receive identity. The ingress `state_owner` filter removes its assertion headers; this filter recreates configured headers from the validated, immutable context, so client-supplied values cannot shadow the trusted projection.
+Place this filter only in a chain whose destination is authorized to receive identity. The ingress `state_owner` filter removes its assertion headers; this filter recreates configured headers from the validated, immutable context, so client-supplied values cannot shadow the trusted projection. In an IRR step it also strips the raw ingress names carried as bounded transport metadata before the child request is dispatched.
 
 ## Configuration
 

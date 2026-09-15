@@ -342,11 +342,13 @@ async fn projection_runs_during_body_pre_read_after_owner_capture() {
         ("x-user-id", "alice"),
         ("x-identity-issuer", "https://authorino.example"),
     ] {
-        assert!(ctx.pre_read_mutations.iter().any(|mutation| {
-            matches!(mutation, TrustedHeaderMutation::Set(header, value)
-                if header == name && value == HeaderValue::from_static(expected))
-        }));
+        assert!(
+            ctx.request_headers_to_set
+                .iter()
+                .any(|(header, value)| { header == name && value == HeaderValue::from_static(expected) })
+        );
     }
+    assert!(ctx.pre_read_mutations.is_empty());
 }
 
 #[tokio::test]
@@ -407,12 +409,42 @@ async fn trusted_headers_mode_queues_all_header_removals_in_body_phase() {
 
     assert!(matches!(action, FilterAction::BodyDone));
     for expected in [TENANT_HEADER, SUBJECT_HEADER] {
-        assert!(
-            ctx.pre_read_mutations
-                .iter()
-                .any(|mutation| matches!(mutation, TrustedHeaderMutation::Remove(name) if name == expected))
-        );
+        assert!(ctx.request_headers_to_remove.iter().any(|name| name == expected));
     }
+    assert!(ctx.pre_read_mutations.is_empty());
+}
+
+#[tokio::test]
+async fn body_phase_owner_mutations_preserve_sibling_grouped_queues() {
+    let request = mapped_request("tenant-a", "alice");
+    let mut ctx = make_filter_context(&request);
+    ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+    ctx.extra_request_headers
+        .push((Cow::Borrowed("x-classified"), "yes".to_owned()));
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hi"}"#));
+
+    assert!(matches!(
+        mapped_filter()
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap(),
+        FilterAction::BodyDone
+    ));
+    assert!(matches!(
+        projection_filter()
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap(),
+        FilterAction::BodyDone
+    ));
+
+    assert!(ctx.pre_read_mutations.is_empty());
+    assert!(ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING));
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .any(|(name, value)| name == "x-classified" && value == "yes")
+    );
 }
 
 #[tokio::test]
@@ -462,11 +494,8 @@ async fn body_phase_installs_owner_before_downstream_body_consumers() {
 
     assert!(matches!(action, FilterAction::BodyDone));
     assert_eq!(ctx.extensions.get::<StateOwner>().unwrap().subject(), "alice");
-    assert!(
-        ctx.pre_read_mutations
-            .iter()
-            .any(|mutation| matches!(mutation, TrustedHeaderMutation::Remove(name) if name == HEADER))
-    );
+    assert!(ctx.request_headers_to_remove.iter().any(|name| name == HEADER));
+    assert!(ctx.pre_read_mutations.is_empty());
 }
 
 #[tokio::test]

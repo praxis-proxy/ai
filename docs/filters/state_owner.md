@@ -7,7 +7,7 @@ Establishes a normalized [`StateOwner`] from trusted identity sources.
 
 ## Configuration Notes
 
-Every configured header must be governed by a trusted upstream boundary. This filter validates and strips consumed headers; it does not authenticate their producer. In `trusted_headers` mode each component must select exactly one `header` or `static` source, and component header names must be distinct.
+Every configured header must be governed by a trusted upstream boundary. This filter validates and strips consumed headers; it does not authenticate their producer. In `trusted_headers` mode each component must select exactly one `header` or `static` source, and component header names must be distinct. Agentic routers can snapshot request headers before the parent protocol commits body-phase removals, so each destination-owned IRR step must begin with `state_owner_headers`; it consumes the carried transport metadata, strips the raw ingress names in the child, and emits only configured outputs.
 
 ## Examples
 

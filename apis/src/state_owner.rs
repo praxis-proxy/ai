@@ -12,6 +12,8 @@
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used, reason = "tests")]
 mod tests;
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -50,6 +52,14 @@ pub struct StateOwner {
     /// Stable subject identifier within `issuer`.
     subject: String,
 }
+
+/// Ingress-only headers consumed while normalizing [`StateOwner`].
+///
+/// Core carries this bounded transport metadata through agentic subrequests so
+/// destination projection can strip raw identity inputs before emitting its
+/// explicitly configured wire contract.
+#[derive(Clone, Debug)]
+pub(crate) struct StateOwnerIngressHeaders(pub(crate) Arc<[HeaderName]>);
 
 impl StateOwner {
     /// Stable tenant namespace.
@@ -231,6 +241,10 @@ fn ensure_distinct_component_headers(sources: [&OwnerComponentSource; 3]) -> Res
 /// This filter validates and strips consumed headers; it does not authenticate
 /// their producer. In `trusted_headers` mode each component must select exactly
 /// one `header` or `static` source, and component header names must be distinct.
+/// Agentic routers can snapshot request headers before the parent protocol
+/// commits body-phase removals, so each destination-owned IRR step must begin
+/// with `state_owner_headers`; it consumes the carried transport metadata,
+/// strips the raw ingress names in the child, and emits only configured outputs.
 ///
 /// # Versioned-assertion YAML configuration
 ///
@@ -268,6 +282,8 @@ fn ensure_distinct_component_headers(sources: [&OwnerComponentSource; 3]) -> Res
 pub struct StateOwnerFilter {
     /// Validated source used to populate the request context.
     source: OwnerSource,
+    /// Header names consumed by the configured source.
+    ingress_headers: Arc<[HeaderName]>,
 }
 
 impl StateOwnerFilter {
@@ -298,13 +314,17 @@ impl StateOwnerFilter {
                 return Err("state_owner: 'policy' mode requires the PPE integration".into());
             },
         };
-        Ok(Box::new(Self { source }))
+        let ingress_headers = ingress_headers(&source);
+        Ok(Box::new(Self {
+            source,
+            ingress_headers,
+        }))
     }
 
     /// Resolve and install the owner, rejecting invalid or absent assertions.
     fn resolve(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) -> FilterAction {
         if ctx.extensions.get::<StateOwner>().is_some() {
-            self.queue_header_removal(ctx, body_phase);
+            self.queue_header_removal(ctx);
             return FilterAction::Continue;
         }
 
@@ -324,28 +344,35 @@ impl StateOwnerFilter {
             },
         };
         ctx.extensions.insert(owner);
-        self.queue_header_removal(ctx, body_phase);
+        ctx.extensions
+            .insert(StateOwnerIngressHeaders(Arc::clone(&self.ingress_headers)));
+        self.queue_header_removal(ctx);
         FilterAction::Continue
     }
 
     /// Queue removal using the mutation channel appropriate for the lifecycle.
-    fn queue_header_removal(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) {
-        match &self.source {
-            OwnerSource::Static(_) => {},
-            OwnerSource::TrustedHeader(header) => queue_one_header_removal(ctx, header, body_phase),
-            OwnerSource::TrustedComponents {
-                tenant,
-                issuer,
-                subject,
-            } => {
-                for header in [tenant, issuer, subject]
-                    .into_iter()
-                    .filter_map(OwnerComponentSource::header)
-                {
-                    queue_one_header_removal(ctx, header, body_phase);
-                }
-            },
+    fn queue_header_removal(&self, ctx: &mut HttpFilterContext<'_>) {
+        for header in self.ingress_headers.iter() {
+            ctx.request_headers_to_remove.push(header.clone());
         }
+    }
+}
+
+/// Capture the bounded set of ingress headers consumed by one owner source.
+fn ingress_headers(source: &OwnerSource) -> Arc<[HeaderName]> {
+    match source {
+        OwnerSource::Static(_) => Arc::from([]),
+        OwnerSource::TrustedHeader(header) => Arc::from([header.clone()]),
+        OwnerSource::TrustedComponents {
+            tenant,
+            issuer,
+            subject,
+        } => [tenant, issuer, subject]
+            .into_iter()
+            .filter_map(OwnerComponentSource::header)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into(),
     }
 }
 
@@ -375,16 +402,6 @@ fn trusted_components_source(
         issuer,
         subject,
     })
-}
-
-/// Queue removal of one consumed identity header.
-fn queue_one_header_removal(ctx: &mut HttpFilterContext<'_>, header: &HeaderName, body_phase: bool) {
-    if body_phase {
-        ctx.pre_read_mutations
-            .push(TrustedHeaderMutation::Remove(header.clone()));
-    } else {
-        ctx.request_headers_to_remove.push(header.clone());
-    }
 }
 
 /// Parse the trusted assertion header into a complete owner.
@@ -525,27 +542,73 @@ fn effective_owner_header_values(
         return values;
     }
 
-    for mutation in ctx.prior_pre_read_mutations.iter().chain(ctx.pre_read_mutations.iter()) {
-        match mutation {
-            TrustedHeaderMutation::Remove(name) if name == header => values.clear(),
-            TrustedHeaderMutation::Set(name, value) if name == header => {
-                values.clear();
-                values.push(value.clone());
-            },
-            TrustedHeaderMutation::Add(name, value) if name == header => match http::HeaderValue::from_str(value) {
-                Ok(value) => values.push(value),
-                Err(error) => {
-                    tracing::warn!(
-                        header = %name,
-                        error = %error,
-                        "skipping invalid trusted owner add mutation"
-                    );
-                },
-            },
-            _ => {},
+    for mutation in &ctx.prior_pre_read_mutations {
+        apply_owner_header_mutation(&mut values, header, mutation);
+    }
+    if ctx.pre_read_mutations.is_empty() {
+        apply_grouped_owner_header_mutations(ctx, header, &mut values);
+    } else {
+        for mutation in &ctx.pre_read_mutations {
+            apply_owner_header_mutation(&mut values, header, mutation);
         }
     }
     values
+}
+
+/// Apply one ordered trusted mutation to the selected owner-header values.
+fn apply_owner_header_mutation(
+    values: &mut Vec<http::HeaderValue>,
+    header: &HeaderName,
+    mutation: &TrustedHeaderMutation,
+) {
+    match mutation {
+        TrustedHeaderMutation::Remove(name) if name == header => values.clear(),
+        TrustedHeaderMutation::Set(name, value) if name == header => {
+            values.clear();
+            values.push(value.clone());
+        },
+        TrustedHeaderMutation::Add(name, value) if name == header => match http::HeaderValue::from_str(value) {
+            Ok(value) => values.push(value),
+            Err(error) => {
+                tracing::warn!(
+                    header = %name,
+                    error = %error,
+                    "skipping invalid trusted owner add mutation"
+                );
+            },
+        },
+        _ => {},
+    }
+}
+
+/// Apply the legacy grouped queues in Core's remove-set-add order.
+fn apply_grouped_owner_header_mutations(
+    ctx: &HttpFilterContext<'_>,
+    header: &HeaderName,
+    values: &mut Vec<http::HeaderValue>,
+) {
+    if ctx.request_headers_to_remove.iter().any(|name| name == header) {
+        values.clear();
+    }
+    if let Some((_, value)) = ctx.request_headers_to_set.iter().rev().find(|(name, _)| name == header) {
+        values.clear();
+        values.push(value.clone());
+    }
+    for (name, value) in &ctx.extra_request_headers {
+        if !name.eq_ignore_ascii_case(header.as_str()) {
+            continue;
+        }
+        match http::HeaderValue::from_str(value) {
+            Ok(value) => values.push(value),
+            Err(error) => {
+                tracing::warn!(
+                    header = %name,
+                    error = %error,
+                    "skipping invalid grouped owner header mutation"
+                );
+            },
+        }
+    }
 }
 
 /// Parse a nonempty trusted header name.

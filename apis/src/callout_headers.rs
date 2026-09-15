@@ -24,33 +24,71 @@ pub fn effective_body_callout_headers<'a>(
     ctx: &HttpFilterContext<'_>,
     mut headers: Cow<'a, HeaderMap>,
 ) -> Cow<'a, HeaderMap> {
-    let mutations = ctx.prior_pre_read_mutations.iter().chain(ctx.pre_read_mutations.iter());
-
-    for mutation in mutations {
-        let headers = headers.to_mut();
-        match mutation {
-            TrustedHeaderMutation::Remove(name) => {
-                headers.remove(name);
-            },
-            TrustedHeaderMutation::Set(name, value) => {
-                headers.insert(name.clone(), value.clone());
-            },
-            TrustedHeaderMutation::Add(name, value) => match HeaderValue::from_str(value) {
-                Ok(value) => {
-                    headers.append(name.clone(), value);
-                },
-                Err(error) => {
-                    tracing::warn!(
-                        header = %name,
-                        error = %error,
-                        "skipping invalid trusted pre-read add mutation for callout"
-                    );
-                },
-            },
+    for mutation in &ctx.prior_pre_read_mutations {
+        apply_trusted_mutation(&mut headers, mutation);
+    }
+    if ctx.pre_read_mutations.is_empty() {
+        apply_grouped_mutations(ctx, &mut headers);
+    } else {
+        for mutation in &ctx.pre_read_mutations {
+            apply_trusted_mutation(&mut headers, mutation);
         }
     }
 
     headers
+}
+
+/// Apply one ordered pre-read mutation.
+fn apply_trusted_mutation(headers: &mut Cow<'_, HeaderMap>, mutation: &TrustedHeaderMutation) {
+    let headers = headers.to_mut();
+    match mutation {
+        TrustedHeaderMutation::Remove(name) => {
+            headers.remove(name);
+        },
+        TrustedHeaderMutation::Set(name, value) => {
+            headers.insert(name.clone(), value.clone());
+        },
+        TrustedHeaderMutation::Add(name, value) => match HeaderValue::from_str(value) {
+            Ok(value) => {
+                headers.append(name.clone(), value);
+            },
+            Err(error) => {
+                tracing::warn!(
+                    header = %name,
+                    error = %error,
+                    "skipping invalid trusted pre-read add mutation for callout"
+                );
+            },
+        },
+    }
+}
+
+/// Apply legacy grouped body-phase queues in Core's remove-set-add order.
+fn apply_grouped_mutations(ctx: &HttpFilterContext<'_>, headers: &mut Cow<'_, HeaderMap>) {
+    for name in &ctx.request_headers_to_remove {
+        headers.to_mut().remove(name);
+    }
+    for (name, value) in &ctx.request_headers_to_set {
+        headers.to_mut().insert(name.clone(), value.clone());
+    }
+    for (name, value) in &ctx.extra_request_headers {
+        match (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            (Ok(name), Ok(value)) => {
+                headers.to_mut().append(name, value);
+            },
+            (name_result, value_result) => {
+                tracing::warn!(
+                    header = %name,
+                    name_err = ?name_result.err(),
+                    value_err = ?value_result.err(),
+                    "skipping invalid grouped pre-read mutation for callout"
+                );
+            },
+        }
+    }
 }
 
 /// Apply pending request-phase mutations to the header view used by a callout.

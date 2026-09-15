@@ -54,6 +54,7 @@ mod config;
 mod tests;
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     hash::{Hash as _, Hasher as _},
     time::Duration,
@@ -73,6 +74,7 @@ use super::{
     state::{DeferredMcpConnector, ResponsesState},
 };
 use crate::{
+    callout_headers::effective_body_callout_headers,
     json_body::{SerializedJson, serialize_json_body},
     mcp_client,
 };
@@ -136,6 +138,9 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 ///
 /// ```yaml
 /// filter: openai_mcp_tool_resolve
+/// forward_headers:
+///   - x-tenant-id
+///   - x-user-id
 /// timeout_ms: 5000
 /// max_rewritten_body_bytes: 67108864
 /// max_tools: 128
@@ -143,9 +148,17 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 ///   - id: corp_drive
 ///     server_url: https://drive-mcp.internal/mcp
 /// ```
+///
+/// `forward_headers` applies only to configured `connector_id` targets. Direct
+/// client-selected `server_url` targets never receive ambient request headers.
+/// Credential headers are rejected; use the MCP tool entry's dedicated
+/// `authorization` field for per-target credentials.
 pub struct McpToolResolveFilter {
     /// Allow connections to loopback addresses.
     allow_loopback: bool,
+
+    /// Trusted request headers explicitly allowed across the MCP boundary.
+    forward_headers: Vec<http::HeaderName>,
 
     /// Connector ID to server URL mapping.
     connectors: HashMap<String, url::Url>,
@@ -184,6 +197,11 @@ impl McpToolResolveFilter {
             .collect::<Result<HashMap<String, url::Url>, FilterError>>()?;
         Ok(Box::new(Self {
             allow_loopback: validated.allow_loopback,
+            forward_headers: validated
+                .forward_headers
+                .iter()
+                .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
+                .collect(),
             connectors,
             max_rewritten_body_bytes: validated.max_rewritten_body_bytes,
             max_servers: validated.max_servers,
@@ -218,8 +236,7 @@ impl McpToolResolveFilter {
             self.max_rewritten_body_bytes,
             self.allow_loopback,
         );
-        let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
-        let resolution = self.resolve_all_entries(&mcp_entries, previous_tools).await?;
+        let resolution = self.resolve_request_entries(ctx, &mcp_entries).await?;
         if !resolution.has_resolved && deferred_mcp.is_empty() {
             return Ok(FilterAction::Continue);
         }
@@ -262,6 +279,19 @@ impl McpToolResolveFilter {
         Ok(FilterAction::Continue)
     }
 
+    /// Resolve request entries using the effective trusted-header view.
+    async fn resolve_request_entries(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        entries: &[serde_json::Value],
+    ) -> Result<Resolution, ResolveError> {
+        let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
+        let effective_headers = effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers));
+        let forwarded_headers = select_forward_headers(&self.forward_headers, &effective_headers);
+        self.resolve_all_entries(entries, previous_tools, &forwarded_headers)
+            .await
+    }
+
     /// Validate MCP entries: check server count and duplicate labels.
     fn validate_entries(&self, entries: &[serde_json::Value]) -> Result<(), ResolveError> {
         let server_count = count_distinct_servers(entries);
@@ -286,6 +316,7 @@ impl McpToolResolveFilter {
         &self,
         entries: &[serde_json::Value],
         previous_tools: Option<&Vec<serde_json::Value>>,
+        forwarded_headers: &http::HeaderMap,
     ) -> Result<Resolution, ResolveError> {
         let (entry_to_task, task_entries, task_allowed_names) = dedup_entries(entries);
 
@@ -293,7 +324,9 @@ impl McpToolResolveFilter {
             .iter()
             .zip(&task_allowed_names)
             .map(|(entry, allowed)| async {
-                let result = self.resolve_entry(entry, previous_tools, allowed.as_deref()).await;
+                let result = self
+                    .resolve_entry(entry, previous_tools, allowed.as_deref(), forwarded_headers)
+                    .await;
                 redact_connector_client_error(result, entry)
             })
             .collect();
@@ -313,6 +346,7 @@ impl McpToolResolveFilter {
         entry: &serde_json::Value,
         previous_tools: Option<&Vec<serde_json::Value>>,
         cache_allowed_names: Option<&[String]>,
+        forwarded_headers: &http::HeaderMap,
     ) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
         let Some(server_url) = resolvable_server_url(entry) else {
             return Ok(None);
@@ -332,7 +366,8 @@ impl McpToolResolveFilter {
             debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
             return Ok(Some(cached));
         }
-        let tools = fetch_tools(entry, server_url, self.timeout, self.max_tools, self.allow_loopback).await?;
+        let forwarded_headers = is_connector.then_some(forwarded_headers);
+        let tools = fetch_tools(entry, server_url, self, forwarded_headers).await?;
         Ok(Some(tools))
     }
 }
@@ -1444,26 +1479,37 @@ fn count_distinct_servers(entries: &[serde_json::Value]) -> usize {
 async fn fetch_tools(
     entry: &serde_json::Value,
     server_url: &str,
-    timeout: Duration,
-    max_tools: usize,
-    allow_loopback: bool,
+    filter: &McpToolResolveFilter,
+    forwarded_headers: Option<&http::HeaderMap>,
 ) -> Result<Vec<serde_json::Value>, ResolveError> {
     let display_url = mcp_client::parse_display_url(server_url);
     debug!(label = server_label(entry), url = %display_url, "calling MCP tools/list");
     let auth = entry.get("authorization").and_then(serde_json::Value::as_str);
-    mcp_client::list_tools(
+    mcp_client::list_tools_with_forwarded_headers(
         server_url,
         entry.get("headers"),
         auth,
-        timeout,
-        max_tools,
-        allow_loopback,
+        forwarded_headers,
+        filter.timeout,
+        filter.max_tools,
+        filter.allow_loopback,
     )
     .await
     .map_err(|source| ResolveError::Client {
         server_label: server_label(entry).to_owned(),
         source,
     })
+}
+
+/// Select only configured headers from the effective body-phase request.
+fn select_forward_headers(names: &[http::HeaderName], source: &http::HeaderMap) -> http::HeaderMap {
+    let mut selected = http::HeaderMap::with_capacity(names.len());
+    for name in names {
+        if let Some(value) = source.get(name) {
+            selected.insert(name.clone(), value.clone());
+        }
+    }
+    selected
 }
 
 /// Rewrite the request body, replacing resolved `type: "mcp"`
