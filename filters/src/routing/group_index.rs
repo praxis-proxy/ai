@@ -23,9 +23,22 @@ pub(crate) struct SelectionGroup {
     /// are retained as separate slots, so duplication intentionally acts as a
     /// producer-controlled selection weight.
     pub(crate) candidate_indexes: Vec<usize>,
+    /// Weighted cumulative buckets for this group.
+    pub(crate) weighted_entries: Vec<WeightedEntry>,
+    /// Total positive weight in this group.
+    pub(crate) total_weight: u64,
     /// State belongs to this snapshot and therefore resets only on a real
     /// semantic snapshot replacement.
     pub(crate) next: AtomicUsize,
+}
+
+/// A cumulative weighted-selection bucket.
+#[derive(Debug)]
+pub(crate) struct WeightedEntry {
+    /// Candidate index in the immutable snapshot.
+    pub(crate) candidate_index: usize,
+    /// Exclusive upper bound for the random draw.
+    pub(crate) cumulative_upper_bound: u64,
 }
 
 /// Precomputed capability lookup used by the request path.
@@ -77,6 +90,7 @@ pub(crate) fn build(candidates: &[RouteCandidate]) -> Result<GroupIndex, FilterE
                     .into());
                 }
                 group.candidate_indexes.push(candidate_index);
+                append_weight(group, candidate_index, candidate)?;
                 continue;
             },
             Some(group) if number != group.number.saturating_add(1) => {
@@ -88,15 +102,39 @@ pub(crate) fn build(candidates: &[RouteCandidate]) -> Result<GroupIndex, FilterE
             _ => {},
         }
 
-        groups.push(SelectionGroup {
+        let mut group = SelectionGroup {
             number,
             admission_state: candidate.admission_state,
             candidate_indexes: vec![candidate_index],
+            weighted_entries: Vec::new(),
+            total_weight: 0,
             next: AtomicUsize::new(0),
-        });
+        };
+        append_weight(&mut group, candidate_index, candidate)?;
+        groups.push(group);
     }
 
     Ok(index)
+}
+
+/// Validate and append one candidate's weight to a group.
+fn append_weight(group: &mut SelectionGroup, index: usize, candidate: &RouteCandidate) -> Result<(), FilterError> {
+    let Some(weight) = candidate.traffic_weight else {
+        return Ok(());
+    };
+    if !(1..=1000).contains(&weight) {
+        return Err(format!("routing: candidate {index}: traffic_weight must be between 1 and 1000").into());
+    }
+    let total = group
+        .total_weight
+        .checked_add(u64::from(weight))
+        .ok_or_else(|| FilterError::from("routing: traffic weights overflow"))?;
+    group.total_weight = total;
+    group.weighted_entries.push(WeightedEntry {
+        candidate_index: index,
+        cumulative_upper_bound: total,
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -119,6 +157,7 @@ mod tests {
             name: Arc::from("model"),
             rank: None,
             selection_group: group,
+            traffic_weight: None,
             selection_tier: None,
             site: Arc::from("site"),
             stable_id: Arc::from("stable"),
@@ -149,6 +188,20 @@ mod tests {
         ])
         .unwrap_err();
         assert!(error.to_string().contains("contiguous and monotonic"));
+    }
+
+    #[test]
+    fn direct_capacity_range_is_accepted_and_out_of_range_values_are_rejected() {
+        for weight in [1, 100, 101, 1_000] {
+            let mut value = candidate(Some(0), AdmissionState::NewAndExisting);
+            value.traffic_weight = Some(weight);
+            assert!(build(&[value]).is_ok(), "weight {weight} should be accepted");
+        }
+        for weight in [0, 1_001, u32::MAX] {
+            let mut value = candidate(Some(0), AdmissionState::NewAndExisting);
+            value.traffic_weight = Some(weight);
+            assert!(build(&[value]).is_err(), "weight {weight} should be rejected");
+        }
     }
 
     #[test]

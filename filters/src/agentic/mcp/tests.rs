@@ -85,6 +85,38 @@ fn reject_invalid_header_names() {
     );
 }
 
+#[test]
+fn reject_api_key_promotion_header() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        headers:
+          method: x-api-key
+        "#,
+    )
+    .unwrap();
+    let err = McpFilter::from_config(&yaml).err().expect("should fail");
+    assert!(
+        err.to_string().contains("x-api-key"),
+        "x-api-key promotion header should be rejected: {err}"
+    );
+}
+
+#[test]
+fn reject_format_routing_promotion_header() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        headers:
+          method: x-praxis-ai-format
+        "#,
+    )
+    .unwrap();
+    let err = McpFilter::from_config(&yaml).err().expect("should fail");
+    assert!(
+        err.to_string().contains("x-praxis-ai-format"),
+        "x-praxis-ai-format promotion header should be rejected: {err}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Filter Behavior Tests
 // -----------------------------------------------------------------------------
@@ -915,6 +947,23 @@ fn custom_protocol_version_header_parses() {
         validated.headers.protocol_version.as_deref(),
         Some("x-custom-mcp-ver"),
         "custom protocol_version header should be used"
+    );
+}
+
+#[test]
+fn build_config_rejects_duplicate_promotion_headers() {
+    let cfg: McpConfig = serde_yaml::from_str(
+        r#"
+        headers:
+          method: x-shared
+          name: X-Shared
+        "#,
+    )
+    .unwrap();
+    let err = build_config(cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("same header name"),
+        "duplicate MCP promotion headers should be rejected: {err}"
     );
 }
 

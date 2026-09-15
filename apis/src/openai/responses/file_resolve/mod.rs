@@ -318,16 +318,12 @@ impl HttpFilter for FileResolveFilter {
 /// Takes ownership of the parsed body so the resolved value can be moved
 /// into [`ResponsesState`] instead of deep-cloned; nothing reads it after
 /// state synchronization.
-#[expect(clippy::too_many_lines, reason = "sequential resolve, rewrite, and size-check flow")]
 async fn resolve_and_rewrite(
     filter: &FileResolveFilter,
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
     mut parsed: serde_json::Value,
 ) -> Result<FilterAction, FilterError> {
-    let streaming = ctx
-        .get_metadata("openai_responses_format.stream")
-        .is_some_and(|v| v == "true");
     let max_bytes = filter.config.max_rewritten_body_bytes;
     let mut budget = filter.client.resolution_budget();
     let count = match resolve_current_input(filter, ctx, &mut parsed, &mut budget).await {
@@ -339,20 +335,20 @@ async fn resolve_and_rewrite(
         if let Err(e) = update_state(filter, ctx, None, &mut budget).await {
             return Ok(reject_resolve_error(&e));
         }
-        if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes, streaming)? {
+        if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
             return Ok(rejection);
         }
         return Ok(FilterAction::Continue);
     }
 
     debug!(count, "resolved file_id references");
-    if let Some(rejection) = rewrite_body(body, &parsed, max_bytes, streaming, filter.name())? {
+    if let Some(rejection) = rewrite_body(body, &parsed, max_bytes, filter.name())? {
         return Ok(rejection);
     }
     if let Err(e) = update_state(filter, ctx, Some(parsed), &mut budget).await {
         return Ok(reject_resolve_error(&e));
     }
-    if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes, streaming)? {
+    if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
         return Ok(rejection);
     }
 
@@ -364,7 +360,6 @@ async fn resolve_and_rewrite(
 fn reject_oversized_state_body(
     ctx: &HttpFilterContext<'_>,
     max_rewritten_body_bytes: usize,
-    streaming: bool,
 ) -> Result<Option<FilterAction>, FilterError> {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         return Ok(None);
@@ -378,7 +373,7 @@ fn reject_oversized_state_body(
             limit = max_rewritten_body_bytes,
             "rebuilt state body exceeds configured limit"
         );
-        reject_rewritten_body_too_large(len, max_rewritten_body_bytes, streaming)
+        reject_rewritten_body_too_large(len, max_rewritten_body_bytes)
     }))
 }
 
@@ -437,7 +432,6 @@ fn rewrite_body(
     body: &mut Option<Bytes>,
     parsed: &serde_json::Value,
     max_rewritten_body_bytes: usize,
-    streaming: bool,
     filter_name: &'static str,
 ) -> Result<Option<FilterAction>, FilterError> {
     let rewritten = serialize_json_body(parsed)
@@ -451,7 +445,6 @@ fn rewrite_body(
         return Ok(Some(reject_rewritten_body_too_large(
             rewritten.len(),
             max_rewritten_body_bytes,
-            streaming,
         )));
     }
     rewritten.commit(body, filter_name, "input");

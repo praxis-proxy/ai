@@ -62,12 +62,16 @@ use crate::json_body::{SerializedJson, serialize_json_body};
 /// When no `ResponsesState` exists, preserves the request body apart
 /// from removing the Praxis-owned `conversation` field.
 ///
-/// Set `terminal_streaming: true` inside an iterative request router step to
-/// select Praxis's streaming transport when the effective outbound body
-/// contains `"stream": true`. Classifier metadata remains descriptive client
-/// intent; this final serializer owns the transport decision. IRR can resume
-/// one downstream stream across response-dependent transitions, but every
-/// response-body filter in a streaming-capable step must use `BodyMode::Stream`.
+/// This filter always advertises the Praxis streaming capability. When the
+/// effective outbound body contains `"stream": true` it selects Praxis's
+/// streaming transport; otherwise it selects the buffered transport. There is
+/// no operator opt-in — the removed `terminal_streaming` flag is rejected via
+/// `deny_unknown_fields` so stale configs fail to build. Classifier metadata
+/// remains descriptive client intent; this final serializer owns the transport
+/// decision. IRR can resume one downstream stream across response-dependent
+/// transitions, but every response-body filter in a step composed with this
+/// filter must use `BodyMode::Stream` (or explicitly reject streaming requests)
+/// rather than silently buffering them.
 ///
 /// # YAML
 ///
@@ -80,7 +84,6 @@ use crate::json_body::{SerializedJson, serialize_json_body};
 /// ```yaml
 /// filter: openai_responses_proxy
 /// max_rewritten_body_bytes: 67108864
-/// terminal_streaming: false
 /// ```
 ///
 /// # Example
@@ -116,11 +119,7 @@ impl ResponsesProxyFilter {
     }
 
     /// Serialize the rebuilt body from conversation state.
-    fn serialize_body(
-        &self,
-        state: &ResponsesState,
-        streaming: bool,
-    ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
+    fn serialize_body(&self, state: &ResponsesState) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
         let serialized = serialize_outbound_body(state)
             .map_err(|e| -> FilterError { format!("openai_responses_proxy: {e}").into() })?;
         if serialized.len() > self.config.max_rewritten_body_bytes {
@@ -132,7 +131,6 @@ impl ResponsesProxyFilter {
             return Ok(Err(reject_rewritten_body_too_large(
                 serialized.len(),
                 self.config.max_rewritten_body_bytes,
-                streaming,
             )));
         }
 
@@ -166,7 +164,11 @@ impl HttpFilter for ResponsesProxyFilter {
     }
 
     fn may_select_streaming_subrequest_response(&self) -> bool {
-        self.config.terminal_streaming
+        // Always advertise the capability: transport follows the effective
+        // outbound `stream` field, chosen per-request in `on_request_body`.
+        // There is no operator opt-in. A runtime guard in Praxis still
+        // validates the actual streaming terminal action.
+        true
     }
 
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -186,29 +188,25 @@ impl HttpFilter for ResponsesProxyFilter {
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             strip_conversation_field(body, self.name());
-            select_terminal_response_mode(&self.config, ctx, body);
+            select_terminal_response_mode(ctx, body);
             debug!("no ResponsesState in extensions, passthrough");
             return Ok(FilterAction::Continue);
         };
 
         if !request_needs_rebuild(state) {
             strip_conversation_field(body, self.name());
-            select_terminal_response_mode(&self.config, ctx, body);
+            select_terminal_response_mode(ctx, body);
             debug!("ResponsesState does not require an outbound rewrite, passthrough");
             return Ok(FilterAction::Continue);
         }
 
-        let streaming = ctx
-            .get_metadata("openai_responses_format.stream")
-            .is_some_and(|v| v == "true");
-
-        let serialized = match self.serialize_body(state, streaming)? {
+        let serialized = match self.serialize_body(state)? {
             Ok(bytes) => bytes,
             Err(action) => return Ok(action),
         };
 
         SerializedJson::from_bytes(serialized).commit(body, self.name(), "body");
-        select_terminal_response_mode(&self.config, ctx, body);
+        select_terminal_response_mode(ctx, body);
 
         Ok(FilterAction::Continue)
     }
@@ -234,11 +232,7 @@ struct EffectiveResponseMode {
 /// Classifier metadata describes client intent, but request transformations can
 /// change the provider-visible body. The final serializer therefore owns this
 /// transport decision and reads the bytes it actually leaves for the upstream.
-fn select_terminal_response_mode(config: &ResponsesProxyConfig, ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) {
-    if !config.terminal_streaming {
-        return;
-    }
-
+fn select_terminal_response_mode(ctx: &mut HttpFilterContext<'_>, body: &Option<Bytes>) {
     let mode = if body
         .as_deref()
         .and_then(|bytes| serde_json::from_slice::<EffectiveResponseMode>(bytes).ok())
@@ -348,9 +342,13 @@ fn compaction_to_assistant_message(m: &serde_json::Value) -> serde_json::Value {
         .and_then(|e| base64::engine::general_purpose::STANDARD.decode(e).ok())
         .and_then(|b| String::from_utf8(b).ok())
         .unwrap_or_default();
+    let prefix = m
+        .get("summary_prefix")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(super::compact::DEFAULT_SUMMARY_PREFIX);
     serde_json::json!({
         "role": "assistant",
-        "content": format!("[Previous conversation summary]\n\n{summary}")
+        "content": format!("{prefix}{summary}")
     })
 }
 

@@ -5,11 +5,15 @@
 
 Promotes the JSON `"model"` field from the request body to a request header.
 
+## Configuration Notes
+
+Promotion is deferred until end-of-stream so a later body-writing filter (for example `llmisvc_model_provider_resolver`) can observe the pending header in the same `StreamBuffer` pre-read pass.
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `header` | string | no | Header name for the promoted model value. |
+| `header` | string | no | Header name for the promoted model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or internal `x-praxis-*` header. Defaults to `X-Model`. |
 
 ## Example
 

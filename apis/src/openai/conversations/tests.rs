@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use bytes::Bytes;
 use http::Method;
@@ -15,8 +21,8 @@ use super::{
     validate::validate_metadata,
 };
 use crate::{
-    openai::responses::state::ResponsesState,
-    store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, StoreError},
+    openai::responses::{DEFAULT_TENANT_ID, state::ResponsesState},
+    store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, SqliteResponseStore, StoreError},
     test_utils::{make_filter_context, make_request, make_response},
 };
 
@@ -3485,8 +3491,9 @@ async fn on_response_body_appends_completed_response() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_surfaces_item_insert_failure() {
     let filter = build_failing_filter(FailingItemStore {
-        fail_create_items: true,
-        fail_message_sync: false,
+        append_failure: AppendFailure::CreateItems,
+        conversation_exists: false,
+        metadata_update: MetadataUpdateOutcome::Updated,
     });
 
     let req = make_request(Method::POST, "/v1/responses");
@@ -3525,8 +3532,9 @@ async fn on_response_body_surfaces_item_insert_failure() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_surfaces_transaction_failure() {
     let filter = build_failing_filter(FailingItemStore {
-        fail_create_items: false,
-        fail_message_sync: true,
+        append_failure: AppendFailure::MessageSync,
+        conversation_exists: false,
+        metadata_update: MetadataUpdateOutcome::Updated,
     });
 
     let req = make_request(Method::POST, "/v1/responses");
@@ -3629,6 +3637,129 @@ fn conformance_conversations_generated_schema_check_rejects_wrong_discriminator(
     println!("PRAXIS_CONFORMANCE_OK conversations schema_check_sensitivity");
 }
 
+#[tokio::test]
+async fn update_conversation_metadata_does_not_clobber_concurrent_append() {
+    // #1144: a metadata update must not overwrite conversation history that a
+    // concurrent item append rebuilt between the handler's read and its write.
+    let inner = Arc::new(
+        SqliteResponseStore::new(
+            "sqlite::memory:",
+            "test_responses",
+            "test_conversations",
+            Some("test_items"),
+            None,
+            None,
+        )
+        .await
+        .expect("store creation should succeed"),
+    );
+
+    inner
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_race".to_owned(),
+            tenant_id: DEFAULT_TENANT_ID.to_owned(),
+            created_at: 1000,
+            metadata: serde_json::json!({"topic": "demo"}),
+            messages: Value::Array(Vec::new()),
+        })
+        .await
+        .expect("seed conversation should succeed");
+    inner
+        .create_items_and_sync_messages(
+            DEFAULT_TENANT_ID,
+            "conv_race",
+            std::slice::from_ref(&race_item("item_a")),
+        )
+        .await
+        .expect("seed item should succeed");
+
+    // AppendDuringUpdateStore commits item_b during the handler's read, opening
+    // the exact window the fix must survive.
+    let wrapper = AppendDuringUpdateStore::new(Arc::clone(&inner), race_item("item_b"));
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: test_conversations
+        items_table: test_items
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let filter = OpenaiConversationsFilter::with_store_for_test(cfg, Arc::new(wrapper));
+
+    let req = make_request(Method::POST, "/v1/conversations/conv_race");
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&serde_json::json!({"metadata": {"topic": "updated"}})).unwrap(),
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from update conversation, got {action:?}");
+    };
+    assert_eq!(rejection.status, 200, "metadata update should succeed");
+    let resp = rejection_body(&rejection);
+    assert_eq!(
+        resp["metadata"]["topic"], "updated",
+        "response should carry the new metadata"
+    );
+
+    // The concurrent append must survive: the cache retains BOTH items and the
+    // metadata is persisted. The old whole-record round-trip clobbered item_b.
+    let fetched = ConversationItemStore::get_conversation(inner.as_ref(), DEFAULT_TENANT_ID, "conv_race")
+        .await
+        .expect("get should succeed")
+        .expect("conversation should exist");
+    assert_eq!(
+        cache_item_ids(&fetched.messages),
+        vec!["item_a".to_owned(), "item_b".to_owned()],
+        "metadata update must not clobber the concurrently appended item (#1144)"
+    );
+    assert_eq!(
+        fetched.metadata,
+        serde_json::json!({"topic": "updated"}),
+        "metadata update must persist"
+    );
+}
+
+#[tokio::test]
+async fn update_conversation_metadata_concurrent_delete_returns_404() {
+    // A row present at the read but gone by the metadata write (Ok(false)) must
+    // surface as a 404, never a spurious 200 for a conversation that no longer
+    // exists.
+    let filter = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::None,
+        conversation_exists: true,
+        metadata_update: MetadataUpdateOutcome::Deleted,
+    });
+
+    let rejection = run_metadata_update(&filter, "conv_gone").await;
+    assert_eq!(
+        rejection.status, 404,
+        "a concurrently deleted conversation must yield 404"
+    );
+    let resp = rejection_body(&rejection);
+    assert_eq!(resp["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn update_conversation_metadata_store_error_returns_500() {
+    // A database failure on the metadata write must propagate as a 500 store
+    // error, not a partial success.
+    let filter = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::None,
+        conversation_exists: true,
+        metadata_update: MetadataUpdateOutcome::Error,
+    });
+
+    let rejection = run_metadata_update(&filter, "conv_err").await;
+    assert_eq!(rejection.status, 500, "a store failure must yield 500");
+    let resp = rejection_body(&rejection);
+    assert_eq!(resp["error"]["type"], "server_error");
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
@@ -3677,16 +3808,59 @@ fn build_failing_filter(store: FailingItemStore) -> OpenaiConversationsFilter {
     OpenaiConversationsFilter::with_store_for_test(cfg, Arc::new(store))
 }
 
+/// Drive a metadata update request through the filter and return its rejection.
+async fn run_metadata_update(filter: &OpenaiConversationsFilter, conversation_id: &str) -> praxis_filter::Rejection {
+    let path = format!("/v1/conversations/{conversation_id}");
+    let req = make_request(Method::POST, &path);
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&serde_json::json!({"metadata": {"topic": "updated"}})).unwrap(),
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from update conversation, got {action:?}");
+    };
+    rejection
+}
+
+/// Outcome the fault-injecting store returns from `update_conversation_metadata`.
+enum MetadataUpdateOutcome {
+    /// The row was deleted between the handler's read and the metadata write.
+    Deleted,
+    /// The database rejected the metadata write.
+    Error,
+    /// The metadata column was updated.
+    Updated,
+}
+
+/// Which append-path operation the fault-injecting store forces to error.
+enum AppendFailure {
+    /// Fail the item-insert path (`create_conversation_items` and the insert
+    /// step of `create_items_and_sync_messages`).
+    CreateItems,
+    /// Fail the message-cache sync path (`update_conversation_messages` and the
+    /// sync step of `create_items_and_sync_messages`).
+    MessageSync,
+    /// Let the append paths succeed.
+    None,
+}
+
 /// A [`ConversationItemStore`] that fails selected operations on demand.
 ///
-/// Benign methods return empty/default results; the two boolean knobs force the
-/// item-insert and message-cache-sync paths to error so append-back failure
-/// handling can be tested without a real database.
+/// Benign methods return empty/default results. `append_failure` forces the
+/// item-insert or message-cache-sync path to error so append-back failure
+/// handling can be tested without a real database, while `conversation_exists`
+/// and `metadata_update` steer the update handler onto its post-read branches
+/// (a vanished row or a failed write) without needing real concurrency.
 struct FailingItemStore {
-    /// Force `create_conversation_items` to return a database error.
-    fail_create_items: bool,
-    /// Force the transactional item/cache operation to error.
-    fail_message_sync: bool,
+    /// Which append-path operation is forced to error, if any.
+    append_failure: AppendFailure,
+    /// Return a record from `get_conversation` so the update handler proceeds
+    /// past its existence check to the metadata write.
+    conversation_exists: bool,
+    /// Outcome the update handler observes from `update_conversation_metadata`.
+    metadata_update: MetadataUpdateOutcome,
 }
 
 #[async_trait::async_trait]
@@ -3701,10 +3875,23 @@ impl ConversationItemStore for FailingItemStore {
         _conversation_id: &str,
         _messages: &Value,
     ) -> Result<bool, StoreError> {
-        if self.fail_message_sync {
+        if matches!(self.append_failure, AppendFailure::MessageSync) {
             return Err(StoreError::Database("mock message sync failure".to_owned()));
         }
         Ok(true)
+    }
+
+    async fn update_conversation_metadata(
+        &self,
+        _tenant_id: &str,
+        _conversation_id: &str,
+        _metadata: &Value,
+    ) -> Result<bool, StoreError> {
+        match self.metadata_update {
+            MetadataUpdateOutcome::Deleted => Ok(false),
+            MetadataUpdateOutcome::Error => Err(StoreError::Database("mock metadata update failure".to_owned())),
+            MetadataUpdateOutcome::Updated => Ok(true),
+        }
     }
 
     async fn compare_and_swap_conversation_messages(
@@ -3719,10 +3906,19 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn get_conversation(
         &self,
-        _tenant_id: &str,
-        _conversation_id: &str,
+        tenant_id: &str,
+        conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError> {
-        Ok(None)
+        if !self.conversation_exists {
+            return Ok(None);
+        }
+        Ok(Some(ConversationRecord {
+            conversation_id: conversation_id.to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            created_at: 1000,
+            metadata: serde_json::json!({"topic": "demo"}),
+            messages: Value::Array(Vec::new()),
+        }))
     }
 
     async fn delete_conversation(&self, _tenant_id: &str, _conversation_id: &str) -> Result<bool, StoreError> {
@@ -3730,7 +3926,7 @@ impl ConversationItemStore for FailingItemStore {
     }
 
     async fn create_conversation_items(&self, _items: &[ConversationItemRecord]) -> Result<(), StoreError> {
-        if self.fail_create_items {
+        if matches!(self.append_failure, AppendFailure::CreateItems) {
             return Err(StoreError::Database("mock item insert failure".to_owned()));
         }
         Ok(())
@@ -3742,11 +3938,14 @@ impl ConversationItemStore for FailingItemStore {
         _conversation_id: &str,
         _items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
-        if self.fail_create_items {
-            return Err(StoreError::Database("mock item insert failure".to_owned()));
-        }
-        if self.fail_message_sync {
-            return Err(StoreError::Database("mock message sync failure".to_owned()));
+        match self.append_failure {
+            AppendFailure::CreateItems => {
+                return Err(StoreError::Database("mock item insert failure".to_owned()));
+            },
+            AppendFailure::MessageSync => {
+                return Err(StoreError::Database("mock message sync failure".to_owned()));
+            },
+            AppendFailure::None => {},
         }
         Ok(())
     }
@@ -3810,6 +4009,210 @@ impl ConversationItemStore for FailingItemStore {
     ) -> Result<bool, StoreError> {
         Ok(false)
     }
+}
+
+/// A [`ConversationItemStore`] that reproduces the #1144 metadata-update race.
+///
+/// On the first `get_conversation` call — the read the update handler performs
+/// before writing metadata — it returns the pre-append conversation snapshot and
+/// then commits a concurrent item append that rebuilds the denormalized
+/// `messages` cache. Every other operation delegates to a real SQLite store that
+/// the test also holds, so it can assert the final persisted state.
+struct AppendDuringUpdateStore {
+    /// Ensures the concurrent append fires exactly once.
+    fired: AtomicBool,
+    /// Item committed by the simulated concurrent writer during the handler read.
+    injected_item: ConversationItemRecord,
+    /// Shared real store; the test reads the final state through the same handle.
+    inner: Arc<SqliteResponseStore>,
+}
+
+impl AppendDuringUpdateStore {
+    fn new(inner: Arc<SqliteResponseStore>, injected_item: ConversationItemRecord) -> Self {
+        Self {
+            fired: AtomicBool::new(false),
+            injected_item,
+            inner,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConversationItemStore for AppendDuringUpdateStore {
+    async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
+        self.inner.upsert_conversation(record).await
+    }
+
+    async fn update_conversation_messages(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        messages: &Value,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .update_conversation_messages(tenant_id, conversation_id, messages)
+            .await
+    }
+
+    async fn update_conversation_metadata(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        metadata: &Value,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .update_conversation_metadata(tenant_id, conversation_id, metadata)
+            .await
+    }
+
+    async fn compare_and_swap_conversation_messages(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        expected_messages: &Value,
+        messages: &Value,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .compare_and_swap_conversation_messages(tenant_id, conversation_id, expected_messages, messages)
+            .await
+    }
+
+    async fn get_conversation(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        // Read the current snapshot the handler will act on, then let a concurrent
+        // writer append an item and rebuild the cache before returning the stale read.
+        let snapshot = ConversationItemStore::get_conversation(self.inner.as_ref(), tenant_id, conversation_id).await?;
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            self.inner
+                .create_items_and_sync_messages(tenant_id, conversation_id, std::slice::from_ref(&self.injected_item))
+                .await?;
+        }
+        Ok(snapshot)
+    }
+
+    async fn delete_conversation(&self, tenant_id: &str, conversation_id: &str) -> Result<bool, StoreError> {
+        self.inner.delete_conversation(tenant_id, conversation_id).await
+    }
+
+    async fn create_conversation_items(&self, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+        self.inner.create_conversation_items(items).await
+    }
+
+    async fn create_items_and_sync_messages(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        self.inner
+            .create_items_and_sync_messages(tenant_id, conversation_id, items)
+            .await
+    }
+
+    async fn list_conversation_items(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        after_item_id: Option<&str>,
+        limit: u32,
+        ascending: bool,
+    ) -> Result<Vec<ConversationItemRecord>, StoreError> {
+        self.inner
+            .list_conversation_items(tenant_id, conversation_id, after_item_id, limit, ascending)
+            .await
+    }
+
+    async fn get_existing_conversation_item_ids(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        item_ids: &[&str],
+    ) -> Result<Vec<String>, StoreError> {
+        self.inner
+            .get_existing_conversation_item_ids(tenant_id, conversation_id, item_ids)
+            .await
+    }
+
+    async fn get_conversation_item(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<ConversationItemRecord>, StoreError> {
+        self.inner
+            .get_conversation_item(tenant_id, conversation_id, item_id)
+            .await
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .delete_conversation_item(tenant_id, conversation_id, item_id)
+            .await
+    }
+
+    async fn conversation_item_position(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        self.inner
+            .conversation_item_position(tenant_id, conversation_id, item_id)
+            .await
+    }
+
+    async fn max_item_position(&self, tenant_id: &str, conversation_id: &str) -> Result<i64, StoreError> {
+        self.inner.max_item_position(tenant_id, conversation_id).await
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        item_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .delete_item_and_sync_messages(tenant_id, conversation_id, item_id)
+            .await
+    }
+}
+
+/// A conversation message item whose `item_data` carries its own id for assertions.
+fn race_item(item_id: &str) -> ConversationItemRecord {
+    ConversationItemRecord {
+        item_id: item_id.to_owned(),
+        tenant_id: DEFAULT_TENANT_ID.to_owned(),
+        conversation_id: "conv_race".to_owned(),
+        item_data: serde_json::json!({
+            "id": item_id,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": item_id}],
+        }),
+        created_at: 1000,
+        // Ignored by create_items_and_sync_messages, which assigns positions itself.
+        position: 0,
+    }
+}
+
+/// Sorted item ids extracted from a denormalized `messages` cache value.
+fn cache_item_ids(messages: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = messages
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    ids.sort();
+    ids
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]

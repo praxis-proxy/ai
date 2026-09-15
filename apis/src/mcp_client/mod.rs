@@ -7,6 +7,7 @@
 //! MCP tool declarations. Designed for reuse by `mcp_tool` (#27)
 //! when `call_tool` support is added.
 
+mod bounded_http;
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -34,9 +35,24 @@ use rmcp::{
     transport::{StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig},
 };
 
+use self::bounded_http::{BoundedMcpHttpClient, MAX_CONTROL_RESPONSE_BYTES};
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
+
+/// Cumulative byte budget for a complete `tools/list` result across all
+/// paginated pages.
+///
+/// Each page is already wire-bounded to [`MAX_CONTROL_RESPONSE_BYTES`] before
+/// deserialization, but pagination must not multiply that ceiling: without an
+/// aggregate cap a server could return up to [`MAX_PAGES`] near-ceiling pages —
+/// each carrying a single, count-cheap tool that stays under `max_tools` — and
+/// force the proxy to retain their decoded union (on the order of 100 MiB per
+/// server, amplified across concurrently resolved servers). This bounds that
+/// union. It is deliberately generous relative to a realistic listing (128
+/// tools averaging 32 KiB) so well-behaved servers are never rejected.
+const MAX_LISTING_RESPONSE_BYTES: usize = 4 * MAX_CONTROL_RESPONSE_BYTES;
 
 /// Cloud instance-metadata IPv4 endpoints that the generic loopback,
 /// link-local, and unspecified checks do not already cover. Any request that
@@ -184,6 +200,23 @@ pub(crate) enum McpClientError {
         max: usize,
     },
 
+    /// An MCP server's paginated `tools/list` result exceeded the cumulative
+    /// byte budget for a single discovery operation.
+    ///
+    /// Distinct from [`TooManyTools`](Self::TooManyTools): the tool *count* can
+    /// stay within `max_tools` while the retained bytes across pages do not.
+    #[error("mcp server {url} returned an oversized tools/list: {bytes} bytes exceeds limit of {max}")]
+    ListingTooLarge {
+        /// Server URL.
+        url: McpDisplayUrl,
+
+        /// Cumulative decoded listing bytes observed when the budget was crossed.
+        bytes: usize,
+
+        /// Configured cumulative maximum.
+        max: usize,
+    },
+
     /// MCP server URL is invalid or resolves to a blocked address.
     #[error("mcp server URL blocked (SSRF): {url}: {reason}")]
     SsrfBlocked {
@@ -200,7 +233,7 @@ pub(crate) enum McpClientError {
 }
 
 /// Parse a server URL into a safe display URL, or return invalid fallback.
-fn parse_display_url(server_url: &str) -> McpDisplayUrl {
+pub(crate) fn parse_display_url(server_url: &str) -> McpDisplayUrl {
     server_url
         .parse::<http::Uri>()
         .map_or_else(|_| McpDisplayUrl::invalid(), |uri| McpDisplayUrl::from_uri(&uri))
@@ -217,9 +250,19 @@ fn parse_display_url(server_url: &str) -> McpDisplayUrl {
 /// `previous_tools` cache in `ResponsesState` prevents redundant
 /// calls across request continuations.
 ///
+/// The transport is size-bounded: `initialize` and `tools/list`
+/// bodies are rejected before deserialization once they cross the
+/// control-response ceiling, so an untrusted server cannot exhaust
+/// proxy memory with an oversized response. Across pagination the
+/// decoded listing is additionally bounded by
+/// [`MAX_LISTING_RESPONSE_BYTES`], so a server cannot multiply the
+/// per-page ceiling by returning many near-ceiling pages. `max_tools`
+/// remains a further, post-deserialization limit on the tool *count*.
+///
 /// # Errors
 ///
-/// Returns [`McpClientError`] on connection failure, timeout, or
+/// Returns [`McpClientError`] on connection failure, timeout, an
+/// oversized response (per page or cumulative), or an otherwise
 /// invalid server response.
 #[expect(clippy::too_many_arguments, reason = "allow_loopback extends the existing param set")]
 pub(crate) async fn list_tools(
@@ -234,9 +277,15 @@ pub(crate) async fn list_tools(
 
     let work = async {
         let resolved = resolve_and_validate(server_url, timeout, allow_loopback).await?;
+        // Bound `initialize` and `tools/list` bodies before deserialization.
+        // Without this an untrusted server could return an arbitrarily large
+        // response that is buffered in full before `max_tools` (a count-only
+        // limit) is ever evaluated, exhausting proxy memory under concurrency.
+        let bounded_client = BoundedMcpHttpClient::control_only(build_pinned_client(&resolved)?);
+        let max_sse_event_size = bounded_client.max_sse_event_size();
         let transport = StreamableHttpClientTransport::with_client(
-            build_pinned_client(&resolved)?,
-            build_transport_config(server_url, headers, authorization)?,
+            bounded_client,
+            build_transport_config(server_url, headers, authorization)?.max_sse_event_size(max_sse_event_size),
         );
         let display_url = resolved.display_url;
         let client = Box::pin(().serve(transport))
@@ -276,15 +325,18 @@ pub(crate) async fn call_tool(
     tool_name: &str,
     arguments: serde_json::Value,
     timeout: Duration,
+    max_result_bytes: usize,
     allow_loopback: bool,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
     let display_url = parse_display_url(server_url);
 
     let work = async {
         let resolved = resolve_and_validate(server_url, timeout, allow_loopback).await?;
+        let bounded_client = BoundedMcpHttpClient::new(build_pinned_client(&resolved)?, max_result_bytes);
+        let max_sse_event_size = bounded_client.max_sse_event_size();
         let transport = StreamableHttpClientTransport::with_client(
-            build_pinned_client(&resolved)?,
-            build_transport_config(server_url, headers, authorization)?,
+            bounded_client,
+            build_transport_config(server_url, headers, authorization)?.max_sse_event_size(max_sse_event_size),
         );
         let display_url = resolved.display_url;
 
@@ -324,20 +376,27 @@ pub(crate) async fn call_tool(
 /// servers returning empty pages with valid cursors.
 const MAX_PAGES: usize = 100;
 
-/// Paginate `tools/list`, bounded by both `max_tools` and
-/// [`MAX_PAGES`].
+/// Paginate `tools/list`, bounded by [`MAX_LISTING_RESPONSE_BYTES`]
+/// (cumulative decoded size), `max_tools` (count), and [`MAX_PAGES`].
+///
+/// Each page body is already capped to the control-response ceiling
+/// before deserialization, but a server can still return many
+/// near-ceiling pages; the cumulative byte budget bounds that
+/// amplification independently of the tool count.
 async fn paginate_tools(
     client: &Peer<RoleClient>,
     max_tools: usize,
     url: &McpDisplayUrl,
 ) -> Result<Vec<rmcp::model::Tool>, McpClientError> {
     let mut all_tools = Vec::new();
+    let mut total_bytes: usize = 0;
     let mut cursor = None;
     for _ in 0..MAX_PAGES {
         let params = PaginatedRequestParams::default().with_cursor(cursor);
         let page = Box::pin(client.list_tools(Some(params)))
             .await
             .map_err(|_source| McpClientError::ListTools { url: url.clone() })?;
+        accumulate_listing_bytes(&mut total_bytes, &page.tools, url)?;
         all_tools.extend(page.tools);
         if all_tools.len() > max_tools {
             return Err(McpClientError::TooManyTools {
@@ -634,4 +693,54 @@ fn tools_to_json(tools: Vec<rmcp::model::Tool>) -> Result<Vec<serde_json::Value>
         .into_iter()
         .map(|tool| serde_json::to_value(tool).map_err(McpClientError::Serialization))
         .collect()
+}
+
+/// `io::Write` sink that counts bytes written instead of retaining
+/// them, so a page's serialized size can be measured without a second
+/// heap buffer.
+#[derive(Default)]
+struct ByteCounter {
+    /// Total number of bytes observed.
+    count: usize,
+}
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.count = self.count.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Measure the JSON-serialized byte size of one decoded `tools/list`
+/// page without allocating a second buffer. A serialization error
+/// (which the caller would surface elsewhere) yields the bytes counted
+/// so far, keeping the cumulative budget conservative.
+fn measure_tools_json_bytes(tools: &[rmcp::model::Tool]) -> usize {
+    let mut counter = ByteCounter::default();
+    match serde_json::to_writer(&mut counter, tools) {
+        Ok(()) | Err(_) => counter.count,
+    }
+}
+
+/// Add one page's decoded size to the running listing total and reject the
+/// whole operation once it crosses [`MAX_LISTING_RESPONSE_BYTES`], so
+/// pagination cannot multiply the per-page ceiling.
+fn accumulate_listing_bytes(
+    total_bytes: &mut usize,
+    tools: &[rmcp::model::Tool],
+    url: &McpDisplayUrl,
+) -> Result<(), McpClientError> {
+    *total_bytes = total_bytes.saturating_add(measure_tools_json_bytes(tools));
+    if *total_bytes > MAX_LISTING_RESPONSE_BYTES {
+        return Err(McpClientError::ListingTooLarge {
+            url: url.clone(),
+            bytes: *total_bytes,
+            max: MAX_LISTING_RESPONSE_BYTES,
+        });
+    }
+    Ok(())
 }

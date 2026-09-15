@@ -1,0 +1,58 @@
+name: Wait for vLLM
+description: Block until the backgrounded vLLM CPU container (started by the start-vllm action) is serving, so its image pull and model load overlap prior steps such as cargo build.
+runs:
+  using: composite
+  steps:
+    - name: Wait for vLLM readiness
+      shell: bash
+      run: |
+        echo "Waiting for vLLM health and model endpoints..."
+        # start-vllm launches `docker pull && docker run` in the background so the
+        # (model-baked, multi-GB) image pull and model load overlap the caller's
+        # build. Join here: poll the serving endpoints, but distinguish the three
+        # non-ready states so a failure is diagnosable instead of an opaque
+        # timeout -- (1) launcher still pulling (container absent, launcher
+        # alive), (2) launcher died before creating the container (pull/run
+        # failed), (3) container created but exited/dead (crashed on model load).
+        deadline=$((SECONDS + 900))
+        start_pid=""
+        [ -f /tmp/vllm-start.pid ] && start_pid="$(cat /tmp/vllm-start.pid)"
+        dump_logs() {
+          echo "----- docker logs vllm -----"
+          docker logs vllm 2>&1 || echo "(no vllm container)"
+          if [ -f /tmp/vllm-start.log ]; then
+            echo "----- /tmp/vllm-start.log -----"
+            cat /tmp/vllm-start.log
+          fi
+        }
+        while true; do
+          if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
+             curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; then
+            echo "vLLM is ready"
+            break
+          fi
+          status="$(docker inspect --format='{{.State.Status}}' vllm 2>/dev/null || echo absent)"
+          case "$status" in
+            exited|dead)
+              echo "::error::vLLM container is '$status' before it began serving"
+              dump_logs
+              exit 1
+              ;;
+            absent)
+              # Container not created yet: fine only while the background launcher
+              # is still pulling/starting. If that process is gone, the pull or
+              # run failed before the container was ever created.
+              if [ -n "$start_pid" ] && ! kill -0 "$start_pid" 2>/dev/null; then
+                echo "::error::vLLM launcher (pid $start_pid) exited before the container was created (pull or start failed)"
+                dump_logs
+                exit 1
+              fi
+              ;;
+          esac
+          if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "::error::vLLM did not become ready within 900s"
+            dump_logs
+            exit 1
+          fi
+          sleep 5
+        done

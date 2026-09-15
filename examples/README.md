@@ -5,7 +5,7 @@ Configuration examples organized by category.
 ## Running an Example
 
 ```console
-cargo run -p praxis-ai-proxy -- -c examples/configs/openai/responses/full-flow.yaml
+cargo run -p praxis-ai-proxy -- -c examples/configs/openai/responses/full-flow-agentic.yaml
 curl http://localhost:8080/
 ```
 
@@ -28,6 +28,7 @@ before sending requests.
 | [credential-injection.yaml](configs/credential-injection.yaml) | Injects per-cluster API credentials into upstream requests and strips client-provided credentials to prevent forwarding |
 | [external-metering.yaml](configs/external-metering.yaml) | Pre-request balance check and post-response token usage reporting against an external metering service |
 | [gcp-adc.yaml](configs/gcp-adc.yaml) | Acquires an OAuth2 access token from the GCE/GKE metadata server (source: adc or metadata) and injects "Authorization: Bearer <token>" on every proxied request to Vertex AI |
+| [identity-header-guard.yaml](configs/identity-header-guard.yaml) | Captures identity headers matching a prefix into filter metadata and strips them before forwarding upstream |
 | [intelligent-route-all-capabilities.yaml](configs/intelligent-route-all-capabilities.yaml) | Demonstrates every candidate capability and selection input handled by intelligent_route today |
 | [intelligent-route-inference.yaml](configs/intelligent-route-inference.yaml) | Routes requests to different upstream clusters based on the inference model name extracted from a configured request header.  The header value is set by an earlier filter such as `json_body_field` |
 | [intelligent-route-mcp.yaml](configs/intelligent-route-mcp.yaml) | Routes MCP `tools/call` requests to the cluster that owns the requested tool, using the `mcp.name` metadata set by the `mcp` filter |
@@ -35,6 +36,7 @@ before sending requests.
 | [json-rpc-routing.yaml](configs/json-rpc-routing.yaml) | Routes JSON-RPC 2.0 requests to different backends based on the "method" field in the JSON request body |
 | [lakera-guard.yaml](configs/lakera-guard.yaml) | Screens every request body through Lakera Guard for content moderation before forwarding to the upstream |
 | [llmd-ext-proc-routing.yaml](configs/llmd-ext-proc-routing.yaml) | A real llm-d EPP or test processor returns the trusted x-gateway-destination-endpoint header |
+| [llmisvc-model-provider-resolver.yaml](configs/llmisvc-model-provider-resolver.yaml) | Rewrites publisher-ID body `model` values to the short model name for LLMISvc / KServe routing; the routing header (default `X-Model`) is left unchanged so routing can still use the publisher ID |
 | [mcp-classifier-routing.yaml](configs/mcp-classifier-routing.yaml) | Routes MCP requests by body-derived method and tool name |
 | [mcp-stateless-broker.yaml](configs/mcp-stateless-broker.yaml) | Configurable stateless MCP broker using the final MCP 2026-07-28 stateless profile |
 | [model-to-header-routing.yaml](configs/model-to-header-routing.yaml) | Routes LLM API requests to different backends based on the "model" field in the JSON request body |
@@ -52,11 +54,17 @@ before sending requests.
 
 | File | Description |
 | ------ | ------------- |
+| [full-flow-agentic.yaml](configs/anthropic/full-flow-agentic.yaml) | A single Anthropic Messages gateway that runs the server-owned web-search loop through Praxis core's iterative_request_router (IRR) and serves BOTH streaming and buffered clients from one pipeline. `anthropic_web_search` selects the transport per request from the client's `stream` flag (`terminal_streaming: true`) |
 | [messages-protocol.yaml](configs/anthropic/messages-protocol.yaml) | Routes Anthropic Messages API requests to a native `/v1/messages` backend |
 | [messages-to-openai.yaml](configs/anthropic/messages-to-openai.yaml) | Transforms Anthropic Messages API requests and responses for Chat Completions-compatible inference backends |
-| [messages-web-search.yaml](configs/anthropic/messages-web-search.yaml) | Runs a non-streaming native Messages model -> You.com search -> model loop through Praxis core's iterative_request_router |
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
 | [unified-gateway.yaml](configs/anthropic/unified-gateway.yaml) | Routes traffic by classifier-promoted headers so a single listener handles Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses requests |
+
+### Azure
+
+| File | Description |
+| ------ | ------------- |
+| [chat-completions-to-openai.yaml](configs/azure/chat-completions-to-openai.yaml) | Proxies standard Chat Completions requests to an Azure OpenAI deployment |
 
 ### Inference
 
@@ -70,20 +78,22 @@ before sending requests.
 | ------ | ------------- |
 | [conversations.yaml](configs/openai/conversations/conversations.yaml) | Local /v1/conversations endpoints for conversation lifecycle, backed by the ConversationItemStore |
 | [embeddings-routing.yaml](configs/openai/embeddings/embeddings-routing.yaml) | Routes OpenAI Embeddings API requests to a dedicated Embeddings API backend |
+| [operation-classifier.yaml](configs/openai/operation-classifier.yaml) | Identifies supported OpenAI operations from the request head — method, normalized path, and protocol headers — and publishes the result so a pipeline can branch on a proxy-owned fact instead of a path prefix |
 | [prompts-routing.yaml](configs/openai/prompts/prompts-routing.yaml) | Routes OpenAI Prompts API requests to a dedicated Prompts API backend |
+| [agentic-loop-deferred-mcp-fixture.yaml](configs/openai/responses/agentic-loop-deferred-mcp-fixture.yaml) | Minimal agentic-loop pipeline that sanitizes deferred MCP connectors on the first inference round. `defer_loading: true` skips `tools/list`, so replay never opens an independent MCP callout |
 | [agentic-loop-fixture.yaml](configs/openai/responses/agentic-loop-fixture.yaml) | Minimal agentic loop pipeline for inference fixture replay |
 | [agentic-loop.yaml](configs/openai/responses/agentic-loop.yaml) | Demonstrates the openai_agentic_loop filter with iterative_request_router for step-based model-tool-model looping in the Responses API |
 | [body-size-limits.yaml](configs/openai/responses/body-size-limits.yaml) | Demonstrates how raw request body size is enforced across a chain of OpenAI Responses filters that each buffer the request body |
 | [compact.yaml](configs/openai/responses/compact.yaml) | Demonstrates compaction after rehydrate, file resolve, and document extract so rewritten current-turn content survives history replacement |
 | [doc-extract.yaml](configs/openai/responses/doc-extract.yaml) | Converts `input_file` content parts to `input_text` for inference backends that do not natively support `input_file` (e.g. vLLM, llm-d) |
 | [file-resolve.yaml](configs/openai/responses/file-resolve.yaml) | Resolves `file_id` and `file_url` references in Responses API input by fetching file metadata and content, then inlining base64 content as `file_data` or `image_url` before forwarding |
-| [file-search-callout.yaml](configs/openai/responses/file-search-callout.yaml) | Demonstrates the `openai_file_search_callout` filter configuration |
+| [file-search-callout.yaml](configs/openai/responses/file-search-callout.yaml) | Demonstrates hosted `file_search` execution under the unified agentic loop (#1046). `openai_agentic_loop` is the sole loop owner: it parses each model response, records the `file_search_call` items it sees as assignments, and publishes the single continuation signal (`action=loop|done`). `openai_file_search_callout` is a pure request-phase dispatcher: at request- body EOS on each IRR re-entry it executes the assigned calls against the vector store and reconciles each item in place, then the owner prepares the next inference request |
 | [file-search-chat-completions-fixture.yaml](configs/openai/responses/file-search-chat-completions-fixture.yaml) | Single-upstream fixture configuration for recording the private Chat Completions function representation of a Responses file_search tool |
 | [file-search-chat-completions.yaml](configs/openai/responses/file-search-chat-completions.yaml) | Accepts finite OpenAI Responses requests with hosted file search while targeting a backend that only implements /v1/chat/completions |
+| [file-search-streaming.yaml](configs/openai/responses/file-search-streaming.yaml) | Demonstrates streaming hosted file_search through the iterative_request_router |
 | [format-routing.yaml](configs/openai/responses/format-routing.yaml) | Routes AI API traffic by detected body format |
-| [full-flow-agentic.yaml](configs/openai/responses/full-flow-agentic.yaml) | Extends the full-flow pipeline with an iterative_request_router (IRR) around the inference step, enabling server-side file search execution |
-| [full-flow.yaml](configs/openai/responses/full-flow.yaml) | Combines conversations, format classification, request validation, file resolution, and backend routing into a single pipeline |
-| [irr-terminal-streaming.yaml](configs/openai/responses/irr-terminal-streaming.yaml) | Demonstrates a single-step iterative_request_router pipeline that exposes a native OpenAI Responses SSE body incrementally. `terminal_streaming: true` lets the final serializer select Praxis's typed streaming transport for an effective `"stream": true` request |
+| [full-flow-agentic.yaml](configs/openai/responses/full-flow-agentic.yaml) | Runs the complete Responses API pipeline through an agentic iterative_request_router that executes hosted file_search, web_search, and MCP tool calls in a model-tool-model loop, persisting both buffered and streaming (`stream: true`) responses |
+| [irr-terminal-streaming.yaml](configs/openai/responses/irr-terminal-streaming.yaml) | Demonstrates a single-step iterative_request_router pipeline that exposes a native OpenAI Responses SSE body incrementally. `openai_responses_proxy` always advertises the streaming capability and selects Praxis's typed streaming transport automatically for an effective `"stream": true` request; there is no operator opt-in |
 | [mcp-dispatch.yaml](configs/openai/responses/mcp-dispatch.yaml) | Demonstrates the `openai_mcp_dispatch` filter configuration |
 | [mcp-tool-resolve.yaml](configs/openai/responses/mcp-tool-resolve.yaml) | Demonstrates the `openai_mcp_tool_resolve` filter, which resolves MCP tool entries in the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server |
 | [model-rewrite.yaml](configs/openai/responses/model-rewrite.yaml) | Rewrites or injects the top-level `model` field in Responses API request bodies before forwarding to the inference backend |
@@ -94,7 +104,7 @@ before sending requests.
 | [responses-proxy.yaml](configs/openai/responses/responses-proxy.yaml) | Proxies OpenAI Responses API requests to a native /v1/responses backend |
 | [responses-routing.yaml](configs/openai/responses/responses-routing.yaml) | Routes Responses API traffic by detected mode |
 | [responses-to-chat-completions.yaml](configs/openai/responses/responses-to-chat-completions.yaml) | Accepts OpenAI Responses create requests, including finite stored continuations, while targeting a backend that only implements /v1/chat/completions |
-| [stream-events.yaml](configs/openai/responses/stream-events.yaml) | Demonstrates the `openai_stream_events` filter, which observes SSE chunks from the backend without modification, accumulates state (response object, output items, tool calls, usage), and writes it to ResponsesState metadata |
+| [stream-events.yaml](configs/openai/responses/stream-events.yaml) | Demonstrates the `openai_stream_events` filter, which composes the current iterative-request-router (IRR) execution into one logical Responses SSE stream: it parses each backend SSE chunk, accumulates state (response object, output items, tool calls, usage) into ResponsesState, normalizes the per-round lifecycle, and preserves parser state through stream completion |
 | [tool-routing.yaml](configs/openai/responses/tool-routing.yaml) | Demonstrates using `openai_tool_parse` to route Responses API requests by their tool composition |
 | [vector-stores-routing.yaml](configs/openai/responses/vector-stores-routing.yaml) | Routes /v1/vector_stores traffic and all its subresources to a dedicated backend (any server compatible with the OpenAI Files / Vector Stores API), while sending everything else to a default backend |
 | [vllm-agentic-api.yaml](configs/openai/responses/vllm-agentic-api.yaml) | vLLM Agentic API: https://github.com/vllm-project/agentic-api |

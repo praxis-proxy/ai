@@ -1,0 +1,8 @@
+{
+  "name": "openresponses-conformance-overlay",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "zod": "3.25.76"
+  }
+}

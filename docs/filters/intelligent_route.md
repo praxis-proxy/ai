@@ -55,6 +55,7 @@ Supports two modes:
 | `candidates[].kind` | `inference_model` \| `mcp_tool` | yes | Capability kind. |
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |
 | `candidates[].site` | string | yes | Site that owns this capability. |
+| `candidates[].traffic_weight` | integer | no | Optional bounded weight used only by weighted selection. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
 | `provider_hop_clusters` | string[] | no | Clusters that terminate the authenticated provider-hop protocol. A selected candidate emits the fixed routing context only when its cluster is present in this allowlist. Each named cluster must use an mTLS-authenticated Praxis provider gateway. Direct API/backend clusters remain absent. |

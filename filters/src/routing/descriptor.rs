@@ -160,6 +160,10 @@ pub(crate) struct CandidateConfig {
 
     /// Site that owns this capability.
     pub site: String,
+
+    /// Optional bounded weight used only by weighted selection.
+    #[serde(default)]
+    pub traffic_weight: Option<u32>,
 }
 
 /// Default freshness state for candidates.
@@ -213,6 +217,9 @@ pub(crate) struct RouteCandidate {
 
     /// Producer-assigned priority group (lower is preferred).
     pub selection_group: Option<u32>,
+
+    /// Explicit positive traffic weight for weighted selection.
+    pub traffic_weight: Option<u32>,
 
     /// Producer-assigned locality tier (e.g. `"same_region"`).
     pub selection_tier: Option<Arc<str>>,
@@ -303,6 +310,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             name: Arc::from(c.name.as_str()),
             rank: None,
             selection_group: None,
+            traffic_weight: c.traffic_weight,
             selection_tier: None,
             site: Arc::from(c.site.as_str()),
             stable_id,
@@ -616,6 +624,7 @@ mod tests {
             kind,
             name: name.to_owned(),
             site: site.to_owned(),
+            traffic_weight: None,
         }
     }
 }

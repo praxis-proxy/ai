@@ -3,9 +3,9 @@
 
 //! Pure request body parser for tool definitions in the Responses API.
 //!
-//! Extracts tool types, function tool metadata, built-in tool
-//! configurations, and `tool_choice` from a JSON request body.
-//! No I/O, no side effects, no mutation of input bytes.
+//! Extracts tool types, built-in tool configurations, and `tool_choice`
+//! from a JSON request body. No I/O, no side effects, no mutation of
+//! input bytes.
 
 // -----------------------------------------------------------------------------
 // ToolType
@@ -33,25 +33,7 @@ pub(crate) enum ToolType {
     /// Tool entry is missing a valid discriminator.
     Unclassified,
     /// Unrecognized tool type (forwarded to inference as-is).
-    Unknown(String),
-}
-
-// -----------------------------------------------------------------------------
-// FunctionTool
-// -----------------------------------------------------------------------------
-
-/// Extracted metadata from a function tool definition.
-///
-/// Only fields the proxy needs for routing and dispatch are extracted.
-/// The full parameter schema is forwarded to inference untouched.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FunctionTool {
-    /// Tool name used for dispatch matching.
-    pub name: String,
-    /// Human-readable description (if present).
-    pub description: Option<String>,
-    /// Whether strict schema validation is requested.
-    pub strict: Option<bool>,
+    Unknown,
 }
 
 // -----------------------------------------------------------------------------
@@ -160,16 +142,10 @@ impl ToolChoice {
 #[derive(Debug)]
 #[expect(clippy::struct_excessive_bools, reason = "presence flags for each hosted tool type")]
 pub(crate) struct ParsedTools {
-    /// Extracted function tool definitions.
-    pub function_tools: Vec<FunctionTool>,
     /// Web search configuration (if a `web_search` entry is present).
     pub web_search: Option<WebSearchConfig>,
     /// File search configuration (if a `file_search` entry is present).
     pub file_search: Option<FileSearchConfig>,
-    /// Number of MCP tool entries found. Full payloads will be
-    /// extracted when the MCP tool listing filter (#43) is added.
-    ///
-    /// Until then, only the count is needed for routing/presence.
     /// Parsed `tool_choice` value.
     pub tool_choice: Option<ToolChoice>,
     /// Number of function tools.
@@ -196,7 +172,6 @@ impl ParsedTools {
     /// Build an empty result with no tools and no `tool_choice`.
     fn empty() -> Self {
         Self {
-            function_tools: Vec::new(),
             web_search: None,
             file_search: None,
             tool_choice: None,
@@ -310,16 +285,14 @@ fn classify_tools_array(tools_array: &[serde_json::Value], tool_choice: Option<T
 
 /// Classify and accumulate a single tool entry.
 ///
-/// Extracts routing-relevant details (names, configs) without
-/// cloning opaque payloads. `tool_dispatch` (#26) will add
-/// owned extraction when it needs full tool entries.
+/// Extracts only the routing-relevant configs that a consumer reads,
+/// without cloning opaque payloads. Filters needing full tool entries
+/// (`openai_mcp_tool_resolve`, `file_search_callout`) parse the body
+/// themselves and read only the promoted presence flags from here.
 fn accumulate_tool(acc: &mut ParsedTools, entry_obj: &serde_json::Map<String, serde_json::Value>) {
     match classify_tool_type(entry_obj) {
         ToolType::Function => {
             acc.function_count += 1;
-            if let Some(ft) = extract_function_tool(entry_obj) {
-                acc.function_tools.push(ft);
-            }
         },
         ToolType::WebSearch if acc.web_search.is_none() => {
             acc.web_search = Some(extract_web_search_config(entry_obj));
@@ -338,7 +311,7 @@ fn accumulate_tool(acc: &mut ParsedTools, entry_obj: &serde_json::Map<String, se
         ToolType::Mcp => {
             acc.mcp_count += 1;
         },
-        ToolType::Unknown(_) => {
+        ToolType::Unknown => {
             acc.unknown_count += 1;
         },
         ToolType::Unclassified | ToolType::WebSearch | ToolType::FileSearch => {},
@@ -383,26 +356,8 @@ fn classify_tool_type(obj: &serde_json::Map<String, serde_json::Value>) -> ToolT
         "image_generation" => ToolType::ImageGeneration,
         "tool_search" => ToolType::ToolSearch,
         "mcp" => ToolType::Mcp,
-        other => ToolType::Unknown(other.to_owned()),
+        _ => ToolType::Unknown,
     }
-}
-
-/// Extract proxy-needed fields from a function tool definition.
-fn extract_function_tool(obj: &serde_json::Map<String, serde_json::Value>) -> Option<FunctionTool> {
-    let name = obj.get("name").and_then(serde_json::Value::as_str)?.to_owned();
-
-    let description = obj
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
-
-    let strict = obj.get("strict").and_then(serde_json::Value::as_bool);
-
-    Some(FunctionTool {
-        name,
-        description,
-        strict,
-    })
 }
 
 /// Extract configuration from a `web_search` tool entry.
@@ -514,18 +469,9 @@ mod tests {
         let result = parse_tools(body);
 
         assert_eq!(result.function_count, 2, "should find 2 function tools");
-        assert_eq!(result.function_tools[0].name, "get_weather", "first tool name");
-        assert_eq!(
-            result.function_tools[0].description.as_deref(),
-            Some("Get weather"),
-            "first tool description"
-        );
-        assert_eq!(result.function_tools[0].strict, Some(true), "first tool strict flag");
-        assert_eq!(result.function_tools[1].name, "send_email", "second tool name");
-        assert!(
-            result.function_tools[1].strict.is_none(),
-            "second tool should have no strict flag"
-        );
+        assert_eq!(result.builtin_count, 0, "function tools are not built-ins");
+        assert_eq!(result.mcp_count, 0, "function tools are not MCP tools");
+        assert_eq!(result.unknown_count, 0, "function tools are classified");
         assert!(result.has_tools(), "should have tools");
         assert!(!result.has_web_search(), "should not have web_search");
         assert!(!result.has_file_search(), "should not have file_search");
@@ -538,10 +484,6 @@ mod tests {
 
         assert!(result.has_tools(), "nameless function tool should still set has_tools");
         assert_eq!(result.function_count, 1, "should count the discriminator");
-        assert!(
-            result.function_tools.is_empty(),
-            "metadata not extractable without name"
-        );
     }
 
     #[test]
@@ -904,6 +846,26 @@ mod tests {
     }
 
     #[test]
+    fn distinct_unknown_tool_types_counted_separately() {
+        let body = br#"{
+            "input": "test",
+            "tools": [
+                {"type": "custom_tool"},
+                {"type": "other_tool"},
+                {"type": "custom_tool"}
+            ]
+        }"#;
+        let result = parse_tools(body);
+
+        assert_eq!(
+            result.unknown_count, 3,
+            "every unknown entry counts, including repeats of one type"
+        );
+        assert_eq!(result.function_count, 0, "unknown types are not functions");
+        assert_eq!(result.builtin_count, 0, "unknown types are not built-ins");
+    }
+
+    #[test]
     fn function_tool_missing_name() {
         let body = br#"{"input": "test", "tools": [{"type": "function", "description": "no name"}]}"#;
         let result = parse_tools(body);
@@ -911,10 +873,6 @@ mod tests {
         assert_eq!(
             result.function_count, 1,
             "discriminator should be counted even without name"
-        );
-        assert!(
-            result.function_tools.is_empty(),
-            "metadata not extractable without name"
         );
         assert!(result.has_tools(), "nameless function tool should still set has_tools");
     }

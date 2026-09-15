@@ -11,10 +11,10 @@ Classifies Anthropic Messages API requests and promotes routing facts to headers
 |-------|------|---------|-------------|
 | `on_invalid` | `continue` \| `reject` \| `error` | no | Behavior when the body cannot be classified. |
 | `max_body_bytes` | integer | no | Maximum body size in bytes for `StreamBuffer` mode. |
-| `headers` | AnthropicMessagesFormatHeaders | no | Header names for promoted classification facts. |
-| `headers.format` | string | no | Header name for the detected format. |
-| `headers.model` | string | no | Header name for the extracted model value. |
-| `headers.stream` | string | no | Header name for the extracted stream flag. |
+| `headers` | AnthropicMessagesFormatHeaders | no | Header names for promoted classification facts. Must not be hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` names. Dedicated defaults remain allowed. |
+| `headers.format` | string | no | Header name for the detected format. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-format` remains allowed. |
+| `headers.model` | string | no | Header name for the extracted model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-model` remains allowed. Must not overwrite other classification facts such as `x-praxis-ai-format`. |
+| `headers.stream` | string | no | Header name for the extracted stream flag. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-stream` remains allowed. |
 
 ## Examples
 

@@ -3,11 +3,11 @@
 
 # `openai_file_search_callout`
 
-Executes pending file search calls against a vector store API compatible backend.
+Dispatches the loop owner's pending file-search assignments against a vector store API compatible backend.
 
 ## Configuration Notes
 
-The enclosing iterative router owns model re-entry. Streaming requests are rejected because citation markers require an incremental SSE transformer. Search queries are forwarded unchanged; model context and citation marker formatting are internal.
+The enclosing iterative router owns model re-entry and `openai_agentic_loop` owns the loop decision; this filter only executes the assignments the owner recorded, at request-body EOS on re-entry. Streaming composes through the step-local `openai_stream_events` filter, whose finalizer synthesizes citation-annotated `file_search` lifecycle frames at EOS. Search queries are forwarded unchanged; model context and citation marker formatting are internal.
 
 ## Configuration
 

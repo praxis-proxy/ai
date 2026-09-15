@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "scenario_id": "responses/agentic-status-less-function-call",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-agentic-model",
+    "source_id": "controlled-agentic-status-less-function-call"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "call_1": "call_recorded_0002",
+      "resp_1": "resp_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What is the weather in Paris?",
+              "model": "synthetic-agentic-model",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "id": "resp_recorded_0001",
+              "object": "response",
+              "output": [
+                {
+                  "arguments": "{\"location\":\"Paris\"}",
+                  "call_id": "call_recorded_0002",
+                  "id": "fc_recorded_0001",
+                  "name": "get_weather",
+                  "type": "function_call"
+                }
+              ],
+              "status": "completed",
+              "usage": {
+                "input_tokens": 10,
+                "output_tokens": 15,
+                "total_tokens": 25
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What is the weather in Paris?",
+              "model": "synthetic-agentic-model",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "id": "resp_recorded_0001",
+              "object": "response",
+              "output": [
+                {
+                  "arguments": "{\"location\":\"Paris\"}",
+                  "call_id": "call_recorded_0002",
+                  "id": "fc_recorded_0001",
+                  "name": "get_weather",
+                  "type": "function_call"
+                }
+              ],
+              "status": "completed",
+              "usage": {
+                "input_tokens": 10,
+                "output_tokens": 15,
+                "total_tokens": 25
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

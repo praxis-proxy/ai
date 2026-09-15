@@ -32,6 +32,11 @@ import httpx
 import pytest
 from openai import BadRequestError, NotFoundError, OpenAI
 
+# When set to a postgres:// URL (the vllm-responses-postgres CI job), the
+# conversations store runs against PostgreSQL instead of the default in-memory
+# SQLite, so this suite exercises the same store backend as the responses tests.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -57,6 +62,38 @@ def _find_binary() -> str:
     )
 
 
+def _conversations_filter() -> dict:
+    """Build the openai_conversations filter config for the configured store.
+
+    Defaults to in-memory SQLite; switches to PostgreSQL when DATABASE_URL is a
+    postgres:// URL, matching the responses tests' backend selection so both
+    suites cover the same store backend in CI.
+    """
+    cfg = {
+        "filter": "openai_conversations",
+        "conversations_table": "conversations",
+        "items_table": "conversation_items",
+    }
+    if DATABASE_URL.startswith("postgres"):
+        cfg.update(
+            {
+                "backend": "postgres",
+                "database_url": DATABASE_URL,
+                # Local CI postgres service is loopback + non-TLS.
+                "allow_private_database_url": True,
+                "ssl_mode": "disable",
+            }
+        )
+    else:
+        cfg.update(
+            {
+                "backend": "sqlite",
+                "database_url": "sqlite::memory:",
+            }
+        )
+    return cfg
+
+
 def _write_config(port: int) -> str:
     config = {
         "listeners": [
@@ -69,15 +106,7 @@ def _write_config(port: int) -> str:
         "filter_chains": [
             {
                 "name": "conversations-pipeline",
-                "filters": [
-                    {
-                        "filter": "openai_conversations",
-                        "backend": "sqlite",
-                        "database_url": "sqlite::memory:",
-                        "conversations_table": "conversations",
-                        "items_table": "conversation_items",
-                    }
-                ],
+                "filters": [_conversations_filter()],
             }
         ],
     }
@@ -199,6 +228,44 @@ class TestOpenAIConversations:
                 metadata={"topic": "nope"},
             )
         assert exc_info.value.status_code == 404
+
+    def test_conversation_update_preserves_items(self, openai_client):
+        # End-to-end smoke check that a metadata update coexists with existing
+        # conversation history: after appending a second item and updating the
+        # metadata, both items are still listable and the metadata took effect.
+        #
+        # This is a sequential flow, so it does NOT reproduce the #1144 race
+        # (a concurrent append committing between the update handler's read and
+        # its write). It also lists via the normalized items table, whereas
+        # #1144 clobbered only the denormalized `messages` cache. The actual
+        # race regression guard is the deterministic Rust test
+        # `update_conversation_metadata_does_not_clobber_concurrent_append` in
+        # apis/src/openai/conversations/tests.rs, which injects an append during
+        # the handler's read and asserts on the messages cache directly.
+        conversation = openai_client.conversations.create(
+            metadata={"topic": "demo"},
+            items=[
+                {"type": "message", "role": "user", "content": "first"},
+            ],
+        )
+        openai_client.conversations.items.create(
+            conversation.id,
+            items=[
+                {"type": "message", "role": "assistant", "content": "second"},
+            ],
+        )
+
+        updated = openai_client.conversations.update(
+            conversation.id,
+            metadata={"topic": "project-x"},
+        )
+        assert updated.metadata["topic"] == "project-x"
+
+        page = openai_client.conversations.items.list(conversation.id, order="asc")
+        texts = [item.content[0].text for item in page.data]
+        assert texts == ["first", "second"], (
+            "metadata update must not drop conversation items"
+        )
 
     def test_conversation_delete(self, openai_client):
         conversation = openai_client.conversations.create(

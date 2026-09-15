@@ -103,6 +103,42 @@ pub struct ConversationItemRecord {
 }
 
 // -----------------------------------------------------------------------------
+// PendingApprovalRecord
+// -----------------------------------------------------------------------------
+
+/// A server-owned pending MCP approval.
+///
+/// Written from proxy **output** the moment an `mcp_approval_request` is
+/// emitted, this is the sole source of truth for correlating a later
+/// `mcp_approval_response` back to the call the proxy actually paused on.
+/// Consent provenance lives here, never in the conversation history: a client
+/// can persist a forged `mcp_approval_request` into the trace, but it will
+/// never have a matching pending record, so it fails closed.
+///
+/// The `target_fingerprint` binds the approval to the concrete resolved target
+/// (URL, headers, authorization, connector) captured at approval time so a
+/// resume turn cannot keep the approved `(server_label, tool_name)` while
+/// redirecting execution elsewhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingApprovalRecord {
+    /// Correlation id; equals the paused function-call `call_id` and the
+    /// emitted `mcp_approval_request` `id`.
+    pub approval_id: String,
+
+    /// Server label of the resolved target.
+    pub server_label: String,
+
+    /// Original (un-encoded) tool name of the resolved target.
+    pub tool_name: String,
+
+    /// Tool arguments as a JSON string, captured from the paused call.
+    pub arguments: String,
+
+    /// Fingerprint of the resolved target captured at approval time.
+    pub target_fingerprint: String,
+}
+
+// -----------------------------------------------------------------------------
 // StoreError
 // -----------------------------------------------------------------------------
 

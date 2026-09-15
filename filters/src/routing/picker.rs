@@ -50,32 +50,42 @@ fn select_from_group<'a>(
     if group.admission_state != AdmissionState::NewAndExisting {
         return None;
     }
-    let ordinal = choose_ordinal(policy, group.candidate_indexes.len(), &group.next);
-    select_from_group_at(candidates, group, ordinal)
-}
-
-/// Select a specific member of a prevalidated group.
-///
-/// This small ordinal seam keeps policy tests deterministic without changing
-/// production randomness or making the request path injectable at runtime.
-fn select_from_group_at<'a>(
-    candidates: &'a [RouteCandidate],
-    group: &SelectionGroup,
-    ordinal: usize,
-) -> Option<&'a RouteCandidate> {
-    group
-        .candidate_indexes
-        .get(ordinal)
-        .and_then(|&index| candidates.get(index))
+    let index = choose_candidate_index(policy, group, &group.next)?;
+    candidates.get(index)
 }
 
 /// Resolve a policy to an index inside a non-empty selection group.
-fn choose_ordinal(policy: PickerPolicy, len: usize, counter: &AtomicUsize) -> usize {
-    match policy {
-        PickerPolicy::Deterministic => 0,
-        PickerPolicy::RoundRobin => counter.fetch_add(1, Ordering::Relaxed) % len,
-        PickerPolicy::Random => rand::rng().random_range(0..len),
+fn choose_candidate_index(policy: PickerPolicy, group: &SelectionGroup, counter: &AtomicUsize) -> Option<usize> {
+    let len = group.candidate_indexes.len();
+    if len == 0 {
+        return None;
     }
+    match policy {
+        PickerPolicy::Deterministic => group.candidate_indexes.first().copied(),
+        PickerPolicy::RoundRobin => group
+            .candidate_indexes
+            .get(counter.fetch_add(1, Ordering::Relaxed) % len)
+            .copied(),
+        PickerPolicy::Random => group.candidate_indexes.get(rand::rng().random_range(0..len)).copied(),
+        PickerPolicy::WeightedRandom => {
+            if group.total_weight == 0 {
+                return None;
+            }
+            let draw = rand::rng().random_range(0..group.total_weight);
+            weighted_index_for_draw(group, draw)
+        },
+    }
+}
+
+/// Resolve a prevalidated weighted draw to its candidate index.
+fn weighted_index_for_draw(group: &SelectionGroup, draw: u64) -> Option<usize> {
+    if draw >= group.total_weight {
+        return None;
+    }
+    let bucket = group
+        .weighted_entries
+        .partition_point(|entry| entry.cumulative_upper_bound <= draw);
+    group.weighted_entries.get(bucket).map(|entry| entry.candidate_index)
 }
 
 #[cfg(test)]
@@ -86,10 +96,10 @@ mod tests {
     use super::{
         super::{
             descriptor::{AdmissionState, CapabilityKind, RouteCandidate},
-            group_index,
+            group_index::{self, SelectionGroup},
             overlay::PickerPolicy,
         },
-        choose_ordinal, select_candidate,
+        choose_candidate_index, select_candidate, weighted_index_for_draw,
     };
 
     fn candidate(cluster: &str, group: Option<u32>, admission: AdmissionState) -> RouteCandidate {
@@ -102,6 +112,7 @@ mod tests {
             name: Arc::from("model"),
             rank: None,
             selection_group: group,
+            traffic_weight: None,
             selection_tier: None,
             site: Arc::from("site"),
             stable_id: Arc::from(cluster),
@@ -232,8 +243,50 @@ mod tests {
     #[test]
     fn round_robin_counter_wraps_without_leaving_group() {
         let counter = AtomicUsize::new(usize::MAX);
-        assert_eq!(choose_ordinal(PickerPolicy::RoundRobin, 2, &counter), usize::MAX % 2);
-        assert_eq!(choose_ordinal(PickerPolicy::RoundRobin, 2, &counter), 0);
+        let group = SelectionGroup {
+            number: 0,
+            admission_state: AdmissionState::NewAndExisting,
+            candidate_indexes: vec![0, 1],
+            weighted_entries: Vec::new(),
+            total_weight: 0,
+            next: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            choose_candidate_index(PickerPolicy::RoundRobin, &group, &counter),
+            Some(usize::MAX % 2)
+        );
+        assert_eq!(
+            choose_candidate_index(PickerPolicy::RoundRobin, &group, &counter),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn weighted_draw_boundaries_are_proportional_and_exclusive() {
+        let mut candidates = vec![
+            candidate("a", Some(0), AdmissionState::NewAndExisting),
+            candidate("b", Some(0), AdmissionState::NewAndExisting),
+        ];
+        candidates.first_mut().unwrap().traffic_weight = Some(70);
+        candidates.get_mut(1).unwrap().traffic_weight = Some(30);
+        let groups = group_index::build(&candidates).unwrap();
+        let group = groups
+            .get(&CapabilityKind::InferenceModel)
+            .and_then(|by_name| by_name.get("model"))
+            .and_then(|groups| groups.first())
+            .unwrap();
+
+        assert_eq!(weighted_index_for_draw(group, 0), Some(0));
+        assert_eq!(weighted_index_for_draw(group, 69), Some(0));
+        assert_eq!(weighted_index_for_draw(group, 70), Some(1));
+        assert_eq!(weighted_index_for_draw(group, 99), Some(1));
+        assert_eq!(weighted_index_for_draw(group, 100), None);
+        let counts = (0..group.total_weight).fold([0_u64; 2], |mut counts, draw| {
+            let index = weighted_index_for_draw(group, draw).unwrap();
+            *counts.get_mut(index).unwrap() += 1;
+            counts
+        });
+        assert_eq!(counts, [70, 30]);
     }
 
     #[test]

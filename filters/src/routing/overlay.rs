@@ -15,6 +15,7 @@
 //! [`ArcSwap`]: arc_swap::ArcSwap
 
 use std::{
+    collections::HashSet,
     fmt::Write as _,
     io::Read as _,
     path::{Path, PathBuf},
@@ -237,6 +238,8 @@ pub(crate) enum PickerPolicy {
     RoundRobin,
     /// Select a candidate uniformly at random from the active group.
     Random,
+    /// Select according to positive candidate traffic weights.
+    WeightedRandom,
 }
 
 impl PickerPolicy {
@@ -246,6 +249,7 @@ impl PickerPolicy {
             Self::Deterministic => "deterministic",
             Self::RoundRobin => "round_robin",
             Self::Random => "random",
+            Self::WeightedRandom => "weighted_random",
         }
     }
 }
@@ -294,6 +298,10 @@ pub(crate) struct OverlayCandidate {
     /// Producer-defined priority group. Lower groups are attempted first.
     #[serde(default)]
     pub(crate) selection_group: Option<u32>,
+
+    /// Optional positive traffic weight.
+    #[serde(default)]
+    pub(crate) traffic_weight: Option<u32>,
 
     /// Producer-assigned locality tier (e.g. `"same_region"`).
     #[serde(default)]
@@ -513,14 +521,15 @@ impl RouteSnapshot {
             validate_expected_scope(expected, &envelope.scope)?;
         }
 
-        descriptor::validate_local_site(&envelope.overlay.local_site)?;
-        let candidates = overlay_to_candidates(&envelope.overlay)?;
-        let group_index = group_index::build(&candidates)?;
-        let generated_at = envelope.overlay.generated_at.map(|s| Arc::from(s.as_str()));
         let selection_mode = envelope
             .overlay
             .selection_policy
             .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
+        descriptor::validate_local_site(&envelope.overlay.local_site)?;
+        let candidates = overlay_to_candidates(&envelope.overlay)?;
+        validate_selection_mode(&candidates, selection_mode)?;
+        let group_index = group_index::build(&candidates)?;
+        let generated_at = envelope.overlay.generated_at.map(|s| Arc::from(s.as_str()));
         warn_if_selection_policy_has_no_groups(selection_mode, &group_index);
 
         Ok(Self {
@@ -542,12 +551,13 @@ impl RouteSnapshot {
             .map_err(|e| FilterError::from(format!("routing: overlay parse error: {e}")))?;
 
         descriptor::validate_local_site(&doc.local_site)?;
-        let candidates = overlay_to_candidates(&doc)?;
-        let group_index = group_index::build(&candidates)?;
-        let generated_at = doc.generated_at.map(|s| Arc::from(s.as_str()));
         let selection_mode = doc
             .selection_policy
             .map_or(PickerPolicy::Deterministic, |policy| policy.mode);
+        let candidates = overlay_to_candidates(&doc)?;
+        validate_selection_mode(&candidates, selection_mode)?;
+        let group_index = group_index::build(&candidates)?;
+        let generated_at = doc.generated_at.map(|s| Arc::from(s.as_str()));
         warn_if_selection_policy_has_no_groups(selection_mode, &group_index);
 
         Ok(Self {
@@ -733,6 +743,23 @@ fn validate_expected_scope(expected: &ExpectedOverlayScope, scope: &ScopeField) 
     Ok(())
 }
 
+/// Enforce the cross-field contract between picker mode and weights.
+fn validate_selection_mode(candidates: &[RouteCandidate], mode: PickerPolicy) -> Result<(), FilterError> {
+    if mode != PickerPolicy::WeightedRandom {
+        if candidates.iter().any(|candidate| candidate.traffic_weight.is_some()) {
+            return Err("routing: traffic_weight is only valid with weightedRandom selection".into());
+        }
+        return Ok(());
+    }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.selection_group.is_none() || candidate.traffic_weight.is_none())
+    {
+        return Err("routing: weightedRandom requires selection_group and traffic_weight on every candidate".into());
+    }
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // Overlay → RouteCandidate conversion
 // -----------------------------------------------------------------------------
@@ -758,20 +785,38 @@ fn overlay_to_candidates(doc: &OverlayDocument) -> Result<Vec<RouteCandidate>, F
                 kind,
                 name: oc.name.clone(),
                 site: oc.site.clone(),
+                traffic_weight: oc.traffic_weight,
             })
         })
         .collect::<Result<Vec<_>, FilterError>>()?;
 
     let mut candidates = descriptor::validate_candidates(raw)?;
     enrich_from_overlay(&mut candidates, &doc.candidates)?;
+    validate_unique_stable_ids(&candidates)?;
     Ok(candidates)
+}
+
+/// Reject effective stable identifiers shared by distinct candidates.
+fn validate_unique_stable_ids(candidates: &[RouteCandidate]) -> Result<(), FilterError> {
+    let mut seen = HashSet::with_capacity(candidates.len());
+    for (index, candidate) in candidates.iter().enumerate() {
+        if !seen.insert(candidate.stable_id.as_ref()) {
+            return Err(format!(
+                "routing: candidate {index}: duplicate stable_id '{}'",
+                candidate.stable_id
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Apply producer-supplied metadata to validated candidates.
 ///
 /// Zips the validated candidate list with the original overlay entries
 /// and sets `admission_state`, `rank`, `selection_group`, `selection_tier`,
-/// and `stable_id`.
+/// and `stable_id`. `traffic_weight` is already copied through the validated
+/// [`CandidateConfig`] path.
 /// Called after [`validate_candidates`] so `deny_unknown_fields` on
 /// [`CandidateConfig`] is never bypassed.
 ///
@@ -1645,6 +1690,19 @@ mod tests {
         let json = r#"{"local_site":"site-a","candidates":[{"kind":"inference_model","name":"m","site":"s","cluster":"c","fresh":true,"stable_id":"   "}]}"#;
         let result = RouteSnapshot::from_overlay(json.as_bytes());
         assert!(result.is_err(), "whitespace stable_id must be rejected");
+    }
+
+    #[test]
+    fn parse_overlay_duplicate_explicit_stable_id_rejected() {
+        let json = r#"{
+            "local_site": "site-a",
+            "candidates": [
+                {"kind":"inference_model","name":"a","site":"s","cluster":"c","fresh":true,"stable_id":"shared"},
+                {"kind":"inference_model","name":"b","site":"s","cluster":"c","fresh":true,"stable_id":"shared"}
+            ]
+        }"#;
+        let result = RouteSnapshot::from_overlay(json.as_bytes());
+        assert!(result.is_err(), "duplicate explicit stable_id values must be rejected");
     }
 
     #[test]
@@ -2848,6 +2906,38 @@ mod tests {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    #[test]
+    fn weighted_overlay_accepts_positive_group_weights() {
+        let json = br#"{"local_site":"s","selection_policy":{"mode":"weightedRandom"},"candidates":[{"kind":"inference_model","name":"m","site":"a","cluster":"a","selection_group":0,"traffic_weight":70},{"kind":"inference_model","name":"m","site":"b","cluster":"b","selection_group":0,"traffic_weight":30}]}"#;
+        let snapshot = RouteSnapshot::from_overlay(json).expect("valid weighted overlay");
+        assert_eq!(snapshot.selection_mode, PickerPolicy::WeightedRandom);
+        assert_eq!(snapshot.candidates[0].traffic_weight, Some(70));
+    }
+
+    #[test]
+    fn weighted_overlay_rejects_missing_or_out_of_range_weights() {
+        let missing = br#"{"local_site":"s","selection_policy":{"mode":"weightedRandom"},"candidates":[{"kind":"inference_model","name":"m","site":"a","cluster":"a","selection_group":0}]}"#;
+        assert!(RouteSnapshot::from_overlay(missing).is_err());
+        let invalid = br#"{"local_site":"s","selection_policy":{"mode":"weightedRandom"},"candidates":[{"kind":"inference_model","name":"m","site":"a","cluster":"a","selection_group":0,"traffic_weight":0}]}"#;
+        assert!(RouteSnapshot::from_overlay(invalid).is_err());
+    }
+
+    #[test]
+    fn non_weighted_overlay_rejects_weight_fields() {
+        let json = br#"{"local_site":"s","selection_policy":{"mode":"random"},"candidates":[{"kind":"inference_model","name":"m","site":"a","cluster":"a","traffic_weight":10}]}"#;
+        assert!(RouteSnapshot::from_overlay(json).is_err());
+    }
+
+    #[test]
+    fn non_weighted_overlay_reports_mode_error_before_weight_range_error() {
+        let json = br#"{"local_site":"s","selection_policy":{"mode":"random"},"candidates":[{"kind":"inference_model","name":"m","site":"a","cluster":"a","traffic_weight":1001}]}"#;
+        let error = RouteSnapshot::from_overlay(json).expect_err("non-weighted mode must reject weights");
+        assert_eq!(
+            error.to_string(),
+            "routing: traffic_weight is only valid with weightedRandom selection"
+        );
+    }
 
     /// Poll `predicate` every 20ms until it returns `true` or `timeout` elapses.
     fn poll_until(timeout: Duration, predicate: impl Fn() -> bool) {

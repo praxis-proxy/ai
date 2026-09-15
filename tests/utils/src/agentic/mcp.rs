@@ -63,6 +63,12 @@ pub struct McpMockConfig {
     /// Tools advertised by `tools/list` and accepted
     /// by `tools/call`.
     pub tools: Vec<McpToolFixture>,
+
+    /// Names of advertised tools whose `tools/call` returns
+    /// an `isError: true` content result, so the dispatch
+    /// filter surfaces a failed `mcp_call`. Tools not listed
+    /// here succeed as usual.
+    pub failing_tools: Vec<String>,
 }
 
 impl Default for McpMockConfig {
@@ -73,6 +79,7 @@ impl Default for McpMockConfig {
             server_name: DEFAULT_SERVER_NAME.to_owned(),
             stateful_sessions: true,
             tools: vec![McpToolFixture::new("echo")],
+            failing_tools: Vec::new(),
         }
     }
 }
@@ -469,10 +476,12 @@ fn handle_tools_call(stream: &mut TcpStream, config: &McpMockConfig, id: &Option
     let name = tool_name.unwrap_or_default();
     let known = config.tools.iter().any(|t| t.name == name);
 
-    if known {
-        write_known_tool_result(stream, id, &name);
-    } else {
+    if !known {
         write_unknown_tool_error(stream, id);
+    } else if config.failing_tools.iter().any(|t| t == &name) {
+        write_failing_tool_result(stream, id, &name);
+    } else {
+        write_known_tool_result(stream, id, &name);
     }
 }
 
@@ -586,6 +595,31 @@ fn write_known_tool_result(stream: &mut TcpStream, id: &Option<Value>, name: &st
                 "text": format!("mock result for {name}"),
             }],
             "isError": false,
+        }
+    });
+
+    let body = result.to_string();
+    write_response(
+        stream,
+        200,
+        "OK",
+        &[("Content-Type", "application/json".to_owned())],
+        &body,
+    );
+}
+
+/// `tools/call` content result flagged `isError: true`, so the dispatch filter
+/// records the `mcp_call` as failed.
+fn write_failing_tool_result(stream: &mut TcpStream, id: &Option<Value>, name: &str) {
+    let result = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{
+                "type": "text",
+                "text": format!("mock failure for {name}"),
+            }],
+            "isError": true,
         }
     });
 

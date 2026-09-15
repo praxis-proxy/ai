@@ -17,6 +17,7 @@ fn base_config() -> CompactFilterConfig {
         inference_url: "http://localhost:11434/v1/chat/completions".to_owned(),
         default_model: "gpt-4o-mini".to_owned(),
         tiktoken_encoding: "cl100k_base".to_owned(),
+        summary_prefix: None,
         timeout_ms: None,
         on_failure: None,
         status_on_error: None,
@@ -162,6 +163,25 @@ fn extract_compaction_config_none() {
 }
 
 #[test]
+fn extract_compaction_config_null_is_treated_as_absent() {
+    let cm = Some(json!(null));
+    assert!(
+        extract_compaction_config(&cm).unwrap().is_none(),
+        "explicit null context_management should behave like an omitted field"
+    );
+}
+
+#[test]
+fn extract_compaction_config_non_array_returns_error() {
+    let cm = Some(json!({"type": "compaction", "compact_threshold": 1000}));
+    let err = extract_compaction_config(&cm).unwrap_err();
+    assert!(
+        err.contains("context_management must be an array"),
+        "a present but non-array context_management must be rejected, got: {err}"
+    );
+}
+
+#[test]
 fn extract_compaction_config_empty_array() {
     let cm = Some(json!([]));
     assert!(extract_compaction_config(&cm).unwrap().is_none());
@@ -216,7 +236,6 @@ fn extract_compaction_config_non_string_model_returns_error() {
     assert!(err.contains("compaction_model"));
 }
 
-
 // =============================================================================
 // build_compaction_item tests
 // =============================================================================
@@ -224,12 +243,39 @@ fn extract_compaction_config_non_string_model_returns_error() {
 #[test]
 fn compaction_item_has_correct_shape() {
     use base64::Engine as _;
-    let item = build_compaction_item("compact_abc123", "This is a summary.");
+    let item = build_compaction_item("compact_abc123", "This is a summary.", DEFAULT_SUMMARY_PREFIX);
     assert_eq!(item["type"], "compaction");
     assert_eq!(item["id"], "compact_abc123");
     let encoded = item["encrypted_content"].as_str().unwrap();
     let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
     assert_eq!(String::from_utf8(decoded).unwrap(), "This is a summary.");
+    assert!(
+        item.get("summary_prefix").is_none(),
+        "default prefix should not be stored in the item"
+    );
+}
+
+#[test]
+fn compaction_item_with_custom_prefix() {
+    let item = build_compaction_item("compact_custom", "Summary.", "Context:\n");
+    assert_eq!(
+        item["summary_prefix"], "Context:\n",
+        "custom prefix should be stored in the item"
+    );
+}
+
+#[test]
+fn build_config_applies_default_summary_prefix() {
+    let cfg = build_config(&base_config()).unwrap();
+    assert_eq!(cfg.summary_prefix, DEFAULT_SUMMARY_PREFIX);
+}
+
+#[test]
+fn build_config_applies_custom_summary_prefix() {
+    let mut cfg = base_config();
+    cfg.summary_prefix = Some("Summary:\n".to_owned());
+    let validated = build_config(&cfg).unwrap();
+    assert_eq!(validated.summary_prefix, "Summary:\n");
 }
 
 // =============================================================================
@@ -247,8 +293,20 @@ fn parse_valid_chat_completion_response() {
         }]
     });
     let body = serde_json::to_vec(&response).unwrap();
-    let result = parse_summarization_response(&body);
-    assert_eq!(result.unwrap(), "Here is the summary.");
+    let result = parse_summarization_response(&body).unwrap();
+    assert_eq!(result.content, "Here is the summary.");
+    assert!(result.usage.is_none(), "no usage reported by the callout");
+}
+
+#[test]
+fn parse_response_captures_usage() {
+    let response = json!({
+        "choices": [{"message": {"role": "assistant", "content": "Summary."}}],
+        "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}
+    });
+    let body = serde_json::to_vec(&response).unwrap();
+    let result = parse_summarization_response(&body).unwrap();
+    assert_eq!(result.usage.unwrap()["total_tokens"], 60);
 }
 
 #[test]
@@ -269,6 +327,79 @@ fn parse_response_empty_choices_returns_error() {
     let response = json!({"choices": []});
     let body = serde_json::to_vec(&response).unwrap();
     assert!(parse_summarization_response(&body).is_err());
+}
+
+// =============================================================================
+// usage mapping tests
+// =============================================================================
+
+#[test]
+fn map_chat_usage_maps_all_fields() {
+    let usage = json!({
+        "prompt_tokens": 50,
+        "completion_tokens": 10,
+        "total_tokens": 60,
+        "prompt_tokens_details": {"cached_tokens": 8},
+        "completion_tokens_details": {"reasoning_tokens": 4}
+    });
+    let mapped = map_chat_usage(&usage);
+    assert_eq!(mapped["input_tokens"], 50);
+    assert_eq!(mapped["output_tokens"], 10);
+    assert_eq!(mapped["total_tokens"], 60);
+    assert_eq!(mapped["input_tokens_details"]["cached_tokens"], 8);
+    assert_eq!(mapped["input_tokens_details"]["cache_write_tokens"], 0);
+    assert_eq!(mapped["output_tokens_details"]["reasoning_tokens"], 4);
+}
+
+#[test]
+fn map_chat_usage_defaults_missing_details_to_zero() {
+    let usage = json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10});
+    let mapped = map_chat_usage(&usage);
+    assert_eq!(mapped["input_tokens_details"]["cached_tokens"], 0);
+    assert_eq!(mapped["output_tokens_details"]["reasoning_tokens"], 0);
+}
+
+#[test]
+fn map_chat_usage_derives_total_when_absent() {
+    let usage = json!({"prompt_tokens": 12, "completion_tokens": 5});
+    let mapped = map_chat_usage(&usage);
+    assert_eq!(mapped["total_tokens"], 17, "total falls back to input + output");
+}
+
+#[test]
+fn build_compaction_usage_prefers_callout_usage() {
+    let summary = Summarization {
+        content: "short".to_owned(),
+        usage: Some(json!({"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120})),
+    };
+    let messages = vec![json!({"role": "user", "content": "a much longer conversation body"})];
+    let usage = build_compaction_usage(&messages, Some(&summary), "cl100k_base");
+    // Reported usage wins over any tiktoken estimate of the message/summary text.
+    assert_eq!(usage["input_tokens"], 100);
+    assert_eq!(usage["output_tokens"], 20);
+    assert_eq!(usage["total_tokens"], 120);
+}
+
+#[test]
+fn build_compaction_usage_falls_back_to_tiktoken_when_usage_absent() {
+    let summary = Summarization {
+        content: "a produced summary".to_owned(),
+        usage: None,
+    };
+    let messages = vec![json!({"role": "user", "content": "the source conversation text"})];
+    let usage = build_compaction_usage(&messages, Some(&summary), "cl100k_base");
+    assert!(
+        usage["input_tokens"].as_u64().unwrap() > 0,
+        "estimates source conversation"
+    );
+    assert!(
+        usage["output_tokens"].as_u64().unwrap() > 0,
+        "estimates produced summary"
+    );
+    assert_eq!(
+        usage["total_tokens"].as_u64().unwrap(),
+        usage["input_tokens"].as_u64().unwrap() + usage["output_tokens"].as_u64().unwrap()
+    );
 }
 
 // =============================================================================
@@ -387,6 +518,7 @@ fn replace_messages_preserves_current_input() {
         "model": "gpt-4o",
         "input": "What's next?"
     }));
+    state.history_rehydrated = true;
     state
         .messages
         .insert(0, json!({"role": "user", "content": "old question"}));
@@ -400,7 +532,7 @@ fn replace_messages_preserves_current_input() {
         .persisted_messages
         .insert(1, json!({"role": "assistant", "content": "old answer"}));
 
-    let compaction_item = build_compaction_item("compact_test", "Summary of old conversation.");
+    let compaction_item = build_compaction_item("compact_test", "Summary of old conversation.", DEFAULT_SUMMARY_PREFIX);
     replace_messages(&mut state, compaction_item);
 
     assert_eq!(state.messages.len(), 2, "should have compaction + current input");
@@ -435,7 +567,7 @@ fn replace_messages_keeps_each_list_current_turn_independently() {
         json!({"role": "user", "content": "from-persisted"}),
     ];
 
-    replace_messages(&mut state, build_compaction_item("c1", "sum"));
+    replace_messages(&mut state, build_compaction_item("c1", "sum", DEFAULT_SUMMARY_PREFIX));
 
     assert_eq!(state.messages.len(), 2);
     assert_eq!(state.messages[1]["content"], "from-messages");
@@ -480,7 +612,10 @@ fn compaction_preserves_resolved_file_data_instead_of_file_url() {
         "state.input stays the original client payload"
     );
 
-    replace_messages(&mut state, build_compaction_item("compact_1", "summary"));
+    replace_messages(
+        &mut state,
+        build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX),
+    );
 
     assert_eq!(state.messages[0]["type"], "compaction");
     let current = &state.messages[1];
@@ -529,7 +664,10 @@ fn compaction_preserves_extracted_input_text_instead_of_input_file() {
     state.messages[tail] = extracted_item.clone();
     state.persisted_messages[tail] = extracted_item;
 
-    replace_messages(&mut state, build_compaction_item("compact_1", "summary"));
+    replace_messages(
+        &mut state,
+        build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX),
+    );
 
     let current = &state.messages[1];
     assert_eq!(
@@ -611,7 +749,7 @@ fn conversation_text_full_tool_round_trip() {
 
 #[test]
 fn conversation_text_includes_compaction_summary() {
-    let item = build_compaction_item("compact_1", "Prior context about widgets.");
+    let item = build_compaction_item("compact_1", "Prior context about widgets.", DEFAULT_SUMMARY_PREFIX);
     let messages = vec![item, json!({"role": "user", "content": "Tell me more"})];
     let text = build_conversation_text(&messages);
     assert!(text.contains("[previous context summary]: Prior context about widgets."));
@@ -620,7 +758,7 @@ fn conversation_text_includes_compaction_summary() {
 
 #[test]
 fn conversation_text_skips_empty_compaction_summary() {
-    let item = build_compaction_item("compact_2", "");
+    let item = build_compaction_item("compact_2", "", DEFAULT_SUMMARY_PREFIX);
     let messages = vec![item, json!({"role": "user", "content": "Hello"})];
     let text = build_conversation_text(&messages);
     assert!(!text.contains("context summary"));
@@ -647,7 +785,7 @@ fn make_filter(on_failure: &str) -> CompactFilter {
 #[test]
 fn callout_error_open_mode_skips_compaction() {
     let filter = make_filter("open");
-    let result = filter.on_callout_error("something went wrong", false);
+    let result = filter.on_callout_error("something went wrong");
     assert!(result.is_ok());
     assert!(result.unwrap().is_none(), "open mode should skip compaction");
 }
@@ -655,7 +793,7 @@ fn callout_error_open_mode_skips_compaction() {
 #[test]
 fn callout_error_closed_mode_rejects_request() {
     let filter = make_filter("closed");
-    let result = filter.on_callout_error("something went wrong", false);
+    let result = filter.on_callout_error("something went wrong");
     assert!(result.is_err(), "closed mode should reject the request");
 }
 
@@ -665,7 +803,7 @@ fn parse_failure_open_mode_skips_compaction() {
     let bad_body = b"not valid json";
     let result = parse_summarization_response(bad_body)
         .map(Some)
-        .or_else(|_| filter.on_callout_error("failed to parse summarization response", false));
+        .or_else(|_| filter.on_callout_error("failed to parse summarization response"));
     assert!(result.is_ok());
     assert!(result.unwrap().is_none());
 }
@@ -676,7 +814,7 @@ fn parse_failure_closed_mode_rejects_request() {
     let bad_body = b"not valid json";
     let result = parse_summarization_response(bad_body)
         .map(Some)
-        .or_else(|_| filter.on_callout_error("failed to parse summarization response", false));
+        .or_else(|_| filter.on_callout_error("failed to parse summarization response"));
     assert!(result.is_err());
 }
 
@@ -692,7 +830,7 @@ fn non_2xx_response_open_mode_skips_compaction() {
         headers: http::HeaderMap::new(),
         body: Bytes::from_static(b"service unavailable"),
     };
-    let result = filter.handle_subrequest_result(Ok(resp), false);
+    let result = filter.handle_subrequest_result(Ok(resp));
     assert!(result.is_ok());
     assert!(result.unwrap().is_none(), "open mode should skip compaction on non-2xx");
 }
@@ -705,80 +843,89 @@ fn non_2xx_response_closed_mode_rejects_request() {
         headers: http::HeaderMap::new(),
         body: Bytes::from_static(b"rate limited"),
     };
-    let result = filter.handle_subrequest_result(Ok(resp), false);
+    let result = filter.handle_subrequest_result(Ok(resp));
     assert!(result.is_err(), "closed mode should reject on non-2xx");
 }
 
 // =============================================================================
-// build_context_overhead_text tests
+// previous_usage fast-path
 // =============================================================================
 
 #[test]
-fn overhead_text_empty_without_instructions_or_tools() {
-    let state = ResponsesState::from_request_body(json!({
-        "model": "gpt-4o",
-        "input": "Hello"
-    }));
-    assert!(build_context_overhead_text(&state).is_empty());
+fn previous_usage_total_returns_total_tokens() {
+    let mut state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "Hi"}));
+    state.previous_usage = Some(json!({"input_tokens": 100, "output_tokens": 50, "total_tokens": 150}));
+    assert_eq!(previous_usage_total(&state), Some(150));
 }
 
 #[test]
-fn overhead_text_includes_instructions() {
-    let state = ResponsesState::from_request_body(json!({
-        "model": "gpt-4o",
-        "input": "Hello",
-        "instructions": "You are a helpful assistant."
-    }));
-    let text = build_context_overhead_text(&state);
-    assert!(text.contains("You are a helpful assistant."));
+fn previous_usage_total_returns_none_when_absent() {
+    let state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "Hi"}));
+    assert_eq!(previous_usage_total(&state), None);
 }
 
 #[test]
-fn overhead_text_includes_tool_definitions() {
-    let state = ResponsesState::from_request_body(json!({
-        "model": "gpt-4o",
-        "input": "Hello",
-        "tools": [{
-            "type": "function",
-            "name": "get_weather",
-            "description": "Get the current weather for a location",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {"type": "string", "description": "City name"}
-                },
-                "required": ["location"]
-            }
-        }]
-    }));
-    let text = build_context_overhead_text(&state);
-    assert!(text.contains("get_weather"));
+fn previous_usage_total_returns_none_when_null() {
+    let mut state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "Hi"}));
+    state.previous_usage = Some(json!({"input_tokens": 100}));
+    assert_eq!(previous_usage_total(&state), None);
 }
 
 #[test]
-fn overhead_text_includes_both_instructions_and_tools() {
-    let state = ResponsesState::from_request_body(json!({
+fn should_compact_uses_previous_usage_when_available() {
+    let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4o",
         "input": "Hello",
-        "instructions": "Be concise.",
-        "tools": [{"type": "function", "name": "search", "parameters": {}}]
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
     }));
-    let text = build_context_overhead_text(&state);
-    assert!(text.contains("Be concise."));
-    assert!(text.contains("search"));
+    state.messages = vec![json!({"role": "user", "content": "Hi"})];
+    state.previous_usage = Some(json!({"total_tokens": 2000}));
+    let result = should_compact(&state, "cl100k_base").unwrap();
+    assert!(result.is_some(), "should compact when previous_usage exceeds threshold");
 }
 
 #[test]
-fn overhead_tokens_count_with_get_token_count() {
-    let state = ResponsesState::from_request_body(json!({
+fn should_compact_skips_when_previous_usage_below_threshold() {
+    let mut state = ResponsesState::from_request_body(json!({
         "model": "gpt-4o",
         "input": "Hello",
-        "instructions": "You are a helpful assistant that answers questions concisely."
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
     }));
-    let text = build_context_overhead_text(&state);
-    let count = get_token_count(&text, "cl100k_base");
-    assert!(count.is_some());
-    assert!(count.unwrap() > 0);
+    state.messages = vec![json!({"role": "user", "content": "Hi"})];
+    state.previous_usage = Some(json!({"total_tokens": 500}));
+    let result = should_compact(&state, "cl100k_base").unwrap();
+    assert!(result.is_none(), "should skip when previous_usage is below threshold");
+}
+
+// =============================================================================
+// direct input should_compact
+// =============================================================================
+
+#[test]
+fn direct_input_should_compact_uses_tiktoken() {
+    let state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": [
+            {"role": "user", "content": "word ".repeat(3000)}
+        ],
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
+    }));
+    let result = should_compact(&state, "cl100k_base").unwrap();
+    assert!(
+        result.is_some(),
+        "direct input exceeding threshold should trigger compaction"
+    );
+}
+
+#[test]
+fn direct_input_should_not_compact_below_threshold() {
+    let state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": [{"role": "user", "content": "Hi"}],
+        "context_management": [{"type": "compaction", "compact_threshold": 50000}]
+    }));
+    let result = should_compact(&state, "cl100k_base").unwrap();
+    assert!(result.is_none(), "direct input below threshold should skip compaction");
 }
 
 #[test]
@@ -794,8 +941,130 @@ fn should_compact_accounts_for_overhead() {
     let result = should_compact(&state, "cl100k_base").unwrap();
     assert!(
         result.is_some(),
-        "overhead from long instructions should push total above threshold"
+        "tiktoken path should include instructions and tool definitions in token count"
     );
+}
+
+#[test]
+fn tiktoken_fallback_includes_instructions_and_tools_in_count() {
+    let state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": [{"role": "user", "content": "short"}],
+        "instructions": "Very long system prompt ".repeat(5000),
+        "tools": [{"type": "function", "name": "f", "description": "d ".repeat(5000)}],
+        "context_management": [{"type": "compaction", "compact_threshold": 1000}]
+    }));
+    let result = should_compact(&state, "cl100k_base").unwrap();
+    assert!(
+        result.is_some(),
+        "tiktoken path should include instructions and tool definitions in token count"
+    );
+}
+
+// =============================================================================
+// parse_compact_request_body
+// =============================================================================
+
+#[test]
+fn parse_compact_request_body_with_previous_response_id() {
+    let body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4o",
+            "previous_response_id": "resp_abc",
+            "instructions": "Be concise"
+        }))
+        .unwrap(),
+    ));
+    let req = parse_compact_request_body(&body).unwrap();
+    assert_eq!(req.model, "gpt-4o");
+    assert_eq!(req.previous_response_id.as_deref(), Some("resp_abc"));
+    assert!(req.input.is_empty());
+    assert_eq!(req.instructions.as_deref(), Some("Be concise"));
+}
+
+#[test]
+fn parse_compact_request_body_with_string_input() {
+    let body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4o", "input": "Summarize this"})).unwrap(),
+    ));
+    let req = parse_compact_request_body(&body).unwrap();
+    assert_eq!(req.model, "gpt-4o");
+    assert!(req.previous_response_id.is_none());
+    assert_eq!(req.input.len(), 1, "string input coerces to one user message");
+    assert_eq!(req.input[0]["role"], "user");
+    assert_eq!(req.input[0]["content"], "Summarize this");
+}
+
+#[test]
+fn parse_compact_request_body_with_array_input() {
+    let body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4o",
+            "input": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"}
+            ]
+        }))
+        .unwrap(),
+    ));
+    let req = parse_compact_request_body(&body).unwrap();
+    assert_eq!(req.input.len(), 2);
+}
+
+#[test]
+fn parse_compact_request_body_empty() {
+    assert!(parse_compact_request_body(&None).is_err());
+}
+
+#[test]
+fn parse_compact_request_body_invalid_json() {
+    let body = Some(Bytes::from_static(b"not json"));
+    assert!(parse_compact_request_body(&body).is_err());
+}
+
+#[test]
+fn parse_compact_request_body_missing_model() {
+    // `model` is required by the contract even when content is present.
+    let body = Some(Bytes::from(serde_json::to_vec(&json!({"input": "hello"})).unwrap()));
+    assert!(parse_compact_request_body(&body).is_err());
+}
+
+#[test]
+fn parse_compact_request_body_empty_model() {
+    let body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "", "input": "hello"})).unwrap(),
+    ));
+    assert!(parse_compact_request_body(&body).is_err());
+}
+
+#[test]
+fn parse_compact_request_body_missing_content() {
+    // `model` alone, with neither `input` nor `previous_response_id`.
+    let body = Some(Bytes::from(serde_json::to_vec(&json!({"model": "gpt-4o"})).unwrap()));
+    assert!(parse_compact_request_body(&body).is_err());
+}
+
+// =============================================================================
+// stored_message_array
+// =============================================================================
+
+#[test]
+fn stored_message_array_returns_messages() {
+    let messages = json!([
+        {"role": "user", "content": "Hello"},
+        {"role": "assistant", "content": "Hi"}
+    ]);
+    assert_eq!(stored_message_array(messages).len(), 2);
+}
+
+#[test]
+fn stored_message_array_empty_array() {
+    assert!(stored_message_array(json!([])).is_empty());
+}
+
+#[test]
+fn stored_message_array_not_array() {
+    assert!(stored_message_array(json!("not an array")).is_empty());
 }
 
 // =============================================================================
@@ -805,11 +1074,61 @@ fn should_compact_accounts_for_overhead() {
 #[test]
 fn compaction_item_round_trips_through_canonical_replay() {
     use crate::openai::responses::canonical_openresponses_replay_item;
-    let item = build_compaction_item("compact_rt", "Summary text.");
+    let item = build_compaction_item("compact_rt", "Summary text.", DEFAULT_SUMMARY_PREFIX);
     let replayed = canonical_openresponses_replay_item(&item);
     assert!(replayed.is_some(), "compaction item should be replayable");
     let replayed = replayed.unwrap();
     assert_eq!(replayed["type"], "compaction");
     assert_eq!(replayed["id"], "compact_rt");
     assert!(replayed.get("encrypted_content").is_some());
+}
+
+// =============================================================================
+// is_compactable tests
+// =============================================================================
+
+#[test]
+fn is_compactable_returns_false_when_no_state() {
+    assert!(!is_compactable(None));
+}
+
+#[test]
+fn is_compactable_returns_true_when_rehydrated() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "Hello"
+    }));
+    state.history_rehydrated = true;
+    assert!(is_compactable(Some(&state)));
+}
+
+#[test]
+fn is_compactable_returns_false_for_direct_input_with_compaction_config() {
+    let state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": [{"role": "user", "content": "Hello"}],
+        "context_management": [{"type": "compaction", "compact_threshold": 100}]
+    }));
+    assert!(!state.history_rehydrated, "precondition: not rehydrated");
+    assert!(!is_compactable(Some(&state)));
+}
+
+#[test]
+fn is_compactable_returns_false_without_rehydration_or_config() {
+    let state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "Hello"
+    }));
+    assert!(!state.history_rehydrated, "precondition: not rehydrated");
+    assert!(!is_compactable(Some(&state)));
+}
+
+#[test]
+fn is_compactable_returns_false_with_non_compaction_config() {
+    let state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "Hello",
+        "context_management": [{"type": "truncation", "max_tokens": 4096}]
+    }));
+    assert!(!is_compactable(Some(&state)));
 }

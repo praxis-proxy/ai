@@ -112,6 +112,16 @@ New capabilities require:
 4. Functional integration test for the example config
 5. Generated example and filter documentation kept in sync
 
+When changing anything under `apis/src/openai/`, always add or extend
+integration tests exercised through the OpenAI client where possible, in
+`tests/integration/sdk/openai/test_openai_conversations.py` or
+`tests/integration/sdk/openai/test_openai_responses_vllm.py`.
+
+When changing anything under `apis/src/anthropic/`, always add or extend
+integration tests exercised through the Anthropic client where possible, in
+`tests/integration/sdk/anthropic/` (e.g.
+`tests/integration/sdk/anthropic/test_anthropic_error_formatter.py`).
+
 ## Inference Fixture Maintenance
 
 When an inference transformation behavior changes, update its tests and

@@ -134,7 +134,9 @@ impl AnthropicMessagesToChatCompletionsStreamFilter {
     /// # Errors
     ///
     /// Returns [`FilterError`] if a partial SSE event or the retained
-    /// tool-call block count exceeds its configured limit.
+    /// tool-call block count exceeds its configured limit, or if a complete
+    /// data event is neither the `[DONE]` sentinel nor a valid Chat
+    /// Completions JSON object.
     fn process_response_chunk(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -448,6 +450,14 @@ fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
 /// Collects all `data` fields into one newline-delimited payload before
 /// processing it. Accepts bare `data`, `data: value`, and `data:value`
 /// per the SSE specification.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if a complete data event is neither the `[DONE]`
+/// sentinel nor a valid Chat Completions JSON object, or if transforming the
+/// chunk exceeds a configured limit. Such events are failed closed rather than
+/// silently discarded, which would erase their content from a stream that still
+/// reports success.
 fn process_event_block(
     ctx: &mut HttpFilterContext<'_>,
     block: &str,
@@ -478,12 +488,41 @@ fn process_event_block(
     if let Some(data) = event_data {
         if data == OPENAI_DONE_SENTINEL {
             emit_done(ctx, output);
-        } else if let Ok(chunk) = serde_json::from_str::<Value>(&data) {
-            transform_chunk(ctx, &chunk, output, max_tool_blocks)?;
+        } else {
+            transform_data_event(ctx, &data, output, max_tool_blocks)?;
         }
     }
 
     Ok(())
+}
+
+/// Parse a non-sentinel SSE data event as a Chat Completions chunk and
+/// transform it into Anthropic events.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when `data` is not valid JSON, is not a JSON object,
+/// or when transforming the chunk exceeds a configured limit. Failing closed
+/// keeps a malformed event from silently vanishing — dropping it would erase
+/// any text, tool call, finish reason, or usage it carried while the
+/// transformed stream still reports success.
+fn transform_data_event(
+    ctx: &mut HttpFilterContext<'_>,
+    data: &str,
+    output: &mut Vec<u8>,
+    max_tool_blocks: usize,
+) -> Result<(), FilterError> {
+    let chunk = serde_json::from_str::<Value>(data).map_err(|err| {
+        FilterError::from(format!(
+            "anthropic_messages_to_chat_completions_stream: upstream SSE data event is not valid JSON: {err}"
+        ))
+    })?;
+    if !chunk.is_object() {
+        return Err(FilterError::from(
+            "anthropic_messages_to_chat_completions_stream: upstream SSE data event is not a JSON object",
+        ));
+    }
+    transform_chunk(ctx, &chunk, output, max_tool_blocks)
 }
 
 // -----------------------------------------------------------------------------
@@ -777,7 +816,20 @@ fn close_tool_block(ctx: &mut HttpFilterContext<'_>, tool_call_key: &str, output
 // -----------------------------------------------------------------------------
 
 /// Emit final events when `[DONE]` is received.
+///
+/// If `[DONE]` arrives before any upstream chunk initialized the stream, a
+/// `message_start` is synthesized first so the terminal `message_delta` and
+/// `message_stop` never appear without the required opening event, yielding a
+/// structurally valid (empty) Anthropic stream instead of a malformed one.
 fn emit_done(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) {
+    let started = ctx
+        .filter_metadata
+        .get(STREAM_STATE_KEY)
+        .is_some_and(|v| v == STREAM_STATE_STARTED);
+    if !started {
+        emit_message_start(ctx, &Value::Null, output);
+    }
+
     emit_final_block_stop(ctx, output);
     emit_message_delta(ctx, output);
     emit_event(output, "message_stop", &serde_json::json!({"type": "message_stop"}));
@@ -1771,21 +1823,95 @@ mod tests {
     }
 
     #[test]
-    fn bare_data_field_participates_in_event_payload() {
+    fn bare_data_field_before_done_fails_closed() {
         let (filter, mut ctx) = make_filter_and_context();
 
         let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\"}]}\n\n";
         let mut body1 = Some(Bytes::from(chunk1));
         drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
 
+        // A leading bare `data` line joins as "\n[DONE]", which is neither the
+        // sentinel nor valid JSON. It must fail closed rather than be silently
+        // discarded or mistaken for the DONE sentinel.
         let done = "data\ndata: [DONE]\n\n";
         let mut body2 = Some(Bytes::from(done));
-        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
-
-        let out = String::from_utf8(body2.unwrap().to_vec()).unwrap();
+        let err = filter.on_response_body(&mut ctx, &mut body2, false).unwrap_err();
         assert!(
-            !out.contains("message_stop"),
-            "a preceding empty data field should prevent DONE sentinel recognition"
+            err.to_string().contains("not valid JSON"),
+            "a preceding empty data field should prevent DONE recognition and fail closed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_json_data_event_fails_closed() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk1 =
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk1));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        // A complete data event that is neither [DONE] nor valid JSON must not
+        // be silently discarded; any text, tool call, finish reason, or usage
+        // it carried would otherwise disappear from a successful stream.
+        let mut body2 = Some(Bytes::from("data: not-json\n\n"));
+        let err = filter.on_response_body(&mut ctx, &mut body2, false).unwrap_err();
+        assert!(
+            err.to_string().contains("not valid JSON"),
+            "malformed JSON data event should fail closed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_first_event_then_done_fails_closed() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        // Reproduction from the finding: a malformed first event followed by
+        // [DONE] must fail closed instead of emitting terminal events with no
+        // preceding message_start.
+        let mut body = Some(Bytes::from("data: not-json\n\ndata: [DONE]\n\n"));
+        let err = filter.on_response_body(&mut ctx, &mut body, false).unwrap_err();
+        assert!(
+            err.to_string().contains("not valid JSON"),
+            "malformed first event should fail the stream before [DONE], got: {err}"
+        );
+    }
+
+    #[test]
+    fn non_object_json_data_event_fails_closed() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        let chunk1 =
+            "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk1));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+
+        // Valid JSON that is not an object is not a Chat Completions chunk and
+        // must fail closed rather than be silently ignored.
+        let mut body2 = Some(Bytes::from("data: 123\n\n"));
+        let err = filter.on_response_body(&mut ctx, &mut body2, false).unwrap_err();
+        assert!(
+            err.to_string().contains("not a JSON object"),
+            "non-object JSON data event should fail closed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn lone_done_synthesizes_message_start_before_terminal_events() {
+        let (filter, mut ctx) = make_filter_and_context();
+
+        // [DONE] with no preceding chunk must still yield a structurally valid
+        // Anthropic stream: message_start precedes message_delta and message_stop.
+        let mut body = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+
+        let out = String::from_utf8(body.unwrap().to_vec()).unwrap();
+        let start = out.find("event: message_start");
+        let delta = out.find("event: message_delta");
+        let stop = out.find("event: message_stop");
+        assert!(
+            matches!((start, delta, stop), (Some(s), Some(d), Some(t)) if s < d && d < t),
+            "message_start must precede message_delta and message_stop, got: {out}"
         );
     }
 

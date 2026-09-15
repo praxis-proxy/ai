@@ -26,7 +26,12 @@ turns:
       client_body_kind: sse
       upstream_path: /v1/responses
       upstream_body_kind: json
-      # Controlled imports use data-only SSE frames; replay still compares the
+      # openai_stream_events composes the terminal IRR round into one logical
+      # Responses stream, re-encoding each frame as a named SSE event. The
+      # controlled upstream import stays data-only; replay still compares the
       # complete normalized upstream and client exchanges byte-for-byte.
-      client_sse_events: []
+      client_sse_events:
+        - response.created
+        - response.output_text.delta
+        - response.completed
       upstream_sse_events: []

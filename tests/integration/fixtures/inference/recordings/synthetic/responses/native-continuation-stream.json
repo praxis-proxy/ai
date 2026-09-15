@@ -1,0 +1,404 @@
+{
+  "version": 1,
+  "scenario_id": "responses/native-continuation-stream",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-native-model",
+    "source_id": "controlled-responses-native-continuation-stream"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "msg_native_controlled_continuation": "msg_recorded_0004",
+      "msg_native_controlled_initial": "msg_recorded_0002",
+      "resp_native_controlled_continuation": "resp_recorded_0003",
+      "resp_native_controlled_initial": "resp_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What is 2+2? Reply with just the number.",
+              "model": "synthetic-native-model",
+              "store": true,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": 0,
+              "error": null,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input": "What is 2+2? Reply with just the number.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "metadata": {},
+              "model": "synthetic-native-model",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "previous_response_id": null,
+              "reasoning": null,
+              "status": "completed",
+              "store": true,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [],
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {
+                  "cached_tokens": 0
+                },
+                "output_tokens": 1,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What is 2+2? Reply with just the number.",
+              "model": "synthetic-native-model",
+              "store": true,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": 0,
+              "error": null,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input": "What is 2+2? Reply with just the number.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "metadata": {},
+              "model": "synthetic-native-model",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "previous_response_id": null,
+              "reasoning": null,
+              "status": "completed",
+              "store": true,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [],
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {
+                  "cached_tokens": 0
+                },
+                "output_tokens": 1,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "continuation",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "What was the previous answer? Reply with just the number.",
+              "model": "synthetic-native-model",
+              "previous_response_id": "resp_recorded_0001",
+              "store": false,
+              "stream": true
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "response.created",
+                "data": "{\"response\":{\"created_at\":0,\"id\":\"resp_recorded_0003\",\"model\":\"synthetic-native-model\",\"object\":\"response\",\"output\":[],\"previous_response_id\":\"resp_recorded_0001\",\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.in_progress",
+                "data": "{\"response\":{\"created_at\":0,\"id\":\"resp_recorded_0003\",\"model\":\"synthetic-native-model\",\"object\":\"response\",\"output\":[],\"previous_response_id\":\"resp_recorded_0001\",\"status\":\"in_progress\"},\"sequence_number\":1,\"type\":\"response.in_progress\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.added",
+                "data": "{\"item\":{\"content\":[],\"id\":\"msg_recorded_0004\",\"role\":\"assistant\",\"status\":\"in_progress\",\"type\":\"message\"},\"output_index\":0,\"sequence_number\":2,\"type\":\"response.output_item.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.content_part.added",
+                "data": "{\"content_index\":0,\"item_id\":\"msg_recorded_0004\",\"output_index\":0,\"part\":{\"annotations\":[],\"text\":\"\",\"type\":\"output_text\"},\"sequence_number\":3,\"type\":\"response.content_part.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_text.delta",
+                "data": "{\"content_index\":0,\"delta\":\"4\",\"item_id\":\"msg_recorded_0004\",\"output_index\":0,\"sequence_number\":4,\"type\":\"response.output_text.delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_text.done",
+                "data": "{\"content_index\":0,\"item_id\":\"msg_recorded_0004\",\"output_index\":0,\"sequence_number\":5,\"text\":\"4\",\"type\":\"response.output_text.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.content_part.done",
+                "data": "{\"content_index\":0,\"item_id\":\"msg_recorded_0004\",\"output_index\":0,\"part\":{\"annotations\":[],\"text\":\"4\",\"type\":\"output_text\"},\"sequence_number\":6,\"type\":\"response.content_part.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.done",
+                "data": "{\"item\":{\"content\":[{\"annotations\":[],\"text\":\"4\",\"type\":\"output_text\"}],\"id\":\"msg_recorded_0004\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"},\"output_index\":0,\"sequence_number\":7,\"type\":\"response.output_item.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.completed",
+                "data": "{\"response\":{\"created_at\":0,\"id\":\"resp_recorded_0003\",\"model\":\"synthetic-native-model\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"4\",\"type\":\"output_text\"}],\"id\":\"msg_recorded_0004\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"previous_response_id\":\"resp_recorded_0001\",\"status\":\"completed\",\"usage\":{\"input_tokens\":28,\"output_tokens\":1,\"total_tokens\":29}},\"sequence_number\":8,\"type\":\"response.completed\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": [
+                {
+                  "content": "What is 2+2? Reply with just the number.",
+                  "role": "user",
+                  "type": "message"
+                },
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "4",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0002",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                },
+                {
+                  "content": "What was the previous answer? Reply with just the number.",
+                  "role": "user",
+                  "type": "message"
+                }
+              ],
+              "model": "synthetic-native-model",
+              "store": false,
+              "stream": true
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "response.created",
+                "data": "{\"response\":{\"created_at\":0,\"id\":\"resp_recorded_0003\",\"model\":\"synthetic-native-model\",\"object\":\"response\",\"output\":[],\"previous_response_id\":null,\"status\":\"in_progress\"},\"sequence_number\":0,\"type\":\"response.created\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.in_progress",
+                "data": "{\"response\":{\"created_at\":0,\"id\":\"resp_recorded_0003\",\"model\":\"synthetic-native-model\",\"object\":\"response\",\"output\":[],\"previous_response_id\":null,\"status\":\"in_progress\"},\"sequence_number\":1,\"type\":\"response.in_progress\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.added",
+                "data": "{\"item\":{\"content\":[],\"id\":\"msg_recorded_0004\",\"role\":\"assistant\",\"status\":\"in_progress\",\"type\":\"message\"},\"output_index\":0,\"sequence_number\":2,\"type\":\"response.output_item.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.content_part.added",
+                "data": "{\"content_index\":0,\"item_id\":\"msg_recorded_0004\",\"output_index\":0,\"part\":{\"annotations\":[],\"text\":\"\",\"type\":\"output_text\"},\"sequence_number\":3,\"type\":\"response.content_part.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_text.delta",
+                "data": "{\"content_index\":0,\"delta\":\"4\",\"item_id\":\"msg_recorded_0004\",\"output_index\":0,\"sequence_number\":4,\"type\":\"response.output_text.delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_text.done",
+                "data": "{\"content_index\":0,\"item_id\":\"msg_recorded_0004\",\"output_index\":0,\"sequence_number\":5,\"text\":\"4\",\"type\":\"response.output_text.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.content_part.done",
+                "data": "{\"content_index\":0,\"item_id\":\"msg_recorded_0004\",\"output_index\":0,\"part\":{\"annotations\":[],\"text\":\"4\",\"type\":\"output_text\"},\"sequence_number\":6,\"type\":\"response.content_part.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.done",
+                "data": "{\"item\":{\"content\":[{\"annotations\":[],\"text\":\"4\",\"type\":\"output_text\"}],\"id\":\"msg_recorded_0004\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"},\"output_index\":0,\"sequence_number\":7,\"type\":\"response.output_item.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.completed",
+                "data": "{\"response\":{\"created_at\":0,\"id\":\"resp_recorded_0003\",\"model\":\"synthetic-native-model\",\"object\":\"response\",\"output\":[{\"content\":[{\"annotations\":[],\"text\":\"4\",\"type\":\"output_text\"}],\"id\":\"msg_recorded_0004\",\"role\":\"assistant\",\"status\":\"completed\",\"type\":\"message\"}],\"previous_response_id\":null,\"status\":\"completed\",\"usage\":{\"input_tokens\":28,\"output_tokens\":1,\"total_tokens\":29}},\"sequence_number\":8,\"type\":\"response.completed\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      }
+    }
+  ]
+}

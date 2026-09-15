@@ -1,70 +1,190 @@
-# Responses API Full Flow — File Search Callout (Non-Streaming)
+# Responses API Full Flow — Unified Agentic Gateway
 #
-# Extends the full-flow pipeline with an iterative_request_router (IRR)
-# around the inference step, enabling server-side file search execution.
-# The IRR sends the request to the model, executes any returned
-# file_search_call through the vector store, and feeds the search
-# context back for a second model inference before returning the
-# final Responses API object.
+# Runs the complete Responses API pipeline through an agentic
+# iterative_request_router that executes hosted file_search, web_search,
+# and MCP tool calls in a model-tool-model loop, persisting both buffered
+# and streaming (`stream: true`) responses. This is the single config an
+# operator would deploy for a Responses API gateway that must serve the
+# full agentic loop, the Conversations API, and the dedicated
+# prompts/embeddings/files/vector_stores services behind one listener.
 #
-# Because IRR fully buffers responses, this config does NOT support
-# streaming or WebSocket. For streaming without the agentic loop,
-# see full-flow.yaml. For MCP-driven agentic tool loops, see
-# agentic-loop.yaml (these two loop types cannot share an IRR step
-# because agentic_loop and file_search_callout use incompatible
-# response-body accumulation strategies).
+# Pre-IRR filters run once on the client request to set up shared state
+# (ResponsesState) which persists across all IRR iterations via extension
+# swapping:
 #
-# Pre-IRR filters run once on the client request to set up shared
-# state (ResponsesState) which persists across all IRR iterations
-# via extension swapping.
+#   1. openai_conversations handles CRUD for the Conversations API
+#      (/v1/conversations) and sets has_conversation metadata when a
+#      Responses request carries a conversation field. On the response
+#      path it appends input+output items back to the conversation after
+#      a successful non-streaming response.
 #
-# Pre-IRR pipeline (runs once):
-#   1. openai_conversations — CRUD for the Conversations API
-#   2. openai_responses_format — classifies body, promotes metadata
-#   3. openai_responses_validate — validates parameters, generates IDs
-#   4. openai_tool_parse — parses tools array, promotes summary facts
-#   5. openai_response_store — persists responses, registers store backend
-#   6. openai_stream_events — accumulates SSE events (no-op here since
-#      IRR buffers the response; retained for pipeline consistency)
-#   7. openai_responses_rehydrate — loads previous_response_id / conversation
-#   8. openai_file_resolve — resolves file_id references via Files API
-#   9. openai_doc_extract — converts input_file to input_text for backends
-#      that do not natively support input_file
-#  10. openai_mcp_tool_resolve — resolves MCP tool entries via tools/list
+#   2. openai_responses_format classifies the request and promotes
+#      format, model, stream, and mode to internal routing headers.
+#      on_invalid is left at the default (passthrough) so that
+#      Conversations API traffic is not rejected before the conversations
+#      filter can handle it in the body phase.
 #
-# IRR inference filter chain (all routing lives inside the IRR step
-# because the IRR must be the terminal filter in the chain):
+#   3. openai_responses_validate checks JSON syntax, generates response
+#      and conversation IDs, and writes responses.* metadata for
+#      downstream filters. Provider-owned parameter combinations pass
+#      through.
+#
+#   4. openai_tool_parse parses the tools array and tool_choice from
+#      Responses API requests and promotes summary facts (has_tools,
+#      has_web_search, tool_choice, function_count, etc.) to metadata and
+#      filter results. Does not mutate the request body.
+#
+#   5. openai_response_store persists responses to SQLite and registers
+#      the store backend so downstream filters (rehydrate, compact) can
+#      read from it. It runs PRE-IRR (before the iterative_request_router
+#      below), so on the response path — which runs in reverse config
+#      order — it persists AFTER the IRR step has composed the terminal
+#      event. This is what makes streaming persistence work: the store
+#      reads the accumulated response object that openai_stream_events
+#      builds inside the IRR.
+#
+#   6. openai_responses_rehydrate loads conversation context from
+#      previous_response_id or conversation field by fetching stored
+#      responses/conversations and prepending their message history to the
+#      current request. previous_response_id takes precedence when both
+#      are present.
+#
+#   7. openai_file_resolve resolves file_id references in the current
+#      input and rehydrated history through a configured Files API. Runs
+#      after rehydrate so stored history is available, and before
+#      responses_proxy so the rebuilt upstream body contains file_data or
+#      image_url rather than stale file_id references.
+#
+#   8. openai_doc_extract converts input_file content parts to input_text
+#      for backends that do not natively support input_file (e.g. vLLM,
+#      llm-d). Text-safe content (text/*, application/json,
+#      application/xml) is decoded from base64, validated as UTF-8, and
+#      forwarded as plain text. Unsupported formats are left unchanged
+#      (on_unsupported: continue). This filter is optional — omit it when
+#      the inference backend natively supports input_file.
+#
+#   9. openai_mcp_tool_resolve resolves MCP tool entries from the tools
+#      array by calling tools/list on each upstream MCP server. Runs after
+#      rehydrate so previous_tools is available for cross-request caching.
+#      Writes mcp_tool_map to ResponsesState for downstream tool dispatch.
+#
+#   10. The bypass gateway (a no-op `headers` carrier hosting a
+#      branch_chains bypass) routes everything EXCEPT a classified
+#      `POST /v1/responses` create request directly to a backend. The IRR
+#      below fully owns the sub-request lifecycle, which is incompatible
+#      with WebSocket upgrades and with the dedicated
+#      prompts/embeddings/files/vector_stores services — so those, plus
+#      `GET /v1/responses` WebSocket handshakes, take the bypass branch.
+#      The carrier's `unless` condition skips it only when the request is
+#      `POST /v1/responses` AND classified as x-praxis-ai-format:
+#      openai_responses, so genuine create requests fall through to the
+#      IRR while a Chat Completions or Anthropic Messages body posted to
+#      /v1/responses (or a GET WebSocket handshake) still runs the
+#      carrier. The `unless` gate is a positive allow-list of one format:
+#      any body that is NOT classified openai_responses (Chat Completions,
+#      Anthropic Messages, or any future/unclassified format) runs the
+#      carrier and gets a route-miss (404) — no per-format reject rule is
+#      needed. Discrimination lives here, PRE-IRR, because the IRR strips
+#      x-praxis-* headers from its sub-request (see step 11). Inside the
+#      bypass, the `/v1/responses` route matches on the WebSocket
+#      `Upgrade` header (routes cannot match on HTTP method), so a WS
+#      handshake reaches the backend while a non-Responses body gets a
+#      route-miss (404). The bypass router/load_balancer live INSIDE the
+#      branch: a top-level router or load_balancer cannot coexist with an
+#      IRR in the same chain, and the branch rejoins at `terminal` so its
+#      selected cluster is forwarded upstream directly.
+#
+#   11. The iterative_request_router owns the agentic loop for classified
+#      openai_responses create requests. openai_responses_proxy rebuilds
+#      the outbound body from ResponsesState and automatically selects the
+#      typed streaming transport for an effective `stream: true` request,
+#      so each backend SSE chunk reaches openai_stream_events
+#      incrementally. openai_agentic_loop is the sole loop owner, sole
+#      response parser, and sole transition authority: it extracts
+#      completed function_call, web_search_call, file_search_call, and MCP
+#      items, records the assignment each request-phase dispatcher must
+#      execute next, and publishes the single loop/done decision. Because
+#      the IRR is the terminal filter, all backend routing for create
+#      requests lives inside the IRR step. That step router is path-only:
+#      the IRR strips every x-praxis-* reserved-prefix header from its
+#      sub-request before the step runs, so it cannot route on
+#      x-praxis-ai-format. Responses-vs-Chat discrimination therefore
+#      happens PRE-IRR at the bypass carrier (step 10); only a classified
+#      openai_responses create request reaches this step.
+#
+# IRR inference filter chain (canonical #1046 order):
 #   Request phase (forward):
-#     openai_file_search_callout → openai_responses_proxy
-#       → headers → router → load_balancer
+#     openai_stream_events → openai_web_search → openai_mcp_dispatch
+#       → openai_file_search_callout → openai_agentic_loop
+#       → openai_responses_proxy → headers → router → load_balancer
 #   Response phase (reverse):
 #     load_balancer → router → headers → openai_responses_proxy
-#       → openai_file_search_callout
-#
-# Only Responses API traffic (/v1/responses) is routed by this
-# config. Non-Responses paths (/v1/prompts, /v1/embeddings, etc.)
-# receive a route-miss error. For a full gateway that also routes
-# non-Responses traffic, see full-flow.yaml (without IRR).
+#       → openai_agentic_loop → (dispatchers have no response phase)
+#       → openai_stream_events
+#   The three dispatchers (openai_web_search, openai_mcp_dispatch,
+#   openai_file_search_callout) have no response phase: each executes the
+#   loop owner's assigned calls at request-body EOS on the next iteration,
+#   reconciling results in place inside ResponsesState.accumulated_output.
+#   Each is inert unless the model emits the matching hosted tool call.
 #
 # Transition rules (evaluated after each step's response-body):
-#   openai_file_search_callout.pending = "true" → next: inference
-#   default                                     → done (exit to client)
+#   openai_agentic_loop.action = "loop" → next: inference
+#   default                             → done (exit to client)
+#   The loop owner is the sole transition authority (issue #1046); the
+#   dispatch filters never drive the IRR transition.
 #
-# Model responses that combine file_search_call with a client-executed
-# function_call are rejected until cross-request continuation state
-# exists.
+# Config knobs:
+#   max_infer_iters: application-level iteration cap on openai_agentic_loop
+#   max_iterations:  infrastructure-level safety cap on the IRR. It must be
+#                    at least max_infer_iters + 1 (initial inference plus
+#                    the allowed tool-backed inference continuations). Here
+#                    7 + 1 = 8.
+#
+# Streaming persistence:
+#   Removing openai_stream_events (or moving openai_response_store after
+#   the IRR) silently breaks streaming persistence: the store persists
+#   ResponsesState.response_object, and only openai_stream_events
+#   populates it for `stream: true` responses. openai_stream_events is
+#   also REQUIRED for loop correctness — openai_responses_proxy selects
+#   typed streaming automatically for `stream: true`, which commits
+#   `response.completed` to the client as it arrives, so a loop-terminal
+#   error detected by openai_agentic_loop can only reach the client
+#   through this filter's logical-stream finalizer. When it is absent from
+#   a streaming step, openai_agentic_loop fails closed with a 500 before
+#   any backend request. Keep the store PRE-IRR and openai_stream_events
+#   INSIDE the IRR step so both buffered and streaming responses are
+#   persisted and retrievable via GET /v1/responses/{id} (served pre-IRR
+#   by openai_response_store).
 #
 # Security: StreamBuffer body callouts run before this listener's
-# header-phase filters. Deploy this example behind an outer
-# authentication and authorization boundary before enabling the
-# required allow_pre_security_callout acknowledgement below.
+# header-phase filters. Deploy this example behind an outer authentication
+# and authorization boundary before enabling the required
+# allow_pre_security_callout acknowledgement below.
+#
+# A request is stateful when any of these hold:
+#   - previous_response_id is set
+#   - tools array is non-empty
+#   - store is true (the OpenAI spec default when omitted)
+#   - background is true
+#   - conversation is set
+#   - prompt.id is set
 #
 # Example requests:
 #
-#   # Simple — validated and routed through the IRR (single pass)
+#   # Stateful (store defaults to true) — validated, looped, persisted
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"Hello, world!"}'
+#
+#   # Streaming with persistence (store defaults to true)
+#   curl -N -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Hello","stream":true}'
+#
+#   # Stateless (store=false, no stateful markers) — validated and routed
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Hello","store":false}'
 #
 #   # Multi-turn with previous_response_id
 #   curl -X POST http://localhost:8080/v1/responses \
@@ -74,11 +194,71 @@
 #   # File search — model issues file_search_call, executed via vector store
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
+#     -H "Authorization: Bearer token" \
 #     -d '{
 #       "model": "gpt-4.1",
 #       "input": "What does the README say about deployment?",
 #       "tools": [{"type": "file_search", "vector_store_ids": ["vs_abc"]}]
 #     }'
+#
+#   # MCP tool loop — model issues an MCP call, executed via the server URL
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "What is the weather in SF?",
+#       "tools": [{"type": "mcp", "server_label": "weather",
+#                  "server_url": "http://mcp-weather:8001/mcp",
+#                  "allowed_tools": ["get_weather"],
+#                  "require_approval": "never"}]
+#     }'
+#
+#   # Retrieve a stored response (buffered or streamed)
+#   curl http://localhost:8080/v1/responses/<response-id>
+#
+#   # Responses WebSocket (requires a WebSocket-capable backend) —
+#   # takes the bypass branch, never the IRR
+#   websocat -H="Authorization: Bearer $OPENAI_API_KEY" \
+#     ws://localhost:8080/v1/responses
+#
+# Web search requires a provider API key. Set WEB_SEARCH_API_KEY in the
+# environment before starting the proxy; openai_web_search stays inert
+# until the model emits a web_search_call.
+#
+# Listener and cluster transport timeouts are intentionally omitted.
+# Configured downstream read and upstream idle/read/write timeouts remain
+# active after a 101 upgrade and can terminate long-lived WebSockets.
+#
+# Direct OpenAI upstream variant:
+#   - Replace the local inference-backend endpoint with api.openai.com:443
+#     and configure tls.sni: api.openai.com (in BOTH the bypass branch's
+#     load_balancer and the IRR step's load_balancer).
+#   - Add this headers filter inside the IRR step after the router to
+#     replace the downstream Host:
+#
+#       - filter: headers
+#         request_set:
+#           - name: Host
+#             value: api.openai.com
+#
+#   - Either pass through the client's Authorization header or add a
+#     credential_injection filter inside the IRR step to inject a
+#     server-owned credential:
+#
+#       - filter: credential_injection
+#         clusters:
+#           - name: inference-backend
+#             header: Authorization
+#             env_var: OPENAI_API_KEY
+#             header_prefix: "Bearer "
+#
+#   - Configure the inference cluster as:
+#
+#       - name: "inference-backend"
+#         endpoints:
+#           - "api.openai.com:443"
+#         tls:
+#           sni: api.openai.com
 #
 # Build:
 #   cargo build -p praxis-ai-proxy
@@ -111,11 +291,12 @@ filter_chains:
 
       - filter: openai_response_store
         backend: sqlite
+        # In-memory:
+        #   database_url: "sqlite::memory:"
+        # File-backed:
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
-
-      - filter: openai_stream_events
 
       - filter: openai_responses_rehydrate
 
@@ -135,16 +316,133 @@ filter_chains:
 
       - filter: openai_mcp_tool_resolve
 
+      # Bypass gateway: a no-op carrier that runs for everything EXCEPT a
+      # classified `POST /v1/responses` create request. When it runs, its
+      # unconditional branch routes the request directly (WebSocket
+      # upgrades, /v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores)
+      # and rejoins at `terminal`, forwarding the selected cluster upstream
+      # without entering the IRR. The router and load_balancer live inside
+      # the branch because a top-level router/load_balancer cannot coexist
+      # with the IRR below. The `unless` condition skips this carrier only
+      # for `POST /v1/responses` bearing x-praxis-ai-format:
+      # openai_responses, so create requests fall through to the IRR while a
+      # non-Responses body on /v1/responses (Chat Completions, Anthropic
+      # Messages, or unclassified) still runs the carrier and gets a
+      # route-miss (404). Discrimination lives here because the IRR strips
+      # x-praxis-* headers from its sub-request; inside the branch the
+      # /v1/responses route matches the WebSocket Upgrade header (routes
+      # cannot match on HTTP method), so a WS handshake reaches the backend
+      # while a non-Responses body does not.
+      - filter: headers
+        conditions:
+          - unless:
+              path: "/v1/responses"
+              methods: [POST]
+              headers:
+                x-praxis-ai-format: "openai_responses"
+        branch_chains:
+          - name: bypass-irr
+            rejoin: terminal
+            chains:
+              - name: bypass-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/v1/prompts"
+                        cluster: "prompts-api"
+                      - path_prefix: "/v1/embeddings"
+                        cluster: "embeddings-api"
+                      - path_prefix: "/v1/files"
+                        cluster: "files-api"
+                      # WebSocket handshakes are GET /v1/responses with an
+                      # Upgrade header. Routes cannot match on HTTP method, so
+                      # the Upgrade header discriminates: a WS handshake routes
+                      # to the backend, while a non-Responses body posted to
+                      # /v1/responses carries no Upgrade header and gets a
+                      # route-miss (404) here instead of reaching the backend.
+                      - path: "/v1/responses"
+                        headers:
+                          upgrade: "websocket"
+                        cluster: "inference-backend"
+                      - path_prefix: "/v1/vector_stores"
+                        cluster: "vector-stores-backend"
+                  - filter: load_balancer
+                    clusters:
+                      - name: "prompts-api"
+                        endpoints:
+                          - "127.0.0.1:9998"
+                      - name: "embeddings-api"
+                        endpoints:
+                          - "127.0.0.1:9997"
+                      - name: "files-api"
+                        endpoints:
+                          - "127.0.0.1:9999"
+                      - name: "inference-backend"
+                        endpoints:
+                          - "127.0.0.1:3001"
+                      - name: "vector-stores-backend"
+                        endpoints:
+                          - "127.0.0.1:3002"
+
+      # Classified openai_responses POST /v1/responses create requests flow
+      # here. The IRR runs the agentic model-tool-model loop: each round
+      # streams through openai_stream_events, the three request-phase
+      # dispatchers execute the loop owner's assigned hosted-tool calls, and
+      # openai_agentic_loop parses each response and publishes the single
+      # loop/done transition. The pre-IRR openai_response_store persists the
+      # composed object on the response path (reverse order). The step
+      # router is path-only because the IRR strips x-praxis-* headers from
+      # its sub-request; the bypass carrier above has already excluded
+      # non-Responses traffic.
       - filter: iterative_request_router
         initial_step: inference
+        # Safety cap: at least max_infer_iters + 1 (7 + 1 = 8).
         max_iterations: 8
-        timeout_ms: 120000
-        step_timeout_ms: 60000
+        # The IRR's 30s default is too short for production model streams.
+        # Allow six minutes total for time-to-first-byte and logical
+        # streaming across the loop; each step inherits a five-minute
+        # deadline (the vLLM integration tests already run at 300s).
+        timeout_ms: 360000
+        step_timeout_ms: 300000
         max_response_bytes: 67108864
+        max_stream_response_bytes: 67108864
         max_state_bytes: 136314880
         steps:
           - name: inference
             filters:
+              # Composes every inference SSE stream into one logical
+              # Responses lifecycle: preserves one response identity across
+              # rounds and withholds per-round terminal events until the IRR
+              # transition is known. A single inference round is just a
+              # one-round logical stream, so this filter always composes and
+              # must run inside this IRR step. REQUIRED for both streaming
+              # persistence and loop-terminal error delivery (see the
+              # "Streaming persistence" note above); openai_agentic_loop
+              # fails closed with a 500 on an effective stream:true request
+              # when it is absent.
+              - filter: openai_stream_events
+
+              # Request-phase dispatcher: runs first on re-entry to execute
+              # web_search_call assignments prepared by the loop owner. Inert
+              # until the model emits a web_search_call.
+              - filter: openai_web_search
+                provider: brave
+                api_key: ${WEB_SEARCH_API_KEY}
+                max_calls_per_round: 32
+              # Request-phase dispatcher: runs second on re-entry to execute
+              # MCP calls prepared and classified by the loop owner. Inert
+              # until the model emits an MCP tool call.
+              - filter: openai_mcp_dispatch
+                max_calls_per_round: 32
+                max_parallel_calls: 8
+                max_result_bytes: 1048576
+                max_total_result_bytes: 8388608
+              # Request-phase dispatcher: at request-body EOS on each IRR
+              # re-entry it executes the file_search_call items the loop owner
+              # assigned in the prior response, reconciling each in place
+              # inside ResponsesState.accumulated_output. It never parses the
+              # response body and never decides whether another round runs,
+              # so it is inert unless the model emits a hosted file_search_call.
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:3002
                 allow_private_url: true
@@ -155,12 +453,25 @@ filter_chains:
                 on_failure: closed
                 forward_headers:
                   - authorization
+              # Sole loop owner: parses each model response, records the
+              # hosted-tool assignments for the dispatchers, and publishes the
+              # single continuation signal (action=loop|done). max_infer_iters
+              # must stay below the IRR max_iterations safety cap (7 + 1 = 8).
+              - filter: openai_agentic_loop
+                max_infer_iters: 7
+              # Selects typed streaming automatically when the effective
+              # outbound body carries `"stream": true`; otherwise buffers.
               - filter: openai_responses_proxy
-                name: inference
               - filter: headers
                 request_set:
                   - name: Content-Type
                     value: application/json
+              # Path-only routing. The x-praxis-ai-format header cannot be
+              # matched here: the IRR strips every x-praxis-* reserved-prefix
+              # header from the sub-request before this step's router runs, so
+              # a header match would always miss (404). Responses-vs-Chat
+              # discrimination therefore happens PRE-IRR at the bypass carrier
+              # (only a classified openai_responses POST reaches this step).
               - filter: router
                 routes:
                   - path: "/v1/responses"
@@ -171,9 +482,15 @@ filter_chains:
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:
-              - filter: openai_file_search_callout
-                key: pending
-                value: "true"
+              # openai_agentic_loop is the sole loop authority (issue #1046):
+              # it parses each model response, records assignments for the
+              # request-phase dispatchers (web_search, mcp_dispatch,
+              # file_search_callout), and publishes the single continuation
+              # signal. The IRR transitions only on the owner's action, never
+              # on a dispatcher's.
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
                 next: inference
               - default: true
                 done: true

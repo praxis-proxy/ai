@@ -32,6 +32,7 @@
             "value": {
               "input": "Reply with exactly `4` and nothing else.",
               "model": "synthetic-agentic-model",
+              "parallel_tool_calls": true,
               "store": false,
               "stream": false
             }
@@ -86,15 +87,9 @@
           "body": {
             "kind": "json",
             "value": {
-              "input": [
-                {
-                  "content": "Reply with exactly `4` and nothing else.",
-                  "role": "user",
-                  "type": "message"
-                }
-              ],
+              "input": "Reply with exactly `4` and nothing else.",
               "model": "synthetic-agentic-model",
-              "parallel_tool_calls": false,
+              "parallel_tool_calls": true,
               "store": false,
               "stream": false
             }

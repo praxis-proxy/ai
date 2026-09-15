@@ -148,6 +148,10 @@ fn default_max_response_body_bytes() -> usize {
 // -----------------------------------------------------------------------------
 
 /// Promoted header names for A2A metadata.
+///
+/// Transport, credential, API-key, and other internal `x-praxis-*` names
+/// are rejected. Each field may use its dedicated `x-praxis-a2a-*` default
+/// or a custom non-`x-praxis-*` header.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct A2aHeaders {
@@ -266,6 +270,10 @@ fn default_version_header() -> Option<String> {
 #[serde(deny_unknown_fields)]
 pub(crate) struct A2aConfig {
     /// Header names for A2A metadata promotion.
+    ///
+    /// Must not be hop-by-hop, framing, Host, credential, API-key, or
+    /// other internal `x-praxis-*` names. Dedicated `x-praxis-a2a-*`
+    /// defaults remain allowed.
     #[serde(default)]
     pub headers: A2aHeaders,
 
@@ -298,14 +306,7 @@ fn default_max_body_bytes() -> usize {
 /// Validate and build the final configuration.
 pub(crate) fn build_config(cfg: A2aConfig) -> Result<A2aConfig, FilterError> {
     validate_max_body_bytes("a2a", cfg.max_body_bytes)?;
-
-    validate_header_name("a2a", "context_id", cfg.headers.context_id.as_deref())?;
-    validate_header_name("a2a", "method", cfg.headers.method.as_deref())?;
-    validate_header_name("a2a", "family", cfg.headers.family.as_deref())?;
-    validate_header_name("a2a", "task_id", cfg.headers.task_id.as_deref())?;
-    validate_header_name("a2a", "kind", cfg.headers.kind.as_deref())?;
-    validate_header_name("a2a", "streaming", cfg.headers.streaming.as_deref())?;
-    validate_header_name("a2a", "version", cfg.headers.version.as_deref())?;
+    validate_a2a_headers(&cfg.headers)?;
 
     if cfg.task_routing.enabled {
         validate_task_routing(&cfg.task_routing)?;
@@ -324,6 +325,38 @@ pub(crate) fn build_config(cfg: A2aConfig) -> Result<A2aConfig, FilterError> {
     }
 
     Ok(cfg)
+}
+
+/// Validate an A2A body-derived promotion header.
+fn validate_a2a_promotion_header(field: &str, name: Option<&str>, dedicated: &str) -> Result<(), FilterError> {
+    praxis_ai_apis::promotion::validate_dedicated_promotion_header("a2a", field, name, &[dedicated])
+}
+
+/// Validate dedicated names and reject collisions across A2A header fields.
+fn validate_a2a_headers(headers: &A2aHeaders) -> Result<(), FilterError> {
+    for (field, name, dedicated) in [
+        ("context_id", headers.context_id.as_deref(), "x-praxis-a2a-context-id"),
+        ("method", headers.method.as_deref(), "x-praxis-a2a-method"),
+        ("family", headers.family.as_deref(), "x-praxis-a2a-family"),
+        ("task_id", headers.task_id.as_deref(), "x-praxis-a2a-task-id"),
+        ("kind", headers.kind.as_deref(), "x-praxis-a2a-kind"),
+        ("streaming", headers.streaming.as_deref(), "x-praxis-a2a-streaming"),
+        ("version", headers.version.as_deref(), "x-praxis-a2a-version"),
+    ] {
+        validate_a2a_promotion_header(field, name, dedicated)?;
+    }
+    praxis_ai_apis::promotion::reject_duplicate_promotion_fields(
+        "a2a",
+        &[
+            ("context_id", headers.context_id.as_deref()),
+            ("method", headers.method.as_deref()),
+            ("family", headers.family.as_deref()),
+            ("task_id", headers.task_id.as_deref()),
+            ("kind", headers.kind.as_deref()),
+            ("streaming", headers.streaming.as_deref()),
+            ("version", headers.version.as_deref()),
+        ],
+    )
 }
 
 /// Validate task routing configuration.
@@ -617,6 +650,70 @@ headers:
         .unwrap();
         let result = build_config(cfg);
         assert!(result.is_ok(), "null (disabled) headers should be accepted");
+    }
+
+    #[test]
+    fn build_config_rejects_api_key_promotion_header() {
+        let cfg: A2aConfig = serde_yaml::from_str(
+            r"
+headers:
+  method: x-api-key
+",
+        )
+        .unwrap();
+        let err = build_config(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("x-api-key"),
+            "x-api-key promotion header should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_format_routing_promotion_header() {
+        let cfg: A2aConfig = serde_yaml::from_str(
+            r"
+headers:
+  method: x-praxis-ai-format
+",
+        )
+        .unwrap();
+        let err = build_config(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("x-praxis-ai-format"),
+            "x-praxis-ai-format promotion header should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn build_config_rejects_duplicate_promotion_headers() {
+        let cfg: A2aConfig = serde_yaml::from_str(
+            r"
+headers:
+  method: x-shared
+  kind: X-Shared
+",
+        )
+        .unwrap();
+        let err = build_config(cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("same header name"),
+            "duplicate A2A promotion headers should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn build_config_accepts_custom_promotion_header() {
+        let cfg: A2aConfig = serde_yaml::from_str(
+            r"
+headers:
+  method: x-custom-a2a-method
+",
+        )
+        .unwrap();
+        assert!(
+            build_config(cfg).is_ok(),
+            "custom non-internal promotion header should be accepted"
+        );
     }
 
     // -------------------------------------------------------------------------

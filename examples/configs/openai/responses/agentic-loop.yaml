@@ -4,11 +4,21 @@
 # for step-based model-tool-model looping in the Responses API.
 #
 # The iterative_request_router (IRR) repeatedly runs one inference step.
-# `openai_mcp_dispatch` dynamically executes MCP calls against the server URL
-# supplied in the request, and `openai_web_search` executes web searches
-# against an external search provider. Both dispatch results back to the
-# model via the loop. Client-side function calls do not match any
-# dispatch filter and are returned to the client without looping.
+# Three request-phase dispatchers execute the loop owner's assigned calls:
+# `openai_web_search` runs web searches against an external provider,
+# `openai_mcp_dispatch` runs MCP calls against the server URL supplied in the
+# request, and `openai_file_search_callout` runs hosted file searches against
+# the vector store. Each dispatches results back to the model via the loop.
+# Client-side function calls resolve to no dispatcher and are returned to the
+# client without looping.
+#
+# Configured `connector_id` values can be combined with `defer_loading: true`
+# and a `tool_search` tool so discovery waits for a later `tool_search_call`.
+# Connector IDs are pipeline-local; they are never forwarded to the
+# inference backend. The first inference round keeps a sanitized
+# `type: mcp` stub plus `tool_search` (the backend must accept those
+# OpenAI hosted-tool shapes). Any later `tool_search_call` loads every
+# pending deferred connector from its internally resolved endpoint.
 #
 # Pre-IRR filters run once on the client request to set up shared
 # state (ResponsesState) which persists across all IRR iterations
@@ -24,22 +34,26 @@
 #   3. openai_response_store — registers the store backend
 #   4. openai_responses_rehydrate — loads previous_response_id context
 #
-# IRR inference filter chain:
+# IRR inference filter chain (canonical #1046 order):
 #   Request phase (forward):
-#     openai_web_search → openai_mcp_dispatch → openai_agentic_loop
+#     openai_stream_events → openai_web_search → openai_mcp_dispatch
+#       → openai_file_search_callout → openai_agentic_loop
 #       → openai_responses_proxy → router → load_balancer
 #   Response phase (reverse):
 #     load_balancer → router → openai_responses_proxy → openai_agentic_loop
-#       → openai_mcp_dispatch → openai_web_search
-#   openai_agentic_loop extracts completed function calls and web_search_call
-#   items. Dispatch filters then identify their respective calls, write
-#   the IRR transition, and execute them at the start of the next
-#   iteration before inference.
+#       → (dispatchers have no response phase) → openai_stream_events
+#   openai_agentic_loop is the sole response parser: it extracts completed
+#   function calls, web_search_call, file_search_call, and hosted
+#   tool_search_call items, records the assignments each dispatcher must
+#   execute, and publishes the single loop/done decision. The dispatchers
+#   execute their assigned calls at request-body EOS on the next iteration,
+#   before inference, and never parse the response.
 #
 # Transition rules (evaluated after each step's response-body):
-#   openai_mcp_dispatch.action = "loop"  → next: inference
-#   openai_web_search.action   = "loop"  → next: inference
+#   openai_agentic_loop.action = "loop"  → next: inference
 #   default                              → done (exit to client)
+#   The loop owner is the sole transition authority (issue #1046); the
+#   dispatch filters never drive the IRR transition.
 #
 # Config knobs:
 #   max_infer_iters: application-level iteration cap (default 10)
@@ -68,6 +82,63 @@
 #                  "server_url": "http://mcp-weather:8001/mcp",
 #                  "allowed_tools": ["get_weather"],
 #                  "require_approval": "never"}]
+#     }'
+#
+#   # Deferred configured connector (loaded on a later tool_search_call)
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "Search drive for quarterly reports",
+#       "tools": [
+#         {"type": "tool_search"},
+#         {
+#           "type": "mcp",
+#           "server_label": "drive",
+#           "connector_id": "corp_drive",
+#           "defer_loading": true,
+#           "allowed_tools": ["search"],
+#           "require_approval": "never"
+#         }
+#       ]
+#     }'
+#
+# MCP approval round trip (require_approval: "always"):
+#
+#   A tool guarded by approval pauses the loop and returns an
+#   `mcp_approval_request` output item (id == the model's call_id) instead of
+#   executing. The client resumes by echoing an `mcp_approval_response` on the
+#   next turn (with previous_response_id and the same tools so the server is
+#   re-resolved). `approve: true` runs the tool exactly once; `approve: false`
+#   feeds the model a truthful denial and runs zero tool calls. Consumption is
+#   single-use — replaying an approval fails closed and never executes twice.
+#
+#   # Turn 1 — the model asks to call the tool; approval is required:
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "What is the weather in SF?",
+#       "tools": [{"type": "mcp", "server_label": "weather",
+#                  "server_url": "http://mcp-weather:8001/mcp",
+#                  "allowed_tools": ["get_weather"],
+#                  "require_approval": "always"}]
+#     }'
+#   # → returns an mcp_approval_request output item, e.g. id "call_abc123".
+#
+#   # Turn 2 — approve the pending call (reuse the returned response id):
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "previous_response_id": "<response id from turn 1>",
+#       "tools": [{"type": "mcp", "server_label": "weather",
+#                  "server_url": "http://mcp-weather:8001/mcp",
+#                  "allowed_tools": ["get_weather"],
+#                  "require_approval": "always"}],
+#       "input": [{"type": "mcp_approval_response",
+#                  "approval_request_id": "call_abc123",
+#                  "approve": true}]
 #     }'
 #
 # Build:
@@ -101,47 +172,76 @@ filter_chains:
       - filter: openai_responses_rehydrate
 
       - filter: openai_mcp_tool_resolve
+        connectors:
+          - id: corp_drive
+            server_url: https://drive-mcp.internal:8443/mcp
 
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 11
         max_stream_response_bytes: 67108864
+        # The IRR's 30s default is too short for production model streams.
+        # Allow six minutes total for time-to-first-byte and logical streaming
+        # across the loop.
+        timeout_ms: 360000
         steps:
           - name: inference
             filters:
-              # Parses every inference SSE stream, preserves one logical
-              # response identity across rounds, and withholds per-round
-              # terminal events until the IRR transition is known.
+              # Composes every inference SSE stream into one logical Responses
+              # lifecycle: preserves one response identity across rounds and
+              # withholds per-round terminal events until the IRR transition is
+              # known. A single inference round is just a one-round logical
+              # stream, so this filter always composes and must run inside this
+              # IRR step.
               #
-              # REQUIRED with `openai_responses_proxy: terminal_streaming`
-              # below. Typed streaming commits `response.completed` to the
+              # REQUIRED because `openai_responses_proxy` below selects typed
+              # streaming automatically for an effective `"stream": true`
+              # request. Typed streaming commits `response.completed` to the
               # client as it arrives, so a loop-terminal error detected by
-              # `openai_agentic_loop` (e.g. an SSE parse failure or a tool-call
-              # cardinality violation) can only reach the client through this
+              # `openai_agentic_loop` (e.g. an SSE parse failure or mixed
+              # client/server function-call ownership) can only reach the client through this
               # filter's logical-stream finalizer, which defers each round's
-              # terminal event and can replace it with an error frame. Without
-              # `logical_stream: true` that error is silently dropped after the
-              # success is already on the wire, so `openai_agentic_loop` fails
-              # closed with a 500 before any backend request when the two are
-              # misconfigured together. (Startup validation of this pairing is
-              # left to a future Praxis-core improvement.)
+              # terminal event and can replace it with an error frame. When this
+              # filter is absent from the step, that error would be silently
+              # dropped after the success is already on the wire, so
+              # `openai_agentic_loop` fails closed with a 500 before any backend
+              # request. (Startup validation of this pairing is left to a future
+              # Praxis-core improvement.)
               - filter: openai_stream_events
-                logical_stream: true
 
-              # Runs first on request re-entry to execute pending web
-              # searches, and last on the model response to detect
-              # web_search_call items.
+              # Request-phase dispatcher: runs first on re-entry to execute
+              # web_search_call assignments prepared by the loop owner.
               - filter: openai_web_search
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
-              # Runs second on request re-entry to execute pending MCP
-              # calls, and second-to-last on the model response to
-              # classify MCP tool calls.
+                max_calls_per_round: 32
+              # Request-phase dispatcher: runs second on re-entry to execute
+              # MCP calls prepared and classified by the loop owner.
               - filter: openai_mcp_dispatch
+                max_calls_per_round: 32
+                max_parallel_calls: 8
+                max_result_bytes: 1048576
+                max_total_result_bytes: 8388608
+              # Request-phase dispatcher: at request-body EOS on each IRR
+              # re-entry it executes the file_search_call items the loop owner
+              # assigned in the prior response, reconciling each in place inside
+              # ResponsesState.accumulated_output. It never parses the response
+              # body and never decides whether another round runs, so it is inert
+              # unless the model emits a hosted file_search_call.
+              - filter: openai_file_search_callout
+                vector_store_url: http://127.0.0.1:8001
+                allow_private_url: true
+                timeout_ms: 5000
+                max_response_bytes: 10485760
+                max_total_response_bytes: 67108864
+                on_failure: closed
+                forward_headers:
+                  - authorization
               - filter: openai_agentic_loop
                 max_infer_iters: 10
+              # Selects typed streaming automatically when the effective
+              # outbound body carries `"stream": true`; otherwise buffers.
               - filter: openai_responses_proxy
-                terminal_streaming: true
               - filter: router
                 routes:
                   - path_prefix: "/"
@@ -152,11 +252,13 @@ filter_chains:
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:
-              - filter: openai_mcp_dispatch
-                key: action
-                value: loop
-                next: inference
-              - filter: openai_web_search
+              # openai_agentic_loop is the sole loop authority (issue #1046): it
+              # parses each model response, records assignments for the
+              # request-phase dispatchers (web_search, mcp_dispatch,
+              # file_search_callout), and publishes the single continuation
+              # signal. The IRR transitions only on the owner's action, never on
+              # a dispatcher's.
+              - filter: openai_agentic_loop
                 key: action
                 value: loop
                 next: inference

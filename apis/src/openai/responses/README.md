@@ -8,7 +8,7 @@ Pipeline overview for filters under `apis/src/openai/responses/`.
 - **`openai_agentic_loop`** — Agentic loop controller for the Responses API pipeline.
 - **`openai_doc_extract`** — Converts `input_file` content parts to `input_text` for backends that do not support `input_file` natively (e.g. vLLM, llm-d).
 - **`openai_file_resolve`** — Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field.
-- **`openai_file_search_callout`** — Executes pending file search calls against a vector store API compatible backend.
+- **`openai_file_search_callout`** — Dispatches the loop owner's pending file-search assignments against a vector store API compatible backend.
 - **`openai_mcp_dispatch`** — Executes MCP tool calls against upstream MCP servers within the Responses API agentic loop.
 - **`openai_mcp_tool_resolve`** — Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server.
 - **`openai_response_store`** — Persists Responses API responses to the configured response store backend.
@@ -18,7 +18,7 @@ Pipeline overview for filters under `apis/src/openai/responses/`.
 - **`openai_responses_proxy`** — Rebuilds the request body from `ResponsesState` when present.
 - **`openai_responses_rehydrate`** — Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input).
 - **`openai_responses_validate`** — Validates and enriches Responses API requests.
-- **`openai_stream_events`** — Accumulates state from native Responses API SSE event streams.
+- **`openai_stream_events`** — Composes the current IRR execution into one logical Responses stream.
 - **`openai_tool_parse`** — Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body.
 - **`openai_web_search`** — Web search filter for model-driven `web_search_call` dispatch.
 - **`responses_to_chat_completions`** — Translates canonical Responses create requests for a Chat Completions backend.
@@ -32,8 +32,8 @@ Body-phase columns show `Access / Mode` when the hook is implemented.
 | `openai_agentic_loop` | ✓ | ReadOnly / StreamBuffer | — | ReadWrite / Stream |
 | `openai_doc_extract` | — | ReadWrite / StreamBuffer | — | — |
 | `openai_file_resolve` | — | ReadWrite / StreamBuffer | — | — |
-| `openai_file_search_callout` | ✓ | ReadOnly / StreamBuffer | — | ReadWrite / Stream |
-| `openai_mcp_dispatch` | — | ReadOnly / StreamBuffer | — | ReadWrite / Stream |
+| `openai_file_search_callout` | — | ReadOnly / StreamBuffer | — | — |
+| `openai_mcp_dispatch` | ✓ | ReadOnly / StreamBuffer | — | — |
 | `openai_mcp_tool_resolve` | ✓ | ReadWrite / StreamBuffer | — | — |
 | `openai_response_store` | ✓ | ReadOnly / Stream | ✓ | ReadOnly / Stream |
 | `openai_responses_compact` | — | ReadOnly / StreamBuffer | — | — |
@@ -44,5 +44,5 @@ Body-phase columns show `Access / Mode` when the hook is implemented.
 | `openai_responses_validate` | — | ReadOnly / StreamBuffer | — | — |
 | `openai_stream_events` | ✓ | — | ✓ | ReadWrite / Stream |
 | `openai_tool_parse` | ✓ | ReadOnly / StreamBuffer | — | — |
-| `openai_web_search` | — | ReadOnly / StreamBuffer | — | ReadOnly / Stream |
+| `openai_web_search` | — | ReadOnly / StreamBuffer | — | — |
 | `responses_to_chat_completions` | — | ReadWrite / StreamBuffer | ✓ | ReadWrite / Stream |

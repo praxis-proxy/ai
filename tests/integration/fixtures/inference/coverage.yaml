@@ -149,6 +149,7 @@ features:
     status: synthetic_only
     scenarios:
       - responses/native-continuation
+      - responses/native-continuation-stream
     providers:
       synthetic:
         status: synthetic_only
@@ -178,6 +179,7 @@ features:
     status: synthetic_only
     scenarios:
       - responses/chat-web-search
+      - responses/chat-web-search-stream
     providers:
       synthetic:
         status: synthetic_only
@@ -199,12 +201,30 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.agentic.status_less_function_call
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/agentic-status-less-function-call
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.agentic.irr_terminal_streaming
     scopes:
       - responses_agentic_loop
     status: synthetic_only
     scenarios:
       - responses/irr-terminal-streaming
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.agentic.deferred_mcp_connectors
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/agentic-deferred-mcp-connectors
     providers:
       synthetic:
         status: synthetic_only
@@ -223,6 +243,15 @@ features:
     status: synthetic_only
     scenarios:
       - responses/chat-malformed-compaction
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.tools.function_echo
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-tool-echo
     providers:
       synthetic:
         status: synthetic_only

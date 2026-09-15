@@ -232,8 +232,7 @@ pub(crate) fn annotate_response(
 }
 
 /// Replace citation markers in response output items.
-#[cfg(test)]
-fn annotate_output_items(
+pub(crate) fn annotate_output_items(
     output: &mut [Value],
     citation_files: &HashMap<String, String>,
 ) -> Result<bool, CitationRewriteError> {

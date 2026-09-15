@@ -12,19 +12,23 @@ use std::{
     time::{Duration, Instant},
 };
 
-use praxis_filter::{FilterAction, HttpFilter};
+use praxis_filter::{BodyMode, FilterAction, HttpFilter};
 use serde_json::{Value, json};
 
 use super::{
     client::{
         ContentChunk, ContentChunkType, FileSearchClient, FileSearchClientConfig, MAX_CONCURRENT_SEARCHES,
         MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchResult, VectorStoreSearchRequest,
-        VectorStoreSearchResponse, request_error,
+        request_error,
     },
     config::{FileSearchFilterConfig, ValidatedConfig, build_config, build_config_with_client},
     *,
 };
-use crate::subrequest::{SubRequestError, SubResponse};
+use crate::{
+    callout_policy::OnFailure,
+    openai::responses::state::{FileSearchAssignment, SynthesisKind},
+    subrequest::{SubRequestError, SubResponse},
+};
 // -----------------------------------------------------------------------------
 // Configuration and transport validation
 // -----------------------------------------------------------------------------
@@ -224,28 +228,18 @@ fn hybrid_ranking_translation_rejects_untranslatable_weights() {
 }
 
 #[test]
-fn search_response_requires_page_data_and_result_content() {
-    let response: VectorStoreSearchResponse = serde_json::from_value(json!({
-        "data": [{
-            "file_id": "file-a",
-            "filename": "a.txt",
-            "score": 0.5,
-            "content": []
-        }]
+fn search_result_requires_content() {
+    let response: SearchResult = serde_json::from_value(json!({
+        "file_id": "file-a",
+        "filename": "a.txt",
+        "score": 0.5,
+        "content": []
     }))
     .unwrap();
-    assert!(response.data[0].content.is_empty());
-    assert!(response.data[0].attributes.is_none());
-
+    assert!(response.content.is_empty());
+    assert!(response.attributes.is_none());
     assert!(
-        serde_json::from_value::<VectorStoreSearchResponse>(json!({})).is_err(),
-        "page data is required"
-    );
-    assert!(
-        serde_json::from_value::<VectorStoreSearchResponse>(json!({
-            "data": [{"file_id":"file-a","filename":"a.txt","score":0.5}]
-        }))
-        .is_err(),
+        serde_json::from_value::<SearchResult>(json!({"file_id":"file-a","filename":"a.txt","score":0.5})).is_err(),
         "result content is required"
     );
 }
@@ -275,7 +269,7 @@ fn plan_accounts_for_every_call_after_global_cap() {
         ],
     );
 
-    let plan = build_search_plan(&state);
+    let plan = build_search_plan(&state, &state.file_search_assignments);
     assert_eq!(plan.spec_coordinates.len(), MAX_SEARCH_SPECS);
     assert_eq!(plan.calls.len(), 3);
     assert_eq!(plan.calls[0].scheduled_specs, MAX_SEARCH_SPECS);
@@ -302,7 +296,7 @@ fn plan_bounds_owned_inputs_but_accounts_for_every_store() {
         })],
     );
 
-    let plan = build_search_plan(&state);
+    let plan = build_search_plan(&state, &state.file_search_assignments);
 
     assert_eq!(plan.vector_store_ids.len(), MAX_SEARCH_SPECS);
     assert!(plan.vector_store_ids[0].len() > MAX_VECTOR_STORE_ID_BYTES);
@@ -435,41 +429,6 @@ fn model_facing_query_join_is_bounded() {
 }
 
 #[test]
-fn response_output_is_bounded_after_search_formatting() {
-    let state = ResponsesState {
-        response_object: json!({"id":"resp","output":[{"type":"message","content":"x".repeat(200)}]}),
-        ..Default::default()
-    };
-
-    assert!(!response_fits(&state, 128));
-    assert!(response_fits(&state, 1_024));
-}
-
-#[test]
-fn continuation_header_replay_excludes_stale_request_metadata() {
-    for name in [
-        http::header::AUTHORIZATION,
-        http::header::ACCEPT,
-        http::header::CONTENT_TYPE,
-        http::header::HeaderName::from_static("x-tenant-id"),
-    ] {
-        assert!(should_replay_original_header(&name), "{name} should be replayed");
-    }
-
-    for name in [
-        http::header::HOST,
-        http::header::CONTENT_LENGTH,
-        http::header::CONTENT_ENCODING,
-        http::header::ACCEPT_ENCODING,
-        http::header::HeaderName::from_static("idempotency-key"),
-        http::header::HeaderName::from_static("proxy-connection"),
-        http::header::HeaderName::from_static("x-praxis-internal-test"),
-    ] {
-        assert!(!should_replay_original_header(&name), "{name} should not be replayed");
-    }
-}
-
-#[test]
 fn continuation_header_replay_excludes_connection_nominated_headers() {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -482,176 +441,20 @@ fn continuation_header_replay_excludes_connection_nominated_headers() {
     assert!(!connection_nominates_header(&headers, &http::header::AUTHORIZATION));
 }
 
-#[test]
-fn output_budget_is_shared_across_inference_rounds() {
-    let state = ResponsesState {
-        file_search_output_items: vec![json!({"type":"reasoning","content":"a".repeat(40)})],
-        response_object: json!({"output":[{"type":"file_search_call","content":"b".repeat(40)}]}),
-        ..Default::default()
-    };
-    let incoming = json!({"output":[{"type":"message","content":"c".repeat(40)}]});
-
-    assert!(combined_output_fits(&state, &incoming, 512));
-    assert!(!combined_output_fits(&state, &incoming, 128));
-}
-
 #[tokio::test]
 async fn no_state_or_pending_calls_is_a_noop() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
+    // No request state at all: the dispatcher drains nothing and continues.
     let mut ctx = make_context(None);
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    assert_eq!(
-        ctx.request_headers_to_set
-            .iter()
-            .find(|(name, _)| *name == http::header::ACCEPT_ENCODING)
-            .map(|(_, value)| value),
-        Some(&http::HeaderValue::from_static("identity"))
+    assert!(
+        matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue),
+        "a dispatcher without Responses state should be a no-op"
     );
 
+    // State present but with no pending file-search assignments: still a no-op.
     ctx.extensions.insert(state_with(&["vs-a"], vec![]));
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    assert!(server.requests().is_empty());
-}
-
-#[tokio::test]
-async fn request_body_initializes_file_search_state_inside_router() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let mut ctx = make_context(None);
-    let mut body = Some(Bytes::from_static(
-        br#"{"model":"gpt-4.1","input":"search","tools":[{"type":"file_search","vector_store_ids":["vs-a"]}]}"#,
-    ));
-
-    assert!(matches!(
-        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-        FilterAction::Continue
-    ));
-    let state = ctx
-        .extensions
-        .get::<ResponsesState>()
-        .expect("state should be initialized");
-    assert_eq!(state.messages[0]["content"], "search");
-    assert_eq!(state.tools[0]["type"], "file_search");
-}
-
-#[tokio::test]
-async fn non_file_search_body_does_not_consume_continuation_budget() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "max_state_bytes: 128\n");
-    let mut ctx = make_context(None);
-    let mut body = Some(Bytes::from(json!({"input":"x".repeat(256)}).to_string()));
-
-    assert!(matches!(
-        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-        FilterAction::Continue
-    ));
-    assert!(ctx.extensions.get::<ResponsesState>().is_none());
-}
-
-#[tokio::test]
-async fn initial_state_is_rejected_before_oversized_json_duplication() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "max_state_bytes: 128\n");
-    let mut ctx = make_context(None);
-    let mut body = Some(Bytes::from(
-        json!({
-            "model":"gpt-4.1",
-            "input":"x".repeat(256),
-            "tools":[{"type":"file_search","vector_store_ids":["vs-a"]}]
-        })
-        .to_string(),
-    ));
-
-    assert!(matches!(
-        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert!(ctx.extensions.get::<ResponsesState>().is_none());
-}
-
-#[tokio::test]
-async fn streaming_file_search_is_rejected_before_callout() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
-    ctx.set_metadata("openai_responses_format.stream", "true");
-
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert!(server.requests().is_empty());
-}
-
-#[tokio::test]
-async fn streaming_without_file_search_is_rejected_before_buffering() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let mut ctx = make_context(None);
-    let mut body = Some(Bytes::from_static(
-        br#"{"model":"gpt-4.1","input":"hello","stream":true}"#,
-    ));
-
-    assert!(matches!(
-        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert!(server.requests().is_empty());
-}
-
-#[tokio::test]
-async fn streaming_rehydrated_citations_are_rejected_without_a_pending_call() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let mut state = state_with(&["vs-a"], vec![]);
-    state.citation_files.insert("file-a".to_owned(), "a.txt".to_owned());
-    let mut ctx = make_context(Some(state));
-    ctx.set_metadata("openai_responses_format.stream", "true");
-
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert!(server.requests().is_empty());
-}
-
-#[tokio::test]
-async fn streaming_rehydrated_state_is_rejected_from_the_request_body() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let mut state = state_with(&["vs-a"], vec![]);
-    state.history_rehydrated = true;
-    let mut ctx = make_context(Some(state));
-    let mut body = Some(Bytes::from_static(
-        br#"{"model":"gpt-4.1","input":"search","stream":true,"tools":[{"type":"file_search","vector_store_ids":["vs-a"]}]}"#,
-    ));
-
-    assert!(matches!(
-        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
-    assert!(server.requests().is_empty());
-}
-
-#[tokio::test]
-async fn first_pass_streaming_file_search_is_rejected() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let mut ctx = make_context(Some(state_with(&["vs-a"], vec![])));
-    ctx.set_metadata("openai_responses_format.stream", "true");
-    ctx.set_metadata("openai_tool_parse.has_file_search", "true");
-
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     assert!(server.requests().is_empty());
 }
 
@@ -665,48 +468,41 @@ async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
         json!({"type":"mcp_list_tools","id":"mcp-list","tools":[]}),
         json!({"type":"message","id":"msg-1","role":"assistant","content":[{"type":"output_text","text":"I will check."}]}),
     ];
-    let mut state = state_with(&["vs-a"], output.clone());
+    let mut state = state_with(&["vs-a"], output);
     state.include.push("file_search_call.results".to_owned());
     state
         .messages
         .push(json!({"type":"message","id":"input-1","role":"user","content":"search"}));
-    state.response_object = json!({"id":"resp-1","output":output});
     let mut ctx = make_context(Some(state));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[1]["status"], "completed");
-    assert_eq!(state.messages.iter().filter(|item| item["id"] == "mcp-list").count(), 0);
-    assert_eq!(item_ids(&state.messages), vec!["input-1", "rs-1", "msg-1"]);
-    assert_eq!(
-        state.messages.iter().find(|item| item["id"] == "rs-1").unwrap()["encrypted_content"],
-        "opaque-reasoning"
-    );
+    // The dispatcher reconciles the assigned call in place inside `accumulated_output`
+    // and leaves every sibling output item untouched and in original order.
     assert_eq!(
         state
-            .messages
+            .accumulated_output
             .iter()
-            .skip(1)
             .map(|item| item["type"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["reasoning", "function_call", "function_call_output", "message"]
+        vec!["reasoning", "file_search_call", "mcp_list_tools", "message"]
     );
-    assert_eq!(
-        state.messages.iter().find(|item| item["id"] == "msg-1").unwrap()["content"][0]["text"],
-        "I will check."
-    );
-    assert_eq!(
-        state.response_object["output"],
-        Value::Array(state.output_items().to_vec())
-    );
+    assert_eq!(state.accumulated_output[1]["status"], "completed");
+    assert_eq!(state.accumulated_output[1]["results"][0]["text"], "Revenue grew.");
     assert_eq!(
         state.citation_files.get("file-a").map(String::as_str),
         Some("report.pdf")
     );
-    assert_eq!(state.output_items()[1]["results"][0]["text"], "Revenue grew.");
+    // Only the private model-context bridge is appended to `messages`; routing of
+    // reasoning/message items is the loop owner's responsibility, not the dispatcher's.
+    assert_eq!(
+        state
+            .messages
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["message", "function_call", "function_call_output"]
+    );
     let model_output = state
         .messages
         .iter()
@@ -718,60 +514,10 @@ async fn successful_callout_preserves_full_output_order_and_is_idempotent() {
     assert!(model_output.ends_with("Revenue grew.\n"));
     let message_len = state.messages.len();
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    // Re-entry is a no-op: the assignments were drained by the first dispatch.
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.messages.len(), message_len);
-}
-
-#[test]
-fn mixed_client_and_file_search_calls_are_rejected_before_search() {
-    let state = state_with(&["vs-a"], vec![]);
-    let mut ctx = make_context(Some(state));
-    let mut response_header = crate::test_utils::make_response();
-    ctx.response_header = Some(&mut response_header);
-    let mut body = Some(Bytes::from(
-        json!({
-            "id":"resp-1",
-            "output":[
-                {"type":"file_search_call","id":"fs-1","status":"searching","queries":["revenue"]},
-                {"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup_tax","arguments":"{}","status":"completed"}
-            ]
-        })
-        .to_string(),
-    ));
-
-    assert!(matches!(
-        FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap(),
-        FilterAction::Reject(_)
-    ));
-    let state = ctx.extensions.remove::<ResponsesState>().unwrap();
-    assert!(state.output_items().is_empty());
-}
-
-#[tokio::test]
-async fn forced_tool_choice_resets_after_search_execution() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let mut state = one_pending_state(&["vs-a"]);
-    state.request_body = json!({
-        "input":"search",
-        "tool_choice":{"type":"file_search"},
-        "tools":[{"type":"file_search","vector_store_ids":["vs-a"]}]
-    });
-    state.tool_choice = json!({"type":"file_search"});
-    let mut ctx = make_context(Some(state));
-
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.tool_choice, "auto");
-    assert_eq!(state.original_tool_choice, Some(json!({"type":"file_search"})));
-    assert!(state.request_body.get("tool_choice").is_none());
 }
 
 #[tokio::test]
@@ -783,18 +529,13 @@ async fn local_calls_keep_public_ids() {
         json!({"type":"file_search_call","status":"searching","queries":["missing id"]}),
         json!({"type":"file_search_call","id":long_id,"status":"searching","queries":["long id"]}),
     ];
-    let mut state = state_with(&["vs-a"], output);
-    state.response_object["id"] = json!("resp-id-normalization");
-    let mut ctx = make_context(Some(state));
+    let mut ctx = make_context(Some(state_with(&["vs-a"], output)));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    let generated_id = state.output_items()[0]["id"].as_str().unwrap();
+    let generated_id = state.accumulated_output[0]["id"].as_str().unwrap();
     assert!(generated_id.starts_with("fs_"));
-    assert_eq!(state.output_items()[1]["id"], long_id);
+    assert_eq!(state.accumulated_output[1]["id"], long_id);
 }
 
 #[tokio::test]
@@ -810,15 +551,12 @@ async fn mixed_valid_and_empty_calls_are_both_terminalized() {
     );
     let mut ctx = make_context(Some(state));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[0]["status"], "completed");
-    assert_eq!(state.output_items()[1]["status"], "incomplete");
-    assert!(state.output_items()[0].get("results").is_none());
-    assert!(state.output_items()[1].get("results").is_none());
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+    assert_eq!(state.accumulated_output[1]["status"], "incomplete");
+    assert!(state.accumulated_output[0].get("results").is_none());
+    assert!(state.accumulated_output[1].get("results").is_none());
     assert_eq!(
         state
             .messages
@@ -863,13 +601,10 @@ async fn model_context_budget_is_shared_across_calls() {
     );
     let mut ctx = make_context(Some(state));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[0]["status"], "completed");
-    assert_eq!(state.output_items()[1]["status"], "incomplete");
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+    assert_eq!(state.accumulated_output[1]["status"], "incomplete");
     let retained_context_bytes: usize = state
         .messages
         .iter()
@@ -897,25 +632,24 @@ async fn pending_call_cap_terminalizes_excess_and_preserves_duplicate_siblings()
     }));
     let mut ctx = make_context(Some(state_with(&[], output)));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert!(
         state
-            .output_items()
+            .accumulated_output
             .iter()
             .filter(|item| item["type"] == "file_search_call")
             .all(|item| item["status"] == "incomplete")
     );
+    // Both the planned calls and the cap-dropped excess receive a valid public id.
     assert!(
         state
-            .output_items()
+            .accumulated_output
             .iter()
             .filter(|item| item["type"] == "file_search_call")
             .all(|item| item["id"].as_str().is_some_and(|id| !id.is_empty()))
     );
+    // Only the planned calls (capped at `MAX_PENDING_CALLS`) emit a model-context bridge.
     assert_eq!(
         state
             .messages
@@ -935,7 +669,7 @@ async fn pending_call_cap_terminalizes_excess_and_preserves_duplicate_siblings()
     );
     assert_eq!(
         state
-            .output_items()
+            .accumulated_output
             .iter()
             .filter(|item| item["id"] == "duplicate")
             .count(),
@@ -945,168 +679,27 @@ async fn pending_call_cap_terminalizes_excess_and_preserves_duplicate_siblings()
 }
 
 #[tokio::test]
-async fn max_tool_calls_counts_completed_calls_before_pending_execution() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let prior = json!({"type":"apply_patch_call","id":"ap-prior","status":"completed"});
-    let pending = json!({"type":"file_search_call","id":"fs-new","status":"searching","queries":["q"]});
-    let mut state = state_with(&["vs-a"], vec![prior, pending]);
-    state.max_tool_calls = Some(1);
-    let mut ctx = make_context(Some(state));
-
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[1]["status"], "incomplete");
-    assert!(server.requests().is_empty());
-    assert_eq!(
-        state
-            .messages
-            .iter()
-            .filter(|item| item["type"] == "function_call_output")
-            .count(),
-        0
-    );
-}
-
-#[tokio::test]
-async fn max_tool_calls_counts_completed_calls_in_the_current_output() {
-    let server = MockServer::json(200, &json!({"data": []}));
-    let filter = make_filter(server.port, "");
-    let completed = json!({"type":"web_search_call","id":"ws-current","status":"completed"});
-    let pending = json!({"type":"file_search_call","id":"fs-new","status":"searching","queries":["q"]});
-    let mut state = state_with(&["vs-a"], vec![completed, pending]);
-    state.max_tool_calls = Some(1);
-    let mut ctx = make_context(Some(state));
-
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[1]["status"], "incomplete");
-    assert!(server.requests().is_empty());
-}
-
-#[test]
-fn exhausted_tool_budget_finishes_without_another_inference() {
-    let prior = json!({"type":"file_search_call","id":"fs-prior","status":"completed"});
-    let mut state = state_with(&["vs-a"], vec![]);
-    state.file_search_output_items.push(prior);
-    state.max_tool_calls = Some(1);
-    let mut ctx = make_context(Some(state));
-    let mut response_header = crate::test_utils::make_response();
-    ctx.response_header = Some(&mut response_header);
-    let mut body = Some(Bytes::from(
-        json!({
-            "id":"resp-budget",
-            "output":[{
-                "type":"file_search_call",
-                "id":"fs-exhausted",
-                "status":"searching",
-                "queries":["again"]
-            }]
-        })
-        .to_string(),
-    ));
-
-    assert!(matches!(
-        FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap(),
-        FilterAction::Continue
-    ));
-    let encoded: Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    assert_eq!(encoded["output"][0]["status"], "completed");
-    assert_eq!(encoded["output"][1]["status"], "incomplete");
-    assert_eq!(
-        ctx.filter_results["openai_file_search_callout"].get("pending"),
-        Some("false")
-    );
-}
-
-#[test]
-fn malformed_success_after_search_is_rejected() {
-    let mut state = state_with(&["vs-a"], vec![]);
-    state.iteration = 1;
-    let mut ctx = make_context(Some(state));
-    let mut response_header = crate::test_utils::make_response();
-    ctx.response_header = Some(&mut response_header);
-    let mut body = Some(Bytes::from_static(b"not-json"));
-
-    assert!(matches!(
-        FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap(),
-        FilterAction::Reject(_)
-    ));
-}
-
-#[test]
-fn malformed_output_shape_after_search_is_rejected() {
-    for response in [json!({}), json!({"output":"invalid"})] {
-        let mut state = state_with(&["vs-a"], vec![]);
-        state.iteration = 1;
-        let mut ctx = make_context(Some(state));
-        let mut response_header = crate::test_utils::make_response();
-        ctx.response_header = Some(&mut response_header);
-        let mut body = Some(Bytes::from(response.to_string()));
-
-        assert!(matches!(
-            FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap(),
-            FilterAction::Reject(_)
-        ));
-    }
-}
-
-#[test]
-fn final_response_rewrite_clears_representation_headers() {
-    let mut state = state_with(&["vs-a"], vec![]);
-    state.iteration = 1;
-    let mut ctx = make_context(Some(state));
-    let mut response_header = crate::test_utils::make_response();
-    for name in [
-        http::header::CONTENT_ENCODING,
-        http::header::CONTENT_LENGTH,
-        http::header::CONTENT_RANGE,
-        http::header::ETAG,
-        http::header::LAST_MODIFIED,
-    ] {
-        response_header
-            .headers
-            .insert(name, http::HeaderValue::from_static("stale"));
-    }
-    ctx.response_header = Some(&mut response_header);
-    let mut body = Some(Bytes::from(json!({"id":"resp-final","output":[]}).to_string()));
-
-    assert!(matches!(
-        FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap(),
-        FilterAction::Continue
-    ));
-    let response = ctx.response_header.as_deref().unwrap();
-    assert!(response.headers.is_empty());
-    assert!(ctx.response_headers_modified);
-}
-
-#[tokio::test]
-async fn mcp_calls_do_not_consume_the_builtin_tool_budget() {
+async fn dispatcher_executes_owner_admitted_assignment_with_mcp_history() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
     let mcp = json!({"type":"mcp_call","id":"mcp-prior","status":"completed"});
     let pending = json!({"type":"file_search_call","id":"fs-new","status":"searching","queries":["q"]});
-    let mut state = state_with(&["vs-a"], vec![mcp, pending]);
-    state.max_tool_calls = Some(1);
+    let state = state_with(&["vs-a"], vec![mcp, pending]);
     let mut ctx = make_context(Some(state));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[1]["status"], "completed");
-    assert_eq!(server.requests().len(), 1);
+    // The owner already applied the response-wide budget before recording this
+    // assignment. The execution-only dispatcher must not re-count MCP history.
+    assert_eq!(state.accumulated_output[1]["status"], "completed");
+    assert!(
+        !server.requests().is_empty(),
+        "the budget-admitted file search must reach the upstream"
+    );
 }
 
 #[tokio::test]
-async fn no_store_ids_terminalizes_calls_and_replays_siblings() {
+async fn no_store_ids_terminalizes_the_assigned_call() {
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_filter(server.port, "");
     let output = vec![
@@ -1115,22 +708,23 @@ async fn no_store_ids_terminalizes_calls_and_replays_siblings() {
     ];
     let mut ctx = make_context(Some(state_with(&[], output)));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[1]["status"], "incomplete");
-    assert!(state.output_items()[1].get("results").is_none());
+    // With no vector stores the assigned call is terminalized incomplete in place.
+    assert_eq!(state.accumulated_output[1]["status"], "incomplete");
+    assert!(state.accumulated_output[1].get("results").is_none());
+    // The sibling reasoning item stays untouched in `accumulated_output`; the
+    // dispatcher only appends its own private bridge to `messages` (sibling
+    // replay is the loop owner's responsibility, not the dispatcher's).
+    assert_eq!(state.accumulated_output[0]["encrypted_content"], "opaque-reasoning");
     assert_eq!(
         state
             .messages
             .iter()
             .map(|item| item["type"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["reasoning", "function_call", "function_call_output"]
+        vec!["function_call", "function_call_output"]
     );
-    assert_eq!(state.messages[0]["encrypted_content"], "opaque-reasoning");
     assert!(server.requests().is_empty());
 }
 
@@ -1140,13 +734,10 @@ async fn zero_match_search_completes_with_bounded_context() {
     let filter = make_filter(server.port, "");
     let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
 
-    assert_eq!(state.output_items()[0]["status"], "completed");
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
     let output = state
         .messages
         .iter()
@@ -1173,12 +764,9 @@ async fn query_cap_marks_the_call_incomplete() {
     );
     let mut ctx = make_context(Some(state));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[0]["status"], "incomplete");
+    assert_eq!(state.accumulated_output[0]["status"], "incomplete");
     assert_eq!(server.requests().len(), MAX_QUERIES_PER_CALL);
 }
 
@@ -1199,10 +787,7 @@ async fn ranking_filters_rewrite_policy_and_safe_path_are_sent_to_vector_store()
     });
     let mut ctx = make_context(Some(state));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
     let request_line = requests[0].lines().next().unwrap();
@@ -1241,13 +826,24 @@ async fn open_and_closed_on_failures_are_distinct() {
         });
         let closed = make_filter(closed_server.port, "on_failure: closed\n");
         let mut closed_ctx = make_context(Some(one_pending_state(&["vs-a"])));
+        // The dispatcher never rejects: a closed-mode failure records a shared
+        // 502 dispatch failure for the loop owner and leaves the call untouched.
         assert!(matches!(
-            closed.on_request(&mut closed_ctx).await.unwrap(),
-            FilterAction::Reject(_)
+            dispatch(&*closed, &mut closed_ctx).await,
+            FilterAction::Continue
         ));
+        let closed_state = closed_ctx.extensions.get::<ResponsesState>().unwrap();
         assert_eq!(
-            closed_ctx.extensions.get::<ResponsesState>().unwrap().output_items()[0]["status"],
-            "searching",
+            closed_state
+                .dispatch_failure
+                .as_ref()
+                .unwrap_or_else(|| panic!("status {status} must record a dispatch failure"))
+                .status,
+            502,
+            "status {status}"
+        );
+        assert_eq!(
+            closed_state.accumulated_output[0]["status"], "searching",
             "status {status}"
         );
 
@@ -1258,13 +854,11 @@ async fn open_and_closed_on_failures_are_distinct() {
         });
         let open = make_filter(open_server.port, "on_failure: open\n");
         let mut open_ctx = make_context(Some(one_pending_state(&["vs-a"])));
-        assert!(matches!(
-            open.on_request(&mut open_ctx).await.unwrap(),
-            FilterAction::Continue
-        ));
+        assert!(matches!(dispatch(&*open, &mut open_ctx).await, FilterAction::Continue));
         let state = open_ctx.extensions.get::<ResponsesState>().unwrap();
-        assert_eq!(state.output_items()[0]["status"], "incomplete", "status {status}");
-        assert!(state.output_items()[0].get("results").is_none());
+        assert!(state.dispatch_failure.is_none(), "status {status}");
+        assert_eq!(state.accumulated_output[0]["status"], "incomplete", "status {status}");
+        assert!(state.accumulated_output[0].get("results").is_none());
         assert!(
             state.messages.iter().any(|item| item["type"] == "function_call_output"),
             "status {status}"
@@ -1281,21 +875,17 @@ async fn aggregate_budget_stops_later_searches_and_marks_call_incomplete() {
     );
     let mut ctx = make_context(Some(one_pending_state(&["vs-a", "vs-b"])));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(
         server.requests().len(),
         1,
         "second request should not consume an unreserved body"
     );
-    assert_eq!(state.output_items()[0]["status"], "incomplete");
-    assert!(state.output_items()[0].get("results").is_none());
+    assert_eq!(state.accumulated_output[0]["status"], "incomplete");
+    assert!(state.accumulated_output[0].get("results").is_none());
     assert_eq!(state.citation_files.get("file-a").map(String::as_str), Some("a.txt"));
 }
-
 
 #[tokio::test]
 async fn malformed_success_bodies_are_charged_to_the_aggregate_budget() {
@@ -1310,28 +900,27 @@ async fn malformed_success_bodies_are_charged_to_the_aggregate_budget() {
     );
     let mut ctx = make_context(Some(one_pending_state(&["vs-a", "vs-b", "vs-c", "vs-d", "vs-e"])));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     assert_eq!(
         server.requests().len(),
         4,
         "malformed HTTP successes must consume the shared body budget"
     );
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[0]["status"], "incomplete");
+    assert_eq!(state.accumulated_output[0]["status"], "incomplete");
 }
 
 #[tokio::test]
-async fn core_limit_rejects_oversized_response_before_full_collection() {
+async fn core_limit_fails_closed_on_oversized_response_before_full_collection() {
     let server = MockServer::json(200, &one_result("file-a", "a.txt", 0.9, &"x".repeat(4_096)));
     let filter = make_filter(server.port, "max_response_bytes: 128\nmax_total_response_bytes: 128\n");
     let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    // The default closed policy records a dispatch failure and leaves the call
+    // unreconciled instead of rejecting.
+    assert!(state.dispatch_failure.is_some());
+    assert_eq!(state.accumulated_output[0]["status"], "searching");
 }
 
 #[tokio::test]
@@ -1341,11 +930,15 @@ async fn whole_call_timeout_covers_slow_response_body() {
     let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
     let started = Instant::now();
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     assert!(started.elapsed() < Duration::from_millis(400));
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .dispatch_failure
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -1370,10 +963,14 @@ async fn one_execution_deadline_covers_later_concurrency_chunks() {
     let mut ctx = make_context(Some(one_pending_state(&store_refs)));
     let started = Instant::now();
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .dispatch_failure
+            .is_some()
+    );
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "later chunks must use the original execution deadline"
@@ -1395,13 +992,27 @@ async fn fail_closed_stops_scheduling_after_the_current_chunk() {
     let store_refs: Vec<&str> = store_ids.iter().map(String::as_str).collect();
     let mut ctx = make_context(Some(one_pending_state(&store_refs)));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Reject(_)
-    ));
+    assert!(
+        matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue),
+        "fail-closed dispatch should record its failure without committing a response"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .dispatch_failure
+            .is_some(),
+        "the first failed search chunk must publish a dispatch failure"
+    );
     let requests = server.requests();
-    assert!(!requests.is_empty());
-    assert!(requests.len() <= MAX_CONCURRENT_SEARCHES);
+    assert!(
+        !requests.is_empty(),
+        "the first concurrent search chunk should reach the provider"
+    );
+    assert!(
+        requests.len() <= MAX_CONCURRENT_SEARCHES,
+        "fail-closed scheduling must not start work beyond the current bounded chunk"
+    );
     assert!(
         requests.iter().all(|request| !request.contains("/vs-8/search")),
         "the first failed chunk must prevent a later chunk from being scheduled"
@@ -1414,10 +1025,7 @@ async fn searches_multiple_stores_concurrently() {
     let filter = make_filter(server.port, "");
     let mut ctx = make_context(Some(one_pending_state(&["vs-a", "vs-b"])));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     assert_eq!(server.requests().len(), 2);
     assert!(
         server.max_active() >= 2,
@@ -1447,12 +1055,9 @@ async fn aggregate_results_are_score_sorted_and_limited_to_top_k() {
     state.include.push("file_search_call.results".to_owned());
     let mut ctx = make_context(Some(state));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    let results = state.output_items()[0]["results"].as_array().unwrap();
+    let results = state.accumulated_output[0]["results"].as_array().unwrap();
     let scores: Vec<f64> = results.iter().filter_map(|result| result["score"].as_f64()).collect();
     let file_ids: Vec<&str> = results.iter().filter_map(|result| result["file_id"].as_str()).collect();
 
@@ -1476,15 +1081,12 @@ async fn fail_open_retains_successful_results_from_a_partial_fan_out() {
     state.include.push("file_search_call.results".to_owned());
     let mut ctx = make_context(Some(state));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(server.requests().len(), 2);
-    assert_eq!(state.output_items()[0]["status"], "incomplete");
-    assert_eq!(state.output_items()[0]["results"].as_array().unwrap().len(), 1);
-    assert_eq!(state.output_items()[0]["results"][0]["file_id"], "file-a");
+    assert_eq!(state.accumulated_output[0]["status"], "incomplete");
+    assert_eq!(state.accumulated_output[0]["results"].as_array().unwrap().len(), 1);
+    assert_eq!(state.accumulated_output[0]["results"][0]["file_id"], "file-a");
 }
 
 #[tokio::test]
@@ -1495,15 +1097,15 @@ async fn outbound_query_store_id_and_request_body_are_bounded() {
     let oversized_store = "s".repeat(MAX_VECTOR_STORE_ID_BYTES + 1);
     let mut store_ctx = make_context(Some(one_pending_state(&[&oversized_store])));
     assert!(matches!(
-        filter.on_request(&mut store_ctx).await.unwrap(),
+        dispatch(&*filter, &mut store_ctx).await,
         FilterAction::Continue
     ));
 
     let mut query_state = one_pending_state(&["vs-query"]);
-    query_state.output_items_mut()[0]["queries"] = json!(["q".repeat(MAX_QUERY_BYTES + 1)]);
+    query_state.accumulated_output[0]["queries"] = json!(["q".repeat(MAX_QUERY_BYTES + 1)]);
     let mut query_ctx = make_context(Some(query_state));
     assert!(matches!(
-        filter.on_request(&mut query_ctx).await.unwrap(),
+        dispatch(&*filter, &mut query_ctx).await,
         FilterAction::Continue
     ));
 
@@ -1511,7 +1113,7 @@ async fn outbound_query_store_id_and_request_body_are_bounded() {
     request_state.tools[0]["filters"] = json!({"type":"eq","key":"blob","value":"x".repeat(MAX_SEARCH_REQUEST_BYTES)});
     let mut request_ctx = make_context(Some(request_state));
     assert!(matches!(
-        filter.on_request(&mut request_ctx).await.unwrap(),
+        dispatch(&*filter, &mut request_ctx).await,
         FilterAction::Continue
     ));
 
@@ -1530,25 +1132,49 @@ async fn malformed_execution_fields_fail_without_silent_normalization() {
     invalid_stores.tools[0]["vector_store_ids"] = json!(["vs-a", 7]);
     let mut invalid_stores_ctx = make_context(Some(invalid_stores));
     assert!(matches!(
-        filter.on_request(&mut invalid_stores_ctx).await.unwrap(),
-        FilterAction::Reject(_)
+        dispatch(&*filter, &mut invalid_stores_ctx).await,
+        FilterAction::Continue
     ));
+    assert!(
+        invalid_stores_ctx
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .dispatch_failure
+            .is_some()
+    );
 
     let mut invalid_max = one_pending_state(&["vs-a"]);
     invalid_max.tools[0]["max_num_results"] = json!("10");
     let mut invalid_max_ctx = make_context(Some(invalid_max));
     assert!(matches!(
-        filter.on_request(&mut invalid_max_ctx).await.unwrap(),
-        FilterAction::Reject(_)
+        dispatch(&*filter, &mut invalid_max_ctx).await,
+        FilterAction::Continue
     ));
+    assert!(
+        invalid_max_ctx
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .dispatch_failure
+            .is_some()
+    );
 
     let mut invalid_queries = one_pending_state(&["vs-a"]);
-    invalid_queries.output_items_mut()[0]["queries"] = json!(["valid", 7]);
+    invalid_queries.accumulated_output[0]["queries"] = json!(["valid", 7]);
     let mut invalid_queries_ctx = make_context(Some(invalid_queries));
     assert!(matches!(
-        filter.on_request(&mut invalid_queries_ctx).await.unwrap(),
-        FilterAction::Reject(_)
+        dispatch(&*filter, &mut invalid_queries_ctx).await,
+        FilterAction::Continue
     ));
+    assert!(
+        invalid_queries_ctx
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .dispatch_failure
+            .is_some()
+    );
 
     assert!(server.requests().is_empty());
 }
@@ -1562,17 +1188,33 @@ async fn missing_file_search_tool_fields_fail_closed() {
     missing_ids.tools[0].as_object_mut().unwrap().remove("vector_store_ids");
     let mut missing_ids_ctx = make_context(Some(missing_ids));
     assert!(matches!(
-        filter.on_request(&mut missing_ids_ctx).await.unwrap(),
-        FilterAction::Reject(_)
+        dispatch(&*filter, &mut missing_ids_ctx).await,
+        FilterAction::Continue
     ));
+    assert!(
+        missing_ids_ctx
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .dispatch_failure
+            .is_some()
+    );
 
     let mut missing_tool = one_pending_state(&["vs-a"]);
     missing_tool.tools.clear();
     let mut missing_tool_ctx = make_context(Some(missing_tool));
     assert!(matches!(
-        filter.on_request(&mut missing_tool_ctx).await.unwrap(),
-        FilterAction::Reject(_)
+        dispatch(&*filter, &mut missing_tool_ctx).await,
+        FilterAction::Continue
     ));
+    assert!(
+        missing_tool_ctx
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .dispatch_failure
+            .is_some()
+    );
 
     assert!(server.requests().is_empty());
 }
@@ -1589,13 +1231,10 @@ async fn fail_open_isolates_a_malformed_pending_call() {
     });
     let mut ctx = make_context(Some(state_with(&["vs-a"], vec![malformed, valid])));
 
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(matches!(dispatch(&*filter, &mut ctx).await, FilterAction::Continue));
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.output_items()[0]["status"], "incomplete");
-    assert_eq!(state.output_items()[1]["status"], "completed");
+    assert_eq!(state.accumulated_output[0]["status"], "incomplete");
+    assert_eq!(state.accumulated_output[1]["status"], "completed");
     assert_eq!(server.requests().len(), 1);
 }
 
@@ -1651,7 +1290,7 @@ fn translate_single_query() {
 
     let count = translate_function_calls_to_file_search(&mut response);
 
-    assert_eq!(count, 1, "one item should be translated");
+    assert_eq!(count, vec![0], "one item translated at round-local index 0");
     let item = &response["output"][0];
     assert_eq!(item["type"], "file_search_call", "type should be rewritten");
     assert_eq!(item["status"], "searching", "status should be set to searching");
@@ -1721,171 +1360,14 @@ fn translate_skips_non_file_search() {
 
     let count = translate_function_calls_to_file_search(&mut response);
 
-    assert_eq!(count, 0, "non-file_search function_calls should not be translated");
+    assert!(
+        count.is_empty(),
+        "non-file_search function_calls should not be translated"
+    );
     assert_eq!(
         response["output"][0]["type"], "function_call",
         "type should remain function_call"
     );
-}
-
-#[test]
-fn translate_skips_without_tool_declaration() {
-    let state = ResponsesState {
-        response_object: json!({"output": []}),
-        tools: vec![json!({"type": "function", "name": "get_weather"})],
-        ..Default::default()
-    };
-    let mut ctx = make_context(Some(state));
-    let mut response_header = crate::test_utils::make_response();
-    ctx.response_header = Some(&mut response_header);
-    let mut body = Some(Bytes::from(
-        json!({
-            "id": "resp-no-tool",
-            "output": [{
-                "type": "function_call",
-                "id": "fc_1",
-                "call_id": "call_1",
-                "name": "file_search",
-                "arguments": "{\"query\": \"revenue\"}",
-                "status": "completed"
-            }]
-        })
-        .to_string(),
-    ));
-
-    let _action = FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap();
-
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(
-        state.output_items()[0]["type"],
-        "function_call",
-        "should not translate without file_search tool in request"
-    );
-}
-
-#[test]
-fn translate_triggers_pending_flag() {
-    let state = state_with(&["vs-a"], vec![]);
-    let mut ctx = make_context(Some(state));
-    let mut response_header = crate::test_utils::make_response();
-    ctx.response_header = Some(&mut response_header);
-    let mut body = Some(Bytes::from(
-        json!({
-            "id": "resp-vllm-1",
-            "output": [{
-                "type": "function_call",
-                "id": "fc_1",
-                "call_id": "call_1",
-                "name": "file_search",
-                "arguments": "{\"query\": \"revenue growth\"}",
-                "status": "completed"
-            }]
-        })
-        .to_string(),
-    ));
-
-    let action = FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap();
-
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "translated file_search_call should trigger pending continuation"
-    );
-    assert_eq!(
-        ctx.filter_results["openai_file_search_callout"].get("pending"),
-        Some("true"),
-        "pending flag should be set after translation"
-    );
-}
-
-#[test]
-fn translate_mixed_triggers_rejection() {
-    let state = state_with(&["vs-a"], vec![]);
-    let mut ctx = make_context(Some(state));
-    let mut response_header = crate::test_utils::make_response();
-    ctx.response_header = Some(&mut response_header);
-    let mut body = Some(Bytes::from(
-        json!({
-            "id": "resp-vllm-mixed",
-            "output": [
-                {
-                    "type": "function_call",
-                    "id": "fc_1",
-                    "call_id": "call_1",
-                    "name": "file_search",
-                    "arguments": "{\"query\": \"revenue\"}",
-                    "status": "completed"
-                },
-                {
-                    "type": "function_call",
-                    "id": "fc_2",
-                    "call_id": "call_2",
-                    "name": "get_weather",
-                    "arguments": "{\"city\": \"Paris\"}",
-                    "status": "completed"
-                }
-            ]
-        })
-        .to_string(),
-    ));
-
-    let action = FileSearchCalloutFilter::capture_response(&mut ctx, &mut body, 268_435_456).unwrap();
-
-    assert!(
-        matches!(action, FilterAction::Reject(_)),
-        "translated file_search_call + client function_call should trigger mixed-tool rejection"
-    );
-}
-
-#[tokio::test]
-async fn translate_end_to_end_executes_search() {
-    let server = MockServer::json(200, &one_result("file-a", "report.pdf", 0.95, "Revenue grew 37%."));
-    let filter = make_filter(server.port, "");
-
-    let mut state = state_with(&["vs-a"], vec![]);
-    state.include.push("file_search_call.results".to_owned());
-    let mut ctx = make_context(Some(state));
-    let mut response_header = crate::test_utils::make_response();
-    ctx.response_header = Some(&mut response_header);
-    let mut body = Some(Bytes::from(
-        json!({
-            "id": "resp-vllm-e2e",
-            "output": [{
-                "type": "function_call",
-                "id": "fc_1",
-                "call_id": "call_1",
-                "name": "file_search",
-                "arguments": "{\"query\": \"revenue growth\"}",
-                "status": "completed"
-            }]
-        })
-        .to_string(),
-    ));
-
-    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "capture_response should continue with pending translation"
-    );
-    assert_eq!(
-        ctx.filter_results["openai_file_search_callout"].get("pending"),
-        Some("true"),
-        "pending flag should be set"
-    );
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "execute_pending should complete search"
-    );
-
-    let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    let item = &state.output_items()[0];
-    assert_eq!(item["type"], "file_search_call", "type should be file_search_call");
-    assert_eq!(
-        item["status"], "completed",
-        "status should be completed after execution"
-    );
-    assert_eq!(server.requests().len(), 1, "search callout should have fired");
 }
 
 // -----------------------------------------------------------------------------
@@ -1987,17 +1469,45 @@ fn format_test_bridge(
     .format(results, false)
 }
 
+/// Build a state the way the parse owner (`openai_agentic_loop`) leaves it for the
+/// demoted dispatcher (issue #1046): every output item is appended to
+/// `accumulated_output`, and each *pending* `file_search_call` is recorded as a
+/// native `FileSearchAssignment`. The dispatcher reads `accumulated_output` and
+/// mutates the assigned items in place; it no longer parses `response_object`.
 fn state_with(store_ids: &[&str], output_items: Vec<Value>) -> ResponsesState {
-    let mut response = serde_json::Map::new();
-    response.insert("output".to_owned(), Value::Array(output_items));
-    ResponsesState {
-        response_object: Value::Object(response),
+    let mut state = ResponsesState {
         tools: vec![json!({
             "type": "file_search",
             "vector_store_ids": store_ids,
         })],
         ..Default::default()
+    };
+    register_assignments(&mut state, output_items);
+    state
+}
+
+/// Append `output_items` to `accumulated_output` and record a native
+/// `FileSearchAssignment` for every pending `file_search_call`, mirroring the
+/// owner's `collect_output_items`.
+fn register_assignments(state: &mut ResponsesState, output_items: Vec<Value>) {
+    for item in output_items {
+        let output_index = state.accumulated_output.len();
+        let pending = is_pending_file_search_call(&item);
+        state.accumulated_output.push(item);
+        if pending {
+            state.file_search_assignments.push(FileSearchAssignment {
+                output_index,
+                synthesis: SynthesisKind::Native,
+            });
+        }
     }
+}
+
+/// Drive the demoted dispatcher the way the IRR request phase does: run
+/// `on_request_body` at end-of-stream, which drains `file_search_assignments`,
+/// executes the vector-store callouts, and reconciles `accumulated_output`.
+async fn dispatch(filter: &dyn HttpFilter, ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    filter.on_request_body(ctx, &mut None, true).await.unwrap()
 }
 
 fn one_pending_state(store_ids: &[&str]) -> ResponsesState {
@@ -2037,13 +1547,6 @@ fn search_results(results: &[(&str, f64)]) -> Value {
             }))
             .collect::<Vec<_>>()
     })
-}
-
-fn item_ids(items: &[Value]) -> Vec<&str> {
-    items
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str))
-        .collect()
 }
 
 fn read_http_request(stream: &mut std::net::TcpStream) -> String {
@@ -2196,4 +1699,74 @@ impl MockServer {
     fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
+}
+
+#[test]
+fn file_search_predicates_are_crate_visible() {
+    use super::{has_file_search_tool, is_file_search_function_call, is_pending_file_search_call};
+    let pending = serde_json::json!({"type": "file_search_call", "status": "searching"});
+    let private = serde_json::json!({"type": "function_call", "name": "file_search"});
+    assert!(
+        is_pending_file_search_call(&pending),
+        "searching file call should be pending"
+    );
+    assert!(
+        is_file_search_function_call(&private),
+        "private file-search function call should be recognized"
+    );
+    let mut state = ResponsesState::default();
+    state.tools = vec![serde_json::json!({"type": "file_search"})];
+    assert!(
+        has_file_search_tool(&state),
+        "configured file-search tool should be detected"
+    );
+}
+
+#[test]
+fn response_body_mode_is_stream() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    assert!(matches!(filter.response_body_mode(), BodyMode::Stream));
+}
+
+// #313 P1 (DoS bound): the per-round provider-streamed observation set is charged against
+// max_state_bytes like every other request-scoped field, so a backend streaming many distinct
+// native ids in one round cannot bypass the ceiling within that round.
+#[test]
+fn continuation_state_charges_provider_streamed_terminal_ids() {
+    let mut state = ResponsesState::default();
+    assert!(
+        continuation_state_fits(0, &state, 64, 0),
+        "an empty observation set fits a tiny ceiling"
+    );
+    // ~48 bytes each × 100 ids ≫ 64-byte ceiling: only charged bytes can trip this.
+    state.provider_streamed_terminal_ids = (0..100).map(|i| format!("fs_call_{i:040}")).collect();
+    assert!(
+        !continuation_state_fits(0, &state, 64, 0),
+        "a large observation set is charged and overflows the ceiling (P1 DoS bound)"
+    );
+}
+
+#[test]
+fn continuation_state_charges_local_completion_response_template() {
+    let mut state = ResponsesState {
+        local_completion_response_template: json!({
+            "id": "resp_prior",
+            "object": "response",
+            "status": "completed",
+            "metadata": "x".repeat(128),
+            "output": []
+        }),
+        ..ResponsesState::default()
+    };
+    assert!(
+        !continuation_state_fits(0, &state, 64, 0),
+        "the re-entry response template must remain inside the continuation ceiling"
+    );
+
+    state.local_completion_response_template = Value::Null;
+    assert!(
+        continuation_state_fits(0, &state, 64, 0),
+        "clearing the response template must release its continuation-state charge"
+    );
 }

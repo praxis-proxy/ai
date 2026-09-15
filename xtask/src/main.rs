@@ -25,6 +25,7 @@ mod lint_separators;
 mod make_replay_fixture;
 mod openai_conformance;
 mod openai_conformance_gate;
+mod openresponses_coverage;
 mod port;
 mod sync_example_readme;
 mod sync_inference_readme;
@@ -108,6 +109,10 @@ enum Command {
     /// Enforce or acknowledge failures in a generated conformance report.
     OpenaiConformanceGate(openai_conformance_gate::Args),
 
+    /// Regenerate or verify the `OpenResponses` translation coverage report
+    /// from the triage manifest.
+    OpenresponsesCoverage(openresponses_coverage::Args),
+
     /// Record a two-sided fixture against a live provider.
     RecordInference(inference_fixtures::RecordArgs),
 
@@ -141,6 +146,7 @@ fn main() {
         Command::OpenaiConformanceReference(args) => openai_conformance::run_reference(&args),
         Command::OpenaiConversationItemContracts(args) => openai_conformance::run_item_contracts(&args),
         Command::OpenaiConformanceGate(args) => openai_conformance_gate::run(&args),
+        Command::OpenresponsesCoverage(args) => openresponses_coverage::run(&args),
         Command::RecordInference(args) => inference_fixtures::run_record(args),
         Command::SyncInferenceReadme(args) => sync_inference_readme::run(&args),
         Command::SyncResponsesReadme(args) => sync_responses_readme::run(&args),

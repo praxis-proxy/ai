@@ -19,8 +19,9 @@
 //! request body.
 //!
 //! The `openai_responses_validate` filter runs after the classifier
-//! to validate JSON syntax and extract additional fields without
-//! rejecting provider-owned parameter combinations.
+//! to validate JSON syntax, reject conflicting history selectors, and
+//! extract additional fields without rejecting provider-owned parameter
+//! combinations.
 
 pub(crate) mod agentic_loop;
 mod body_limits;
@@ -31,6 +32,7 @@ pub(crate) mod error;
 pub(crate) mod file_resolve;
 /// Executes hosted file-search calls against an OGX vector store API.
 pub(crate) mod file_search_callout;
+pub(crate) mod mcp_classify;
 pub(crate) mod mcp_dispatch;
 pub(crate) mod model_rewrite;
 pub(crate) mod openai_mcp_tool_resolve;
@@ -60,13 +62,14 @@ pub use store::ResponseStoreFilter;
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
-    clippy::unwrap_used,
     clippy::expect_used,
+    clippy::field_reassign_with_default,
     clippy::indexing_slicing,
-    clippy::panic,
-    clippy::needless_raw_strings,
     clippy::needless_raw_string_hashes,
+    clippy::needless_raw_strings,
+    clippy::panic,
     clippy::too_many_lines,
+    clippy::unwrap_used,
     reason = "tests"
 )]
 mod tests;
@@ -362,7 +365,6 @@ fn handle_invalid_format(format: AiRequestFormat, config: &ResponsesFormatConfig
                 400,
                 "invalid_request_error",
                 message,
-                false,
             )))
         },
     }
@@ -597,6 +599,46 @@ fn defaulted_openresponses_item_type(object: &serde_json::Map<String, serde_json
 // -----------------------------------------------------------------------------
 // Shared Utilities
 // -----------------------------------------------------------------------------
+
+/// Only a successfully terminated stream may authorize external side effects.
+pub(crate) fn streamed_round_is_dispatchable(ctx: &HttpFilterContext<'_>, state: &state::ResponsesState) -> bool {
+    state.request_body.get("stream").and_then(serde_json::Value::as_bool) != Some(true)
+        || (ctx.get_metadata("responses.stream_completion") == Some("terminal")
+            && state.response_object.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+            && ctx.get_metadata("responses.stream_parse_error") != Some("true"))
+}
+
+/// Arm the two-layer continuation stop (§7.3): `action="done"` ends
+/// `logical_stream_continues` (layer 1); `pending="false"` ends the
+/// config-driven IRR router (layer 2). Both are required, and this fires on
+/// EVERY terminal path — including when an error was already recorded — so a
+/// stale `action="loop"` from a prior round cannot suppress the error frame or
+/// trigger another IRR round (#313 P1). Idempotent.
+///
+/// After the #1046 unification the single continuation authority is the owner
+/// (`openai_agentic_loop`): `logical_stream_continues` and the config-driven IRR
+/// `on_result` both key on the owner's `action`/`pending`, so the stop is armed
+/// on the owner's result set. This also covers the oversized `web_search` batch
+/// (the owner records `action="loop"` before `web_search` caps the batch and
+/// records the terminal error).
+pub(crate) fn fs_arm_stream_stop(ctx: &mut HttpFilterContext<'_>) {
+    let results = ctx.filter_results.entry("openai_agentic_loop").or_default();
+    drop(results.set("action", "done"));
+    drop(results.set("pending", "false"));
+}
+
+/// Fail-closed after the streaming `200` is committed (§7.3). Preserves a
+/// pre-existing parse/timeout error's `code`/`message`/`skip_persist` — the
+/// first, most-specific failure wins — but ALWAYS arms the two-layer stop, even
+/// on a pre-existing error, so a stale `action="loop"` cannot survive (#313 P1).
+pub(crate) fn fs_end_stream_with_error_ctx(ctx: &mut HttpFilterContext<'_>, code: &str, message: &str) {
+    if ctx.get_metadata("responses.stream_error_code").is_none() {
+        ctx.set_metadata("responses.stream_error_code", code);
+        ctx.set_metadata("responses.stream_error_message", message);
+        ctx.set_metadata("responses.skip_persist", "true");
+    }
+    fs_arm_stream_stop(ctx);
+}
 
 /// Extract a conversation ID from a request body.
 ///

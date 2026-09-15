@@ -11,6 +11,10 @@ Executes MCP tool calls against upstream MCP servers within the Responses API ag
 |-------|------|---------|-------------|
 | `allow_loopback` | bool | no | Allow connections to loopback addresses (default: false). |
 | `timeout_ms` | integer | no | Per-call timeout in milliseconds for `tools/call` calls. |
+| `max_calls_per_round` | integer | no | Hard cap on MCP calls processed from one model response (1..=1024; default: 32). |
+| `max_parallel_calls` | integer | no | Maximum concurrent MCP calls when `parallel_tool_calls` is enabled (1..=64; default: 8). |
+| `max_result_bytes` | integer | no | Maximum retained bytes for one MCP result (minimum: 1 `KiB`; default: 1 `MiB`). |
+| `max_total_result_bytes` | integer | no | Maximum retained bytes across one MCP result batch (default: 8 MiB). |
 
 ## Examples
 
@@ -25,4 +29,8 @@ filter: openai_mcp_dispatch
 ```yaml
 filter: openai_mcp_dispatch
 timeout_ms: 30000
+max_calls_per_round: 32
+max_parallel_calls: 8
+max_result_bytes: 1048576
+max_total_result_bytes: 8388608
 ```

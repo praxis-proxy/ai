@@ -13,7 +13,7 @@ mod filter;
 mod handlers;
 mod item_schema;
 pub mod openapi;
-mod routes;
+pub(crate) mod routes;
 mod validate;
 
 pub use filter::OpenaiConversationsFilter;

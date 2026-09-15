@@ -10,7 +10,7 @@
 # responses_to_chat_completions runs inside the iterative router and selects its
 # transport from the effective request: a `"stream": true` request streams, so
 # each translated per-round stream stays internal to the router; a finite request
-# buffers. openai_stream_events (logical_stream: true) accumulates each translated
+# buffers. openai_stream_events accumulates each translated
 # per-round Responses SSE stream and withholds per-round terminal events until the
 # IRR transition is known, exposing one coherent client-facing Responses SSE
 # lifecycle across the model round, the web search, and the resumed model output.
@@ -75,7 +75,6 @@ filter_chains:
               # the response phase so it observes the translated Responses SSE. A
               # no-op on finite (non-SSE) responses.
               - filter: openai_stream_events
-                logical_stream: true
 
               - filter: openai_web_search
                 provider: brave
@@ -112,7 +111,12 @@ filter_chains:
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:
-              - filter: openai_web_search
+              # openai_agentic_loop is the sole loop authority (issue #1046): it
+              # parses each model response, records the assignment consumed by
+              # the request-phase openai_web_search dispatcher, and publishes the
+              # single continuation signal. The IRR transitions only on the
+              # owner's action, never on a dispatcher's.
+              - filter: openai_agentic_loop
                 key: action
                 value: loop
                 next: inference

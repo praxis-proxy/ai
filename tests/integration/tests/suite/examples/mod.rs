@@ -3,33 +3,37 @@
 
 //! Integration tests for example configurations.
 
+mod operation_classifier;
 mod test_utils;
 #[expect(unreachable_pub)]
 pub use test_utils::load_example_config;
 
 mod agentic_routing;
+mod anthropic_full_flow_agentic;
 mod anthropic_messages;
-mod anthropic_messages_web_search;
 mod aws_sigv4;
 #[cfg(feature = "azure-ad-filter")]
 mod azure_ad;
+mod azure_translation;
 mod compact;
 mod credential_injection;
 mod external_metering;
 mod file_search_callout;
 mod file_search_chat_completions;
-mod full_flow;
+mod file_search_streaming;
 mod full_flow_agentic;
 #[cfg(feature = "gcp-adc-filter")]
 mod gcp_adc;
 mod guardrails;
 mod guardrails_response;
+mod identity_header_guard;
 mod inference_fallback;
 mod irr_terminal_streaming;
 #[cfg(feature = "http-callout-filter")]
 mod lakera_guard;
 #[cfg(feature = "llmd-ext-proc")]
 mod llmd_ext_proc;
+mod llmisvc_model_provider_resolver;
 mod mcp_broker;
 mod model_to_header;
 mod openai_agentic_loop;
@@ -54,6 +58,7 @@ mod provider_route;
 mod rehydrate;
 mod responses_routing;
 mod responses_to_chat_completions;
+mod responses_to_chat_completions_conformance;
 mod session_replay;
 mod time_to_first_token;
 mod token_count;

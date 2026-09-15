@@ -1,0 +1,87 @@
+# Anthropic Messages Full-Flow Agentic (Web Search)
+#
+# A single Anthropic Messages gateway that runs the server-owned web-search
+# loop through Praxis core's iterative_request_router (IRR) and serves BOTH
+# streaming and buffered clients from one pipeline. `anthropic_web_search`
+# selects the transport per request from the client's `stream` flag
+# (`terminal_streaming: true`):
+#
+#   * `"stream": true`  -> the terminal answer is streamed to the client as one
+#     coherent Anthropic Messages SSE lifecycle (a single `message_start`,
+#     forwarded text `content_block_*` frames, then one terminal `message_delta`
+#     / `message_stop`). Intermediate model/search transitions stay internal and
+#     the managed `WebSearch` tool-use block is suppressed.
+#   * `"stream": false` -> the same loop runs buffered and returns one final
+#     Anthropic Messages JSON object.
+#
+# Because the inference step may stream its response, every response filter in
+# that step uses `BodyMode::Stream`; `anthropic_web_search` rewrites the SSE body
+# incrementally for a streaming round and accumulates then classifies a buffered
+# round.
+#
+# The model runs natively on the Anthropic Messages wire format (for example
+# vLLM's `/v1/messages` endpoint). The managed `WebSearch` tool is executed by
+# the proxy against the configured provider, so the model only needs to emit
+# `WebSearch` tool-use blocks; the loop performs the search and re-enters.
+#
+# Requires WEB_SEARCH_API_KEY. The Messages backend listens on 127.0.0.1:8000.
+#
+# Run the deterministic model mock:
+#   cargo run -p praxis-test-utils --example anthropic_messages_web_search_mock
+#
+# In a second terminal, run Praxis:
+#   WEB_SEARCH_API_KEY="$WEB_SEARCH_API_KEY" cargo run -p praxis-ai-proxy -- \
+#     -c examples/configs/anthropic/full-flow-agentic.yaml
+#
+# Streaming request (incremental terminal answer):
+#   curl -N http://127.0.0.1:8080/v1/messages \
+#     -H 'content-type: application/json' \
+#     -d '{"model":"openai/gpt-oss-20b","max_tokens":1024,"stream":true,"messages":[{"role":"user","content":"Use web search to look up potato, then summarize in one sentence."}],"tools":[{"name":"WebSearch","description":"Search the web","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}'
+#
+# Buffered request (single final JSON object): send the same body with
+# "stream": false (or omit "stream").
+
+listeners:
+  - name: anthropic-full-flow-agentic
+    address: "127.0.0.1:8080"
+    filter_chains: [full-flow-agentic]
+
+filter_chains:
+  - name: full-flow-agentic
+    filters:
+      - filter: anthropic_messages_format
+        on_invalid: reject
+      - filter: anthropic_validate
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 6
+        timeout_ms: 90000
+        steps:
+          - name: inference
+            filters:
+              - filter: anthropic_web_search
+                provider: you
+                api_key: ${WEB_SEARCH_API_KEY}
+                default_context_size: medium
+                timeout_ms: 10000
+                terminal_streaming: true
+              - filter: anthropic_messages_protocol
+                default_version: "2023-06-01"
+              - filter: router
+                routes:
+                  - path_prefix: "/v1/messages"
+                    cluster: messages-backend
+              - filter: load_balancer
+                clusters:
+                  - name: messages-backend
+                    endpoints: ["127.0.0.1:8000"]
+            on_result:
+              - filter: anthropic_web_search
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
