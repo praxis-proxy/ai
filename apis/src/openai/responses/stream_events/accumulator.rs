@@ -23,41 +23,52 @@ use crate::openai::{
 
 /// Process a single SSE event, updating `ResponsesState` in
 /// extensions and per-filter accumulation state.
+///
+/// Returns the serialized byte size of any clone retained in `tool_calls` by this
+/// event (`0` for every event but a `function_call_arguments.done` that stores a
+/// clone). That clone is the one accumulator whose growth the driving frame does not
+/// bound, so the caller charges the returned size against the request-wide
+/// accumulation byte budget (#556); see [`finalize_function_call`].
+#[must_use = "the returned clone bytes must be charged against the accumulation byte budget"]
 pub(super) fn accumulate_event(
     ctx: &mut HttpFilterContext<'_>,
     filter_state: &mut StreamEventsState,
     event: &ResponsesEvent,
-) {
+) -> usize {
     match event {
         ResponsesEvent::ResponseCompleted(payload)
         | ResponsesEvent::ResponseIncomplete(payload)
         | ResponsesEvent::ResponseFailed(payload) => {
             handle_terminal_event(ctx, payload, event);
+            0
         },
 
         ResponsesEvent::OutputItemAdded(payload) => {
             handle_output_item_added(ctx, payload);
+            0
         },
         ResponsesEvent::OutputItemDone(payload) => {
             handle_output_item_done(ctx, payload);
+            0
         },
 
         ResponsesEvent::FunctionCallArgumentsDelta(payload) => {
             handle_function_call_delta(filter_state, payload);
+            0
         },
-        ResponsesEvent::FunctionCallArgumentsDone(payload) => {
-            handle_function_call_done(ctx, filter_state, payload);
-        },
+        ResponsesEvent::FunctionCallArgumentsDone(payload) => handle_function_call_done(ctx, filter_state, payload),
 
         ResponsesEvent::Error(payload) => {
             warn!(error = %payload, "streaming error event received");
+            0
         },
 
         ResponsesEvent::Unknown { event_type, .. } => {
             debug!(event_type, "unknown SSE event type (forward-compat)");
+            0
         },
 
-        _ => {},
+        _ => 0,
     }
 }
 
@@ -211,15 +222,22 @@ fn reject_overflowing_tool_call(filter_state: &mut StreamEventsState, key: Strin
 }
 
 /// Finalize a function call from the done event's payload and push to `tool_calls`.
-fn handle_function_call_done(ctx: &mut HttpFilterContext<'_>, filter_state: &mut StreamEventsState, payload: &Value) {
+///
+/// Returns the serialized byte size of the clone retained in `tool_calls`, or `0`
+/// when the call is rejected or no clone is stored.
+fn handle_function_call_done(
+    ctx: &mut HttpFilterContext<'_>,
+    filter_state: &mut StreamEventsState,
+    payload: &Value,
+) -> usize {
     let Some(key) = tool_call_key(payload) else {
-        return;
+        return 0;
     };
     if filter_state.rejected_tool_call_args.contains(&key) {
-        return;
+        return 0;
     }
     if reject_oversized_done(filter_state, &key, payload) {
-        return;
+        return 0;
     }
 
     let accumulated = filter_state.tool_call_args.remove(&key);
@@ -230,7 +248,7 @@ fn handle_function_call_done(ctx: &mut HttpFilterContext<'_>, filter_state: &mut
         .or(accumulated)
         .unwrap_or_default();
 
-    finalize_function_call(ctx, &key, payload, &arguments);
+    finalize_function_call(ctx, &key, payload, &arguments)
 }
 
 /// Reject a completed function call whose `arguments` already exceed the cap.
@@ -255,7 +273,21 @@ fn reject_oversized_done(filter_state: &mut StreamEventsState, key: &str, payloa
 }
 
 /// Apply finalized arguments to the matching output item and store the tool call.
-fn finalize_function_call(ctx: &mut HttpFilterContext<'_>, key: &str, payload: &Value, arguments: &str) {
+///
+/// Returns the serialized byte size of the clone retained in `tool_calls`, or `0`
+/// when no clone is stored (no matching item, or a non-function item).
+///
+/// A `function_call_arguments.done` clones the *whole* retained output item — whose
+/// payload arrived in an earlier frame — into `tool_calls`, so this clone is the one
+/// accumulator whose growth the small driving `done` frame does not bound. Sizing
+/// the clone here, where it is actually made, lets the caller charge the exact
+/// retained bytes against the request-wide accumulation byte budget (#556): a
+/// backend that re-clones a large id-less item with hundreds of tiny `done` frames
+/// then fails closed instead of retaining megabytes uncharged. On the replace path
+/// the full new clone is charged (the counter is monotonic and cannot credit the
+/// dropped old value); that over-charges a re-`done` of the same call slightly,
+/// which only fails the stream closed marginally earlier.
+fn finalize_function_call(ctx: &mut HttpFilterContext<'_>, key: &str, payload: &Value, arguments: &str) -> usize {
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
     let tool_call = {
         let Some(item) = find_output_item_mut(state.output_items_mut(), payload) else {
@@ -263,7 +295,7 @@ fn finalize_function_call(ctx: &mut HttpFilterContext<'_>, key: &str, payload: &
                 key,
                 "dropping function-call arguments.done without matching output item"
             );
-            return;
+            return 0;
         };
 
         let Some(tool_call) = complete_function_call_item(item, arguments) else {
@@ -271,12 +303,16 @@ fn finalize_function_call(ctx: &mut HttpFilterContext<'_>, key: &str, payload: &
                 key,
                 "dropping function-call arguments.done for non-function output item"
             );
-            return;
+            return 0;
         };
         tool_call
     };
 
+    // Size the clone before it is moved into `tool_calls`; this is the retained
+    // growth the byte budget must charge.
+    let retained_bytes = crate::json_body::serialized_len(&tool_call).unwrap_or(0);
     upsert_tool_call(&mut state.tool_calls, tool_call);
+    retained_bytes
 }
 
 /// Build the stable key used by argument delta/done events.

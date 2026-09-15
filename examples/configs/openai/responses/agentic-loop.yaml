@@ -12,6 +12,14 @@
 # Client-side function calls resolve to no dispatcher and are returned to the
 # client without looping.
 #
+# Configured `connector_id` values can be combined with `defer_loading: true`
+# and a `tool_search` tool so discovery waits for a later `tool_search_call`.
+# Connector IDs are pipeline-local; they are never forwarded to the
+# inference backend. The first inference round keeps a sanitized
+# `type: mcp` stub plus `tool_search` (the backend must accept those
+# OpenAI hosted-tool shapes). Any later `tool_search_call` loads every
+# pending deferred connector from its internally resolved endpoint.
+#
 # Pre-IRR filters run once on the client request to set up shared
 # state (ResponsesState) which persists across all IRR iterations
 # via extension swapping.
@@ -35,10 +43,11 @@
 #     load_balancer → router → openai_responses_proxy → openai_agentic_loop
 #       → (dispatchers have no response phase) → openai_stream_events
 #   openai_agentic_loop is the sole response parser: it extracts completed
-#   function calls, web_search_call, and file_search_call items, records the
-#   assignments each dispatcher must execute, and publishes the single loop/done
-#   decision. The dispatchers execute their assigned calls at request-body EOS
-#   on the next iteration, before inference, and never parse the response.
+#   function calls, web_search_call, file_search_call, and hosted
+#   tool_search_call items, records the assignments each dispatcher must
+#   execute, and publishes the single loop/done decision. The dispatchers
+#   execute their assigned calls at request-body EOS on the next iteration,
+#   before inference, and never parse the response.
 #
 # Transition rules (evaluated after each step's response-body):
 #   openai_agentic_loop.action = "loop"  → next: inference
@@ -73,6 +82,25 @@
 #                  "server_url": "http://mcp-weather:8001/mcp",
 #                  "allowed_tools": ["get_weather"],
 #                  "require_approval": "never"}]
+#     }'
+#
+#   # Deferred configured connector (loaded on a later tool_search_call)
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "Search drive for quarterly reports",
+#       "tools": [
+#         {"type": "tool_search"},
+#         {
+#           "type": "mcp",
+#           "server_label": "drive",
+#           "connector_id": "corp_drive",
+#           "defer_loading": true,
+#           "allowed_tools": ["search"],
+#           "require_approval": "never"
+#         }
+#       ]
 #     }'
 #
 # MCP approval round trip (require_approval: "always"):
@@ -144,6 +172,9 @@ filter_chains:
       - filter: openai_responses_rehydrate
 
       - filter: openai_mcp_tool_resolve
+        connectors:
+          - id: corp_drive
+            server_url: https://drive-mcp.internal:8443/mcp
 
       - filter: iterative_request_router
         initial_step: inference

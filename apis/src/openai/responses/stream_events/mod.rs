@@ -90,6 +90,17 @@ pub(super) struct StreamEventsState {
     rejected_tool_call_args: std::collections::HashSet<String>,
     /// Cap on accumulated bytes per tool-call argument string.
     max_tool_call_argument_bytes: usize,
+    /// Aggregate accumulation byte ceiling; the stream fails closed once passed.
+    ///
+    /// The running total it bounds lives request-wide in
+    /// [`ResponsesState::stream_accumulated_bytes`], not here, so it survives the
+    /// per-round re-arm.
+    max_accumulated_bytes: usize,
+    /// Cap on accumulated output items; the stream fails closed once passed.
+    ///
+    /// The count it bounds is derived request-wide from the retained output
+    /// (`accumulated_output` + the current round's `output`), not tracked here.
+    max_output_items: usize,
     /// Inference iteration number for lifecycle suppression and index offsets.
     iteration: u32,
     /// Output index offset contributed by preceding inference/tool rounds.
@@ -124,12 +135,18 @@ pub(super) struct StreamEventsState {
 /// # max_events: 100000
 /// # timeout_secs: 300
 /// # max_tool_call_argument_bytes: 1048576
+/// # max_accumulated_bytes: 67108864
+/// # max_output_items: 100000
 /// ```
 pub struct OpenaiStreamEventsFilter {
     /// Configuration for the SSE frame parser.
     parser_config: SseParserConfig,
     /// Cap on accumulated bytes per tool-call argument string.
     max_tool_call_argument_bytes: usize,
+    /// Aggregate accumulation byte ceiling across output items and tool-call args.
+    max_accumulated_bytes: usize,
+    /// Cap on accumulated streaming output items.
+    max_output_items: usize,
 }
 
 impl OpenaiStreamEventsFilter {
@@ -153,12 +170,42 @@ impl OpenaiStreamEventsFilter {
         Ok(Self {
             parser_config: cfg.to_parser_config(),
             max_tool_call_argument_bytes: cfg.max_tool_call_argument_bytes(),
+            max_accumulated_bytes: cfg.max_accumulated_bytes(),
+            max_output_items: cfg.max_output_items(),
         })
     }
 
     /// Whether per-request parser state has been installed.
     fn is_armed(ctx: &HttpFilterContext<'_>) -> bool {
         ctx.get_filter_state::<StreamEventsState>().is_some()
+    }
+
+    /// Build fresh per-round parser state seeded with this round's `iteration`
+    /// and `output_index_offset`.
+    ///
+    /// The accumulation budget's running totals are not reset here — they live
+    /// request-wide in [`ResponsesState`] so they survive the re-arm.
+    fn new_round_state(&self, iteration: u32, output_index_offset: u64) -> StreamEventsState {
+        StreamEventsState {
+            frame_parser: SseFrameParser::new(self.parser_config.max_buffer_bytes),
+            event_count: 0,
+            max_events: self.parser_config.max_events,
+            timeout: self.parser_config.timeout,
+            started_at: None,
+            completed_at: None,
+            completion_state: CompletionState::Open,
+            tool_call_args: std::collections::HashMap::new(),
+            rejected_tool_call_args: std::collections::HashSet::new(),
+            max_tool_call_argument_bytes: self.max_tool_call_argument_bytes,
+            max_accumulated_bytes: self.max_accumulated_bytes,
+            max_output_items: self.max_output_items,
+            iteration,
+            output_index_offset,
+            deferred_terminal: None,
+            deferred_done: false,
+            local_items_flushed: false,
+            local_tool_items: std::collections::HashMap::new(),
+        }
     }
 
     /// Install fresh parser state for one inference stream.
@@ -179,24 +226,7 @@ impl OpenaiStreamEventsFilter {
             }
             (state.iteration, output_index_offset)
         });
-        ctx.insert_filter_state(StreamEventsState {
-            frame_parser: SseFrameParser::new(self.parser_config.max_buffer_bytes),
-            event_count: 0,
-            max_events: self.parser_config.max_events,
-            timeout: self.parser_config.timeout,
-            started_at: None,
-            completed_at: None,
-            completion_state: CompletionState::Open,
-            tool_call_args: std::collections::HashMap::new(),
-            rejected_tool_call_args: std::collections::HashSet::new(),
-            max_tool_call_argument_bytes: self.max_tool_call_argument_bytes,
-            iteration,
-            output_index_offset,
-            deferred_terminal: None,
-            deferred_done: false,
-            local_items_flushed: false,
-            local_tool_items: std::collections::HashMap::new(),
-        });
+        ctx.insert_filter_state(self.new_round_state(iteration, output_index_offset));
         ctx.set_metadata("responses.stream_completion", "open");
         // Publish a per-round marker that `openai_agentic_loop` reads (and then
         // consumes) to confirm this typed-streaming round can surface
@@ -451,6 +481,14 @@ fn parse_and_accumulate(
 ) -> Result<Option<Bytes>, SseParseError> {
     check_timeout(state, now)?;
 
+    // A prior chunk or round may have tripped the aggregate accumulation budget.
+    // Fail every remaining chunk closed before parsing so a later terminal event
+    // cannot commit on a poisoned stream. The budget is request-wide, so this
+    // stays tripped across the per-round re-arm as well as across chunks.
+    if let Some(error) = accumulation_budget_exceeded(state, ctx) {
+        return Err(error);
+    }
+
     let frames = state.frame_parser.parse_chunk_with_counted_event_limit(
         bytes,
         state.event_count,
@@ -463,8 +501,12 @@ fn parse_and_accumulate(
     // parses. A malformed frame aborts the chunk atomically, so no local-tool
     // milestone is recorded for bytes that never reach the client and EOS
     // recovery still re-synthesizes the executed tool items (#276 finding 3).
-    let events = parse_chunk_events(state, &frames, now)?;
-    let logical_output = commit_chunk_events(state, ctx, events);
+    let events = parse_chunk_events(state, ctx, &frames, now)?;
+    // Commit accumulates the retained output, enforces the item-count budget
+    // against it, and only then records delivery milestones and emits bytes — so a
+    // count overflow fails the chunk closed before any milestone is committed (see
+    // [`commit_chunk_events`]).
+    let logical_output = commit_chunk_events(state, ctx, events)?;
 
     Ok((!logical_output.is_empty()).then(|| Bytes::from(logical_output)))
 }
@@ -476,6 +518,7 @@ fn parse_and_accumulate(
 /// local-tool milestone (#276 finding 3).
 fn parse_chunk_events(
     state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
     frames: &[SseFrame],
     now: Instant,
 ) -> Result<Vec<ResponsesEvent>, SseParseError> {
@@ -489,23 +532,203 @@ fn parse_chunk_events(
         state.event_count += 1;
         let event = ResponsesEvent::from_frame(frame)?;
         record_completion(state, &event, now)?;
+        charge_accumulation_budget(state, ctx, &event, frame)?;
         events.push(event);
     }
     Ok(events)
 }
 
+/// Charge one parsed event's wire bytes against the request-wide accumulation
+/// byte budget.
+///
+/// Bounds every accumulator this filter grows *from the driving frame* — the
+/// response output-item list, the per-tool-call argument buffers, the local-tool
+/// `emitted_output_items` map (keyed by an owned `item_id`, with a
+/// `streamed_phases` set of owned event-type strings), and the terminal snapshot
+/// retained in `response_object` and the deferred terminal — by an aggregate byte
+/// ceiling. Each of these grows by a substring of the frame that drives it, so
+/// `frame.data.len()` is a conservative upper bound on the bytes each event
+/// contributes to shared state, and the budget bounds total accumulated memory even
+/// when every individual event stays within `max_buffer_bytes`.
+///
+/// The one accumulator whose growth is *not* bounded by the driving frame is the
+/// `tool_calls` list: a `function_call_arguments.done` clones the whole retained
+/// output item (whose payload arrived in an earlier frame) rather than the small
+/// `done` frame. That clone is charged in phase 2 ([`commit_chunk_events`]), where
+/// it is actually performed and its size is known exactly, instead of being
+/// predicted here — so the byte budget cannot diverge from the item the commit
+/// retains, and no per-event history rescan is needed.
+///
+/// The running total lives in [`ResponsesState::stream_accumulated_bytes`], so it
+/// is charged once per request and survives the per-round re-arm: a multi-round
+/// stream cannot reset the counter between IRR rounds and accumulate unbounded
+/// state while no single round trips the cap.
+///
+/// `frame.data.len()` is the compact JSON wire size, a proxy that undercounts the
+/// parsed `serde_json::Value` heap footprint (per-entry `String` keys and enum
+/// discriminants) by a bounded constant factor; the ceiling therefore bounds
+/// memory up to that factor, not to the byte. This is deliberate: charging wire
+/// bytes keeps the budget aligned with what a backend can actually stream and
+/// avoids rejecting a streamed response whose equivalent non-streaming body the
+/// buffered path would accept.
+///
+/// Terminal lifecycle events (`response.completed`/`incomplete`/`failed`) are
+/// charged: their payload snapshots the full accumulated output plus usage into
+/// `response_object` and is retained a second time as the deferred terminal, so a
+/// terminal frame that alone exceeds the ceiling (yet still fits
+/// `max_buffer_bytes`) must fail closed like any other accumulator growth. The
+/// per-frame `added`/`done`/terminal charges over-count an item that also streams
+/// the paired envelopes; that is a deliberately conservative, fail-closed-earlier
+/// byte bound. The distinct item-count dimension is enforced separately from the
+/// retained output (see [`accumulation_count_exceeded`]).
+///
+/// Runs in phase 1 (parse) so a frame-bounded accumulator's growth aborts the chunk
+/// atomically before [`commit_chunk_events`] mutates shared state.
+fn charge_accumulation_budget(
+    state: &StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    event: &ResponsesEvent,
+    frame: &SseFrame,
+) -> Result<(), SseParseError> {
+    if !charges_accumulation_bytes(event) {
+        return Ok(());
+    }
+    let accumulated_bytes = {
+        let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
+        responses.stream_accumulated_bytes = responses.stream_accumulated_bytes.saturating_add(frame.data.len());
+        responses.stream_accumulated_bytes
+    };
+    accumulation_bytes_exceeded(state, accumulated_bytes).map_or(Ok(()), Err)
+}
+
+/// Whether an event's wire bytes grow retained accumulation state and so must be
+/// charged against the aggregate byte budget.
+fn charges_accumulation_bytes(event: &ResponsesEvent) -> bool {
+    match event {
+        ResponsesEvent::OutputItemAdded(_)
+        | ResponsesEvent::OutputItemDone(_)
+        | ResponsesEvent::FunctionCallArgumentsDelta(_)
+        | ResponsesEvent::FunctionCallArgumentsDone(_)
+        | ResponsesEvent::ResponseCompleted(_)
+        | ResponsesEvent::ResponseIncomplete(_)
+        | ResponsesEvent::ResponseFailed(_) => true,
+        // Local-tool progress events (`response.web_search_call.*`,
+        // `response.mcp_call.*`, `response.mcp_list_tools.*`) grow
+        // `emitted_output_items` via `record_model_output_item`; charge them so
+        // that accumulator cannot be inflated by many distinct `item_id`s or
+        // event-type suffixes while the byte ceiling stays at zero.
+        ResponsesEvent::Unknown { event_type, .. } => is_local_tool_progress_event(event_type),
+        _ => false,
+    }
+}
+
+/// The sticky accumulation-budget error, if any dimension is over its cap.
+///
+/// Returned as a fast-path guard on later chunks — including the first chunk of a
+/// re-armed round — so once either the request-wide byte total or the retained
+/// item count is over its cap the stream stays failed closed.
+fn accumulation_budget_exceeded(state: &StreamEventsState, ctx: &HttpFilterContext<'_>) -> Option<SseParseError> {
+    let accumulated_bytes = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .map_or(0, |responses| responses.stream_accumulated_bytes);
+    accumulation_bytes_exceeded(state, accumulated_bytes).or_else(|| accumulation_count_exceeded(state, ctx))
+}
+
+/// The byte-budget error, if the request-wide charged total is over its cap.
+fn accumulation_bytes_exceeded(state: &StreamEventsState, accumulated_bytes: usize) -> Option<SseParseError> {
+    (accumulated_bytes > state.max_accumulated_bytes).then_some(SseParseError::AccumulationLimitExceeded {
+        dimension: "accumulated_bytes",
+        value: accumulated_bytes,
+        limit: state.max_accumulated_bytes,
+    })
+}
+
+/// The item-count error, if the request-wide retained output exceeds its cap.
+///
+/// The count is the number of retained output items — those already drained into
+/// [`ResponsesState::accumulated_output`] by preceding rounds plus the current
+/// round's live `output` array — not a per-envelope tally. Because
+/// `output_item.done` replaces in place the item its matching `output_item.added`
+/// pushed (by output index or id), a canonical `added`/`done` pair is one retained
+/// item, so deriving the count from the retained lists dedups that pair and spans
+/// every round with no per-round counter to reset. The two lists never overlap
+/// while a round streams: the agentic loop moves a round's `output` into
+/// `accumulated_output` (via `mem::take`) only at the round boundary, so the sum
+/// is monotonic across the whole request and the guard stays sticky once tripped.
+fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContext<'_>) -> Option<SseParseError> {
+    let count = ctx.extensions.get::<ResponsesState>().map_or(0, |responses| {
+        responses
+            .accumulated_output
+            .len()
+            .saturating_add(responses.output_items().len())
+    });
+    (count > state.max_output_items).then_some(SseParseError::AccumulationLimitExceeded {
+        dimension: "output_items",
+        value: count,
+        limit: state.max_output_items,
+    })
+}
+
 /// Phase 2: commit accumulation and logical emission for a fully parsed chunk.
 ///
-/// Both steps are infallible, so every recorded milestone corresponds to bytes
-/// that actually reach the client. Returns the logical-stream bytes.
+/// Split into two passes so both retained-state budgets are validated before any
+/// delivery milestone is recorded:
+///
+/// - Phase 2a accumulates every event into the retained output (`output_items`, `tool_calls`, `response_object`) — the
+///   only state the count derives from, and state no delivery milestone depends on. As it accumulates it charges the
+///   one byte-bearing growth the phase-1 frame charge cannot bound: the `tool_calls` clone a
+///   `function_call_arguments.done` makes of a whole retained output item (see [`charge_accumulation_budget`]). That
+///   clone is measured, not predicted, so the charge equals the item the commit actually retained and a `done` that
+///   re-clones a large item fails the chunk closed the instant the request-wide byte total exceeds the cap.
+/// - The count guard then runs against the grown output, *before* any delivery milestone is recorded. A chunk that
+///   overflows the item cap therefore fails closed without leaving a committed local-tool milestone that EOS recovery
+///   would trust for bytes the client never received (review finding: the former post-commit count check let an
+///   already-executed tool's milestone survive a rejected chunk, dropping that tool from the client-visible stream).
+/// - Phase 2b records milestones and emits the logical bytes.
+///
+/// On a rejected chunk phase 2a has already grown the retained output past a cap, so
+/// the request-wide guards in [`accumulation_budget_exceeded`] stay sticky for every
+/// later chunk and round. The byte guard fails closed per event, so transient
+/// overshoot is bounded to the single clone that trips the cap. Phase 2b is
+/// infallible, so every recorded milestone still corresponds to bytes that actually
+/// reach the client. Returns the logical-stream bytes.
 fn commit_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
     events: Vec<ResponsesEvent>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, SseParseError> {
+    for event in &events {
+        let retained_clone_bytes = accumulate_event(ctx, state, event);
+        // A `function_call_arguments.done` clones a whole retained output item into
+        // `tool_calls` — the one accumulator whose growth the driving `done` frame
+        // does not bound. Charge that measured clone here, where it happens, and fail
+        // the chunk closed the instant the request-wide byte total exceeds the cap.
+        // Charging the actual clone (not a phase-1 prediction) is exact and
+        // O(clone size): it cannot diverge from the item the commit retained, and the
+        // per-event check bounds transient overshoot to a single clone.
+        if retained_clone_bytes > 0 {
+            let accumulated_bytes = {
+                let responses = ctx.extensions.get_or_insert_with(ResponsesState::default);
+                responses.stream_accumulated_bytes =
+                    responses.stream_accumulated_bytes.saturating_add(retained_clone_bytes);
+                responses.stream_accumulated_bytes
+            };
+            if let Some(error) = accumulation_bytes_exceeded(state, accumulated_bytes) {
+                return Err(error);
+            }
+        }
+    }
+
+    // The retained item count only exists after phase 2a grows it. Enforce it here,
+    // before phase 2b records any delivery milestone, so a rejected chunk leaves no
+    // milestone for undelivered bytes. Any overshoot is bounded to a single chunk.
+    if let Some(error) = accumulation_count_exceeded(state, ctx) {
+        return Err(error);
+    }
+
     let mut logical_output = Vec::new();
     for event in events {
-        accumulate_event(ctx, state, &event);
         append_logical_event(state, ctx, event, &mut logical_output);
     }
 
@@ -519,7 +742,7 @@ fn commit_chunk_events(
         response_state.deferred_stream_done = true;
     }
 
-    logical_output
+    Ok(logical_output)
 }
 
 /// Whether an event is a response lifecycle-creation event
@@ -656,16 +879,17 @@ fn commit_local_tool_milestones(
     // Record which client-visible milestones the model backend streamed for this
     // item. `output_item.added`/`.done` mark it announced (so a later flush does
     // not re-emit `output_item.added`); an actual `response.web_search_call.*` /
-    // `response.mcp_call.*` progress event marks the lifecycle as already streamed
-    // in-band (so the flush does not re-synthesize it). Persisted across rounds
-    // via `emitted_output_items`, this is what a resumed round's flush consults.
+    // `response.mcp_call.*` / `response.mcp_list_tools.*` progress event marks
+    // the lifecycle as already streamed in-band (so the flush does not
+    // re-synthesize it). Persisted across rounds via `emitted_output_items`,
+    // this is what a resumed round's flush consults.
     record_model_output_item(ctx, event);
 
     // #276: ahead of the first model output *content* event, stream any locally
-    // generated tool items (MCP calls/approvals, or web searches absent from the
-    // upstream stream) that the tool-dispatch filters appended to
-    // `accumulated_output` but never emitted incrementally. They must precede the
-    // resumed model output and occupy their reserved output indices.
+    // generated tool items (MCP calls/approvals/listings, or web searches
+    // absent from the upstream stream) that the tool-dispatch filters appended
+    // to `accumulated_output` but never emitted incrementally. They must
+    // precede the resumed model output and occupy their reserved output indices.
     // `accumulated_output` is fixed for the round, so the flush runs once here
     // rather than re-serializing every local item ahead of each event; the EOS
     // flush still catches items whose round produced no resumed model event.
@@ -729,11 +953,12 @@ fn mark_local_done_delivered(ctx: &mut HttpFilterContext<'_>, event: &ResponsesE
 /// its latest content, but prove nothing about the tool-specific progress
 /// lifecycle: a backend may stream `added` then `done` with no progress events in
 /// between, or only some of them (e.g. `in_progress` then `done`). Only observing
-/// an actual `response.web_search_call.*` / `response.mcp_call.*` event proves
-/// that specific phase reached the client, so each is recorded individually by
-/// its event type. Deriving the lifecycle from `done` would suppress the
-/// synthesized progress a partial `added → in_progress → done` sequence still
-/// owes for its missing `searching`/`completed` phases.
+/// an actual `response.web_search_call.*` / `response.mcp_call.*` /
+/// `response.mcp_list_tools.*` event proves that specific phase reached the
+/// client, so each is recorded individually by its event type. Deriving the
+/// lifecycle from `done` would suppress the synthesized progress a partial
+/// `added → in_progress → done` sequence still owes for its missing
+/// `searching`/`completed` phases.
 fn record_model_output_item(ctx: &mut HttpFilterContext<'_>, event: &ResponsesEvent) {
     match event {
         ResponsesEvent::OutputItemAdded(payload) | ResponsesEvent::OutputItemDone(payload) => {

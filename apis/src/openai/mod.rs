@@ -13,6 +13,7 @@ pub(crate) mod conversations;
 pub(crate) mod error_response_formatter;
 pub(crate) mod include;
 mod operation;
+pub(crate) mod operation_classifier;
 pub(crate) mod responses;
 pub(crate) mod sse;
 #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
@@ -28,6 +29,7 @@ pub use conversations::{
     implementation_openapi_json as conversations_openapi_json, operation_specs as conversations_operation_specs,
 };
 pub use operation::{OpenAiHandlingMode, OpenAiOperationSpec, OpenAiRequestBody};
+pub use operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter};
 pub use responses::{
     AgenticLoopFilter, CompactFilter, DocExtractFilter, FileResolveFilter, FileSearchCalloutFilter, McpDispatchFilter,
     McpToolResolveFilter, ModelRewriteFilter, OpenaiResponsesValidateFilter, RehydrateFilter, ResponseStoreFilter,

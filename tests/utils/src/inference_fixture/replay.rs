@@ -321,6 +321,7 @@ pub(super) fn load_and_validate_config_source(scenario: &InferenceScenario) -> R
     validate_replay_filters(&config)?;
     let value =
         serde_json::to_value(config).map_err(|_source| runtime_error("scenario config could not be inspected"))?;
+    validate_mcp_resolve_replay_requests(&value, scenario)?;
     if !config_contains_endpoint_address(&value, &scenario.upstream_authority)? {
         return Err(runtime_error(
             "scenario upstream authority was not found in example config",
@@ -407,6 +408,11 @@ fn validate_replay_filters(config: &Config) -> Result<(), FixtureError> {
 }
 
 /// Whether a filter type is known to be fully contained within replay.
+///
+/// `openai_mcp_tool_resolve` is not in this list: it can issue a live
+/// `tools/list` callout. Replay admits it only as deferred-connector
+/// sanitization, gated by `filter_is_replay_contained` plus scenario
+/// request inspection in `validate_mcp_resolve_replay_requests`.
 fn is_replay_contained_filter(filter_type: &str) -> bool {
     matches!(
         filter_type,
@@ -423,16 +429,67 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "openai_response_store"
             | "openai_responses_rehydrate"
             | "openai_stream_events"
+            | "openai_tool_parse"
             | "responses_to_chat_completions"
             | "router"
             | "load_balancer"
     )
 }
 
+/// Whether one filter entry is replay-contained, including the deferred-only
+/// `openai_mcp_tool_resolve` exception.
+fn filter_is_replay_contained(filter: &FilterEntry) -> bool {
+    filter.filter_type == "openai_mcp_tool_resolve" || is_replay_contained_filter(filter.filter_type.as_str())
+}
+
+/// Rejects `openai_mcp_tool_resolve` fixtures whose requests would eager-list.
+///
+/// The filter type is admitted so deferred-connector sanitization (no
+/// `tools/list`) can replay. An MCP tool without `defer_loading: true` would
+/// call `tools/list` even when the connector URL is the replay-owned backend,
+/// so those scenario requests are not contained.
+fn validate_mcp_resolve_replay_requests(config: &Value, scenario: &InferenceScenario) -> Result<(), FixtureError> {
+    if !json_contains_filter(config, "openai_mcp_tool_resolve") {
+        return Ok(());
+    }
+    for turn in &scenario.turns {
+        if recorded_body_has_eager_mcp_tool(&turn.request.body) {
+            return Err(runtime_error("scenario MCP listing is not replay-contained"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether a serialized config tree names `filter_type` as a pipeline filter.
+fn json_contains_filter(value: &Value, filter_type: &str) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.get("filter").and_then(Value::as_str) == Some(filter_type)
+                || object.values().any(|value| json_contains_filter(value, filter_type))
+        },
+        Value::Array(values) => values.iter().any(|value| json_contains_filter(value, filter_type)),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
+/// Whether a scenario request body contains an MCP tool that would call `tools/list` now.
+fn recorded_body_has_eager_mcp_tool(body: &RecordedBody) -> bool {
+    let RecordedBody::Json { value } = body else {
+        return false;
+    };
+    let Some(tools) = value.get("tools").and_then(Value::as_array) else {
+        return false;
+    };
+    tools.iter().any(|tool| {
+        tool.get("type").and_then(Value::as_str) == Some("mcp")
+            && !tool.get("defer_loading").and_then(Value::as_bool).unwrap_or(false)
+    })
+}
+
 /// Traverses top-level and inline branch filters without scanning inert config data.
 fn validate_replay_filter_entries(filters: &[FilterEntry]) -> Result<(), FixtureError> {
     for filter in filters {
-        if !is_replay_contained_filter(filter.filter_type.as_str()) {
+        if !filter_is_replay_contained(filter) {
             return Err(runtime_error("scenario filter is not replay-contained"));
         }
         for branch in filter.branch_chains.iter().flatten() {
@@ -1665,10 +1722,10 @@ mod tests {
         },
         ScenarioRunner, ScriptedHttpServer, SseEventMembership, build_replay_config, compare_imported_requests,
         finish_backend_after_proxy_shutdown, fixture_comparison_value, has_only_normal_relative_components,
-        is_network_value_key, load_and_validate_config_source, resolve_example_config_path, send_recorded_request,
-        validate_endpoint_collection, validate_generic_network_string, validate_network_string_with_context,
-        validate_replay_filters, validate_replay_network_value, validate_scenario_requests, validate_singular_endpoint,
-        validate_sse_events, validate_upstream_inputs,
+        is_network_value_key, is_replay_contained_filter, load_and_validate_config_source, resolve_example_config_path,
+        send_recorded_request, validate_endpoint_collection, validate_generic_network_string,
+        validate_network_string_with_context, validate_replay_filters, validate_replay_network_value,
+        validate_scenario_requests, validate_singular_endpoint, validate_sse_events, validate_upstream_inputs,
     };
     use crate::{example_config_path, free_port_guard, proxy::blocked_proxy_guard_for_test};
 
@@ -2621,8 +2678,6 @@ mod tests {
         }
 
         for path in [
-            "openai/responses/agentic-loop.yaml",
-            "openai/responses/mcp-tool-resolve.yaml",
             "openai/responses/mcp-dispatch.yaml",
             "openai/responses/file-resolve.yaml",
             "openai/responses/compact.yaml",
@@ -2656,6 +2711,64 @@ mod tests {
         let source = replay_config_source("openai/responses/agentic-loop-fixture.yaml");
         let config = Config::from_yaml(&source).expect("agentic-loop-fixture config should parse");
         validate_replay_filters(&config).expect("agentic-loop-fixture contains only replay-safe filters");
+    }
+
+    #[test]
+    fn replay_config_allows_deferred_mcp_fixture() {
+        let source = replay_config_source("openai/responses/agentic-loop-deferred-mcp-fixture.yaml");
+        let config = Config::from_yaml(&source).expect("deferred MCP fixture config should parse");
+        validate_replay_filters(&config).expect("deferred MCP fixture contains only replay-safe filters");
+    }
+
+    #[test]
+    fn openai_mcp_tool_resolve_is_not_unconditionally_replay_contained() {
+        assert!(
+            !is_replay_contained_filter("openai_mcp_tool_resolve"),
+            "eager tools/list must not be treated as unconditionally replay-safe"
+        );
+    }
+
+    #[test]
+    fn replay_allows_deferred_mcp_scenario_requests() {
+        let scenario = deferred_mcp_scenario(&json!([
+            {"type": "tool_search"},
+            {
+                "type": "mcp",
+                "server_label": "drive",
+                "connector_id": "corp_drive",
+                "defer_loading": true
+            }
+        ]));
+
+        load_and_validate_config_source(&scenario).expect("deferred MCP requests must remain replayable");
+    }
+
+    #[test]
+    fn replay_rejects_eager_mcp_listing_in_deferred_resolve_fixture() {
+        let scenario = deferred_mcp_scenario(&json!([{
+            "type": "mcp",
+            "server_label": "drive",
+            "connector_id": "corp_drive"
+        }]));
+
+        let error = load_and_validate_config_source(&scenario)
+            .expect_err("eager MCP tools must not replay through openai_mcp_tool_resolve");
+
+        assert_eq!(error.to_string(), "scenario MCP listing is not replay-contained");
+    }
+
+    #[test]
+    fn replay_rejects_inline_server_url_mcp_listing_in_deferred_resolve_fixture() {
+        let scenario = deferred_mcp_scenario(&json!([{
+            "type": "mcp",
+            "server_label": "drive",
+            "server_url": "http://127.0.0.1:3001/mcp"
+        }]));
+
+        let error = load_and_validate_config_source(&scenario)
+            .expect_err("inline MCP server_url listing must not replay through openai_mcp_tool_resolve");
+
+        assert_eq!(error.to_string(), "scenario MCP listing is not replay-contained");
     }
 
     #[test]
@@ -3557,6 +3670,45 @@ mod tests {
                 expect: ScenarioExpectation {
                     client_status: 302,
                     client_body_kind: BodyKind::Empty,
+                    upstream_path: "/v1/responses".to_owned(),
+                    upstream_body_kind: BodyKind::Json,
+                    client_sse_events: Vec::new(),
+                    client_sse_repeatable_events: Vec::new(),
+                    client_sse_interleaved_events: Vec::new(),
+                    upstream_sse_events: Vec::new(),
+                    upstream_sse_repeatable_events: Vec::new(),
+                    upstream_sse_interleaved_events: Vec::new(),
+                },
+            }],
+        }
+    }
+
+    fn deferred_mcp_scenario(tools: &Value) -> InferenceScenario {
+        InferenceScenario {
+            version: 1,
+            id: "responses/agentic-deferred-mcp-connectors".to_owned(),
+            description: "deferred MCP replay containment".to_owned(),
+            protocol: InferenceProtocol::OpenaiResponses,
+            example_config: "openai/responses/agentic-loop-deferred-mcp-fixture.yaml".to_owned(),
+            upstream_authority: "127.0.0.1:3001".to_owned(),
+            features: vec!["responses.agentic.deferred_mcp_connectors".to_owned()],
+            turns: vec![ScenarioTurn {
+                name: "initial".to_owned(),
+                request: RecordedRequest {
+                    method: "POST".to_owned(),
+                    path: "/v1/responses".to_owned(),
+                    headers: BTreeMap::from([("content-type".to_owned(), vec!["application/json".to_owned()])]),
+                    body: RecordedBody::Json {
+                        value: json!({
+                            "model": "fixture-model",
+                            "input": "hello",
+                            "tools": tools
+                        }),
+                    },
+                },
+                expect: ScenarioExpectation {
+                    client_status: 200,
+                    client_body_kind: BodyKind::Json,
                     upstream_path: "/v1/responses".to_owned(),
                     upstream_body_kind: BodyKind::Json,
                     client_sse_events: Vec::new(),
