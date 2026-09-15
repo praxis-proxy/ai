@@ -242,8 +242,16 @@ fn late_upstream_failure_does_not_replace_committed_sse() {
         "the event delivered before the transport failure must be preserved: {raw}"
     );
     assert!(
-        !raw.to_ascii_lowercase().contains("bad gateway") && !raw.contains("\"error\""),
-        "a late failure must not replace the committed SSE response: {raw}"
+        !raw.to_ascii_lowercase().contains("bad gateway"),
+        "a late failure must not replace the committed SSE response with an HTTP error: {raw}"
+    );
+    assert!(
+        raw.to_ascii_lowercase().contains("text/event-stream"),
+        "the committed SSE content type must stay: {raw}"
+    );
+    assert!(
+        !raw.contains("exceeded timeout"),
+        "a truncated chunk is ordinary transport Io, not a stream timeout: {raw}"
     );
     backend_thread.join().expect("backend thread should not panic");
 }

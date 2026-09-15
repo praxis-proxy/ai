@@ -22,14 +22,16 @@ mod local_tools;
 use std::{
     collections::{BTreeSet, hash_map::DefaultHasher},
     hash::{Hash as _, Hasher as _},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use praxis_core::connectivity::{ConnectionOptions, Upstream};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
-    SubRequestResponseMode, parse_filter_config,
+    StreamTerminationCause, SubRequestResponseMode, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, trace, warn};
@@ -80,6 +82,14 @@ pub(super) struct StreamEventsState {
     timeout: Duration,
     /// Timestamp of first chunk.
     started_at: Option<Instant>,
+    /// Selected peer captured after load balancing.
+    ///
+    /// IRR reconstructs response-body contexts with `ctx.upstream: None`
+    /// after snapshotting this peer's `read_timeout` into the live body.
+    /// Remaining-budget recaps restore this handle so leftover
+    /// `timeout_secs` is published on `ctx.upstream` for the streaming
+    /// executor to copy onto the active `SubResponseBody` timer.
+    selected_peer: Option<Upstream>,
     /// Timestamp when a terminal state was first observed.
     completed_at: Option<Instant>,
     /// Stream completion state (`Open` / `TerminalLifecycle` / `Error`).
@@ -125,6 +135,11 @@ pub(super) struct StreamEventsState {
 ///
 /// Must run inside an `iterative_request_router` step. Running it
 /// elsewhere is a misconfiguration and fails closed at request time.
+/// Place it after `load_balancer` so `timeout_secs` can cap the selected
+/// peer; `openai_responses_proxy` buffers the request body, so IRR runs
+/// that phase before load balancing. Each later chunk restores that peer
+/// onto IRR body contexts (which have `upstream: None`) and recaps leftover
+/// budget so the streaming executor can copy that cap onto the live body.
 ///
 /// # YAML
 ///
@@ -192,6 +207,7 @@ impl OpenaiStreamEventsFilter {
             max_events: self.parser_config.max_events,
             timeout: self.parser_config.timeout,
             started_at: None,
+            selected_peer: None,
             completed_at: None,
             completion_state: CompletionState::Open,
             tool_call_args: std::collections::HashMap::new(),
@@ -269,6 +285,11 @@ impl OpenaiStreamEventsFilter {
                 // `Accept-Encoding` whenever logical parsing is armed so a
                 // compliant backend returns plaintext SSE.
                 ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+                if ctx.upstream.is_none() {
+                    debug!("stream_events timeout_secs not applied: load balancer has not selected ctx.upstream");
+                }
+                apply_remaining_peer_read_timeout(ctx);
+                remember_selected_peer(ctx);
                 None
             },
         }
@@ -311,14 +332,6 @@ const fn arm_decision(is_streaming_responses: bool, inside_irr: bool) -> ArmDeci
 impl HttpFilter for OpenaiStreamEventsFilter {
     fn name(&self) -> &'static str {
         "openai_stream_events"
-    }
-
-    fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::None
-    }
-
-    fn request_body_mode(&self) -> BodyMode {
-        BodyMode::Stream
     }
 
     fn response_body_access(&self) -> BodyAccess {
@@ -409,11 +422,138 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         process_chunk(ctx, body);
 
         if end_of_stream {
+            record_idle_transport_timeout(ctx);
             validate_stream_end(ctx);
             finalize_logical_stream(ctx, body);
         }
 
         Ok(FilterAction::Continue)
+    }
+}
+
+/// Remaining time in the absolute deadline from the first SSE chunk.
+///
+/// Before that chunk the full `timeout_secs` budget is still available
+/// for the first upstream read. After it, each cap uses only what is
+/// left so a stall near the deadline cannot run for another full period.
+fn remaining_timeout(state: &StreamEventsState, now: Instant) -> Duration {
+    match state.started_at {
+        None => state.timeout,
+        Some(started) => state.timeout.saturating_sub(now.duration_since(started)),
+    }
+}
+
+/// Cap the selected peer's next read at the remaining stream budget.
+///
+/// No-op until load balancing has set `ctx.upstream`. A tighter cluster
+/// `read_timeout` is left in place. IRR reconstructs response-body
+/// contexts with `upstream: None`, so later remaining-budget recaps
+/// restore [`StreamEventsState::selected_peer`] first. The streaming
+/// executor then copies leftover `ctx.upstream.read_timeout` onto the
+/// live body.
+fn apply_remaining_peer_read_timeout(ctx: &mut HttpFilterContext<'_>) {
+    let timeout = ctx
+        .get_filter_state::<StreamEventsState>()
+        .map_or(Duration::ZERO, |state| remaining_timeout(state, Instant::now()));
+    if timeout.is_zero() {
+        return;
+    }
+    cap_upstream_read_timeout(ctx, timeout);
+}
+
+/// Keep the load-balanced peer so IRR body hooks can recap leftover budget.
+fn remember_selected_peer(ctx: &mut HttpFilterContext<'_>) {
+    let peer = ctx.upstream.clone();
+    if let Some(state) = ctx.get_filter_state_mut::<StreamEventsState>() {
+        state.selected_peer.clone_from(&peer);
+    }
+}
+
+/// Restore the selected peer onto an IRR response-body context.
+///
+/// Praxis already copied the original `read_timeout` into the live
+/// [`SubResponseBody`](praxis_core::subrequest::SubResponseBody) at
+/// dispatch. Recapping leftover `timeout_secs` on this restored object
+/// does not change that snapshot; the streaming executor copies leftover
+/// `ctx.upstream.read_timeout` onto the live body after this pass.
+fn restore_selected_peer(ctx: &mut HttpFilterContext<'_>, state: &StreamEventsState) {
+    if ctx.upstream.is_none() {
+        ctx.upstream.clone_from(&state.selected_peer);
+    }
+}
+
+/// Cap the selected peer's per-read timeout at `timeout`.
+///
+/// At arm time this is snapshotted into the live body. On later chunks
+/// leftover budget is published on `ctx.upstream` so the streaming
+/// executor can recap that live timer. No-op until the selected peer is
+/// present (directly, or restored from arm).
+fn cap_upstream_read_timeout(ctx: &mut HttpFilterContext<'_>, timeout: Duration) {
+    let Some(upstream) = ctx.upstream.as_mut() else {
+        return;
+    };
+    cap_connection_read_timeout(&mut upstream.connection, timeout);
+}
+
+/// Cap one connection's `read_timeout` at `timeout` without relaxing a
+/// tighter cluster value.
+fn cap_connection_read_timeout(connection: &mut Arc<ConnectionOptions>, timeout: Duration) {
+    let opts = Arc::make_mut(connection);
+    opts.read_timeout = Some(opts.read_timeout.map_or(timeout, |existing| existing.min(timeout)));
+}
+
+/// Whether an `Io` termination is the stream deadline, not a reset.
+///
+/// Praxis 0.5.4 reports a winning peer `read_timeout` as
+/// [`StreamTerminationCause::Io`]. Matching every `Io` would also
+/// label truncated chunks and ordinary resets as timeouts. Only an
+/// open parser that has already seen a chunk and exhausted
+/// `timeout_secs` is a stream timeout.
+fn io_exceeded_stream_deadline(state: &StreamEventsState, now: Instant) -> bool {
+    state
+        .started_at
+        .is_some_and(|started| now.duration_since(started) >= state.timeout)
+}
+
+/// Treat an IRR idle, deadline, or exhausted stream-budget abort as a timeout.
+///
+/// Those failures arrive as end-of-stream with [`StreamTerminationCause`]
+/// set, not as another SSE chunk, so [`check_timeout`] never ran while
+/// the backend was silent. Ordinary `Io` (truncated chunks, resets)
+/// is left unhandled so IRR does not replace committed SSE with a
+/// timeout error. A backend that already sent a terminal event can
+/// still trip a timer while closing the HTTP body; that is not a
+/// stream error.
+fn record_idle_transport_timeout(ctx: &mut HttpFilterContext<'_>) {
+    let Some(cause) = ctx.stream_termination().map(praxis_filter::StreamTermination::cause) else {
+        return;
+    };
+    let timed_out = match cause {
+        StreamTerminationCause::IdleTimeout | StreamTerminationCause::DeadlineExceeded => true,
+        StreamTerminationCause::Io => ctx
+            .get_filter_state::<StreamEventsState>()
+            .is_some_and(|state| io_exceeded_stream_deadline(state, Instant::now())),
+        _ => false,
+    };
+    if !timed_out {
+        return;
+    }
+    publish_idle_timeout_if_incomplete(ctx);
+    ctx.mark_stream_termination_handled();
+}
+
+/// Set timeout error metadata only when the SSE parser never saw a terminal event.
+fn publish_idle_timeout_if_incomplete(ctx: &mut HttpFilterContext<'_>) {
+    let parser_complete = ctx
+        .get_filter_state::<StreamEventsState>()
+        .is_some_and(|state| state.completion_state != CompletionState::Open);
+    if !parser_complete && ctx.get_metadata("responses.stream_error_code").is_none() {
+        ctx.set_metadata("responses.stream_error_code", "server_error");
+        ctx.set_metadata(
+            "responses.stream_error_message",
+            "upstream Responses stream exceeded timeout",
+        );
+        ctx.set_metadata("responses.skip_persist", "true");
     }
 }
 
@@ -427,12 +567,19 @@ fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
         return;
     };
 
+    restore_selected_peer(ctx, &state);
+
     let now = Instant::now();
     state.started_at.get_or_insert(now);
+    let remaining = remaining_timeout(&state, now);
 
     let parsed = parse_and_accumulate(&mut state, ctx, bytes, now);
     handle_parse_result(ctx, body, &state, parsed);
 
+    if remaining > Duration::ZERO {
+        cap_upstream_read_timeout(ctx, remaining);
+    }
+    state.selected_peer.clone_from(&ctx.upstream);
     ctx.insert_filter_state(state);
 }
 
@@ -466,7 +613,11 @@ fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>,
     ctx.set_metadata("responses.stream_error_code", "server_error");
     ctx.set_metadata(
         "responses.stream_error_message",
-        "upstream Responses stream could not be parsed",
+        if matches!(error, SseParseError::Timeout { .. }) {
+            "upstream Responses stream exceeded timeout"
+        } else {
+            "upstream Responses stream could not be parsed"
+        },
     );
     ctx.set_metadata("responses.skip_persist", "true");
     *body = None;
@@ -1873,30 +2024,61 @@ fn mark_complete(state: &mut StreamEventsState, new_state: CompletionState, now:
 
 /// Check that the SSE stream terminated with a terminal event.
 fn validate_stream_end(ctx: &mut HttpFilterContext<'_>) {
-    let incomplete = ctx.get_filter_state::<StreamEventsState>().is_some_and(|state| {
-        let checked_at = state.completed_at.unwrap_or_else(Instant::now);
-        if let Err(e) = check_timeout(state, checked_at) {
-            warn!(error = %e, "stream did not terminate cleanly");
-            true
-        } else if state.completion_state == CompletionState::Open {
-            warn!("stream did not terminate cleanly: missing terminal event");
-            true
-        } else {
-            false
-        }
-    });
-    if incomplete {
-        ctx.set_metadata("responses.stream_incomplete", "true".to_owned());
-        if ctx.get_metadata("responses.stream_error_code").is_none() {
-            ctx.set_metadata("responses.stream_error_code", "server_error");
-            ctx.set_metadata(
-                "responses.stream_error_message",
-                "upstream Responses stream did not terminate cleanly",
-            );
-            ctx.set_metadata("responses.skip_persist", "true");
-        }
+    match stream_end_kind(ctx) {
+        StreamEndKind::Complete => {},
+        StreamEndKind::Incomplete { timed_out } => {
+            record_incomplete_stream(ctx, timed_out);
+        },
     }
     debug!("stream_events processing complete");
+}
+
+/// Classify how the current parser state ended.
+fn stream_end_kind(ctx: &HttpFilterContext<'_>) -> StreamEndKind {
+    let Some(state) = ctx.get_filter_state::<StreamEventsState>() else {
+        return StreamEndKind::Complete;
+    };
+    let checked_at = state.completed_at.unwrap_or_else(Instant::now);
+    match check_timeout(state, checked_at) {
+        Err(error) => {
+            warn!(%error, "stream did not terminate cleanly");
+            StreamEndKind::Incomplete { timed_out: true }
+        },
+        Ok(()) if state.completion_state == CompletionState::Open => {
+            warn!("stream did not terminate cleanly: missing terminal event");
+            StreamEndKind::Incomplete { timed_out: false }
+        },
+        Ok(()) => StreamEndKind::Complete,
+    }
+}
+
+/// Publish incomplete-stream metadata for persistence and logical-stream errors.
+fn record_incomplete_stream(ctx: &mut HttpFilterContext<'_>, timed_out: bool) {
+    ctx.set_metadata("responses.stream_incomplete", "true".to_owned());
+    if ctx.get_metadata("responses.stream_error_code").is_some() {
+        return;
+    }
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata(
+        "responses.stream_error_message",
+        if timed_out {
+            "upstream Responses stream exceeded timeout"
+        } else {
+            "upstream Responses stream did not terminate cleanly"
+        },
+    );
+    ctx.set_metadata("responses.skip_persist", "true");
+}
+
+/// How an SSE stream ended from the parser's point of view.
+enum StreamEndKind {
+    /// A terminal lifecycle or error event was observed in time.
+    Complete,
+    /// The stream ended without a clean terminal event.
+    Incomplete {
+        /// Whether the wall-clock budget was exceeded.
+        timed_out: bool,
+    },
 }
 
 /// Whether the response is a successful `text/event-stream` response.
@@ -1926,7 +2108,6 @@ fn response_is_encoded(ctx: &HttpFilterContext<'_>) -> bool {
         .as_ref()
         .is_some_and(|resp| resp.headers.contains_key(http::header::CONTENT_ENCODING))
 }
-
 
 #[cfg(test)]
 mod tests;

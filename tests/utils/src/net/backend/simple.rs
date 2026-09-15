@@ -57,6 +57,7 @@ impl Backend {
             status: 200,
             chunks,
             headers: Vec::new(),
+            stall_after_first_chunk: None,
         }
     }
 
@@ -147,6 +148,10 @@ pub struct ChunkedBackend {
 
     /// Extra response headers as `(name, value)` pairs.
     headers: Vec<(String, String)>,
+
+    /// Optional pause after the first body chunk, to simulate a stalled SSE
+    /// upstream that has already committed headers.
+    stall_after_first_chunk: Option<Duration>,
 }
 
 impl ChunkedBackend {
@@ -164,6 +169,16 @@ impl ChunkedBackend {
         self
     }
 
+    /// Sleep after writing the first chunk, without closing the connection.
+    ///
+    /// Use this to exercise idle-stream timeouts: the proxy has already
+    /// seen a valid SSE frame, then the backend goes silent.
+    #[must_use]
+    pub fn stall_after_first_chunk(mut self, stall: Duration) -> Self {
+        self.stall_after_first_chunk = Some(stall);
+        self
+    }
+
     /// Start the backend and return a [`BackendGuard`].
     ///
     /// # Panics
@@ -173,6 +188,7 @@ impl ChunkedBackend {
         let status = self.status;
         let chunks = self.chunks;
         let headers = self.headers;
+        let stall_after_first_chunk = self.stall_after_first_chunk;
 
         spawn_tcp_server_with_shutdown(move |mut stream| {
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -184,31 +200,49 @@ impl ChunkedBackend {
             // streamed body. A real upstream drains the request and sends a
             // graceful FIN, so mirror that here to keep streaming tests stable.
             let _request = read_full_request(&mut stream);
-
-            let reason = reason_phrase(status);
-            let mut resp = format!(
-                "HTTP/1.1 {status} {reason}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nServer: praxis-test-backend\r\n"
-            );
-            for (name, value) in &headers {
-                use std::fmt::Write as _;
-                let _written = write!(resp, "{name}: {value}\r\n");
-            }
-            resp.push_str("\r\n");
-            let _sent = stream.write_all(resp.as_bytes());
-            let _flushed = stream.flush();
-
-            for chunk in &chunks {
-                let hex_len = format!("{:x}\r\n", chunk.len());
-                let _sent = stream.write_all(hex_len.as_bytes());
-                let _sent = stream.write_all(chunk.as_bytes());
-                let _sent = stream.write_all(b"\r\n");
-                let _flushed = stream.flush();
-            }
-
-            let _sent = stream.write_all(b"0\r\n\r\n");
-            let _flushed = stream.flush();
+            write_chunked_http_body(&mut stream, status, &headers, &chunks, stall_after_first_chunk);
         })
     }
+}
+
+/// Write a chunked HTTP response, optionally stalling after the first body chunk.
+fn write_chunked_http_body(
+    stream: &mut TcpStream,
+    status: u16,
+    headers: &[(String, String)],
+    chunks: &[String],
+    stall_after_first_chunk: Option<Duration>,
+) {
+    let reason = reason_phrase(status);
+    let mut resp = format!(
+        "HTTP/1.1 {status} {reason}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nServer: praxis-test-backend\r\n"
+    );
+    for (name, value) in headers {
+        use std::fmt::Write as _;
+        let _written = write!(resp, "{name}: {value}\r\n");
+    }
+    resp.push_str("\r\n");
+    let _sent = stream.write_all(resp.as_bytes());
+    let _flushed = stream.flush();
+    write_chunked_payload(stream, chunks, stall_after_first_chunk);
+}
+
+/// Write chunked-body payload bytes, including the terminating zero chunk.
+fn write_chunked_payload(stream: &mut TcpStream, chunks: &[String], stall_after_first_chunk: Option<Duration>) {
+    for (index, chunk) in chunks.iter().enumerate() {
+        let hex_len = format!("{:x}\r\n", chunk.len());
+        let _sent = stream.write_all(hex_len.as_bytes());
+        let _sent = stream.write_all(chunk.as_bytes());
+        let _sent = stream.write_all(b"\r\n");
+        let _flushed = stream.flush();
+        if index == 0
+            && let Some(stall) = stall_after_first_chunk
+        {
+            std::thread::sleep(stall);
+        }
+    }
+    let _sent = stream.write_all(b"0\r\n\r\n");
+    let _flushed = stream.flush();
 }
 
 // -----------------------------------------------------------------------------

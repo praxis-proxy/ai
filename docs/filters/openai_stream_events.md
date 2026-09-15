@@ -7,7 +7,7 @@ Composes the current IRR execution into one logical Responses stream.
 
 ## Configuration Notes
 
-Must run inside an `iterative_request_router` step. Running it elsewhere is a misconfiguration and fails closed at request time.
+Must run inside an `iterative_request_router` step. Running it elsewhere is a misconfiguration and fails closed at request time. Place it after `load_balancer` so `timeout_secs` can cap the selected peer; `openai_responses_proxy` buffers the request body, so IRR runs that phase before load balancing. Each later chunk restores that peer onto IRR body contexts (which have `upstream: None`) and recaps leftover budget so the streaming executor can copy that cap onto the live body.
 
 All fields are optional; omitted values fall back to [`SseParserConfig`] defaults.
 
@@ -17,7 +17,7 @@ All fields are optional; omitted values fall back to [`SseParserConfig`] default
 |-------|------|---------|-------------|
 | `max_buffer_bytes` | integer | no | Maximum bytes buffered for incomplete SSE lines/data across chunk boundaries. Default: 10 MiB. |
 | `max_events` | integer | no | Maximum number of SSE events before the parser errors. Default: 100,000. |
-| `timeout_secs` | integer | no | Maximum seconds from first chunk to stream completion. Default: 300 (5 minutes). |
+| `timeout_secs` | integer | no | Maximum seconds from the first SSE chunk to stream completion. The parser enforces this absolute deadline when chunks or end-of-stream arrive. Place the filter after `load_balancer` so `on_request` can cap the selected peer's `read_timeout` at the remaining budget (the full timeout before the first chunk). IRR snapshots that timeout into the live body and reconstructs later contexts with `ctx.upstream: None`. Each chunk restores the selected peer and recaps leftover budget so the streaming executor can copy that cap onto the live body; mutating a detached peer alone would leave the original per-read timer running. A tighter cluster `read_timeout_ms` is left in place. Default: 300 (5 minutes). |
 | `max_tool_call_argument_bytes` | integer | no | Maximum bytes accepted per function-call argument string from `function_call_arguments.delta` or `function_call_arguments.done` events. Default: 1 MiB. |
 | `max_accumulated_bytes` | integer | no | Maximum aggregate bytes accumulated across streaming output items and function-call argument buffers before the stream fails closed. Bounds total process memory even when every individual event is within `max_buffer_bytes`. Default: 64 MiB. |
 | `max_output_items` | integer | no | Maximum number of streaming output items accumulated before the stream fails closed. Default: 100,000. |
