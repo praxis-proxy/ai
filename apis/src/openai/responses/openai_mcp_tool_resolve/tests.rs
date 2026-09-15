@@ -957,6 +957,16 @@ fn no_credentials_with_empty_headers() {
 }
 
 #[test]
+fn connector_cache_is_disabled_when_request_headers_are_forwarded() {
+    let connector = serde_json::json!({"connector_id": "trusted", "server_label": "tools"});
+    assert!(!can_reuse_cached_listing(&connector, true, true));
+    assert!(can_reuse_cached_listing(&connector, true, false));
+
+    let direct = serde_json::json!({"server_url": "https://mcp.example.test"});
+    assert!(can_reuse_cached_listing(&direct, false, true));
+}
+
+#[test]
 fn same_server_different_auth_both_detected() {
     let url = "http://10.0.0.1/mcp";
     let entry_a = serde_json::json!({"server_label": "s", "server_url": url, "authorization": "tok_a"});

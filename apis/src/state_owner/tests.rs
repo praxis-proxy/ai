@@ -448,6 +448,39 @@ async fn body_phase_owner_mutations_preserve_sibling_grouped_queues() {
 }
 
 #[tokio::test]
+async fn body_phase_owner_mutations_join_an_existing_ordered_pass() {
+    let request = mapped_request("tenant-a", "alice");
+    let mut ctx = make_filter_context(&request);
+    ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
+        "x-ext-proc".parse().unwrap(),
+        HeaderValue::from_static("applied"),
+    ));
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hi"}"#));
+
+    assert!(matches!(
+        mapped_filter()
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap(),
+        FilterAction::BodyDone
+    ));
+    assert!(matches!(
+        projection_filter()
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap(),
+        FilterAction::BodyDone
+    ));
+
+    let headers = effective_body_callout_headers(&ctx, Cow::Borrowed(&ctx.request.headers));
+    assert_eq!(headers.get("x-ext-proc").unwrap(), "applied");
+    assert_eq!(headers.get("x-tenant-id").unwrap(), "tenant-a");
+    assert_eq!(headers.get("x-user-id").unwrap(), "alice");
+    assert!(headers.get(TENANT_HEADER).is_none());
+    assert!(headers.get(SUBJECT_HEADER).is_none());
+}
+
+#[tokio::test]
 async fn trusted_headers_mode_fails_closed_on_missing_or_duplicate_components() {
     let mut missing = mapped_request("tenant-a", "alice");
     missing.headers.remove(SUBJECT_HEADER);

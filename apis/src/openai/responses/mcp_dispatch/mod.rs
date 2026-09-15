@@ -60,8 +60,9 @@ use tracing::{debug, warn};
 
 use self::{
     approval::{
-        ApprovalError, ResolvedApproval, build_approved_tool_call, build_denial_message, extract_approval_responses,
-        is_approval_response, parse_approval_response, resolve_approval, target_fingerprint,
+        ApprovalError, ResolvedApproval, bind_forwarded_header_context, build_approved_tool_call, build_denial_message,
+        extract_approval_responses, is_approval_response, parse_approval_response, resolve_approval,
+        target_fingerprint,
     },
     config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config},
 };
@@ -210,6 +211,16 @@ impl McpDispatchFilter {
             }
         }
         forwarded
+    }
+
+    /// Bind connector approvals to the ambient headers this request will send.
+    fn bind_request_forwarded_header_context(ctx: &mut HttpFilterContext<'_>, headers: &http::HeaderMap) {
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+            return;
+        };
+        for entry in state.mcp_tool_map.values_mut() {
+            bind_forwarded_header_context(entry, headers);
+        }
     }
 
     /// Append MCP execution results to private continuation and public output state.
@@ -658,6 +669,8 @@ impl HttpFilter for McpDispatchFilter {
             return Ok(FilterAction::Continue);
         }
         ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
+        let forwarded_headers = self.forwarded_headers(ctx);
+        Self::bind_request_forwarded_header_context(ctx, &forwarded_headers);
 
         // Resume approvals from the previous turn before executing any calls.
         // On approval this injects a function-call-shaped tool call that the
@@ -706,7 +719,6 @@ impl HttpFilter for McpDispatchFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let forwarded_headers = self.forwarded_headers(ctx);
         let results = match self
             .execute_pending_calls(state, &mcp_calls, &tool_index, &forwarded_headers)
             .await

@@ -324,7 +324,7 @@ impl StateOwnerFilter {
     /// Resolve and install the owner, rejecting invalid or absent assertions.
     fn resolve(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) -> FilterAction {
         if ctx.extensions.get::<StateOwner>().is_some() {
-            self.queue_header_removal(ctx);
+            self.queue_header_removal(ctx, body_phase);
             return FilterAction::Continue;
         }
 
@@ -346,14 +346,22 @@ impl StateOwnerFilter {
         ctx.extensions.insert(owner);
         ctx.extensions
             .insert(StateOwnerIngressHeaders(Arc::clone(&self.ingress_headers)));
-        self.queue_header_removal(ctx);
+        self.queue_header_removal(ctx, body_phase);
         FilterAction::Continue
     }
 
     /// Queue removal using the mutation channel appropriate for the lifecycle.
-    fn queue_header_removal(&self, ctx: &mut HttpFilterContext<'_>) {
+    fn queue_header_removal(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) {
         for header in self.ingress_headers.iter() {
             ctx.request_headers_to_remove.push(header.clone());
+            // Core requires one provenance mechanism per pre-read pass. Join an
+            // ordered pass established by an earlier filter (for example
+            // ext_proc), while retaining the grouped queue for compatibility
+            // with filters inspecting pending mutations in the same pass.
+            if body_phase && !ctx.pre_read_mutations.is_empty() {
+                ctx.pre_read_mutations
+                    .push(TrustedHeaderMutation::Remove(header.clone()));
+            }
         }
     }
 }

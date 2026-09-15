@@ -8,7 +8,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderName, HeaderValue};
-use praxis_filter::{BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
+use praxis_filter::{
+    BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext, TrustedHeaderMutation, parse_filter_config,
+};
 use serde::Deserialize;
 
 use crate::state_owner::{StateOwner, StateOwnerIngressHeaders, reject_owner};
@@ -87,7 +89,7 @@ impl StateOwnerHeadersFilter {
     }
 
     /// Queue destination-bound headers from the normalized owner context.
-    fn project(&self, ctx: &mut HttpFilterContext<'_>) -> FilterAction {
+    fn project(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) -> FilterAction {
         let Some(owner) = ctx.extensions.get::<StateOwner>() else {
             return reject_owner(
                 401,
@@ -116,24 +118,29 @@ impl StateOwnerHeadersFilter {
         // still contain the uncommitted ingress identity headers. Strip those
         // raw inputs in the destination chain before emitting only its
         // explicitly configured identity contract.
-        strip_ingress_headers(ctx);
-        queue_projection(ctx, &self.tenant_header, tenant);
-        queue_projection(ctx, &self.subject_header, subject);
+        let ordered = body_phase && !ctx.pre_read_mutations.is_empty();
+        strip_ingress_headers(ctx, ordered);
+        queue_projection(ctx, &self.tenant_header, tenant, ordered);
+        queue_projection(ctx, &self.subject_header, subject, ordered);
         if let (Some(header), Some(value)) = (&self.issuer_header, issuer) {
-            queue_projection(ctx, header, value);
+            queue_projection(ctx, header, value, ordered);
         }
         FilterAction::Continue
     }
 }
 
 /// Remove raw transport assertions before projecting destination identity.
-fn strip_ingress_headers(ctx: &mut HttpFilterContext<'_>) {
+fn strip_ingress_headers(ctx: &mut HttpFilterContext<'_>, ordered: bool) {
     let ingress_headers = ctx
         .extensions
         .get::<StateOwnerIngressHeaders>()
         .map(|headers| Arc::clone(&headers.0));
     if let Some(headers) = ingress_headers {
         ctx.request_headers_to_remove.extend(headers.iter().cloned());
+        if ordered {
+            ctx.pre_read_mutations
+                .extend(headers.iter().cloned().map(TrustedHeaderMutation::Remove));
+        }
     }
 }
 
@@ -182,8 +189,12 @@ fn projection_value(component: &str, value: &str) -> Result<HeaderValue, FilterA
 }
 
 /// Queue an overwrite in the mutation channel for the active lifecycle phase.
-fn queue_projection(ctx: &mut HttpFilterContext<'_>, header: &HeaderName, value: HeaderValue) {
-    ctx.request_headers_to_set.push((header.clone(), value));
+fn queue_projection(ctx: &mut HttpFilterContext<'_>, header: &HeaderName, value: HeaderValue, ordered: bool) {
+    ctx.request_headers_to_set.push((header.clone(), value.clone()));
+    if ordered {
+        ctx.pre_read_mutations
+            .push(TrustedHeaderMutation::Set(header.clone(), value));
+    }
 }
 
 #[async_trait]
@@ -199,7 +210,7 @@ impl HttpFilter for StateOwnerHeadersFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        Ok(self.project(ctx))
+        Ok(self.project(ctx, false))
     }
 
     async fn on_request_body(
@@ -208,7 +219,7 @@ impl HttpFilter for StateOwnerHeadersFilter {
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        Ok(match self.project(ctx) {
+        Ok(match self.project(ctx, true) {
             FilterAction::Continue => FilterAction::BodyDone,
             action => action,
         })

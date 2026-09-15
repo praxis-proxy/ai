@@ -359,7 +359,7 @@ impl McpToolResolveFilter {
                 server_label: label.to_owned(),
                 source,
             })?;
-        if !has_entry_credentials(entry)
+        if can_reuse_cached_listing(entry, is_connector, !self.forward_headers.is_empty())
             && let Some(cached) =
                 find_cached_listing(previous_tools, label, server_url, cache_allowed_names, is_connector)
         {
@@ -2431,6 +2431,11 @@ fn has_entry_credentials(entry: &serde_json::Value) -> bool {
             .get("headers")
             .and_then(serde_json::Value::as_object)
             .is_some_and(|h| !h.is_empty())
+}
+
+/// Whether a previous `tools/list` result is valid without current request context.
+fn can_reuse_cached_listing(entry: &serde_json::Value, is_connector: bool, forward_headers_configured: bool) -> bool {
+    !(has_entry_credentials(entry) || is_connector && forward_headers_configured)
 }
 
 /// Extract `server_label` from an MCP tool entry.
