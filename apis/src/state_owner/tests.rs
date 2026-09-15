@@ -348,7 +348,7 @@ async fn projection_runs_during_body_pre_read_after_owner_capture() {
                 .any(|(header, value)| { header == name && value == HeaderValue::from_static(expected) })
         );
     }
-    assert!(ctx.pre_read_mutations.is_empty());
+    assert_eq!(ctx.pre_read_mutations.len(), 7);
 }
 
 #[tokio::test]
@@ -411,7 +411,7 @@ async fn trusted_headers_mode_queues_all_header_removals_in_body_phase() {
     for expected in [TENANT_HEADER, SUBJECT_HEADER] {
         assert!(ctx.request_headers_to_remove.iter().any(|name| name == expected));
     }
-    assert!(ctx.pre_read_mutations.is_empty());
+    assert_eq!(ctx.pre_read_mutations.len(), 2);
 }
 
 #[tokio::test]
@@ -438,13 +438,46 @@ async fn body_phase_owner_mutations_preserve_sibling_grouped_queues() {
         FilterAction::BodyDone
     ));
 
-    assert!(ctx.pre_read_mutations.is_empty());
+    assert_eq!(ctx.pre_read_mutations.len(), 7);
     assert!(ctx.request_headers_to_remove.contains(&http::header::ACCEPT_ENCODING));
     assert!(
         ctx.extra_request_headers
             .iter()
             .any(|(name, value)| name == "x-classified" && value == "yes")
     );
+}
+
+#[tokio::test]
+async fn later_ordered_mutation_cannot_discard_owner_projection() {
+    let request = mapped_request("tenant-a", "alice");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hi"}"#));
+
+    assert!(matches!(
+        mapped_filter()
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap(),
+        FilterAction::BodyDone
+    ));
+    assert!(matches!(
+        projection_filter()
+            .on_request_body(&mut ctx, &mut body, true)
+            .await
+            .unwrap(),
+        FilterAction::BodyDone
+    ));
+    ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
+        "x-ext-proc".parse().unwrap(),
+        HeaderValue::from_static("applied-later"),
+    ));
+
+    let headers = effective_body_callout_headers(&ctx, Cow::Borrowed(&ctx.request.headers));
+    assert_eq!(headers.get("x-ext-proc").unwrap(), "applied-later");
+    assert_eq!(headers.get("x-tenant-id").unwrap(), "tenant-a");
+    assert_eq!(headers.get("x-user-id").unwrap(), "alice");
+    assert!(headers.get(TENANT_HEADER).is_none());
+    assert!(headers.get(SUBJECT_HEADER).is_none());
 }
 
 #[tokio::test]
@@ -528,7 +561,7 @@ async fn body_phase_installs_owner_before_downstream_body_consumers() {
     assert!(matches!(action, FilterAction::BodyDone));
     assert_eq!(ctx.extensions.get::<StateOwner>().unwrap().subject(), "alice");
     assert!(ctx.request_headers_to_remove.iter().any(|name| name == HEADER));
-    assert!(ctx.pre_read_mutations.is_empty());
+    assert_eq!(ctx.pre_read_mutations.len(), 1);
 }
 
 #[tokio::test]

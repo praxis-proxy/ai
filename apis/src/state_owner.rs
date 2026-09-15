@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Trusted ownership context for persisted private state.
+//! Trusted ownership context for owner-aware filters.
 //!
 //! The filter in this module normalizes identity supplied by a trusted upstream
 //! authentication boundary. Deployments must prevent untrusted clients from
@@ -39,10 +39,12 @@ const SINGLE_TENANT_ISSUER: &str = "urn:praxis:single-tenant";
 /// Stable subject used by the explicit shared-owner compatibility mode.
 const SINGLE_TENANT_SUBJECT: &str = "shared";
 
-/// Immutable owner of persisted private state.
+/// Immutable normalized owner identity.
 ///
 /// Tenant, issuer, and subject together form the ownership identity. A subject
-/// alone is not globally unique and must never be used as the storage scope.
+/// alone is not globally unique and must never be used as an owner scope.
+/// Installing this context does not by itself authorize access or change store
+/// predicates; persistence filters must explicitly consume it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct StateOwner {
     /// Stable tenant namespace.
@@ -354,11 +356,10 @@ impl StateOwnerFilter {
     fn queue_header_removal(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) {
         for header in self.ingress_headers.iter() {
             ctx.request_headers_to_remove.push(header.clone());
-            // Core requires one provenance mechanism per pre-read pass. Join an
-            // ordered pass established by an earlier filter (for example
-            // ext_proc), while retaining the grouped queue for compatibility
-            // with filters inspecting pending mutations in the same pass.
-            if body_phase && !ctx.pre_read_mutations.is_empty() {
+            // A later ordered producer (for example ext_proc) makes Core ignore
+            // every grouped queue for this pre-read pass. Always retain this
+            // security mutation in the ordered log during the body phase.
+            if body_phase {
                 ctx.pre_read_mutations
                     .push(TrustedHeaderMutation::Remove(header.clone()));
             }
