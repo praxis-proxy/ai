@@ -346,14 +346,21 @@ fn validate_credential(index: usize, credential: Option<&CandidateCredential>) -
 ///
 /// Rejects blank, unparseable, or reserved-prefix header names.
 pub(crate) fn validate_model_header(raw: &str) -> Result<http::header::HeaderName, FilterError> {
+    validate_header_name(raw, "model_header")
+}
+
+/// Validate a configured header name, naming `field` in any error.
+///
+/// Rejects blank, unparseable, or reserved-prefix header names.
+pub(crate) fn validate_header_name(raw: &str, field: &str) -> Result<http::header::HeaderName, FilterError> {
     if raw.trim().is_empty() {
-        return Err("routing: model_header must not be empty".into());
+        return Err(format!("routing: {field} must not be empty").into());
     }
     let header: http::header::HeaderName = raw
         .parse()
-        .map_err(|e| -> FilterError { format!("routing: invalid model_header: {e}").into() })?;
+        .map_err(|e| -> FilterError { format!("routing: invalid {field}: {e}").into() })?;
     if RESERVED_HEADER_PREFIXES.iter().any(|p| header.as_str().starts_with(p)) {
-        return Err("routing: model_header must not use a reserved internal header prefix".into());
+        return Err(format!("routing: {field} must not use a reserved internal header prefix").into());
     }
     Ok(header)
 }

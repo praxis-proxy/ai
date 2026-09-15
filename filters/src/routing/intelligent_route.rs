@@ -108,6 +108,12 @@ struct IntelligentRouteConfig {
     #[serde(default = "default_model_header")]
     model_header: String,
 
+    /// Request header set to the chosen cluster's name, for a gateway that
+    /// routes by header (`ext_proc` + Envoy) rather than reading `ctx.cluster`
+    /// through a downstream `load_balancer` filter. Unset, none is emitted.
+    #[serde(default)]
+    route_header: Option<String>,
+
     /// Clusters that terminate the authenticated provider-hop protocol.
     ///
     /// A selected candidate emits the fixed routing context only when
@@ -288,7 +294,8 @@ enum AffinityOutcome<'a> {
 ///   `routing-config.json`) and hot-reloaded via [`ArcSwap`] when the file changes.
 ///
 /// **Behavior:**
-/// - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no metadata is written.
+/// - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no route-decision metadata is
+///   written, though the configured route header still mirrors the preserved cluster.
 /// - If no routing source is present, the filter returns `Continue` without routing.
 /// - If the model header or MCP tool name is blank, oversized, or invalid, the filter rejects with 400.
 /// - If a matching candidate is found, `ctx.cluster` is set and bounded route-decision metadata is written.
@@ -410,6 +417,8 @@ pub struct IntelligentRouteFilter {
     provider_hop_clusters: BTreeSet<String>,
     /// Header that carries the model name.
     model_header: HeaderName,
+    /// Request header set to the chosen cluster, for header-routing gateways.
+    route_header: Option<HeaderName>,
     /// Watcher handle for overlay hot reload (None in static mode).
     _reload_handle: Option<OverlayReloadHandle>,
     /// In-memory session affinity (None when disabled).
@@ -435,10 +444,19 @@ impl IntelligentRouteFilter {
     /// - neither `overlay_file` nor `candidates` is set
     /// - the overlay file cannot be read or parsed
     /// - the candidate list is empty or invalid
-    /// - the model header is invalid
+    /// - the model header or route header is invalid
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sequential config validation and snapshot construction"
+    )]
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: IntelligentRouteConfig = parse_filter_config("intelligent_route", config)?;
         let model_header = descriptor::validate_model_header(&cfg.model_header)?;
+        let route_header = cfg
+            .route_header
+            .as_deref()
+            .map(|h| descriptor::validate_header_name(h, "route_header"))
+            .transpose()?;
 
         if cfg.overlay_file.is_some() && cfg.candidates.is_some() {
             return Err("intelligent_route: cannot set both overlay_file and candidates".into());
@@ -464,6 +482,7 @@ impl IntelligentRouteFilter {
 
         Ok(Box::new(Self {
             model_header,
+            route_header,
             _reload_handle: reload_handle,
             provider_hop_clusters,
             session_affinity,
@@ -490,14 +509,16 @@ impl IntelligentRouteFilter {
             name,
         );
         if let AffinityOutcome::Reused(c) = outcome {
-            return apply_reused(
+            let action = apply_reused(
                 ctx,
                 &snap.local_site,
                 c,
                 &self.provider_hop_clusters,
                 snap.semantic_revision.as_ref(),
                 snap.selection_mode,
-            );
+            )?;
+            self.emit_route_header(ctx, &c.cluster);
+            return Ok(action);
         }
         let failover = matches!(outcome, AffinityOutcome::Failover);
         let Some((c, selection_group)) =
@@ -515,10 +536,37 @@ impl IntelligentRouteFilter {
             selection_group,
             snap.selection_mode,
         )?;
+        self.emit_route_header(ctx, &c.cluster);
         if let Some(aff) = &self.session_affinity {
             record_session(aff, ctx, &c.stable_id, session_key.as_deref(), failover);
         }
         Ok(FilterAction::Continue)
+    }
+
+    /// Set the configured route header to the effective cluster.
+    ///
+    /// Header-routing gateways forward on this header rather than reading
+    /// `ctx.cluster`. An unencodable cluster name is logged at warn and skipped.
+    fn emit_route_header(&self, ctx: &mut HttpFilterContext<'_>, cluster: &str) {
+        let Some(header) = &self.route_header else {
+            return;
+        };
+        match HeaderValue::from_str(cluster) {
+            Ok(value) => {
+                tracing::debug!(
+                    header = %header,
+                    value = %cluster,
+                    "intelligent_route: emitting route header"
+                );
+                ctx.request_headers_to_set.push((header.clone(), value));
+            },
+            Err(e) => tracing::warn!(
+                header = %header,
+                cluster = %cluster,
+                error = %e,
+                "intelligent_route: route header value not a valid header; not emitting"
+            ),
+        }
     }
 }
 
@@ -646,9 +694,18 @@ impl HttpFilter for IntelligentRouteFilter {
             .push(HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER));
         ctx.request_headers_to_remove
             .push(HeaderName::from_static(OVERLAY_REVISION_HEADER));
+        // The route header is not in the reserved namespace, so the protocol
+        // guard does not reject a client that forges it. Strip it here so only a
+        // pick emits it; non-pick paths then fail closed rather than trusting the
+        // client value. On a pick the later set wins over this remove.
+        if let Some(header) = &self.route_header {
+            ctx.request_headers_to_remove.push(header.clone());
+        }
 
-        if ctx.cluster.is_some() {
+        if let Some(cluster) = ctx.cluster.clone() {
             tracing::debug!("intelligent_route: cluster already set; preserving");
+            // Mirror the preserved cluster onto the route header for a header-routing gateway.
+            self.emit_route_header(ctx, &cluster);
             return Ok(FilterAction::Continue);
         }
 
@@ -1624,11 +1681,209 @@ mod tests {
         assert!(parse(yaml).is_ok(), "existing static config should still work");
     }
 
+    const DEST_HEADER: &str = "x-gateway-destination-endpoint";
+
+    fn route_header_filter(
+        snapshot: Arc<ArcSwap<RouteSnapshot>>,
+        route_header: Option<&'static str>,
+        session_affinity: Option<SessionAffinity>,
+    ) -> IntelligentRouteFilter {
+        IntelligentRouteFilter {
+            model_header: HeaderName::from_static("x-model"),
+            route_header: route_header.map(HeaderName::from_static),
+            _reload_handle: None,
+            provider_hop_clusters: BTreeSet::new(),
+            session_affinity,
+            snapshot,
+        }
+    }
+
+    fn emitted_dest_header(ctx: &HttpFilterContext<'_>) -> Option<String> {
+        ctx.request_headers_to_set
+            .iter()
+            .find(|(h, _)| h.as_str() == DEST_HEADER)
+            .and_then(|(_, v)| v.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    fn dest_header_stripped(ctx: &HttpFilterContext<'_>) -> bool {
+        ctx.request_headers_to_remove.iter().any(|h| h.as_str() == DEST_HEADER)
+    }
+
+    #[tokio::test]
+    async fn route_header_carries_the_chosen_cluster() {
+        let filter = route_header_filter(
+            Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-v1"))),
+            Some(DEST_HEADER),
+            None,
+        );
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(
+            emitted_dest_header(&ctx).as_deref(),
+            Some("cluster-v1"),
+            "the route header carries the picked cluster for header-routing gateways"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_header_absent_emits_no_destination_header() {
+        let filter = route_header_filter(Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-v1"))), None, None);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert!(ctx.cluster.is_some(), "a pick actually happened");
+        assert_eq!(
+            emitted_dest_header(&ctx),
+            None,
+            "no route header is emitted when unconfigured"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_route_header_is_overwritten_on_a_pick() {
+        let filter = route_header_filter(
+            Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-v1"))),
+            Some(DEST_HEADER),
+            None,
+        );
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers
+            .insert(DEST_HEADER, HeaderValue::from_static("attacker-cluster"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert!(dest_header_stripped(&ctx), "the client value is stripped");
+        assert_eq!(
+            emitted_dest_header(&ctx).as_deref(),
+            Some("cluster-v1"),
+            "the pick overwrites a forged route header"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_header_mirrors_a_pre_set_cluster() {
+        // A preserved pre-set cluster still emits the route header; a forged client value is stripped.
+        let filter = route_header_filter(
+            Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-v1"))),
+            Some(DEST_HEADER),
+            None,
+        );
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert(DEST_HEADER, HeaderValue::from_static("attacker-cluster"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("pre-set-cluster"));
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("pre-set-cluster"),
+            "the pre-set cluster is preserved"
+        );
+        assert!(dest_header_stripped(&ctx), "the forged client value is stripped");
+        assert_eq!(
+            emitted_dest_header(&ctx).as_deref(),
+            Some("pre-set-cluster"),
+            "the route header mirrors the preserved cluster for a header-routing gateway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_route_header_is_stripped_when_no_pick() {
+        // No model header takes the Skip path. A forged route header must not
+        // survive to the gateway, or it would route on client input.
+        let filter = route_header_filter(
+            Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-v1"))),
+            Some(DEST_HEADER),
+            None,
+        );
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert(DEST_HEADER, HeaderValue::from_static("attacker-cluster"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert!(ctx.cluster.is_none(), "no pick happened on the skip path");
+        assert!(dest_header_stripped(&ctx), "the forged route header is stripped");
+        assert_eq!(emitted_dest_header(&ctx), None, "nothing is emitted without a pick");
+    }
+
+    #[tokio::test]
+    async fn an_unencodable_cluster_emits_no_route_header() {
+        // A cluster name that is not a valid header value is logged and skipped;
+        // the strip still runs, so a forged value cannot survive instead.
+        let snap = make_overlay_snapshot(&[("new_and_existing", "bad\u{0001}cluster")]);
+        let filter = route_header_filter(Arc::new(ArcSwap::from_pointee(snap)), Some(DEST_HEADER), None);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers
+            .insert(DEST_HEADER, HeaderValue::from_static("attacker-cluster"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert!(ctx.cluster.is_some(), "the candidate was still picked");
+        assert_eq!(
+            emitted_dest_header(&ctx),
+            None,
+            "an unencodable cluster emits no header"
+        );
+        assert!(
+            dest_header_stripped(&ctx),
+            "and the forged value is stripped, so nothing survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn reused_session_also_emits_the_route_header() {
+        // A session-affinity-reused pick still needs its destination header, or a
+        // header-routing gateway would not honour the bound cluster.
+        let snap = make_overlay_snapshot(&[("new_and_existing", "c-a"), ("new_and_existing", "c-b")]);
+        let affinity = make_test_affinity();
+        affinity.bindings.insert(
+            "sess-1".to_owned(),
+            Binding {
+                expires: Instant::now() + Duration::from_secs(300),
+                stable_id: Arc::from("inference_model/llama/s/c-a"),
+            },
+        );
+        let filter = route_header_filter(Arc::new(ArcSwap::from_pointee(snap)), Some(DEST_HEADER), Some(affinity));
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        req.headers.insert("x-session-id", HeaderValue::from_static("sess-1"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let _unused = filter.on_request(&mut ctx).await.unwrap();
+        assert_eq!(
+            ctx.get_metadata("intelligent_route.session.reused"),
+            Some("true"),
+            "the pick was reused"
+        );
+        assert_eq!(
+            emitted_dest_header(&ctx).as_deref(),
+            Some("c-a"),
+            "the reused cluster is emitted too"
+        );
+    }
+
+    #[test]
+    fn blank_route_header_rejected() {
+        let err = parse_err(
+            "local_site: site-a\nroute_header: \"\"\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\n",
+        );
+        assert!(
+            err.to_string().contains("route_header") && err.to_string().contains("empty"),
+            "a blank route_header should be rejected and the error should name the field: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn on_request_after_snapshot_swap() {
         let shared = Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-v1")));
         let filter = IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
+            route_header: None,
             _reload_handle: None,
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
@@ -1781,6 +2036,7 @@ mod tests {
         )));
         let filter = IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
+            route_header: None,
             _reload_handle: None,
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
@@ -2485,6 +2741,7 @@ mod tests {
         )])));
         let filter = IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
+            route_header: None,
             _reload_handle: None,
             provider_hop_clusters: BTreeSet::from(["provider-gateway".to_owned()]),
             session_affinity: Some(make_test_affinity()),
@@ -2531,6 +2788,7 @@ mod tests {
         let shared = Arc::new(ArcSwap::from_pointee(snap));
         let filter = IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
+            route_header: None,
             _reload_handle: None,
             provider_hop_clusters: BTreeSet::from(["cluster-a".to_owned()]),
             session_affinity: None,
@@ -2785,6 +3043,7 @@ mod tests {
     ) -> IntelligentRouteFilter {
         IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
+            route_header: None,
             _reload_handle: None,
             provider_hop_clusters: BTreeSet::new(),
             session_affinity,

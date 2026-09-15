@@ -11,7 +11,7 @@ This filter is registered by the AI proxy (not Praxis core) because it encodes A
 
 **Modes:** - **Static:** candidates are declared inline in the YAML config. - **Overlay:** candidates are loaded from an overlay file (`routing-overlay.json` envelope or legacy `routing-config.json`) and hot-reloaded via [`ArcSwap`] when the file changes.
 
-**Behavior:** - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no metadata is written. - If no routing source is present, the filter returns `Continue` without routing. - If the model header or MCP tool name is blank, oversized, or invalid, the filter rejects with 400. - If a matching candidate is found, `ctx.cluster` is set and bounded route-decision metadata is written. - If no matching candidate is found, the filter rejects with 404.
+**Behavior:** - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no route-decision metadata is written, though the configured route header still mirrors the preserved cluster. - If no routing source is present, the filter returns `Continue` without routing. - If the model header or MCP tool name is blank, oversized, or invalid, the filter rejects with 400. - If a matching candidate is found, `ctx.cluster` is set and bounded route-decision metadata is written. - If no matching candidate is found, the filter rejects with 404.
 
 **Selection:** session affinity is resolved first. New requests use the overlay's selection mode within the first viable producer-defined group. Missing group or policy metadata uses deterministic first-admitted ordering. Praxis AI does not recompute source geography, load, or score. `admission_state=none` is never eligible. `existing_only` is eligible only through an already-bound session affinity entry.
 
@@ -58,6 +58,7 @@ Supports two modes:
 | `candidates[].traffic_weight` | integer | no | Optional bounded weight used only by weighted selection. |
 | `local_site` | string | no | Name of the local site (required in static mode, provided by overlay in overlay mode). |
 | `model_header` | string | no | Header name that carries the model name (default: `X-Model`). |
+| `route_header` | string | no | Request header set to the chosen cluster's name, for a gateway that routes by header (`ext_proc` + Envoy) rather than reading `ctx.cluster` through a downstream `load_balancer` filter. Unset, none is emitted. |
 | `provider_hop_clusters` | string[] | no | Clusters that terminate the authenticated provider-hop protocol. A selected candidate emits the fixed routing context only when its cluster is present in this allowlist. Each named cluster must use an mTLS-authenticated Praxis provider gateway. Direct API/backend clusters remain absent. |
 | `expected_overlay_scope` | ExpectedOverlayScope | no | Expected scope of the overlay envelope. When set, each specified field is validated against the envelope scope on load and every reload. Rejected on mismatch. Only relevant in overlay mode with envelope-format files. |
 | `expected_overlay_scope.network` | string | no | Expected network name. |
