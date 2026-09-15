@@ -698,10 +698,9 @@ impl ResponseStore for PostgresResponseStore {
             return self.upsert_response(record).await;
         }
 
-        let response_object =
-            serde_json::to_string(&record.response_object).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let input = serde_json::to_string(&record.input).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let messages = serde_json::to_string(&record.messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let response_object = self.compression.encode(&record.response_object)?;
+        let input = self.compression.encode(&record.input)?;
+        let messages = self.compression.encode(&record.messages)?;
 
         let upsert_sql = format!(
             "INSERT INTO {} \
