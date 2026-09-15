@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use praxis_filter::{BodyMode, FilterAction, HttpFilter};
+use praxis_filter::{BodyMode, FilterAction, HttpFilter, TrustedHeaderMutation};
 use serde_json::{Value, json};
 
 use super::{
@@ -439,6 +439,32 @@ fn continuation_header_replay_excludes_connection_nominated_headers() {
 
     assert!(connection_nominates_header(&headers, &nominated));
     assert!(!connection_nominates_header(&headers, &http::header::AUTHORIZATION));
+}
+
+#[test]
+fn callout_headers_apply_trusted_body_phase_overlay() {
+    let mut request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    request
+        .headers
+        .insert("x-auth-user", http::HeaderValue::from_static("raw-assertion"));
+    request
+        .headers
+        .insert("x-user-id", http::HeaderValue::from_static("spoofed-user"));
+    let request = Box::leak(Box::new(request));
+    let mut ctx = crate::test_utils::make_filter_context(request);
+    ctx.pre_read_mutations
+        .push(TrustedHeaderMutation::Remove(http::HeaderName::from_static(
+            "x-auth-user",
+        )));
+    ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
+        http::HeaderName::from_static("x-user-id"),
+        http::HeaderValue::from_static("alice"),
+    ));
+
+    let headers = callout_request_headers(&ctx);
+
+    assert!(headers.get("x-auth-user").is_none());
+    assert_eq!(headers.get("x-user-id").unwrap(), "alice");
 }
 
 #[tokio::test]

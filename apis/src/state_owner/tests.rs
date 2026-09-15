@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
+use std::borrow::Cow;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::{HeaderValue, Method};
@@ -8,7 +10,9 @@ use praxis_filter::{FilterAction, RequestExtensions, TrustedHeaderMutation};
 
 use super::{StateOwner, StateOwnerFilter};
 use crate::{
-    StateOwnerHeadersFilter, project_state_owner,
+    StateOwnerHeadersFilter,
+    callout_headers::effective_callout_headers,
+    project_state_owner,
     test_utils::{make_filter_context, make_request},
 };
 
@@ -285,6 +289,40 @@ async fn projection_runs_during_body_pre_read_after_owner_capture() {
                 if header == name && value == HeaderValue::from_static(expected))
         }));
     }
+}
+
+#[tokio::test]
+async fn body_phase_callout_observes_owner_removals_and_projection() {
+    let mut request = mapped_request("tenant-a", "alice");
+    request
+        .headers
+        .insert("x-tenant-id", HeaderValue::from_static("spoofed-tenant"));
+    request
+        .headers
+        .insert("x-user-id", HeaderValue::from_static("spoofed-user"));
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"hi"}"#));
+
+    assert!(matches!(
+        mapped_filter()
+            .on_request_body(&mut ctx, &mut body, false)
+            .await
+            .unwrap(),
+        FilterAction::BodyDone
+    ));
+    assert!(matches!(
+        projection_filter()
+            .on_request_body(&mut ctx, &mut body, false)
+            .await
+            .unwrap(),
+        FilterAction::BodyDone
+    ));
+
+    let headers = effective_callout_headers(&ctx, Cow::Borrowed(&ctx.request.headers));
+    assert_eq!(headers.get("x-tenant-id").unwrap(), "tenant-a");
+    assert_eq!(headers.get("x-user-id").unwrap(), "alice");
+    assert!(headers.get(TENANT_HEADER).is_none());
+    assert!(headers.get(SUBJECT_HEADER).is_none());
 }
 
 #[tokio::test]

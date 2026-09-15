@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod azure;
+pub mod callout_headers;
 pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
