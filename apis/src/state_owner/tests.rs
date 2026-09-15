@@ -11,7 +11,7 @@ use praxis_filter::{FilterAction, RequestExtensions, TrustedHeaderMutation};
 use super::{StateOwner, StateOwnerFilter};
 use crate::{
     StateOwnerHeadersFilter,
-    callout_headers::effective_callout_headers,
+    callout_headers::effective_body_callout_headers,
     project_state_owner,
     test_utils::{make_filter_context, make_request},
 };
@@ -318,7 +318,7 @@ async fn body_phase_callout_observes_owner_removals_and_projection() {
         FilterAction::BodyDone
     ));
 
-    let headers = effective_callout_headers(&ctx, Cow::Borrowed(&ctx.request.headers));
+    let headers = effective_body_callout_headers(&ctx, Cow::Borrowed(&ctx.request.headers));
     assert_eq!(headers.get("x-tenant-id").unwrap(), "tenant-a");
     assert_eq!(headers.get("x-user-id").unwrap(), "alice");
     assert!(headers.get(TENANT_HEADER).is_none());

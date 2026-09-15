@@ -16,7 +16,7 @@
     reason = "tests"
 )]
 mod filter_tests {
-    use std::time::Duration;
+    use std::{borrow::Cow, time::Duration};
 
     use praxis_filter::{BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, TrustedHeaderMutation};
     use wiremock::{
@@ -923,6 +923,60 @@ mod filter_tests {
 
         let action = filter.on_request(&mut ctx).await.unwrap();
         assert!(matches!(action, FilterAction::Continue), "forward_headers should work");
+    }
+
+    #[tokio::test]
+    async fn header_phase_forward_headers_use_pending_overlay() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/guard"))
+            .and(wiremock::matchers::header("x-user-id", "alice"))
+            .and(wiremock::matchers::header("x-auth-scope", "read"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let yaml = serde_yaml::from_str::<serde_yaml::Value>(&format!(
+            r#"
+            target:
+              url: "{}/guard"
+              forward_headers:
+                - "x-auth-user"
+                - "x-user-id"
+                - "x-auth-scope"
+            request:
+              phase: request_headers
+            "#,
+            mock_server.uri()
+        ))
+        .unwrap();
+        let filter = test_filter(&yaml).unwrap();
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-auth-user", "raw-assertion".parse().unwrap());
+        headers.insert("x-user-id", "spoofed-user".parse().unwrap());
+        let req = praxis_filter::Request {
+            method: http::Method::POST,
+            uri: "/test".parse().unwrap(),
+            headers,
+        };
+        let mut ctx = make_filter_context(&req);
+        ctx.request_headers_to_remove
+            .push(http::HeaderName::from_static("x-auth-user"));
+        ctx.request_headers_to_set.push((
+            http::HeaderName::from_static("x-user-id"),
+            http::HeaderValue::from_static("alice"),
+        ));
+        ctx.extra_request_headers
+            .push((Cow::Borrowed("x-auth-scope"), "read".to_owned()));
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        let requests = mock_server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].headers.get("x-auth-user").is_none());
     }
 
     #[tokio::test]

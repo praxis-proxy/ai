@@ -29,7 +29,7 @@ use config::{HttpCalloutConfig, Phase, expand_env_vars, validate_callout_url};
 use extract::{BodyShaper, CompiledExtraction};
 use http::HeaderMap;
 use praxis_ai_apis::{
-    callout_headers::effective_callout_headers,
+    callout_headers::{effective_body_callout_headers, effective_request_callout_headers},
     callout_policy::{OnFailure, validate_status_on_error},
     callout_target::{AddressPolicy, validate_configured_http_target},
     http_hop::{connection_nominates_header, is_hop_by_hop},
@@ -208,7 +208,10 @@ impl HttpCalloutFilter {
     /// safely-forwarded client headers, and the target-bound `Host`.
     fn build_callout_headers(&self, ctx: &HttpFilterContext<'_>) -> HeaderMap {
         let mut headers = HeaderMap::new();
-        let request_headers = effective_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers));
+        let request_headers = match self.phase {
+            Phase::RequestHeaders => effective_request_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers)),
+            Phase::RequestBody => effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers)),
+        };
 
         // Static configured headers.
         for (name, value) in &self.headers {

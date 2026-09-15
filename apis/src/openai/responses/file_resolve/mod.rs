@@ -89,7 +89,7 @@ use super::{
     state::ResponsesState,
 };
 use crate::{
-    callout_headers::effective_callout_headers,
+    callout_headers::effective_body_callout_headers,
     callout_policy::OnMissing,
     classifier::is_responses_create,
     json_body::serialize_json_body,
@@ -332,7 +332,7 @@ async fn resolve_and_rewrite(
     // Body pre-read mutations have not reached `ctx.request` yet. Materialize
     // their effective view once so every Files API call observes trusted
     // removals and projections while `ctx` is subsequently mutated.
-    let request_headers = effective_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers)).into_owned();
+    let request_headers = effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers)).into_owned();
     let count = match resolve_current_input(filter, &request_headers, &mut parsed, &mut budget).await {
         Ok(count) => count,
         Err(e) => return Ok(reject_resolve_error(&e)),

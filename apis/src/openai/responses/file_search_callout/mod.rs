@@ -46,7 +46,7 @@ use self::{
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
 use crate::{
-    callout_headers::effective_callout_headers,
+    callout_headers::effective_body_callout_headers,
     callout_policy::OnFailure,
     http_hop::connection_nominates_header,
     openai::responses::{
@@ -422,7 +422,7 @@ fn callout_request_headers<'a>(ctx: &'a HttpFilterContext<'_>) -> Cow<'a, Header
     } else {
         Cow::Borrowed(&ctx.request.headers)
     };
-    effective_callout_headers(ctx, headers)
+    effective_body_callout_headers(ctx, headers)
 }
 
 /// Framework-owned bytes already charged by the iterative router.
