@@ -13,8 +13,9 @@
 # request path preserves that order rather than recomputing those scores.
 #
 # The mcp filter classifies MCP tools/call requests and continues past non-MCP
-# bodies. json_body_field promotes the model from inference requests.
-# intelligent_route gives MCP metadata precedence when both inputs are present.
+# bodies. model_to_header promotes the model from inference requests and strips
+# any spoofed client copy. intelligent_route gives MCP metadata precedence when
+# both inputs are present.
 #
 # Usage:
 #   cargo run -p praxis-ai-proxy -- \
@@ -32,8 +33,9 @@ filter_chains:
       - filter: mcp
         on_invalid: continue
 
-      - filter: json_body_field
-        field: model
+      # Promote the JSON body's `model` field into X-Model and strip any
+      # client-supplied X-Model so the routed model cannot be spoofed.
+      - filter: model_to_header
         header: X-Model
 
       - filter: intelligent_route

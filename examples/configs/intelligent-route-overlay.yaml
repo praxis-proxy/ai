@@ -25,9 +25,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      # Extract model name from the JSON body into a request header.
-      - filter: json_body_field
-        field: model
+      # Promote the JSON body's `model` field into X-Model and strip any
+      # client-supplied X-Model so the routed model cannot be spoofed.
+      - filter: model_to_header
         header: X-Model
 
       # Route from the routing overlay file.

@@ -298,8 +298,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: json_body_field
-        field: model
+      - filter: model_to_header
         header: X-Model
       - filter: intelligent_route
         overlay_file: "{overlay}"
@@ -430,8 +429,7 @@ filter_chains:
     filters:
       - filter: mcp
         on_invalid: continue
-      - filter: json_body_field
-        field: model
+      - filter: model_to_header
         header: X-Model
       - filter: intelligent_route
         local_site: site-a

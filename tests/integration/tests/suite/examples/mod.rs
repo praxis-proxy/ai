@@ -28,6 +28,8 @@ mod guardrails;
 mod guardrails_response;
 mod identity_header_guard;
 mod inference_fallback;
+mod intelligent_route_hardening;
+mod intelligent_route_management_skip;
 mod irr_terminal_streaming;
 #[cfg(feature = "http-callout-filter")]
 mod lakera_guard;

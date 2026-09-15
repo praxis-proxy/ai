@@ -3,6 +3,7 @@
 
 //! A shared helper for body-derived data promotion.
 
+use http::HeaderName;
 use praxis_filter::{
     FilterError,
     builtins::http::{
@@ -139,6 +140,35 @@ pub fn validate_dedicated_promotion_header(
 ) -> Result<(), FilterError> {
     validate_header_name(filter, field, name)?;
     reject_unsafe_promotion_target(filter, field, name, dedicated, &[])
+}
+
+/// Validate and parse a dedicated promotion-header target in one step.
+///
+/// Like [`validate_dedicated_promotion_header`], but for callers that must
+/// retain the header at runtime: it parses the name into a [`HeaderName`]
+/// once and applies the safety policy to that parsed value, so the syntax
+/// is not validated twice. Unlike the `Option`-based validators, `name` is
+/// required because the caller wants the resulting header.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when the name is empty, not a valid HTTP header
+/// name, or an unsafe promotion target (transport, credential, or internal
+/// `x-praxis-*` header outside `dedicated`).
+pub fn parse_dedicated_promotion_header(
+    filter: &str,
+    field: &str,
+    name: &str,
+    dedicated: &[&str],
+) -> Result<HeaderName, FilterError> {
+    if name.is_empty() {
+        return Err(format!("{filter}: {field} header name must not be empty").into());
+    }
+    let header = name.parse::<HeaderName>().map_err(|e| -> FilterError {
+        format!("{filter}: {field} header name is not a valid HTTP header name: {e}").into()
+    })?;
+    reject_unsafe_promotion_target(filter, field, Some(header.as_str()), dedicated, &[])?;
+    Ok(header)
 }
 
 /// Reject two configured promotion fields that resolve to the same header.
@@ -438,6 +468,54 @@ mod tests {
         assert!(
             is_transport_controlled_header("Content-Length"),
             "the allocating wrapper must still accept mixed case"
+        );
+    }
+
+    #[test]
+    fn parse_dedicated_header_returns_normalized_header() {
+        let header = parse_dedicated_promotion_header("test", "header", "X-Model", &[]).unwrap();
+        assert_eq!(
+            header.as_str(),
+            "x-model",
+            "parsed header should be returned in normalized form"
+        );
+    }
+
+    #[test]
+    fn parse_dedicated_header_rejects_empty() {
+        let err = parse_dedicated_promotion_header("test", "header", "", &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "empty header name should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_dedicated_header_rejects_invalid_syntax() {
+        let err = parse_dedicated_promotion_header("test", "header", "bad header", &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("not a valid HTTP header name"),
+            "syntactically invalid header name should be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_dedicated_header_rejects_unsafe_target() {
+        let err = parse_dedicated_promotion_header("test", "header", "authorization", &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("transport, credential, or internal header"),
+            "credential header must be rejected as a promotion target: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_dedicated_header_accepts_its_own_dedicated_name() {
+        let header =
+            parse_dedicated_promotion_header("test", "model", "X-Praxis-Ai-Model", &["x-praxis-ai-model"]).unwrap();
+        assert_eq!(
+            header.as_str(),
+            "x-praxis-ai-model",
+            "dedicated internal header should be allowed and normalized"
         );
     }
 
