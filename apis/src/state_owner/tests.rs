@@ -210,6 +210,64 @@ async fn trusted_headers_mode_maps_static_and_header_components() {
     assert!(ctx.request_headers_to_remove.iter().any(|name| name == SUBJECT_HEADER));
 }
 
+#[tokio::test]
+async fn body_phase_uses_earlier_trusted_component_replacement() {
+    let request = mapped_request("spoofed-tenant", "alice");
+    let mut ctx = make_filter_context(&request);
+    ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
+        TENANT_HEADER.parse().unwrap(),
+        HeaderValue::from_static("tenant-a"),
+    ));
+    let mut body = None;
+
+    let action = mapped_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+
+    assert!(matches!(action, FilterAction::BodyDone));
+    let owner = ctx.extensions.get::<StateOwner>().unwrap();
+    assert_eq!(owner.tenant_id(), "tenant-a");
+    assert_eq!(owner.subject(), "alice");
+}
+
+#[tokio::test]
+async fn body_phase_honors_earlier_trusted_component_removal() {
+    let request = mapped_request("spoofed-tenant", "alice");
+    let mut ctx = make_filter_context(&request);
+    ctx.pre_read_mutations
+        .push(TrustedHeaderMutation::Remove(TENANT_HEADER.parse().unwrap()));
+    let mut body = None;
+
+    let action = mapped_filter()
+        .on_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+
+    assert!(matches!(action, FilterAction::Reject(_)));
+    assert!(ctx.extensions.get::<StateOwner>().is_none());
+}
+
+#[tokio::test]
+async fn body_phase_uses_earlier_trusted_assertion_replacement() {
+    let request = request_with(&assertion(["spoofed-tenant", "spoofed-issuer", "mallory"]));
+    let mut ctx = make_filter_context(&request);
+    let trusted = assertion(["tenant-a", "issuer-a", "alice"]);
+    ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
+        HEADER.parse().unwrap(),
+        HeaderValue::from_str(&trusted).unwrap(),
+    ));
+    let mut body = None;
+
+    let action = filter().on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::BodyDone));
+    let owner = ctx.extensions.get::<StateOwner>().unwrap();
+    assert_eq!(owner.tenant_id(), "tenant-a");
+    assert_eq!(owner.issuer(), "issuer-a");
+    assert_eq!(owner.subject(), "alice");
+}
+
 #[test]
 fn projection_configuration_rejects_invalid_or_ambiguous_headers() {
     for yaml in [

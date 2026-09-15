@@ -303,15 +303,14 @@ impl StateOwnerFilter {
 
     /// Resolve and install the owner, rejecting invalid or absent assertions.
     fn resolve(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) -> FilterAction {
-        self.queue_header_removal(ctx, body_phase);
-
         if ctx.extensions.get::<StateOwner>().is_some() {
+            self.queue_header_removal(ctx, body_phase);
             return FilterAction::Continue;
         }
 
         let owner = match &self.source {
             OwnerSource::Static(owner) => owner.clone(),
-            OwnerSource::TrustedHeader(header) => match resolve_trusted_header(ctx, header) {
+            OwnerSource::TrustedHeader(header) => match resolve_trusted_header(ctx, header, body_phase) {
                 Ok(owner) => owner,
                 Err(action) => return action,
             },
@@ -319,12 +318,13 @@ impl StateOwnerFilter {
                 tenant,
                 issuer,
                 subject,
-            } => match resolve_trusted_components(ctx, tenant, issuer, subject) {
+            } => match resolve_trusted_components(ctx, tenant, issuer, subject, body_phase) {
                 Ok(owner) => owner,
                 Err(action) => return action,
             },
         };
         ctx.extensions.insert(owner);
+        self.queue_header_removal(ctx, body_phase);
         FilterAction::Continue
     }
 
@@ -388,8 +388,12 @@ fn queue_one_header_removal(ctx: &mut HttpFilterContext<'_>, header: &HeaderName
 }
 
 /// Parse the trusted assertion header into a complete owner.
-fn resolve_trusted_header(ctx: &HttpFilterContext<'_>, header: &HeaderName) -> Result<StateOwner, FilterAction> {
-    let value = exactly_one_header_value(ctx, header)?;
+fn resolve_trusted_header(
+    ctx: &HttpFilterContext<'_>,
+    header: &HeaderName,
+    body_phase: bool,
+) -> Result<StateOwner, FilterAction> {
+    let value = exactly_one_header_value(ctx, header, body_phase)?;
     if value.as_bytes().len() > MAX_ASSERTION_BYTES {
         return Err(reject_owner(
             400,
@@ -419,13 +423,14 @@ fn resolve_trusted_components(
     tenant: &OwnerComponentSource,
     issuer: &OwnerComponentSource,
     subject: &OwnerComponentSource,
+    body_phase: bool,
 ) -> Result<StateOwner, FilterAction> {
     // The request extension owns its identity for the complete filter
     // lifecycle, so the three bounded component values must cross this
     // boundary as owned strings.
-    let tenant_id = resolve_owner_component(ctx, "tenant", tenant)?;
-    let issuer = resolve_owner_component(ctx, "issuer", issuer)?;
-    let subject = resolve_owner_component(ctx, "subject", subject)?;
+    let tenant_id = resolve_owner_component(ctx, "tenant", tenant, body_phase)?;
+    let issuer = resolve_owner_component(ctx, "issuer", issuer, body_phase)?;
+    let subject = resolve_owner_component(ctx, "subject", subject, body_phase)?;
     StateOwner::from_trusted_parts(tenant_id, issuer, subject)
         .map_err(|error| reject_owner(400, "invalid_state_owner", error.client_message()))
 }
@@ -435,13 +440,14 @@ fn resolve_owner_component(
     ctx: &HttpFilterContext<'_>,
     component: &'static str,
     source: &OwnerComponentSource,
+    body_phase: bool,
 ) -> Result<String, FilterAction> {
     let header = match source {
         OwnerComponentSource::Header(header) => header,
         OwnerComponentSource::Static(value) => return Ok(value.clone()),
     };
 
-    let value = exactly_one_component_header_value(ctx, component, header)?;
+    let value = exactly_one_component_header_value(ctx, component, header, body_phase)?;
     let Ok(value) = value.to_str() else {
         return Err(reject_owner(
             400,
@@ -455,12 +461,13 @@ fn resolve_owner_component(
 }
 
 /// Require exactly one value for a mapped component header.
-fn exactly_one_component_header_value<'a>(
-    ctx: &'a HttpFilterContext<'_>,
+fn exactly_one_component_header_value(
+    ctx: &HttpFilterContext<'_>,
     component: &'static str,
     header: &HeaderName,
-) -> Result<&'a http::HeaderValue, FilterAction> {
-    let mut values = ctx.request.headers.get_all(header).iter();
+    body_phase: bool,
+) -> Result<http::HeaderValue, FilterAction> {
+    let mut values = effective_owner_header_values(ctx, header, body_phase).into_iter();
     let Some(value) = values.next() else {
         return Err(reject_owner(
             401,
@@ -479,11 +486,12 @@ fn exactly_one_component_header_value<'a>(
 }
 
 /// Require exactly one value for the configured assertion header.
-fn exactly_one_header_value<'a>(
-    ctx: &'a HttpFilterContext<'_>,
+fn exactly_one_header_value(
+    ctx: &HttpFilterContext<'_>,
     header: &HeaderName,
-) -> Result<&'a http::HeaderValue, FilterAction> {
-    let mut values = ctx.request.headers.get_all(header).iter();
+    body_phase: bool,
+) -> Result<http::HeaderValue, FilterAction> {
+    let mut values = effective_owner_header_values(ctx, header, body_phase).into_iter();
     let Some(value) = values.next() else {
         return Err(reject_owner(
             401,
@@ -499,6 +507,45 @@ fn exactly_one_header_value<'a>(
         ));
     }
     Ok(value)
+}
+
+/// Resolve one configured owner header through earlier trusted body mutations.
+///
+/// Only matching values are copied. This preserves exact multi-value semantics
+/// without cloning the request's complete header collection. During the normal
+/// request phase the protocol has already committed pre-read mutations to the
+/// request map, so replay is limited to body pre-read callbacks.
+fn effective_owner_header_values(
+    ctx: &HttpFilterContext<'_>,
+    header: &HeaderName,
+    body_phase: bool,
+) -> Vec<http::HeaderValue> {
+    let mut values: Vec<_> = ctx.request.headers.get_all(header).iter().cloned().collect();
+    if !body_phase {
+        return values;
+    }
+
+    for mutation in ctx.prior_pre_read_mutations.iter().chain(ctx.pre_read_mutations.iter()) {
+        match mutation {
+            TrustedHeaderMutation::Remove(name) if name == header => values.clear(),
+            TrustedHeaderMutation::Set(name, value) if name == header => {
+                values.clear();
+                values.push(value.clone());
+            },
+            TrustedHeaderMutation::Add(name, value) if name == header => match http::HeaderValue::from_str(value) {
+                Ok(value) => values.push(value),
+                Err(error) => {
+                    tracing::warn!(
+                        header = %name,
+                        error = %error,
+                        "skipping invalid trusted owner add mutation"
+                    );
+                },
+            },
+            _ => {},
+        }
+    }
+    values
 }
 
 /// Parse a nonempty trusted header name.
