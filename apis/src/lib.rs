@@ -23,6 +23,7 @@ pub mod promotion;
 pub mod store;
 pub mod subrequest;
 pub mod token_cache;
+pub mod vertex;
 pub(crate) mod web_search;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
