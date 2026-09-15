@@ -1170,7 +1170,9 @@ fn fs_end_stream_writes_five_keys_and_is_idempotent() {
     assert_eq!(ctx.get_metadata("responses.stream_error_code"), Some("server_error"));
     assert_eq!(ctx.get_metadata("responses.stream_error_message"), Some("boom"));
     assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
-    let r = ctx.filter_results.get("openai_file_search_callout").unwrap();
+    // After the #1046 unification the stream-stop is armed on the single
+    // continuation owner (`openai_agentic_loop`), not the demoted file-search filter.
+    let r = ctx.filter_results.get("openai_agentic_loop").unwrap();
     assert_eq!(r.get("action"), Some("done"));
     assert_eq!(r.get("pending"), Some("false"));
     // Idempotent: a second call with a different code does not clobber.

@@ -36,7 +36,7 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_conversations`](openai_conversations.md) | Handles all `/v1/conversations` endpoints locally. |
 | [`openai_doc_extract`](openai_doc_extract.md) | Converts `input_file` content parts to `input_text` for backends that do not support `input_file` natively (e.g. vLLM, llm-d). |
 | [`openai_file_resolve`](openai_file_resolve.md) | Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field. |
-| [`openai_file_search_callout`](openai_file_search_callout.md) | Executes pending file search calls against a vector store API compatible backend. |
+| [`openai_file_search_callout`](openai_file_search_callout.md) | Dispatches the loop owner's pending file-search assignments against a vector store API compatible backend. |
 | [`openai_mcp_dispatch`](openai_mcp_dispatch.md) | Executes MCP tool calls against upstream MCP servers within the Responses API agentic loop. |
 | [`openai_mcp_tool_resolve`](openai_mcp_tool_resolve.md) | Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server. |
 | [`openai_response_store`](openai_response_store.md) | Persists Responses API responses to the configured response store backend. |
@@ -90,10 +90,17 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`ai_guardrails`](ai_guardrails.md) | Calls an external AI guardrail provider to evaluate request and response bodies. The provider determines whether content should be passed, blocked, or redacted. |
 
+### Identity Guard
+
+| Filter | Description |
+|--------|-------------|
+| [`identity_header_guard`](identity_header_guard.md) | Captures request headers matching a configured prefix into `filter_metadata` and removes them from the upstream request. |
+
 ### Inference
 
 | Filter | Description |
 |--------|-------------|
+| [`llmisvc_model_provider_resolver`](llmisvc_model_provider_resolver.md) | Rewrites publisher-ID body `model` values to the short model name for `LLMISvc` / `KServe` routing; the routing header is left unchanged. |
 | [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
 
 ### Metering

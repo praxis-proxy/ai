@@ -17,6 +17,7 @@ pub mod callout;
 #[cfg(feature = "gcp-adc-filter")]
 pub mod gcp;
 pub mod guardrails;
+mod identity_guard;
 pub mod inference;
 pub mod metering;
 #[cfg(feature = "opentelemetry")]
@@ -38,7 +39,8 @@ pub use callout::HttpCalloutFilter;
 #[cfg(feature = "gcp-adc-filter")]
 pub use gcp::GcpAdcFilter;
 pub use guardrails::AiGuardrailsFilter;
-pub use inference::ModelToHeaderFilter;
+pub use identity_guard::IdentityHeaderGuardFilter;
+pub use inference::{LlmisvcModelProviderResolverFilter, ModelToHeaderFilter};
 pub use metering::ExternalMeteringFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};

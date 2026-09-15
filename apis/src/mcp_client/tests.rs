@@ -335,6 +335,19 @@ fn too_many_tools_error_display() {
 }
 
 #[test]
+fn listing_too_large_error_display() {
+    let err = McpClientError::ListingTooLarge {
+        url: display_url("http://example.com/mcp"),
+        bytes: 5 * 1024 * 1024,
+        max: 4 * 1024 * 1024,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("5242880"), "should include observed byte count");
+    assert!(msg.contains("4194304"), "should include cumulative max");
+    assert!(msg.contains("example.com"), "should include URL");
+}
+
+#[test]
 fn list_tools_error_display() {
     let err = McpClientError::ListTools {
         url: display_url("http://example.com/mcp"),
@@ -1142,4 +1155,173 @@ async fn list_tools_cumulative_pagination_timeout() {
     let err = result.expect_err("cumulative pagination time exceeding timeout should time out");
     let msg = err.to_string();
     assert!(msg.contains("timed out"), "error should mention timeout: {msg}");
+}
+
+/// MCP server whose `tools/list` returns a single tool carrying an oversized
+/// description, used to prove `list_tools` bounds the response body before it
+/// is buffered and deserialized.
+#[derive(Debug, Clone)]
+struct OversizedListToolsMcpServer {
+    /// Byte length of the description attached to the one returned tool.
+    description_bytes: usize,
+}
+
+impl ServerHandler for OversizedListToolsMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let tool = rmcp::model::Tool::new(
+            "dummy".to_owned(),
+            "x".repeat(self.description_bytes),
+            std::sync::Arc::new(serde_json::Map::new()),
+        );
+        Ok(rmcp::model::ListToolsResult::with_all_items(vec![tool]))
+    }
+}
+
+async fn start_oversized_list_mcp_server(description_bytes: usize) -> (String, tokio_util::sync::CancellationToken) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+
+    let service: StreamableHttpService<OversizedListToolsMcpServer, LocalSessionManager> = StreamableHttpService::new(
+        move || Ok(OversizedListToolsMcpServer { description_bytes }),
+        std::sync::Arc::default(),
+        config,
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+
+    (format!("http://{addr}/mcp"), ct)
+}
+
+#[tokio::test]
+async fn list_tools_rejects_oversized_response() {
+    // A single tool whose description alone dwarfs the 1 MiB control-response
+    // ceiling. `max_tools` caps only the tool *count* (here just 1), so before
+    // the transport was size-bounded the entire body was downloaded and
+    // deserialized regardless — the memory-exhaustion vector this guards.
+    let (url, ct) = start_oversized_list_mcp_server(2 * 1024 * 1024).await;
+    let result = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 128, true).await;
+    ct.cancel();
+
+    let err = result.expect_err("oversized tools/list response must be rejected before buffering");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tools/list failed"),
+        "oversized response should surface as a tools/list failure: {msg}"
+    );
+}
+
+/// MCP server that paginates `tools/list`, returning one tool per page whose
+/// description is large but stays under the per-page control ceiling. Used to
+/// prove the cumulative byte budget bounds pagination: each page passes the
+/// per-page bound and the tool *count* stays under `max_tools`, yet their union
+/// crosses the operation-wide limit.
+#[derive(Debug, Clone)]
+struct MultiPageListToolsMcpServer {
+    /// Byte length of the description attached to the one tool per page.
+    description_bytes: usize,
+    /// Number of pages the server will serve before ending pagination.
+    total_pages: usize,
+}
+
+impl ServerHandler for MultiPageListToolsMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn list_tools(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let page: usize = request.and_then(|p| p.cursor).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let tool = rmcp::model::Tool::new(
+            format!("tool_{page}"),
+            "x".repeat(self.description_bytes),
+            std::sync::Arc::new(serde_json::Map::new()),
+        );
+        let mut res = rmcp::model::ListToolsResult::with_all_items(vec![tool]);
+        res.next_cursor = (page + 1 < self.total_pages).then(|| (page + 1).to_string());
+        Ok(res)
+    }
+}
+
+async fn start_multi_page_list_mcp_server(
+    description_bytes: usize,
+    total_pages: usize,
+) -> (String, tokio_util::sync::CancellationToken) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+
+    let service: StreamableHttpService<MultiPageListToolsMcpServer, LocalSessionManager> = StreamableHttpService::new(
+        move || {
+            Ok(MultiPageListToolsMcpServer {
+                description_bytes,
+                total_pages,
+            })
+        },
+        std::sync::Arc::default(),
+        config,
+    );
+
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+
+    (format!("http://{addr}/mcp"), ct)
+}
+
+#[tokio::test]
+async fn list_tools_rejects_oversized_cumulative_pagination() {
+    // Every page carries a single ~900 KiB tool: individually under the 1 MiB
+    // per-page control ceiling, and the running count (one tool per page) never
+    // approaches `max_tools`. Only the cumulative byte budget across pages can
+    // catch this, so it exercises the aggregate bound rather than the per-page
+    // bound or the count cap. `total_pages` is capped well below `MAX_PAGES` so a
+    // regression that dropped the budget check fails cleanly (bounded transfer)
+    // instead of streaming tens of MiB.
+    let (url, ct) = start_multi_page_list_mcp_server(900 * 1024, 12).await;
+    let result = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 128, true).await;
+    ct.cancel();
+
+    let err = result.expect_err("cumulative tools/list bytes exceeding the budget must be rejected");
+    assert!(
+        matches!(err, McpClientError::ListingTooLarge { .. }),
+        "aggregate overflow should surface as ListingTooLarge, got: {err:?}"
+    );
 }

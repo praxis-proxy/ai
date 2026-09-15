@@ -20,18 +20,19 @@ mod external_metering;
 mod file_search_callout;
 mod file_search_chat_completions;
 mod file_search_streaming;
-mod full_flow;
 mod full_flow_agentic;
 #[cfg(feature = "gcp-adc-filter")]
 mod gcp_adc;
 mod guardrails;
 mod guardrails_response;
+mod identity_header_guard;
 mod inference_fallback;
 mod irr_terminal_streaming;
 #[cfg(feature = "http-callout-filter")]
 mod lakera_guard;
 #[cfg(feature = "llmd-ext-proc")]
 mod llmd_ext_proc;
+mod llmisvc_model_provider_resolver;
 mod mcp_broker;
 mod model_to_header;
 mod openai_agentic_loop;

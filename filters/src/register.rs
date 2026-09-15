@@ -15,9 +15,9 @@ use crate::HttpCalloutFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 use crate::TokenRateLimitFilter;
 use crate::{
-    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IntelligentRouteFilter, McpFilter,
-    ModelToHeaderFilter, PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter,
-    TokenCountFilter, TokenUsageHeadersFilter,
+    A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
+    IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
+    ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -118,7 +118,15 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     );
     praxis_filter::register_filters!(
         @register registry,
+        http "identity_header_guard" => IdentityHeaderGuardFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
         http "model_to_header" => ModelToHeaderFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "llmisvc_model_provider_resolver" => LlmisvcModelProviderResolverFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -454,6 +462,8 @@ mod tests {
         let names = registry.available_filters();
         let expected = [
             "ai_guardrails",
+            "identity_header_guard",
+            "llmisvc_model_provider_resolver",
             "openai_responses_validate",
             "responses_to_chat_completions",
             "a2a",

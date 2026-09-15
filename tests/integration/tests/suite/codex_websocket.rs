@@ -103,10 +103,12 @@ async fn pinned_codex_uses_responses_websocket_through_full_flow() {
     let mut backend = start_scripted_websocket_backend_turns(vec![prewarm, script]).await;
     let proxy_port = free_port();
     let db = TempSqlite::new("codex_websocket");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
         .expect("full-flow example should exist");
     let patched = patch_yaml(
-        &yaml.replace("sqlite://responses.db?mode=rwc", db.url()),
+        &yaml
+            .replace("sqlite://responses.db?mode=rwc", db.url())
+            .replace("${WEB_SEARCH_API_KEY}", "test-key"),
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend.port())]),
     );

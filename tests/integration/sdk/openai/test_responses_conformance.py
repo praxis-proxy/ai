@@ -34,6 +34,7 @@ OVERLAY_PATH = REPO_ROOT / "tests/conformance/openresponses/package.json"
 
 SUITE_REPO = "https://github.com/openresponses/openresponses"
 SUITE_SHA = "92c12d96d7b61d6d15e2214daa5e9c6000ab6e1c"
+STREAMING_TEMPLATE_ID = "streaming-response"
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
@@ -107,6 +108,26 @@ def _run_compliance(suite_dir: Path, listener_port: int, ids: set[str]) -> subpr
     return subprocess.run(cmd, cwd=suite_dir, capture_output=True, text=True)
 
 
+def _supported_run_groups(ids: set[str]) -> list[set[str]]:
+    """Split supported templates so streaming is not starved by siblings.
+
+    The OpenResponses CLI launches every `--filter` id via `Promise.all`. After
+    `openai_stream_events` moved inside IRR, Praxis 0.5.4 applies a hardcoded
+    30s inter-chunk idle timeout to that stream. Concurrent Qwen CPU
+    generations can stall SSE for longer than that and drop the socket
+    (`streaming-response` then fails with "socket connection was closed
+    unexpectedly"). Isolate the streaming template; keep the rest batched.
+    """
+    streaming = {STREAMING_TEMPLATE_ID} & ids
+    rest = ids - {STREAMING_TEMPLATE_ID}
+    groups: list[set[str]] = []
+    if streaming:
+        groups.append(streaming)
+    if rest:
+        groups.append(rest)
+    return groups
+
+
 class _WitnessHandler(BaseHTTPRequestHandler):
     seen_paths: list[tuple[str, str]] = []
 
@@ -127,10 +148,15 @@ class _WitnessHandler(BaseHTTPRequestHandler):
                         continue
                     self.send_header(key, value)
                 self.end_headers()
-                for chunk in upstream.iter_raw():
-                    if chunk:
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
+                try:
+                    for chunk in upstream.iter_raw():
+                        if chunk:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                except BrokenPipeError:
+                    # Praxis (or the suite client) hung up; common when IRR's
+                    # 30s streaming idle timeout wins under concurrent load.
+                    return
 
     def do_POST(self):
         self._forward()
@@ -195,6 +221,15 @@ def praxis_proxy(tmp_path):
             witness.shutdown()
 
 
+def test_supported_run_groups_isolates_streaming():
+    groups = _supported_run_groups({"basic-response", STREAMING_TEMPLATE_ID, "tool-calling"})
+    assert groups[0] == {STREAMING_TEMPLATE_ID}
+    assert groups[1] == {"basic-response", "tool-calling"}
+    assert _supported_run_groups({STREAMING_TEMPLATE_ID}) == [{STREAMING_TEMPLATE_ID}]
+    assert _supported_run_groups({"basic-response"}) == [{"basic-response"}]
+    assert _supported_run_groups(set()) == []
+
+
 def test_suite_template_ids_are_fully_triaged():
     suite_dir = _ensure_suite()
     supported, unsupported, inapplicable = _manifest_ids(_load_manifest())
@@ -216,8 +251,11 @@ def test_openresponses_conformance_supported_all_pass(praxis_proxy):
     listener_port, seen = praxis_proxy
     suite_dir = _ensure_suite()
     supported, _, _ = _manifest_ids(_load_manifest())
-    result = _run_compliance(suite_dir, listener_port, supported)
-    assert result.returncode == 0, f"suite failed:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    for group in _supported_run_groups(supported):
+        result = _run_compliance(suite_dir, listener_port, group)
+        assert result.returncode == 0, (
+            f"suite failed for {sorted(group)}:\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
     paths = {(method, path) for method, path in seen}
     assert ("POST", "/v1/chat/completions") in paths, f"backend never saw chat completions; saw {paths}"
     assert not any(path.startswith("/v1/responses") for _method, path in seen), (

@@ -15,6 +15,12 @@
 # `response.mcp_list_tools.failed` and terminal `response.failed` events.
 # Local request-policy failures such as SSRF blocking remain HTTP errors.
 #
+# Configured `connector_id` plus `defer_loading: true` is validated
+# here when the request also includes `tool_search`: the ID is resolved
+# locally and stripped from the backend body, but this pipeline does
+# **not** load tools. Deferred discovery requires `openai_mcp_dispatch`
+# inside an agentic loop — see agentic-loop.yaml.
+#
 # On SUCCESS, the filter seeds one `mcp_list_tools` output item per
 # resolved server into the response state, but — unlike the failure
 # lifecycle, which this filter emits itself — a successful request must
@@ -30,7 +36,7 @@
 #
 # This is a minimal pipeline focused on MCP tool discovery. For a
 # complete setup with multi-turn conversation support (rehydrate,
-# response store), see full-flow.yaml.
+# response store), see full-flow-agentic.yaml.
 #
 # For cross-request caching via `previous_tools`, add
 # `openai_responses_rehydrate` before this filter so that

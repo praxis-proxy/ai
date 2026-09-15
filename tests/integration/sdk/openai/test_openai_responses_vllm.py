@@ -47,7 +47,7 @@ VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
 OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-CONFIG_PATH = "examples/configs/openai/responses/full-flow.yaml"
+CONFIG_PATH = "examples/configs/openai/responses/full-flow-agentic.yaml"
 AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
 IRR_STREAMING_CONFIG_PATH = (
     "examples/configs/openai/responses/irr-terminal-streaming.yaml"
@@ -129,6 +129,11 @@ def _write_config(praxis_port: int, db_path: str) -> str:
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
     config = config.replace("127.0.0.1:9999", _ogx_endpoint())
+    # The unified gateway wires openai_web_search into the IRR; its config
+    # resolves ${WEB_SEARCH_API_KEY} at startup and fails closed when unset.
+    # These vLLM turns never emit a web_search_call, so a literal placeholder
+    # key keeps the dispatcher inert while letting the binary start.
+    config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
     config = _patch_store_backend(config, db_path)
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -598,7 +603,7 @@ def _write_witness_config(
     db_path: str,
     backend_port: int,
 ) -> str:
-    """Patch full-flow.yaml to route the native backend through the shim.
+    """Patch full-flow-agentic.yaml to route the native backend through the shim.
 
     Identical to :func:`_write_config` except the ``127.0.0.1:3001`` backend is
     pointed at the recording shim (which forwards to vLLM) instead of vLLM
@@ -610,6 +615,7 @@ def _write_witness_config(
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
     config = config.replace("127.0.0.1:9999", _ogx_endpoint())
+    config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
     config = _patch_store_backend(config, db_path)
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -636,6 +642,12 @@ def _write_agentic_config(
         '- "127.0.0.1:3001"',
         f'- "{vllm}"\n                    read_timeout_ms: 300000',
     )
+    # agentic-loop.yaml is the canonical unified config (#1046): it wires all
+    # three request-phase dispatchers (web_search, mcp_dispatch,
+    # file_search_callout) under the single agentic-loop owner. Retarget the
+    # file-search vector store at OGX so the file-search dispatcher is live here
+    # too; it stays inert for web/mcp-only tests that emit no file_search_call.
+    config = config.replace("http://127.0.0.1:8001", f"http://{_ogx_endpoint()}")
     config = _patch_store_backend(config, db_path)
     config = config.replace(
         "- filter: openai_mcp_tool_resolve\n",
@@ -1561,6 +1573,18 @@ class TestOpenAIResponsesVLLM:
             f"previous_response_id; got: {lifecycle_previous_ids}"
         )
 
+        # Issue #1150: the persisted record (served by GET) must agree with the
+        # terminal frame the client observed. The streaming persistence source is
+        # an independent ResponsesState.response_object that the incremental wire
+        # rewrite never touches, so before the fix the stored response echoed the
+        # backend's null even though the streamed terminal carried first.id.
+        retrieved = _retrieve_with_retry(openai_client, final_response.id)
+        assert retrieved.previous_response_id == first.id, (
+            "the stored streaming response must persist the caller's "
+            "previous_response_id, matching the terminal frame the client saw; "
+            f"got: {retrieved.previous_response_id!r}"
+        )
+
     @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
     def test_conflicting_history_selectors_error_shape(self, openai_client, stream):
         with pytest.raises(BadRequestError) as exc_info:
@@ -1690,9 +1714,12 @@ class TestOpenAIResponsesVLLM:
     def test_client_function_call_returns(self, openai_client):
         """Client-side function tools are returned without auto-execution.
 
-        The full-flow pipeline has no agentic loop, so function_call
-        items are passed through to the client. Validates that vLLM
-        produces a well-formed function_call through the proxy.
+        The unified agentic pipeline's openai_agentic_loop only auto-executes
+        hosted tools (file_search, web_search, MCP); a bare client-side
+        function_call has no hosted dispatcher, so the loop terminates
+        (action=done) and passes the function_call through to the client.
+        Validates that vLLM produces a well-formed function_call through the
+        proxy.
         """
         response = openai_client.responses.create(
             model=VLLM_MODEL,
@@ -4004,6 +4031,7 @@ filter_chains:
     filters:
       - filter: openai_responses_format
       - filter: openai_responses_validate
+      - filter: openai_tool_parse
       - filter: iterative_request_router
         initial_step: inference
         max_iterations: 8
@@ -4017,7 +4045,11 @@ filter_chains:
         steps:
           - name: inference
             filters:
-              - filter: openai_tool_parse
+              # Request-phase dispatcher: at request-body EOS on each IRR
+              # re-entry it executes the file_search_call items the loop owner
+              # assigned in the prior response, reconciling each in place. It
+              # never parses the response and never drives the IRR transition
+              # (#1046).
               - filter: openai_file_search_callout
                 vector_store_url: http://{ogx_endpoint}
                 allow_private_url: true
@@ -4028,6 +4060,11 @@ filter_chains:
                 on_failure: closed
                 forward_headers:
                   - authorization
+              # Sole loop owner: parses each model response, records file-search
+              # assignments for the dispatcher, and publishes the single
+              # continuation signal (action=loop|done).
+              - filter: openai_agentic_loop
+                max_infer_iters: 7
               - filter: openai_responses_proxy
                 name: inference
               - filter: headers
@@ -4045,9 +4082,9 @@ filter_chains:
                     endpoints:
                       - "{vllm_endpoint}"
             on_result:
-              - filter: openai_file_search_callout
-                key: pending
-                value: "true"
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
                 next: inference
               - default: true
                 done: true
@@ -4523,7 +4560,7 @@ class TestFileSearchStreamingVLLM:
     """Issue #313: streaming hosted file_search (stream=True).
 
     Unlike TestFileSearchVLLM (buffered), this drives the #313 streaming
-    example config: openai_stream_events(logical_stream) + file_search_callout
+    example config: openai_stream_events(logical_stream) + openai_file_search_callout
     + openai_responses_proxy (streaming transport auto-derived from
     stream=True). vLLM emits a private
     function_call(name=file_search), which the callout suppresses and replaces

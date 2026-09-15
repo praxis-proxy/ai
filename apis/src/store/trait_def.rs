@@ -248,6 +248,31 @@ pub trait ConversationItemStore: Send + Sync {
         messages: &serde_json::Value,
     ) -> Result<bool, StoreError>;
 
+    /// Update only the conversation's metadata, leaving the denormalized message
+    /// cache untouched.
+    ///
+    /// Returns `true` if a record was updated, `false` if no matching
+    /// conversation existed for this tenant.
+    ///
+    /// This is a targeted single-column write: it never reads or rewrites
+    /// `messages`, so a metadata update cannot clobber a `messages` cache that a
+    /// concurrent item append rebuilt after the caller last read the row. The
+    /// update handler must use this instead of round-tripping the whole record
+    /// through [`upsert_conversation`], which would write back a stale `messages`
+    /// snapshot and drop the concurrently appended items (#1144).
+    ///
+    /// [`upsert_conversation`]: ConversationItemStore::upsert_conversation
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if serialization or the database operation fails.
+    async fn update_conversation_metadata(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<bool, StoreError>;
+
     /// Replace the denormalized message cache only when it still equals
     /// `expected_messages`.
     ///
