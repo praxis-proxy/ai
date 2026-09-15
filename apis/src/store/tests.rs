@@ -8,8 +8,8 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::{
-    ConversationItemRecord, ConversationRecord, PostgresResponseStore, ResponseRecord, ResponseStoreRegistry,
-    SqliteResponseStore, SslMode, StoreError,
+    CompressionAlgorithm, ConversationItemRecord, ConversationRecord, PostgresResponseStore, ResponseRecord,
+    ResponseStoreRegistry, SqliteResponseStore, SslMode, StoreCompressionConfig, StoreError,
     trait_def::{ConversationItemStore, ResponseStore},
 };
 use crate::openai::{
@@ -27,6 +27,7 @@ async fn sqlite_store_initializes_schema() {
         "sqlite::memory:",
         "test_responses",
         "test_conversation_messages",
+        None,
         None,
         None,
     )
@@ -1605,7 +1606,7 @@ async fn file_backed_store_crud() {
     let db_path = dir.path().join("test.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
-    let store = SqliteResponseStore::new(&url, "file_responses", "file_conversations", None, None)
+    let store = SqliteResponseStore::new(&url, "file_responses", "file_conversations", None, None, None)
         .await
         .expect("file-backed store creation should succeed");
 
@@ -1634,18 +1635,32 @@ async fn schema_migration_is_idempotent() {
     let db_path = dir.path().join("idempotent.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
-    let store = SqliteResponseStore::new(&url, "idem_responses", "idem_conversations", Some("idem_items"), None)
-        .await
-        .expect("first init should succeed");
+    let store = SqliteResponseStore::new(
+        &url,
+        "idem_responses",
+        "idem_conversations",
+        Some("idem_items"),
+        None,
+        None,
+    )
+    .await
+    .expect("first init should succeed");
 
     let record = make_response_record("resp_1", "tenant_a", 1000);
     store.upsert_response(&record).await.expect("upsert should succeed");
 
     drop(store);
 
-    let store2 = SqliteResponseStore::new(&url, "idem_responses", "idem_conversations", Some("idem_items"), None)
-        .await
-        .expect("second init with same tables should succeed");
+    let store2 = SqliteResponseStore::new(
+        &url,
+        "idem_responses",
+        "idem_conversations",
+        Some("idem_items"),
+        None,
+        None,
+    )
+    .await
+    .expect("second init with same tables should succeed");
 
     let fetched = store2
         .get_response("tenant_a", "resp_1")
@@ -1682,7 +1697,7 @@ async fn sqlite_rejects_table_with_missing_columns() {
         .expect("manual create should succeed");
     pool.close().await;
 
-    let result = SqliteResponseStore::new(&url, "bad_responses", "ok_conversations", None, None).await;
+    let result = SqliteResponseStore::new(&url, "bad_responses", "ok_conversations", None, None, None).await;
     let Err(err) = result else {
         panic!("init should fail on schema mismatch");
     };
@@ -1720,7 +1735,8 @@ async fn sqlite_rejects_items_table_with_missing_columns() {
     .expect("manual create should succeed");
     pool.close().await;
 
-    let result = SqliteResponseStore::new(&url, "ok_responses", "ok_conversations", Some("bad_items"), None).await;
+    let result =
+        SqliteResponseStore::new(&url, "ok_responses", "ok_conversations", Some("bad_items"), None, None).await;
     let Err(err) = result else {
         panic!("init should fail on items schema mismatch");
     };
@@ -1744,7 +1760,7 @@ async fn sqlite_stamps_schema_version_on_fresh_db() {
     let db_path = dir.path().join("version.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
-    let _store = SqliteResponseStore::new(&url, "vr", "vc", None, None)
+    let _store = SqliteResponseStore::new(&url, "vr", "vc", None, None, None)
         .await
         .expect("store creation should succeed");
 
@@ -1758,7 +1774,7 @@ async fn sqlite_stamps_schema_version_on_fresh_db() {
         .fetch_one(&pool)
         .await
         .expect("version row should exist");
-    assert_eq!(version, 1, "fresh store should stamp version 1");
+    assert_eq!(version, 2, "fresh store should stamp version 2");
 }
 
 #[tokio::test]
@@ -1784,7 +1800,7 @@ async fn sqlite_rejects_schema_version_mismatch() {
         .expect("insert should succeed");
     pool.close().await;
 
-    let result = SqliteResponseStore::new(&url, "vr", "vc", None, None).await;
+    let result = SqliteResponseStore::new(&url, "vr", "vc", None, None, None).await;
     let Err(err) = result else {
         panic!("init should fail on version mismatch");
     };
@@ -1807,13 +1823,96 @@ async fn sqlite_accepts_matching_schema_version() {
     let db_path = dir.path().join("good_version.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
-    let _store = SqliteResponseStore::new(&url, "vr", "vc", None, None)
+    let _store = SqliteResponseStore::new(&url, "vr", "vc", None, None, None)
         .await
         .expect("first init should succeed");
 
-    let _store2 = SqliteResponseStore::new(&url, "vr", "vc", None, None)
+    let _store2 = SqliteResponseStore::new(&url, "vr", "vc", None, None, None)
         .await
         .expect("second init with matching version should succeed");
+}
+
+#[tokio::test]
+async fn sqlite_v1_text_schema_migrates_to_v2_preserving_rows() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("migrate.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse")
+        .create_if_missing(true);
+
+    // Build a legacy version-1 layout: TEXT payload columns, stamped v1,
+    // with a plain-JSON row written the way the pre-bytes store would.
+    let pool = sqlx::SqlitePool::connect_with(options.clone())
+        .await
+        .expect("pool should connect");
+    for stmt in [
+        "CREATE TABLE mr (tenant_id TEXT NOT NULL, id TEXT NOT NULL, created_at BIGINT NOT NULL, \
+         model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, messages TEXT NOT NULL, \
+         PRIMARY KEY (tenant_id, id))",
+        "CREATE TABLE mc (conversation_id TEXT NOT NULL, tenant_id TEXT NOT NULL, created_at BIGINT NOT NULL, \
+         metadata TEXT NOT NULL, messages TEXT NOT NULL, PRIMARY KEY (conversation_id, tenant_id))",
+        "CREATE TABLE mr_schema_version (version BIGINT NOT NULL PRIMARY KEY)",
+        "INSERT INTO mr_schema_version (version) VALUES (1)",
+        "INSERT INTO mr (tenant_id, id, created_at, model, response_object, input, messages) \
+         VALUES ('tenant_a', 'legacy_resp', 1000, 'gpt-4.1', \
+         '{\"id\":\"legacy_resp\",\"model\":\"gpt-4.1\"}', '\"hi\"', '[{\"role\":\"user\"}]')",
+    ] {
+        sqlx::query(stmt)
+            .execute(&pool)
+            .await
+            .expect("legacy setup should succeed");
+    }
+    pool.close().await;
+
+    // Before migration the store refuses to start.
+    let before = SqliteResponseStore::new(&url, "mr", "mc", None, None, None).await;
+    assert!(
+        before.is_err_and(|e| e.to_string().contains("schema version mismatch")),
+        "store must refuse a version-1 database"
+    );
+
+    // Apply the documented operator migration: CAST the responses payload
+    // columns to BLOB storage class and bump the schema version.
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    for stmt in [
+        "UPDATE mr SET response_object = CAST(response_object AS BLOB), \
+         input = CAST(input AS BLOB), messages = CAST(messages AS BLOB)",
+        "UPDATE mr_schema_version SET version = 2",
+    ] {
+        sqlx::query(stmt)
+            .execute(&pool)
+            .await
+            .expect("migration should succeed");
+    }
+    pool.close().await;
+
+    // After migration the store starts and the legacy row reads back intact.
+    let store = SqliteResponseStore::new(&url, "mr", "mc", None, None, None)
+        .await
+        .expect("store should start on a migrated version-2 database");
+
+    let fetched = store
+        .get_response("tenant_a", "legacy_resp")
+        .await
+        .expect("get should succeed")
+        .expect("legacy row should be readable after migration");
+    assert_eq!(fetched.input, json!("hi"), "legacy plain-JSON input should decode");
+    assert_eq!(fetched.model, "gpt-4.1", "legacy model should be intact");
+
+    // A fresh write through the migrated store also round-trips.
+    let record = make_response_record("post_mig", "tenant_a", 2000);
+    store.upsert_response(&record).await.expect("upsert should succeed");
+    let round = store
+        .get_response("tenant_a", "post_mig")
+        .await
+        .expect("get should succeed")
+        .expect("new row should exist");
+    assert_eq!(round.response_object, record.response_object, "new write round-trips");
 }
 
 // -----------------------------------------------------------------------------
@@ -2096,6 +2195,7 @@ async fn pg_nonexistent_ssl_root_cert_fails() {
         Some(SslMode::VerifyCa),
         Some("/nonexistent/ca.pem"),
         None,
+        None,
     ))
     .await;
 
@@ -2137,6 +2237,7 @@ async fn pg_rejects_table_with_missing_columns() {
         &format!("ok_conversations_{suffix}"),
         None,
         Some(SslMode::Disable),
+        None,
         None,
         None,
     ))
@@ -2200,6 +2301,7 @@ async fn pg_rejects_schema_version_mismatch() {
         Some(SslMode::Disable),
         None,
         None,
+        None,
     ))
     .await;
     let Err(err) = result else {
@@ -2223,6 +2325,127 @@ async fn pg_rejects_schema_version_mismatch() {
     }
 }
 
+#[tokio::test]
+#[ignore]
+async fn pg_v1_text_schema_migrates_to_v2_bytea_preserving_rows() {
+    use sqlx::AssertSqlSafe;
+
+    let url = pg_database_url();
+    let suffix = pg_unique_suffix();
+    let resp_table = format!("mig_r_{suffix}");
+    let conv_table = format!("mig_c_{suffix}");
+    let ver_table = format!("{resp_table}_schema_version");
+
+    let options: sqlx::postgres::PgConnectOptions = url.parse().expect("url should parse");
+    let pool = Box::pin(sqlx::PgPool::connect_with(options))
+        .await
+        .expect("pool should connect");
+
+    // Build a legacy version-1 layout: TEXT payload columns, stamped v1,
+    // with a plain-JSON row written the way the pre-bytes store would.
+    for stmt in [
+        format!(
+            "CREATE TABLE {resp_table} (
+                tenant_id TEXT NOT NULL, id TEXT NOT NULL, created_at BIGINT NOT NULL,
+                model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL,
+                messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id))"
+        ),
+        format!(
+            "CREATE TABLE {conv_table} (
+                conversation_id TEXT NOT NULL, tenant_id TEXT NOT NULL, created_at BIGINT NOT NULL,
+                metadata TEXT NOT NULL, messages TEXT NOT NULL, PRIMARY KEY (conversation_id, tenant_id))"
+        ),
+        format!("CREATE TABLE {ver_table} (version BIGINT NOT NULL PRIMARY KEY)"),
+        format!("INSERT INTO {ver_table} (version) VALUES (1)"),
+        format!(
+            "INSERT INTO {resp_table} (tenant_id, id, created_at, model, response_object, input, messages) \
+             VALUES ('tenant_a', 'legacy_resp', 1000, 'gpt-4.1', \
+             '{{\"id\":\"legacy_resp\",\"model\":\"gpt-4.1\"}}', '\"hi\"', '[{{\"role\":\"user\"}}]')"
+        ),
+    ] {
+        sqlx::query(AssertSqlSafe(stmt.as_str()))
+            .execute(&pool)
+            .await
+            .expect("legacy setup should succeed");
+    }
+
+    // Before migration the store refuses to start.
+    let before = Box::pin(PostgresResponseStore::new(
+        &url,
+        &resp_table,
+        &conv_table,
+        None,
+        Some(SslMode::Disable),
+        None,
+        None,
+        None,
+    ))
+    .await;
+    assert!(
+        before.is_err_and(|e| e.to_string().contains("schema version mismatch")),
+        "store must refuse a version-1 database"
+    );
+
+    // Apply the documented operator migration. Only the responses table's
+    // payload columns become BYTEA; conversations stay TEXT.
+    for stmt in [
+        format!(
+            "ALTER TABLE {resp_table} \
+             ALTER COLUMN response_object TYPE BYTEA USING convert_to(response_object, 'UTF8'), \
+             ALTER COLUMN input TYPE BYTEA USING convert_to(input, 'UTF8'), \
+             ALTER COLUMN messages TYPE BYTEA USING convert_to(messages, 'UTF8')"
+        ),
+        format!("UPDATE {ver_table} SET version = 2"),
+    ] {
+        sqlx::query(AssertSqlSafe(stmt.as_str()))
+            .execute(&pool)
+            .await
+            .expect("migration should succeed");
+    }
+    pool.close().await;
+
+    // After migration the store starts and the legacy row reads back intact.
+    let store = Box::pin(PostgresResponseStore::new(
+        &url,
+        &resp_table,
+        &conv_table,
+        None,
+        Some(SslMode::Disable),
+        None,
+        None,
+        None,
+    ))
+    .await
+    .expect("store should start on a migrated version-2 database");
+
+    let fetched = store
+        .get_response("tenant_a", "legacy_resp")
+        .await
+        .expect("get should succeed")
+        .expect("legacy row should be readable after migration");
+    assert_eq!(fetched.input, json!("hi"), "legacy plain-JSON input should decode");
+    assert_eq!(fetched.model, "gpt-4.1", "legacy model should be intact");
+
+    // A fresh write through the migrated store also round-trips.
+    let record = make_response_record("post_mig", "tenant_a", 2000);
+    store.upsert_response(&record).await.expect("upsert should succeed");
+    let round = store
+        .get_response("tenant_a", "post_mig")
+        .await
+        .expect("get should succeed")
+        .expect("new row should exist");
+    assert_eq!(round.response_object, record.response_object, "new write round-trips");
+
+    let cleanup_pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("cleanup pool");
+    for table in [&ver_table, &resp_table, &conv_table] {
+        let drop_sql = format!("DROP TABLE IF EXISTS {table}");
+        sqlx::query(AssertSqlSafe(drop_sql.as_str()))
+            .execute(&cleanup_pool)
+            .await
+            .expect("cleanup should succeed");
+    }
+}
+
 async fn make_pg_store() -> PostgresResponseStore {
     let url = pg_database_url();
     let suffix = pg_unique_suffix();
@@ -2234,9 +2457,98 @@ async fn make_pg_store() -> PostgresResponseStore {
         Some(SslMode::Disable),
         None,
         None,
+        None,
     ))
     .await
     .expect("postgres store creation should succeed")
+}
+
+async fn make_pg_compressed_store() -> PostgresResponseStore {
+    let url = pg_database_url();
+    let suffix = pg_unique_suffix();
+    Box::pin(PostgresResponseStore::new(
+        &url,
+        &format!("test_responses_{suffix}"),
+        &format!("test_conversations_{suffix}"),
+        Some(&format!("test_conversation_items_{suffix}")),
+        Some(SslMode::Disable),
+        None,
+        None,
+        Some(&zstd_compression()),
+    ))
+    .await
+    .expect("postgres compressed store creation should succeed")
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_compressed_store_roundtrips_response() {
+    let store = make_pg_compressed_store().await;
+    let record = make_response_record("resp_zstd", "tenant_a", 1000);
+    store.upsert_response(&record).await.expect("upsert should succeed");
+
+    let fetched = store
+        .get_response("tenant_a", "resp_zstd")
+        .await
+        .expect("get should succeed")
+        .expect("record should exist");
+
+    assert_eq!(
+        fetched.response_object, record.response_object,
+        "response_object round-trips"
+    );
+    assert_eq!(fetched.input, record.input, "input round-trips");
+    assert_eq!(fetched.messages, record.messages, "messages round-trip");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_compression_is_backward_compatible_with_plain_rows() {
+    let url = pg_database_url();
+    let suffix = pg_unique_suffix();
+    let responses_table = format!("test_responses_{suffix}");
+    let conversations_table = format!("test_conversations_{suffix}");
+
+    let plain = Box::pin(PostgresResponseStore::new(
+        &url,
+        &responses_table,
+        &conversations_table,
+        None,
+        Some(SslMode::Disable),
+        None,
+        None,
+        None,
+    ))
+    .await
+    .expect("postgres store creation should succeed");
+    let record = make_response_record("resp_plain", "tenant_a", 1000);
+    plain.upsert_response(&record).await.expect("upsert should succeed");
+    drop(plain);
+
+    let compressed = Box::pin(PostgresResponseStore::new(
+        &url,
+        &responses_table,
+        &conversations_table,
+        None,
+        Some(SslMode::Disable),
+        None,
+        None,
+        Some(&zstd_compression()),
+    ))
+    .await
+    .expect("compressed postgres store creation should succeed");
+
+    let fetched = compressed
+        .get_response("tenant_a", "resp_plain")
+        .await
+        .expect("get should succeed")
+        .expect("plain record should remain readable");
+    assert_eq!(
+        fetched.response_object, record.response_object,
+        "response_object readable"
+    );
+    assert_eq!(fetched.input, record.input, "input readable");
+    assert_eq!(fetched.messages, record.messages, "messages readable");
 }
 
 #[tokio::test]
@@ -3065,6 +3377,87 @@ async fn pg_delete_item_and_sync_messages_missing_conversation_errors() {
 }
 
 // -----------------------------------------------------------------------------
+// Compression (SQLite)
+// -----------------------------------------------------------------------------
+
+fn zstd_compression() -> StoreCompressionConfig {
+    StoreCompressionConfig {
+        algorithm: CompressionAlgorithm::Zstd,
+        level: Some(3),
+    }
+}
+
+async fn make_compressed_store() -> SqliteResponseStore {
+    SqliteResponseStore::new(
+        "sqlite::memory:",
+        "test_responses",
+        "test_conversation_messages",
+        Some("test_conversation_items"),
+        None,
+        Some(&zstd_compression()),
+    )
+    .await
+    .expect("compressed store creation should succeed")
+}
+
+#[tokio::test]
+async fn compressed_store_roundtrips_response() {
+    let store = make_compressed_store().await;
+    let record = make_response_record("resp_zstd", "tenant_a", 1000);
+    store.upsert_response(&record).await.expect("upsert should succeed");
+
+    let fetched = store
+        .get_response("tenant_a", "resp_zstd")
+        .await
+        .expect("get should succeed")
+        .expect("record should exist");
+
+    assert_eq!(
+        fetched.response_object, record.response_object,
+        "response_object round-trips"
+    );
+    assert_eq!(fetched.input, record.input, "input round-trips");
+    assert_eq!(fetched.messages, record.messages, "messages round-trip");
+}
+
+#[tokio::test]
+async fn compression_is_backward_compatible_with_plain_rows() {
+    let dir = tempfile::tempdir().expect("tempdir should be created");
+    let db_path = dir.path().join("backcompat.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let plain = SqliteResponseStore::new(&url, "bc_responses", "bc_conversations", None, None, None)
+        .await
+        .expect("plain store creation should succeed");
+    let record = make_response_record("resp_plain", "tenant_a", 1000);
+    plain.upsert_response(&record).await.expect("upsert should succeed");
+    drop(plain);
+
+    let compressed = SqliteResponseStore::new(
+        &url,
+        "bc_responses",
+        "bc_conversations",
+        None,
+        None,
+        Some(&zstd_compression()),
+    )
+    .await
+    .expect("compressed store creation should succeed");
+
+    let fetched = compressed
+        .get_response("tenant_a", "resp_plain")
+        .await
+        .expect("get should succeed")
+        .expect("plain record should remain readable");
+    assert_eq!(
+        fetched.response_object, record.response_object,
+        "response_object readable"
+    );
+    assert_eq!(fetched.input, record.input, "input readable");
+    assert_eq!(fetched.messages, record.messages, "messages readable");
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 
@@ -3075,6 +3468,7 @@ async fn make_store() -> SqliteResponseStore {
         "test_conversation_messages",
         None,
         None,
+        None,
     )
     .await
     .expect("store creation should succeed")
@@ -3083,9 +3477,16 @@ async fn make_store() -> SqliteResponseStore {
 async fn make_file_store(dir: &tempfile::TempDir, items_table: Option<&str>) -> SqliteResponseStore {
     let db_path = dir.path().join("concurrent.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
-    SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", items_table, None)
-        .await
-        .expect("file-backed store creation should succeed")
+    SqliteResponseStore::new(
+        &url,
+        "test_responses",
+        "test_conversation_messages",
+        items_table,
+        None,
+        None,
+    )
+    .await
+    .expect("file-backed store creation should succeed")
 }
 
 async fn make_store_with_items() -> SqliteResponseStore {
@@ -3094,6 +3495,7 @@ async fn make_store_with_items() -> SqliteResponseStore {
         "test_responses",
         "test_conversation_messages",
         Some("test_conversation_items"),
+        None,
         None,
     )
     .await
@@ -3112,6 +3514,7 @@ async fn make_pg_store_with_items() -> PostgresResponseStore {
         &conversations_table,
         Some(&items_table),
         Some(SslMode::Disable),
+        None,
         None,
         None,
     )

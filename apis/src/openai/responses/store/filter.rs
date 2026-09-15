@@ -126,6 +126,7 @@ impl ResponseStoreFilter {
                     &self.config.conversations_table,
                     None,
                     self.config.pool.as_ref(),
+                    self.config.compression.as_ref(),
                 )
                 .await;
                 store.map(|s| {
@@ -150,6 +151,7 @@ impl ResponseStoreFilter {
                     self.config.ssl_mode,
                     ssl_root_cert,
                     self.config.pool.as_ref(),
+                    self.config.compression.as_ref(),
                 ))
                 .await;
                 store.map(|s| {

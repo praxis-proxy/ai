@@ -1627,6 +1627,7 @@ mod tests {
             "test_conversations",
             Some("test_conversation_items"),
             None,
+            None,
         )
         .await
         .expect("store creation should succeed")

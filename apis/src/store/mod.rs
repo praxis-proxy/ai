@@ -7,6 +7,7 @@
 //! backend, and supporting types. Used by AI API filters for
 //! persisting response records and conversation history.
 
+mod compression;
 mod pool;
 mod postgres;
 pub(crate) mod postgres_url;
@@ -37,6 +38,7 @@ pub(crate) use schemas::{
 };
 
 pub use self::{
+    compression::{CompressionAlgorithm, StoreCompressionConfig},
     pool::PoolConfig,
     postgres::{PostgresResponseStore, SslMode},
     sqlite::SqliteResponseStore,

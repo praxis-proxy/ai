@@ -14,7 +14,7 @@ name = "praxis_ai_apis"
 
 [features]
 default = ["store"]
-store = ["dep:sqlx", "dep:dashmap"]
+store = ["dep:sqlx", "dep:dashmap", "dep:zstd"]
 praxis-main = []
 
 [lints]
@@ -45,6 +45,7 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tracing = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true }
+zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 axum = { workspace = true }

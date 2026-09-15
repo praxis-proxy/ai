@@ -84,6 +84,7 @@ tonic-prost = "0.14.6"
 tonic-prost-build = { version = "0.14.6", features = ["transport"] }
 tokio-stream = "0.1.19"
 zeroize = "1.9.0"
+zstd = "0.13.3"
 
 # Praxis core dependencies
 praxis-core = { version = "0.5.4", package = "praxis-proxy-core" }

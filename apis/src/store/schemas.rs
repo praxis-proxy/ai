@@ -29,7 +29,13 @@ pub(crate) struct TableNames {
 // -----------------------------------------------------------------------------
 
 /// Current schema version. Bump this when the DDL changes.
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+///
+/// Version 2 stores the responses table's JSON payload columns
+/// (`response_object`, `input`, `messages`) as native binary (`BLOB`
+/// on SQLite, `BYTEA` on `PostgreSQL`) instead of `TEXT` so the
+/// response store can persist compressed payloads. Databases created
+/// under version 1 must be migrated before use.
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 /// Suffix appended to the responses table name to derive the schema
 /// version table name.
@@ -41,6 +47,30 @@ pub(crate) fn schema_version_table(responses: &str) -> String {
 }
 
 // -----------------------------------------------------------------------------
+// SQL Dialect
+// -----------------------------------------------------------------------------
+
+/// SQL dialect a store targets, used to pick dialect-specific types in
+/// generated DDL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlDialect {
+    /// SQLite backend.
+    Sqlite,
+    /// `PostgreSQL` backend.
+    Postgres,
+}
+
+impl SqlDialect {
+    /// Column type for a binary JSON payload column.
+    fn bytes_type(self) -> &'static str {
+        match self {
+            SqlDialect::Sqlite => "BLOB",
+            SqlDialect::Postgres => "BYTEA",
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Schema DDL
 // -----------------------------------------------------------------------------
 
@@ -48,18 +78,21 @@ pub(crate) fn schema_version_table(responses: &str) -> String {
 ///
 /// Each statement uses `IF NOT EXISTS` so it is safe to run on
 /// every startup. The schema uses TEXT for JSON columns (standard
-/// `SQLite` pattern) and BIGINT for timestamps so the same DDL is
-/// compatible with `PostgreSQL` `i64` decoding.
+/// `SQLite` pattern) with the exception of the responses table which
+/// uses the dialect's binary type (`BLOB` on SQLite, `BYTEA` on `PostgreSQL`)
+/// so the responses store can persist compressed payloads; Timestamps
+/// use BIGINT so the same DDL is compatible with `PostgreSQL` `i64` decoding.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if table names contain
 /// invalid characters.
-pub(crate) fn generate_ddl(tables: &TableNames) -> Result<Vec<String>, StoreError> {
+pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<Vec<String>, StoreError> {
     let (r, c) = validate_table_names(tables)?;
+    let bytes_type = dialect.bytes_type();
 
     let mut stmts = vec![
-        responses_ddl(r),
+        responses_ddl(r, bytes_type),
         conversations_ddl(c),
         format!("CREATE INDEX IF NOT EXISTS idx_{c}_tenant_id ON {c}(tenant_id)"),
     ];
@@ -137,16 +170,16 @@ pub(crate) fn validate_postgres_table_set_identifiers(
 }
 
 /// DDL for the responses table.
-fn responses_ddl(r: &str) -> String {
+fn responses_ddl(r: &str, bytes_type: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {r} (
             tenant_id       TEXT NOT NULL,
             id              TEXT NOT NULL,
             created_at      BIGINT NOT NULL,
             model           TEXT NOT NULL,
-            response_object TEXT NOT NULL,
-            input           TEXT NOT NULL,
-            messages        TEXT NOT NULL,
+            response_object {bytes_type} NOT NULL,
+            input           {bytes_type} NOT NULL,
+            messages        {bytes_type} NOT NULL,
             PRIMARY KEY (tenant_id, id)
         )"
     )
@@ -428,7 +461,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: None,
         };
-        let ddl = generate_ddl(&tables).expect("valid names should produce DDL");
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
         assert_eq!(
             ddl.len(),
             4,
@@ -447,7 +480,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: None,
         };
-        let ddl = generate_ddl(&tables).expect("valid names should produce DDL");
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
 
         assert!(
             ddl[0].contains("created_at      BIGINT NOT NULL"),
@@ -457,13 +490,55 @@ mod tests {
     }
 
     #[test]
+    fn generate_ddl_sqlite_uses_blob_for_responses_payload_columns() {
+        let tables = TableNames {
+            responses: "test_responses".to_owned(),
+            conversations: "test_conversations".to_owned(),
+            items: Some("test_items".to_owned()),
+        };
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
+        assert!(
+            ddl[0].contains("response_object BLOB NOT NULL"),
+            "SQLite responses payload should be BLOB: {}",
+            ddl[0]
+        );
+        assert!(ddl[0].contains("input           BLOB NOT NULL"), "{}", ddl[0]);
+        assert!(ddl[0].contains("messages        BLOB NOT NULL"), "{}", ddl[0]);
+        assert!(!ddl[0].contains("BYTEA"), "SQLite must not use BYTEA: {}", ddl[0]);
+        // Conversations and items stay TEXT.
+        assert!(ddl[1].contains("messages        TEXT NOT NULL"), "{}", ddl[1]);
+        assert!(ddl[3].contains("item_data         TEXT NOT NULL"), "{}", ddl[3]);
+    }
+
+    #[test]
+    fn generate_ddl_postgres_uses_bytea_for_responses_payload_columns() {
+        let tables = TableNames {
+            responses: "test_responses".to_owned(),
+            conversations: "test_conversations".to_owned(),
+            items: Some("test_items".to_owned()),
+        };
+        let ddl = generate_ddl(&tables, SqlDialect::Postgres).expect("valid names should produce DDL");
+        assert!(
+            ddl[0].contains("response_object BYTEA NOT NULL"),
+            "Postgres responses payload should be BYTEA: {}",
+            ddl[0]
+        );
+        assert!(ddl[0].contains("input           BYTEA NOT NULL"), "{}", ddl[0]);
+        assert!(ddl[0].contains("messages        BYTEA NOT NULL"), "{}", ddl[0]);
+        assert!(!ddl[0].contains("BLOB"), "Postgres must not use BLOB: {}", ddl[0]);
+        // Conversations and items stay TEXT.
+        assert!(ddl[1].contains("messages        TEXT NOT NULL"), "{}", ddl[1]);
+        assert!(ddl[3].contains("item_data         TEXT NOT NULL"), "{}", ddl[3]);
+    }
+
+    #[test]
     fn generate_ddl_rejects_invalid_name() {
         let tables = TableNames {
             responses: "valid_name".to_owned(),
             conversations: "1invalid".to_owned(),
             items: None,
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("start with"),
             "should reject invalid conversation table name: {err}"
@@ -477,7 +552,7 @@ mod tests {
             conversations: "same_table".to_owned(),
             items: None,
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("distinct"),
             "should reject duplicate table names: {err}"
@@ -491,7 +566,7 @@ mod tests {
             conversations: "responses".to_owned(),
             items: None,
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("distinct"),
             "should reject case-insensitive duplicate table names: {err}"
@@ -623,7 +698,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: None,
         };
-        let ddl = generate_ddl(&tables).expect("valid names should produce DDL");
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
         let version_ddl = ddl.last().expect("should have statements");
         assert!(
             version_ddl.contains("test_responses_schema_version"),
@@ -656,7 +731,7 @@ mod tests {
             conversations: "test_schema_version".to_owned(),
             items: None,
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("collides with conversation table"),
             "should reject collision: {err}"
@@ -670,7 +745,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: Some("test_schema_version".to_owned()),
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("collides with items table"),
             "should reject collision: {err}"
@@ -684,7 +759,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: Some("test_items".to_owned()),
         };
-        let ddl = generate_ddl(&tables).expect("valid names with items should produce DDL");
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names with items should produce DDL");
         assert_eq!(
             ddl.len(),
             7,
@@ -709,7 +784,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: Some("shared_name".to_owned()),
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string()
                 .contains("items and response table names must be distinct"),
@@ -724,7 +799,7 @@ mod tests {
             conversations: "shared_name".to_owned(),
             items: Some("shared_name".to_owned()),
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string()
                 .contains("items and conversation table names must be distinct"),

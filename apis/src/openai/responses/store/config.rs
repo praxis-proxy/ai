@@ -9,7 +9,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
 use crate::store::{
-    PoolConfig, SslMode,
+    PoolConfig, SslMode, StoreCompressionConfig,
     postgres_url::{
         self, has_postgres_url_ssl_root_cert, is_verified_postgres_sslmode, postgres_url_sslmode,
         validate_postgres_url_tls_file_params,
@@ -88,6 +88,14 @@ pub(crate) struct ResponseStoreConfig {
     /// `idle_timeout = 600s`, `acquire_timeout = 30s`).
     #[serde(default)]
     pub pool: Option<PoolConfig>,
+
+    /// Optional payload compression for stored JSON columns.
+    ///
+    /// When omitted, payloads are stored uncompressed. Reads
+    /// auto-detect the format, so enabling compression keeps existing
+    /// uncompressed records readable.
+    #[serde(default)]
+    pub compression: Option<StoreCompressionConfig>,
 }
 
 // -----------------------------------------------------------------------------
@@ -109,6 +117,9 @@ pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterErr
     }
     if let Some(pool) = &cfg.pool {
         pool.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
+    }
+    if let Some(compression) = &cfg.compression {
+        compression.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
     }
     match cfg.backend {
         StorageBackend::Sqlite => {
