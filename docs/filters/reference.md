@@ -28,6 +28,13 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`openai_chat_completions_to_azureai_chat_completions`](openai_chat_completions_to_azureai_chat_completions.md) | Transforms requests targeting Azure OpenAI deployments into standard Chat Completions-compatible form and normalizes responses back. |
 
+### General
+
+| Filter | Description |
+|--------|-------------|
+| [`state_owner`](state_owner.md) | Establishes a normalized [`StateOwner`] from trusted identity sources. |
+| [`state_owner_headers`](state_owner_headers.md) | Projects a normalized [`StateOwner`] into destination-specific HTTP headers. |
+
 ### OpenAI
 
 | Filter | Description |

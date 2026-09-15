@@ -46,6 +46,7 @@ use self::{
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
 use crate::{
+    callout_headers::effective_body_callout_headers,
     callout_policy::OnFailure,
     http_hop::connection_nominates_header,
     openai::responses::{
@@ -409,17 +410,19 @@ impl HttpFilter for FileSearchCalloutFilter {
 /// can reach the vector store. Borrows on the first iteration; on
 /// continuations filters out headers nominated by `Connection`.
 fn callout_request_headers<'a>(ctx: &'a HttpFilterContext<'_>) -> Cow<'a, HeaderMap> {
-    let Some(state) = ctx.extensions.get::<IterationState>().filter(|s| s.iteration() > 0) else {
-        return Cow::Borrowed(&ctx.request.headers);
-    };
-    let original = &state.original_request.headers;
-    let mut filtered = HeaderMap::with_capacity(original.len());
-    for (name, value) in original {
-        if !connection_nominates_header(original, name) {
-            filtered.append(name.clone(), value.clone());
+    let headers = if let Some(state) = ctx.extensions.get::<IterationState>().filter(|s| s.iteration() > 0) {
+        let original = &state.original_request.headers;
+        let mut filtered = HeaderMap::with_capacity(original.len());
+        for (name, value) in original {
+            if !connection_nominates_header(original, name) {
+                filtered.append(name.clone(), value.clone());
+            }
         }
-    }
-    Cow::Owned(filtered)
+        Cow::Owned(filtered)
+    } else {
+        Cow::Borrowed(&ctx.request.headers)
+    };
+    effective_body_callout_headers(ctx, headers)
 }
 
 /// Framework-owned bytes already charged by the iterative router.

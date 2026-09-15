@@ -98,6 +98,7 @@ pub(crate) mod test_utils {
             request_headers_to_set: Vec::new(),
             filter_metadata: std::collections::HashMap::new(),
             pre_read_mutations: Vec::new(),
+            prior_pre_read_mutations: Vec::new(),
             structured_metadata: std::collections::HashMap::new(),
             filter_results: std::collections::HashMap::new(),
             filter_state: std::collections::HashMap::new(),

@@ -8,8 +8,8 @@ use std::{collections::HashMap, time::Duration};
 use futures::{SinkExt as _, StreamExt as _};
 use praxis_test_utils::{
     Backend, CapturedWsMessage, StatefulCapturingBackend, TempSqlite, WsBackendEvent, WsServerAction,
-    example_config_path, free_port, http_get, http_send, json_post, parse_body, parse_header, parse_status, patch_yaml,
-    start_backend_with_shutdown, start_echo_backend, start_proxy, start_scripted_websocket_backend,
+    example_config_path, free_port, http_send, json_post as raw_json_post, parse_body, parse_header, parse_status,
+    patch_yaml, start_backend_with_shutdown, start_echo_backend, start_proxy, start_scripted_websocket_backend,
     start_stateful_backend,
 };
 use serde_json::{Value, json};
@@ -54,9 +54,39 @@ const SECOND_RESPONSE_SSE: &str = concat!(
 /// Maximum time allowed for a test client to complete a WebSocket handshake.
 const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Stable trusted identity used by this example's integration clients.
+const TEST_TENANT: &str = "integration-tenant";
+const TEST_SUBJECT: &str = "integration-user";
+
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Add the trusted identity headers expected by the shipped full-flow config.
+fn authenticated_request(request: &str) -> String {
+    request.replacen(
+        "\r\n\r\n",
+        &format!("\r\nx-auth-tenant: {TEST_TENANT}\r\nx-auth-user: {TEST_SUBJECT}\r\n\r\n"),
+        1,
+    )
+}
+
+/// Build an authenticated JSON request for the full-flow example.
+fn json_post(path: &str, body: &str) -> String {
+    authenticated_request(&raw_json_post(path, body))
+}
+
+/// Send an authenticated GET and return `(status, body)`.
+fn http_get(addr: &str, path: &str, host: Option<&str>) -> (u16, String) {
+    let host = host.unwrap_or("localhost");
+    let raw = http_send(
+        addr,
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nx-auth-tenant: {TEST_TENANT}\r\nx-auth-user: {TEST_SUBJECT}\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    (parse_status(&raw), parse_body(&raw))
+}
 
 /// Load the full-flow config with the sqlite store redirected to an isolated
 /// temp database. Store-enabled requests now reach the backend and persist, so
@@ -1084,6 +1114,8 @@ async fn full_flow_websocket_non_101_backend_response_remains_http() {
         &format!("127.0.0.1:{proxy_port}"),
         "GET /v1/responses HTTP/1.1\r\n\
          Host: 127.0.0.1\r\n\
+         x-auth-tenant: integration-tenant\r\n\
+         x-auth-user: integration-user\r\n\
          Connection: Upgrade\r\n\
          Upgrade: websocket\r\n\
          Sec-WebSocket-Version: 13\r\n\
@@ -1182,10 +1214,11 @@ fn full_flow_agentic_file_search_round_trip() {
         }],
         "usage": {"input_tokens": 20, "output_tokens": 7, "total_tokens": 27}
     });
-    let model = start_stateful_backend(vec![
+    let model = StatefulCapturingBackend::new(vec![
         (200, first_model_response.to_string()),
         (200, final_model_response.to_string()),
-    ]);
+    ])
+    .start_with_shutdown();
     let search_response = json!({
         "data": [{
             "file_id": "file-q4",
@@ -1222,6 +1255,26 @@ fn full_flow_agentic_file_search_round_trip() {
     assert_eq!(response["output"][0]["status"], "completed");
     assert_eq!(response["output"][1]["type"], "message");
 
+    for request in model.requests() {
+        let headers = request.headers.to_lowercase();
+        assert!(
+            headers.contains("authorization: bearer search-key"),
+            "every inference round should retain client authorization: {headers}"
+        );
+        assert!(
+            headers.contains("x-tenant-id: integration-tenant"),
+            "inference should receive the projected tenant: {headers}"
+        );
+        assert!(
+            headers.contains("x-user-id: integration-user"),
+            "inference should receive the projected subject: {headers}"
+        );
+        assert!(
+            !headers.contains("x-auth-tenant:") && !headers.contains("x-auth-user:"),
+            "raw ingress identity must not cross the IRR boundary: {headers}"
+        );
+    }
+
     let search_requests = search.requests();
     let search_callouts: Vec<_> = search_requests.iter().filter(|r| r.method == "POST").collect();
     assert_eq!(search_callouts.len(), 1, "expected one vector store callout");
@@ -1232,6 +1285,19 @@ fn full_flow_agentic_file_search_round_trip() {
             .contains("authorization: bearer search-key"),
         "vector store callout should forward the authorization header: {}",
         search_callouts[0].headers,
+    );
+    let headers = search_callouts[0].headers.to_lowercase();
+    assert!(
+        headers.contains("x-tenant-id: integration-tenant"),
+        "vector store callout should receive the projected tenant: {headers}"
+    );
+    assert!(
+        headers.contains("x-user-id: integration-user"),
+        "vector store callout should receive the projected subject: {headers}"
+    );
+    assert!(
+        !headers.contains("x-auth-tenant:") && !headers.contains("x-auth-user:"),
+        "raw ingress identity must not cross the callout boundary: {headers}"
     );
 }
 
@@ -1265,7 +1331,10 @@ fn full_flow_agentic_non_responses_path_bypasses_irr() {
     let (config, _db) = load_full_flow_agentic_config(proxy_port, &HashMap::from([("127.0.0.1:9998", backend.port())]));
     let proxy = start_proxy(&config);
 
-    let raw = http_send(proxy.addr(), "GET /v1/prompts HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    let raw = http_send(
+        proxy.addr(),
+        &authenticated_request("GET /v1/prompts HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"),
+    );
 
     assert_eq!(
         parse_status(&raw),
@@ -1434,6 +1503,13 @@ async fn connect_websocket_with_timeout<R>(request: R, timeout: Duration) -> Web
 where
     R: tokio_tungstenite::tungstenite::client::IntoClientRequest + Unpin,
 {
+    let mut request = request.into_client_request()?;
+    request
+        .headers_mut()
+        .insert("x-auth-tenant", TEST_TENANT.parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-auth-user", TEST_SUBJECT.parse().unwrap());
     tokio::time::timeout(timeout, Box::pin(connect_async(request)))
         .await
         .map_err(|_elapsed| {

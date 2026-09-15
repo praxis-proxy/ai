@@ -3,7 +3,7 @@
 
 //! MCP client wrapper for calling upstream MCP servers.
 //!
-//! Thin layer over `rmcp` that exposes [`list_tools`] for resolving
+//! Thin layer over `rmcp` that exposes [`list_tools_with_forwarded_headers`] for resolving
 //! MCP tool declarations. Designed for reuse by `mcp_tool` (#27)
 //! when `call_tool` support is added.
 
@@ -265,10 +265,41 @@ pub(crate) fn parse_display_url(server_url: &str) -> McpDisplayUrl {
 /// oversized response (per page or cumulative), or an otherwise
 /// invalid server response.
 #[expect(clippy::too_many_arguments, reason = "allow_loopback extends the existing param set")]
+#[cfg(test)]
 pub(crate) async fn list_tools(
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
+    timeout: Duration,
+    max_tools: usize,
+    allow_loopback: bool,
+) -> Result<Vec<serde_json::Value>, McpClientError> {
+    list_tools_with_forwarded_headers(
+        server_url,
+        headers,
+        authorization,
+        &[],
+        None,
+        timeout,
+        max_tools,
+        allow_loopback,
+    )
+    .await
+}
+
+/// Call `tools/list` with an additional trusted, operator-allowlisted header
+/// set. Forwarded values override same-named client tool-entry headers.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "trusted forwarded headers extend the existing API"
+)]
+#[expect(clippy::too_many_lines, reason = "transport setup and bounded listing are linear")]
+pub(crate) async fn list_tools_with_forwarded_headers(
+    server_url: &str,
+    headers: Option<&serde_json::Value>,
+    authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: Option<&http::HeaderMap>,
     timeout: Duration,
     max_tools: usize,
     allow_loopback: bool,
@@ -285,7 +316,14 @@ pub(crate) async fn list_tools(
         let max_sse_event_size = bounded_client.max_sse_event_size();
         let transport = StreamableHttpClientTransport::with_client(
             bounded_client,
-            build_transport_config(server_url, headers, authorization)?.max_sse_event_size(max_sse_event_size),
+            build_transport_config_with_forwarded_headers(
+                server_url,
+                headers,
+                authorization,
+                forwarded_header_names,
+                forwarded_headers,
+            )?
+            .max_sse_event_size(max_sse_event_size),
         );
         let display_url = resolved.display_url;
         let client = Box::pin(().serve(transport))
@@ -308,7 +346,7 @@ pub(crate) async fn list_tools(
 /// Call `tools/call` on an MCP server and return the result.
 ///
 /// Creates a fresh Streamable HTTP transport per call, same
-/// pattern as [`list_tools`]. Session reuse deferred to MCP
+/// pattern as [`list_tools_with_forwarded_headers`]. Session reuse deferred to MCP
 /// Foundation PR 5.
 ///
 /// # Errors
@@ -316,12 +354,46 @@ pub(crate) async fn list_tools(
 /// Returns [`McpClientError`] on connection failure, timeout, or
 /// tool execution failure.
 #[expect(clippy::too_many_arguments, reason = "allow_loopback extends the existing param set")]
-#[expect(clippy::too_many_lines, reason = "transport setup + call follows list_tools pattern")]
-#[expect(clippy::large_stack_frames, reason = "rmcp call_tool future is inherently large")]
+#[cfg(test)]
 pub(crate) async fn call_tool(
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    timeout: Duration,
+    max_result_bytes: usize,
+    allow_loopback: bool,
+) -> Result<rmcp::model::CallToolResult, McpClientError> {
+    call_tool_with_forwarded_headers(
+        server_url,
+        headers,
+        authorization,
+        &[],
+        None,
+        tool_name,
+        arguments,
+        timeout,
+        max_result_bytes,
+        allow_loopback,
+    )
+    .await
+}
+
+/// Call `tools/call` with an additional trusted, operator-allowlisted header
+/// set. Forwarded values override same-named client tool-entry headers.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "trusted forwarded headers extend the existing API"
+)]
+#[expect(clippy::too_many_lines, reason = "transport setup + call follows list_tools pattern")]
+#[expect(clippy::large_stack_frames, reason = "rmcp call_tool future is inherently large")]
+pub(crate) async fn call_tool_with_forwarded_headers(
+    server_url: &str,
+    headers: Option<&serde_json::Value>,
+    authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: Option<&http::HeaderMap>,
     tool_name: &str,
     arguments: serde_json::Value,
     timeout: Duration,
@@ -336,7 +408,14 @@ pub(crate) async fn call_tool(
         let max_sse_event_size = bounded_client.max_sse_event_size();
         let transport = StreamableHttpClientTransport::with_client(
             bounded_client,
-            build_transport_config(server_url, headers, authorization)?.max_sse_event_size(max_sse_event_size),
+            build_transport_config_with_forwarded_headers(
+                server_url,
+                headers,
+                authorization,
+                forwarded_header_names,
+                forwarded_headers,
+            )?
+            .max_sse_event_size(max_sse_event_size),
         );
         let display_url = resolved.display_url;
 
@@ -428,10 +507,31 @@ async fn paginate_tools(
 ///
 /// Returns [`McpClientError::InvalidAuthorization`] if the token
 /// contains characters invalid in HTTP header values.
+#[cfg(test)]
 fn build_transport_config(
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
+) -> Result<StreamableHttpClientTransportConfig, McpClientError> {
+    build_transport_config_with_forwarded_headers(server_url, headers, authorization, &[], None)
+}
+
+/// Build transport config and overlay trusted, operator-allowlisted headers.
+///
+/// Every configured forwarded name is removed from client tool-entry headers
+/// even when no trusted value is available or the target is a direct URL. This
+/// prevents client-controlled headers from impersonating ambient identity at a
+/// connector endpoint reached through an equivalent direct URL.
+#[expect(
+    clippy::too_many_lines,
+    reason = "client filtering and trusted overlay are one security boundary"
+)]
+fn build_transport_config_with_forwarded_headers(
+    server_url: &str,
+    headers: Option<&serde_json::Value>,
+    authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: Option<&http::HeaderMap>,
 ) -> Result<StreamableHttpClientTransportConfig, McpClientError> {
     let mut config = StreamableHttpClientTransportConfig::with_uri(server_url);
     let mut header_map = HashMap::new();
@@ -442,10 +542,22 @@ fn build_transport_config(
             if let Some(value_str) = value.as_str()
                 && let Ok(name) = key.parse::<http::HeaderName>()
                 && !is_blocked_mcp_header(&name)
+                && !forwarded_header_names.contains(&name)
                 && !nominated.contains(&name)
                 && let Ok(val) = http::HeaderValue::from_str(value_str)
             {
                 header_map.insert(name, val);
+            }
+        }
+    }
+
+    if let Some(forwarded_headers) = forwarded_headers {
+        for name in forwarded_headers.keys() {
+            if is_blocked_mcp_header(name) {
+                continue;
+            }
+            if let Some(value) = forwarded_headers.get(name) {
+                header_map.insert(name.clone(), value.clone());
             }
         }
     }
@@ -645,7 +757,7 @@ fn connection_nominated_from_json(
 
 /// Headers that must not pass through from client-supplied MCP
 /// tool config into the proxy's outbound MCP transport.
-fn is_blocked_mcp_header(name: &http::HeaderName) -> bool {
+pub(crate) fn is_blocked_mcp_header(name: &http::HeaderName) -> bool {
     if crate::http_hop::is_hop_by_hop(name.as_str()) {
         return true;
     }

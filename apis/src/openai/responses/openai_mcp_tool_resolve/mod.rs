@@ -54,6 +54,7 @@ mod config;
 mod tests;
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     hash::{Hash as _, Hasher as _},
     time::Duration,
@@ -73,6 +74,7 @@ use super::{
     state::{DeferredMcpConnector, ResponsesState},
 };
 use crate::{
+    callout_headers::effective_body_callout_headers,
     json_body::{SerializedJson, serialize_json_body},
     mcp_client,
 };
@@ -136,6 +138,9 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 ///
 /// ```yaml
 /// filter: openai_mcp_tool_resolve
+/// forward_headers:
+///   - x-tenant-id
+///   - x-user-id
 /// timeout_ms: 5000
 /// max_rewritten_body_bytes: 67108864
 /// max_tools: 128
@@ -143,9 +148,17 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 ///   - id: corp_drive
 ///     server_url: https://drive-mcp.internal/mcp
 /// ```
+///
+/// `forward_headers` applies only to configured `connector_id` targets. Direct
+/// client-selected `server_url` targets never receive ambient request headers.
+/// Credential headers are rejected; use the MCP tool entry's dedicated
+/// `authorization` field for per-target credentials.
 pub struct McpToolResolveFilter {
     /// Allow connections to loopback addresses.
     allow_loopback: bool,
+
+    /// Trusted request headers explicitly allowed across the MCP boundary.
+    forward_headers: Vec<http::HeaderName>,
 
     /// Connector ID to server URL mapping.
     connectors: HashMap<String, url::Url>,
@@ -184,6 +197,11 @@ impl McpToolResolveFilter {
             .collect::<Result<HashMap<String, url::Url>, FilterError>>()?;
         Ok(Box::new(Self {
             allow_loopback: validated.allow_loopback,
+            forward_headers: validated
+                .forward_headers
+                .iter()
+                .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
+                .collect(),
             connectors,
             max_rewritten_body_bytes: validated.max_rewritten_body_bytes,
             max_servers: validated.max_servers,
@@ -218,8 +236,7 @@ impl McpToolResolveFilter {
             self.max_rewritten_body_bytes,
             self.allow_loopback,
         );
-        let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
-        let resolution = self.resolve_all_entries(&mcp_entries, previous_tools).await?;
+        let resolution = self.resolve_request_entries(ctx, &mcp_entries).await?;
         if !resolution.has_resolved && deferred_mcp.is_empty() {
             return Ok(FilterAction::Continue);
         }
@@ -262,6 +279,19 @@ impl McpToolResolveFilter {
         Ok(FilterAction::Continue)
     }
 
+    /// Resolve request entries using the effective trusted-header view.
+    async fn resolve_request_entries(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        entries: &[serde_json::Value],
+    ) -> Result<Resolution, ResolveError> {
+        let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
+        let effective_headers = effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers));
+        let forwarded_headers = select_forward_headers(&self.forward_headers, &effective_headers);
+        self.resolve_all_entries(entries, previous_tools, &forwarded_headers)
+            .await
+    }
+
     /// Validate MCP entries: check server count and duplicate labels.
     fn validate_entries(&self, entries: &[serde_json::Value]) -> Result<(), ResolveError> {
         let server_count = count_distinct_servers(entries);
@@ -286,6 +316,7 @@ impl McpToolResolveFilter {
         &self,
         entries: &[serde_json::Value],
         previous_tools: Option<&Vec<serde_json::Value>>,
+        forwarded_headers: &http::HeaderMap,
     ) -> Result<Resolution, ResolveError> {
         let (entry_to_task, task_entries, task_allowed_names) = dedup_entries(entries);
 
@@ -293,7 +324,9 @@ impl McpToolResolveFilter {
             .iter()
             .zip(&task_allowed_names)
             .map(|(entry, allowed)| async {
-                let result = self.resolve_entry(entry, previous_tools, allowed.as_deref()).await;
+                let result = self
+                    .resolve_entry(entry, previous_tools, allowed.as_deref(), forwarded_headers)
+                    .await;
                 redact_connector_client_error(result, entry)
             })
             .collect();
@@ -313,6 +346,7 @@ impl McpToolResolveFilter {
         entry: &serde_json::Value,
         previous_tools: Option<&Vec<serde_json::Value>>,
         cache_allowed_names: Option<&[String]>,
+        forwarded_headers: &http::HeaderMap,
     ) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
         let Some(server_url) = resolvable_server_url(entry) else {
             return Ok(None);
@@ -325,14 +359,24 @@ impl McpToolResolveFilter {
                 server_label: label.to_owned(),
                 source,
             })?;
-        if !has_entry_credentials(entry)
+        if can_reuse_cached_listing(entry, is_connector)
             && let Some(cached) =
                 find_cached_listing(previous_tools, label, server_url, cache_allowed_names, is_connector)
         {
             debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
             return Ok(Some(cached));
         }
-        let tools = fetch_tools(entry, server_url, self.timeout, self.max_tools, self.allow_loopback).await?;
+        let forwarded_headers = is_connector.then_some(forwarded_headers);
+        let tools = fetch_tools(
+            entry,
+            server_url,
+            &self.forward_headers,
+            forwarded_headers,
+            self.timeout,
+            self.max_tools,
+            self.allow_loopback,
+        )
+        .await?;
         Ok(Some(tools))
     }
 }
@@ -1444,6 +1488,8 @@ fn count_distinct_servers(entries: &[serde_json::Value]) -> usize {
 async fn fetch_tools(
     entry: &serde_json::Value,
     server_url: &str,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: Option<&http::HeaderMap>,
     timeout: Duration,
     max_tools: usize,
     allow_loopback: bool,
@@ -1451,10 +1497,12 @@ async fn fetch_tools(
     let display_url = mcp_client::parse_display_url(server_url);
     debug!(label = server_label(entry), url = %display_url, "calling MCP tools/list");
     let auth = entry.get("authorization").and_then(serde_json::Value::as_str);
-    mcp_client::list_tools(
+    mcp_client::list_tools_with_forwarded_headers(
         server_url,
         entry.get("headers"),
         auth,
+        forwarded_header_names,
+        forwarded_headers,
         timeout,
         max_tools,
         allow_loopback,
@@ -1464,6 +1512,17 @@ async fn fetch_tools(
         server_label: server_label(entry).to_owned(),
         source,
     })
+}
+
+/// Select only configured headers from the effective body-phase request.
+fn select_forward_headers(names: &[http::HeaderName], source: &http::HeaderMap) -> http::HeaderMap {
+    let mut selected = http::HeaderMap::with_capacity(names.len());
+    for name in names {
+        if let Some(value) = source.get(name) {
+            selected.insert(name.clone(), value.clone());
+        }
+    }
+    selected
 }
 
 /// Rewrite the request body, replacing resolved `type: "mcp"`
@@ -2029,6 +2088,12 @@ pub(crate) fn has_pending_deferred_discovery(state: &ResponsesState) -> bool {
         && super::state::tool_search_discovery_is_within_budget(state)
 }
 
+/// Test helper for deferred discovery without ambient request headers.
+#[cfg(test)]
+async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), ResolveError> {
+    discover_deferred_connectors_with_forwarded_headers(state, &[], &http::HeaderMap::new()).await
+}
+
 /// Load tools for deferred connectors after a `tool_search_call`.
 ///
 /// Lists every pending connector before mutating state. Applies
@@ -2037,13 +2102,17 @@ pub(crate) fn has_pending_deferred_discovery(state: &ResponsesState) -> bool {
 /// sanitized deferred MCP entries with function tools. An exhausted
 /// `max_tool_calls` budget skips `tools/list` and leaves connectors
 /// pending so the round can return to the caller.
-pub(crate) async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), ResolveError> {
+pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
+    state: &mut ResponsesState,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
+) -> Result<(), ResolveError> {
     if state.deferred_mcp.is_empty() || !super::state::tool_search_discovery_is_within_budget(state) {
         return Ok(());
     }
 
     let pending = std::mem::take(&mut state.deferred_mcp);
-    let prepared = match prepare_deferred_listings(&pending).await {
+    let prepared = match prepare_deferred_listings(&pending, forwarded_header_names, forwarded_headers).await {
         Ok(prepared) => prepared,
         Err(err) => {
             state.deferred_mcp = pending;
@@ -2078,16 +2147,27 @@ struct PreparedDeferredListing {
 ///
 /// Independent servers are listed concurrently so total latency is bounded by
 /// the slowest connector rather than the sum of per-server timeouts. Commit
-/// remains transactional in [`discover_deferred_connectors`].
+/// remains transactional in [`discover_deferred_connectors_with_forwarded_headers`].
 async fn prepare_deferred_listings(
     pending: &[DeferredMcpConnector],
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
 ) -> Result<Vec<PreparedDeferredListing>, ResolveError> {
-    futures::future::try_join_all(pending.iter().map(prepare_deferred_listing)).await
+    futures::future::try_join_all(
+        pending
+            .iter()
+            .map(|connector| prepare_deferred_listing(connector, forwarded_header_names, forwarded_headers)),
+    )
+    .await
 }
 
 /// List and rewrite one deferred connector without mutating shared state.
-async fn prepare_deferred_listing(connector: &DeferredMcpConnector) -> Result<PreparedDeferredListing, ResolveError> {
-    let listing = list_deferred_connector(connector).await?;
+async fn prepare_deferred_listing(
+    connector: &DeferredMcpConnector,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
+) -> Result<PreparedDeferredListing, ResolveError> {
+    let listing = list_deferred_connector(connector, forwarded_header_names, forwarded_headers).await?;
     let entry = deferred_entry_view(connector);
     let allowed = extract_allowed_tools(&entry);
     let filtered = apply_allowed_tools_filter(listing, &allowed);
@@ -2173,7 +2253,11 @@ fn check_json_body_size(body: &serde_json::Value, max_rewritten_body_bytes: usiz
 }
 
 /// Call `tools/list` for one deferred connector, redacting URLs on error.
-async fn list_deferred_connector(connector: &DeferredMcpConnector) -> Result<Vec<serde_json::Value>, ResolveError> {
+async fn list_deferred_connector(
+    connector: &DeferredMcpConnector,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
+) -> Result<Vec<serde_json::Value>, ResolveError> {
     let entry = deferred_entry_view(connector);
     mcp_client::validate_mcp_url(&connector.server_url, connector.timeout, connector.allow_loopback)
         .await
@@ -2181,6 +2265,8 @@ async fn list_deferred_connector(connector: &DeferredMcpConnector) -> Result<Vec
     fetch_tools(
         &entry,
         &connector.server_url,
+        forwarded_header_names,
+        Some(forwarded_headers),
         connector.timeout,
         connector.max_tools,
         connector.allow_loopback,
@@ -2385,6 +2471,15 @@ fn has_entry_credentials(entry: &serde_json::Value) -> bool {
             .get("headers")
             .and_then(serde_json::Value::as_object)
             .is_some_and(|h| !h.is_empty())
+}
+
+/// Whether a previous `tools/list` result is valid without current request context.
+fn can_reuse_cached_listing(entry: &serde_json::Value, is_connector: bool) -> bool {
+    // Persisted listings do not carry forwarding provenance. A connector may
+    // have been discovered under headers from a prior dynamically reloaded
+    // pipeline, so connector listings must always be refreshed. Direct URLs
+    // remain reusable only when their entry has no request-specific credentials.
+    !is_connector && !has_entry_credentials(entry)
 }
 
 /// Extract `server_label` from an MCP tool entry.

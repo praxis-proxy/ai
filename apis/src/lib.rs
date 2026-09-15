@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod azure;
+pub mod callout_headers;
 pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
@@ -19,11 +20,16 @@ pub mod json_body;
 pub(crate) mod mcp_client;
 pub mod openai;
 pub mod promotion;
+mod state_owner;
+mod state_owner_headers;
 #[cfg(feature = "store")]
 pub mod store;
 pub mod subrequest;
 pub mod token_cache;
 pub(crate) mod web_search;
+
+pub use state_owner::{StateOwner, StateOwnerFilter, project_state_owner};
+pub use state_owner_headers::StateOwnerHeadersFilter;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -84,6 +90,7 @@ pub(crate) mod test_utils {
             request_headers_to_set: Vec::new(),
             filter_metadata: std::collections::HashMap::new(),
             pre_read_mutations: Vec::new(),
+            prior_pre_read_mutations: Vec::new(),
             structured_metadata: std::collections::HashMap::new(),
             filter_results: std::collections::HashMap::new(),
             filter_state: std::collections::HashMap::new(),
@@ -131,6 +138,14 @@ pub(crate) mod test_utils {
     /// [`FilterRegistry`]: praxis_filter::FilterRegistry
     pub(crate) fn make_ai_registry() -> praxis_filter::FilterRegistry {
         let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        praxis_filter::register_filters!(
+            @register registry,
+            http "state_owner" => crate::StateOwnerFilter::from_config
+        );
+        praxis_filter::register_filters!(
+            @register registry,
+            http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
+        );
         praxis_filter::register_filters!(
             @register registry,
             http "openai_responses_format" => crate::openai::ResponsesFormatFilter::from_config

@@ -44,6 +44,7 @@ mod config;
 mod tests;
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     time::Duration,
 };
@@ -59,8 +60,9 @@ use tracing::{debug, warn};
 
 use self::{
     approval::{
-        ApprovalError, ResolvedApproval, build_approved_tool_call, build_denial_message, extract_approval_responses,
-        is_approval_response, parse_approval_response, resolve_approval, target_fingerprint,
+        ApprovalError, ResolvedApproval, bind_forwarded_header_context, build_approved_tool_call, build_denial_message,
+        extract_approval_responses, is_approval_response, parse_approval_response, resolve_approval,
+        target_fingerprint,
     },
     config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config},
 };
@@ -69,12 +71,13 @@ use super::{
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
     openai_mcp_tool_resolve::{
-        McpToolIndex, McpToolMatch, consume_pending_list_tools_failure, discover_deferred_connectors,
-        has_pending_deferred_discovery, resolve_error_action,
+        McpToolIndex, McpToolMatch, consume_pending_list_tools_failure,
+        discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
     },
     state::{DispatchFailure, McpApprovalState, ResponsesState},
 };
 use crate::{
+    callout_headers::effective_body_callout_headers,
     json_body::serialized_len,
     mcp_client,
     store::{PendingApprovalRecord, ResponseStore, ResponseStoreRegistry},
@@ -94,6 +97,17 @@ const MAX_CALLS_METADATA: &str = "responses.mcp_max_calls_per_round";
 /// unbounded batch could otherwise overflow into an HTTP 500.
 const MAX_APPROVAL_RESPONSES: usize = 1;
 
+/// Whether this internally resolved tool entry names a configured connector.
+///
+/// Optional fields are serialized into the tool map as JSON `null`, so field
+/// presence alone is not sufficient to distinguish a request-selected URL.
+pub(super) fn is_connector_tool_entry(entry: &serde_json::Value) -> bool {
+    entry
+        .get("connector_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|connector_id| !connector_id.is_empty())
+}
+
 // -----------------------------------------------------------------------------
 // McpDispatchFilter
 // -----------------------------------------------------------------------------
@@ -111,15 +125,25 @@ const MAX_APPROVAL_RESPONSES: usize = 1;
 ///
 /// ```yaml
 /// filter: openai_mcp_dispatch
+/// forward_headers:
+///   - x-tenant-id
+///   - x-user-id
 /// timeout_ms: 30000
 /// max_calls_per_round: 32
 /// max_parallel_calls: 8
 /// max_result_bytes: 1048576
 /// max_total_result_bytes: 8388608
 /// ```
+///
+/// `forward_headers` applies only to connector-backed tools resolved by
+/// `openai_mcp_tool_resolve`. Direct client-selected `server_url` targets never
+/// receive ambient request headers. Credential headers are rejected; use the
+/// MCP tool entry's dedicated `authorization` field for per-target credentials.
 pub struct McpDispatchFilter {
     /// Allow connections to loopback addresses.
     allow_loopback: bool,
+    /// Trusted request headers explicitly allowed across the MCP boundary.
+    forward_headers: Vec<http::HeaderName>,
     /// Timeout for MCP tool calls.
     timeout: Duration,
     /// Hard cap on calls accepted from one model round.
@@ -143,6 +167,11 @@ impl McpDispatchFilter {
         let validated = build_config(cfg)?;
         Ok(Box::new(Self {
             allow_loopback: validated.allow_loopback,
+            forward_headers: validated
+                .forward_headers
+                .iter()
+                .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
+                .collect(),
             timeout: Duration::from_millis(validated.timeout_ms),
             max_calls_per_round: validated.max_calls_per_round,
             max_parallel_calls: validated.max_parallel_calls,
@@ -162,6 +191,7 @@ impl McpDispatchFilter {
         state: &ResponsesState,
         mcp_calls: &[&serde_json::Value],
         tool_index: &McpToolIndex<'_>,
+        forwarded_headers: &http::HeaderMap,
     ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
         debug!(
             count = mcp_calls.len(),
@@ -177,8 +207,32 @@ impl McpDispatchFilter {
             max_total_result_bytes: execution_batch_limit,
             timeout: self.timeout,
             allow_loopback: self.allow_loopback,
+            forwarded_header_names: &self.forward_headers,
+            forwarded_headers: Some(forwarded_headers),
         };
         execute_mcp_calls(mcp_calls, tool_index, options).await
+    }
+
+    /// Select only configured headers from the effective body-phase request.
+    fn forwarded_headers(&self, ctx: &HttpFilterContext<'_>) -> http::HeaderMap {
+        let effective = effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers));
+        let mut forwarded = http::HeaderMap::with_capacity(self.forward_headers.len());
+        for name in &self.forward_headers {
+            if let Some(value) = effective.get(name) {
+                forwarded.insert(name.clone(), value.clone());
+            }
+        }
+        forwarded
+    }
+
+    /// Bind connector approvals to the ambient headers this request will send.
+    fn bind_request_forwarded_header_context(&self, ctx: &mut HttpFilterContext<'_>, headers: &http::HeaderMap) {
+        let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
+            return;
+        };
+        for entry in state.mcp_tool_map.values_mut() {
+            bind_forwarded_header_context(entry, &self.forward_headers, headers);
+        }
     }
 
     /// Append MCP execution results to private continuation and public output state.
@@ -627,6 +681,8 @@ impl HttpFilter for McpDispatchFilter {
             return Ok(FilterAction::Continue);
         }
         ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
+        let forwarded_headers = self.forwarded_headers(ctx);
+        self.bind_request_forwarded_header_context(ctx, &forwarded_headers);
 
         // Resume approvals from the previous turn before executing any calls.
         // On approval this injects a function-call-shaped tool call that the
@@ -656,7 +712,7 @@ impl HttpFilter for McpDispatchFilter {
                 .as_ref()
                 .filter(|bytes| !bytes.is_empty())
                 .map_or(fallback.as_slice(), |bytes| bytes.as_ref());
-            let action = discover_pending_connectors(ctx, bytes).await?;
+            let action = discover_pending_connectors(ctx, bytes, &self.forward_headers, &forwarded_headers).await?;
             if !matches!(action, FilterAction::Continue) {
                 return Ok(action);
             }
@@ -675,7 +731,10 @@ impl HttpFilter for McpDispatchFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let results = match self.execute_pending_calls(state, &mcp_calls, &tool_index).await {
+        let results = match self
+            .execute_pending_calls(state, &mcp_calls, &tool_index, &forwarded_headers)
+            .await
+        {
             Ok(results) => results,
             Err(_limit) => return Ok(Self::result_limit_action(ctx)),
         };
@@ -689,12 +748,14 @@ impl HttpFilter for McpDispatchFilter {
 async fn discover_pending_connectors(
     ctx: &mut HttpFilterContext<'_>,
     body: &[u8],
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
 ) -> Result<FilterAction, FilterError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
         warn!("ResponsesState missing when discovering deferred MCP connectors");
         return Ok(FilterAction::Continue);
     };
-    match discover_deferred_connectors(state).await {
+    match discover_deferred_connectors_with_forwarded_headers(state, forwarded_header_names, forwarded_headers).await {
         Ok(()) => Ok(FilterAction::Continue),
         Err(err) => {
             let streaming = ctx
@@ -1104,7 +1165,7 @@ fn fit_result_or_limit_error(
 
 /// Controls execution of one homogeneous MCP call batch.
 #[derive(Clone, Copy)]
-struct McpExecutionOptions {
+struct McpExecutionOptions<'a> {
     /// Whether independent calls may execute concurrently.
     parallel: bool,
     /// Maximum number of calls concurrently in flight.
@@ -1117,6 +1178,10 @@ struct McpExecutionOptions {
     timeout: Duration,
     /// Whether MCP endpoints may resolve to loopback addresses.
     allow_loopback: bool,
+    /// Names reserved for trusted forwarding, including when values are absent.
+    forwarded_header_names: &'a [http::HeaderName],
+    /// Trusted request headers selected by operator configuration.
+    forwarded_headers: Option<&'a http::HeaderMap>,
 }
 
 /// Execute MCP tool calls — concurrently when `parallel` is true,
@@ -1124,7 +1189,7 @@ struct McpExecutionOptions {
 async fn execute_mcp_calls(
     mcp_calls: &[&serde_json::Value],
     tool_index: &McpToolIndex<'_>,
-    options: McpExecutionOptions,
+    options: McpExecutionOptions<'_>,
 ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
     let minimum_reservation = mcp_calls
         .len()
@@ -1155,14 +1220,10 @@ async fn execute_mcp_calls(
 /// Avoid detached tasks: dropping the request must also cancel every pending
 /// external side effect. Panics are converted to per-call errors so one faulty
 /// future does not discard successful siblings.
-#[expect(
-    clippy::too_many_lines,
-    reason = "task joining and ordered byte-budget commit are one lifecycle"
-)]
 async fn execute_parallel(
     mcp_calls: &[&serde_json::Value],
     tool_index: &McpToolIndex<'_>,
-    options: McpExecutionOptions,
+    options: McpExecutionOptions<'_>,
 ) -> Vec<McpCallResult> {
     let mut results = Vec::with_capacity(mcp_calls.len());
     let mut remaining_calls = mcp_calls;
@@ -1170,16 +1231,9 @@ async fn execute_parallel(
         let chunk_size = remaining_calls.len().min(options.max_parallel_calls);
         let (chunk, rest) = remaining_calls.split_at(chunk_size);
         remaining_calls = rest;
-        let futures = chunk.iter().map(|tc| {
-            std::panic::AssertUnwindSafe(execute_single_call(
-                tc,
-                tool_index,
-                options.max_result_bytes,
-                options.timeout,
-                options.allow_loopback,
-            ))
-            .catch_unwind()
-        });
+        let futures = chunk
+            .iter()
+            .map(|tc| std::panic::AssertUnwindSafe(execute_single_call(tc, tool_index, &options)).catch_unwind());
         for (tc, outcome) in chunk.iter().zip(join_all(futures).await) {
             let result = match outcome {
                 Ok(Some(result)) => result,
@@ -1203,19 +1257,11 @@ async fn execute_parallel(
 async fn execute_sequential(
     mcp_calls: &[&serde_json::Value],
     tool_index: &McpToolIndex<'_>,
-    options: McpExecutionOptions,
+    options: McpExecutionOptions<'_>,
 ) -> Vec<McpCallResult> {
     let mut results = Vec::with_capacity(mcp_calls.len());
     for tc in mcp_calls {
-        let result = if let Some(result) = execute_single_call(
-            tc,
-            tool_index,
-            options.max_result_bytes,
-            options.timeout,
-            options.allow_loopback,
-        )
-        .await
-        {
+        let result = if let Some(result) = execute_single_call(tc, tool_index, &options).await {
             result
         } else {
             warn!(tool = ?tc.get("name"), "sequential MCP call returned None, emitting error");
@@ -1351,9 +1397,7 @@ fn process_call_result(
 async fn execute_single_call(
     tool_call: &serde_json::Value,
     tool_index: &McpToolIndex<'_>,
-    max_result_bytes: usize,
-    timeout: Duration,
-    allow_loopback: bool,
+    options: &McpExecutionOptions<'_>,
 ) -> Option<McpCallResult> {
     let encoded_name = tool_call.get("name").and_then(serde_json::Value::as_str)?;
     let call_id = tool_call
@@ -1375,6 +1419,9 @@ async fn execute_single_call(
         .unwrap_or("unknown");
     let headers = entry.get("headers");
     let authorization = entry.get("authorization").and_then(serde_json::Value::as_str);
+    let forwarded_headers = is_connector_tool_entry(entry)
+        .then_some(options.forwarded_headers)
+        .flatten();
     let (arguments, arguments_string) = match parse_call_arguments(
         tool_call,
         call_id,
@@ -1396,7 +1443,7 @@ async fn execute_single_call(
     // Limiting the wire/result payload to one quarter of the retained allowance
     // keeps every in-flight task within its aggregate reservation even at that
     // worst-case ownership point.
-    let payload_limit = result_payload_limit(max_result_bytes);
+    let payload_limit = result_payload_limit(options.max_result_bytes);
     if payload_limit == 0 {
         return Some(build_error_result(
             call_id,
@@ -1408,15 +1455,17 @@ async fn execute_single_call(
         ));
     }
 
-    let result = mcp_client::call_tool(
+    let result = mcp_client::call_tool_with_forwarded_headers(
         server_url,
         headers,
         authorization,
+        options.forwarded_header_names,
+        forwarded_headers,
         original_tool_name,
         arguments,
-        timeout,
+        options.timeout,
         payload_limit,
-        allow_loopback,
+        options.allow_loopback,
     )
     .await;
     Some(process_call_result(

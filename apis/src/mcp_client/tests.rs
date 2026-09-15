@@ -51,6 +51,66 @@ fn build_config_with_headers() {
 }
 
 #[test]
+fn trusted_forwarded_headers_override_tool_entry_values() {
+    let headers = serde_json::json!({"x-tenant-id": "spoofed", "x-tool": "kept"});
+    let mut forwarded = http::HeaderMap::new();
+    forwarded.insert("x-tenant-id", http::HeaderValue::from_static("tenant-a"));
+    forwarded.insert(http::header::HOST, http::HeaderValue::from_static("evil.example"));
+
+    let config = build_transport_config_with_forwarded_headers(
+        "http://localhost:8001/mcp",
+        Some(&headers),
+        None,
+        &[http::HeaderName::from_static("x-tenant-id")],
+        Some(&forwarded),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config
+            .custom_headers
+            .get(&http::HeaderName::from_static("x-tenant-id"))
+            .unwrap(),
+        "tenant-a"
+    );
+    assert_eq!(
+        config
+            .custom_headers
+            .get(&http::HeaderName::from_static("x-tool"))
+            .unwrap(),
+        "kept"
+    );
+    assert!(!config.custom_headers.contains_key(&http::header::HOST));
+}
+
+#[test]
+fn configured_forwarded_names_are_stripped_without_trusted_values() {
+    let headers = serde_json::json!({"x-tenant-id": "spoofed", "x-tool": "kept"});
+
+    let config = build_transport_config_with_forwarded_headers(
+        "http://localhost:8001/mcp",
+        Some(&headers),
+        None,
+        &[http::HeaderName::from_static("x-tenant-id")],
+        None,
+    )
+    .unwrap();
+
+    assert!(
+        !config
+            .custom_headers
+            .contains_key(&http::HeaderName::from_static("x-tenant-id"))
+    );
+    assert_eq!(
+        config
+            .custom_headers
+            .get(&http::HeaderName::from_static("x-tool"))
+            .unwrap(),
+        "kept"
+    );
+}
+
+#[test]
 fn build_config_ignores_non_string_header_values() {
     let headers = serde_json::json!({"x-good": "ok", "x-bad": 123});
     let config = build_transport_config("http://localhost:8001/mcp", Some(&headers), None).unwrap();

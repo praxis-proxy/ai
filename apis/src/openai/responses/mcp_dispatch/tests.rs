@@ -12,9 +12,9 @@ use serde_json::json;
 use super::{
     McpDispatchFilter, McpExecutionOptions, admitted_result_limits, build_error_result, build_success_result,
     content_blocks_to_output, execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id,
-    extract_mcp_tool_calls, find_by_encoded_name, is_mcp_tool_call, mcp_call_ids_are_unique_and_new,
-    normalize_arguments, parse_call_arguments, partition_calls_by_approval, prepare_response_round,
-    process_call_result, resolve_tool_entry, result_payload_limit,
+    extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry, is_mcp_tool_call,
+    mcp_call_ids_are_unique_and_new, normalize_arguments, parse_call_arguments, partition_calls_by_approval,
+    prepare_response_round, process_call_result, resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     openai::responses::{
@@ -22,9 +22,9 @@ use crate::{
         mcp_classify::{ApprovalPolicy, parse_approval_policy, requires_approval},
         mcp_dispatch::{
             approval::{
-                ApprovalError, ResolvedApproval, build_approved_tool_call, build_denial_message,
-                extract_approval_responses, is_approval_response, parse_approval_response, resolve_approval,
-                target_fingerprint,
+                ApprovalError, ResolvedApproval, bind_forwarded_header_context, build_approved_tool_call,
+                build_denial_message, extract_approval_responses, is_approval_response, parse_approval_response,
+                resolve_approval, target_fingerprint,
             },
             config::{McpDispatchConfig, build_config},
         },
@@ -43,6 +43,19 @@ fn call_refs(calls: &[serde_json::Value]) -> Vec<&serde_json::Value> {
 
 const TEST_MAX_RESULT_BYTES: usize = 1_048_576;
 const TEST_MAX_TOTAL_RESULT_BYTES: usize = 8_388_608;
+
+#[test]
+fn only_nonempty_string_connector_ids_enable_ambient_headers() {
+    assert!(is_connector_tool_entry(&json!({"connector_id": "configured"})));
+    for direct_or_invalid in [
+        json!({}),
+        json!({"connector_id": null}),
+        json!({"connector_id": ""}),
+        json!({"connector_id": true}),
+    ] {
+        assert!(!is_connector_tool_entry(&direct_or_invalid));
+    }
+}
 
 #[test]
 fn rejected_calls_do_not_dilute_admitted_result_allowance() {
@@ -73,7 +86,7 @@ fn mcp_call_ids_must_be_present_nonempty_and_unique() {
     ));
 }
 
-fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecutionOptions {
+fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecutionOptions<'static> {
     McpExecutionOptions {
         parallel,
         max_parallel_calls: 8,
@@ -81,6 +94,8 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
         timeout,
         allow_loopback: true,
+        forwarded_header_names: &[],
+        forwarded_headers: None,
     }
 }
 
@@ -596,6 +611,22 @@ fn config_custom_timeout() {
 }
 
 #[test]
+fn config_validates_forward_headers() {
+    let cfg = serde_yaml::from_str::<McpDispatchConfig>("forward_headers: [X-Tenant-ID, x-user-id]").unwrap();
+    let validated = build_config(cfg).unwrap();
+    assert_eq!(validated.forward_headers, ["x-tenant-id", "x-user-id"]);
+
+    for yaml in [
+        "forward_headers: [host]",
+        "forward_headers: [authorization]",
+        "forward_headers: [x-user-id, X-User-ID]",
+    ] {
+        let cfg = serde_yaml::from_str::<McpDispatchConfig>(yaml).unwrap();
+        assert!(build_config(cfg).is_err(), "should reject {yaml}");
+    }
+}
+
+#[test]
 fn config_rejects_unknown_fields() {
     let result = serde_yaml::from_str::<McpDispatchConfig>("unknown_field: true");
     assert!(result.is_err(), "should reject unknown fields");
@@ -1070,8 +1101,9 @@ async fn execute_single_call_missing_name_returns_none() {
     let map = sample_tool_map();
     let tc = json!({"call_id": "c1"});
     let timeout = std::time::Duration::from_millis(100);
+    let options = execution_options(false, timeout);
     assert!(
-        execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
+        execute_single_call(&tc, &McpToolIndex::new(&map), &options)
             .await
             .is_none()
     );
@@ -1082,8 +1114,9 @@ async fn execute_single_call_unknown_tool_returns_none() {
     let map = sample_tool_map();
     let tc = json!({"name": "nonexistent", "call_id": "c1"});
     let timeout = std::time::Duration::from_millis(100);
+    let options = execution_options(false, timeout);
     assert!(
-        execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
+        execute_single_call(&tc, &McpToolIndex::new(&map), &options)
             .await
             .is_none()
     );
@@ -1094,7 +1127,8 @@ async fn execute_single_call_ambiguous_returns_error() {
     let map = lossy_collision_tool_map();
     let tc = json!({"name": "my_server__get", "call_id": "c1"});
     let timeout = std::time::Duration::from_millis(100);
-    let result = execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
+    let options = execution_options(false, timeout);
+    let result = execute_single_call(&tc, &McpToolIndex::new(&map), &options)
         .await
         .unwrap();
     assert!(result.output_item["error"].as_str().unwrap().contains("ambiguous"));
@@ -1105,7 +1139,8 @@ async fn execute_single_call_malformed_args_returns_error() {
     let map = sample_tool_map();
     let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": "not-json"});
     let timeout = std::time::Duration::from_millis(100);
-    let result = execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
+    let options = execution_options(false, timeout);
+    let result = execute_single_call(&tc, &McpToolIndex::new(&map), &options)
         .await
         .unwrap();
     assert!(result.output_item["error"].as_str().unwrap().contains("malformed"));
@@ -1116,7 +1151,8 @@ async fn execute_single_call_connection_error() {
     let map = sample_tool_map();
     let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {"city": "Paris"}});
     let timeout = std::time::Duration::from_millis(200);
-    let result = execute_single_call(&tc, &McpToolIndex::new(&map), TEST_MAX_RESULT_BYTES, timeout, true)
+    let options = execution_options(false, timeout);
+    let result = execute_single_call(&tc, &McpToolIndex::new(&map), &options)
         .await
         .unwrap();
     assert!(
@@ -2722,6 +2758,51 @@ fn resolve_approval_rejects_swapped_authorization() {
         matches!(err, ApprovalError::TargetIdentityMismatch(_)),
         "a swapped authorization credential must fail closed: {err:?}"
     );
+}
+
+#[test]
+fn resolve_approval_rejects_changed_forwarded_connector_identity() {
+    let mut approved = weather_entry();
+    approved["connector_id"] = json!("trusted");
+    let mut approved_headers = http::HeaderMap::new();
+    approved_headers.insert("x-tenant-id", "tenant-a".parse().unwrap());
+    let names = [http::HeaderName::from_static("x-tenant-id")];
+    bind_forwarded_header_context(&mut approved, &names, &approved_headers);
+
+    let pending = pending_record("call_1", "weather", "get_weather", "{}", target_fingerprint(&approved));
+    let mut current = approved;
+    let mut current_headers = http::HeaderMap::new();
+    current_headers.insert("x-tenant-id", "tenant-b".parse().unwrap());
+    bind_forwarded_header_context(&mut current, &names, &current_headers);
+    let map = HashMap::from([(("weather".to_owned(), "get_weather".to_owned()), current)]);
+    let input = parse_approval_response(&approval_response("call_1", true, None)).expect("parse");
+
+    let err = resolve_approval(&input, &pending, &map).unwrap_err();
+    assert!(
+        matches!(err, ApprovalError::TargetIdentityMismatch(_)),
+        "an approval resumed under another connector identity must fail closed: {err:?}"
+    );
+}
+
+#[test]
+fn resolve_approval_rejects_changed_forwarded_name_set_when_values_are_absent() {
+    let mut approved = weather_entry();
+    approved["connector_id"] = json!("trusted");
+    let empty_headers = http::HeaderMap::new();
+    bind_forwarded_header_context(
+        &mut approved,
+        &[http::HeaderName::from_static("x-tenant-id")],
+        &empty_headers,
+    );
+
+    let pending = pending_record("call_1", "weather", "get_weather", "{}", target_fingerprint(&approved));
+    let mut current = approved;
+    bind_forwarded_header_context(&mut current, &[], &empty_headers);
+    let map = HashMap::from([(("weather".to_owned(), "get_weather".to_owned()), current)]);
+    let input = parse_approval_response(&approval_response("call_1", true, None)).expect("parse");
+
+    let err = resolve_approval(&input, &pending, &map).unwrap_err();
+    assert!(matches!(err, ApprovalError::TargetIdentityMismatch(_)));
 }
 
 #[test]

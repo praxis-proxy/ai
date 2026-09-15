@@ -51,7 +51,8 @@ pub fn resolve_pipelines(
             entries.extend_from_slice(chain_filters);
         }
 
-        let mut pipeline = FilterPipeline::build_with_chains(&mut entries, registry, &chains)?;
+        let mut pipeline =
+            FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)?;
         configure_pipeline(&mut pipeline, config, health_registry, kv_stores, subrequest_client)?;
 
         validate_provider_boundary(listener, &entries, &chains)?;

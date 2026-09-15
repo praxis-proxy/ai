@@ -1290,6 +1290,41 @@ fn apply_request_header_mutation_records_ordered_pre_read_mutations() {
     );
 }
 
+#[test]
+fn ordered_ext_proc_mutations_preserve_earlier_grouped_mutations() {
+    let req = make_request(Method::GET, "/");
+    let mut ctx = make_ctx(&req);
+    let owner = http::HeaderName::from_static("x-owner");
+    ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
+    ctx.request_headers_to_set
+        .push((owner.clone(), http::HeaderValue::from_static("tenant-a")));
+    ctx.extra_request_headers
+        .push((std::borrow::Cow::Borrowed("x-classified"), "yes".to_owned()));
+
+    let mutation = HeaderMutation {
+        set_headers: vec![make_hvo("x-ext-proc", "applied")],
+        remove_headers: vec![],
+    };
+    mutations::apply_request_header_mutation(&mutation, &mut ctx);
+
+    assert!(matches!(
+        &ctx.pre_read_mutations[0],
+        TrustedHeaderMutation::Remove(name) if name == http::header::ACCEPT_ENCODING
+    ));
+    assert!(matches!(
+        &ctx.pre_read_mutations[1],
+        TrustedHeaderMutation::Set(name, value) if name == owner && value == "tenant-a"
+    ));
+    assert!(matches!(
+        &ctx.pre_read_mutations[2],
+        TrustedHeaderMutation::Add(name, value) if name == "x-classified" && value == "yes"
+    ));
+    assert!(matches!(
+        &ctx.pre_read_mutations[3],
+        TrustedHeaderMutation::Add(name, value) if name == "x-ext-proc" && value == "applied"
+    ));
+}
+
 // -----------------------------------------------------------------------------
 // Mutation: apply_response_header_mutation
 // -----------------------------------------------------------------------------
@@ -2471,6 +2506,7 @@ fn make_ctx(req: &praxis_filter::Request) -> HttpFilterContext<'_> {
         filter_metadata: HashMap::new(),
         structured_metadata: HashMap::new(),
         pre_read_mutations: Vec::new(),
+        prior_pre_read_mutations: Vec::new(),
         filter_results: HashMap::new(),
         filter_state: HashMap::new(),
         health_registry: None,

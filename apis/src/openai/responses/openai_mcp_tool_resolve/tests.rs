@@ -24,6 +24,21 @@ fn config_with_custom_timeout() {
 }
 
 #[test]
+fn config_validates_forward_headers() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("forward_headers: [X-Tenant-ID, x-user-id]").unwrap();
+    assert!(McpToolResolveFilter::from_config(&yaml).is_ok());
+
+    for yaml in [
+        "forward_headers: [host]",
+        "forward_headers: [authorization]",
+        "forward_headers: [x-user-id, X-User-ID]",
+    ] {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        assert!(McpToolResolveFilter::from_config(&yaml).is_err());
+    }
+}
+
+#[test]
 fn config_rejects_unknown_fields() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("unknown_field: true").unwrap();
     assert!(
@@ -939,6 +954,15 @@ fn no_credentials_without_auth_or_headers() {
 fn no_credentials_with_empty_headers() {
     let entry = serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "headers": {}});
     assert!(!has_entry_credentials(&entry));
+}
+
+#[test]
+fn connector_cache_is_disabled_across_forwarding_reloads() {
+    let connector = serde_json::json!({"connector_id": "trusted", "server_label": "tools"});
+    assert!(!can_reuse_cached_listing(&connector, true));
+
+    let direct = serde_json::json!({"server_url": "https://mcp.example.test"});
+    assert!(can_reuse_cached_listing(&direct, false));
 }
 
 #[test]
