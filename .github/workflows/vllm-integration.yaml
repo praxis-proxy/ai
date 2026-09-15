@@ -14,6 +14,7 @@ on:
       - "apis/src/store/**"
       - "server/**"
       - "tests/integration/sdk/openai/**"
+      - "tests/utils/examples/conversations_tenant_proxy.rs"
       - "tests/integration/ogx-constraints.txt"
       - "examples/configs/openai/responses/**"
       - "Cargo.toml"
@@ -32,6 +33,7 @@ on:
       - "apis/src/store/**"
       - "server/**"
       - "tests/integration/sdk/openai/**"
+      - "tests/utils/examples/conversations_tenant_proxy.rs"
       - "tests/integration/ogx-constraints.txt"
       - "examples/configs/openai/responses/**"
       - "Cargo.toml"
@@ -90,6 +92,7 @@ jobs:
             'apis/src/store/' \
             'server/' \
             'tests/integration/sdk/openai/' \
+            'tests/utils/examples/conversations_tenant_proxy.rs' \
             'tests/integration/ogx-constraints.txt' \
             'examples/configs/openai/responses/' \
             'Cargo.toml' \
@@ -168,12 +171,16 @@ jobs:
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy
+        run: |
+          cargo build -p praxis-ai-proxy
+          cargo build -p praxis-test-utils --example conversations_tenant_proxy
 
       - name: Wait for vLLM readiness
         uses: ./.github/actions/wait-vllm
 
       - name: Run Conversations SDK integration tests
+        env:
+          PRAXIS_TENANT_TEST_BIN: target/debug/examples/conversations_tenant_proxy
         run: |
           uv run tests/integration/sdk/openai/test_openai_conversations.py -s
 
@@ -317,7 +324,9 @@ jobs:
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy
+        run: |
+          cargo build -p praxis-ai-proxy
+          cargo build -p praxis-test-utils --example conversations_tenant_proxy
 
       - name: Wait for vLLM readiness
         uses: ./.github/actions/wait-vllm
@@ -325,6 +334,7 @@ jobs:
       - name: Run Conversations SDK integration tests (PostgreSQL store)
         env:
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          PRAXIS_TENANT_TEST_BIN: target/debug/examples/conversations_tenant_proxy
         run: |
           uv run tests/integration/sdk/openai/test_openai_conversations.py -s
 
