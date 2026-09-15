@@ -7,6 +7,7 @@
 //! backends, and supporting types. Used by AI API filters for persisting
 //! response records and conversation history.
 
+mod compression;
 #[cfg_attr(
     not(any(feature = "store-postgres", feature = "store-sqlite")),
     expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),
@@ -67,6 +68,7 @@ pub use self::postgres_tls::PgTlsConfig;
 #[cfg(feature = "store-sqlite")]
 pub use self::sqlite::SqliteResponseStore;
 pub use self::{
+    compression::{CompressionAlgorithm, StoreCompressionConfig},
     pool::PoolConfig,
     ssl_mode::SslMode,
     trait_def::{ConversationItemStore, ResponseStore},

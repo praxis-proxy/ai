@@ -170,6 +170,7 @@ impl OpenaiConversationsFilter {
             &self.config.conversations_table,
             Some(&self.config.items_table),
             self.config.pool.as_ref(),
+            None,
         )
         .await
         .map(|s| {
@@ -191,6 +192,7 @@ impl OpenaiConversationsFilter {
             Some(&self.config.items_table),
             &tls,
             self.config.pool.as_ref(),
+            None,
         )
         .await
         .map(|s| {

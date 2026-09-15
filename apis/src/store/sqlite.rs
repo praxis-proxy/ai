@@ -11,10 +11,12 @@ use sqlx::{
 use tracing::info;
 
 use super::{
+    compression::{StoreCompressionConfig, decode},
     pool::{PoolConfig, apply_pool_config},
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, TableNames, check_schema,
         expected_tables, generate_ddl, pending_approvals_table, schema_version_table, sqlite_key_column_folding,
+        SqlDialect,
     },
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
@@ -35,6 +37,8 @@ pub struct SqliteResponseStore {
     pool: SqlitePool,
     /// Configured table names.
     tables: TableNames,
+    /// Payload compression codec applied on write.
+    compression: StoreCompressionConfig,
 }
 
 impl SqliteResponseStore {
@@ -49,23 +53,34 @@ impl SqliteResponseStore {
     /// config (e.g., `openai_responses`). `items_table` is
     /// optional and enables conversation item storage.
     ///
+    /// `compression` selects the optional codec applied to the
+    /// responses table's payload columns on write; when omitted, those
+    /// payloads are stored as raw JSON bytes. Reads auto-detect the
+    /// format, so records written under any setting remain readable.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Database`] if the connection, schema
     /// initialization, or table name validation fails.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "constructor grew a compression parameter alongside table and pool options"
+    )]
     pub async fn new(
         database_url: &str,
         responses_table: &str,
         conversations_table: &str,
         items_table: Option<&str>,
         pool_config: Option<&PoolConfig>,
+        compression: Option<&StoreCompressionConfig>,
     ) -> Result<Self, StoreError> {
         let tables = TableNames {
             responses: responses_table.to_owned(),
             conversations: conversations_table.to_owned(),
             items: items_table.map(str::to_owned),
         };
-        let ddl = generate_ddl(&tables)?;
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite)?;
 
         let options: SqliteConnectOptions = database_url
             .parse()
@@ -90,7 +105,11 @@ impl SqliteResponseStore {
             conversations = conversations_table,
             "response store initialized"
         );
-        Ok(Self { pool, tables })
+        Ok(Self {
+            pool,
+            tables,
+            compression: compression.cloned().unwrap_or_default(),
+        })
     }
 
     /// Insert or update a conversation row shared by both store traits.
@@ -447,10 +466,9 @@ async fn check_schema_version(pool: &SqlitePool, tables: &TableNames) -> Result<
 )]
 impl ResponseStore for SqliteResponseStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
-        let response_object =
-            serde_json::to_string(&record.response_object).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let input = serde_json::to_string(&record.input).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let messages = serde_json::to_string(&record.messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let response_object = self.compression.encode(&record.response_object)?;
+        let input = self.compression.encode(&record.input)?;
+        let messages = self.compression.encode(&record.messages)?;
 
         let sql = format!(
             "INSERT INTO {} \
@@ -1421,11 +1439,11 @@ fn row_to_pending_approval_record(row: &sqlx::sqlite::SqliteRow) -> Result<Pendi
 
 /// Convert a sqlx row to a [`ResponseRecord`].
 fn row_to_response_record(row: &sqlx::sqlite::SqliteRow) -> Result<ResponseRecord, StoreError> {
-    let response_object_json: String = row
+    let response_object_json: Vec<u8> = row
         .try_get("response_object")
         .map_err(|e| StoreError::Database(e.to_string()))?;
-    let input_json: String = row.try_get("input").map_err(|e| StoreError::Database(e.to_string()))?;
-    let messages_json: String = row
+    let input_json: Vec<u8> = row.try_get("input").map_err(|e| StoreError::Database(e.to_string()))?;
+    let messages_json: Vec<u8> = row
         .try_get("messages")
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
@@ -1436,10 +1454,9 @@ fn row_to_response_record(row: &sqlx::sqlite::SqliteRow) -> Result<ResponseRecor
             .try_get("created_at")
             .map_err(|e| StoreError::Database(e.to_string()))?,
         model: row.try_get("model").map_err(|e| StoreError::Database(e.to_string()))?,
-        response_object: serde_json::from_str(&response_object_json)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?,
-        input: serde_json::from_str(&input_json).map_err(|e| StoreError::Serialization(e.to_string()))?,
-        messages: serde_json::from_str(&messages_json).map_err(|e| StoreError::Serialization(e.to_string()))?,
+        response_object: decode(&response_object_json)?,
+        input: decode(&input_json)?,
+        messages: decode(&messages_json)?,
     })
 }
 

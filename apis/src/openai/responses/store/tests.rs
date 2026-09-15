@@ -53,6 +53,48 @@ conversations_table: conversations
 }
 
 #[test]
+fn config_with_zstd_compression_parses_and_validates() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+compression:
+  algorithm: zstd
+  level: 5
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    validate_config(&cfg).expect("valid zstd compression config should validate");
+    let compression = cfg.compression.expect("compression should be present");
+    assert_eq!(compression.level, Some(5), "configured level should round-trip");
+}
+
+#[test]
+fn config_with_invalid_compression_level_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+compression:
+  algorithm: none
+  level: 3
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let err = validate_config(&cfg).expect_err("level with algorithm none should be rejected");
+    assert!(
+        format!("{err}").contains("level"),
+        "error should mention the offending level field: {err}"
+    );
+}
+
+#[test]
 fn empty_database_url_rejected() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
@@ -1751,7 +1793,7 @@ async fn pipeline_persists_after_format_request_body_classification() {
         "response body phase should persist and continue"
     );
 
-    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None, None)
         .await
         .unwrap();
     let record = store
@@ -1863,7 +1905,7 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
         "EOS should persist from accumulated state and continue"
     );
 
-    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None, None)
         .await
         .unwrap();
     let record = store
@@ -1947,7 +1989,7 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
     let (db_url, db_path) = temp_sqlite_url("pipeline_persists_rehydrated_messages");
-    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
+    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None, None)
         .await
         .unwrap();
     seeded_store
@@ -2041,7 +2083,7 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
         "response body phase should persist and continue"
     );
 
-    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None, None)
         .await
         .unwrap();
     let record = store
@@ -2072,7 +2114,7 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
     let (db_url, db_path) = temp_sqlite_url("pipeline_persists_fallback_mcp_metadata");
-    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
+    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None, None)
         .await
         .unwrap();
     seeded_store
@@ -2171,7 +2213,7 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
         "response body phase should persist and continue"
     );
 
-    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None, None)
         .await
         .unwrap();
     let record = store

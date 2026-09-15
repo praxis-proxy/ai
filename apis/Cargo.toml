@@ -22,7 +22,7 @@ openai-responses = []
 # openai_file_resolve: downloads referenced files (pinned reqwest client).
 openai-file-resolve-filter = ["openai-responses", "dep:reqwest"]
 # Response and conversation storage (SQL). Implies the Responses kernel it serves.
-store = ["openai-responses", "dep:sqlx", "dep:dashmap"]
+store = ["openai-responses", "dep:sqlx", "dep:dashmap", "dep:zstd"]
 store-postgres = ["store", "sqlx/postgres", "sqlx/tls-native-tls"]
 store-sqlite = ["store", "sqlx/sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
@@ -73,6 +73,7 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tracing = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }

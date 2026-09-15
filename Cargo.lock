@@ -3466,6 +3466,7 @@ dependencies = [
  "url",
  "utoipa",
  "yaml_serde",
+ "zstd",
 ]
 
 [[package]]
