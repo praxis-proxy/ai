@@ -42,7 +42,9 @@ impl TempWorkspace {
         )?;
         fs::write(dir.path().join("result.txt"), "")?;
 
-        let verify_sh = format!("#!/bin/sh\ngrep -q \"{expected_content}\" result.txt\n");
+        let verify_sh = format!(
+            "#!/bin/sh\nset -eu\ngrep -q \"{expected_content}\" result.txt\nprintf 'verified\\n' > .verification-ran\n"
+        );
         let verify_path = dir.path().join("verify.sh");
         fs::write(&verify_path, verify_sh)?;
 
@@ -92,6 +94,10 @@ impl TempWorkspace {
             self.expected_content,
             content
         );
+
+        let marker = fs::read_to_string(self.dir.path().join(".verification-ran"))
+            .expect("client should execute verify.sh and create its marker");
+        assert_eq!(marker, "verified\n", "verification marker should be complete");
 
         let status = self.run_verification().expect("execution of verify.sh script failed");
         assert!(
