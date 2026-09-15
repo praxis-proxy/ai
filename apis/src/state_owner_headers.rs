@@ -118,9 +118,11 @@ impl StateOwnerHeadersFilter {
         // still contain the uncommitted ingress identity headers. Strip those
         // raw inputs in the destination chain before emitting only its
         // explicitly configured identity contract.
-        // Always use the ordered body-phase log. If a later filter starts using
-        // it, Core gives that log precedence over all grouped queues.
-        let ordered = body_phase;
+        // Do not activate Core's exclusive ordered mode: current body filters
+        // still use the grouped queues, and activating it here would suppress
+        // their later mutations. If an earlier trusted producer already chose
+        // ordered mode, join its log so this projection retains provenance.
+        let ordered = body_phase && !ctx.pre_read_mutations.is_empty();
         strip_ingress_headers(ctx, ordered);
         queue_projection(ctx, &self.tenant_header, tenant, ordered);
         queue_projection(ctx, &self.subject_header, subject, ordered);

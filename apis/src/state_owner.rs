@@ -354,12 +354,14 @@ impl StateOwnerFilter {
 
     /// Queue removal using the mutation channel appropriate for the lifecycle.
     fn queue_header_removal(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) {
+        // Do not activate Core's exclusive ordered mode: current body filters
+        // still use the grouped queues, and activating it here would suppress
+        // their later mutations. If an earlier trusted producer already chose
+        // ordered mode, join its log so these removals retain provenance.
+        let ordered = body_phase && !ctx.pre_read_mutations.is_empty();
         for header in self.ingress_headers.iter() {
             ctx.request_headers_to_remove.push(header.clone());
-            // A later ordered producer (for example ext_proc) makes Core ignore
-            // every grouped queue for this pre-read pass. Always retain this
-            // security mutation in the ordered log during the body phase.
-            if body_phase {
+            if ordered {
                 ctx.pre_read_mutations
                     .push(TrustedHeaderMutation::Remove(header.clone()));
             }
