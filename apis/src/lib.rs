@@ -19,11 +19,14 @@ pub mod json_body;
 pub(crate) mod mcp_client;
 pub mod openai;
 pub mod promotion;
+mod state_owner;
 #[cfg(feature = "store")]
 pub mod store;
 pub mod subrequest;
 pub mod token_cache;
 pub(crate) mod web_search;
+
+pub use state_owner::{StateOwner, StateOwnerFilter};
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -135,7 +138,7 @@ pub(crate) mod test_utils {
         let mut registry = praxis_filter::FilterRegistry::with_builtins();
         praxis_filter::register_filters!(
             @register registry,
-            http "openai_state_owner" => crate::openai::OpenAiStateOwnerFilter::from_config
+            http "state_owner" => crate::StateOwnerFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,

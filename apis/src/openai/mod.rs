@@ -14,7 +14,6 @@ pub(crate) mod error_response_formatter;
 pub(crate) mod include;
 mod operation;
 pub(crate) mod operation_classifier;
-mod ownership;
 pub(crate) mod responses;
 pub(crate) mod sse;
 #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
@@ -31,7 +30,6 @@ pub use conversations::{
 };
 pub use operation::{OpenAiHandlingMode, OpenAiOperationSpec, OpenAiRequestBody};
 pub use operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter};
-pub use ownership::{OpenAiStateOwner, OpenAiStateOwnerFilter};
 pub use responses::{
     AgenticLoopFilter, CompactFilter, DocExtractFilter, FileResolveFilter, FileSearchCalloutFilter, McpDispatchFilter,
     McpToolResolveFilter, ModelRewriteFilter, OpenaiResponsesValidateFilter, RehydrateFilter, ResponseStoreFilter,

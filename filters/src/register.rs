@@ -111,6 +111,7 @@ fn register_gcp_filters(registry: &mut FilterRegistry) {
 
 /// Register general-purpose AI filters.
 fn register_general_ai_filters(registry: &mut FilterRegistry) {
+    register_state_owner(registry);
     #[cfg(feature = "http-callout-filter")]
     praxis_filter::register_filters!(
         @register registry,
@@ -235,7 +236,6 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
 
 /// Register OpenAI Responses API request-path filters.
 fn register_openai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
-    register_openai_state_owner(registry);
     register_openai_responses_filters(registry, subrequest_client);
     praxis_filter::register_filters!(
         @register registry,
@@ -247,18 +247,16 @@ fn register_openai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     );
 }
 
-/// Register the trusted OpenAI state owner adapter as security-critical.
+/// Register the trusted state owner adapter as security-critical.
 #[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
-fn register_openai_state_owner(registry: &mut FilterRegistry) {
+fn register_state_owner(registry: &mut FilterRegistry) {
     registry
         .register_with_class(
-            "openai_state_owner",
-            praxis_filter::FilterFactory::Http(std::sync::Arc::new(
-                praxis_ai_apis::openai::OpenAiStateOwnerFilter::from_config,
-            )),
+            "state_owner",
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(praxis_ai_apis::StateOwnerFilter::from_config)),
             praxis_filter::SecurityClass::Security,
         )
-        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_state_owner'"));
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'state_owner'"));
 }
 
 /// Register OpenAI Responses API filters.
@@ -483,7 +481,7 @@ mod tests {
             "ai_guardrails",
             "identity_header_guard",
             "llmisvc_model_provider_resolver",
-            "openai_state_owner",
+            "state_owner",
             "openai_responses_validate",
             "responses_to_chat_completions",
             "a2a",

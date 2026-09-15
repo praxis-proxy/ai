@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Trusted ownership context for OpenAI persisted state.
+//! Trusted ownership context for persisted private state.
 //!
 //! The filter in this module normalizes identity supplied by a trusted upstream
 //! authentication boundary. Deployments must prevent untrusted clients from
@@ -17,11 +17,10 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::header::HeaderName;
 use praxis_filter::{
-    BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext, TrustedHeaderMutation, parse_filter_config,
+    BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, TrustedHeaderMutation,
+    parse_filter_config,
 };
 use serde::Deserialize;
-
-use super::responses::error::responses_error_rejection;
 
 /// Maximum encoded owner assertion accepted from the trusted boundary.
 const MAX_ASSERTION_BYTES: usize = 4_096;
@@ -38,12 +37,12 @@ const SINGLE_TENANT_ISSUER: &str = "urn:praxis:single-tenant";
 /// Stable subject used by the explicit shared-owner compatibility mode.
 const SINGLE_TENANT_SUBJECT: &str = "shared";
 
-/// Immutable owner of OpenAI persisted state.
+/// Immutable owner of persisted private state.
 ///
 /// Tenant, issuer, and subject together form the ownership identity. A subject
 /// alone is not globally unique and must never be used as the storage scope.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct OpenAiStateOwner {
+pub struct StateOwner {
     /// Stable tenant namespace.
     tenant_id: String,
     /// Stable identity-provider or trust-domain identifier.
@@ -52,7 +51,7 @@ pub struct OpenAiStateOwner {
     subject: String,
 }
 
-impl OpenAiStateOwner {
+impl StateOwner {
     /// Stable tenant namespace.
     pub fn tenant_id(&self) -> &str {
         &self.tenant_id
@@ -88,10 +87,10 @@ impl OpenAiStateOwner {
     }
 }
 
-/// Configuration for [`OpenAiStateOwnerFilter`].
+/// Configuration for [`StateOwnerFilter`].
 #[derive(Debug, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-enum OpenAiStateOwnerConfig {
+enum StateOwnerConfig {
     /// Explicit compatibility mode sharing one owner within a tenant namespace.
     SingleTenant {
         /// Stable namespace assigned to every request in this pipeline.
@@ -148,7 +147,7 @@ struct OwnerStaticComponentConfig {
 /// Configured source of the normalized owner context.
 enum OwnerSource {
     /// One shared owner for an explicitly configured tenant namespace.
-    Static(OpenAiStateOwner),
+    Static(StateOwner),
     /// Versioned assertion from a trusted upstream boundary.
     TrustedHeader(HeaderName),
     /// Owner assembled from independently configured trusted component sources.
@@ -180,7 +179,7 @@ impl OwnerComponentSource {
             },
             OwnerComponentConfig::Static(config) => {
                 validate_component(component, &config.value)
-                    .map_err(|error| format!("openai_state_owner: {}", error.client_message()))?;
+                    .map_err(|error| format!("state_owner: {}", error.client_message()))?;
                 Ok(Self::Static(config.value))
             },
         }
@@ -200,13 +199,13 @@ fn ensure_distinct_component_headers(sources: [&OwnerComponentSource; 3]) -> Res
     let mut seen = std::collections::HashSet::with_capacity(sources.len());
     for header in sources.into_iter().filter_map(OwnerComponentSource::header) {
         if !seen.insert(header) {
-            return Err("openai_state_owner: trusted_headers component headers must be distinct".into());
+            return Err("state_owner: trusted_headers component headers must be distinct".into());
         }
     }
     Ok(())
 }
 
-/// Establishes a normalized [`OpenAiStateOwner`] from trusted identity sources.
+/// Establishes a normalized [`StateOwner`] from trusted identity sources.
 ///
 /// Every configured header must be governed by a trusted upstream boundary.
 /// This filter validates and strips consumed headers; it does not authenticate
@@ -216,7 +215,7 @@ fn ensure_distinct_component_headers(sources: [&OwnerComponentSource; 3]) -> Res
 /// # Versioned-assertion YAML configuration
 ///
 /// ```yaml
-/// filter: openai_state_owner
+/// filter: state_owner
 /// mode: trusted_owner
 /// header: x-authenticated-state-owner
 /// ```
@@ -227,7 +226,7 @@ fn ensure_distinct_component_headers(sources: [&OwnerComponentSource; 3]) -> Res
 /// # Mapped-header YAML configuration
 ///
 /// ```yaml
-/// filter: openai_state_owner
+/// filter: state_owner
 /// mode: trusted_headers
 /// tenant:
 ///   header: x-maas-tenant
@@ -242,16 +241,16 @@ fn ensure_distinct_component_headers(sources: [&OwnerComponentSource; 3]) -> Res
 /// # Single-tenant YAML configuration
 ///
 /// ```yaml
-/// filter: openai_state_owner
+/// filter: state_owner
 /// mode: single_tenant
 /// tenant_id: local
 /// ```
-pub struct OpenAiStateOwnerFilter {
+pub struct StateOwnerFilter {
     /// Validated source used to populate the request context.
     source: OwnerSource,
 }
 
-impl OpenAiStateOwnerFilter {
+impl StateOwnerFilter {
     /// Parse and validate filter configuration.
     ///
     /// # Errors
@@ -260,23 +259,23 @@ impl OpenAiStateOwnerFilter {
     /// `policy` is intentionally rejected until the PPE integration is present,
     /// so selecting it can never silently degrade to owner-only authorization.
     pub fn from_config(value: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let config: OpenAiStateOwnerConfig = parse_filter_config("openai_state_owner", value)?;
+        let config: StateOwnerConfig = parse_filter_config("state_owner", value)?;
         let source = match config {
-            OpenAiStateOwnerConfig::SingleTenant { tenant_id } => single_tenant_source(tenant_id)?,
-            OpenAiStateOwnerConfig::TrustedOwner { header } => {
+            StateOwnerConfig::SingleTenant { tenant_id } => single_tenant_source(tenant_id)?,
+            StateOwnerConfig::TrustedOwner { header } => {
                 OwnerSource::TrustedHeader(parse_header_name("header", &header)?)
             },
-            OpenAiStateOwnerConfig::TrustedHeaders {
+            StateOwnerConfig::TrustedHeaders {
                 tenant,
                 issuer,
                 subject,
             } => trusted_components_source(tenant, issuer, subject)?,
-            OpenAiStateOwnerConfig::Policy { header } => {
+            StateOwnerConfig::Policy { header } => {
                 // Validate the complete adapter config before reporting the
                 // reserved mode, so a future implementation inherits the same
                 // strict header contract.
                 drop(parse_header_name("header", &header)?);
-                return Err("openai_state_owner: 'policy' mode requires the PPE integration".into());
+                return Err("state_owner: 'policy' mode requires the PPE integration".into());
             },
         };
         Ok(Box::new(Self { source }))
@@ -286,7 +285,7 @@ impl OpenAiStateOwnerFilter {
     fn resolve(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) -> FilterAction {
         self.queue_header_removal(ctx, body_phase);
 
-        if ctx.extensions.get::<OpenAiStateOwner>().is_some() {
+        if ctx.extensions.get::<StateOwner>().is_some() {
             return FilterAction::Continue;
         }
 
@@ -332,12 +331,12 @@ impl OpenAiStateOwnerFilter {
 
 /// Build the explicit shared owner used by single-tenant deployments.
 fn single_tenant_source(tenant_id: String) -> Result<OwnerSource, FilterError> {
-    let owner = OpenAiStateOwner::from_trusted_parts(
+    let owner = StateOwner::from_trusted_parts(
         tenant_id,
         SINGLE_TENANT_ISSUER.to_owned(),
         SINGLE_TENANT_SUBJECT.to_owned(),
     )
-    .map_err(|error| format!("openai_state_owner: {}", error.client_message()))?;
+    .map_err(|error| format!("state_owner: {}", error.client_message()))?;
     Ok(OwnerSource::Static(owner))
 }
 
@@ -369,7 +368,7 @@ fn queue_one_header_removal(ctx: &mut HttpFilterContext<'_>, header: &HeaderName
 }
 
 /// Parse the trusted assertion header into a complete owner.
-fn resolve_trusted_header(ctx: &HttpFilterContext<'_>, header: &HeaderName) -> Result<OpenAiStateOwner, FilterAction> {
+fn resolve_trusted_header(ctx: &HttpFilterContext<'_>, header: &HeaderName) -> Result<StateOwner, FilterAction> {
     let value = exactly_one_header_value(ctx, header)?;
     if value.as_bytes().len() > MAX_ASSERTION_BYTES {
         return Err(reject_owner(
@@ -400,14 +399,14 @@ fn resolve_trusted_components(
     tenant: &OwnerComponentSource,
     issuer: &OwnerComponentSource,
     subject: &OwnerComponentSource,
-) -> Result<OpenAiStateOwner, FilterAction> {
+) -> Result<StateOwner, FilterAction> {
     // The request extension owns its identity for the complete filter
     // lifecycle, so the three bounded component values must cross this
     // boundary as owned strings.
     let tenant_id = resolve_owner_component(ctx, "tenant", tenant)?;
     let issuer = resolve_owner_component(ctx, "issuer", issuer)?;
     let subject = resolve_owner_component(ctx, "subject", subject)?;
-    OpenAiStateOwner::from_trusted_parts(tenant_id, issuer, subject)
+    StateOwner::from_trusted_parts(tenant_id, issuer, subject)
         .map_err(|error| reject_owner(400, "invalid_state_owner", error.client_message()))
 }
 
@@ -485,15 +484,15 @@ fn exactly_one_header_value<'a>(
 /// Parse a nonempty trusted header name.
 fn parse_header_name(field: &str, header: &str) -> Result<HeaderName, FilterError> {
     if header.is_empty() {
-        return Err(format!("openai_state_owner: '{field}' must not be empty").into());
+        return Err(format!("state_owner: '{field}' must not be empty").into());
     }
-    HeaderName::from_bytes(header.as_bytes()).map_err(|e| format!("openai_state_owner: invalid '{field}': {e}").into())
+    HeaderName::from_bytes(header.as_bytes()).map_err(|e| format!("state_owner: invalid '{field}': {e}").into())
 }
 
 #[async_trait]
-impl HttpFilter for OpenAiStateOwnerFilter {
+impl HttpFilter for StateOwnerFilter {
     fn name(&self) -> &'static str {
-        "openai_state_owner"
+        "state_owner"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -558,7 +557,7 @@ impl OwnerAssertionError {
 }
 
 /// Decode the provider-neutral `v1` assertion envelope.
-fn decode_assertion(value: &str) -> Result<OpenAiStateOwner, OwnerAssertionError> {
+fn decode_assertion(value: &str) -> Result<StateOwner, OwnerAssertionError> {
     let payload = value
         .strip_prefix(ASSERTION_VERSION_PREFIX)
         .ok_or(OwnerAssertionError::UnsupportedVersion)?;
@@ -570,7 +569,7 @@ fn decode_assertion(value: &str) -> Result<OpenAiStateOwner, OwnerAssertionError
         .map_err(|_error| OwnerAssertionError::InvalidEncoding)?;
     let [tenant_id, issuer, subject]: [String; 3] =
         serde_json::from_slice(&decoded).map_err(|_error| OwnerAssertionError::InvalidPayload)?;
-    OpenAiStateOwner::from_trusted_parts(tenant_id, issuer, subject)
+    StateOwner::from_trusted_parts(tenant_id, issuer, subject)
 }
 
 /// Validate one stable owner component.
@@ -581,7 +580,24 @@ fn validate_component(name: &'static str, value: &str) -> Result<(), OwnerAssert
     Ok(())
 }
 
-/// Build a bounded OpenAI-compatible ownership rejection.
+/// Build a bounded rejection compatible with OpenAI and Anthropic clients.
 fn reject_owner(status: u16, code: &str, message: &str) -> FilterAction {
-    FilterAction::Reject(responses_error_rejection(status, code, message))
+    let error_type = if status == 401 {
+        "authentication_error"
+    } else {
+        "invalid_request_error"
+    };
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": error_type,
+            "code": code,
+            "message": message,
+        }
+    });
+    FilterAction::Reject(
+        Rejection::status(status)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_vec(&body).unwrap_or_default()),
+    )
 }

@@ -12,7 +12,7 @@
 # (ResponsesState) which persists across all IRR iterations via extension
 # swapping:
 #
-#   0. openai_state_owner installs the explicit shared local owner used
+#   0. state_owner installs the explicit shared local owner used
 #      by all persisted state filters in this example.
 #
 #   1. openai_conversations handles CRUD for the Conversations API
@@ -274,7 +274,7 @@ listeners:
 filter_chains:
   - name: full-flow-agentic-pipeline
     filters:
-      - filter: openai_state_owner
+      - filter: state_owner
         mode: single_tenant
         tenant_id: local
 

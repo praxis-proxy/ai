@@ -6,7 +6,7 @@ use bytes::Bytes;
 use http::{HeaderValue, Method};
 use praxis_filter::{FilterAction, TrustedHeaderMutation};
 
-use super::{OpenAiStateOwner, OpenAiStateOwnerFilter};
+use super::{StateOwner, StateOwnerFilter};
 use crate::test_utils::{make_filter_context, make_request};
 
 const HEADER: &str = "x-test-state-owner";
@@ -15,7 +15,7 @@ const SUBJECT_HEADER: &str = "x-maas-user";
 
 fn filter() -> Box<dyn praxis_filter::HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("mode: trusted_owner\nheader: {HEADER}")).unwrap();
-    OpenAiStateOwnerFilter::from_config(&yaml).unwrap()
+    StateOwnerFilter::from_config(&yaml).unwrap()
 }
 
 fn mapped_filter() -> Box<dyn praxis_filter::HttpFilter> {
@@ -29,11 +29,15 @@ subject:
   header: x-maas-user",
     )
     .unwrap();
-    OpenAiStateOwnerFilter::from_config(&yaml).unwrap()
+    StateOwnerFilter::from_config(&yaml).unwrap()
 }
 
 fn mapped_request(tenant: &str, subject: &str) -> praxis_filter::Request {
-    let mut request = make_request(Method::POST, "/v1/responses");
+    mapped_request_for_path("/v1/responses", tenant, subject)
+}
+
+fn mapped_request_for_path(path: &str, tenant: &str, subject: &str) -> praxis_filter::Request {
+    let mut request = make_request(Method::POST, path);
     request
         .headers
         .insert(TENANT_HEADER, HeaderValue::from_str(tenant).unwrap());
@@ -41,6 +45,13 @@ fn mapped_request(tenant: &str, subject: &str) -> praxis_filter::Request {
         .headers
         .insert(SUBJECT_HEADER, HeaderValue::from_str(subject).unwrap());
     request
+}
+
+fn rejection_body(action: FilterAction) -> serde_json::Value {
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected rejection");
+    };
+    serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap()
 }
 
 fn assertion(parts: [&str; 3]) -> String {
@@ -55,14 +66,31 @@ fn request_with(value: &str) -> praxis_filter::Request {
 }
 
 fn rejection_code(action: FilterAction) -> String {
-    let FilterAction::Reject(rejection) = action else {
-        panic!("expected rejection");
-    };
-    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    let body = rejection_body(action);
     body.pointer("/error/code")
         .and_then(serde_json::Value::as_str)
         .unwrap()
         .to_owned()
+}
+
+#[tokio::test]
+async fn provider_neutral_context_supports_anthropic_messages() {
+    let request = mapped_request_for_path("/v1/messages", "tenant-a", "claude-user");
+    let mut ctx = make_filter_context(&request);
+
+    let action = mapped_filter().on_request(&mut ctx).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(ctx.extensions.get::<StateOwner>().unwrap().subject(), "claude-user");
+
+    let missing = make_request(Method::POST, "/v1/messages");
+    let mut missing_ctx = make_filter_context(&missing);
+    let body = rejection_body(mapped_filter().on_request(&mut missing_ctx).await.unwrap());
+    assert_eq!(body.pointer("/type").and_then(serde_json::Value::as_str), Some("error"));
+    assert_eq!(
+        body.pointer("/error/type").and_then(serde_json::Value::as_str),
+        Some("authentication_error")
+    );
 }
 
 #[test]
@@ -74,23 +102,20 @@ fn configuration_requires_valid_header_name() {
         "mode: trusted_owner\nheader: 'not a header'",
     ] {
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        assert!(
-            OpenAiStateOwnerFilter::from_config(&value).is_err(),
-            "should reject {yaml}"
-        );
+        assert!(StateOwnerFilter::from_config(&value).is_err(), "should reject {yaml}");
     }
 }
 
 #[test]
 fn configuration_rejects_unknown_fields() {
     let value: serde_yaml::Value = serde_yaml::from_str("mode: trusted_owner\nheader: x-owner\nunknown: true").unwrap();
-    assert!(OpenAiStateOwnerFilter::from_config(&value).is_err());
+    assert!(StateOwnerFilter::from_config(&value).is_err());
 }
 
 #[test]
 fn policy_mode_is_reserved_and_fails_configuration() {
     let value: serde_yaml::Value = serde_yaml::from_str("mode: policy\nheader: x-owner").unwrap();
-    let Err(error) = OpenAiStateOwnerFilter::from_config(&value) else {
+    let Err(error) = StateOwnerFilter::from_config(&value) else {
         panic!("policy mode must remain unavailable without PPE");
     };
     assert!(error.to_string().contains("requires the PPE integration"));
@@ -99,14 +124,14 @@ fn policy_mode_is_reserved_and_fails_configuration() {
 #[tokio::test]
 async fn explicit_single_tenant_mode_installs_shared_owner_without_a_header() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("mode: single_tenant\ntenant_id: local").unwrap();
-    let filter = OpenAiStateOwnerFilter::from_config(&yaml).unwrap();
+    let filter = StateOwnerFilter::from_config(&yaml).unwrap();
     let request = make_request(Method::GET, "/v1/responses/resp_known");
     let mut ctx = make_filter_context(&request);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
-    let owner = ctx.extensions.get::<OpenAiStateOwner>().unwrap();
+    let owner = ctx.extensions.get::<StateOwner>().unwrap();
     assert_eq!(owner.tenant_id(), "local");
     assert_eq!(owner.issuer(), "urn:praxis:single-tenant");
     assert_eq!(owner.subject(), "shared");
@@ -117,7 +142,7 @@ async fn explicit_single_tenant_mode_installs_shared_owner_without_a_header() {
 fn single_tenant_mode_requires_a_valid_namespace() {
     for yaml in ["mode: single_tenant", "mode: single_tenant\ntenant_id: ''"] {
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        assert!(OpenAiStateOwnerFilter::from_config(&value).is_err());
+        assert!(StateOwnerFilter::from_config(&value).is_err());
     }
 }
 
@@ -130,10 +155,7 @@ fn trusted_headers_configuration_rejects_ambiguous_or_invalid_sources() {
         "mode: trusted_headers\ntenant: {header: x-tenant}\nissuer: {static: ''}\nsubject: {header: x-user}",
     ] {
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        assert!(
-            OpenAiStateOwnerFilter::from_config(&value).is_err(),
-            "should reject {yaml}"
-        );
+        assert!(StateOwnerFilter::from_config(&value).is_err(), "should reject {yaml}");
     }
 }
 
@@ -145,7 +167,7 @@ async fn trusted_headers_mode_maps_static_and_header_components() {
     let action = mapped_filter().on_request(&mut ctx).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
-    let owner = ctx.extensions.get::<OpenAiStateOwner>().unwrap();
+    let owner = ctx.extensions.get::<StateOwner>().unwrap();
     assert_eq!(owner.tenant_id(), "tenant-a");
     assert_eq!(owner.issuer(), "https://authorino.example");
     assert_eq!(owner.subject(), "alice");
@@ -204,7 +226,7 @@ async fn installs_complete_owner_and_queues_removal() {
     let action = filter().on_request(&mut ctx).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
-    let owner = ctx.extensions.get::<OpenAiStateOwner>().unwrap();
+    let owner = ctx.extensions.get::<StateOwner>().unwrap();
     assert_eq!(owner.tenant_id(), "tenant-a");
     assert_eq!(owner.issuer(), "https://issuer.example");
     assert_eq!(owner.subject(), "alice");
@@ -220,7 +242,7 @@ async fn body_phase_installs_owner_before_downstream_body_consumers() {
     let action = filter().on_request_body(&mut ctx, &mut body, false).await.unwrap();
 
     assert!(matches!(action, FilterAction::BodyDone));
-    assert_eq!(ctx.extensions.get::<OpenAiStateOwner>().unwrap().subject(), "alice");
+    assert_eq!(ctx.extensions.get::<StateOwner>().unwrap().subject(), "alice");
     assert!(
         ctx.pre_read_mutations
             .iter()
@@ -290,11 +312,11 @@ async fn installed_context_is_not_reparsed_or_replaced() {
     let request = request_with("malformed");
     let mut ctx = make_filter_context(&request);
     ctx.extensions
-        .insert(OpenAiStateOwner::from_trusted_parts("tenant-a".into(), "issuer-a".into(), "alice".into()).unwrap());
+        .insert(StateOwner::from_trusted_parts("tenant-a".into(), "issuer-a".into(), "alice".into()).unwrap());
 
     let action = filter().on_request(&mut ctx).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
-    assert_eq!(ctx.extensions.get::<OpenAiStateOwner>().unwrap().subject(), "alice");
+    assert_eq!(ctx.extensions.get::<StateOwner>().unwrap().subject(), "alice");
     assert!(ctx.request_headers_to_remove.iter().any(|name| name == HEADER));
 }
