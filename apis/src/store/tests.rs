@@ -2266,10 +2266,14 @@ async fn sqlite_rejects_table_with_missing_columns() {
     assert!(msg.contains("model"), "error should list missing column: {msg}");
 }
 
+// -----------------------------------------------------------------------------
+// Schema Validation (primary keys)
+// -----------------------------------------------------------------------------
+
 #[tokio::test]
-async fn sqlite_rejects_items_table_with_missing_columns() {
+async fn sqlite_rejects_table_with_incompatible_primary_key() {
     let dir = tempfile::tempdir().expect("tempdir should succeed");
-    let db_path = dir.path().join("bad_items.db");
+    let db_path = dir.path().join("bad_pk.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
     let options = url
@@ -2279,20 +2283,24 @@ async fn sqlite_rejects_items_table_with_missing_columns() {
     let pool = sqlx::SqlitePool::connect_with(options)
         .await
         .expect("pool should connect");
+    // Every expected column is present, but the table is keyed by id
+    // alone. Without tenant_id in the primary key, INSERT OR REPLACE
+    // collapses rows that share a response id across tenants, silently
+    // destroying another tenant's record.
     sqlx::query(
-        "CREATE TABLE bad_items (item_id TEXT NOT NULL, tenant_id TEXT NOT NULL, \
-         conversation_id TEXT NOT NULL, created_at BIGINT NOT NULL, position BIGINT NOT NULL, \
-         PRIMARY KEY (item_id, tenant_id, conversation_id))",
+        "CREATE TABLE bad_pk_responses (\
+         id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, created_at BIGINT NOT NULL, \
+         model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+         messages TEXT NOT NULL)",
     )
     .execute(&pool)
     .await
     .expect("manual create should succeed");
     pool.close().await;
 
-    let result =
-        SqliteResponseStore::new(&url, "ok_responses", "ok_conversations", Some("bad_items"), None, None).await;
+    let result = SqliteResponseStore::new(&url, "bad_pk_responses", "ok_conversations", None, None, None).await;
     let Err(err) = result else {
-        panic!("init should fail on items schema mismatch");
+        panic!("init should fail on incompatible primary key");
     };
 
     let msg = err.to_string();
@@ -2300,8 +2308,164 @@ async fn sqlite_rejects_items_table_with_missing_columns() {
         msg.contains("schema validation failed"),
         "error should mention schema validation: {msg}"
     );
-    assert!(msg.contains("bad_items"), "error should name the table: {msg}");
-    assert!(msg.contains("item_data"), "error should list missing column: {msg}");
+    assert!(msg.contains("bad_pk_responses"), "error should name the table: {msg}");
+    assert!(
+        msg.contains("primary key"),
+        "error should mention the primary key: {msg}"
+    );
+    assert!(
+        msg.contains("tenant_id"),
+        "error should mention the expected tenant_id key column: {msg}"
+    );
+    assert!(
+        msg.contains("migration"),
+        "error should tell the operator a migration is required: {msg}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Schema Validation (unique constraints)
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sqlite_rejects_table_with_tenant_leaking_unique_constraint() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("leak_unique.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse")
+        .create_if_missing(true);
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    // The composite primary key is correct, but an extra UNIQUE(id) makes
+    // id unique across tenants. SQLite REPLACE deletes any row violating a
+    // UNIQUE or PRIMARY KEY constraint, so a second tenant's INSERT OR
+    // REPLACE with the same id silently deletes the first tenant's row.
+    // Checking only the primary key would miss this, so init must reject it.
+    sqlx::query(
+        "CREATE TABLE leak_responses (\
+         tenant_id TEXT NOT NULL, id TEXT NOT NULL, created_at BIGINT NOT NULL, \
+         model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+         messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id), UNIQUE (id))",
+    )
+    .execute(&pool)
+    .await
+    .expect("manual create should succeed");
+    pool.close().await;
+
+    let result = SqliteResponseStore::new(&url, "leak_responses", "leak_conversations", None, None, None).await;
+    let Err(err) = result else {
+        panic!("init should fail on a unique constraint that omits tenant_id");
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("schema validation failed"),
+        "error should mention schema validation: {msg}"
+    );
+    assert!(msg.contains("leak_responses"), "error should name the table: {msg}");
+    assert!(
+        msg.contains("unexpected unique index") && msg.contains("only the primary key"),
+        "error should explain a unique index beyond the primary key is rejected: {msg}"
+    );
+    assert!(
+        msg.contains("migration"),
+        "error should tell the operator a migration is required: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_rejects_table_with_case_insensitive_collation_on_key() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("collate_key.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse")
+        .create_if_missing(true);
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    // tenant_id carries COLLATE NOCASE, so the primary key treats "Tenant-A"
+    // and "tenant-a" as equal. INSERT OR REPLACE then deletes one tenant's row
+    // when the other writes the same id -- a cross-tenant collapse. The column
+    // names still cover the primary key, so only a collation check catches it.
+    sqlx::query(
+        "CREATE TABLE collate_responses (\
+         tenant_id TEXT NOT NULL COLLATE NOCASE, id TEXT NOT NULL, created_at BIGINT NOT NULL, \
+         model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+         messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id))",
+    )
+    .execute(&pool)
+    .await
+    .expect("manual create should succeed");
+    pool.close().await;
+
+    let result = SqliteResponseStore::new(&url, "collate_responses", "collate_conversations", None, None, None).await;
+    let Err(err) = result else {
+        panic!("init should fail on a case-insensitive collation over a primary key column");
+    };
+
+    let msg = err.to_string();
+    assert!(msg.contains("schema validation failed"), "{msg}");
+    assert!(msg.contains("collate_responses"), "error should name the table: {msg}");
+    assert!(
+        msg.contains("tenant_id"),
+        "error should name the offending column: {msg}"
+    );
+    assert!(
+        msg.to_ascii_lowercase().contains("collation"),
+        "error should explain the collation is unsafe: {msg}"
+    );
+    assert!(msg.contains("migration"), "{msg}");
+}
+
+#[tokio::test]
+async fn sqlite_rejects_table_with_non_text_affinity_key() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("affinity_key.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse")
+        .create_if_missing(true);
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    // id is declared INTEGER, so it has numeric affinity: the distinct text ids
+    // "1" and "01" are both stored as the integer 1 and collide, letting
+    // INSERT OR REPLACE delete a distinct response. The column names and
+    // collation look correct, so only an affinity check rejects it.
+    sqlx::query(
+        "CREATE TABLE affinity_responses (\
+         tenant_id TEXT NOT NULL, id INTEGER NOT NULL, created_at BIGINT NOT NULL, \
+         model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+         messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id))",
+    )
+    .execute(&pool)
+    .await
+    .expect("manual create should succeed");
+    pool.close().await;
+
+    let result = SqliteResponseStore::new(&url, "affinity_responses", "affinity_conversations", None, None, None).await;
+    let Err(err) = result else {
+        panic!("init should fail on a primary key column without TEXT affinity");
+    };
+
+    let msg = err.to_string();
+    assert!(msg.contains("schema validation failed"), "{msg}");
+    assert!(msg.contains("affinity_responses"), "error should name the table: {msg}");
+    assert!(msg.contains("id"), "error should name the offending column: {msg}");
+    assert!(
+        msg.to_ascii_lowercase().contains("affinity"),
+        "error should explain the affinity is unsafe: {msg}"
+    );
+    assert!(msg.contains("migration"), "{msg}");
 }
 
 // -----------------------------------------------------------------------------
@@ -2689,6 +2853,117 @@ fn pg_unique_suffix() -> String {
         .to_lowercase()
 }
 
+/// Fixture for the `PostgreSQL` schema-validation integration tests.
+///
+/// Each of those tests hand-crafts a pre-existing schema, points
+/// `PostgresResponseStore::new` at it, and asserts that startup validation accepts
+/// or rejects it. The connect -> pre-clean -> craft -> init -> assert -> clean-up
+/// boilerplate is identical across them; only the crafted DDL and the expected
+/// error text differ. This fixture collapses that boilerplate so each test reads as
+/// "given this schema, init must reject it because <reason>".
+///
+/// Table names are suffix-scoped via [`pg_unique_suffix`] so tests running on
+/// separate threads never collide. Because the suffix is deterministic per thread,
+/// a prior run that panicked before cleanup can leave tables behind; every init
+/// drops the managed set first so a stale table cannot mask the crafted one.
+struct PgSchemaFixture {
+    url: String,
+    suffix: String,
+    responses: String,
+    conversations: String,
+    version: String,
+}
+
+impl PgSchemaFixture {
+    fn new(prefix: &str) -> Self {
+        let suffix = pg_unique_suffix();
+        let responses = format!("{prefix}_responses_{suffix}");
+        let conversations = format!("{prefix}_conversations_{suffix}");
+        let version = format!("{responses}_schema_version");
+        Self {
+            url: pg_database_url(),
+            suffix,
+            responses,
+            conversations,
+            version,
+        }
+    }
+
+    /// A suffix-scoped name for a non-table object (a collation) so parallel
+    /// threads never collide.
+    fn name(&self, base: &str) -> String {
+        format!("{base}_{}", self.suffix)
+    }
+
+    /// Every table this fixture owns, in drop order.
+    fn all_tables(&self) -> Vec<&str> {
+        vec![&self.responses, &self.conversations, &self.version]
+    }
+
+    /// Drop every owned table, then run `teardown` (drops for non-table objects such
+    /// as collations, which must follow the tables that depend on them). All
+    /// statements are idempotent (`IF EXISTS`).
+    async fn drop_all(&self, pool: &sqlx::PgPool, teardown: &[String]) {
+        use sqlx::AssertSqlSafe;
+        for table in self.all_tables() {
+            let sql = format!("DROP TABLE IF EXISTS {table}");
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .execute(pool)
+                .await
+                .expect("drop table should succeed");
+        }
+        for stmt in teardown {
+            sqlx::query(AssertSqlSafe(stmt.as_str()))
+                .execute(pool)
+                .await
+                .expect("teardown should succeed");
+        }
+    }
+
+    /// Pre-clean, run `setup` to craft the schema, run init, clean up, and return the
+    /// init result. `teardown` runs as both pre-clean and post-clean.
+    async fn init(&self, setup: &[String], teardown: &[String]) -> Result<PostgresResponseStore, StoreError> {
+        use sqlx::AssertSqlSafe;
+
+        let options: sqlx::postgres::PgConnectOptions = self.url.parse().expect("url should parse");
+        let pool = Box::pin(sqlx::PgPool::connect_with(options))
+            .await
+            .expect("pool should connect");
+        self.drop_all(&pool, teardown).await;
+        for stmt in setup {
+            sqlx::query(AssertSqlSafe(stmt.as_str()))
+                .execute(&pool)
+                .await
+                .expect("setup should succeed");
+        }
+        pool.close().await;
+
+        let result = Box::pin(PostgresResponseStore::new(
+            &self.url,
+            &self.responses,
+            &self.conversations,
+            None,
+            Some(SslMode::Disable),
+            None,
+            None,
+            None,
+        ))
+        .await;
+
+        let cleanup_pool = Box::pin(sqlx::PgPool::connect(&self.url)).await.expect("cleanup pool");
+        self.drop_all(&cleanup_pool, teardown).await;
+        result
+    }
+
+    /// Init against the crafted schema, require rejection, and return the error text.
+    async fn expect_rejected(&self, setup: &[String], teardown: &[String]) -> String {
+        match self.init(setup, teardown).await {
+            Ok(_) => panic!("init should reject the crafted schema"),
+            Err(err) => err.to_string(),
+        }
+    }
+}
+
 #[test]
 fn pg_ssl_mode_defaults_to_verify_full() {
     let mode = SslMode::default();
@@ -2765,118 +3040,247 @@ async fn pg_nonexistent_ssl_root_cert_fails() {
 #[tokio::test]
 #[ignore]
 async fn pg_rejects_table_with_missing_columns() {
-    use sqlx::AssertSqlSafe;
+    let fx = PgSchemaFixture::new("missing_cols");
+    let msg = fx
+        .expect_rejected(
+            &[format!(
+                "CREATE TABLE {} (tenant_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (tenant_id, id))",
+                fx.responses
+            )],
+            &[],
+        )
+        .await;
 
-    let url = pg_database_url();
-    let suffix = pg_unique_suffix();
-    let table_name = format!("bad_responses_{suffix}");
-
-    let options: sqlx::postgres::PgConnectOptions = url.parse().expect("url should parse");
-    let pool = Box::pin(sqlx::PgPool::connect_with(options))
-        .await
-        .expect("pool should connect");
-    let create_sql = format!(
-        "CREATE TABLE IF NOT EXISTS {table_name} \
-         (tenant_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (tenant_id, id))"
-    );
-    sqlx::query(AssertSqlSafe(create_sql.as_str()))
-        .execute(&pool)
-        .await
-        .expect("manual create should succeed");
-    pool.close().await;
-
-    let result = Box::pin(PostgresResponseStore::new(
-        &url,
-        &table_name,
-        &format!("ok_conversations_{suffix}"),
-        None,
-        Some(SslMode::Disable),
-        None,
-        None,
-        None,
-    ))
-    .await;
-    let Err(err) = result else {
-        panic!("init should fail on schema mismatch");
-    };
-
-    let msg = err.to_string();
     assert!(
         msg.contains("schema validation failed"),
         "error should mention schema validation: {msg}"
     );
-    assert!(msg.contains(&table_name), "error should name the table: {msg}");
+    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
     assert!(msg.contains("created_at"), "error should list missing column: {msg}");
+}
 
-    let cleanup_pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("cleanup pool");
-    let conv_table = format!("ok_conversations_{suffix}");
-    let ver_table = format!("{table_name}_schema_version");
-    for table in [&table_name, &conv_table, &ver_table] {
-        let drop_sql = format!("DROP TABLE IF EXISTS {table}");
-        sqlx::query(AssertSqlSafe(drop_sql.as_str()))
-            .execute(&cleanup_pool)
-            .await
-            .expect("cleanup should succeed");
-    }
+#[tokio::test]
+#[ignore]
+async fn pg_rejects_table_with_incompatible_primary_key() {
+    let fx = PgSchemaFixture::new("bad_pk");
+    // Every column is present, but the table is keyed by id alone.
+    // ON CONFLICT (tenant_id, id) would fail at runtime, so init must
+    // reject the incompatible key up front.
+    let msg = fx
+        .expect_rejected(
+            &[format!(
+                "CREATE TABLE {} (\
+                 id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, created_at BIGINT NOT NULL, \
+                 model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+                 messages TEXT NOT NULL)",
+                fx.responses
+            )],
+            &[],
+        )
+        .await;
+
+    assert!(
+        msg.contains("schema validation failed"),
+        "error should mention schema validation: {msg}"
+    );
+    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
+    assert!(
+        msg.contains("primary key"),
+        "error should mention the primary key: {msg}"
+    );
+    assert!(
+        msg.contains("migration"),
+        "error should tell the operator a migration is required: {msg}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_rejects_table_with_tenant_leaking_unique_constraint() {
+    let fx = PgSchemaFixture::new("leak");
+    // The composite primary key is correct, but the extra UNIQUE(id) makes
+    // id unique across tenants. ON CONFLICT (tenant_id, id) cannot satisfy
+    // that constraint, so a cross-tenant write would fail at runtime; init
+    // must reject the schema up front.
+    let msg = fx
+        .expect_rejected(
+            &[format!(
+                "CREATE TABLE {} (\
+                 tenant_id TEXT NOT NULL, id TEXT NOT NULL, created_at BIGINT NOT NULL, \
+                 model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+                 messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id), UNIQUE (id))",
+                fx.responses
+            )],
+            &[],
+        )
+        .await;
+
+    assert!(
+        msg.contains("schema validation failed"),
+        "error should mention schema validation: {msg}"
+    );
+    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
+    assert!(
+        msg.contains("unexpected unique index") && msg.contains("only the primary key"),
+        "error should explain a unique index beyond the primary key is rejected: {msg}"
+    );
+    assert!(
+        msg.contains("migration"),
+        "error should tell the operator a migration is required: {msg}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_rejects_table_with_deferrable_primary_key() {
+    let fx = PgSchemaFixture::new("defer_pk");
+    // The key columns are correct, but a DEFERRABLE primary key cannot serve as
+    // an ON CONFLICT arbiter: PostgreSQL rejects every upsert with "ON CONFLICT
+    // does not support deferrable unique constraints ... as arbiters". A check
+    // that only inspects columns would accept this and break every write, so
+    // init must reject it at startup.
+    let msg = fx
+        .expect_rejected(
+            &[format!(
+                "CREATE TABLE {} (\
+                 tenant_id TEXT NOT NULL, id TEXT NOT NULL, created_at BIGINT NOT NULL, \
+                 model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+                 messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id) DEFERRABLE INITIALLY DEFERRED)",
+                fx.responses
+            )],
+            &[],
+        )
+        .await;
+
+    assert!(msg.contains("schema validation failed"), "{msg}");
+    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
+    assert!(
+        msg.to_ascii_lowercase().contains("deferrable"),
+        "error should explain the constraint is deferrable: {msg}"
+    );
+    assert!(msg.contains("migration"), "{msg}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_rejects_table_with_case_insensitive_collation_on_key() {
+    let fx = PgSchemaFixture::new("ci_coll");
+    let collation = fx.name("ci_coll");
+    // A non-deterministic collation folds case, so the primary key index treats
+    // 'Tenant-A' and 'tenant-a' as equal: ON CONFLICT (tenant_id, id) then
+    // overwrites one tenant's row with another's. The key columns are correctly
+    // named, so only a comparison-semantics check catches this.
+    let msg = fx
+        .expect_rejected(
+            &[
+                format!(
+                    "CREATE COLLATION {collation} (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+                ),
+                format!(
+                    "CREATE TABLE {} (\
+                     tenant_id TEXT COLLATE {collation} NOT NULL, id TEXT NOT NULL, created_at BIGINT NOT NULL, \
+                     model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+                     messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id))",
+                    fx.responses
+                ),
+            ],
+            &[format!("DROP COLLATION IF EXISTS {collation}")],
+        )
+        .await;
+
+    assert!(msg.contains("schema validation failed"), "{msg}");
+    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
+    assert!(
+        msg.to_ascii_lowercase().contains("collation"),
+        "error should explain the collation folds comparisons: {msg}"
+    );
+    assert!(msg.contains("migration"), "{msg}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_rejects_table_with_citext_key() {
+    let fx = PgSchemaFixture::new("citext");
+    // citext is case-insensitive by type, not by collation: the index reports a
+    // deterministic default collation, so only a key-column type check catches
+    // that 'Tenant-A' and 'tenant-a' collapse under ON CONFLICT. The extension is
+    // shared and left in place.
+    let msg = fx
+        .expect_rejected(
+            &[
+                "CREATE EXTENSION IF NOT EXISTS citext".to_owned(),
+                format!(
+                    "CREATE TABLE {} (\
+                     tenant_id CITEXT NOT NULL, id TEXT NOT NULL, created_at BIGINT NOT NULL, \
+                     model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+                     messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id))",
+                    fx.responses
+                ),
+            ],
+            &[],
+        )
+        .await;
+
+    assert!(msg.contains("schema validation failed"), "{msg}");
+    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
+    assert!(
+        msg.to_ascii_lowercase().contains("citext"),
+        "error should name the case-insensitive type: {msg}"
+    );
+    assert!(msg.contains("migration"), "{msg}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_accepts_varchar_key_columns() {
+    let fx = PgSchemaFixture::new("varchar_key");
+    // varchar is allow-listed alongside text, but PostgreSQL backs a varchar key
+    // with the text_ops operator class (opcintype = text), not a varchar_ops. A
+    // trusted-opclass check that compared the class input type to the column type
+    // would see text != varchar and wrongly reject a valid schema, so varchar keys
+    // must be accepted.
+    let result = fx
+        .init(
+            &[format!(
+                "CREATE TABLE {} (\
+                 tenant_id VARCHAR NOT NULL, id VARCHAR NOT NULL, created_at BIGINT NOT NULL, \
+                 model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+                 messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id))",
+                fx.responses
+            )],
+            &[],
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "varchar keys use the text_ops operator class and must be accepted: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 #[ignore]
 async fn pg_rejects_schema_version_mismatch() {
-    use sqlx::AssertSqlSafe;
+    let fx = PgSchemaFixture::new("ver");
+    // Seed only the version table with an unsupported version. Init creates the
+    // (valid) responses and conversations tables, so validation passes and the
+    // version check is what rejects startup.
+    let msg = fx
+        .expect_rejected(
+            &[
+                format!("CREATE TABLE {} (version BIGINT NOT NULL PRIMARY KEY)", fx.version),
+                format!("INSERT INTO {} (version) VALUES (99)", fx.version),
+            ],
+            &[],
+        )
+        .await;
 
-    let url = pg_database_url();
-    let suffix = pg_unique_suffix();
-    let resp_table = format!("vr_{suffix}");
-    let conv_table = format!("vc_{suffix}");
-    let ver_table = format!("{resp_table}_schema_version");
-
-    let options: sqlx::postgres::PgConnectOptions = url.parse().expect("url should parse");
-    let pool = Box::pin(sqlx::PgPool::connect_with(options))
-        .await
-        .expect("pool should connect");
-    let create_sql = format!("CREATE TABLE IF NOT EXISTS {ver_table} (version BIGINT NOT NULL PRIMARY KEY)");
-    sqlx::query(AssertSqlSafe(create_sql.as_str()))
-        .execute(&pool)
-        .await
-        .expect("create should succeed");
-    let insert_sql = format!("INSERT INTO {ver_table} (version) VALUES (99)");
-    sqlx::query(AssertSqlSafe(insert_sql.as_str()))
-        .execute(&pool)
-        .await
-        .expect("insert should succeed");
-    pool.close().await;
-
-    let result = Box::pin(PostgresResponseStore::new(
-        &url,
-        &resp_table,
-        &conv_table,
-        None,
-        Some(SslMode::Disable),
-        None,
-        None,
-        None,
-    ))
-    .await;
-    let Err(err) = result else {
-        panic!("init should fail on version mismatch");
-    };
-
-    let msg = err.to_string();
     assert!(
         msg.contains("schema version mismatch"),
         "error should mention version mismatch: {msg}"
     );
     assert!(msg.contains("99"), "error should show stored version: {msg}");
-
-    let cleanup_pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("cleanup pool");
-    for table in [&ver_table, &resp_table, &conv_table] {
-        let drop_sql = format!("DROP TABLE IF EXISTS {table}");
-        sqlx::query(AssertSqlSafe(drop_sql.as_str()))
-            .execute(&cleanup_pool)
-            .await
-            .expect("cleanup should succeed");
-    }
 }
 
 #[tokio::test]

@@ -14,8 +14,9 @@ use super::{
     compression::{StoreCompressionConfig, decode},
     pool::{PoolConfig, apply_pool_config},
     schemas::{
-        ColumnCheck, PENDING_APPROVALS_COLUMNS, SCHEMA_VERSION, SqlDialect, TableNames, VERSION_COLUMNS,
-        check_column_presence, expected_table_columns, generate_ddl, pending_approvals_table, schema_version_table,
+        ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
+        check_schema, expected_tables, generate_ddl, pending_approvals_table, schema_version_table,
+        sqlite_key_column_folding,
     },
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
@@ -223,33 +224,203 @@ async fn table_column_names(pool: &SqlitePool, table: &str) -> Result<Vec<String
         .map_err(|e| StoreError::Database(e.to_string()))
 }
 
-/// Query column metadata for each table and verify expected columns exist.
-async fn validate_schema(pool: &SqlitePool, tables: &TableNames) -> Result<(), StoreError> {
-    let version_table = schema_version_table(&tables.responses);
-    let approvals_table = pending_approvals_table(&tables.responses);
-    let expected = expected_table_columns(tables);
-    let mut results = Vec::with_capacity(expected.len() + 2);
+/// Fetch ordered primary key columns for a `SQLite` table, each paired with
+/// its declared type.
+///
+/// `PRAGMA table_info` reports `pk` as 0 for non-key columns and the
+/// column's 1-based position within the primary key otherwise, so sorting
+/// by it reconstructs the composite key in declaration order. The declared
+/// type carries the column's affinity, which the index pragmas do not expose.
+async fn primary_key_columns(pool: &SqlitePool, table: &str) -> Result<Vec<(String, String)>, StoreError> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let rows = sqlx::query(AssertSqlSafe(pragma.as_str()))
+        .fetch_all(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
 
-    for (table_name, expected_cols) in &expected {
-        results.push((*table_name, *expected_cols, table_column_names(pool, table_name).await?));
+    let mut key_columns: Vec<(i64, (String, String))> = Vec::new();
+    for row in &rows {
+        let position: i64 = row.try_get("pk").map_err(|e| StoreError::Database(e.to_string()))?;
+        if position > 0 {
+            let name: String = row.try_get("name").map_err(|e| StoreError::Database(e.to_string()))?;
+            let declared_type: String = row.try_get("type").map_err(|e| StoreError::Database(e.to_string()))?;
+            key_columns.push((position, (name, declared_type)));
+        }
     }
-    results.push((
-        version_table.as_str(),
-        VERSION_COLUMNS,
-        table_column_names(pool, &version_table).await?,
-    ));
-    results.push((
-        approvals_table.as_str(),
-        PENDING_APPROVALS_COLUMNS,
-        table_column_names(pool, &approvals_table).await?,
-    ));
+    key_columns.sort_by_key(|(position, _)| *position);
+    Ok(key_columns.into_iter().map(|(_, column)| column).collect())
+}
 
-    let refs: Vec<ColumnCheck<'_>> = results
+/// Build a `SQLite` table's primary key columns with per-column folding
+/// verdicts.
+///
+/// The declared type (carrying affinity) comes from `PRAGMA table_info` via
+/// [`primary_key_columns`]; the collation governing each key column's equality
+/// comes from the primary key's backing auto-index (`pragma_index_list` origin
+/// `'pk'`, then `pragma_index_xinfo`). A single-column `INTEGER PRIMARY KEY`
+/// aliases the rowid and has no auto-index, so it carries no collation and is
+/// caught by the affinity half of [`sqlite_key_column_folding`].
+async fn table_primary_key(pool: &SqlitePool, table: &str) -> Result<Vec<ActualKeyColumn>, StoreError> {
+    let declared = primary_key_columns(pool, table).await?;
+    let collations = match primary_key_index_name(pool, table).await? {
+        Some(index) => index_key_collations(pool, &index).await?,
+        None => Vec::new(),
+    };
+    Ok(declared
+        .into_iter()
+        .map(|(name, declared_type)| {
+            let collation = collations
+                .iter()
+                .find(|(column, _)| column == &name)
+                .and_then(|(_, collation)| collation.as_deref());
+            ActualKeyColumn {
+                folding: sqlite_key_column_folding(&declared_type, collation),
+                name,
+            }
+        })
+        .collect())
+}
+
+/// Fetch the name of a `SQLite` table's primary key auto-index, if any.
+///
+/// A composite (or any non-`INTEGER`) primary key is backed by an auto-index
+/// reported by `pragma_index_list` with `origin = 'pk'`; a single-column
+/// `INTEGER PRIMARY KEY` aliases the rowid and has none. The table name is
+/// bound as a parameter so a quoted or special name does not break the query.
+async fn primary_key_index_name(pool: &SqlitePool, table: &str) -> Result<Option<String>, StoreError> {
+    let rows = sqlx::query("SELECT name, origin FROM pragma_index_list(?)")
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    for row in &rows {
+        let origin: String = row.try_get("origin").map_err(|e| StoreError::Database(e.to_string()))?;
+        if origin == "pk" {
+            return Ok(Some(
+                row.try_get("name").map_err(|e| StoreError::Database(e.to_string()))?,
+            ));
+        }
+    }
+    Ok(None)
+}
+
+/// Fetch the key columns of a `SQLite` index paired with their collations via
+/// the `pragma_index_xinfo` table-valued function.
+///
+/// The index name is bound as a parameter so a name that needs quoting does not
+/// break the query. `index_xinfo` marks the columns named in the index with
+/// `key = 1` and the auxiliary rowid/covering columns with `key = 0`, which are
+/// skipped. A NULL name is an expression key column (never present on our
+/// primary keys) and is also skipped. The collation is returned verbatim;
+/// [`sqlite_key_column_folding`] decides whether it folds distinct values.
+async fn index_key_collations(pool: &SqlitePool, index: &str) -> Result<Vec<(String, Option<String>)>, StoreError> {
+    let rows = sqlx::query("SELECT name, coll, \"key\" AS is_key FROM pragma_index_xinfo(?)")
+        .bind(index)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let mut collations = Vec::new();
+    for row in &rows {
+        let is_key: i64 = row.try_get("is_key").map_err(|e| StoreError::Database(e.to_string()))?;
+        if is_key == 0 {
+            continue;
+        }
+        let name: Option<String> = row.try_get("name").map_err(|e| StoreError::Database(e.to_string()))?;
+        let collation: Option<String> = row.try_get("coll").map_err(|e| StoreError::Database(e.to_string()))?;
+        if let Some(name) = name {
+            collations.push((name, collation));
+        }
+    }
+    Ok(collations)
+}
+
+/// Fetch the unique indexes on a `SQLite` table other than the primary key's
+/// auto-index, each with the columns it covers, via `pragma_index_list` and
+/// `pragma_index_info`.
+///
+/// The table name is bound as a parameter so a quoted or special name does not
+/// break the query. `pragma_index_list` reports every index with a `unique`
+/// flag and an `origin` (`'pk'` for the primary key, `'u'` for a `UNIQUE`
+/// constraint, `'c'` for a `CREATE UNIQUE INDEX`). Every unique index whose
+/// origin is not `'pk'` is compared against the store's own generated unique
+/// indexes by column set; anything else is rejected fail-closed rather than
+/// proved a safe superset, since a narrower unique key loses rows via
+/// `INSERT OR REPLACE`.
+async fn table_extra_unique_indexes(pool: &SqlitePool, table: &str) -> Result<Vec<ActualUniqueIndex>, StoreError> {
+    let rows = sqlx::query("SELECT name, \"unique\" AS is_unique, origin FROM pragma_index_list(?)")
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let mut indexes = Vec::new();
+    for row in &rows {
+        let is_unique: i64 = row
+            .try_get("is_unique")
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        let origin: String = row.try_get("origin").map_err(|e| StoreError::Database(e.to_string()))?;
+        if is_unique == 0 || origin == "pk" {
+            continue;
+        }
+        let name: String = row.try_get("name").map_err(|e| StoreError::Database(e.to_string()))?;
+        let columns = index_columns(pool, &name).await?;
+        indexes.push(ActualUniqueIndex { name, columns });
+    }
+    indexes.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(indexes)
+}
+
+/// Fetch the columns a `SQLite` index covers, in index order, via
+/// `pragma_index_info`.
+///
+/// The index name is bound as a parameter. `pragma_index_info` lists one row per
+/// indexed column ordered by `seqno`, so the returned columns preserve the
+/// index's declared order.
+async fn index_columns(pool: &SqlitePool, index: &str) -> Result<Vec<String>, StoreError> {
+    let rows = sqlx::query("SELECT name FROM pragma_index_info(?) ORDER BY seqno")
+        .bind(index)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let mut columns = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let name: Option<String> = row.try_get("name").map_err(|e| StoreError::Database(e.to_string()))?;
+        if let Some(name) = name {
+            columns.push(name);
+        }
+    }
+    Ok(columns)
+}
+
+/// Discover each tenant-scoped table's schema and compare it against the schema
+/// this store generates before the schema version is stamped.
+///
+/// The single [`check_schema`] comparison fails closed on any deviation -- a
+/// missing column, a primary key that is not the exact ordered contract, a key
+/// column with a non-TEXT affinity or folding collation, or a unique index whose
+/// column set is not one the store itself generates -- because
+/// `CREATE TABLE IF NOT EXISTS` preserves a pre-existing table that could
+/// silently lose data across tenants under `INSERT OR REPLACE`. The global schema
+/// version table holds no tenant data and is validated by value in
+/// [`check_schema_version`], not here.
+async fn validate_schema(pool: &SqlitePool, tables: &TableNames) -> Result<(), StoreError> {
+    let expected = expected_tables(tables);
+    let mut actuals = Vec::with_capacity(expected.len());
+    for (table_name, _) in &expected {
+        actuals.push(ActualTable {
+            columns: table_column_names(pool, table_name).await?,
+            primary_key: table_primary_key(pool, table_name).await?,
+            // SQLite has no deferrable constraints; a primary key is always immediate.
+            primary_key_immediate: true,
+            unique_indexes: table_extra_unique_indexes(pool, table_name).await?,
+        });
+    }
+
+    let checks: Vec<SchemaCheck<'_>> = expected
         .iter()
-        .map(|(name, expected, actual)| (*name, *expected, actual.as_slice()))
+        .zip(&actuals)
+        .map(|((name, contract), actual)| (name.as_str(), *contract, actual))
         .collect();
-
-    check_column_presence(&refs)
+    check_schema(&checks)
 }
 
 /// Stamp or validate the schema version.
