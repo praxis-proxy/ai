@@ -26,12 +26,10 @@ use serde::Deserialize;
 ///
 /// Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting`
 /// proposal in `praxis-proxy/enhancements`, scoped to this milestone's
-/// static header-value matchers and per-rule algorithm choice. CEL
-/// matchers, soft-limit tiers, weighted per-type accounting, and
-/// configurable estimation strategies are still out of scope (see the
-/// module doc comment) -- upstream itself defers the first two; the
-/// latter two are deferred to a separate follow-up by design, not by
-/// upstream mandate.
+/// static header-value matchers, per-rule algorithm choice, and M4
+/// token-type weights (`default_weights` / per-rule `weights`). CEL
+/// matchers, soft-limit tiers, and configurable estimation strategies
+/// are still out of scope (see the module doc comment).
 ///
 /// Assumes request identity has already been resolved upstream (this
 /// filter doesn't authenticate callers) -- a catch-all rule (no
@@ -60,6 +58,13 @@ pub(super) struct TokenRateLimitConfig {
     /// in-process and Valkey rules in one filter instance.
     #[serde(default)]
     pub backend: BackendConfig,
+
+    /// Filter-wide default per-type weights applied at reconciliation
+    /// (proposal M4). Omitted types default to `1.0`. Rules may overlay
+    /// individual types via [`RuleConfig::weights`]. Admission still
+    /// reserves [`RuleConfig::reserved_tokens`] unweighted.
+    #[serde(default)]
+    pub default_weights: super::weights::TokenTypeWeightsConfig,
 }
 
 /// One `rules:` entry: an optional match condition, an algorithm choice
@@ -126,6 +131,11 @@ pub(super) struct RuleConfig {
     /// when unset.
     #[serde(default)]
     pub reservation_timeout: Option<String>,
+
+    /// Optional per-rule overlay on [`TokenRateLimitConfig::default_weights`].
+    /// Omitted types inherit the filter defaults (then `1.0`).
+    #[serde(default)]
+    pub weights: super::weights::TokenTypeWeightsConfig,
 }
 
 /// Static header-value match condition for a [`RuleConfig`].
@@ -370,6 +380,56 @@ mod tests {
             }
             .capacity(),
             7
+        );
+    }
+
+    #[test]
+    fn parses_filter_wide_and_per_rule_weights() {
+        let cfg = parse(
+            "default_weights:\n\
+             \x20 cached_input: 0.1\n\
+             \x20 reasoning: 0.9\n\
+             rules:\n\
+             \x20 - name: team-alpha\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 1000\n\
+             \x20   reserved_tokens: 50\n\
+             \x20   weights:\n\
+             \x20     cached_input: 0.05\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.default_weights.cached_input, Some(0.1));
+        assert_eq!(cfg.default_weights.reasoning, Some(0.9));
+        assert!(cfg.default_weights.input.is_none());
+        assert_eq!(cfg.rules[0].weights.cached_input, Some(0.05));
+        assert!(cfg.rules[0].weights.reasoning.is_none());
+    }
+
+    #[test]
+    fn rejects_an_unknown_weight_type_name() {
+        let err = parse(
+            "default_weights:\n  cached: 0.1\nrules:\n  - name: default\n    algorithm: sliding_window\n    \
+             window: 1h\n    capacity: 100\n    reserved_tokens: 5\n",
+        )
+        .expect_err("typo'd type name must fail");
+        assert!(err.to_string().contains("unknown field"), "got: {err}");
+    }
+
+    #[test]
+    fn omits_weights_when_unset_so_pre_m4_configs_still_parse() {
+        let cfg = parse(
+            "rules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    \
+             reserved_tokens: 50\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.default_weights,
+            super::super::weights::TokenTypeWeightsConfig::default()
+        );
+        assert_eq!(
+            cfg.rules[0].weights,
+            super::super::weights::TokenTypeWeightsConfig::default()
         );
     }
 }

@@ -11,9 +11,10 @@
 #
 # This is the agreed M1/M2/M6 core of the token rate limiting proposal
 # (00121_token-rate-limiting.md in praxis-proxy/enhancements, tracked by
-# epic ai#121):
+# epic ai#121), plus M4 token-type weights:
 #   - M1: a single sliding-window budget (one catch-all rule)
 #   - M2: reservation-based admission, reconciled against actual usage
+#   - M4: per-type weights at reconciliation (cached input cheaper, etc.)
 #   - M6: 429 responses with token-denominated rate limit headers
 #
 # `rules:` (per `ai#789`/`praxis#551`) lets each rule pick its own
@@ -27,11 +28,16 @@
 # share every rule's budget across every gateway instance/replica over
 # one shared connection.
 #
+# `default_weights` (M4) scale provider-reported token types when the
+# reservation is reconciled. Cache read/write are a breakdown of
+# token.input (not an addition); reasoning is nested in token.output
+# on OpenAI/Anthropic and additive on Google. Omitted types default to
+# 1.0. Admission still reserves `reserved_tokens` unweighted (M3).
+#
 # Deliberately not yet built (see filters/src/token_rate_limit/mod.rs
 # for the full rationale): CEL/composite bucket keys, configurable
 # estimation strategies (M3, `reserved_tokens` below is a fixed
-# placeholder), token-type-aware accounting (M4), and
-# observability/metering (M7/M8/S3).
+# placeholder), and observability/metering (M7/M8/S3).
 #
 # token_rate_limit is declared *before* token_count: response hooks
 # run in reverse declared order, so token_count's on_response_body
@@ -70,6 +76,12 @@ filter_chains:
             cluster: backend
 
       - filter: token_rate_limit
+        default_weights:
+          input: 1.0
+          output: 1.0
+          cached_input: 0.1    # prompt-cache hits (token.cache_read)
+          cache_write: 1.25    # prompt-cache writes (token.cache_write)
+          reasoning: 0.9       # thinking tokens (token.reasoning)
         rules:
           - name: default
             algorithm: sliding_window

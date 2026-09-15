@@ -13,9 +13,9 @@
 #   curl -i http://localhost:8080/v1/chat/completions -H 'x-app-id: beta'  -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
 #
 # See token-rate-limit.yaml for the full rationale on reservation-based
-# admission (M2), reconciliation, the `rules:` schema, and what's still
-# deliberately out of scope (composite/CEL keys, configurable
-# estimation, token-type-aware accounting, observability/metering).
+# admission (M2), reconciliation, M4 token-type weights, the `rules:`
+# schema, and what's still deliberately out of scope (composite/CEL
+# keys, configurable estimation, observability/metering).
 #
 # Supported token_count provider values:
 #   openai | anthropic | google | bedrock | azure
@@ -35,6 +35,10 @@ filter_chains:
             cluster: backend
 
       - filter: token_rate_limit
+        default_weights:
+          cached_input: 0.1
+          cache_write: 1.25
+          reasoning: 0.9
         rules:
           - name: team-alpha
             match:
@@ -44,6 +48,8 @@ filter_chains:
             window: 1h                    # exact trailing-window budget
             capacity: 100000              # max tokens admitted within `window`
             reserved_tokens: 500          # fixed cost reserved per request at admission
+            weights:
+              cached_input: 0.05          # this tenant gets a steeper cache discount
           - name: team-beta
             match:
               headers:
