@@ -12,6 +12,14 @@ mod credential_inject;
 pub(crate) mod descriptor;
 pub(crate) mod group_index;
 mod intelligent_route;
+// The load data source lands ahead of its consumer. The scorer and the
+// intelligent_route wiring that read the store land in the immediate follow-up,
+// which removes this expectation.
+#[expect(
+    dead_code,
+    reason = "data source landed ahead of its consumer, wired in the immediate follow-up"
+)]
+pub(crate) mod load;
 pub(crate) mod metadata;
 pub(crate) mod overlay;
 pub(crate) mod picker;
