@@ -561,8 +561,14 @@ filter_chains:
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:{files_api_port}"
-        allow_private_files_api_url: true
         allow_pre_security_callout: true
+        outbound_chain:
+          name: files-api-outbound
+          filters:
+            - filter: headers
+              request_set:
+                - name: x-file-callout
+                  value: file-resolve
         file_url: resolve
         allowed_file_url_origins:
           - "http://127.0.0.1:{file_url_port}"
@@ -654,8 +660,14 @@ filter_chains:
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:{files_api_port}"
-        allow_private_files_api_url: true
         allow_pre_security_callout: true
+        outbound_chain:
+          name: files-api-outbound
+          filters:
+            - filter: headers
+              request_set:
+                - name: x-file-callout
+                  value: file-resolve
         file_url: passthrough
         on_missing: reject
 
@@ -783,8 +795,14 @@ filter_chains:
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:{files_api_port}"
-        allow_private_files_api_url: true
         allow_pre_security_callout: true
+        outbound_chain:
+          name: files-api-outbound
+          filters:
+            - filter: headers
+              request_set:
+                - name: x-file-callout
+                  value: file-resolve
         file_url: resolve
         allowed_file_url_origins:
           - "http://127.0.0.1:{file_url_port}"
@@ -811,6 +829,7 @@ filter_chains:
 
 insecure_options:
   allow_private_endpoints: true
+  allow_private_upstreams: true # file_id callout reaches the loopback Files API
 "#,
         inference_guard.port(),
         default_guard.port()
@@ -865,6 +884,115 @@ insecure_options:
     );
 }
 
+#[test]
+fn example_config_outbound_chain_runs_for_file_id_not_file_url() {
+    // The Files API stub answers only when the outbound chain's
+    // `headers` filter has stamped `x-file-callout: file-resolve`
+    // on the callout; the `file_url` stub answers only when that header
+    // is absent. A single 200 with both parts resolved therefore proves
+    // the outbound filter ran for the `file_id` callout but never for the
+    // client-controlled `file_url` download.
+    let files_api_port = start_files_api_stub_requires_callout_header();
+    let file_url_port = start_file_url_stub_rejects_callout_header();
+    let inference_guard = start_capturing_backend("{}");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let yaml = format!(
+        r#"
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [file-resolve-pipeline]
+
+filter_chains:
+  - name: file-resolve-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+
+      - filter: openai_file_resolve
+        files_api_url: "http://127.0.0.1:{files_api_port}"
+        allow_pre_security_callout: true
+        outbound_chain:
+          name: files-api-outbound
+          filters:
+            - filter: headers
+              request_set:
+                - name: x-file-callout
+                  value: file-resolve
+        file_url: resolve
+        allowed_file_url_origins:
+          - "http://127.0.0.1:{file_url_port}"
+        on_missing: reject
+        timeout_ms: 10000
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            cluster: "inference-backend"
+          - path_prefix: "/"
+            cluster: "default-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:{}"
+          - name: "default-backend"
+            endpoints:
+              - "127.0.0.1:{}"
+
+insecure_options:
+  allow_private_endpoints: true
+  allow_private_upstreams: true # file_id callout reaches the loopback Files API
+"#,
+        inference_guard.port(),
+        default_guard.port()
+    );
+    let config = praxis_core::config::Config::from_yaml(&yaml).expect("config should parse");
+    let proxy = start_proxy(&config);
+
+    let body = format!(
+        r#"{{
+            "model": "gpt-4.1",
+            "input": [
+                {{
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {{"type": "input_file", "file_id": "test-file-123"}},
+                        {{"type": "input_file", "file_url": "http://127.0.0.1:{file_url_port}/document.txt"}}
+                    ]
+                }}
+            ]
+        }}"#
+    );
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "request should succeed: outbound chain stamps the file_id callout but not the file_url download"
+    );
+
+    let captured: serde_json::Value =
+        serde_json::from_str(&inference_guard.body()).expect("captured body should be valid JSON");
+    assert_eq!(
+        captured["input"][0]["content"][0]["file_data"].as_str().unwrap(),
+        "SGVsbG8sIHdvcmxkIQ==",
+        "file_id resolved only because the outbound chain ran and set x-file-callout"
+    );
+    assert_eq!(
+        captured["input"][0]["content"][1]["file_data"].as_str().unwrap(),
+        "data:text/plain;base64,SGVsbG8sIHdvcmxkIQ==",
+        "file_url resolved only because the outbound chain did NOT run for it"
+    );
+}
+
 pub(super) fn start_file_url_stub() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -876,6 +1004,137 @@ pub(super) fn start_file_url_stub() -> u16 {
     });
 
     port
+}
+
+/// Files API stub that serves content only when the outbound chain has
+/// stamped `x-file-callout: file-resolve` on the callout request,
+/// proving the bound outbound filter pipeline executed for `file_id`
+/// resolution.
+fn start_files_api_stub_requires_callout_header() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || handle_files_api_request_requires_callout_header(stream));
+        }
+    });
+
+    port
+}
+
+/// File URL stub that rejects any request carrying the outbound chain's
+/// `x-file-callout` header, proving the chain never runs for
+/// client-controlled `file_url` downloads.
+fn start_file_url_stub_rejects_callout_header() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || handle_file_url_request_rejects_callout_header(stream));
+        }
+    });
+
+    port
+}
+
+fn handle_files_api_request_requires_callout_header(mut stream: std::net::TcpStream) {
+    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+
+    let mut data = Vec::new();
+    let mut buf = [0_u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => data.extend_from_slice(&buf[..n]),
+        }
+        if data.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let raw = String::from_utf8_lossy(&data);
+    let has_callout_header = raw.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("x-file-callout:") && lower.contains("file-resolve")
+    });
+    if !has_callout_header {
+        let body = br#"{"error":"missing outbound callout header"}"#;
+        let header = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _sent = stream.write_all(header.as_bytes());
+        let _sent = stream.write_all(body);
+        return;
+    }
+
+    let path = raw
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+
+    let (status, content_type, body_bytes): (u16, &str, Vec<u8>) =
+        if path.ends_with("/content") && path.contains("test-file-123") {
+            (200, "text/plain", FILE_CONTENT.as_bytes().to_vec())
+        } else if path.contains("test-file-123") {
+            (200, "application/json", FILE_METADATA.as_bytes().to_vec())
+        } else {
+            (404, "application/json", MISSING_FILE_ERROR.as_bytes().to_vec())
+        };
+
+    let header = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        if status == 200 { "OK" } else { "Not Found" },
+        body_bytes.len()
+    );
+    let _sent = stream.write_all(header.as_bytes());
+    let _sent = stream.write_all(&body_bytes);
+}
+
+fn handle_file_url_request_rejects_callout_header(mut stream: std::net::TcpStream) {
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let mut data = Vec::new();
+    let mut buf = [0_u8; 4096];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => data.extend_from_slice(&buf[..n]),
+        }
+        if data.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let raw = String::from_utf8_lossy(&data);
+    let has_callout_header = raw
+        .lines()
+        .any(|line| line.to_ascii_lowercase().starts_with("x-file-callout:"));
+    if has_callout_header {
+        let body = br#"{"error":"outbound chain leaked to file_url download"}"#;
+        let header = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _sent = stream.write_all(header.as_bytes());
+        let _sent = stream.write_all(body);
+        return;
+    }
+
+    let body = FILE_CONTENT.as_bytes();
+    let header = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        body.len()
+    );
+    let _sent = stream.write_all(header.as_bytes());
+    let _sent = stream.write_all(body);
 }
 
 fn start_file_url_stub_auth_check() -> u16 {

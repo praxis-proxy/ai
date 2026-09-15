@@ -3,6 +3,7 @@
 
 //! Configuration types for the `openai_file_resolve` filter.
 
+use praxis_core::config::ChainRef;
 use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 
@@ -42,12 +43,28 @@ pub(crate) enum FileUrlMode {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileResolveConfig {
-    /// Allow `files_api_url` to resolve to private, loopback, link-local,
-    /// or otherwise non-public addresses. Default `false` permits DNS
-    /// names only when every connect-time result is public. Set to `true`
-    /// only when the Files API is a trusted private service.
+    /// Outbound filter chain applied to configured Files API
+    /// (`file_id`) metadata and content requests.
+    ///
+    /// The chain runs through the `FilteredSubrequestExecutor`, so its
+    /// filters observe and can mutate the outbound callout before it is
+    /// dialed. SSRF protection for `files_api_url` derives from the
+    /// pipeline's `allow_private_upstreams`, enforced both when the
+    /// callout target is pinned and at connect time.
+    ///
+    /// Client-controlled `file_url` downloads never traverse this
+    /// chain; they stay on the credential-free hardened resolver.
+    ///
+    /// Must be an **inline** chain (`name` + `filters`). A named
+    /// reference is rejected at build time: the registration prepends
+    /// and appends an internal upstream-seed filter to the chain, which
+    /// it cannot inject into a chain resolved by name inside the
+    /// binding context. The field is optional at the struct level so
+    /// programmatic constructors can omit it, but the filter
+    /// registration fails the build when the chain is missing or cannot
+    /// be bound.
     #[serde(default)]
-    pub allow_private_files_api_url: bool,
+    pub outbound_chain: Option<ChainRef>,
 
     /// Allow Files API callouts from the `StreamBuffer` pre-read
     /// phase, before header-phase security filters execute.
@@ -151,11 +168,12 @@ pub(crate) fn validate_config(mut cfg: FileResolveConfig) -> Result<FileResolveC
         return Err("openai_file_resolve: 'files_api_url' must not end with '/'".into());
     }
 
-    api_client::validate_base_url(
-        "openai_file_resolve",
-        &cfg.files_api_url,
-        cfg.allow_private_files_api_url,
-    )?;
+    // Structural checks (scheme, credentials, query, fragment) still apply.
+    // Private-IP rejection for the configured Files API now derives from the
+    // outbound pipeline's `allow_private_upstreams`, enforced when the callout
+    // target is pinned (`prepare_url_target`) and at connect time
+    // (`build_peer`), so the config-time private-IP gate is disabled here.
+    api_client::validate_base_url("openai_file_resolve", &cfg.files_api_url, true)?;
     api_client::validate_forward_headers("openai_file_resolve", &mut cfg.forward_headers)?;
     validate_limits(&cfg)?;
     validate_pre_security_callout(&cfg)?;
@@ -253,7 +271,6 @@ mod tests {
 
     const MINIMAL_YAML: &str = r#"
 files_api_url: "http://files-api:8321"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
 "#;
 
@@ -297,7 +314,6 @@ allow_pre_security_callout: true
     fn full_config_parses() {
         let yaml = r#"
 files_api_url: "http://files:9090"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
 forward_headers:
   - authorization
@@ -427,7 +443,7 @@ timeout_ms: 300001"#;
     #[test]
     fn valid_config_passes() {
         let cfg = FileResolveConfig {
-            allow_private_files_api_url: true,
+            outbound_chain: None,
             allow_pre_security_callout: true,
             files_api_url: "http://files-api:8321".to_owned(),
             forward_headers: Vec::new(),
@@ -446,7 +462,6 @@ timeout_ms: 300001"#;
     fn forward_headers_are_normalized() {
         let yaml = r#"
 files_api_url: "http://files-api:8321"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
 forward_headers:
   - Authorization
@@ -466,7 +481,6 @@ forward_headers:
     fn invalid_forward_header_rejected() {
         let yaml = r#"
 files_api_url: "http://files-api:8321"
-allow_private_files_api_url: true
 forward_headers: ["bad header"]
 "#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
@@ -486,9 +500,7 @@ forward_headers: ["bad header"]
             "proxy-authorization",
             "x-praxis-route",
         ] {
-            let yaml = format!(
-                "files_api_url: \"http://files-api:8321\"\nallow_private_files_api_url: true\nforward_headers: [\"{name}\"]"
-            );
+            let yaml = format!("files_api_url: \"http://files-api:8321\"\nforward_headers: [\"{name}\"]");
             let cfg: FileResolveConfig = serde_yaml::from_str(&yaml).unwrap();
 
             assert!(
@@ -502,7 +514,6 @@ forward_headers: ["bad header"]
     fn duplicate_forward_headers_rejected_case_insensitively() {
         let yaml = r#"
 files_api_url: "http://files-api:8321"
-allow_private_files_api_url: true
 forward_headers: ["Authorization", "authorization"]
 "#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
@@ -517,7 +528,6 @@ forward_headers: ["Authorization", "authorization"]
     fn pre_security_callout_requires_explicit_opt_in() {
         let yaml = r#"
 files_api_url: "http://files-api:8321"
-allow_private_files_api_url: true
 "#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
 
@@ -527,39 +537,30 @@ allow_private_files_api_url: true
         );
     }
 
-    // SSRF validation is tested thoroughly in api_client::url::tests.
-    // These tests verify the delegation path through validate_config.
+    // Config-time validation keeps only structural checks (scheme,
+    // credentials, query, fragment). Private-IP rejection for the
+    // configured Files API now lives on the outbound pipeline's
+    // `allow_private_upstreams`, enforced when the callout target is
+    // pinned (`prepare_url_target`) and at connect time (`build_peer`),
+    // so a loopback `files_api_url` passes config validation.
 
     #[test]
-    fn ssrf_rejects_loopback_ipv4() {
-        let yaml = r#"files_api_url: "http://127.0.0.1:8321""#;
+    fn loopback_files_api_url_passes_config_validation() {
+        let yaml = r#"files_api_url: "http://127.0.0.1:8321"
+allow_pre_security_callout: true"#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(
-            validate_config(cfg).is_err(),
-            "loopback IPv4 should be rejected without allow_private"
+            validate_config(cfg).is_ok(),
+            "loopback files_api_url is accepted at config time; SSRF is enforced by the outbound pipeline"
         );
     }
 
     #[test]
-    fn ssrf_allows_public_ipv4() {
+    fn public_files_api_url_passes_config_validation() {
         let yaml = r#"files_api_url: "http://8.8.8.8:8321"
 allow_pre_security_callout: true"#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(validate_config(cfg).is_ok(), "public IPv4 should be allowed");
-    }
-
-    #[test]
-    fn ssrf_allows_private_with_override() {
-        let yaml = r#"
-files_api_url: "http://127.0.0.1:8321"
-allow_private_files_api_url: true
-allow_pre_security_callout: true
-"#;
-        let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(
-            validate_config(cfg).is_ok(),
-            "loopback should be allowed with allow_private_files_api_url"
-        );
     }
 
     #[test]
@@ -573,7 +574,6 @@ allow_pre_security_callout: true
     fn files_api_url_rejects_embedded_credentials() {
         let yaml = r#"
 files_api_url: "http://user:password@files-api:8321"
-allow_private_files_api_url: true
 "#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(
@@ -586,7 +586,6 @@ allow_private_files_api_url: true
     fn files_api_url_rejects_query_string() {
         let yaml = r#"
 files_api_url: "http://files-api:8321/base?tenant=abc"
-allow_private_files_api_url: true
 "#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(
@@ -599,7 +598,6 @@ allow_private_files_api_url: true
     fn files_api_url_rejects_fragment() {
         let yaml = r#"
 files_api_url: "http://files-api:8321/base#v2"
-allow_private_files_api_url: true
 "#;
         let cfg: FileResolveConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(
@@ -618,7 +616,6 @@ allow_private_files_api_url: true
     fn file_url_passthrough_accepted() {
         let yaml = r#"
 files_api_url: "http://ogx:8321"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
 file_url: passthrough
 "#;
@@ -631,7 +628,6 @@ file_url: passthrough
     fn allowed_origins_with_passthrough_rejected() {
         let yaml = r#"
 files_api_url: "http://ogx:8321"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
 file_url: passthrough
 allowed_file_url_origins:
@@ -648,7 +644,6 @@ allowed_file_url_origins:
     fn valid_allowed_origins_accepted() {
         let yaml = r#"
 files_api_url: "http://ogx:8321"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
 file_url: resolve
 allowed_file_url_origins:
@@ -663,7 +658,6 @@ allowed_file_url_origins:
     fn duplicate_origins_rejected() {
         let yaml = r#"
 files_api_url: "http://ogx:8321"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
 allowed_file_url_origins:
   - "https://files.example.com"
@@ -677,7 +671,6 @@ allowed_file_url_origins:
     fn origin_with_path_rejected() {
         let yaml = r#"
 files_api_url: "http://ogx:8321"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
 allowed_file_url_origins:
   - "https://files.example.com/api"
@@ -690,7 +683,6 @@ allowed_file_url_origins:
     fn origin_cloud_metadata_rejected() {
         let yaml = r#"
 files_api_url: "http://ogx:8321"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
 allowed_file_url_origins:
   - "http://169.254.169.254"

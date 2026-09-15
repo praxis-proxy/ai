@@ -15,7 +15,7 @@ This filter resolves references inside Responses requests; it does not proxy cli
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `allow_private_files_api_url` | bool | no | Allow `files_api_url` to resolve to private, loopback, link-local, or otherwise non-public addresses. Default `false` permits DNS names only when every connect-time result is public. Set to `true` only when the Files API is a trusted private service. |
+| `outbound_chain` | ChainRef | no | Outbound filter chain applied to configured Files API (`file_id`) metadata and content requests. The chain runs through the `FilteredSubrequestExecutor`, so its filters observe and can mutate the outbound callout before it is dialed. SSRF protection for `files_api_url` derives from the pipeline's `allow_private_upstreams`, enforced both when the callout target is pinned and at connect time. Client-controlled `file_url` downloads never traverse this chain; they stay on the credential-free hardened resolver. Must be an **inline** chain (`name` + `filters`). A named reference is rejected at build time: the registration prepends and appends an internal upstream-seed filter to the chain, which it cannot inject into a chain resolved by name inside the binding context. The field is optional at the struct level so programmatic constructors can omit it, but the filter registration fails the build when the chain is missing or cannot be bound. |
 | `allow_pre_security_callout` | bool | no | Allow Files API callouts from the `StreamBuffer` pre-read phase, before header-phase security filters execute. This must be explicitly enabled only when an outer trust boundary authenticates and authorizes requests before they reach this listener. Forwarded headers are the original downstream values, not mutations from request filters. |
 | `files_api_url` | string | yes | Base URL of the Files API endpoint. Example: `http://files-api:8321` |
 | `forward_headers` | string[] | no | Headers to forward from the original request to the Files API for authentication and tenant isolation. No downstream headers are forwarded by default. |
@@ -34,8 +34,14 @@ This filter resolves references inside Responses requests; it does not proxy cli
 ```yaml
 filter: openai_file_resolve
 files_api_url: "http://files-api:8321"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
+outbound_chain:
+  name: files-api-outbound
+  filters:
+    - filter: headers
+      request_set:
+        - name: x-file-callout
+          value: file-resolve
 ```
 
 ### Example 2
@@ -43,8 +49,14 @@ allow_pre_security_callout: true
 ```yaml
 filter: openai_file_resolve
 files_api_url: "http://files-api:8321"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
+outbound_chain:
+  name: files-api-outbound
+  filters:
+    - filter: headers
+      request_set:
+        - name: x-file-callout
+          value: file-resolve
 forward_headers:
   - authorization
   - x-tenant-id
@@ -60,8 +72,14 @@ max_file_references: 32
 ```yaml
 filter: openai_file_resolve
 files_api_url: "http://ogx:8321"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
+outbound_chain:
+  name: ogx-outbound
+  filters:
+    - filter: headers
+      request_set:
+        - name: x-file-callout
+          value: file-resolve
 file_url: resolve
 allowed_file_url_origins:
   - "https://files.internal:8443"

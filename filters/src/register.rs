@@ -3,7 +3,10 @@
 
 //! Public AI filter registration for consumers outside `praxis-ai-proxy`.
 
-use praxis_core::subrequest::SubRequestClient;
+use praxis_core::{
+    config::{ChainRef, FailureMode, FilterEntry},
+    subrequest::SubRequestClient,
+};
 use praxis_filter::FilterRegistry;
 
 #[cfg(feature = "azure-ad-filter")]
@@ -364,25 +367,93 @@ fn register_anthropic_web_search(registry: &mut FilterRegistry, subrequest_clien
     }
 }
 
-/// Register `openai_file_resolve` with the shared client when
-/// available, otherwise fall back to an isolated per-filter connector.
+/// Register `openai_file_resolve` as a chain-binding filter.
+///
+/// Configured Files API (`file_id`) callouts run through the
+/// `outbound_chain` filter pipeline, which is resolved and validated at
+/// build/hot-reload time via [`ChainBindingContext::bind_chain`]. The chain
+/// is required: registration fails the build when it is missing or cannot be
+/// bound. The shared [`SubRequestClient`] is captured when available;
+/// otherwise the filter falls back to an isolated per-filter connector.
+///
+/// The internal `openai_callout_seed_upstream` filter is registered alongside
+/// and prepended to the bound chain (see [`seed_file_resolve_chain`]) so the
+/// executor can dial the API client's pinned upstream.
+///
+/// [`ChainBindingContext::bind_chain`]: praxis_filter::ChainBindingContext::bind_chain
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
 fn register_file_resolve(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
-    if let Some(client) = subrequest_client {
-        let client = client.clone();
-        registry
-            .register(
-                "openai_file_resolve",
-                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
-                    praxis_ai_apis::openai::FileResolveFilter::from_config_with_client(config, client.clone())
-                })),
-            )
-            .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_resolve'"));
-    } else {
-        praxis_filter::register_filters!(
-            @register registry,
-            http "openai_file_resolve" => praxis_ai_apis::openai::FileResolveFilter::from_config
-        );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_callout_seed_upstream" => praxis_ai_apis::openai::CalloutSeedUpstreamFilter::from_config
+    );
+    let shared = subrequest_client.cloned();
+    registry
+        .register_chain_binding(
+            "openai_file_resolve",
+            std::sync::Arc::new(move |config, ctx| {
+                let chain_ref = praxis_ai_apis::openai::FileResolveFilter::outbound_chain_ref(config)?.ok_or_else(
+                    || -> praxis_filter::FilterError { "openai_file_resolve: 'outbound_chain' is required".into() },
+                )?;
+                let seeded = seed_file_resolve_chain(chain_ref)?;
+                let outbound = std::sync::Arc::new(ctx.bind_chain(&seeded)?);
+                let client = match &shared {
+                    Some(client) => client.clone(),
+                    None => SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+                };
+                praxis_ai_apis::openai::FileResolveFilter::from_config_with_outbound(config, client, outbound)
+            }),
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_resolve'"));
+}
+
+/// Install the internal `openai_callout_seed_upstream` filter at both ends of a
+/// file-resolve `outbound_chain`.
+///
+/// The configured Files API destination (`files_api_url`) is owned by the
+/// filter rather than resolved from a cluster, so the bound chain has no
+/// traffic-management filter to populate `filter_ctx.upstream`. The API client
+/// pins and stages the upstream; the seed filter projects it onto the context
+/// so the `FilteredSubrequestExecutor` can dial it.
+///
+/// The seed is added twice: a **head** instance (index 0) so the operator's own
+/// filters observe the real destination, and a **tail** instance (appended)
+/// that reasserts the pinned upstream after those filters run. The tail defeats
+/// a mid-chain override — e.g. an operator `endpoint_selector` — that would
+/// otherwise silently retarget a callout still carrying Files API credentials.
+/// The seed clones rather than consumes the staged upstream, so both instances
+/// project the same validated destination.
+///
+/// Only inline chains are supported: a named reference is resolved inside
+/// [`ChainBindingContext::bind_chain`], which the AI registration cannot reach
+/// to inject the seed, so it is rejected at build time. See the
+/// `outbound_chain` documentation for `openai_file_resolve`.
+///
+/// [`ChainBindingContext::bind_chain`]: praxis_filter::ChainBindingContext::bind_chain
+fn seed_file_resolve_chain(chain_ref: ChainRef) -> Result<ChainRef, praxis_filter::FilterError> {
+    match chain_ref {
+        ChainRef::Inline { name, mut filters } => {
+            filters.insert(0, seed_upstream_entry());
+            filters.push(seed_upstream_entry());
+            Ok(ChainRef::Inline { name, filters })
+        },
+        ChainRef::Named(_) => Err("openai_file_resolve: 'outbound_chain' must be an inline chain \
+             so the internal upstream seed filter can be installed; named chains are not supported"
+            .into()),
+    }
+}
+
+/// Build the internal seed [`FilterEntry`] prepended to file-resolve outbound
+/// chains. Configuration-free; it always runs, on every request.
+fn seed_upstream_entry() -> FilterEntry {
+    FilterEntry {
+        filter_type: "openai_callout_seed_upstream".to_owned(),
+        branch_chains: None,
+        conditions: Vec::new(),
+        name: None,
+        response_conditions: Vec::new(),
+        failure_mode: FailureMode::default(),
+        config: serde_yaml::Value::Null,
     }
 }
 
@@ -457,8 +528,99 @@ fn register_web_search(registry: &mut FilterRegistry, subrequest_client: Option<
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests"
+)]
 mod tests {
-    use super::build_ai_registry;
+    use praxis_core::config::{ChainRef, FailureMode, FilterEntry};
+
+    use super::{build_ai_registry, seed_file_resolve_chain};
+
+    /// A stand-in operator filter entry for the outbound chain.
+    fn operator_entry(filter_type: &str) -> FilterEntry {
+        FilterEntry {
+            filter_type: filter_type.to_owned(),
+            branch_chains: None,
+            conditions: Vec::new(),
+            name: None,
+            response_conditions: Vec::new(),
+            failure_mode: FailureMode::default(),
+            config: serde_yaml::Value::Null,
+        }
+    }
+
+    /// The seed is installed at both ends of an inline chain so a tail
+    /// instance can reassert the pinned upstream after operator filters run.
+    #[test]
+    fn seed_file_resolve_chain_installs_head_and_tail() {
+        let inline = ChainRef::Inline {
+            name: "files-api-outbound".to_owned(),
+            filters: vec![operator_entry("headers")],
+        };
+
+        let seeded = seed_file_resolve_chain(inline).expect("inline chain should be seeded");
+
+        let ChainRef::Inline { filters, .. } = seeded else {
+            panic!("seeding must preserve an inline chain");
+        };
+        assert_eq!(filters.len(), 3, "head seed + operator filter + tail seed");
+        assert_eq!(filters[0].filter_type, "openai_callout_seed_upstream", "head seed");
+        assert_eq!(
+            filters[1].filter_type, "headers",
+            "operator filter is preserved in order"
+        );
+        assert_eq!(
+            filters[2].filter_type, "openai_callout_seed_upstream",
+            "tail reassert seed"
+        );
+    }
+
+    /// An empty inline chain still gets both seeds.
+    #[test]
+    fn seed_file_resolve_chain_seeds_empty_inline_chain() {
+        let inline = ChainRef::Inline {
+            name: "empty".to_owned(),
+            filters: Vec::new(),
+        };
+
+        let seeded = seed_file_resolve_chain(inline).expect("empty inline chain should be seeded");
+
+        let ChainRef::Inline { filters, .. } = seeded else {
+            panic!("seeding must preserve an inline chain");
+        };
+        assert_eq!(filters.len(), 2, "head and tail seed");
+        assert!(
+            filters
+                .iter()
+                .all(|entry| entry.filter_type == "openai_callout_seed_upstream"),
+            "both entries must be the seed filter",
+        );
+    }
+
+    /// Named chains cannot be extended by the AI registration (the binding
+    /// context does not expose the named-chain table), so they are rejected
+    /// with a message that points at the inline requirement.
+    #[test]
+    fn seed_file_resolve_chain_rejects_named() {
+        let named = ChainRef::Named("shared-chain".to_owned());
+
+        let err = seed_file_resolve_chain(named).expect_err("named chains must be rejected");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("inline"),
+            "error should explain the inline requirement: {message}"
+        );
+        assert!(
+            message.contains("named"),
+            "error should name the rejected variant: {message}"
+        );
+    }
 
     #[test]
     fn build_ai_registry_includes_ai_and_builtin_filters() {

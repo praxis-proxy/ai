@@ -18,15 +18,28 @@
 //! [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
 
 pub(crate) mod error;
+pub(crate) mod outbound_seed;
 pub(crate) mod url;
 
-use std::time::Duration;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use http::HeaderMap;
+use praxis_core::{
+    config::{CachedClusterTls, ClusterTls},
+    connectivity::{ConnectionOptions, PreparedTarget, Upstream, is_private_ip, prepare_url_target},
+};
+use praxis_filter::{
+    CalloutResponse, FilterPipeline, FilteredSubrequestExecutor, RequestExtensions, SubrequestRuntime, TlsPeerIdentity,
+};
 
 pub(crate) use self::{
     error::ApiClientError,
+    outbound_seed::StagedCalloutUpstream,
     url::{resource_url, validate_base_url, validate_forward_headers},
 };
 use crate::{
@@ -34,6 +47,11 @@ use crate::{
     http_hop::{connection_nominates_header, is_hop_by_hop},
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
 };
+
+/// Sub-request nesting depth for Files API callouts. These callouts run
+/// from the top-level request pipeline, never from within another
+/// sub-request, so they start a fresh depth count.
+const OUTBOUND_CALLOUT_DEPTH: u8 = 0;
 
 /// Configuration for constructing an [`ApiClient`].
 ///
@@ -284,6 +302,264 @@ impl ApiClient {
         sanitize_response_headers(&mut response.headers);
         Ok(response)
     }
+
+    /// Build an [`OutboundExecution`] that routes callouts through
+    /// `pipeline` using this client's shared sub-request transport,
+    /// per-request timeout, and the originating downstream attributes.
+    pub(crate) fn outbound_execution(
+        &self,
+        pipeline: Arc<FilterPipeline>,
+        runtime: DownstreamRuntime,
+    ) -> OutboundExecution {
+        OutboundExecution {
+            pipeline,
+            client: self.client.clone(),
+            step_timeout: self.timeout,
+            runtime,
+        }
+    }
+
+    /// Send a GET request through the bound outbound filter chain and
+    /// return a bounded, header-sanitized HTTP response.
+    ///
+    /// Unlike [`get`](Self::get), the request traverses the
+    /// [`FilteredSubrequestExecutor`], so the outbound chain observes and
+    /// can mutate the callout before it is dialed. SSRF protection for the
+    /// configured target derives from the bound pipeline's
+    /// `allow_private_upstreams`, enforced both when the target is pinned
+    /// (`prepare_url_target`) and at connect time (`build_peer`).
+    pub(crate) async fn get_via_chain(
+        &self,
+        url: &str,
+        request_headers: &HeaderMap,
+        max_response_bytes: usize,
+        outbound: &OutboundExecution,
+    ) -> Result<SubResponse, ApiClientError> {
+        let headers = self.build_header_map(request_headers);
+        // Box the transport future so it is heap-allocated rather than inlined
+        // into this future and every ancestor resolve future (large_futures).
+        Box::pin(self.execute_via_chain(
+            url,
+            http::Method::GET,
+            headers,
+            Bytes::new(),
+            max_response_bytes,
+            outbound,
+        ))
+        .await
+    }
+
+    /// Pin the target, stage it, and run the request through the bound
+    /// outbound chain, returning the buffered response.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::large_stack_frames,
+        reason = "callout assembly holds the staged target, sub-request, and extensions; transport futures are already boxed"
+    )]
+    async fn execute_via_chain(
+        &self,
+        url: &str,
+        method: http::Method,
+        headers: HeaderMap,
+        body: Bytes,
+        max_response_bytes: usize,
+        outbound: &OutboundExecution,
+    ) -> Result<SubResponse, ApiClientError> {
+        let parsed = ::url::Url::parse(url).map_err(|_error| ApiClientError::Transport {
+            source: SubRequestError::InvalidRequest("malformed callout URL".to_owned()),
+        })?;
+        if Some(parsed.origin().ascii_serialization()) != self.target_origin {
+            return Err(ApiClientError::Transport {
+                source: SubRequestError::InvalidRequest(
+                    "callout URL changed the configured credential origin".to_owned(),
+                ),
+            });
+        }
+
+        // One clock bounds both target preparation and the sub-request.
+        let deadline = Instant::now() + self.timeout;
+
+        // Pin the resolved target before dialing: the validation hook runs
+        // once on the complete address set, rejecting private or reserved
+        // addresses unless the bound pipeline opted into private upstreams.
+        let allow_private = outbound.pipeline.allow_private_upstreams();
+        let target = Box::pin(prepare_url_target(url, deadline, |addresses: &[SocketAddr]| {
+            if allow_private {
+                return Ok(());
+            }
+            if addresses.iter().any(|addr| is_private_ip(&addr.ip())) {
+                return Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+                    "callout target resolves to a private or reserved address".into(),
+                );
+            }
+            Ok(())
+        }))
+        .await
+        .map_err(|error| ApiClientError::Transport {
+            source: SubRequestError::Connect(error.to_string()),
+        })?;
+
+        let upstream = upstream_from_prepared_target(&target)?;
+
+        // The executor sets Host from the staged authority and forwards the
+        // request URI verbatim, so send an origin-form path+query target.
+        let origin_form = match parsed.query() {
+            Some(query) => format!("{}?{query}", parsed.path()),
+            None => parsed.path().to_owned(),
+        };
+        let uri = origin_form
+            .parse::<http::Uri>()
+            .map_err(|_error| ApiClientError::Transport {
+                source: SubRequestError::InvalidRequest("malformed callout URL path".to_owned()),
+            })?;
+
+        let request = SubRequest {
+            method,
+            uri,
+            headers,
+            body,
+        };
+        let mut extensions = RequestExtensions::default();
+        extensions.insert(StagedCalloutUpstream { upstream });
+
+        let executor = FilteredSubrequestExecutor::for_callout(
+            outbound.client.clone(),
+            outbound.runtime.runtime(),
+            OUTBOUND_CALLOUT_DEPTH,
+            max_response_bytes,
+            outbound.step_timeout,
+        );
+
+        // Known limitation: the executor collapses its transport-failure
+        // classification into an opaque error. In particular a response that
+        // overflows `max_response_bytes` is surfaced either as a synthetic 502
+        // (buffered transport `ResponseTooLarge`) or as a stringly
+        // `FilterError` here, and the typed `ResponseTooLarge` the direct-dial
+        // path returned is lost — so an oversized content download becomes a
+        // generic `CalloutFailed` (502-class) rather than a truthful
+        // `ResolveError::TooLarge` (413-class). The callout still fails closed.
+        // The metadata pre-check in `resolve_file` (declared `bytes` vs the
+        // content budget) rejects the common oversized case truthfully before
+        // this download runs, so the residual regression is limited to files
+        // whose metadata omits or understates `bytes` and whose content then
+        // streams past the budget. Restoring full fidelity needs a praxis
+        // change: a public typed overflow error from `run()` (e.g.
+        // `CalloutResponse::TooLarge`) or exposing the existing `pub(crate)`
+        // `TransportFailure` classification through `SubResponse`.
+        let mut response = match Box::pin(executor.run(&outbound.pipeline, &request, extensions, deadline))
+            .await
+            .map_err(|error| ApiClientError::Transport {
+                source: SubRequestError::Io(error.to_string()),
+            })? {
+            CalloutResponse::Buffered(response) => response,
+            CalloutResponse::Streaming { .. } => {
+                return Err(ApiClientError::Transport {
+                    source: SubRequestError::InvalidRequest(
+                        "outbound chain returned a streaming response for a buffered file callout".to_owned(),
+                    ),
+                });
+            },
+        };
+        sanitize_response_headers(&mut response.headers);
+        Ok(response)
+    }
+}
+
+/// Cloneable snapshot of the downstream attributes forwarded into each
+/// outbound sub-request.
+///
+/// Held so a fresh [`SubrequestRuntime`] can be built per callout without
+/// requiring [`SubrequestRuntime`] itself to be cloneable.
+#[derive(Clone)]
+pub(crate) struct DownstreamRuntime {
+    /// Original downstream client address.
+    pub client_addr: Option<IpAddr>,
+    /// Whether the original downstream connection used TLS.
+    pub downstream_tls: bool,
+    /// Verified downstream peer identity, when present.
+    pub peer_identity: Option<Arc<TlsPeerIdentity>>,
+    /// Start instant of the logical client request.
+    pub request_start: Instant,
+}
+
+impl DownstreamRuntime {
+    /// Materialize a per-sub-request [`SubrequestRuntime`] from the snapshot.
+    fn runtime(&self) -> SubrequestRuntime {
+        SubrequestRuntime::new(
+            self.client_addr,
+            self.downstream_tls,
+            self.peer_identity.clone(),
+            self.request_start,
+        )
+    }
+}
+
+/// Prebuilt context for routing configured API callouts through a bound
+/// outbound filter chain via the [`FilteredSubrequestExecutor`].
+pub(crate) struct OutboundExecution {
+    /// Bound outbound filter pipeline applied to each callout.
+    pipeline: Arc<FilterPipeline>,
+    /// Shared sub-request transport client.
+    client: SubRequestClient,
+    /// Per-sub-request step timeout.
+    step_timeout: Duration,
+    /// Downstream attributes forwarded into each sub-request.
+    runtime: DownstreamRuntime,
+}
+
+/// Build an [`Upstream`] from a validated, pinned [`PreparedTarget`].
+///
+/// Uses the first pinned address as the transport endpoint — a literal
+/// `ip:port`, so the executor's connect-time SSRF re-check
+/// (`build_peer` → `resolve_address_checked`) re-validates the same address
+/// without a second DNS lookup, leaving no rebinding window between preparation
+/// and dial. The URL authority becomes the upstream `Host`, and for TLS the URL
+/// host becomes the SNI. Certificate verification stays on (`verify: true`),
+/// matching the hardened direct-dial path.
+///
+/// # Known limitation: single-address dial (no connect-fallback)
+///
+/// [`Upstream`] carries a single `address`, and the executor's `build_peer`
+/// resolves and dials exactly one address, so only the first pinned address is
+/// retained here. A dual-stack or multi-address Files API host whose first
+/// address is unreachable therefore fails the callout, whereas the previous
+/// direct-dial path tried every resolved address in turn (see
+/// `subrequest::execute_with_addresses`). This is a fidelity regression, not a
+/// safety one — the callout still fails closed. Restoring connect-fallback
+/// requires a praxis change: multi-address support on [`Upstream`] (e.g. an
+/// `addresses` list) plus a connect-fallback loop in the executor's buffered
+/// dial path, or a `connect_fallback` option on `ConnectionOptions`.
+fn upstream_from_prepared_target(target: &PreparedTarget) -> Result<Upstream, ApiClientError> {
+    let address = target.addresses().first().ok_or_else(|| ApiClientError::Transport {
+        source: SubRequestError::Connect("callout target resolved to no addresses".to_owned()),
+    })?;
+
+    let tls = if target.is_tls() {
+        let cluster_tls = ClusterTls {
+            ca: None,
+            client_cert: None,
+            sni: Some(target.sni().to_owned()),
+            verify: true,
+        };
+        Some(
+            CachedClusterTls::try_from_config(&cluster_tls).map_err(|error| ApiClientError::Transport {
+                source: SubRequestError::Connect(error.to_string()),
+            })?,
+        )
+    } else {
+        None
+    };
+
+    Ok(Upstream {
+        address: Arc::from(address.to_string()),
+        // The authority carries the operator-configured host:port so the
+        // executor sets it as the upstream Host, decoupled from the pinned
+        // transport IP.
+        authority: Some(target.host_authority().clone()),
+        connection: Arc::new(ConnectionOptions::default()),
+        tls,
+    })
 }
 
 /// Retain the safe response metadata required by callout consumers.

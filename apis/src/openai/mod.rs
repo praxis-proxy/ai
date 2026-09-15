@@ -24,6 +24,7 @@ pub(crate) mod sse;
 pub(crate) mod translation;
 pub(crate) mod url_security;
 
+pub use api_client::outbound_seed::CalloutSeedUpstreamFilter;
 pub use conversations::{
     ConversationOperation, ConversationOperationSpec, OpenaiConversationsFilter,
     implementation_openapi_json as conversations_openapi_json, operation_specs as conversations_operation_specs,
