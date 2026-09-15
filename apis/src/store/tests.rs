@@ -3286,122 +3286,56 @@ async fn pg_rejects_schema_version_mismatch() {
 #[tokio::test]
 #[ignore]
 async fn pg_v1_text_schema_migrates_to_v2_bytea_preserving_rows() {
-    use sqlx::AssertSqlSafe;
+    let fx = PgSchemaFixture::new("mig");
 
-    let url = pg_database_url();
-    let suffix = pg_unique_suffix();
-    let resp_table = format!("mig_r_{suffix}");
-    let conv_table = format!("mig_c_{suffix}");
-    let ver_table = format!("{resp_table}_schema_version");
-
-    let options: sqlx::postgres::PgConnectOptions = url.parse().expect("url should parse");
-    let pool = Box::pin(sqlx::PgPool::connect_with(options))
-        .await
-        .expect("pool should connect");
-
-    // Build a legacy version-1 layout: TEXT payload columns, stamped v1,
-    // with a plain-JSON row written the way the pre-bytes store would.
-    for stmt in [
+    let legacy_v1 = [
         format!(
-            "CREATE TABLE {resp_table} (
-                tenant_id TEXT NOT NULL, id TEXT NOT NULL, created_at BIGINT NOT NULL,
-                model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL,
-                messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id))"
+            "CREATE TABLE {} (\
+             tenant_id TEXT NOT NULL, id TEXT NOT NULL, created_at BIGINT NOT NULL, \
+             model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+             messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id))",
+            fx.responses
         ),
         format!(
-            "CREATE TABLE {conv_table} (
-                conversation_id TEXT NOT NULL, tenant_id TEXT NOT NULL, created_at BIGINT NOT NULL,
-                metadata TEXT NOT NULL, messages TEXT NOT NULL, PRIMARY KEY (conversation_id, tenant_id))"
+            "CREATE TABLE {} (\
+             conversation_id TEXT NOT NULL, tenant_id TEXT NOT NULL, created_at BIGINT NOT NULL, \
+             metadata TEXT NOT NULL, messages TEXT NOT NULL, PRIMARY KEY (conversation_id, tenant_id))",
+            fx.conversations
         ),
-        format!("CREATE TABLE {ver_table} (version BIGINT NOT NULL PRIMARY KEY)"),
-        format!("INSERT INTO {ver_table} (version) VALUES (1)"),
+        format!("CREATE TABLE {} (version BIGINT NOT NULL PRIMARY KEY)", fx.version),
+        format!("INSERT INTO {} (version) VALUES (1)", fx.version),
         format!(
-            "INSERT INTO {resp_table} (tenant_id, id, created_at, model, response_object, input, messages) \
+            "INSERT INTO {} (tenant_id, id, created_at, model, response_object, input, messages) \
              VALUES ('tenant_a', 'legacy_resp', 1000, 'gpt-4.1', \
-             '{{\"id\":\"legacy_resp\",\"model\":\"gpt-4.1\"}}', '\"hi\"', '[{{\"role\":\"user\"}}]')"
+             '{{\"id\":\"legacy_resp\",\"model\":\"gpt-4.1\"}}', '\"hi\"', '[{{\"role\":\"user\"}}]')",
+            fx.responses
         ),
-    ] {
-        sqlx::query(AssertSqlSafe(stmt.as_str()))
-            .execute(&pool)
-            .await
-            .expect("legacy setup should succeed");
-    }
+    ];
 
-    // Before migration the store refuses to start.
-    let before = Box::pin(PostgresResponseStore::new(
-        &url,
-        &resp_table,
-        &conv_table,
-        None,
-        Some(SslMode::Disable),
-        None,
-        None,
-        None,
-    ))
-    .await;
+    let msg = fx.expect_rejected(&legacy_v1, &[]).await;
     assert!(
-        before.is_err_and(|e| e.to_string().contains("schema version mismatch")),
-        "store must refuse a version-1 database"
+        msg.contains("schema version mismatch"),
+        "store must refuse a version-1 database: {msg}"
     );
 
-    // Apply the documented operator migration. Only the responses table's
-    // payload columns become BYTEA; conversations stay TEXT.
-    for stmt in [
+    let migrate = [
         format!(
-            "ALTER TABLE {resp_table} \
+            "ALTER TABLE {} \
              ALTER COLUMN response_object TYPE BYTEA USING convert_to(response_object, 'UTF8'), \
              ALTER COLUMN input TYPE BYTEA USING convert_to(input, 'UTF8'), \
-             ALTER COLUMN messages TYPE BYTEA USING convert_to(messages, 'UTF8')"
+             ALTER COLUMN messages TYPE BYTEA USING convert_to(messages, 'UTF8')",
+            fx.responses
         ),
-        format!("UPDATE {ver_table} SET version = 2"),
-    ] {
-        sqlx::query(AssertSqlSafe(stmt.as_str()))
-            .execute(&pool)
-            .await
-            .expect("migration should succeed");
-    }
-    pool.close().await;
+        format!("UPDATE {} SET version = 2", fx.version),
+    ];
+    let migrated_v2: Vec<String> = legacy_v1.into_iter().chain(migrate).collect();
 
-    // After migration the store starts and the legacy row reads back intact.
-    let store = Box::pin(PostgresResponseStore::new(
-        &url,
-        &resp_table,
-        &conv_table,
-        None,
-        Some(SslMode::Disable),
-        None,
-        None,
-        None,
-    ))
-    .await
-    .expect("store should start on a migrated version-2 database");
-
-    let fetched = store
-        .get_response("tenant_a", "legacy_resp")
-        .await
-        .expect("get should succeed")
-        .expect("legacy row should be readable after migration");
-    assert_eq!(fetched.input, json!("hi"), "legacy plain-JSON input should decode");
-    assert_eq!(fetched.model, "gpt-4.1", "legacy model should be intact");
-
-    // A fresh write through the migrated store also round-trips.
-    let record = make_response_record("post_mig", "tenant_a", 2000);
-    store.upsert_response(&record).await.expect("upsert should succeed");
-    let round = store
-        .get_response("tenant_a", "post_mig")
-        .await
-        .expect("get should succeed")
-        .expect("new row should exist");
-    assert_eq!(round.response_object, record.response_object, "new write round-trips");
-
-    let cleanup_pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("cleanup pool");
-    for table in [&ver_table, &resp_table, &conv_table] {
-        let drop_sql = format!("DROP TABLE IF EXISTS {table}");
-        sqlx::query(AssertSqlSafe(drop_sql.as_str()))
-            .execute(&cleanup_pool)
-            .await
-            .expect("cleanup should succeed");
-    }
+    let result = fx.init(&migrated_v2, &[]).await;
+    assert!(
+        result.is_ok(),
+        "store should start on a migrated version-2 database: {:?}",
+        result.err()
+    );
 }
 
 async fn make_pg_store() -> PostgresResponseStore {
