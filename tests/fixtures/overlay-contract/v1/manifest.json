@@ -49,6 +49,19 @@
     "hybrid-missing-schema.json": {
       "expected": "reject",
       "reason": "missing_schema_version"
+    },
+    "valid-apikey-credential.json": {
+      "content_digest": "19f1db97d7ac3492202a8cb152bb35dd18fe9faf610a6c8f9535fbc063b9ad97",
+      "expected": "accept",
+      "revision": "19f1db97d7ac3492202a8cb152bb35dd18fe9faf610a6c8f9535fbc063b9ad97"
+    },
+    "credential-unknown-strategy.json": {
+      "expected": "reject",
+      "reason": "unsupported_credential_strategy"
+    },
+    "credential-bearer-with-header.json": {
+      "expected": "reject",
+      "reason": "invalid_credential_combination"
     }
   },
   "source": "praxis-proxy/ai",

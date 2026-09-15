@@ -26,6 +26,8 @@ These names are AI-owned rather than Praxis-reserved because Praxis intentionall
 | `routes[].credential.secretRef.key` | string | yes | Secret data key. |
 | `routes[].credential.secretRef.name` | string | yes | Secret name. |
 | `routes[].credential.secretRef.namespace` | string | yes | Secret namespace. |
+| `routes[].credential.header` | string | no | Optional target header override (`apikey` only). |
+| `routes[].credential.prefix` | string | no | Optional scheme prefix prepended before the token (`apikey` only). |
 | `routes[].model` | string | yes | Exact model accepted for this candidate. |
 | `routes[].paths` | string[] | yes | Exact inference paths accepted for this candidate. |
 | `emit_demo_attribution` | bool | no | Add provider gateway and selected-backend response attribution headers. |

@@ -16,7 +16,7 @@ use praxis_filter::FilterError;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
-use super::metadata::{CandidateCredential, STRATEGY_BEARER_TOKEN};
+use super::metadata::{CandidateCredential, STRATEGY_API_KEY, STRATEGY_BEARER_TOKEN, is_supported_credential_strategy};
 
 /// Maximum number of route candidates.
 const MAX_CANDIDATES: usize = 1024;
@@ -321,12 +321,29 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
 }
 
 /// Validate credential reference fields on a candidate entry.
+///
+/// The strategy vocabulary is pinned to the cross-repository wire contract
+/// (`bearer_token`, `apikey`); unknown values fail closed at load so a
+/// producer typo can never reach request handling. `header`/`prefix` are
+/// `apikey`-only overrides and are rejected on any other strategy.
 fn validate_credential(index: usize, credential: Option<&CandidateCredential>) -> Result<(), FilterError> {
     let Some(credential) = credential else {
         return Ok(());
     };
-    if credential.strategy != STRATEGY_BEARER_TOKEN {
+    if !is_supported_credential_strategy(&credential.strategy) {
         return Err(format!("routing: candidates[{index}].credential.strategy is unsupported").into());
+    }
+    if credential.strategy == STRATEGY_BEARER_TOKEN && (credential.header.is_some() || credential.prefix.is_some()) {
+        return Err(format!(
+            "routing: candidates[{index}].credential.header/prefix is only valid with the {STRATEGY_API_KEY} strategy"
+        )
+        .into());
+    }
+    if let Some(header) = &credential.header {
+        validate_credential_header(index, header)?;
+    }
+    if let Some(prefix) = &credential.prefix {
+        validate_credential_prefix(index, prefix)?;
     }
     validate_name(
         &format!("candidates[{index}].credential.secretRef.name"),
@@ -340,6 +357,31 @@ fn validate_credential(index: usize, credential: Option<&CandidateCredential>) -
         &format!("candidates[{index}].credential.secretRef.key"),
         &credential.secret_ref.key,
     )
+}
+
+/// Validate a per-candidate credential header override as an HTTP header name.
+fn validate_credential_header(index: usize, header: &str) -> Result<(), FilterError> {
+    validate_name(&format!("candidates[{index}].credential.header"), header)?;
+    http::HeaderName::from_bytes(header.as_bytes()).map_err(|error| {
+        FilterError::from(format!(
+            "routing: candidates[{index}].credential.header is not a valid HTTP header name: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Validate a per-candidate credential prefix as a whitespace-free
+/// visible-ASCII scheme literal (for example `Bearer` or `AWS4-HMAC-SHA256`).
+fn validate_credential_prefix(index: usize, prefix: &str) -> Result<(), FilterError> {
+    let valid =
+        !prefix.trim().is_empty() && prefix.len() <= 256 && prefix.bytes().all(|byte| (0x21..=0x7E).contains(&byte));
+    if !valid {
+        return Err(format!(
+            "routing: candidates[{index}].credential.prefix must be 1-256 visible ASCII bytes without whitespace"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Validate the promoted model header name.
@@ -390,7 +432,7 @@ fn validate_name(field: &str, value: &str) -> Result<(), FilterError> {
     reason = "tests"
 )]
 mod tests {
-    use super::*;
+    use super::{super::metadata::CredentialRef, *};
 
     // -------------------------------------------------------------------------
     // Valid Configs
@@ -614,6 +656,89 @@ mod tests {
     // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
+
+    fn credential_with(strategy: &str, header: Option<&str>, prefix: Option<&str>) -> CandidateCredential {
+        CandidateCredential {
+            strategy: strategy.to_owned(),
+            secret_ref: CredentialRef {
+                key: "token".to_owned(),
+                name: "sec".to_owned(),
+                namespace: "ns".to_owned(),
+            },
+            header: header.map(str::to_owned),
+            prefix: prefix.map(str::to_owned),
+        }
+    }
+
+    fn candidate_with(credential: CandidateCredential) -> CandidateConfig {
+        let mut c = candidate("inference_model", "m", "s", "c");
+        c.credential = Some(credential);
+        c
+    }
+
+    #[test]
+    fn bearer_and_apikey_strategies_accepted() {
+        for strategy in [STRATEGY_BEARER_TOKEN, STRATEGY_API_KEY] {
+            assert!(
+                validate_candidates(vec![candidate_with(credential_with(strategy, None, None))]).is_ok(),
+                "{strategy} must be in the supported vocabulary"
+            );
+        }
+        assert!(
+            validate_candidates(vec![candidate_with(credential_with(
+                STRATEGY_API_KEY,
+                Some("x-api-key"),
+                Some("Bearer"),
+            ))])
+            .is_ok(),
+            "apikey header/prefix overrides must be accepted"
+        );
+    }
+
+    #[test]
+    fn unknown_credential_strategy_rejected_at_load() {
+        for strategy in ["oauth2", "sigv4", "Bearer", ""] {
+            let err = validate_candidates(vec![candidate_with(credential_with(strategy, None, None))])
+                .expect_err("unknown strategies must fail closed at load");
+            assert!(err.to_string().contains("unsupported"), "{strategy}: {err}");
+        }
+    }
+
+    #[test]
+    fn bearer_token_with_header_or_prefix_rejected() {
+        let err = validate_candidates(vec![candidate_with(credential_with(
+            STRATEGY_BEARER_TOKEN,
+            Some("x-api-key"),
+            None,
+        ))])
+        .expect_err("header is apikey-only");
+        assert!(err.to_string().contains("apikey"), "{err}");
+        let err = validate_candidates(vec![candidate_with(credential_with(
+            STRATEGY_BEARER_TOKEN,
+            None,
+            Some("Bearer"),
+        ))])
+        .expect_err("prefix is apikey-only");
+        assert!(err.to_string().contains("apikey"), "{err}");
+    }
+
+    #[test]
+    fn malformed_credential_overrides_rejected() {
+        let err = validate_candidates(vec![candidate_with(credential_with(
+            STRATEGY_API_KEY,
+            Some("bad header"),
+            None,
+        ))])
+        .expect_err("header override must parse as an HTTP header name");
+        assert!(err.to_string().contains("header"), "{err}");
+        let err = validate_candidates(vec![candidate_with(credential_with(
+            STRATEGY_API_KEY,
+            None,
+            Some("Bear er"),
+        ))])
+        .expect_err("prefix override must not contain whitespace");
+        assert!(err.to_string().contains("prefix"), "{err}");
+    }
 
     fn candidate(kind_str: &str, name: &str, site: &str, cluster: &str) -> CandidateConfig {
         let kind: CapabilityKind = serde_yaml::from_str(&format!("\"{kind_str}\"")).unwrap();

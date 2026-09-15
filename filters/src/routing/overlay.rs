@@ -328,12 +328,20 @@ fn default_fresh() -> bool {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OverlayCredential {
-    /// Authentication strategy (e.g. `"bearer_token"`).
+    /// Authentication strategy (e.g. `"bearer_token"`, `"apikey"`).
     strategy: String,
 
     /// Reference to the Secret holding the credential.
     #[serde(rename = "secretRef", alias = "secret_ref")]
     secret_ref: OverlaySecretRef,
+
+    /// Optional target header override (`apikey` strategy only).
+    #[serde(default)]
+    header: Option<String>,
+
+    /// Optional scheme prefix override (`apikey` strategy only).
+    #[serde(default)]
+    prefix: Option<String>,
 }
 
 /// Secret reference within a projected credential.
@@ -780,6 +788,8 @@ fn overlay_to_candidates(doc: &OverlayDocument) -> Result<Vec<RouteCandidate>, F
                         namespace: credential.secret_ref.namespace.clone(),
                         key: credential.secret_ref.key.clone(),
                     },
+                    header: credential.header.clone(),
+                    prefix: credential.prefix.clone(),
                 }),
                 fresh: oc.fresh,
                 kind,
@@ -1371,6 +1381,75 @@ mod tests {
         }"#;
         let doc: OverlayDocument = serde_json::from_str(json).unwrap();
         assert!(doc.candidates[0].credential.is_some());
+    }
+
+    #[test]
+    fn apikey_credential_overrides_flow_into_candidates() {
+        let json = r#"{
+            "local_site": "site-a",
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "claude",
+                "site": "site-b",
+                "cluster": "api-provider",
+                "fresh": true,
+                "credential": {
+                    "strategy": "apikey",
+                    "secretRef": {
+                        "name": "anthropic-key",
+                        "namespace": "grid-system",
+                        "key": "api-key"
+                    },
+                    "header": "x-api-key"
+                }
+            }]
+        }"#;
+        let snap = RouteSnapshot::from_overlay(json.as_bytes()).unwrap();
+        let credential = snap.candidates[0].credential.as_ref().unwrap();
+        assert_eq!(credential.strategy, "apikey");
+        assert_eq!(credential.header.as_deref(), Some("x-api-key"));
+        assert_eq!(credential.prefix, None);
+    }
+
+    #[test]
+    fn overlay_rejects_unknown_credential_strategy() {
+        let json = r#"{
+            "local_site": "site-a",
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "gpt-4",
+                "site": "site-b",
+                "cluster": "api-provider",
+                "fresh": true,
+                "credential": {
+                    "strategy": "oauth2",
+                    "secretRef": {"name": "n", "namespace": "ns", "key": "k"}
+                }
+            }]
+        }"#;
+        let error = RouteSnapshot::from_overlay(json.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("unsupported"), "{error}");
+    }
+
+    #[test]
+    fn overlay_rejects_bearer_token_with_header_override() {
+        let json = r#"{
+            "local_site": "site-a",
+            "candidates": [{
+                "kind": "inference_model",
+                "name": "gpt-4",
+                "site": "site-b",
+                "cluster": "api-provider",
+                "fresh": true,
+                "credential": {
+                    "strategy": "bearer_token",
+                    "secretRef": {"name": "n", "namespace": "ns", "key": "k"},
+                    "header": "x-api-key"
+                }
+            }]
+        }"#;
+        let error = RouteSnapshot::from_overlay(json.as_bytes()).unwrap_err();
+        assert!(error.to_string().contains("apikey"), "{error}");
     }
 
     #[test]

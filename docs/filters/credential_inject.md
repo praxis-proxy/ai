@@ -17,7 +17,7 @@ Reads `intelligent_route.credential.*` filter metadata written by the preceding 
 | `credentials[].name` | string | yes | Kubernetes Secret name — must match `intelligent_route.credential.name`. |
 | `credentials[].namespace` | string | yes | Kubernetes Secret namespace — must match `intelligent_route.credential.namespace`. |
 | `credentials[].key` | string | yes | Key within `Secret.data` — must match `intelligent_route.credential.key`. |
-| `credentials[].strategy` | string | no | Credential strategy.  Currently only `"bearer_token"` is supported. |
+| `credentials[].strategy` | string | no | Credential strategy: `"bearer_token"` (default) or `"apikey"`. The configured strategy is cross-checked against the strategy written by the routing overlay at request time; a mismatch fails closed. |
 | `credentials[].value` | string | no | Inline token value.  Mutually exclusive with `env_var` and `file`. |
 | `credentials[].env_var` | string | no | Environment variable holding the token.  Mutually exclusive with `value` and `file`. |
 | `credentials[].file` | string | no | Path to a file containing the token. The initial value is validated at filter construction. A watcher revalidates the file after atomic projected-volume changes so Secret rotation does not require a restart. The file contents are trimmed of leading/trailing whitespace before use. The file must exist, be readable, and be non-empty; construction fails otherwise.  Use this source when the token is mounted from a Kubernetes Secret volume so that token bytes never appear in Praxis `ConfigMap`s. Mutually exclusive with `value` and `env_var`. |
@@ -35,6 +35,6 @@ credentials:
   - name: other-secret
     namespace: default
     key: api-key
-    strategy: bearer_token
+    strategy: apikey            # per-candidate header/prefix come from the overlay
     env_var: OTHER_API_TOKEN    # token from environment variable
 ```

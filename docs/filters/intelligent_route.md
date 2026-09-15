@@ -51,6 +51,8 @@ Supports two modes:
 | `candidates[].credential.secretRef.key` | string | yes | Secret data key. |
 | `candidates[].credential.secretRef.name` | string | yes | Secret name. |
 | `candidates[].credential.secretRef.namespace` | string | yes | Secret namespace. |
+| `candidates[].credential.header` | string | no | Optional target header override (`apikey` only). |
+| `candidates[].credential.prefix` | string | no | Optional scheme prefix prepended before the token (`apikey` only). |
 | `candidates[].fresh` | bool | no | Whether this candidate is fresh (default: `true`). |
 | `candidates[].kind` | `inference_model` \| `mcp_tool` | yes | Capability kind. |
 | `candidates[].name` | string | yes | Capability name (model name, tool name, or agent name). |

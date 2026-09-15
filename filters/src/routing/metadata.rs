@@ -82,9 +82,25 @@ pub(crate) const CREDENTIAL_NAME: &str = "intelligent_route.credential.name";
 pub(crate) const CREDENTIAL_NAMESPACE: &str = "intelligent_route.credential.namespace";
 /// Secret data key for credential lookup.
 pub(crate) const CREDENTIAL_KEY: &str = "intelligent_route.credential.key";
+/// Optional per-candidate injection header override (`apikey` strategy only).
+pub(crate) const CREDENTIAL_HEADER: &str = "intelligent_route.credential.header";
+/// Optional per-candidate injection prefix override (`apikey` strategy only).
+pub(crate) const CREDENTIAL_PREFIX: &str = "intelligent_route.credential.prefix";
 
 /// Bearer token injection strategy identifier.
 pub(crate) const STRATEGY_BEARER_TOKEN: &str = "bearer_token";
+
+/// API-key injection strategy identifier (configurable header, optional
+/// scheme prefix). Matches the control-plane `ExternalProvider` auth type
+/// `apikey`.
+pub(crate) const STRATEGY_API_KEY: &str = "apikey";
+
+/// Whether a credential strategy value belongs to the supported wire
+/// vocabulary. Unknown strategies must fail closed at overlay load and at
+/// injection time, never at request routing time.
+pub(crate) fn is_supported_credential_strategy(strategy: &str) -> bool {
+    matches!(strategy, STRATEGY_BEARER_TOKEN | STRATEGY_API_KEY)
+}
 
 /// Kubernetes Secret reference. Only locator fields are carried in routing
 /// configuration and request metadata.
@@ -101,6 +117,11 @@ pub(crate) struct CredentialRef {
 
 /// Provider-local reference to credential bytes resolved by
 /// `credential_inject`.
+///
+/// `header` and `prefix` are optional per-candidate overrides for the
+/// `apikey` strategy: the target header to write and the scheme literal to
+/// prepend before the token. They are never valid for `bearer_token`, which
+/// is always `Authorization: Bearer <token>`.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct CandidateCredential {
@@ -109,6 +130,14 @@ pub(crate) struct CandidateCredential {
 
     /// Secret locator, never secret bytes.
     pub secret_ref: CredentialRef,
+
+    /// Optional target header override (`apikey` only).
+    #[serde(default)]
+    pub header: Option<String>,
+
+    /// Optional scheme prefix prepended before the token (`apikey` only).
+    #[serde(default)]
+    pub prefix: Option<String>,
 }
 
 /// Replace credential-reference metadata with provider-local policy output.
@@ -121,6 +150,12 @@ pub(crate) fn set_credential_metadata(ctx: &mut HttpFilterContext<'_>, credentia
     ctx.set_metadata(CREDENTIAL_NAME, &credential.secret_ref.name);
     ctx.set_metadata(CREDENTIAL_NAMESPACE, &credential.secret_ref.namespace);
     ctx.set_metadata(CREDENTIAL_KEY, &credential.secret_ref.key);
+    if let Some(header) = &credential.header {
+        ctx.set_metadata(CREDENTIAL_HEADER, header);
+    }
+    if let Some(prefix) = &credential.prefix {
+        ctx.set_metadata(CREDENTIAL_PREFIX, prefix);
+    }
 }
 
 /// Remove any previously written credential-reference metadata.
@@ -129,6 +164,8 @@ pub(crate) fn clear_credential_metadata(ctx: &mut HttpFilterContext<'_>) {
     ctx.filter_metadata.remove(CREDENTIAL_NAME);
     ctx.filter_metadata.remove(CREDENTIAL_NAMESPACE);
     ctx.filter_metadata.remove(CREDENTIAL_KEY);
+    ctx.filter_metadata.remove(CREDENTIAL_HEADER);
+    ctx.filter_metadata.remove(CREDENTIAL_PREFIX);
 }
 
 #[cfg(test)]
@@ -164,5 +201,40 @@ mod tests {
                 "{header} must remain in the AI routing namespace"
             );
         }
+    }
+
+    #[test]
+    fn supported_strategy_vocabulary() {
+        assert!(is_supported_credential_strategy(STRATEGY_BEARER_TOKEN));
+        assert!(is_supported_credential_strategy(STRATEGY_API_KEY));
+        assert!(!is_supported_credential_strategy("oauth2"));
+        assert!(!is_supported_credential_strategy("sigv4"));
+        assert!(!is_supported_credential_strategy(""));
+    }
+
+    #[test]
+    fn apikey_overrides_round_trip_through_metadata() {
+        let req = crate::test_utils::make_request(http::Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(
+            &mut ctx,
+            Some(&CandidateCredential {
+                strategy: STRATEGY_API_KEY.to_owned(),
+                secret_ref: CredentialRef {
+                    key: "api-key".to_owned(),
+                    name: "anthropic-cred".to_owned(),
+                    namespace: "grid-system".to_owned(),
+                },
+                header: Some("x-api-key".to_owned()),
+                prefix: None,
+            }),
+        );
+        assert_eq!(ctx.get_metadata(CREDENTIAL_STRATEGY), Some(STRATEGY_API_KEY));
+        assert_eq!(ctx.get_metadata(CREDENTIAL_HEADER), Some("x-api-key"));
+        assert_eq!(ctx.get_metadata(CREDENTIAL_PREFIX), None);
+
+        clear_credential_metadata(&mut ctx);
+        assert_eq!(ctx.get_metadata(CREDENTIAL_HEADER), None);
+        assert_eq!(ctx.get_metadata(CREDENTIAL_STRATEGY), None);
     }
 }

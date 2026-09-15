@@ -12,24 +12,43 @@
 //!
 //! | Metadata key | Example value |
 //! |---|---|
-//! | `intelligent_route.credential.strategy` | `"bearer_token"` |
+//! | `intelligent_route.credential.strategy` | `"bearer_token"` or `"apikey"` |
 //! | `intelligent_route.credential.name` | `"my-api-secret"` |
 //! | `intelligent_route.credential.namespace` | `"grid-system"` |
 //! | `intelligent_route.credential.key` | `"token"` |
+//! | `intelligent_route.credential.header` | `"x-api-key"` (`apikey` only, optional) |
+//! | `intelligent_route.credential.prefix` | `"Bearer"` (`apikey` only, optional) |
 //!
 //! This filter reads those keys, looks up the matching token in its configured
-//! credential map, removes the incoming `Authorization` value, and sets
-//! `Authorization: Bearer <token>` on the upstream request. The filter must
-//! appear after the routing filter in the filter chain.
+//! credential map, removes any incoming copy of the target header plus the
+//! caller's `Authorization` and `x-api-key` values, and sets the credential
+//! header on the upstream request. The filter must appear after the routing
+//! filter in the filter chain.
+//!
+//! # Strategies
+//!
+//! | Strategy | Header | Value |
+//! |---|---|---|
+//! | `bearer_token` | `Authorization` (fixed) | `Bearer <token>` |
+//! | `apikey` | `credential.header` override, else `Authorization` | `<prefix> <token>`; prefix defaults to `Bearer` only when the header is `Authorization`, otherwise the raw token |
+//!
+//! `apikey` matches the control-plane `ExternalProvider` auth type and gives
+//! IPP `apikey-injection` parity: Anthropic (`x-api-key: <token>`), Azure
+//! (`api-key: <token>`), and generic bearer providers are all expressible
+//! per candidate. `header`/`prefix` overrides arrive only from the routing
+//! overlay (validated at load); unknown strategies fail closed.
 //!
 //! # Behaviour
 //!
 //! | State | Action |
 //! |---|---|
 //! | No `intelligent_route.credential.name` metadata | No-op — candidate has no credential |
-//! | Metadata present, matching entry found | Inject `Authorization: Bearer <token>` |
+//! | Metadata present, matching entry found | Inject credential header |
 //! | Metadata present, no matching entry | Reject 503 (fail closed) |
-//! | Strategy not `"bearer_token"` | Reject 503 (fail closed) |
+//! | Strategy outside the supported vocabulary | Reject 503 (fail closed) |
+//! | Metadata strategy differs from the configured entry strategy | Reject 503 (fail closed) |
+//! | `header`/`prefix` override present with `bearer_token` | Reject 503 (fail closed) |
+//! | `header`/`prefix` override is not a valid literal | Reject 503 (fail closed) |
 //!
 //! # Security
 //!
@@ -61,7 +80,7 @@
 //!   - name: other-secret
 //!     namespace: default
 //!     key: api-key
-//!     strategy: bearer_token
+//!     strategy: apikey            # per-candidate header/prefix come from the overlay
 //!     env_var: OTHER_API_TOKEN    # token from environment variable
 //! ```
 //!
@@ -87,7 +106,8 @@ use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use super::metadata::{
-    CREDENTIAL_KEY, CREDENTIAL_NAME, CREDENTIAL_NAMESPACE, CREDENTIAL_STRATEGY, STRATEGY_BEARER_TOKEN,
+    CREDENTIAL_HEADER, CREDENTIAL_KEY, CREDENTIAL_NAME, CREDENTIAL_NAMESPACE, CREDENTIAL_PREFIX, CREDENTIAL_STRATEGY,
+    STRATEGY_API_KEY, STRATEGY_BEARER_TOKEN, is_supported_credential_strategy,
 };
 
 /// Maximum credential references accepted by one filter instance.
@@ -130,7 +150,10 @@ struct CredentialEntryConfig {
     /// Key within `Secret.data` — must match `intelligent_route.credential.key`.
     key: String,
 
-    /// Credential strategy.  Currently only `"bearer_token"` is supported.
+    /// Credential strategy: `"bearer_token"` (default) or `"apikey"`.
+    ///
+    /// The configured strategy is cross-checked against the strategy written
+    /// by the routing overlay at request time; a mismatch fails closed.
     #[serde(default = "default_strategy")]
     strategy: String,
 
@@ -180,12 +203,20 @@ struct CredentialRef {
 /// Resolved credential ready for request-time injection.
 #[derive(Clone)]
 struct ResolvedCredential {
-    /// Full `Authorization` header value ("Bearer {token}"), zeroized on drop.
+    /// Strategy provisioned for this config entry.  Cross-checked against the
+    /// strategy the routing overlay selected for the request; a mismatch means
+    /// the overlay and the filter config disagree about the credential's
+    /// semantics and the request fails closed.
+    strategy: String,
+
+    /// Raw secret, zeroized on drop.  The final header value is assembled
+    /// per-request so the overlay's per-candidate `header`/`prefix` overrides
+    /// apply without provisioning one config entry per header shape.
     ///
     /// A non-zeroized copy is created per-request for `HeaderValue`; it lives
     /// until the request context is dropped.  This is the same accepted residual
     /// as in the Praxis `credential_injection` filter.
-    header_value: Zeroizing<String>,
+    token: Zeroizing<String>,
 }
 
 /// A configured credential and its request-time source.
@@ -210,6 +241,8 @@ struct WatchedCredential {
     path: PathBuf,
     /// Secret reference used for safe diagnostics.
     reference: CredentialRef,
+    /// Strategy provisioned for this entry; preserved across reloads.
+    strategy: String,
     /// Snapshot published to requests.
     snapshot: Arc<ArcSwap<CredentialSnapshot>>,
 }
@@ -275,7 +308,7 @@ impl CredentialInjectFilter {
     /// - any entry has more than one token source (`value`, `env_var`, `file`) or none
     /// - any `env_var` is not set in the environment
     /// - any `file` does not exist, is unreadable, or is empty
-    /// - any strategy is not `"bearer_token"`
+    /// - any strategy is outside the supported vocabulary (`bearer_token`, `apikey`)
     /// - the assembled header value is not valid HTTP
     #[expect(
         clippy::too_many_lines,
@@ -302,7 +335,7 @@ impl CredentialInjectFilter {
             let resolved = match (&entry.value, &entry.env_var, &entry.file) {
                 (None, None, Some(path)) => {
                     validate_bounded("file", path, MAX_SOURCE_LEN)?;
-                    resolve_file_credential(path, &cred_ref)?
+                    resolve_file_credential(path, &cred_ref, &entry.strategy)?
                 },
                 _ => resolve_credential(entry)?,
             };
@@ -320,6 +353,7 @@ impl CredentialInjectFilter {
                 watched.push(WatchedCredential {
                     path: PathBuf::from(path),
                     reference: cred_ref.clone(),
+                    strategy: entry.strategy.clone(),
                     snapshot: Arc::clone(&snapshot),
                 });
             }
@@ -350,15 +384,16 @@ impl HttpFilter for CredentialInjectFilter {
         reason = "request filter preserves the security decision as one operation"
     )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let Some(selected) = selected_credential_ref(ctx) else {
+        let Some(selected) = selected_credential(ctx) else {
             tracing::debug!("credential_inject: no selected credential; skipping");
             return Ok(FilterAction::Continue);
         };
-        let Ok(cred_ref) = selected else {
+        let Ok(selected) = selected else {
             return Ok(FilterAction::Reject(Rejection::status(503)));
         };
+        let cred_ref = &selected.cred_ref;
 
-        let Some(configured) = self.credentials.get(&cred_ref) else {
+        let Some(configured) = self.credentials.get(cred_ref) else {
             // Log the reference identity (not the token) to assist debugging.
             tracing::debug!(
                 name = %cred_ref.name,
@@ -377,19 +412,52 @@ impl HttpFilter for CredentialInjectFilter {
             return Ok(FilterAction::Reject(Rejection::status(503)));
         };
 
+        // The overlay decides which candidate uses which credential; the
+        // config entry provisions its semantics.  Agreement is required.
+        if cred.strategy != selected.strategy {
+            tracing::debug!(
+                name = %cred_ref.name,
+                namespace = %cred_ref.namespace,
+                key = %cred_ref.key,
+                selected = %selected.strategy,
+                configured = %cred.strategy,
+                "credential_inject: selected and configured strategies differ; failing closed"
+            );
+            return Ok(FilterAction::Reject(Rejection::status(503)));
+        }
+
+        // `header`/`prefix` are validated `apikey` overrides from the overlay.
+        // Without an override the credential is injected as `Authorization`
+        // with a `Bearer` scheme; an `apikey` targeting any other header
+        // injects the raw token unless the overlay supplies a prefix.
+        let header_name = selected.header.clone().unwrap_or(AUTHORIZATION);
+        let prefix: Option<&str> = match (selected.prefix.as_deref(), header_name == AUTHORIZATION) {
+            (Some(prefix), _) => Some(prefix),
+            (None, true) => Some("Bearer"),
+            (None, false) => None,
+        };
+        let assembled = Zeroizing::new(match prefix {
+            Some(prefix) => format!("{prefix} {}", &*cred.token),
+            None => cred.token.to_string(),
+        });
+        let header_value = HeaderValue::from_str(&assembled).map_err(|e| -> FilterError {
+            format!("credential_inject: invalid resolved credential header: {e}").into()
+        })?;
+
         tracing::debug!(
             name = %cred_ref.name,
             namespace = %cred_ref.namespace,
             key = %cred_ref.key,
-            "credential_inject: injecting bearer credential"
+            header = %header_name.as_str(),
+            "credential_inject: injecting credential"
         );
 
-        let header_value = HeaderValue::from_str(cred.header_value.as_str()).map_err(|e| -> FilterError {
-            format!("credential_inject: invalid resolved Authorization header: {e}").into()
-        })?;
         ctx.request_headers_to_remove.push(AUTHORIZATION);
         ctx.request_headers_to_remove.push(HeaderName::from_static("x-api-key"));
-        ctx.request_headers_to_set.push((AUTHORIZATION, header_value));
+        if header_name != AUTHORIZATION && header_name.as_str() != "x-api-key" {
+            ctx.request_headers_to_remove.push(header_name.clone());
+        }
+        ctx.request_headers_to_set.push((header_name, header_value));
 
         Ok(FilterAction::Continue)
     }
@@ -399,44 +467,115 @@ impl HttpFilter for CredentialInjectFilter {
 // Helpers
 // -----------------------------------------------------------------------------
 
-/// Read one complete credential reference from filter metadata.
+/// Credential selection written by the routing filter into request metadata.
+struct SelectedCredential {
+    /// Strategy the overlay selected for this request.
+    strategy: String,
+    /// Secret locator for the configured entry lookup.
+    cred_ref: CredentialRef,
+    /// Validated target header override (`apikey` only).
+    header: Option<HeaderName>,
+    /// Validated scheme prefix override (`apikey` only).
+    prefix: Option<String>,
+}
+
+/// Read one complete credential selection from filter metadata.
 ///
-/// Absence of all four fields means that the selected route requires no
-/// credential. Any partial or unsupported reference fails closed.
-fn selected_credential_ref(ctx: &HttpFilterContext<'_>) -> Option<Result<CredentialRef, ()>> {
+/// Absence of all reference fields means the selected route requires no
+/// credential. Any partial, unsupported, or malformed selection fails closed.
+fn selected_credential(ctx: &HttpFilterContext<'_>) -> Option<Result<SelectedCredential, ()>> {
     let strategy = ctx.get_metadata(CREDENTIAL_STRATEGY);
     let name = ctx.get_metadata(CREDENTIAL_NAME);
     let namespace = ctx.get_metadata(CREDENTIAL_NAMESPACE);
     let key = ctx.get_metadata(CREDENTIAL_KEY);
+    let header = ctx.get_metadata(CREDENTIAL_HEADER);
+    let prefix = ctx.get_metadata(CREDENTIAL_PREFIX);
 
     if strategy.is_none() && name.is_none() && namespace.is_none() && key.is_none() {
         return None;
     }
-    if strategy != Some(STRATEGY_BEARER_TOKEN) || name.is_none() || namespace.is_none() || key.is_none() {
-        tracing::debug!(
-            strategy = strategy.unwrap_or("missing"),
-            "credential_inject: incomplete or unsupported credential reference; failing closed"
-        );
+    let reference_complete = name.is_some() && namespace.is_some() && key.is_some();
+    let overrides_present = header.is_some() || prefix.is_some();
+    if !selection_supported(strategy, reference_complete, overrides_present) {
         return Some(Err(()));
     }
+    let Some((header, prefix)) = parse_credential_overrides(header, prefix) else {
+        return Some(Err(()));
+    };
 
-    Some(Ok(CredentialRef {
-        name: name.unwrap_or_default().to_owned(),
-        namespace: namespace.unwrap_or_default().to_owned(),
-        key: key.unwrap_or_default().to_owned(),
+    Some(Ok(SelectedCredential {
+        strategy: strategy.unwrap_or_default().to_owned(),
+        cred_ref: CredentialRef {
+            name: name.unwrap_or_default().to_owned(),
+            namespace: namespace.unwrap_or_default().to_owned(),
+            key: key.unwrap_or_default().to_owned(),
+        },
+        header,
+        prefix,
     }))
 }
 
-/// Validate that the strategy is supported.
+/// Whether the metadata fields form a complete, supported selection.
+///
+/// Overrides are only valid alongside `apikey`; every other strategy must
+/// carry the full Secret locator with a supported strategy value.
+fn selection_supported(strategy: Option<&str>, reference_complete: bool, overrides_present: bool) -> bool {
+    let overrides_allowed = !overrides_present || strategy == Some(STRATEGY_API_KEY);
+    let complete = reference_complete && strategy.is_some_and(is_supported_credential_strategy) && overrides_allowed;
+    if complete {
+        return true;
+    }
+    tracing::debug!(
+        strategy = strategy.unwrap_or("missing"),
+        "credential_inject: incomplete or unsupported credential reference; failing closed"
+    );
+    false
+}
+
+/// Parse and validate the optional `apikey` header/prefix overrides.
+///
+/// Returns `None` when either override is present but malformed; the
+/// strategy cross-check that rejects overrides on other strategies lives in
+/// [`selected_credential`].
+fn parse_credential_overrides(
+    header: Option<&str>,
+    prefix: Option<&str>,
+) -> Option<(Option<HeaderName>, Option<String>)> {
+    let header = match header.map(|raw| HeaderName::from_bytes(raw.as_bytes())) {
+        Some(Ok(header)) => Some(header),
+        Some(Err(_)) => {
+            tracing::debug!("credential_inject: credential header override is not a valid header name");
+            return None;
+        },
+        None => None,
+    };
+    let prefix = match prefix {
+        Some(raw) if is_valid_prefix(raw) => Some(raw.to_owned()),
+        Some(_) => {
+            tracing::debug!("credential_inject: credential prefix override is not a valid literal");
+            return None;
+        },
+        None => None,
+    };
+    Some((header, prefix))
+}
+
+/// Validate that the strategy is in the supported wire vocabulary.
 fn validate_strategy(strategy: &str) -> Result<(), FilterError> {
-    if strategy == STRATEGY_BEARER_TOKEN {
+    if is_supported_credential_strategy(strategy) {
         return Ok(());
     }
     Err(format!(
         "credential_inject: unsupported strategy '{strategy}' \
-         (only 'bearer_token' is currently supported)"
+         (only '{STRATEGY_BEARER_TOKEN}' and '{STRATEGY_API_KEY}' are currently supported)"
     )
     .into())
+}
+
+/// Whether a prefix override is a bounded, whitespace-free visible-ASCII
+/// scheme literal.
+fn is_valid_prefix(prefix: &str) -> bool {
+    !prefix.trim().is_empty() && prefix.len() <= 256 && prefix.bytes().all(|byte| (0x21..=0x7E).contains(&byte))
 }
 
 /// Validate the bounded Secret locator fields used as the lookup key.
@@ -450,8 +589,10 @@ fn validate_credential_ref(entry: &CredentialEntryConfig) -> Result<(), FilterEr
 fn resolve_credential(entry: &CredentialEntryConfig) -> Result<ResolvedCredential, FilterError> {
     let token = resolve_token(entry)?;
     validate_token(&token)?;
-    let header_value_str = format!("Bearer {}", &*token);
-    HeaderValue::from_str(&header_value_str).map_err(|e| -> FilterError {
+    // Fail fast at startup if the token could not form the default
+    // `Authorization: Bearer` header; per-request overrides are validated
+    // when they arrive.
+    validate_default_header_shape(&token).map_err(|e| -> FilterError {
         format!(
             "credential_inject: assembled header value invalid for '{}/{}/{}': {e}",
             entry.name, entry.namespace, entry.key
@@ -459,24 +600,36 @@ fn resolve_credential(entry: &CredentialEntryConfig) -> Result<ResolvedCredentia
         .into()
     })?;
     Ok(ResolvedCredential {
-        header_value: Zeroizing::new(header_value_str),
+        strategy: entry.strategy.clone(),
+        token,
     })
 }
 
 /// Resolve a credential from one projected Secret file.
-fn resolve_file_credential(path: &str, reference: &CredentialRef) -> Result<ResolvedCredential, FilterError> {
+fn resolve_file_credential(
+    path: &str,
+    reference: &CredentialRef,
+    strategy: &str,
+) -> Result<ResolvedCredential, FilterError> {
     let token = read_projected_token(path, reference)?;
     validate_token(&token)?;
-    let header_value = format!("Bearer {}", &*token);
-    HeaderValue::from_str(&header_value).map_err(|error| {
+    validate_default_header_shape(&token).map_err(|error| {
         format!(
             "credential_inject: projected credential is not valid for '{}/{}/{}': {error}",
             reference.name, reference.namespace, reference.key
         )
     })?;
     Ok(ResolvedCredential {
-        header_value: Zeroizing::new(header_value),
+        strategy: strategy.to_owned(),
+        token,
     })
+}
+
+/// Check that one token can form the default `Authorization: Bearer` value.
+fn validate_default_header_shape(token: &str) -> Result<(), String> {
+    HeaderValue::from_str(&format!("Bearer {token}"))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Read one projected credential using the same bounded validation path for
@@ -508,19 +661,20 @@ fn read_projected_token(path: &str, reference: &CredentialRef) -> Result<Zeroizi
 /// Publish the current file state, failing closed when it cannot be read or
 /// validated.
 fn reload_credential(item: &WatchedCredential) {
-    let credential = match resolve_file_credential(item.path.to_string_lossy().as_ref(), &item.reference) {
-        Ok(credential) => Some(credential),
-        Err(error) => {
-            tracing::warn!(
-                name = %item.reference.name,
-                namespace = %item.reference.namespace,
-                key = %item.reference.key,
-                error = %error,
-                "credential_inject: projected credential unavailable; failing closed"
-            );
-            None
-        },
-    };
+    let credential =
+        match resolve_file_credential(item.path.to_string_lossy().as_ref(), &item.reference, &item.strategy) {
+            Ok(credential) => Some(credential),
+            Err(error) => {
+                tracing::warn!(
+                    name = %item.reference.name,
+                    namespace = %item.reference.namespace,
+                    key = %item.reference.key,
+                    error = %error,
+                    "credential_inject: projected credential unavailable; failing closed"
+                );
+                None
+            },
+        };
     item.snapshot.store(Arc::new(CredentialSnapshot { credential }));
 }
 
@@ -601,7 +755,7 @@ fn spawn_credential_watcher(watched: Vec<WatchedCredential>) -> Result<Credentia
             // complete startup snapshot.
             let mut initial = Vec::with_capacity(watched.len());
             for item in &watched {
-                match resolve_file_credential(item.path.to_string_lossy().as_ref(), &item.reference) {
+                match resolve_file_credential(item.path.to_string_lossy().as_ref(), &item.reference, &item.strategy) {
                     Ok(credential) => initial.push((Arc::clone(&item.snapshot), credential)),
                     Err(error) => {
                         drop(ready_tx.send(Err(format!("failed authoritative credential read: {error}"))));
@@ -854,6 +1008,156 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------------
+    // API Key Strategy
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn apikey_config_accepted() {
+        let f = parse("credentials:\n  - name: s\n    namespace: ns\n    key: k\n    strategy: apikey\n    value: tok");
+        assert!(f.is_ok(), "apikey must be in the supported vocabulary");
+    }
+
+    #[tokio::test]
+    async fn apikey_without_overrides_injects_authorization_bearer() {
+        let f = make_filter_with_strategy("apikey", "sec", "ns", "key", "sk-ant-123");
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "apikey", "sec", "ns", "key");
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue), "apikey must continue");
+        assert_eq!(ctx.request_headers_to_set.len(), 1);
+        assert_eq!(ctx.request_headers_to_set[0].0, AUTHORIZATION);
+        assert_eq!(ctx.request_headers_to_set[0].1.to_str().unwrap(), "Bearer sk-ant-123");
+    }
+
+    #[tokio::test]
+    async fn apikey_header_override_injects_raw_token_and_strips_targets() {
+        let f = make_filter_with_strategy("apikey", "anthropic", "ns", "key", "sk-ant-456");
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert("x-api-key", HeaderValue::from_static("customer-key"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata_with_overrides(&mut ctx, "apikey", "anthropic", "ns", "key", Some("x-api-key"), None);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "header override must continue"
+        );
+        assert_eq!(ctx.request_headers_to_set.len(), 1);
+        assert_eq!(ctx.request_headers_to_set[0].0, HeaderName::from_static("x-api-key"));
+        assert_eq!(
+            ctx.request_headers_to_set[0].1.to_str().unwrap(),
+            "sk-ant-456",
+            "custom header must receive the raw token without a scheme prefix"
+        );
+        assert!(ctx.request_headers_to_remove.contains(&AUTHORIZATION));
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static("x-api-key")),
+            "caller-supplied target header must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn apikey_prefix_override_prepends_scheme_and_strips_custom_target() {
+        let f = make_filter_with_strategy("apikey", "sec", "ns", "key", "tok-789");
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers
+            .insert("x-goog-api-key", HeaderValue::from_static("caller-copy"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata_with_overrides(
+            &mut ctx,
+            "apikey",
+            "sec",
+            "ns",
+            "key",
+            Some("x-goog-api-key"),
+            Some("Bearer"),
+        );
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(
+            ctx.request_headers_to_set[0].0,
+            HeaderName::from_static("x-goog-api-key")
+        );
+        assert_eq!(ctx.request_headers_to_set[0].1.to_str().unwrap(), "Bearer tok-789");
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static("x-goog-api-key")),
+            "custom target header must be stripped from the caller request"
+        );
+    }
+
+    #[tokio::test]
+    async fn apikey_malformed_overrides_fail_closed() {
+        let f = make_filter_with_strategy("apikey", "sec", "ns", "key", "tok");
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+
+        let mut bad_header = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata_with_overrides(&mut bad_header, "apikey", "sec", "ns", "key", Some("bad header"), None);
+        let action = f.on_request(&mut bad_header).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 503),
+            "unparseable header override must fail closed"
+        );
+
+        let mut bad_prefix = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata_with_overrides(&mut bad_prefix, "apikey", "sec", "ns", "key", None, Some("Bear er"));
+        let action = f.on_request(&mut bad_prefix).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 503),
+            "whitespace-bearing prefix override must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn bearer_token_with_header_override_fails_closed() {
+        let f = make_filter_with_value("sec", "ns", "key", "tok");
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata_with_overrides(&mut ctx, "bearer_token", "sec", "ns", "key", Some("x-api-key"), None);
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 503),
+            "header overrides are apikey-only and must fail closed on bearer_token"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlay_and_config_strategy_mismatch_fails_closed() {
+        let f = make_filter_with_value("sec", "ns", "key", "tok"); // configured bearer_token
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "apikey", "sec", "ns", "key"); // overlay selected apikey
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 503),
+            "overlay and config must agree on credential semantics"
+        );
+        assert!(ctx.request_headers_to_set.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apikey_token_not_in_filter_metadata_after_injection() {
+        let f = make_filter_with_strategy("apikey", "sec", "ns", "key", "super-secret-apikey");
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata_with_overrides(&mut ctx, "apikey", "sec", "ns", "key", Some("x-api-key"), None);
+        let _unused = f.on_request(&mut ctx).await.unwrap();
+        for value in ctx.filter_metadata.values() {
+            assert!(
+                !value.contains("super-secret-apikey"),
+                "token must not appear in filter_metadata; found in: {value}"
+            );
+        }
+    }
+
     #[test]
     fn missing_env_var_rejected_at_construction() {
         // Exercises the env_var resolution path without unsafe set_var.
@@ -984,10 +1288,9 @@ mod tests {
 
         let handle = spawn_credential_watcher(vec![watched]).unwrap();
         let current = snapshot.load_full();
-        assert_eq!(
-            current.credential.as_ref().unwrap().header_value.as_str(),
-            "Bearer token-c"
-        );
+        let resolved = current.credential.as_ref().unwrap();
+        assert_eq!(&*resolved.token, "token-c");
+        assert_eq!(resolved.strategy, STRATEGY_BEARER_TOKEN);
         drop(handle);
     }
 
@@ -1012,10 +1315,7 @@ mod tests {
 
         std::fs::write(&first_path, "token-c\n").unwrap();
         process_watcher_event(&notify::Event::new(EventKind::Other), &watched);
-        assert_eq!(
-            first_snapshot.load().credential.as_ref().unwrap().header_value.as_str(),
-            "Bearer token-c"
-        );
+        assert_eq!(&*first_snapshot.load().credential.as_ref().unwrap().token, "token-c");
     }
 
     #[test]
@@ -1236,7 +1536,9 @@ mod tests {
     fn initial_snapshot(path: &Path, name: &str) -> Arc<ArcSwap<CredentialSnapshot>> {
         let reference = credential_reference(name);
         Arc::new(ArcSwap::from_pointee(CredentialSnapshot {
-            credential: Some(resolve_file_credential(path.to_string_lossy().as_ref(), &reference).unwrap()),
+            credential: Some(
+                resolve_file_credential(path.to_string_lossy().as_ref(), &reference, STRATEGY_BEARER_TOKEN).unwrap(),
+            ),
         }))
     }
 
@@ -1244,6 +1546,7 @@ mod tests {
         WatchedCredential {
             path,
             reference: credential_reference(name),
+            strategy: STRATEGY_BEARER_TOKEN.to_owned(),
             snapshot: Arc::clone(snapshot),
         }
     }
@@ -1263,6 +1566,19 @@ mod tests {
         parse(&yaml).unwrap()
     }
 
+    fn make_filter_with_strategy(
+        strategy: &str,
+        name: &str,
+        namespace: &str,
+        key: &str,
+        token: &str,
+    ) -> Box<dyn HttpFilter> {
+        let yaml = format!(
+            "credentials:\n  - name: {name}\n    namespace: {namespace}\n    key: {key}\n    strategy: {strategy}\n    value: {token}"
+        );
+        parse(&yaml).unwrap()
+    }
+
     fn set_credential_metadata(
         ctx: &mut HttpFilterContext<'_>,
         strategy: &str,
@@ -1270,9 +1586,31 @@ mod tests {
         namespace: &str,
         key: &str,
     ) {
+        set_credential_metadata_with_overrides(ctx, strategy, name, namespace, key, None, None);
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "metadata fixture covers the full credential contract"
+    )]
+    fn set_credential_metadata_with_overrides(
+        ctx: &mut HttpFilterContext<'_>,
+        strategy: &str,
+        name: &str,
+        namespace: &str,
+        key: &str,
+        header: Option<&str>,
+        prefix: Option<&str>,
+    ) {
         ctx.set_metadata(CREDENTIAL_STRATEGY, strategy);
         ctx.set_metadata(CREDENTIAL_NAME, name);
         ctx.set_metadata(CREDENTIAL_NAMESPACE, namespace);
         ctx.set_metadata(CREDENTIAL_KEY, key);
+        if let Some(header) = header {
+            ctx.set_metadata(CREDENTIAL_HEADER, header);
+        }
+        if let Some(prefix) = prefix {
+            ctx.set_metadata(CREDENTIAL_PREFIX, prefix);
+        }
     }
 }
