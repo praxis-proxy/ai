@@ -7,6 +7,9 @@ use serde::Deserialize;
 use serde_json::{Map, Number, Value, json};
 use thiserror::Error;
 
+use super::reasoning::{
+    ReasoningOptions, extract_reasoning_item, message_has_reasoning, reasoning_item_id, requested_summary,
+};
 use crate::web_search::is_web_search_tool_type;
 
 // -----------------------------------------------------------------------------
@@ -103,6 +106,10 @@ pub(crate) struct ResponseContext<'a> {
     pub(crate) safety_identifier: Option<&'a Value>,
     /// Request prompt cache key to echo on the `Responses` resource.
     pub(crate) prompt_cache_key: Option<&'a Value>,
+    /// Original `Responses` reasoning controls to echo on the `Responses` resource.
+    pub(crate) reasoning: Option<&'a Value>,
+    /// Reasoning dialect behavior applied while translating the response.
+    pub(crate) reasoning_options: ReasoningOptions,
 }
 
 impl<'a> ResponseContext<'a> {
@@ -133,6 +140,8 @@ impl<'a> ResponseContext<'a> {
             service_tier: request.value("service_tier"),
             safety_identifier: request.value("safety_identifier"),
             prompt_cache_key: request.value("prompt_cache_key"),
+            reasoning: request.value("reasoning"),
+            reasoning_options: ReasoningOptions::default(),
         }
     }
 
@@ -140,6 +149,13 @@ impl<'a> ResponseContext<'a> {
     #[must_use]
     pub(crate) fn with_completed_at(mut self, completed_at: u64) -> Self {
         self.completed_at = Some(completed_at);
+        self
+    }
+
+    /// Return a response context configured with a reasoning dialect.
+    #[must_use]
+    pub(crate) fn with_reasoning_options(mut self, reasoning_options: ReasoningOptions) -> Self {
+        self.reasoning_options = reasoning_options;
         self
     }
 }
@@ -255,6 +271,34 @@ pub(crate) enum TranslationError {
     /// A file-search definition cannot be executed by the local callout.
     #[error("invalid Responses file_search tool for Chat Completions translation: {0}")]
     InvalidFileSearchTool(&'static str),
+    /// A reasoning summary was requested for a dialect without a safe-summary contract.
+    #[error("reasoning.summary is not supported by the configured reasoning dialect")]
+    UnsupportedReasoningSummary,
+    /// The request specified conflicting reasoning summary controls.
+    #[error("reasoning.summary and reasoning.generate_summary conflict")]
+    ConflictingReasoningSummary,
+    /// The provider returned more raw reasoning than the configured limit allows.
+    #[error("raw reasoning content ({bytes} bytes) exceeds the configured maximum of {max_bytes} bytes")]
+    ReasoningTooLarge {
+        /// Observed raw reasoning size in bytes.
+        bytes: usize,
+        /// Configured maximum raw reasoning size in bytes.
+        max_bytes: usize,
+    },
+    /// The provider returned raw reasoning in an unexpected shape.
+    #[error("provider returned malformed raw reasoning content: expected string, found {0}")]
+    MalformedReasoning(String),
+    /// A reasoning summary control was present but not a string or null.
+    #[error("reasoning.{field} must be a string or null, found {actual}")]
+    MalformedReasoningSummary {
+        /// The summary control field name.
+        field: &'static str,
+        /// The observed JSON type.
+        actual: String,
+    },
+    /// The `reasoning` request field was present but not an object or null.
+    #[error("reasoning must be an object or null, found {0}")]
+    MalformedReasoningBlock(String),
 }
 
 /// Borrowed canonical request fields that supersede their original request values.
@@ -516,6 +560,9 @@ fn append_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Tran
         Some("function_call_output") => append_tool_output(messages, obj)?,
         Some("message") => append_message_item(messages, obj)?,
         Some("compaction") => append_compaction_item(messages, obj)?,
+        // Cross-turn reasoning passthrough is Responses-native (encrypted
+        // reasoning items) outside the scope of Chat Completions translation.
+        Some("reasoning") => {},
         None if obj.contains_key("role") || obj.contains_key("content") => append_message_item(messages, obj)?,
         None => return Err(TranslationError::UnsupportedInputItemType("unknown".to_owned())),
         Some(input_type) => return Err(TranslationError::UnsupportedInputItemType(input_type.to_owned())),
@@ -1142,7 +1189,7 @@ fn build_object_tool_choice(
 }
 
 /// Return a stable JSON type name for diagnostics.
-fn json_type_name(value: &Value) -> &'static str {
+pub(crate) fn json_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "boolean",
@@ -1166,7 +1213,7 @@ pub(crate) fn chat_response_to_response_resource(
         .as_object()
         .ok_or(TranslationError::ExpectedObject("Chat Completions response"))?;
 
-    let finish_reason = validate_chat_response(obj)?;
+    let finish_reason = validate_chat_response(obj, &context.reasoning_options)?;
     let status = response_status(finish_reason);
     let incomplete_details = incomplete_details(finish_reason);
     let output = build_output_items(obj, context, status)?;
@@ -1180,11 +1227,14 @@ pub(crate) fn chat_response_to_response_resource(
         service_tier: &service_tier,
     };
 
-    Ok(response_resource(context, parts))
+    response_resource(context, parts)
 }
 
 /// Validate the minimum successful Chat Completions shape used by translation.
-fn validate_chat_response(obj: &Map<String, Value>) -> Result<&str, TranslationError> {
+fn validate_chat_response<'a>(
+    obj: &'a Map<String, Value>,
+    reasoning_options: &ReasoningOptions,
+) -> Result<&'a str, TranslationError> {
     let choices = obj
         .get("choices")
         .and_then(Value::as_array)
@@ -1206,12 +1256,16 @@ fn validate_chat_response(obj: &Map<String, Value>) -> Result<&str, TranslationE
         ));
     }
 
-    validate_chat_message(choice, finish_reason)?;
+    validate_chat_message(choice, finish_reason, reasoning_options)?;
     Ok(finish_reason)
 }
 
 /// Validate the assistant message fields that the translator consumes.
-fn validate_chat_message(choice: &Map<String, Value>, finish_reason: &str) -> Result<(), TranslationError> {
+fn validate_chat_message(
+    choice: &Map<String, Value>,
+    finish_reason: &str,
+    reasoning_options: &ReasoningOptions,
+) -> Result<(), TranslationError> {
     let message = choice
         .get("message")
         .and_then(Value::as_object)
@@ -1227,11 +1281,12 @@ fn validate_chat_message(choice: &Map<String, Value>, finish_reason: &str) -> Re
     let has_content = validate_chat_content(message)?;
     let has_refusal = validate_chat_refusal(message)?;
     let has_tool_calls = validate_chat_tool_calls(message, finish_reason)?;
+    let has_reasoning = message_has_reasoning(choice.get("message"), reasoning_options)?;
     // A completed terminal must carry at least one translatable output; without
     // one the translator would synthesize a counterfeit `completed` response with
     // an empty output array. Incomplete terminals (length, content_filter)
     // truthfully carry empty output, so they are exempt.
-    let has_output = has_content || has_refusal || has_tool_calls;
+    let has_output = has_content || has_refusal || has_tool_calls || has_reasoning;
     if response_status(finish_reason) == "completed" && !has_output {
         return Err(TranslationError::InvalidChatResponse(
             "first choice message has no supported output",
@@ -1330,7 +1385,7 @@ fn is_supported_function_call(tool_call: &Value) -> bool {
 /// Produces the same resource shape as the finite translation but with an empty
 /// output list, null usage, and `in_progress` status, matching the snapshot
 /// carried by `response.created` and `response.in_progress` streaming events.
-pub(crate) fn in_progress_response_resource(context: &ResponseContext<'_>) -> Value {
+pub(crate) fn in_progress_response_resource(context: &ResponseContext<'_>) -> Result<Value, TranslationError> {
     let service_tier = context
         .service_tier
         .filter(|value| value.is_string())
@@ -1362,7 +1417,10 @@ struct ResponseResourceParts<'a> {
 }
 
 /// Build a full `Responses` resource snapshot.
-fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts<'_>) -> Value {
+fn response_resource(
+    context: &ResponseContext<'_>,
+    parts: ResponseResourceParts<'_>,
+) -> Result<Value, TranslationError> {
     let status = parts.status;
     let mut resource = json!({
         "id": context.response_id,
@@ -1378,7 +1436,7 @@ fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts
         "output": Value::Array(parts.output),
         "parallel_tool_calls": context.parallel_tool_calls,
         "previous_response_id": previous_response_id_value(context),
-        "reasoning": Value::Null,
+        "reasoning": reasoning_value(context)?,
         "store": context.store,
         "temperature": number_or_default(context.temperature, 1.0),
         "text": text_value(context),
@@ -1396,7 +1454,7 @@ fn response_resource(context: &ResponseContext<'_>, parts: ResponseResourceParts
         "service_tier": parts.service_tier
     });
     insert_request_resource_fields(&mut resource, context, status);
-    resource
+    Ok(resource)
 }
 
 /// Insert required response fields that are sourced from the original request.
@@ -1507,6 +1565,18 @@ fn previous_response_id_value(context: &ResponseContext<'_>) -> Value {
         .map_or(Value::Null, |response_id| Value::String(response_id.to_owned()))
 }
 
+/// Build the `reasoning` response field.
+fn reasoning_value(context: &ResponseContext<'_>) -> Result<Value, TranslationError> {
+    let Some(reasoning) = context.reasoning.and_then(Value::as_object) else {
+        return Ok(Value::Null);
+    };
+    let summary = requested_summary(reasoning)?.map_or(Value::Null, |summary| Value::String(summary.to_owned()));
+    Ok(json!({
+        "effort": reasoning.get("effort").cloned().unwrap_or(Value::Null),
+        "summary": summary,
+    }))
+}
+
 /// Build the `tool_choice` response field.
 fn tool_choice_value(context: &ResponseContext<'_>) -> Value {
     context
@@ -1585,6 +1655,14 @@ fn build_output_items(
     };
 
     let message = choice.get("message");
+    if let Some(reasoning_item) = extract_reasoning_item(
+        message,
+        reasoning_item_id(&context.response_id),
+        status,
+        &context.reasoning_options,
+    )? {
+        output.push(reasoning_item);
+    }
     let logprobs = chat_logprobs_content(choice);
     append_message_output(&mut output, message, context, status, logprobs);
     append_tool_call_outputs(&mut output, message, context, status)?;
