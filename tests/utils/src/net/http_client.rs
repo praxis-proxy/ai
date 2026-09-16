@@ -9,6 +9,8 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+
 // -----------------------------------------------------------------------------
 // Raw Request / Response
 // -----------------------------------------------------------------------------
@@ -110,6 +112,50 @@ pub fn json_post(path: &str, body: &str) -> String {
          {body}",
         body.len()
     )
+}
+
+/// Build a raw JSON HTTP POST like [`json_post`] with one extra header line.
+///
+/// `header_line` is inserted verbatim (no trailing CRLF), e.g.
+/// `"Authorization: Basic ..."`, so a test can present a gateway credential to a
+/// `basic_auth`-guarded listener.
+///
+/// # Examples
+///
+/// ```
+/// # use praxis_test_utils::json_post_with_header;
+/// let req = json_post_with_header("/v1/messages", "{}", "Authorization: Basic Zm9v");
+/// assert!(req.contains("Authorization: Basic Zm9v\r\n"));
+/// ```
+pub fn json_post_with_header(path: &str, body: &str, header_line: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/json\r\n\
+         {header_line}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n\
+         {body}",
+        body.len()
+    )
+}
+
+/// Encode `username:password` into an HTTP Basic `Authorization` header value.
+///
+/// Returns the full value, e.g. `Basic Z2F0ZXdheTpzZWNyZXQ=`, suitable for a
+/// `basic_auth` gateway challenge.
+///
+/// # Examples
+///
+/// ```
+/// # use praxis_test_utils::basic_auth_header;
+/// assert_eq!(
+///     basic_auth_header("gateway", "secret"),
+///     "Basic Z2F0ZXdheTpzZWNyZXQ="
+/// );
+/// ```
+pub fn basic_auth_header(username: &str, password: &str) -> String {
+    format!("Basic {}", STANDARD.encode(format!("{username}:{password}")))
 }
 
 // -----------------------------------------------------------------------------

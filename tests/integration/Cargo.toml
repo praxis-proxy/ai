@@ -39,6 +39,7 @@ praxis-core = { workspace = true }
 praxis-ai-proxy = { workspace = true }
 praxis-filter = { workspace = true }
 praxis-test-utils = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

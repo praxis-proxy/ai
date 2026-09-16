@@ -1,0 +1,137 @@
+# Anthropic Messages -> Chat Completions vLLM Passthrough (credential-isolated)
+#
+# Translates native Anthropic Messages API traffic into OpenAI Chat Completions
+# for a vLLM backend that serves `/v1/chat/completions`, with the same
+# three-boundary credential isolation as the native passthrough config. This is
+# the config a real Claude Code client uses to reach a Chat-Completions-only
+# vLLM backend through Praxis: the client speaks the Anthropic wire format,
+# Praxis rewrites both the request and the response, and vLLM only ever sees
+# OpenAI Chat Completions.
+#
+# Contrast with `messages-native-vllm.yaml`, which passes the Anthropic wire
+# format through UNCHANGED to a vLLM backend that serves `/v1/messages`
+# natively. Use this config instead when the backend speaks only OpenAI Chat
+# Completions (e.g. llm-d with disaggregation, KServe without Anthropic
+# support), and `messages-native-vllm.yaml` when it serves Anthropic natively.
+#
+# Translation (adapted from `messages-to-openai.yaml`):
+#   - `anthropic_messages_to_chat_completions` rewrites the request body
+#     (system hoisting, content-block flattening, tool mapping) and the
+#     non-streaming response body back into Anthropic Messages.
+#   - `anthropic_messages_to_chat_completions_stream` converts streaming SSE,
+#     gated to `text/event-stream` responses.
+#   - `path_rewrite` maps `POST /v1/messages` to `/v1/chat/completions`.
+#
+# Credential isolation (three distinct credentials, each at its own boundary),
+# identical to `messages-native-vllm.yaml`:
+#   - `basic_auth` authenticates the *client* to this gateway. A trusted caller
+#     (e.g. Claude Code via `ANTHROPIC_CUSTOM_HEADERS`) presents an
+#     `Authorization: Basic ...` gateway credential; `basic_auth` verifies it
+#     and, with `strip_authorization: true`, removes it so it never reaches the
+#     backend.
+#   - The `headers` filter removes the client's `x-api-key` (the native
+#     Anthropic auth header) so a caller's Anthropic key never reaches vLLM.
+#   - `credential_injection` then injects the backend's own distinct Bearer
+#     token from `VLLM_API_KEY` toward the cluster.
+#
+# The gateway password is resolved from `GATEWAY_AUTH_PASSWORD` at pipeline
+# build time; set it (and `VLLM_API_KEY`) in the proxy's environment.
+#
+# Note: `/v1/messages/count_tokens` has no Chat Completions equivalent, so it is
+# NOT rewritten (the `path_rewrite` pattern is anchored to `^/v1/messages$`) and
+# reaches the OpenAI backend as an unknown path. A Chat-Completions-only vLLM
+# returns 404 for it; Claude Code treats native token counting as best-effort
+# and degrades gracefully.
+
+listeners:
+  - name: anthropic-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [anthropic-transform-vllm]
+
+filter_chains:
+  - name: anthropic-transform-vllm
+    filters:
+      # Authenticate the client to the gateway BEFORE anything else, and strip
+      # the gateway `Authorization` so it never reaches the backend. Real callers
+      # present it via a custom `Authorization: Basic ...` header (Claude Code:
+      # `ANTHROPIC_CUSTOM_HEADERS`).
+      - filter: basic_auth
+        realm: "praxis-transform-vllm-gateway"
+        strip_authorization: true
+        credentials:
+          - username: gateway
+            env_var: GATEWAY_AUTH_PASSWORD
+
+      # Classify the request as Anthropic Messages and promote facts to internal
+      # `x-praxis-ai-*` headers. `on_invalid: continue` lets non-message paths
+      # (health checks, model discovery) pass through.
+      - filter: anthropic_messages_format
+        on_invalid: continue
+
+      # Validate only the message-bearing endpoints before translation. Scoping
+      # to `/v1/messages` keeps bodyless probes such as `GET /v1/models` from
+      # being rejected for having an empty body.
+      - filter: anthropic_validate
+        conditions:
+          - when:
+              path_prefix: "/v1/messages"
+
+      # Translate the Anthropic request body into OpenAI Chat Completions and the
+      # non-streaming response body back into Anthropic Messages.
+      - filter: anthropic_messages_to_chat_completions
+        max_body_bytes: 1048576
+
+      # Convert streaming Chat Completions SSE back into Anthropic SSE. Gated to
+      # `text/event-stream` so buffered JSON responses stay on the non-streaming
+      # path above.
+      - filter: anthropic_messages_to_chat_completions_stream
+        max_partial_event_bytes: 10485760
+        # Cap on distinct streaming tool-call content blocks retained per
+        # response; exceeding it fails the stream closed.
+        max_tool_blocks: 10000
+        response_conditions:
+          - when:
+              headers:
+                content-type: "text/event-stream"
+
+      # Strip the client's native Anthropic auth header so it never reaches the
+      # backend. `credential_injection` below handles `Authorization`.
+      - filter: headers
+        request_remove:
+          - x-api-key
+
+      # Map the Anthropic message endpoint onto the backend's Chat Completions
+      # endpoint. Anchored to `^/v1/messages$` so `/v1/messages/count_tokens`
+      # and other paths are left unchanged.
+      - filter: path_rewrite
+        replace:
+          pattern: "^/v1/messages$"
+          replacement: "/v1/chat/completions"
+        conditions:
+          - when:
+              path_prefix: "/v1/messages"
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "chat-completions-backend"
+
+      # Inject the backend's own credential after routing selects the cluster.
+      # `strip_client_credential` (default true) removes any client-supplied
+      # `Authorization` before injection.
+      - filter: credential_injection
+        clusters:
+          - name: chat-completions-backend
+            header: Authorization
+            env_var: VLLM_API_KEY
+            header_prefix: "Bearer "
+            strip_client_credential: true
+
+      - filter: load_balancer
+        clusters:
+          - name: "chat-completions-backend"
+            endpoints:
+              - "127.0.0.1:8000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local vLLM backend

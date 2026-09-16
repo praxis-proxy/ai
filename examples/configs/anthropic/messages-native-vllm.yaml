@@ -1,0 +1,113 @@
+# Anthropic Messages -> Native vLLM Passthrough
+#
+# Routes native Anthropic Messages API traffic (`/v1/messages` and
+# `/v1/messages/count_tokens`) to a vLLM backend that natively serves
+# the Anthropic Messages API, WITHOUT any request or response body
+# translation. This is the config a real Claude Code client uses to
+# reach a vLLM backend through Praxis while every byte of the Anthropic
+# wire format is preserved end to end.
+#
+# Contrast with `messages-to-openai.yaml`, which TRANSLATES Anthropic
+# Messages into OpenAI Chat Completions for Chat-Completions-only
+# backends. This config deliberately omits the
+# `anthropic_messages_to_chat_completions[_stream]` translation filters:
+# vLLM speaks `/v1/messages` natively, so translation would be lossy and
+# unnecessary.
+#
+# Credential isolation (three distinct credentials, each at its own boundary):
+#   - `basic_auth` authenticates the *client* to this gateway. A trusted
+#     caller (e.g. Claude Code via `ANTHROPIC_CUSTOM_HEADERS`) presents an
+#     `Authorization: Basic ...` gateway credential; `basic_auth` verifies
+#     it and, with `strip_authorization: true`, removes it so it never
+#     reaches the backend.
+#   - The `headers` filter removes the client's `x-api-key` (the native
+#     Anthropic auth header) so a caller's Anthropic key never reaches
+#     vLLM either.
+#   - `credential_injection` then injects the backend's own distinct Bearer
+#     token from `VLLM_API_KEY` toward the cluster.
+#   Together these guarantee the client cannot smuggle credentials to the
+#   backend, only authenticated callers are upgraded with the backend
+#   credential, and the backend only ever sees the server-owned token.
+#
+# The gateway password is resolved from `GATEWAY_AUTH_PASSWORD` at pipeline
+# build time; set it (and `VLLM_API_KEY`) in the proxy's environment. See
+# `credential-injection.yaml` for alternative client gates (mTLS, IP ACL).
+
+listeners:
+  - name: anthropic-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [anthropic-native-vllm]
+
+filter_chains:
+  - name: anthropic-native-vllm
+    filters:
+      # Authenticate the client to the gateway BEFORE anything else, and
+      # strip the gateway `Authorization` so it never reaches the backend.
+      # Real callers present it via a custom `Authorization: Basic ...`
+      # header (Claude Code: `ANTHROPIC_CUSTOM_HEADERS`).
+      - filter: basic_auth
+        realm: "praxis-native-vllm-gateway"
+        strip_authorization: true
+        credentials:
+          - username: gateway
+            env_var: GATEWAY_AUTH_PASSWORD
+
+      # Classify the request as Anthropic Messages and promote facts to
+      # internal `x-praxis-ai-*` headers. `on_invalid: continue` lets
+      # non-message paths (health checks, model discovery) pass through.
+      - filter: anthropic_messages_format
+        on_invalid: continue
+
+      # Validate only the message-bearing endpoints. Scoping to
+      # `/v1/messages` keeps bodyless probes such as `GET /v1/models`
+      # from being rejected for having an empty body.
+      - filter: anthropic_validate
+        conditions:
+          - when:
+              path_prefix: "/v1/messages"
+
+      # Supply a default `anthropic-version` header for internal or
+      # non-SDK callers that omit it. Real Claude Code always sends one,
+      # so this is a no-op for it.
+      - filter: anthropic_messages_protocol
+        default_version: "2023-06-01"
+
+      # Strip the client's native Anthropic auth header so it never
+      # reaches the backend. `credential_injection` below handles
+      # `Authorization`.
+      - filter: headers
+        request_remove:
+          - x-api-key
+
+      - filter: router
+        routes:
+          - path: "/v1/messages"
+            cluster: "vllm-backend"
+          - path: "/v1/messages/count_tokens"
+            cluster: "vllm-backend"
+          - path: "/v1/models"
+            cluster: "vllm-backend"
+          # Any other native endpoint (health checks and documented startup
+          # probes) is proxied unchanged to the same backend.
+          - path_prefix: "/"
+            cluster: "vllm-backend"
+
+      # Inject the backend's own credential after routing selects the
+      # cluster. `strip_client_credential` (default true) removes any
+      # client-supplied `Authorization` before injection.
+      - filter: credential_injection
+        clusters:
+          - name: vllm-backend
+            header: Authorization
+            env_var: VLLM_API_KEY
+            header_prefix: "Bearer "
+            strip_client_credential: true
+
+      - filter: load_balancer
+        clusters:
+          - name: "vllm-backend"
+            endpoints:
+              - "127.0.0.1:8000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local vLLM backend

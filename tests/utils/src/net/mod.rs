@@ -24,8 +24,8 @@ pub use backend::{
 #[cfg(feature = "llmd-ext-proc")]
 pub use ext_proc_mock::{MockProcessorGuard, start_mock_routing_processor};
 pub use http_client::{
-    http_get, http_get_retry, http_get_v6, http_post, http_send, json_post, parse_body, parse_header, parse_header_all,
-    parse_status,
+    basic_auth_header, http_get, http_get_retry, http_get_v6, http_post, http_send, json_post, json_post_with_header,
+    parse_body, parse_header, parse_header_all, parse_status,
 };
 pub use port::{PortGuard, bind_unique_port, free_port, free_port_guard, free_port_v6, ipv6_available};
 pub use postgres::{PostgresGuard, start_postgres};
