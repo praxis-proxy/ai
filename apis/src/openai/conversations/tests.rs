@@ -23,7 +23,7 @@ use super::{
 use crate::{
     openai::responses::{DEFAULT_TENANT_ID, state::ResponsesState},
     store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, SqliteResponseStore, StoreError},
-    test_utils::{make_filter_context, make_request, make_response},
+    test_utils::{make_owned_filter_context, make_request, make_response},
 };
 
 fn rejection_body(rejection: &praxis_filter::Rejection) -> Value {
@@ -1144,7 +1144,7 @@ async fn create_and_get_conversation() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"metadata": {"env": "test"}});
@@ -1161,7 +1161,7 @@ async fn create_and_get_conversation() {
     assert!(conv_id.starts_with("conv_"));
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -1178,7 +1178,7 @@ async fn get_nonexistent_conversation_returns_404() {
     let filter = build_test_filter();
 
     let req = make_request(Method::GET, "/v1/conversations/conv_nonexistent");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -1193,7 +1193,7 @@ async fn update_conversation() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({"v": "1"})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"metadata": {"v": "2"}});
@@ -1208,7 +1208,7 @@ async fn update_conversation() {
     assert_eq!(resp["metadata"]["v"], "2");
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from get after update");
@@ -1223,7 +1223,7 @@ async fn update_conversation_body_requires_metadata() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({"v": "1"})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from_static(b"{}"));
@@ -1239,7 +1239,7 @@ async fn update_conversation_body_requires_metadata() {
     assert_eq!(error["param"], "metadata");
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from get after update");
@@ -1254,7 +1254,7 @@ async fn update_conversation_without_body_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({"v": "1"})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = None;
@@ -1276,7 +1276,7 @@ async fn delete_conversation() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::DELETE, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -1287,7 +1287,7 @@ async fn delete_conversation() {
     assert!(resp["deleted"].as_bool().unwrap());
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject");
@@ -1296,11 +1296,11 @@ async fn delete_conversation() {
 }
 
 #[tokio::test]
-async fn delete_conversation_preserves_item_rows() {
+async fn deleted_conversation_items_are_not_request_accessible() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -1319,7 +1319,7 @@ async fn delete_conversation_preserves_item_rows() {
     let conv_id = resp["id"].as_str().unwrap();
 
     let req = make_request(Method::DELETE, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from delete conversation");
@@ -1327,15 +1327,15 @@ async fn delete_conversation_preserves_item_rows() {
     assert_eq!(rejection.status, 200, "delete conversation should return 200");
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items/item_keep"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from get retained item");
     };
-    assert_eq!(rejection.status, 200, "conversation delete should not delete item row");
-    let resp = rejection_body(&rejection);
-    assert_eq!(resp["id"], "item_keep");
-    assert_eq!(resp["content"][0]["text"], "keep me");
+    assert_eq!(
+        rejection.status, 404,
+        "direct item retrieval must authorize the live parent conversation"
+    );
 }
 
 #[tokio::test]
@@ -1343,7 +1343,7 @@ async fn unmatched_path_continues() {
     let filter = build_test_filter();
 
     let req = make_request(Method::GET, "/v1/chat/completions");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
 }
@@ -1360,7 +1360,7 @@ async fn post_routes_use_stream_buffer_request_body_mode() {
     );
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.request_body_mode = filter.request_body_mode();
     let action = filter.on_request(&mut ctx).await.unwrap();
 
@@ -1385,7 +1385,7 @@ async fn unmatched_post_path_continues() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/chat/completions");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     assert!(matches!(action, FilterAction::Continue));
@@ -1396,7 +1396,7 @@ async fn early_body_pre_read_defers_store_write_until_request_filters_run() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(7);
 
     let body_json = serde_json::json!({"metadata": {"phase": "deferred"}});
@@ -1421,7 +1421,7 @@ async fn create_conversation_with_invalid_metadata() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"metadata": "not-an-object"});
@@ -1438,7 +1438,7 @@ async fn create_conversation_with_invalid_json_returns_400() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from_static(b"{not-json"));
@@ -1459,7 +1459,7 @@ async fn create_conversation_with_non_object_json_returns_400() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from_static(b"[]"));
@@ -1481,7 +1481,7 @@ async fn update_conversation_with_non_object_json_preserves_metadata() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({"v": "1"})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from_static(b"[]"));
@@ -1492,7 +1492,7 @@ async fn update_conversation_with_non_object_json_preserves_metadata() {
     assert_eq!(rejection.status, 400, "non-object JSON should return 400");
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from get after invalid update");
@@ -1506,7 +1506,7 @@ async fn initial_items_can_be_listed_and_retrieved() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -1526,7 +1526,7 @@ async fn initial_items_can_be_listed_and_retrieved() {
     let conv_id = resp["id"].as_str().unwrap();
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items?order=asc"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from list items");
@@ -1545,7 +1545,7 @@ async fn initial_items_can_be_listed_and_retrieved() {
     assert_eq!(resp["data"][1]["content"][0]["annotations"], serde_json::json!([]));
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items/item_explicit"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from get item");
@@ -1563,7 +1563,7 @@ async fn empty_item_list_returns_string_pagination_ids() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -1582,7 +1582,7 @@ async fn create_conversation_rejects_duplicate_initial_item_ids() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -1612,7 +1612,7 @@ async fn create_and_delete_item_endpoints_are_local() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -1633,7 +1633,7 @@ async fn create_and_delete_item_endpoints_are_local() {
     assert_eq!(resp["data"][0]["content"][0]["text"], "new");
 
     let req = make_request(Method::DELETE, &format!("/v1/conversations/{conv_id}/items/item_new"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from delete item");
@@ -1641,7 +1641,7 @@ async fn create_and_delete_item_endpoints_are_local() {
     assert_eq!(rejection.status, 200, "delete item should return 200");
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items/item_new"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from get deleted item");
@@ -1655,7 +1655,7 @@ async fn item_endpoints_apply_include_projection_without_changing_stored_items()
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let body_json = serde_json::json!({
         "items": [{
@@ -1681,7 +1681,7 @@ async fn item_endpoints_apply_include_projection_without_changing_stored_items()
         Method::GET,
         &format!("/v1/conversations/{conv_id}/items/reasoning_1?include%5B%5D=reasoning.encrypted_content"),
     );
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from get item");
@@ -1694,7 +1694,7 @@ async fn item_endpoints_apply_include_projection_without_changing_stored_items()
     );
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from list items");
@@ -1709,7 +1709,7 @@ async fn item_endpoints_apply_include_projection_without_changing_stored_items()
         Method::GET,
         &format!("/v1/conversations/{conv_id}/items?include=reasoning.encrypted_content"),
     );
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from list items with include");
@@ -1730,7 +1730,7 @@ async fn item_endpoints_reject_unknown_include_values() {
         Method::POST,
         &format!("/v1/conversations/{conv_id}/items?include=future.secret_field"),
     );
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let mut body = Some(Bytes::from_static(
         br#"{"items":[{"id":"reasoning_2","type":"reasoning","summary":[]}]}"#,
@@ -1747,7 +1747,7 @@ async fn item_endpoints_reject_unknown_include_values() {
         format!("/v1/conversations/{conv_id}/items/missing?include=future.secret_field"),
     ] {
         let req = make_request(Method::GET, &path);
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = make_owned_filter_context(&req);
         let action = filter.on_request(&mut ctx).await.unwrap();
         let FilterAction::Reject(rejection) = action else {
             panic!("expected Reject from {path}");
@@ -1771,7 +1771,7 @@ async fn item_subresource_routes_do_not_fall_through_upstream() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
@@ -1800,7 +1800,7 @@ async fn item_subresource_routes_do_not_fall_through_upstream() {
         (Method::DELETE, format!("/v1/conversations/{conv_id}/items/item_local")),
     ] {
         let req = make_request(method.clone(), &path);
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = make_owned_filter_context(&req);
         let action = filter.on_request(&mut ctx).await.unwrap();
         let FilterAction::Reject(rejection) = action else {
             panic!("{method} {path} should be handled locally, got {action:?}");
@@ -1819,7 +1819,7 @@ async fn encoded_item_id_path_segments_are_decoded() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -1838,7 +1838,7 @@ async fn encoded_item_id_path_segments_are_decoded() {
         Method::GET,
         &format!("/v1/conversations/{conv_id}/items/item%20with%20space"),
     );
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from get encoded item");
@@ -1852,7 +1852,7 @@ async fn encoded_item_id_path_segments_are_decoded() {
         Method::DELETE,
         &format!("/v1/conversations/{conv_id}/items/item%20with%20space"),
     );
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from delete encoded item");
@@ -1866,7 +1866,7 @@ fn encoded_conversation_path(conv_id: &str) -> String {
 
 async fn reject_path(filter: &dyn HttpFilter, method: Method, path: &str) -> praxis_filter::Rejection {
     let req = make_request(method, path);
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject for {path}, got {action:?}");
@@ -1885,7 +1885,7 @@ async fn encoded_conversation_id_path_segments_are_decoded() {
     assert_eq!(rejection_body(&rejection)["id"], conv_id);
 
     let req = make_request(Method::POST, &path);
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&serde_json::json!({"metadata": {"k": "2"}})).unwrap(),
@@ -1899,7 +1899,7 @@ async fn encoded_conversation_id_path_segments_are_decoded() {
 
     let items_path = format!("{path}/items");
     let req = make_request(Method::POST, &items_path);
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&serde_json::json!({
@@ -1947,7 +1947,7 @@ async fn item_list_after_cursor_decodes_query_plus_as_space() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -1969,7 +1969,7 @@ async fn item_list_after_cursor_decodes_query_plus_as_space() {
         Method::GET,
         &format!("/v1/conversations/{conv_id}/items?order=asc&after=item+with+space"),
     );
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from list after cursor");
@@ -1987,7 +1987,7 @@ async fn create_items_rejects_duplicate_ids_in_request() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2011,7 +2011,7 @@ async fn create_items_rejects_existing_id_without_overwrite() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let body_json = serde_json::json!({
         "items": [
@@ -2026,7 +2026,7 @@ async fn create_items_rejects_existing_id_without_overwrite() {
     assert_eq!(rejection.status, 200, "initial item create should succeed");
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let body_json = serde_json::json!({
         "items": [
@@ -2041,7 +2041,7 @@ async fn create_items_rejects_existing_id_without_overwrite() {
     assert_eq!(rejection.status, 400, "existing item ID should return 400");
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items/item_existing"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from get existing item");
@@ -2063,7 +2063,7 @@ async fn delete_nonexistent_conversation_returns_404() {
     let filter = build_test_filter();
 
     let req = make_request(Method::DELETE, "/v1/conversations/conv_nonexistent");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -2077,7 +2077,7 @@ async fn update_nonexistent_conversation_returns_404() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations/conv_nonexistent");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"metadata": {"v": "1"}});
@@ -2100,7 +2100,7 @@ async fn create_items_missing_items_field_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from_static(b"{}"));
@@ -2123,7 +2123,7 @@ async fn create_items_non_array_items_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"items": "not-an-array"});
@@ -2142,7 +2142,7 @@ async fn create_items_null_items_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from_static(br#"{"items":null}"#));
@@ -2160,7 +2160,7 @@ async fn create_items_too_many_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let items: Vec<Value> = (0..21)
@@ -2186,7 +2186,7 @@ async fn create_items_for_nonexistent_conversation_returns_404() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations/conv_nonexistent/items");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2209,7 +2209,7 @@ async fn create_items_with_invalid_json_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from_static(b"{not-json"));
@@ -2227,7 +2227,7 @@ async fn create_items_with_non_object_json_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from_static(b"[]"));
@@ -2249,7 +2249,7 @@ async fn create_items_with_non_object_item_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"items": ["not-an-object"]});
@@ -2273,7 +2273,7 @@ async fn create_items_with_empty_item_id_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2294,7 +2294,7 @@ async fn create_items_with_numeric_item_id_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2320,7 +2320,7 @@ async fn create_items_with_null_item_id_generates_id() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2351,7 +2351,7 @@ async fn create_items_with_empty_role_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2377,7 +2377,7 @@ async fn create_items_with_non_string_role_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2403,7 +2403,7 @@ async fn create_items_with_missing_role_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2429,7 +2429,7 @@ async fn create_items_with_missing_content_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2455,7 +2455,7 @@ async fn create_items_with_non_string_non_array_content_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2481,7 +2481,7 @@ async fn create_items_with_array_content_passthrough() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let content = serde_json::json!([{"type": "input_text", "text": "array content"}]);
@@ -2508,7 +2508,7 @@ async fn non_message_item_type_skips_normalization() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2530,7 +2530,7 @@ async fn conformance_conversations_item_requests_reject_unknown_and_malformed_co
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let mut body = Some(Bytes::from_static(br#"{"items":[{"type":"future_item"}]}"#));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -2546,7 +2546,7 @@ async fn conformance_conversations_item_requests_reject_unknown_and_malformed_co
         ("malformed", serde_json::json!({"type": "function_call"})),
     ] {
         let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}/items"));
-        let mut ctx = make_filter_context(&req);
+        let mut ctx = make_owned_filter_context(&req);
         drop(filter.on_request(&mut ctx).await.unwrap());
 
         let mut body = Some(Bytes::from(
@@ -2576,7 +2576,7 @@ async fn delete_item_from_nonexistent_conversation_returns_404() {
     let filter = build_test_filter();
 
     let req = make_request(Method::DELETE, "/v1/conversations/conv_nonexistent/items/item_1");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -2597,7 +2597,7 @@ async fn delete_nonexistent_item_returns_404() {
         Method::DELETE,
         &format!("/v1/conversations/{conv_id}/items/item_nonexistent"),
     );
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -2611,7 +2611,7 @@ async fn get_item_from_nonexistent_conversation_returns_404() {
     let filter = build_test_filter();
 
     let req = make_request(Method::GET, "/v1/conversations/conv_nonexistent/items/item_1");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -2632,7 +2632,7 @@ async fn list_items_for_nonexistent_conversation_returns_404() {
     let filter = build_test_filter();
 
     let req = make_request(Method::GET, "/v1/conversations/conv_nonexistent/items");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -2649,7 +2649,7 @@ async fn list_items_with_limit_parameter() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2671,7 +2671,7 @@ async fn list_items_with_limit_parameter() {
         Method::GET,
         &format!("/v1/conversations/{conv_id}/items?limit=2&order=asc"),
     );
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -2690,7 +2690,7 @@ async fn list_items_desc_order() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -2708,7 +2708,7 @@ async fn list_items_desc_order() {
     let conv_id = resp["id"].as_str().unwrap();
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items?order=desc"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -2729,7 +2729,7 @@ async fn create_conversation_with_non_array_items_returns_400() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"items": "not-an-array"});
@@ -2747,7 +2747,7 @@ async fn create_conversation_with_null_items_defaults_to_empty() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from_static(br#"{"items":null}"#));
@@ -2765,7 +2765,7 @@ async fn create_conversation_with_too_many_initial_items_returns_400() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let items: Vec<Value> = (0..21)
@@ -2786,7 +2786,7 @@ async fn create_conversation_with_null_metadata_defaults_to_empty() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"metadata": null});
@@ -2810,7 +2810,7 @@ async fn create_conversation_with_empty_object_defaults_to_empty() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from_static(b"{}"));
@@ -2833,7 +2833,7 @@ async fn create_conversation_without_body_defaults_to_empty() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = None;
@@ -2856,7 +2856,7 @@ async fn update_conversation_with_invalid_metadata_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({"v": "1"})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"metadata": "not-an-object"});
@@ -2879,7 +2879,7 @@ async fn update_conversation_with_null_metadata_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({"v": "1"})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"metadata": null});
@@ -2902,7 +2902,7 @@ async fn update_conversation_with_invalid_json_returns_400() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({"v": "1"})).await;
 
     let req = make_request(Method::POST, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from_static(b"{bad-json"));
@@ -2923,8 +2923,8 @@ async fn cross_tenant_get_conversation_returns_404() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("responses.tenant_id", "tenant-a");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(crate::test_utils::test_owner("tenant-a"));
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"metadata": {"owner": "a"}});
@@ -2937,8 +2937,8 @@ async fn cross_tenant_get_conversation_returns_404() {
     let conv_id = resp["id"].as_str().unwrap();
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("responses.tenant_id", "tenant-b");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(crate::test_utils::test_owner("tenant-b"));
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -2955,8 +2955,8 @@ async fn cross_tenant_delete_conversation_returns_404() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("responses.tenant_id", "tenant-a");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(crate::test_utils::test_owner("tenant-a"));
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"metadata": {"owner": "a"}});
@@ -2969,8 +2969,8 @@ async fn cross_tenant_delete_conversation_returns_404() {
     let conv_id = resp["id"].as_str().unwrap();
 
     let req = make_request(Method::DELETE, &format!("/v1/conversations/{conv_id}"));
-    let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("responses.tenant_id", "tenant-b");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(crate::test_utils::test_owner("tenant-b"));
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -2987,8 +2987,8 @@ async fn cross_tenant_delete_item_returns_404() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("responses.tenant_id", "tenant-a");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(crate::test_utils::test_owner("tenant-a"));
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -3006,8 +3006,8 @@ async fn cross_tenant_delete_item_returns_404() {
         Method::DELETE,
         &format!("/v1/conversations/{conv_id}/items/item_secret"),
     );
-    let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("responses.tenant_id", "tenant-b");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.insert(crate::test_utils::test_owner("tenant-b"));
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -3025,7 +3025,7 @@ async fn delete_item_returns_updated_conversation() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({
@@ -3043,7 +3043,7 @@ async fn delete_item_returns_updated_conversation() {
     let conv_id = resp["id"].as_str().unwrap();
 
     let req = make_request(Method::DELETE, &format!("/v1/conversations/{conv_id}/items/item_gone"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -3058,7 +3058,7 @@ async fn delete_item_returns_updated_conversation() {
     assert_eq!(resp["id"], conv_id);
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from list items");
@@ -3090,7 +3090,7 @@ async fn trailing_slash_on_conversation_path_is_normalized() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({"k": "v"})).await;
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -3107,7 +3107,7 @@ async fn trailing_slash_on_items_path_is_normalized() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items/"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
 
     let FilterAction::Reject(rejection) = action else {
@@ -3128,7 +3128,7 @@ async fn body_hook_with_end_of_stream_false_continues() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from_static(b"partial"));
@@ -3144,7 +3144,7 @@ async fn body_hook_for_get_request_continues() {
     let filter = build_test_filter();
 
     let req = make_request(Method::GET, "/v1/conversations/conv_1");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
 
     let mut body = Some(Bytes::from_static(b"ignored"));
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -3163,7 +3163,7 @@ async fn put_on_conversation_path_continues() {
     let filter = build_test_filter();
 
     let req = make_request(Method::PUT, "/v1/conversations/conv_1");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue), "PUT should not be handled");
 }
@@ -3173,7 +3173,7 @@ async fn patch_on_conversation_path_continues() {
     let filter = build_test_filter();
 
     let req = make_request(Method::PATCH, "/v1/conversations/conv_1");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue), "PATCH should not be handled");
 }
@@ -3191,7 +3191,7 @@ fn set_append_back_metadata(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
 async fn on_response_not_armed_without_conversation_metadata() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
 
     let action = filter.on_response(&mut ctx).await.unwrap();
@@ -3202,7 +3202,7 @@ async fn on_response_not_armed_without_conversation_metadata() {
 async fn on_response_not_armed_when_streaming() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
     ctx.set_metadata("openai_responses_format.stream", "true");
@@ -3215,7 +3215,7 @@ async fn on_response_not_armed_when_streaming() {
 async fn on_response_not_armed_when_background() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
     ctx.set_metadata("openai_responses_format.background", "true");
@@ -3228,7 +3228,7 @@ async fn on_response_not_armed_when_background() {
 async fn on_response_not_armed_for_non_2xx() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
 
@@ -3244,7 +3244,7 @@ async fn on_response_not_armed_for_non_2xx() {
 async fn on_response_not_armed_for_non_json_content_type() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
 
@@ -3261,7 +3261,7 @@ async fn on_response_not_armed_for_non_json_content_type() {
 async fn on_response_armed_for_json_200() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     ctx.response_body_mode = filter.response_body_mode();
     set_append_back_metadata(&mut ctx);
@@ -3283,7 +3283,7 @@ async fn on_response_armed_for_json_200() {
 async fn on_response_unarmed_keeps_stream_body_mode() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     ctx.response_body_mode = filter.response_body_mode();
 
@@ -3303,7 +3303,7 @@ async fn on_response_unarmed_keeps_stream_body_mode() {
 async fn on_response_body_releases_when_not_armed() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
 
     drop(filter.on_response(&mut ctx).await.unwrap());
@@ -3317,7 +3317,7 @@ async fn on_response_body_releases_when_not_armed() {
 async fn on_response_body_continues_when_not_end_of_stream() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
 
@@ -3336,7 +3336,7 @@ async fn on_response_body_continues_when_not_end_of_stream() {
 async fn on_response_body_skips_non_completed_status() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
 
@@ -3359,7 +3359,7 @@ async fn on_response_body_skips_non_completed_status() {
 async fn on_response_body_skips_invalid_json() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
 
@@ -3378,7 +3378,7 @@ async fn on_response_body_skips_invalid_json() {
 async fn on_response_body_skips_empty_items() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
 
@@ -3401,7 +3401,7 @@ async fn on_response_body_skips_empty_items() {
 async fn on_response_body_skips_empty_body() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
 
@@ -3422,7 +3422,7 @@ async fn on_response_body_appends_completed_response() {
     let conv_id = create_test_conversation(filter.as_ref(), serde_json::json!({})).await;
 
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     ctx.set_metadata("openai_responses_format.has_conversation", "true");
     ctx.set_metadata("responses.conversation_id", &conv_id);
@@ -3461,7 +3461,7 @@ async fn on_response_body_appends_completed_response() {
     );
 
     let req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items?order=asc"));
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject from list items after append-back");
@@ -3497,7 +3497,7 @@ async fn on_response_body_surfaces_item_insert_failure() {
     });
 
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
     ctx.extensions.insert(ResponsesState {
@@ -3538,7 +3538,7 @@ async fn on_response_body_surfaces_transaction_failure() {
     });
 
     let req = make_request(Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(0);
     set_append_back_metadata(&mut ctx);
     ctx.extensions.insert(ResponsesState {
@@ -3656,7 +3656,7 @@ async fn update_conversation_metadata_does_not_clobber_concurrent_append() {
     inner
         .upsert_conversation(&ConversationRecord {
             conversation_id: "conv_race".to_owned(),
-            tenant_id: DEFAULT_TENANT_ID.to_owned(),
+            owner: crate::test_utils::test_owner(DEFAULT_TENANT_ID),
             created_at: 1000,
             metadata: serde_json::json!({"topic": "demo"}),
             messages: Value::Array(Vec::new()),
@@ -3665,7 +3665,7 @@ async fn update_conversation_metadata_does_not_clobber_concurrent_append() {
         .expect("seed conversation should succeed");
     inner
         .create_items_and_sync_messages(
-            DEFAULT_TENANT_ID,
+            &crate::test_utils::test_owner(DEFAULT_TENANT_ID),
             "conv_race",
             std::slice::from_ref(&race_item("item_a")),
         )
@@ -3689,7 +3689,7 @@ async fn update_conversation_metadata_does_not_clobber_concurrent_append() {
     let filter = OpenaiConversationsFilter::with_store_for_test(cfg, Arc::new(wrapper));
 
     let req = make_request(Method::POST, "/v1/conversations/conv_race");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&serde_json::json!({"metadata": {"topic": "updated"}})).unwrap(),
@@ -3707,10 +3707,14 @@ async fn update_conversation_metadata_does_not_clobber_concurrent_append() {
 
     // The concurrent append must survive: the cache retains BOTH items and the
     // metadata is persisted. The old whole-record round-trip clobbered item_b.
-    let fetched = ConversationItemStore::get_conversation(inner.as_ref(), DEFAULT_TENANT_ID, "conv_race")
-        .await
-        .expect("get should succeed")
-        .expect("conversation should exist");
+    let fetched = ConversationItemStore::get_conversation(
+        inner.as_ref(),
+        &crate::test_utils::test_owner(DEFAULT_TENANT_ID),
+        "conv_race",
+    )
+    .await
+    .expect("get should succeed")
+    .expect("conversation should exist");
     assert_eq!(
         cache_item_ids(&fetched.messages),
         vec!["item_a".to_owned(), "item_b".to_owned()],
@@ -3778,7 +3782,7 @@ fn build_test_filter() -> Box<dyn HttpFilter> {
 
 async fn create_test_conversation(filter: &dyn HttpFilter, metadata: Value) -> String {
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"metadata": metadata});
@@ -3811,7 +3815,7 @@ fn build_failing_filter(store: FailingItemStore) -> OpenaiConversationsFilter {
 async fn run_metadata_update(filter: &OpenaiConversationsFilter, conversation_id: &str) -> praxis_filter::Rejection {
     let path = format!("/v1/conversations/{conversation_id}");
     let req = make_request(Method::POST, &path);
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
     let mut body = Some(Bytes::from(
         serde_json::to_vec(&serde_json::json!({"metadata": {"topic": "updated"}})).unwrap(),
@@ -3863,6 +3867,10 @@ struct FailingItemStore {
 }
 
 #[async_trait::async_trait]
+#[expect(
+    clippy::renamed_function_params,
+    reason = "test double still uses the former tenant-oriented names"
+)]
 impl ConversationItemStore for FailingItemStore {
     async fn upsert_conversation(&self, _record: &ConversationRecord) -> Result<(), StoreError> {
         Ok(())
@@ -3870,7 +3878,7 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn update_conversation_messages(
         &self,
-        _tenant_id: &str,
+        _tenant_id: &crate::StateOwner,
         _conversation_id: &str,
         _messages: &Value,
     ) -> Result<bool, StoreError> {
@@ -3882,7 +3890,7 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn update_conversation_metadata(
         &self,
-        _tenant_id: &str,
+        _tenant_id: &crate::StateOwner,
         _conversation_id: &str,
         _metadata: &Value,
     ) -> Result<bool, StoreError> {
@@ -3895,7 +3903,7 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn compare_and_swap_conversation_messages(
         &self,
-        _tenant_id: &str,
+        _tenant_id: &crate::StateOwner,
         _conversation_id: &str,
         _expected_messages: &Value,
         _messages: &Value,
@@ -3905,7 +3913,7 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn get_conversation(
         &self,
-        tenant_id: &str,
+        tenant_id: &crate::StateOwner,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError> {
         if !self.conversation_exists {
@@ -3913,14 +3921,18 @@ impl ConversationItemStore for FailingItemStore {
         }
         Ok(Some(ConversationRecord {
             conversation_id: conversation_id.to_owned(),
-            tenant_id: tenant_id.to_owned(),
+            owner: tenant_id.clone(),
             created_at: 1000,
             metadata: serde_json::json!({"topic": "demo"}),
             messages: Value::Array(Vec::new()),
         }))
     }
 
-    async fn delete_conversation(&self, _tenant_id: &str, _conversation_id: &str) -> Result<bool, StoreError> {
+    async fn delete_conversation(
+        &self,
+        _tenant_id: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<bool, StoreError> {
         Ok(false)
     }
 
@@ -3933,7 +3945,7 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn create_items_and_sync_messages(
         &self,
-        _tenant_id: &str,
+        _tenant_id: &crate::StateOwner,
         _conversation_id: &str,
         _items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
@@ -3951,7 +3963,7 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn list_conversation_items(
         &self,
-        _tenant_id: &str,
+        _tenant_id: &crate::StateOwner,
         _conversation_id: &str,
         _after_item_id: Option<&str>,
         _limit: u32,
@@ -3962,7 +3974,7 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn get_existing_conversation_item_ids(
         &self,
-        _tenant_id: &str,
+        _tenant_id: &crate::StateOwner,
         _conversation_id: &str,
         _item_ids: &[&str],
     ) -> Result<Vec<String>, StoreError> {
@@ -3971,7 +3983,7 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn get_conversation_item(
         &self,
-        _tenant_id: &str,
+        _tenant_id: &crate::StateOwner,
         _conversation_id: &str,
         _item_id: &str,
     ) -> Result<Option<ConversationItemRecord>, StoreError> {
@@ -3980,7 +3992,7 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn delete_conversation_item(
         &self,
-        _tenant_id: &str,
+        _tenant_id: &crate::StateOwner,
         _conversation_id: &str,
         _item_id: &str,
     ) -> Result<bool, StoreError> {
@@ -3989,20 +4001,24 @@ impl ConversationItemStore for FailingItemStore {
 
     async fn conversation_item_position(
         &self,
-        _tenant_id: &str,
+        _tenant_id: &crate::StateOwner,
         _conversation_id: &str,
         _item_id: &str,
     ) -> Result<Option<i64>, StoreError> {
         Ok(None)
     }
 
-    async fn max_item_position(&self, _tenant_id: &str, _conversation_id: &str) -> Result<i64, StoreError> {
+    async fn max_item_position(
+        &self,
+        _tenant_id: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<i64, StoreError> {
         Ok(0)
     }
 
     async fn delete_item_and_sync_messages(
         &self,
-        _tenant_id: &str,
+        _tenant_id: &crate::StateOwner,
         _conversation_id: &str,
         _item_id: &str,
     ) -> Result<bool, StoreError> {
@@ -4037,6 +4053,10 @@ impl AppendDuringUpdateStore {
 }
 
 #[async_trait::async_trait]
+#[expect(
+    clippy::renamed_function_params,
+    reason = "test double still uses the former tenant-oriented names"
+)]
 impl ConversationItemStore for AppendDuringUpdateStore {
     async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
         self.inner.upsert_conversation(record).await
@@ -4044,7 +4064,7 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 
     async fn update_conversation_messages(
         &self,
-        tenant_id: &str,
+        tenant_id: &crate::StateOwner,
         conversation_id: &str,
         messages: &Value,
     ) -> Result<bool, StoreError> {
@@ -4055,7 +4075,7 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 
     async fn update_conversation_metadata(
         &self,
-        tenant_id: &str,
+        tenant_id: &crate::StateOwner,
         conversation_id: &str,
         metadata: &Value,
     ) -> Result<bool, StoreError> {
@@ -4066,7 +4086,7 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 
     async fn compare_and_swap_conversation_messages(
         &self,
-        tenant_id: &str,
+        tenant_id: &crate::StateOwner,
         conversation_id: &str,
         expected_messages: &Value,
         messages: &Value,
@@ -4078,7 +4098,7 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 
     async fn get_conversation(
         &self,
-        tenant_id: &str,
+        tenant_id: &crate::StateOwner,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError> {
         // Read the current snapshot the handler will act on, then let a concurrent
@@ -4092,7 +4112,11 @@ impl ConversationItemStore for AppendDuringUpdateStore {
         Ok(snapshot)
     }
 
-    async fn delete_conversation(&self, tenant_id: &str, conversation_id: &str) -> Result<bool, StoreError> {
+    async fn delete_conversation(
+        &self,
+        tenant_id: &crate::StateOwner,
+        conversation_id: &str,
+    ) -> Result<bool, StoreError> {
         self.inner.delete_conversation(tenant_id, conversation_id).await
     }
 
@@ -4102,7 +4126,7 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 
     async fn create_items_and_sync_messages(
         &self,
-        tenant_id: &str,
+        tenant_id: &crate::StateOwner,
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
@@ -4113,7 +4137,7 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 
     async fn list_conversation_items(
         &self,
-        tenant_id: &str,
+        tenant_id: &crate::StateOwner,
         conversation_id: &str,
         after_item_id: Option<&str>,
         limit: u32,
@@ -4126,7 +4150,7 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 
     async fn get_existing_conversation_item_ids(
         &self,
-        tenant_id: &str,
+        tenant_id: &crate::StateOwner,
         conversation_id: &str,
         item_ids: &[&str],
     ) -> Result<Vec<String>, StoreError> {
@@ -4137,7 +4161,7 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 
     async fn get_conversation_item(
         &self,
-        tenant_id: &str,
+        tenant_id: &crate::StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<Option<ConversationItemRecord>, StoreError> {
@@ -4148,7 +4172,7 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 
     async fn delete_conversation_item(
         &self,
-        tenant_id: &str,
+        tenant_id: &crate::StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError> {
@@ -4159,7 +4183,7 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 
     async fn conversation_item_position(
         &self,
-        tenant_id: &str,
+        tenant_id: &crate::StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<Option<i64>, StoreError> {
@@ -4168,13 +4192,13 @@ impl ConversationItemStore for AppendDuringUpdateStore {
             .await
     }
 
-    async fn max_item_position(&self, tenant_id: &str, conversation_id: &str) -> Result<i64, StoreError> {
+    async fn max_item_position(&self, tenant_id: &crate::StateOwner, conversation_id: &str) -> Result<i64, StoreError> {
         self.inner.max_item_position(tenant_id, conversation_id).await
     }
 
     async fn delete_item_and_sync_messages(
         &self,
-        tenant_id: &str,
+        tenant_id: &crate::StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError> {
@@ -4188,7 +4212,7 @@ impl ConversationItemStore for AppendDuringUpdateStore {
 fn race_item(item_id: &str) -> ConversationItemRecord {
     ConversationItemRecord {
         item_id: item_id.to_owned(),
-        tenant_id: DEFAULT_TENANT_ID.to_owned(),
+        owner: crate::test_utils::test_owner(DEFAULT_TENANT_ID),
         conversation_id: "conv_race".to_owned(),
         item_data: serde_json::json!({
             "id": item_id,
@@ -4327,7 +4351,7 @@ fn insert_payload(payloads: &mut BTreeMap<OperationKey, Value>, spec: &Conversat
 
 async fn successful_post_json(filter: &dyn HttpFilter, path: &str, body_json: Value) -> Value {
     let req = make_request(Method::POST, path);
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
@@ -4341,7 +4365,7 @@ async fn successful_post_json(filter: &dyn HttpFilter, path: &str, body_json: Va
 
 async fn successful_request_json(filter: &dyn HttpFilter, method: Method, path: &str) -> Value {
     let req = make_request(method, path);
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected Reject, got {action:?}");
@@ -4625,7 +4649,7 @@ async fn create_conversation_response_field_order_matches_openai() {
     let filter = build_test_filter();
 
     let req = make_request(Method::POST, "/v1/conversations");
-    let mut ctx = make_filter_context(&req);
+    let mut ctx = make_owned_filter_context(&req);
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let body_json = serde_json::json!({"metadata": {"project": "test"}});

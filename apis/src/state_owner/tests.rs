@@ -28,7 +28,7 @@ fn filter() -> Box<dyn praxis_filter::HttpFilter> {
 #[test]
 fn filtered_subrequest_projection_copies_only_normalized_owner() {
     let mut parent = RequestExtensions::new();
-    parent.insert(StateOwner::from_trusted_parts("tenant-a".into(), "issuer-a".into(), "alice".into()).unwrap());
+    parent.insert(StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap());
     let mut child = RequestExtensions::new();
 
     assert!(project_state_owner(&parent, &mut child));
@@ -106,6 +106,14 @@ fn rejection_code(action: FilterAction) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap()
         .to_owned()
+}
+
+#[test]
+fn validates_all_owner_components() {
+    assert!(StateOwner::from_trusted_parts("tenant", "issuer", "subject").is_ok());
+    assert!(StateOwner::from_trusted_parts("", "issuer", "subject").is_err());
+    assert!(StateOwner::from_trusted_parts("tenant", "issuer\n", "subject").is_err());
+    assert!(StateOwner::from_trusted_parts("tenant", "issuer", "x".repeat(1_025)).is_err());
 }
 
 #[tokio::test]
@@ -624,7 +632,7 @@ async fn installed_context_is_not_reparsed_or_replaced() {
     let request = request_with("malformed");
     let mut ctx = make_filter_context(&request);
     ctx.extensions
-        .insert(StateOwner::from_trusted_parts("tenant-a".into(), "issuer-a".into(), "alice".into()).unwrap());
+        .insert(StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap());
 
     let action = filter().on_request(&mut ctx).await.unwrap();
 

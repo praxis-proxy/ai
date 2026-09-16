@@ -28,7 +28,7 @@ pub mod subrequest;
 pub mod token_cache;
 pub(crate) mod web_search;
 
-pub use state_owner::{StateOwner, StateOwnerFilter, project_state_owner};
+pub use state_owner::{StateOwner, StateOwnerError, StateOwnerFilter, project_state_owner};
 pub use state_owner_headers::StateOwnerHeadersFilter;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
@@ -131,6 +131,19 @@ pub(crate) mod test_utils {
             headers: HeaderMap::new(),
             status: http::StatusCode::OK,
         }
+    }
+
+    /// Build a stable owner for tests that previously supplied only a tenant.
+    pub(crate) fn test_owner(tenant_id: &str) -> crate::StateOwner {
+        crate::StateOwner::from_trusted_parts(tenant_id, "test-issuer", "test-subject")
+            .expect("test owner should be valid")
+    }
+
+    /// Build a filter context with the default trusted test owner installed.
+    pub(crate) fn make_owned_filter_context(req: &Request) -> HttpFilterContext<'_> {
+        let mut ctx = make_filter_context(req);
+        ctx.extensions.insert(test_owner("default"));
+        ctx
     }
 
     /// Build a [`FilterRegistry`] with core builtins plus AI API filters

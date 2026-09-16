@@ -42,12 +42,12 @@ use serde_json::Value;
 use tracing::{debug, trace, warn};
 
 use super::{
-    DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, append_stored_input_items,
-    canonical_openresponses_replay_item, error::responses_error_rejection, extract_conversation_id,
-    state::ResponsesState,
+    DEFAULT_STORE_NAME, append_stored_input_items, canonical_openresponses_replay_item,
+    error::responses_error_rejection, extract_conversation_id, state::ResponsesState,
 };
 use crate::{
     is_event_stream_content_type,
+    state_owner::{StateOwner, require_state_owner},
     store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry},
 };
 
@@ -126,11 +126,11 @@ impl RehydrateFilter {
         parsed_body: Value,
         prev_id: String,
     ) -> Result<FilterAction, FilterError> {
-        let tenant_id = ctx
-            .get_metadata(TENANT_METADATA_KEY)
-            .unwrap_or(DEFAULT_TENANT_ID)
-            .to_owned();
-        let record = match fetch_and_validate_previous(ctx, &tenant_id, &prev_id).await {
+        let owner = match require_state_owner(ctx) {
+            Ok(owner) => owner.clone(),
+            Err(action) => return Ok(action),
+        };
+        let record = match fetch_and_validate_previous(ctx, &owner, &prev_id).await {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
@@ -155,11 +155,11 @@ impl RehydrateFilter {
             Ok(id) => id,
             Err(action) => return Ok(action),
         };
-        let tenant_id = ctx
-            .get_metadata(TENANT_METADATA_KEY)
-            .unwrap_or(DEFAULT_TENANT_ID)
-            .to_owned();
-        let record = match fetch_conversation(ctx, &tenant_id, &conv_id).await {
+        let owner = match require_state_owner(ctx) {
+            Ok(owner) => owner.clone(),
+            Err(action) => return Ok(action),
+        };
+        let record = match fetch_conversation(ctx, &owner, &conv_id).await {
             Ok(r) => r,
             Err(action) => return Ok(action),
         };
@@ -1122,10 +1122,10 @@ fn stored_messages_for_conversation(record: ConversationRecord) -> Vec<Value> {
 /// Fetch the previous response and validate its status in one step.
 async fn fetch_and_validate_previous(
     ctx: &HttpFilterContext<'_>,
-    tenant_id: &str,
+    owner: &StateOwner,
     prev_id: &str,
 ) -> Result<ResponseRecord, FilterAction> {
-    let record = fetch_previous_response(ctx, tenant_id, prev_id).await?;
+    let record = fetch_previous_response(ctx, owner, prev_id).await?;
     validate_response_status(&record)?;
     Ok(record)
 }
@@ -1151,7 +1151,7 @@ fn resolve_conversation_id(body: &Value) -> Result<String, FilterAction> {
 /// Fetch a conversation record from the store.
 async fn fetch_conversation(
     ctx: &HttpFilterContext<'_>,
-    tenant_id: &str,
+    owner: &StateOwner,
     conv_id: &str,
 ) -> Result<ConversationRecord, FilterAction> {
     let registry = ctx.extensions.get::<ResponseStoreRegistry>().ok_or_else(|| {
@@ -1159,12 +1159,12 @@ async fn fetch_conversation(
         reject_server_error("response store is not available")
     })?;
 
-    let store = registry.get(DEFAULT_STORE_NAME).ok_or_else(|| {
+    let store = registry.get_scoped(DEFAULT_STORE_NAME, owner).ok_or_else(|| {
         warn!("rehydrate: default response store not registered");
         reject_server_error("response store is not available")
     })?;
 
-    let record = store.get_conversation(tenant_id, conv_id).await.map_err(|e| {
+    let record = store.get_conversation(conv_id).await.map_err(|e| {
         warn!(error = %e, "rehydrate: failed to fetch conversation");
         reject_server_error("failed to fetch conversation")
     })?;
@@ -1250,7 +1250,7 @@ fn parse_body_and_extract_id(bytes: &[u8]) -> Result<(Value, Option<String>), Fi
 /// Fetch the previous response record from the store.
 async fn fetch_previous_response(
     ctx: &HttpFilterContext<'_>,
-    tenant_id: &str,
+    owner: &StateOwner,
     prev_id: &str,
 ) -> Result<ResponseRecord, FilterAction> {
     let registry = ctx.extensions.get::<ResponseStoreRegistry>().ok_or_else(|| {
@@ -1258,12 +1258,12 @@ async fn fetch_previous_response(
         reject_server_error("response store is not available")
     })?;
 
-    let store = registry.get(DEFAULT_STORE_NAME).ok_or_else(|| {
+    let store = registry.get_scoped(DEFAULT_STORE_NAME, owner).ok_or_else(|| {
         warn!("rehydrate: default response store not registered");
         reject_server_error("response store is not available")
     })?;
 
-    let record = store.get_response(tenant_id, prev_id).await.map_err(|e| {
+    let record = store.get_response(prev_id).await.map_err(|e| {
         warn!(error = %e, "rehydrate: failed to fetch previous response");
         reject_server_error("failed to fetch previous response")
     })?;

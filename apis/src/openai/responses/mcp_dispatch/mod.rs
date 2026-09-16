@@ -67,7 +67,7 @@ use self::{
     config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config},
 };
 use super::{
-    DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY,
+    DEFAULT_STORE_NAME,
     error::responses_error_rejection,
     mcp_classify::{McpDisposition, classify_mcp},
     openai_mcp_tool_resolve::{
@@ -80,7 +80,8 @@ use crate::{
     callout_headers::effective_body_callout_headers,
     json_body::serialized_len,
     mcp_client,
-    store::{PendingApprovalRecord, ResponseStore, ResponseStoreRegistry},
+    state_owner::StateOwner,
+    store::{OwnerScopedResponseStore, PendingApprovalRecord, ResponseStoreRegistry},
 };
 
 /// Step-local metadata carrying the configured response fan-out cap to the owner.
@@ -347,21 +348,20 @@ impl McpDispatchFilter {
         // persisted into the trace on a prior turn) has no matching pending row
         // and is therefore invisible here, and an approval issued by a different
         // response is out of scope under this previous_response_id.
-        let tenant_id = ctx
-            .get_metadata(TENANT_METADATA_KEY)
-            .unwrap_or(DEFAULT_TENANT_ID)
-            .to_owned();
+        let owner = ctx.extensions.get::<StateOwner>().cloned().ok_or_else(|| {
+            responses_error_rejection(401, "missing_state_owner", "trusted state owner assertion is required")
+        })?;
         let store = ctx
             .extensions
             .get::<ResponseStoreRegistry>()
-            .and_then(|registry| registry.get(DEFAULT_STORE_NAME))
+            .and_then(|registry| registry.get_scoped(DEFAULT_STORE_NAME, &owner))
             .ok_or_else(|| {
                 warn!("mcp_dispatch: response store unavailable while resuming approvals");
                 responses_error_rejection(500, "server_error", "response store is not available")
             })?;
         let approval_ids: Vec<&str> = inputs.iter().map(|i| i.approval_id.as_str()).collect();
         let pending_records = store
-            .get_pending_approvals(&tenant_id, &previous_response_id, &approval_ids)
+            .get_pending_approvals(&previous_response_id, &approval_ids)
             .await
             .map_err(|e| {
                 warn!(error = %e, "mcp_dispatch: failed to load pending approvals");
@@ -403,14 +403,7 @@ impl McpDispatchFilter {
         // approval was already consumed (replay) rather than never issued.
         let consumed_at = i64::try_from(ctx.time_source.now().as_millis()).unwrap_or(i64::MAX);
         let claim_ids: Vec<&str> = resolved.iter().map(|d| d.approval_id.as_str()).collect();
-        consume_batch(
-            store.as_ref(),
-            &tenant_id,
-            &previous_response_id,
-            &claim_ids,
-            consumed_at,
-        )
-        .await?;
+        consume_batch(&store, &previous_response_id, &claim_ids, consumed_at).await?;
 
         // Phase 4: apply the decisions to request-scoped state.
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -433,16 +426,12 @@ impl McpDispatchFilter {
 /// rejects the whole batch without consuming any id, so a corrected retry can
 /// still resume the legitimately approved calls.
 async fn consume_batch(
-    store: &dyn ResponseStore,
-    tenant_id: &str,
+    store: &OwnerScopedResponseStore,
     response_id: &str,
     approval_ids: &[&str],
     consumed_at: i64,
 ) -> Result<(), Rejection> {
-    match store
-        .consume_approvals(tenant_id, response_id, approval_ids, consumed_at)
-        .await
-    {
+    match store.consume_approvals(response_id, approval_ids, consumed_at).await {
         Ok(None) => Ok(()),
         Ok(Some(index)) => {
             let approval_id = approval_ids.get(index).copied().unwrap_or_default();

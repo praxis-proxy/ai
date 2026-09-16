@@ -23,6 +23,7 @@ use super::{
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
 };
+use crate::StateOwner;
 
 // -----------------------------------------------------------------------------
 // SslMode
@@ -161,44 +162,50 @@ impl PostgresResponseStore {
 
         let sql = format!(
             "INSERT INTO {} \
-             (conversation_id, tenant_id, created_at, metadata, messages) \
-             VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (conversation_id, tenant_id) DO UPDATE SET \
+             (conversation_id, tenant_id, owner_issuer, owner_subject, created_at, metadata, messages) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (conversation_id) DO UPDATE SET \
              messages = EXCLUDED.messages, \
-             metadata = EXCLUDED.metadata",
-            self.tables.conversations
+             metadata = EXCLUDED.metadata \
+             WHERE {}.tenant_id = EXCLUDED.tenant_id \
+               AND {}.owner_issuer = EXCLUDED.owner_issuer \
+               AND {}.owner_subject = EXCLUDED.owner_subject",
+            self.tables.conversations, self.tables.conversations, self.tables.conversations, self.tables.conversations
         );
 
-        sqlx::query(AssertSqlSafe(sql.as_str()))
+        let result = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(&record.conversation_id)
-            .bind(&record.tenant_id)
+            .bind(record.owner.tenant_id())
+            .bind(record.owner.issuer())
+            .bind(record.owner.subject())
             .bind(record.created_at)
             .bind(&metadata)
             .bind(&messages)
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        Ok(())
+        require_owner_preserving_write(result.rows_affected(), "conversation")
     }
 
     /// Retrieve a conversation row shared by both store traits.
     async fn get_conversation_record(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError> {
         let sql = format!(
-            "SELECT conversation_id, tenant_id, created_at, \
+            "SELECT conversation_id, tenant_id, owner_issuer, owner_subject, created_at, \
                     metadata, messages \
              FROM {} \
-             WHERE conversation_id = $1 AND tenant_id = $2",
+             WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
             self.tables.conversations
         );
 
         let row = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(conversation_id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -207,15 +214,17 @@ impl PostgresResponseStore {
     }
 
     /// Delete only a conversation row.
-    async fn delete_conversation_record(&self, tenant_id: &str, conversation_id: &str) -> Result<bool, StoreError> {
+    async fn delete_conversation_record(&self, owner: &StateOwner, conversation_id: &str) -> Result<bool, StoreError> {
         let sql = format!(
-            "DELETE FROM {} WHERE conversation_id = $1 AND tenant_id = $2",
+            "DELETE FROM {} WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
             self.tables.conversations
         );
 
         let result = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(conversation_id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -486,6 +495,10 @@ async fn check_schema_version(pool: &sqlx::PgPool, tables: &TableNames) -> Resul
 
 #[async_trait]
 impl ResponseStore for PostgresResponseStore {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "owner-preserving SQL upsert keeps all bindings explicit"
+    )]
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
         let response_object =
             serde_json::to_string(&record.response_object).map_err(|e| StoreError::Serialization(e.to_string()))?;
@@ -494,20 +507,25 @@ impl ResponseStore for PostgresResponseStore {
 
         let sql = format!(
             "INSERT INTO {} \
-             (id, tenant_id, created_at, model, response_object, input, messages) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (tenant_id, id) DO UPDATE SET \
+             (id, tenant_id, owner_issuer, owner_subject, created_at, model, response_object, input, messages) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (id) DO UPDATE SET \
              created_at = EXCLUDED.created_at, \
              model = EXCLUDED.model, \
              response_object = EXCLUDED.response_object, \
              input = EXCLUDED.input, \
-             messages = EXCLUDED.messages",
-            self.tables.responses
+             messages = EXCLUDED.messages \
+             WHERE {}.tenant_id = EXCLUDED.tenant_id \
+               AND {}.owner_issuer = EXCLUDED.owner_issuer \
+               AND {}.owner_subject = EXCLUDED.owner_subject",
+            self.tables.responses, self.tables.responses, self.tables.responses, self.tables.responses
         );
 
-        sqlx::query(AssertSqlSafe(sql.as_str()))
+        let result = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(&record.id)
-            .bind(&record.tenant_id)
+            .bind(record.owner.tenant_id())
+            .bind(record.owner.issuer())
+            .bind(record.owner.subject())
             .bind(record.created_at)
             .bind(&record.model)
             .bind(&response_object)
@@ -516,22 +534,23 @@ impl ResponseStore for PostgresResponseStore {
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
-
-        Ok(())
+        require_owner_preserving_write(result.rows_affected(), "response")
     }
 
-    async fn get_response(&self, tenant_id: &str, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
+    async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
         let sql = format!(
-            "SELECT id, tenant_id, created_at, model, \
+            "SELECT id, tenant_id, owner_issuer, owner_subject, created_at, model, \
                     response_object, input, messages \
              FROM {} \
-             WHERE id = $1 AND tenant_id = $2",
+             WHERE id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
             self.tables.responses
         );
 
         let row = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -539,13 +558,16 @@ impl ResponseStore for PostgresResponseStore {
         row.map(|r| row_to_response_record(&r)).transpose()
     }
 
-    async fn delete_response(&self, tenant_id: &str, id: &str) -> Result<bool, StoreError> {
+    async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError> {
         // Delete the response and any pending approvals it issued in one atomic
         // transaction: a deleted response must leave no consumable approval
         // behind and retain no sensitive tool arguments.
-        let delete_response_sql = format!("DELETE FROM {} WHERE id = $1 AND tenant_id = $2", self.tables.responses);
+        let delete_response_sql = format!(
+            "DELETE FROM {} WHERE id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
+            self.tables.responses
+        );
         let delete_approvals_sql = format!(
-            "DELETE FROM {} WHERE tenant_id = $1 AND response_id = $2",
+            "DELETE FROM {} WHERE response_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4",
             pending_approvals_table(&self.tables.responses)
         );
         let mut tx = Box::pin(self.pool.begin())
@@ -553,13 +575,17 @@ impl ResponseStore for PostgresResponseStore {
             .map_err(|e| StoreError::Database(e.to_string()))?;
         let result = sqlx::query(AssertSqlSafe(delete_response_sql.as_str()))
             .bind(id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .execute(&mut *tx)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
         sqlx::query(AssertSqlSafe(delete_approvals_sql.as_str()))
-            .bind(tenant_id)
             .bind(id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .execute(&mut *tx)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -569,16 +595,16 @@ impl ResponseStore for PostgresResponseStore {
 
     async fn get_conversation(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError> {
-        self.get_conversation_record(tenant_id, conversation_id).await
+        self.get_conversation_record(owner, conversation_id).await
     }
 
     #[expect(clippy::too_many_lines, reason = "sequential per-record bind within a transaction")]
     async fn record_pending_approvals(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         response_id: &str,
         records: &[PendingApprovalRecord],
         created_at: i64,
@@ -592,10 +618,13 @@ impl ResponseStore for PostgresResponseStore {
         // no-op rather than a `consumed_at` reset that would enable replay.
         let sql = format!(
             "INSERT INTO {table} \
-             (tenant_id, response_id, approval_id, server_label, tool_name, arguments, target_fingerprint, \
-             created_at, consumed_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             ON CONFLICT (tenant_id, response_id, approval_id) DO NOTHING"
+             (tenant_id, owner_issuer, owner_subject, response_id, approval_id, server_label, tool_name, arguments, \
+             target_fingerprint, created_at, consumed_at) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 \
+             WHERE EXISTS (SELECT 1 FROM {} WHERE id = $12 AND tenant_id = $13 \
+               AND owner_issuer = $14 AND owner_subject = $15) \
+             ON CONFLICT (response_id, approval_id) DO NOTHING",
+            self.tables.responses
         );
 
         let mut tx = Box::pin(self.pool.begin())
@@ -604,7 +633,9 @@ impl ResponseStore for PostgresResponseStore {
 
         for record in records {
             sqlx::query(AssertSqlSafe(sql.as_str()))
-                .bind(tenant_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
                 .bind(response_id)
                 .bind(&record.approval_id)
                 .bind(&record.server_label)
@@ -613,6 +644,10 @@ impl ResponseStore for PostgresResponseStore {
                 .bind(&record.target_fingerprint)
                 .bind(created_at)
                 .bind(Option::<i64>::None)
+                .bind(response_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -640,25 +675,31 @@ impl ResponseStore for PostgresResponseStore {
 
         let upsert_sql = format!(
             "INSERT INTO {} \
-             (id, tenant_id, created_at, model, response_object, input, messages) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (tenant_id, id) DO UPDATE SET \
+             (id, tenant_id, owner_issuer, owner_subject, created_at, model, response_object, input, messages) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (id) DO UPDATE SET \
              created_at = EXCLUDED.created_at, \
              model = EXCLUDED.model, \
              response_object = EXCLUDED.response_object, \
              input = EXCLUDED.input, \
-             messages = EXCLUDED.messages",
-            self.tables.responses
+             messages = EXCLUDED.messages \
+             WHERE {}.tenant_id = EXCLUDED.tenant_id \
+               AND {}.owner_issuer = EXCLUDED.owner_issuer \
+               AND {}.owner_subject = EXCLUDED.owner_subject",
+            self.tables.responses, self.tables.responses, self.tables.responses, self.tables.responses
         );
         let approvals_table = pending_approvals_table(&self.tables.responses);
         // Insert-if-absent so a re-emit never resets an already-consumed row back
         // to outstanding (which would enable replay).
         let approval_sql = format!(
             "INSERT INTO {approvals_table} \
-             (tenant_id, response_id, approval_id, server_label, tool_name, arguments, target_fingerprint, \
-             created_at, consumed_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             ON CONFLICT (tenant_id, response_id, approval_id) DO NOTHING"
+             (tenant_id, owner_issuer, owner_subject, response_id, approval_id, server_label, tool_name, arguments, \
+             target_fingerprint, created_at, consumed_at) \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11 \
+             WHERE EXISTS (SELECT 1 FROM {} WHERE id = $12 AND tenant_id = $13 \
+               AND owner_issuer = $14 AND owner_subject = $15) \
+             ON CONFLICT (response_id, approval_id) DO NOTHING",
+            self.tables.responses
         );
 
         // One transaction so the response and its pending approvals commit
@@ -669,9 +710,11 @@ impl ResponseStore for PostgresResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        sqlx::query(AssertSqlSafe(upsert_sql.as_str()))
+        let result = sqlx::query(AssertSqlSafe(upsert_sql.as_str()))
             .bind(&record.id)
-            .bind(&record.tenant_id)
+            .bind(record.owner.tenant_id())
+            .bind(record.owner.issuer())
+            .bind(record.owner.subject())
             .bind(record.created_at)
             .bind(&record.model)
             .bind(&response_object)
@@ -680,10 +723,13 @@ impl ResponseStore for PostgresResponseStore {
             .execute(&mut *tx)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
+        require_owner_preserving_write(result.rows_affected(), "response")?;
 
         for approval in pending_approvals {
             sqlx::query(AssertSqlSafe(approval_sql.as_str()))
-                .bind(&record.tenant_id)
+                .bind(record.owner.tenant_id())
+                .bind(record.owner.issuer())
+                .bind(record.owner.subject())
                 .bind(&record.id)
                 .bind(&approval.approval_id)
                 .bind(&approval.server_label)
@@ -692,6 +738,10 @@ impl ResponseStore for PostgresResponseStore {
                 .bind(&approval.target_fingerprint)
                 .bind(record.created_at)
                 .bind(Option::<i64>::None)
+                .bind(&record.id)
+                .bind(record.owner.tenant_id())
+                .bind(record.owner.issuer())
+                .bind(record.owner.subject())
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -703,7 +753,7 @@ impl ResponseStore for PostgresResponseStore {
 
     async fn get_pending_approvals(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         response_id: &str,
         approval_ids: &[&str],
     ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
@@ -711,19 +761,22 @@ impl ResponseStore for PostgresResponseStore {
             return Ok(Vec::new());
         }
         let table = pending_approvals_table(&self.tables.responses);
-        // $1 is the tenant, $2 the issuing response; approval ids start at $3.
+        // Owner occupies $1-$3 and the issuing response is $4.
         let placeholders = (0..approval_ids.len())
-            .map(|i| format!("${}", i + 3))
+            .map(|i| format!("${}", i + 5))
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
             "SELECT approval_id, server_label, tool_name, arguments, target_fingerprint \
              FROM {table} \
-             WHERE tenant_id = $1 AND response_id = $2 AND approval_id IN ({placeholders})"
+             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 \
+               AND response_id = $4 AND approval_id IN ({placeholders})"
         );
 
         let mut query = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .bind(response_id);
         for approval_id in approval_ids {
             query = query.bind(*approval_id);
@@ -737,7 +790,7 @@ impl ResponseStore for PostgresResponseStore {
 
     async fn consume_approvals(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         response_id: &str,
         approval_ids: &[&str],
         consumed_at: i64,
@@ -752,7 +805,8 @@ impl ResponseStore for PostgresResponseStore {
         // than never issued.
         let sql = format!(
             "UPDATE {table} SET consumed_at = $1 \
-             WHERE tenant_id = $2 AND response_id = $3 AND approval_id = $4 AND consumed_at IS NULL"
+             WHERE tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
+               AND response_id = $5 AND approval_id = $6 AND consumed_at IS NULL"
         );
 
         let mut tx = Box::pin(self.pool.begin())
@@ -762,7 +816,9 @@ impl ResponseStore for PostgresResponseStore {
         for (index, approval_id) in approval_ids.iter().enumerate() {
             let result = sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(consumed_at)
-                .bind(tenant_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
                 .bind(response_id)
                 .bind(*approval_id)
                 .execute(&mut *tx)
@@ -793,20 +849,23 @@ impl ConversationItemStore for PostgresResponseStore {
 
     async fn update_conversation_messages(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         messages: &serde_json::Value,
     ) -> Result<bool, StoreError> {
         let messages = serde_json::to_string(messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
         let sql = format!(
-            "UPDATE {} SET messages = $1 WHERE conversation_id = $2 AND tenant_id = $3",
+            "UPDATE {} SET messages = $1 WHERE conversation_id = $2 AND tenant_id = $3 \
+             AND owner_issuer = $4 AND owner_subject = $5",
             self.tables.conversations
         );
 
         let result = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(&messages)
             .bind(conversation_id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -816,20 +875,23 @@ impl ConversationItemStore for PostgresResponseStore {
 
     async fn update_conversation_metadata(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         metadata: &serde_json::Value,
     ) -> Result<bool, StoreError> {
         let metadata = serde_json::to_string(metadata).map_err(|e| StoreError::Serialization(e.to_string()))?;
         let sql = format!(
-            "UPDATE {} SET metadata = $1 WHERE conversation_id = $2 AND tenant_id = $3",
+            "UPDATE {} SET metadata = $1 WHERE conversation_id = $2 AND tenant_id = $3 \
+             AND owner_issuer = $4 AND owner_subject = $5",
             self.tables.conversations
         );
 
         let result = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(&metadata)
             .bind(conversation_id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .execute(&self.pool)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -839,7 +901,7 @@ impl ConversationItemStore for PostgresResponseStore {
 
     async fn compare_and_swap_conversation_messages(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         expected_messages: &serde_json::Value,
         messages: &serde_json::Value,
@@ -848,13 +910,16 @@ impl ConversationItemStore for PostgresResponseStore {
             serde_json::to_string(expected_messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
         let messages = serde_json::to_string(messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
         let sql = format!(
-            "UPDATE {} SET messages = $1 WHERE conversation_id = $2 AND tenant_id = $3 AND messages = $4",
+            "UPDATE {} SET messages = $1 WHERE conversation_id = $2 AND tenant_id = $3 \
+             AND owner_issuer = $4 AND owner_subject = $5 AND messages = $6",
             self.tables.conversations
         );
         let result = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(&messages)
             .bind(conversation_id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .bind(&expected)
             .execute(&self.pool)
             .await
@@ -864,14 +929,14 @@ impl ConversationItemStore for PostgresResponseStore {
 
     async fn get_conversation(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError> {
-        self.get_conversation_record(tenant_id, conversation_id).await
+        self.get_conversation_record(owner, conversation_id).await
     }
 
-    async fn delete_conversation(&self, tenant_id: &str, conversation_id: &str) -> Result<bool, StoreError> {
-        self.delete_conversation_record(tenant_id, conversation_id).await
+    async fn delete_conversation(&self, owner: &StateOwner, conversation_id: &str) -> Result<bool, StoreError> {
+        self.delete_conversation_record(owner, conversation_id).await
     }
 
     async fn create_conversation_items(&self, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
@@ -887,24 +952,34 @@ impl ConversationItemStore for PostgresResponseStore {
 
         let sql = format!(
             "INSERT INTO {table} \
-             (item_id, tenant_id, conversation_id, item_data, created_at, position) \
-             VALUES ($1, $2, $3, $4, $5, $6)"
+             (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
+             SELECT $1, tenant_id, owner_issuer, owner_subject, conversation_id, $2, $3, $4 \
+             FROM {} \
+             WHERE conversation_id = $5 AND tenant_id = $6 AND owner_issuer = $7 AND owner_subject = $8",
+            self.tables.conversations
         );
 
         for item in items {
             let item_data =
                 serde_json::to_string(&item.item_data).map_err(|e| StoreError::Serialization(e.to_string()))?;
 
-            sqlx::query(AssertSqlSafe(sql.as_str()))
+            let result = sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(&item.item_id)
-                .bind(&item.tenant_id)
-                .bind(&item.conversation_id)
                 .bind(&item_data)
                 .bind(item.created_at)
                 .bind(item.position)
+                .bind(&item.conversation_id)
+                .bind(item.owner.tenant_id())
+                .bind(item.owner.issuer())
+                .bind(item.owner.subject())
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StoreError::Database(e.to_string()))?;
+            if result.rows_affected() != 1 {
+                return Err(StoreError::Database(
+                    "conversation item owner does not match its parent".to_owned(),
+                ));
+            }
         }
 
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
@@ -913,7 +988,7 @@ impl ConversationItemStore for PostgresResponseStore {
 
     async fn list_conversation_items(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         after_item_id: Option<&str>,
         limit: u32,
@@ -929,23 +1004,22 @@ impl ConversationItemStore for PostgresResponseStore {
         let cursor_operator = if ascending { ">" } else { "<" };
 
         let rows = if let Some(item_id) = after_item_id {
-            let Some(position) = self
-                .conversation_item_position(tenant_id, conversation_id, item_id)
-                .await?
-            else {
+            let Some(position) = self.conversation_item_position(owner, conversation_id, item_id).await? else {
                 return Ok(Vec::new());
             };
             let sql = format!(
-                "SELECT item_id, tenant_id, conversation_id, item_data, created_at, position \
+                "SELECT item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position \
                  FROM {table} \
-                 WHERE tenant_id = $1 AND conversation_id = $2 \
-                   AND (position {cursor_operator} $3 \
-                        OR (position = $4 AND item_id {cursor_operator} $5)) \
+                 WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4 \
+                   AND (position {cursor_operator} $5 \
+                        OR (position = $6 AND item_id {cursor_operator} $7)) \
                  ORDER BY position {direction}, item_id {direction} \
-                 LIMIT $6"
+                 LIMIT $8"
             );
             sqlx::query(AssertSqlSafe(sql.as_str()))
-                .bind(tenant_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
                 .bind(conversation_id)
                 .bind(position)
                 .bind(position)
@@ -956,14 +1030,16 @@ impl ConversationItemStore for PostgresResponseStore {
                 .map_err(|e| StoreError::Database(e.to_string()))?
         } else {
             let sql = format!(
-                "SELECT item_id, tenant_id, conversation_id, item_data, created_at, position \
+                "SELECT item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position \
                  FROM {table} \
-                 WHERE tenant_id = $1 AND conversation_id = $2 \
+                 WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4 \
                  ORDER BY position {direction}, item_id {direction} \
-                 LIMIT $3"
+                 LIMIT $5"
             );
             sqlx::query(AssertSqlSafe(sql.as_str()))
-                .bind(tenant_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
                 .bind(conversation_id)
                 .bind(i64::from(limit))
                 .fetch_all(&self.pool)
@@ -976,7 +1052,7 @@ impl ConversationItemStore for PostgresResponseStore {
 
     async fn get_existing_conversation_item_ids(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         item_ids: &[&str],
     ) -> Result<Vec<String>, StoreError> {
@@ -992,12 +1068,15 @@ impl ConversationItemStore for PostgresResponseStore {
 
         let sql = format!(
             "SELECT item_id FROM {table} \
-             WHERE tenant_id = $1 AND conversation_id = $2 AND item_id = ANY($3)"
+             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 \
+               AND conversation_id = $4 AND item_id = ANY($5)"
         );
 
         let ids: Vec<&str> = item_ids.to_vec();
         sqlx::query_scalar::<_, String>(AssertSqlSafe(sql.as_str()))
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .bind(conversation_id)
             .bind(&ids)
             .fetch_all(&self.pool)
@@ -1007,7 +1086,7 @@ impl ConversationItemStore for PostgresResponseStore {
 
     async fn get_conversation_item(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<Option<ConversationItemRecord>, StoreError> {
@@ -1018,14 +1097,17 @@ impl ConversationItemStore for PostgresResponseStore {
             .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
 
         let sql = format!(
-            "SELECT item_id, tenant_id, conversation_id, item_data, created_at, position \
+            "SELECT item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position \
              FROM {table} \
-             WHERE item_id = $1 AND tenant_id = $2 AND conversation_id = $3"
+             WHERE item_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
+               AND conversation_id = $5"
         );
 
         let row = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(item_id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .bind(conversation_id)
             .fetch_optional(&self.pool)
             .await
@@ -1036,7 +1118,7 @@ impl ConversationItemStore for PostgresResponseStore {
 
     async fn delete_conversation_item(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError> {
@@ -1046,11 +1128,16 @@ impl ConversationItemStore for PostgresResponseStore {
             .as_deref()
             .ok_or_else(|| StoreError::Unavailable("items table not configured".to_owned()))?;
 
-        let sql = format!("DELETE FROM {table} WHERE item_id = $1 AND tenant_id = $2 AND conversation_id = $3");
+        let sql = format!(
+            "DELETE FROM {table} WHERE item_id = $1 AND tenant_id = $2 AND owner_issuer = $3 \
+             AND owner_subject = $4 AND conversation_id = $5"
+        );
 
         let result = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(item_id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .bind(conversation_id)
             .execute(&self.pool)
             .await
@@ -1061,7 +1148,7 @@ impl ConversationItemStore for PostgresResponseStore {
 
     async fn conversation_item_position(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<Option<i64>, StoreError> {
@@ -1073,12 +1160,15 @@ impl ConversationItemStore for PostgresResponseStore {
 
         let sql = format!(
             "SELECT position FROM {table} \
-             WHERE item_id = $1 AND tenant_id = $2 AND conversation_id = $3"
+             WHERE item_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
+               AND conversation_id = $5"
         );
 
         let row = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(item_id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .bind(conversation_id)
             .fetch_optional(&self.pool)
             .await
@@ -1088,7 +1178,7 @@ impl ConversationItemStore for PostgresResponseStore {
             .transpose()
     }
 
-    async fn max_item_position(&self, tenant_id: &str, conversation_id: &str) -> Result<i64, StoreError> {
+    async fn max_item_position(&self, owner: &StateOwner, conversation_id: &str) -> Result<i64, StoreError> {
         let table = self
             .tables
             .items
@@ -1098,11 +1188,13 @@ impl ConversationItemStore for PostgresResponseStore {
         let sql = format!(
             "SELECT COALESCE(MAX(position), 0) AS max_pos \
              FROM {table} \
-             WHERE tenant_id = $1 AND conversation_id = $2"
+             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4"
         );
 
         let row = sqlx::query(AssertSqlSafe(sql.as_str()))
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .bind(conversation_id)
             .fetch_one(&self.pool)
             .await
@@ -1111,15 +1203,20 @@ impl ConversationItemStore for PostgresResponseStore {
         row.try_get("max_pos").map_err(|e| StoreError::Database(e.to_string()))
     }
 
+    #[expect(
+        clippy::large_stack_frames,
+        reason = "sqlx transaction state is boxed and remains just above the lint threshold"
+    )]
     async fn create_items_and_sync_messages(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
         if items.is_empty() {
             return Ok(());
         }
+        require_matching_item_scope(owner, conversation_id, items)?;
 
         let items_table = self
             .tables
@@ -1134,12 +1231,14 @@ impl ConversationItemStore for PostgresResponseStore {
 
         let lock_sql = format!(
             "SELECT 1 FROM {conv_table} \
-             WHERE conversation_id = $1 AND tenant_id = $2 \
+             WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
              FOR UPDATE"
         );
         sqlx::query(AssertSqlSafe(lock_sql.as_str()))
             .bind(conversation_id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -1147,10 +1246,12 @@ impl ConversationItemStore for PostgresResponseStore {
         let max_sql = format!(
             "SELECT COALESCE(MAX(position), 0) AS max_pos \
              FROM {items_table} \
-             WHERE tenant_id = $1 AND conversation_id = $2"
+             WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4"
         );
         let max_row = sqlx::query(AssertSqlSafe(max_sql.as_str()))
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .bind(conversation_id)
             .fetch_one(&mut *tx)
             .await
@@ -1161,8 +1262,8 @@ impl ConversationItemStore for PostgresResponseStore {
 
         let insert_sql = format!(
             "INSERT INTO {items_table} \
-             (item_id, tenant_id, conversation_id, item_data, created_at, position) \
-             VALUES ($1, $2, $3, $4, $5, $6)"
+             (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
         );
         for (i, item) in items.iter().enumerate() {
             let offset = i64::try_from(i).unwrap_or(i64::MAX);
@@ -1172,7 +1273,9 @@ impl ConversationItemStore for PostgresResponseStore {
 
             sqlx::query(AssertSqlSafe(insert_sql.as_str()))
                 .bind(&item.item_id)
-                .bind(tenant_id)
+                .bind(owner.tenant_id())
+                .bind(owner.issuer())
+                .bind(owner.subject())
                 .bind(conversation_id)
                 .bind(&item_data)
                 .bind(item.created_at)
@@ -1182,7 +1285,7 @@ impl ConversationItemStore for PostgresResponseStore {
                 .map_err(|e| StoreError::Database(e.to_string()))?;
         }
 
-        pg_rebuild_messages(&mut tx, items_table, conv_table, tenant_id, conversation_id).await?;
+        pg_rebuild_messages(&mut tx, items_table, conv_table, owner, conversation_id).await?;
 
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(())
@@ -1190,7 +1293,7 @@ impl ConversationItemStore for PostgresResponseStore {
 
     async fn delete_item_and_sync_messages(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError> {
@@ -1207,23 +1310,28 @@ impl ConversationItemStore for PostgresResponseStore {
 
         let lock_sql = format!(
             "SELECT 1 FROM {conv_table} \
-             WHERE conversation_id = $1 AND tenant_id = $2 \
+             WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
              FOR UPDATE"
         );
         sqlx::query(AssertSqlSafe(lock_sql.as_str()))
             .bind(conversation_id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
         let delete_sql = format!(
             "DELETE FROM {items_table} \
-             WHERE item_id = $1 AND tenant_id = $2 AND conversation_id = $3"
+             WHERE item_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
+               AND conversation_id = $5"
         );
         let result = sqlx::query(AssertSqlSafe(delete_sql.as_str()))
             .bind(item_id)
-            .bind(tenant_id)
+            .bind(owner.tenant_id())
+            .bind(owner.issuer())
+            .bind(owner.subject())
             .bind(conversation_id)
             .execute(&mut *tx)
             .await
@@ -1234,7 +1342,7 @@ impl ConversationItemStore for PostgresResponseStore {
             return Ok(false);
         }
 
-        pg_rebuild_messages(&mut tx, items_table, conv_table, tenant_id, conversation_id).await?;
+        pg_rebuild_messages(&mut tx, items_table, conv_table, owner, conversation_id).await?;
 
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(true)
@@ -1257,16 +1365,18 @@ async fn pg_rebuild_messages(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     items_table: &str,
     conv_table: &str,
-    tenant_id: &str,
+    owner: &StateOwner,
     conversation_id: &str,
 ) -> Result<(), StoreError> {
     let select_sql = format!(
         "SELECT item_data FROM {items_table} \
-         WHERE tenant_id = $1 AND conversation_id = $2 \
+         WHERE tenant_id = $1 AND owner_issuer = $2 AND owner_subject = $3 AND conversation_id = $4 \
          ORDER BY position ASC, item_id ASC"
     );
     let rows = sqlx::query(AssertSqlSafe(select_sql.as_str()))
-        .bind(tenant_id)
+        .bind(owner.tenant_id())
+        .bind(owner.issuer())
+        .bind(owner.subject())
         .bind(conversation_id)
         .fetch_all(&mut **tx)
         .await
@@ -1287,12 +1397,14 @@ async fn pg_rebuild_messages(
 
     let update_sql = format!(
         "UPDATE {conv_table} SET messages = $1 \
-         WHERE conversation_id = $2 AND tenant_id = $3"
+         WHERE conversation_id = $2 AND tenant_id = $3 AND owner_issuer = $4 AND owner_subject = $5"
     );
     let updated = sqlx::query(AssertSqlSafe(update_sql.as_str()))
         .bind(&messages_json)
         .bind(conversation_id)
-        .bind(tenant_id)
+        .bind(owner.tenant_id())
+        .bind(owner.issuer())
+        .bind(owner.subject())
         .execute(&mut **tx)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -1309,6 +1421,34 @@ async fn pg_rebuild_messages(
 // -----------------------------------------------------------------------------
 // Row Conversion
 // -----------------------------------------------------------------------------
+
+/// Turn an owner-filtered upsert no-op into a bounded, identity-free error.
+fn require_owner_preserving_write(rows_affected: u64, resource: &str) -> Result<(), StoreError> {
+    if rows_affected == 1 {
+        Ok(())
+    } else {
+        tracing::warn!(resource, "resource id is already owned by another principal");
+        Err(StoreError::Database(format!("{resource} id collision")))
+    }
+}
+
+/// Require every transactional item to match its authorized parent scope.
+fn require_matching_item_scope(
+    owner: &StateOwner,
+    conversation_id: &str,
+    items: &[ConversationItemRecord],
+) -> Result<(), StoreError> {
+    if items
+        .iter()
+        .all(|item| &item.owner == owner && item.conversation_id == conversation_id)
+    {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidInput(
+            "conversation item scope does not match its parent".to_owned(),
+        ))
+    }
+}
 
 /// Convert a sqlx row to a [`PendingApprovalRecord`].
 fn row_to_pending_approval_record(row: &PgRow) -> Result<PendingApprovalRecord, StoreError> {
@@ -1343,9 +1483,7 @@ fn row_to_response_record(row: &PgRow) -> Result<ResponseRecord, StoreError> {
 
     Ok(ResponseRecord {
         id: row.try_get("id").map_err(|e| StoreError::Database(e.to_string()))?,
-        tenant_id: row
-            .try_get("tenant_id")
-            .map_err(|e| StoreError::Database(e.to_string()))?,
+        owner: row_to_owner(row)?,
         created_at: row
             .try_get("created_at")
             .map_err(|e| StoreError::Database(e.to_string()))?,
@@ -1367,9 +1505,7 @@ fn row_to_conversation_item_record(row: &PgRow) -> Result<ConversationItemRecord
         item_id: row
             .try_get("item_id")
             .map_err(|e| StoreError::Database(e.to_string()))?,
-        tenant_id: row
-            .try_get("tenant_id")
-            .map_err(|e| StoreError::Database(e.to_string()))?,
+        owner: row_to_owner(row)?,
         conversation_id: row
             .try_get("conversation_id")
             .map_err(|e| StoreError::Database(e.to_string()))?,
@@ -1396,15 +1532,28 @@ fn row_to_conversation_record(row: &PgRow) -> Result<ConversationRecord, StoreEr
         conversation_id: row
             .try_get("conversation_id")
             .map_err(|e| StoreError::Database(e.to_string()))?,
-        tenant_id: row
-            .try_get("tenant_id")
-            .map_err(|e| StoreError::Database(e.to_string()))?,
+        owner: row_to_owner(row)?,
         created_at: row
             .try_get("created_at")
             .map_err(|e| StoreError::Database(e.to_string()))?,
         metadata: serde_json::from_str(&metadata_json).map_err(|e| StoreError::Serialization(e.to_string()))?,
         messages: serde_json::from_str(&messages_json).map_err(|e| StoreError::Serialization(e.to_string()))?,
     })
+}
+
+/// Decode and validate the immutable owner columns in a persisted row.
+fn row_to_owner(row: &PgRow) -> Result<StateOwner, StoreError> {
+    let tenant_id: String = row
+        .try_get("tenant_id")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let issuer: String = row
+        .try_get("owner_issuer")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let subject: String = row
+        .try_get("owner_subject")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    StateOwner::from_trusted_parts(tenant_id, issuer, subject)
+        .map_err(|e| StoreError::Database(format!("invalid persisted owner: {e}")))
 }
 
 // -----------------------------------------------------------------------------
