@@ -62,6 +62,13 @@ COMPACT_CONFIG_PATH = "examples/configs/openai/responses/compact.yaml"
 WEB_SEARCH_CHAT_STREAMING_CONFIG_PATH = (
     "examples/configs/openai/responses/web-search-chat-completions.yaml"
 )
+# The full-flow example trusts these only after an authentication gateway has
+# overwritten them. This harness connects directly to Praxis, so it emulates
+# that boundary for clients using the full-flow configuration.
+TRUSTED_OWNER_HEADERS = {
+    "x-auth-tenant": "test-tenant",
+    "x-auth-user": "test-user",
+}
 
 TERMINAL_RESPONSE_EVENTS = {
     "response.cancelled",
@@ -1050,6 +1057,7 @@ def _witness_proxy_session(tmp_path_factory, request):
         client = OpenAI(
             base_url=f"http://127.0.0.1:{port}/v1",
             api_key="test",
+            default_headers=TRUSTED_OWNER_HEADERS,
             max_retries=0,
             timeout=300,
         )
@@ -1084,6 +1092,7 @@ def openai_client(praxis_proxy):
     return OpenAI(
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
         api_key="test",
+        default_headers=TRUSTED_OWNER_HEADERS,
         max_retries=0,
         timeout=300,
     )
@@ -1343,7 +1352,7 @@ class TestOpenAIResponsesVLLM:
         # application/json error envelope, not an SSE error event.
         raw = httpx.post(
             f"{str(openai_client.base_url).rstrip('/')}/responses",
-            headers={"Authorization": "Bearer test"},
+            headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
             json={
                 "model": VLLM_MODEL,
                 "input": "This request must not reach vLLM.",
@@ -1367,7 +1376,7 @@ class TestOpenAIResponsesVLLM:
     def test_malformed_request_has_sdk_compatible_error(self, openai_client):
         response = httpx.post(
             f"{str(openai_client.base_url).rstrip('/')}/responses",
-            headers={"Authorization": "Bearer test"},
+            headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
             json={},
             timeout=10,
         )
