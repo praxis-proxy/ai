@@ -151,8 +151,11 @@ struct CredentialEntryConfig {
     /// Injection header for `strategy: apikey`.  Defaults to `x-api-key`.
     /// Mutually exclusive with `strategy: bearer_token`, which always injects
     /// `Authorization`.  Reserved internal header prefixes (`x-praxis-`,
-    /// `x-mcp-`) and `authorization` itself are rejected: the Praxis upstream
-    /// boundary would strip the injected credential in flight.
+    /// `x-mcp-`), transport-controlled names (`host`, `content-length`,
+    /// hop-by-hop, `proxy-authorization`), and `authorization` itself are
+    /// rejected: the Praxis upstream boundary would strip the injected
+    /// credential in flight, and transport-controlled targets would corrupt
+    /// framing or leak the credential to an intermediary.
     #[serde(default)]
     header: Option<String>,
 
