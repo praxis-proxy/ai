@@ -40,7 +40,7 @@ pub use callout::HttpCalloutFilter;
 pub use gcp::GcpAdcFilter;
 pub use guardrails::AiGuardrailsFilter;
 pub use identity_guard::IdentityHeaderGuardFilter;
-pub use inference::ModelToHeaderFilter;
+pub use inference::{LlmisvcModelProviderResolverFilter, ModelToHeaderFilter};
 pub use metering::ExternalMeteringFilter;
 pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, register_ai_filters};

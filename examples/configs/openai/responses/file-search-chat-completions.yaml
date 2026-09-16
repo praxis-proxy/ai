@@ -3,23 +3,30 @@
 # Accepts finite OpenAI Responses requests with hosted file search while
 # targeting a backend that only implements /v1/chat/completions. The
 # compatibility filter privately exposes file_search to that backend as a
-# function tool, then the existing file-search callout executes the returned
-# function call and drives one more finite inference round.
+# function tool; openai_agentic_loop then normalizes the returned function
+# call into a file_search_call and records it as an assignment, and
+# openai_file_search_callout executes it before one more finite inference
+# round (#1046).
 #
-# Request order:
+# Request order (forward):
 #   1. openai_responses_format classifies the client request.
 #   2. openai_responses_validate creates canonical ResponsesState.
 #   3. iterative_request_router owns the finite model-search-model loop.
-#   4. openai_file_search_callout executes pending hosted search calls.
-#   5. responses_to_chat_completions synthesizes the private function tool.
-#   6. path_rewrite selects /v1/chat/completions explicitly.
+#   4. openai_file_search_callout dispatches the owner's pending hosted
+#      search assignments at request-body EOS on IRR re-entry.
+#   5. openai_agentic_loop prepares the next inference round.
+#   6. responses_to_chat_completions synthesizes the private function tool.
+#   7. path_rewrite selects /v1/chat/completions explicitly.
 #
 # Response filters run in reverse order. Each Chat Completions response is
-# therefore converted into a Responses resource before
-# openai_file_search_callout inspects it. A returned
-# function_call(name="file_search") is normalized to file_search_call,
-# executed through the vector store, and retained in the client-visible final
-# Responses output.
+# therefore converted into a Responses resource by
+# responses_to_chat_completions before openai_agentic_loop inspects it. A
+# returned function_call(name="file_search") is normalized to
+# file_search_call, recorded as an assignment, executed through the vector
+# store on the next re-entry, and retained in the client-visible final
+# Responses output. openai_agentic_loop is the sole loop owner and publishes
+# the single continuation signal (action=loop|done); openai_file_search_callout
+# is a request-phase dispatcher with no response phase.
 #
 # This pipeline is finite only. Streaming file-search orchestration is not
 # supported.
@@ -51,6 +58,11 @@ filter_chains:
         steps:
           - name: inference
             filters:
+              # Request-phase dispatcher: at request-body EOS on each IRR
+              # re-entry it executes the file_search_call items the loop owner
+              # assigned in the prior (translated) response, reconciling each in
+              # place inside ResponsesState.accumulated_output. It never parses
+              # the response body and never decides whether another round runs.
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:8001
                 allow_private_url: true
@@ -61,6 +73,15 @@ filter_chains:
                 on_failure: closed
                 forward_headers:
                   - authorization
+
+              # Sole loop owner: on the response phase it runs after
+              # responses_to_chat_completions has converted the Chat Completions
+              # reply into a Responses resource, so it parses the normalized
+              # file_search_call items, records assignments for the dispatcher,
+              # and publishes the single continuation signal (action=loop|done).
+              # max_infer_iters must stay below the IRR max_iterations cap.
+              - filter: openai_agentic_loop
+                max_infer_iters: 7
 
               - filter: responses_to_chat_completions
                 max_rewritten_body_bytes: 67108864
@@ -90,9 +111,9 @@ filter_chains:
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:
-              - filter: openai_file_search_callout
-                key: pending
-                value: "true"
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
                 next: inference
               - default: true
                 done: true

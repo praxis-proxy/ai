@@ -20,7 +20,7 @@ Reads `intelligent_route.credential.*` filter metadata written by the preceding 
 | `credentials[].strategy` | string | no | Credential strategy.  Currently only `"bearer_token"` is supported. |
 | `credentials[].value` | string | no | Inline token value.  Mutually exclusive with `env_var` and `file`. |
 | `credentials[].env_var` | string | no | Environment variable holding the token.  Mutually exclusive with `value` and `file`. |
-| `credentials[].file` | string | no | Path to a file containing the token, read once at filter construction. The file contents are trimmed of leading/trailing whitespace before use. The file must exist, be readable, and be non-empty; construction fails otherwise.  Use this source when the token is mounted from a Kubernetes Secret volume so that token bytes never appear in Praxis `ConfigMap`s. Mutually exclusive with `value` and `env_var`. |
+| `credentials[].file` | string | no | Path to a file containing the token. The initial value is validated at filter construction. A watcher revalidates the file after atomic projected-volume changes so Secret rotation does not require a restart. The file contents are trimmed of leading/trailing whitespace before use. The file must exist, be readable, and be non-empty; construction fails otherwise.  Use this source when the token is mounted from a Kubernetes Secret volume so that token bytes never appear in Praxis `ConfigMap`s. Mutually exclusive with `value` and `env_var`. |
 
 ## Example
 

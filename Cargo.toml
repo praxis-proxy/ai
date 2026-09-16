@@ -48,13 +48,13 @@ redis = { version = "1.5.0", default-features = false, features = ["tokio-comp"]
 regex = "1.13.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "stream"] }
 rmcp = { version = "3.1.4", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
-rustls = "0.23.43"
+rustls = "0.23.45"
 schemars = "1.2.2"
 rustls-pemfile = "2.2.0"
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json_canonicalizer = "0.3.2"
-serde_json = { version = "1.0.151", features = ["preserve_order"] }
+serde_json = { version = "1.0.151", features = ["preserve_order", "raw_value"] }
 serde_json_path = "0.7.2"
 sha2 = "0.11.0"
 syn = { version = "3.0.4", features = ["full", "extra-traits", "visit"] }

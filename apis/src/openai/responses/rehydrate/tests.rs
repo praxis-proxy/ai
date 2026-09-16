@@ -1723,6 +1723,15 @@ async fn restores_for_streaming_response() {
         matches!(action, FilterAction::Continue),
         "on_response should continue and arm the streaming restore"
     );
+    // #1150: an eligible stream also arms the persistence-source restore so
+    // `canonicalize_logical_response` repairs the stored `response_object` to match
+    // these rewritten wire frames.
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .is_some_and(|state| state.previous_response_id_stream_restore_armed),
+        "an eligible streaming restore must arm the store-source restore flag"
+    );
 
     let input = concat!(
         "event: response.created\n",
@@ -1946,6 +1955,15 @@ async fn does_not_restore_for_encoded_streaming_response() {
             .is_some_and(|resp| resp.headers.contains_key(http::header::CONTENT_ENCODING)),
         "Content-Encoding must be preserved so the client can still decode the stream"
     );
+    // #1150 review: an encoded stream is passed through verbatim, so the
+    // persistence-source restore must stay disarmed to match the untouched wire.
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .expect("state should be present")
+            .previous_response_id_stream_restore_armed,
+        "an encoded event stream must not arm the store-source restore flag"
+    );
 
     let original = concat!(
         "event: response.completed\n",
@@ -1982,6 +2000,16 @@ async fn does_not_restore_for_non_ok_streaming_response() {
     assert!(
         !ctx.response_headers_modified,
         "a non-200 event stream must not be rewritten"
+    );
+    // #1150 review: the wire is left untouched, so the persistence-source restore
+    // must stay disarmed or a later GET would report a previous_response_id the
+    // streamed response never carried.
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .expect("state should be present")
+            .previous_response_id_stream_restore_armed,
+        "a non-200 event stream must not arm the store-source restore flag"
     );
 
     let original = concat!(
@@ -2046,6 +2074,17 @@ async fn declines_streaming_response_with_body_validators() {
     assert!(
         !ctx.response_headers_modified,
         "a validator-bearing event stream must be declined as an untouched passthrough"
+    );
+    // #1150 review: because the wire frames are passed through with the backend's
+    // null previous_response_id intact, the persistence-source restore must stay
+    // disarmed so `canonicalize_logical_response` cannot rewrite the stored record
+    // into disagreeing with the streamed terminal.
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .expect("state should be present")
+            .previous_response_id_stream_restore_armed,
+        "a validator-bearing event stream must not arm the store-source restore flag"
     );
 
     let headers = &ctx

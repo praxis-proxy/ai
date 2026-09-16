@@ -19,7 +19,7 @@ use serde_json::json;
 
 use super::{
     ArmDecision, CompletionState, OpenaiStreamEventsFilter, StreamEventsState, accumulate_response_object,
-    arm_decision, encode_local_completion,
+    arm_decision, canonicalize_logical_response, encode_local_completion, encode_local_error,
 };
 use crate::{
     openai::{
@@ -31,6 +31,11 @@ use crate::{
 
 fn make_filter() -> OpenaiStreamEventsFilter {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+    OpenaiStreamEventsFilter::build(&yaml).unwrap()
+}
+
+fn make_filter_from(yaml: &str) -> OpenaiStreamEventsFilter {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
     OpenaiStreamEventsFilter::build(&yaml).unwrap()
 }
 
@@ -129,6 +134,42 @@ fn local_completion_encodes_canonical_logical_sse_terminal() {
 }
 
 #[test]
+fn reentry_arm_preserves_response_template_for_local_completion() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        logical_stream_response_id: Some("resp_logical".to_owned()),
+        accumulated_output: vec![json!({"type":"mcp_approval_request", "id":"approval_1"})],
+        response_object: json!({
+            "id":"resp_upstream", "object":"response", "status":"completed", "output":[]
+        }),
+        ..ResponsesState::default()
+    });
+
+    filter.arm(&mut ctx);
+
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .response_object
+            .is_null(),
+        "re-entry must invalidate the prior upstream terminal"
+    );
+    let encoded = encode_local_completion(&mut ctx).expect("the preserved response template should encode");
+    let encoded = std::str::from_utf8(&encoded).unwrap();
+    assert!(
+        encoded.contains("event: response.completed"),
+        "local completion must restore a terminal response after re-entry: {encoded}"
+    );
+    assert!(
+        encoded.contains("\"id\":\"approval_1\""),
+        "the restored terminal must contain accumulated output: {encoded}"
+    );
+}
+
+#[test]
 fn local_completion_preserves_deferred_done_sentinel() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -142,6 +183,220 @@ fn local_completion_preserves_deferred_done_sentinel() {
     assert!(
         encoded.ends_with(b"data: [DONE]\n\n"),
         "request-side completion must preserve the upstream sentinel"
+    );
+}
+
+#[test]
+fn local_completion_flushes_file_search_lifecycle_before_terminal() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        accumulated_output: vec![json!({
+            "type":"file_search_call",
+            "id":"fs_local",
+            "status":"completed",
+            "results":[]
+        })],
+        pending_local_tool_synthesis: vec![(0, SynthesisKind::Private)],
+        response_object: json!({
+            "id":"resp_local",
+            "object":"response",
+            "status":"completed",
+            "output":[]
+        }),
+        ..ResponsesState::default()
+    });
+
+    let encoded = encode_local_completion(&mut ctx).expect("local completion should encode");
+    let encoded = String::from_utf8(encoded.to_vec()).unwrap();
+
+    let done = encoded
+        .find("event: response.output_item.done")
+        .expect("the local file-search lifecycle should be flushed");
+    let terminal = encoded
+        .find("event: response.completed")
+        .expect("the response terminal should be emitted");
+    assert!(
+        done < terminal,
+        "the local tool lifecycle must precede response.completed"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .pending_local_tool_synthesis
+            .is_empty(),
+        "local completion must drain the synthesis queue exactly once"
+    );
+}
+
+#[test]
+fn local_error_flushes_file_search_lifecycle_before_terminal() {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        accumulated_output: vec![json!({
+            "type":"file_search_call",
+            "id":"fs_local",
+            "status":"completed",
+            "results":[]
+        })],
+        pending_local_tool_synthesis: vec![(0, SynthesisKind::Private)],
+        ..ResponsesState::default()
+    });
+
+    let encoded = encode_local_error(&mut ctx, "server_error", "dispatch failed").expect("local error should encode");
+    let encoded = String::from_utf8(encoded.to_vec()).unwrap();
+
+    let done = encoded
+        .find("event: response.output_item.done")
+        .expect("the local file-search lifecycle should be flushed");
+    let terminal = encoded
+        .find("event: error")
+        .expect("the error terminal should be emitted");
+    assert!(done < terminal, "the local tool lifecycle must precede the SSE error");
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .pending_local_tool_synthesis
+            .is_empty(),
+        "local error must drain the synthesis queue exactly once"
+    );
+}
+
+#[test]
+fn canonicalize_restores_previous_response_id_into_store_source() {
+    // #1150: a rehydrated streaming turn strips `previous_response_id` from the
+    // upstream request, so the backend echoes `null` in its terminal lifecycle
+    // response. The rehydrate filter repairs the client-visible SSE bytes, but
+    // the persistence source is this independent `response_object`. The
+    // canonicalization boundary must restore the caller's id here too, or a
+    // later GET returns different continuation metadata than the terminal frame.
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        history_rehydrated: true,
+        previous_response_id: Some("resp_prev".to_owned()),
+        response_object: json!({
+            "id": "resp_upstream",
+            "object": "response",
+            "status": "completed",
+            "previous_response_id": serde_json::Value::Null,
+            "output": []
+        }),
+        ..ResponsesState::default()
+    });
+
+    let encoded = encode_local_completion(&mut ctx).expect("response object should encode");
+    let encoded = String::from_utf8(encoded.to_vec()).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(
+        encoded
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("SSE data line should exist"),
+    )
+    .unwrap();
+
+    // The store source (`response_object`) is the record a later GET serves.
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.response_object["previous_response_id"], "resp_prev",
+        "the persisted store source must carry the caller's previous_response_id, \
+         not the backend's null"
+    );
+    assert_eq!(
+        payload["response"]["previous_response_id"], "resp_prev",
+        "the canonical logical terminal must agree with the wire terminal"
+    );
+}
+
+#[test]
+fn canonicalize_preserves_backend_previous_response_id_without_rehydration() {
+    // Without rehydration the proxy leaves `previous_response_id` on the upstream
+    // request, so the backend echoes the real value. The canonicalization
+    // boundary must not overwrite it with request state (which is `None` here),
+    // and it must never fabricate one when history was not rehydrated.
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        history_rehydrated: false,
+        previous_response_id: None,
+        response_object: json!({
+            "id": "resp_upstream",
+            "object": "response",
+            "status": "completed",
+            "previous_response_id": "resp_backend",
+            "output": []
+        }),
+        ..ResponsesState::default()
+    });
+
+    encode_local_completion(&mut ctx).expect("response object should encode");
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.response_object["previous_response_id"], "resp_backend",
+        "a non-rehydrated turn must keep the backend-echoed previous_response_id"
+    );
+}
+
+#[test]
+fn canonicalize_skips_previous_response_id_when_wire_rewrite_declined() {
+    // #1150 review: for a validator-bearing or non-200 event stream,
+    // `openai_responses_rehydrate` declines the wire rewrite and leaves the
+    // streamed terminal's `previous_response_id` as the backend-echoed `null`.
+    // Canonicalization is the persistence source and MUST make the same decision,
+    // or a later GET returns a `previous_response_id` the streamed response never
+    // carried. The upstream-streaming caller passes the filter's declined
+    // eligibility (`restore = false`) even on a rehydrated turn.
+    let mut state = ResponsesState {
+        history_rehydrated: true,
+        previous_response_id: Some("resp_prev".to_owned()),
+        response_object: json!({
+            "id": "resp_upstream",
+            "object": "response",
+            "status": "completed",
+            "previous_response_id": serde_json::Value::Null,
+            "output": []
+        }),
+        ..ResponsesState::default()
+    };
+
+    canonicalize_logical_response(&mut state, false);
+
+    assert_eq!(
+        state.response_object["previous_response_id"],
+        serde_json::Value::Null,
+        "a wire-ineligible stream must leave the stored previous_response_id untouched \
+         so the persisted record matches the un-rewritten terminal frame"
+    );
+}
+
+#[test]
+fn canonicalize_restores_previous_response_id_when_wire_rewrite_armed() {
+    // The counterpart to the declined case: when the wire rewrite is armed
+    // (`restore = true`), the persistence source restores the caller's id so a
+    // later GET agrees with the rewritten terminal frame.
+    let mut state = ResponsesState {
+        history_rehydrated: true,
+        previous_response_id: Some("resp_prev".to_owned()),
+        response_object: json!({
+            "id": "resp_upstream",
+            "object": "response",
+            "status": "completed",
+            "previous_response_id": serde_json::Value::Null,
+            "output": []
+        }),
+        ..ResponsesState::default()
+    };
+
+    canonicalize_logical_response(&mut state, true);
+
+    assert_eq!(
+        state.response_object["previous_response_id"], "resp_prev",
+        "an armed wire rewrite must restore the caller's previous_response_id into \
+         the persisted store source"
     );
 }
 
@@ -205,6 +460,49 @@ fn oversized_max_tool_call_argument_bytes_rejected() {
         result.is_err(),
         "max_tool_call_argument_bytes above 64 MiB should be rejected"
     );
+}
+
+#[test]
+fn oversized_max_events_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_events: 100000000").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "max_events above the ceiling should be rejected");
+}
+
+#[test]
+fn zero_max_accumulated_bytes_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_accumulated_bytes: 0").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "zero max_accumulated_bytes should be rejected");
+}
+
+#[test]
+fn oversized_max_accumulated_bytes_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_accumulated_bytes: 100000000").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "max_accumulated_bytes above 64 MiB should be rejected");
+}
+
+#[test]
+fn zero_max_output_items_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_output_items: 0").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "zero max_output_items should be rejected");
+}
+
+#[test]
+fn oversized_max_output_items_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_output_items: 100000000").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_err(), "max_output_items above the ceiling should be rejected");
+}
+
+#[test]
+fn accumulation_budget_fields_accepted() {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("max_accumulated_bytes: 1048576\nmax_output_items: 500").unwrap();
+    let result = OpenaiStreamEventsFilter::from_config(&yaml);
+    assert!(result.is_ok(), "in-range accumulation budget fields should be accepted");
 }
 
 #[tokio::test]
@@ -396,8 +694,11 @@ async fn logical_stream_suppresses_intermediate_terminal_and_normalizes_resumed_
     ));
     filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
     assert!(terminal.is_none(), "the per-turn terminal must be withheld");
+    // After the #1046 unification the loop owner (`openai_agentic_loop`) is the
+    // single continuation authority: it records `action="loop"` for the
+    // MCP-classified call before the intermediate terminal is suppressed.
     ctx.filter_results
-        .entry("openai_mcp_dispatch")
+        .entry("openai_agentic_loop")
         .or_default()
         .set("action", "loop")
         .unwrap();
@@ -412,7 +713,7 @@ async fn logical_stream_suppresses_intermediate_terminal_and_normalizes_resumed_
     state.iteration = 1;
     state.accumulated_output = vec![function_call, json!({"type": "mcp_call", "id": "mcp_1"})];
     mark_accumulated_output_executed(state);
-    ctx.filter_results.remove("openai_mcp_dispatch");
+    ctx.filter_results.remove("openai_agentic_loop");
     filter.arm(&mut ctx);
 
     let mut resumed_created = Some(make_sse_chunk(
@@ -757,6 +1058,638 @@ async fn logical_stream_suppresses_malformed_chunk_and_emits_terminal_error() {
     );
 }
 
+/// Arm a plain streaming logical-stream context (no hosted tools) for the given
+/// filter, then feed a `response.created` opener. Returns the armed context.
+fn arm_plain_stream(filter: &OpenaiStreamEventsFilter) -> praxis_filter::HttpFilterContext<'static> {
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    filter.arm(&mut ctx);
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_budget", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+    ctx
+}
+
+fn output_item_added_chunk(index: usize) -> Bytes {
+    make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "item": {"type": "message", "id": format!("item_{index}"), "content": []},
+            "output_index": index,
+        }),
+    )
+}
+
+#[tokio::test]
+async fn accumulation_byte_budget_fails_closed_across_chunks() {
+    // Each output_item.added frame is individually valid (well under
+    // max_buffer_bytes), but their aggregate crosses the byte ceiling: the
+    // stream must fail closed once the running total exceeds it (#556).
+    let filter = make_filter_from("max_accumulated_bytes: 400");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut failed = false;
+    for i in 0..50 {
+        let mut chunk = Some(output_item_added_chunk(i));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        if chunk.is_none() {
+            failed = true;
+            break;
+        }
+    }
+
+    assert!(
+        failed,
+        "aggregate output-item bytes must eventually fail the stream closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_parse_error"),
+        Some("true"),
+        "budget overflow must be recorded as a stream parse error"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "budget-overflow streams must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_item_count_budget_fails_closed() {
+    // The item-count dimension trips independently of the byte ceiling: with a
+    // generous byte cap, the third output item exceeds max_output_items: 2.
+    let filter = make_filter_from("max_output_items: 2\nmax_accumulated_bytes: 67108864");
+    let mut ctx = arm_plain_stream(&filter);
+
+    for i in 0..2 {
+        let mut chunk = Some(output_item_added_chunk(i));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(chunk.is_some(), "items within the count cap must pass through");
+    }
+
+    let mut overflow = Some(output_item_added_chunk(2));
+    filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
+    assert!(overflow.is_none(), "the item past the count cap must fail closed");
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "count-overflow streams must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_budget_poisons_subsequent_terminal() {
+    // Once tripped, the budget stays tripped: a later terminal event (which is
+    // itself not charged) must not resurrect the stream and commit a success,
+    // so the store never persists a poisoned response.
+    let filter = make_filter_from("max_output_items: 1\nmax_accumulated_bytes: 67108864");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut first = Some(output_item_added_chunk(0));
+    filter.on_response_body(&mut ctx, &mut first, false).unwrap();
+    assert!(first.is_some(), "the first item is within the count cap");
+
+    let mut second = Some(output_item_added_chunk(1));
+    filter.on_response_body(&mut ctx, &mut second, false).unwrap();
+    assert!(second.is_none(), "the second item overflows the count cap");
+
+    let mut completed = Some(make_sse_chunk(
+        "response.completed",
+        &json!({
+            "response": {"id": "resp_budget", "status": "completed", "output": []},
+            "sequence_number": 5
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut completed, false).unwrap();
+    assert!(
+        completed.is_none(),
+        "a terminal event after budget overflow must stay suppressed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a poisoned stream must not be persisted even after a terminal event"
+    );
+}
+
+/// A `response.web_search_call.in_progress` local-tool progress frame carrying a
+/// distinct `item_id`. Each grows `emitted_output_items` via
+/// `record_model_output_item`, so each must be charged against the byte budget.
+fn web_search_progress_chunk(index: usize) -> Bytes {
+    make_sse_chunk(
+        "response.web_search_call.in_progress",
+        &json!({"item_id": format!("ws_{index:06}"), "output_index": index}),
+    )
+}
+
+/// A `response.function_call_arguments.delta` frame for a distinct tool call. The
+/// per-call argument buffer is capped individually, but the number of distinct
+/// keys is bounded only by the aggregate byte budget.
+fn function_call_delta_chunk(index: usize) -> Bytes {
+    make_sse_chunk(
+        "response.function_call_arguments.delta",
+        &json!({"item_id": format!("fc_{index:06}"), "output_index": index, "delta": "{\"q\":\"x\"}"}),
+    )
+}
+
+/// A `response.output_item.done` frame that finalizes a fresh item (no prior
+/// `output_item.added`), exercising the append branch of `handle_output_item_done`.
+fn output_item_done_chunk(index: usize) -> Bytes {
+    make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "item": {"type": "message", "id": format!("done_{index}"), "content": []},
+            "output_index": index,
+        }),
+    )
+}
+
+#[tokio::test]
+async fn accumulation_charges_local_tool_progress_events() {
+    // Local-tool progress events (`response.web_search_call.*` etc.) grow the
+    // `emitted_output_items` map without pushing an output item, so before the
+    // charge they escaped the aggregate ceiling entirely. Each must now count
+    // against the byte budget so distinct `item_id`s cannot exhaust memory (#556).
+    let filter = make_filter_from("max_accumulated_bytes: 400");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut failed = false;
+    for i in 0..50 {
+        let mut chunk = Some(web_search_progress_chunk(i));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        if chunk.is_none() {
+            failed = true;
+            break;
+        }
+    }
+
+    assert!(
+        failed,
+        "aggregate local-tool progress bytes must eventually fail the stream closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_parse_error"),
+        Some("true"),
+        "budget overflow must be recorded as a stream parse error"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "budget-overflow streams must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_charges_tool_call_argument_bytes() {
+    // The tool-call argument accumulator — the dimension #556 named as the core
+    // vuln, whose key count was unbounded — is charged through the same byte
+    // budget: many distinct function-call deltas must fail the stream closed.
+    let filter = make_filter_from("max_accumulated_bytes: 400");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut failed = false;
+    for i in 0..50 {
+        let mut chunk = Some(function_call_delta_chunk(i));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        if chunk.is_none() {
+            failed = true;
+            break;
+        }
+    }
+
+    assert!(failed, "aggregate tool-call argument bytes must fail the stream closed");
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "tool-call budget overflow streams must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_count_charges_output_item_done() {
+    // `output_item.done` can append a brand-new item (no prior `added`), so it
+    // must bump the item counter too; a done-only stream cannot bypass the count
+    // cap. With a generous byte cap, the third done item trips max_output_items: 2.
+    let filter = make_filter_from("max_output_items: 2\nmax_accumulated_bytes: 67108864");
+    let mut ctx = arm_plain_stream(&filter);
+
+    for i in 0..2 {
+        let mut chunk = Some(output_item_done_chunk(i));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(chunk.is_some(), "done items within the count cap must pass through");
+    }
+
+    let mut overflow = Some(output_item_done_chunk(2));
+    filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
+    assert!(overflow.is_none(), "the done item past the count cap must fail closed");
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "count-overflow streams must not be persisted"
+    );
+}
+
+#[test]
+fn default_budget_is_mandatory() {
+    // #556 requires the aggregate budget to apply even when unconfigured. A filter
+    // built from empty config must carry the default 64 MiB / 100,000 caps, not an
+    // unbounded (opt-in) ceiling.
+    let filter = make_filter();
+    assert_eq!(
+        filter.max_accumulated_bytes,
+        64 * 1024 * 1024,
+        "omitted max_accumulated_bytes must default to the mandatory 64 MiB ceiling"
+    );
+    assert_eq!(
+        filter.max_output_items, 100_000,
+        "omitted max_output_items must default to the mandatory 100,000 cap"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_count_dedups_added_done_pair() {
+    // A canonical `output_item.added` -> `output_item.done` pair for the SAME item
+    // is one retained output item, not two. The count derives from the retained
+    // output (which `done` replaces in place), so a matched pair must not trip
+    // `max_output_items: 1`. Regression for the per-envelope double count, where
+    // `added` and `done` each bumped a separate counter (#556 review finding 3).
+    let filter = make_filter_from("max_output_items: 1\nmax_accumulated_bytes: 67108864");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut added = Some(output_item_added_chunk(0));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+    assert!(added.is_some(), "the added envelope is the single retained item");
+
+    // Same id and output_index: `done` replaces the item in place, so the retained
+    // count stays at one.
+    let mut done = Some(make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "item": {"type": "message", "id": "item_0", "content": []},
+            "output_index": 0,
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut done, false).unwrap();
+    assert!(
+        done.is_some(),
+        "a matched added/done pair is one item and must not trip the count cap"
+    );
+    assert_ne!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a canonical added/done pair must not fail the stream closed"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_charges_retained_tool_call_clone() {
+    // A `function_call_arguments.done` clones the whole retained output item into
+    // `tool_calls`. When the item carries a large `name` (charged once on its
+    // `output_item.added`) but no `id`/`call_id`, `upsert_tool_call` cannot dedup
+    // and every later tiny `done` frame appends another full clone. Charging only
+    // `frame.data.len()` left the counter near zero while megabytes were retained,
+    // so the clone-to-be must be charged too (#556 review finding: retained
+    // tool-call copies escaped the byte budget).
+    let big_name = "n".repeat(5000);
+
+    // The cap admits the announced item and its first clone but not many. Fifty
+    // tiny `done` frames alone (~2 KiB) stay well under it, so without charging the
+    // clone the stream would never fail closed in this loop.
+    let filter = make_filter_from("max_accumulated_bytes: 20000");
+    let mut ctx = arm_plain_stream(&filter);
+
+    // An id-less, call_id-less function-call item announced once.
+    let mut added = Some(make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "item": {"type": "function_call", "name": big_name, "arguments": "", "status": "in_progress"},
+            "output_index": 0,
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut added, false).unwrap();
+    assert!(added.is_some(), "the announced function call is within the cap");
+
+    let mut failed = false;
+    for _ in 0..50 {
+        let mut done = Some(make_sse_chunk(
+            "response.function_call_arguments.done",
+            &json!({"output_index": 0, "arguments": "{}"}),
+        ));
+        filter.on_response_body(&mut ctx, &mut done, false).unwrap();
+        if done.is_none() {
+            failed = true;
+            break;
+        }
+    }
+
+    assert!(
+        failed,
+        "re-cloned tool-call copies must be charged and eventually fail the stream closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a stream whose retained tool-call clones overflow the byte budget must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_charges_retained_tool_call_clone_in_one_chunk() {
+    // The coalesced variant of `accumulation_charges_retained_tool_call_clone`: the
+    // id-less `output_item.added` and every re-cloning `function_call_arguments.done`
+    // arrive in ONE chunk. The clone charge is measured in phase 2 as each `done`
+    // actually clones the item into `tool_calls`, so a coalesced added + repeated
+    // dones fails the stream closed the instant the retained clones cross the cap —
+    // never accepting the full amplification of tool-call copies while the counter
+    // stays near zero (#556 re-review finding: same-chunk added + repeated dones).
+    let big_name = "n".repeat(5000);
+
+    // The cap admits the announced item and a clone or two but not fifty. The fifty
+    // tiny `done` frames alone (~2 KiB) stay far under it, so only charging the
+    // same-chunk clones fails this single chunk closed.
+    let filter = make_filter_from("max_accumulated_bytes: 20000");
+    let mut ctx = arm_plain_stream(&filter);
+
+    // One chunk: the id-less, call_id-less function-call item announced once, then
+    // fifty `done` frames each re-cloning it into `tool_calls`.
+    let mut coalesced = Vec::new();
+    coalesced.extend_from_slice(&make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "item": {"type": "function_call", "name": big_name, "arguments": "", "status": "in_progress"},
+            "output_index": 0,
+        }),
+    ));
+    for _ in 0..50 {
+        coalesced.extend_from_slice(&make_sse_chunk(
+            "response.function_call_arguments.done",
+            &json!({"output_index": 0, "arguments": "{}"}),
+        ));
+    }
+
+    let mut chunk = Some(Bytes::from(coalesced));
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        chunk.is_none(),
+        "a single chunk whose coalesced added + repeated dones retain megabytes of clones must fail closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a coalesced-chunk clone overflow must not be persisted"
+    );
+
+    // The chunk fails closed inside phase 2, the moment the measured clones cross the
+    // cap — after retaining only a bounded handful, never the full 50-way
+    // amplification. Bounded retention with rejection is the fix; the earlier phase-1
+    // prediction under-charged the coalesced case and never rejected at all.
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.tool_calls.len() < 50,
+        "the per-event byte guard must fail closed before the full amplification, got {} clones",
+        state.tool_calls.len()
+    );
+}
+
+#[tokio::test]
+async fn accumulation_charges_clone_when_added_output_index_mismatches() {
+    // Finding 1 (#556 re-review): the clone charge must follow the accumulator's
+    // actual append/replace rules, not an advertised `output_index`.
+    // `handle_output_item_added` IGNORES `output_index` and pushes, so an item
+    // announced with `output_index: 7` still lands at actual index 0. A
+    // `function_call_arguments.done` targeting index 0 then clones that large item.
+    // The former phase-1 prediction resolved the pending item by the advertised
+    // index 7, matched nothing, charged zero, and never rejected — retaining
+    // megabytes uncharged. Measuring the clone where it is made closes the gap: the
+    // done resolves the real index-0 item, clones it, and is charged.
+    let big_name = "n".repeat(5000);
+
+    let filter = make_filter_from("max_accumulated_bytes: 20000");
+    let mut ctx = arm_plain_stream(&filter);
+
+    // One chunk: an id-less function call announced with a MISMATCHED output_index
+    // (7, though `added` ignores it and lands the item at index 0), then repeated
+    // dones targeting the real index 0.
+    let mut coalesced = Vec::new();
+    coalesced.extend_from_slice(&make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "item": {"type": "function_call", "name": big_name, "arguments": "", "status": "in_progress"},
+            "output_index": 7,
+        }),
+    ));
+    for _ in 0..50 {
+        coalesced.extend_from_slice(&make_sse_chunk(
+            "response.function_call_arguments.done",
+            &json!({"output_index": 0, "arguments": "{}"}),
+        ));
+    }
+
+    let mut chunk = Some(Bytes::from(coalesced));
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        chunk.is_none(),
+        "an added item whose advertised output_index differs from its landing index must still have \
+         its repeated clones charged and fail the stream closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a mismatched-index clone overflow must not be persisted"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.tool_calls.len() < 50,
+        "the clone charge must fail closed before the full amplification, got {} clones",
+        state.tool_calls.len()
+    );
+}
+
+#[tokio::test]
+async fn accumulation_argument_done_without_item_is_incremental() {
+    // Finding 2 (#556 re-review): the clone charge must not rescan the parsed-event
+    // history for every completion. A coalesced chunk of many
+    // `function_call_arguments.done` events with NO matching output item was the
+    // O(N^2) worst case the old rescan hit (~1.9s for 60k events). Charging the clone
+    // at commit makes each done O(1): it finds no item, clones nothing, and charges
+    // nothing. A large such chunk must be processed without spurious overflow and
+    // without retaining any tool call.
+    let filter = make_filter_from("max_accumulated_bytes: 67108864\nmax_events: 100000");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let mut coalesced = Vec::new();
+    for _ in 0..20_000 {
+        coalesced.extend_from_slice(&make_sse_chunk(
+            "response.function_call_arguments.done",
+            &json!({"output_index": 0, "arguments": "{}"}),
+        ));
+    }
+
+    let mut chunk = Some(Bytes::from(coalesced));
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    // No matching output item ever existed, so nothing was cloned or charged as a
+    // clone and the stream is not failed closed.
+    assert_ne!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "dones without a matching output item must not spuriously overflow the byte budget"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.tool_calls.is_empty(),
+        "a done with no matching output item must retain no tool call"
+    );
+}
+
+#[tokio::test]
+async fn count_overflow_rejects_before_recording_local_tool_milestone() {
+    // A chunk that overflows the item cap must fail closed *before* recording any
+    // delivery milestone: otherwise a local tool whose progress streamed earlier in
+    // the same chunk leaves a committed milestone that EOS recovery trusts, dropping
+    // the executed tool from the client-visible stream. The count guard now runs
+    // between accumulation and milestone recording (#556 review finding).
+    let filter = make_filter_from("max_output_items: 1\nmax_accumulated_bytes: 67108864");
+    let mut ctx = arm_plain_stream(&filter);
+
+    // Round-0 item fills the single-item cap.
+    let mut first = Some(output_item_added_chunk(0));
+    filter.on_response_body(&mut ctx, &mut first, false).unwrap();
+    assert!(first.is_some(), "the first item is within the count cap");
+
+    // One chunk: a local-tool progress frame (which would record a milestone for
+    // its `item_id`) followed by an `output_item.added` that overflows the count
+    // cap. The whole chunk must be rejected atomically.
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&web_search_progress_chunk(1));
+    combined.extend_from_slice(&output_item_added_chunk(1));
+    let mut chunk = Some(Bytes::from(combined));
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(chunk.is_none(), "the overflowing chunk must fail closed");
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a count-overflow chunk must not be persisted"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        !state.emitted_output_items.contains_key("ws_000001"),
+        "no local-tool milestone may be recorded for a chunk rejected on count overflow"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_byte_budget_spans_irr_rounds() {
+    // The aggregate byte budget is request-wide: bytes charged in an earlier IRR
+    // round persist across the per-round re-arm, so a later round cannot reset the
+    // counter and accumulate unbounded state while no single round trips the cap.
+    // Regression for the per-round reset (#556 review finding 1).
+
+    // Measure what one output item charges so the cap can admit two items but
+    // reject the third, independent of the exact wire size.
+    let probe = make_filter_from("max_accumulated_bytes: 67108864");
+    let mut probe_ctx = arm_plain_stream(&probe);
+    let mut probe_chunk = Some(output_item_added_chunk(0));
+    probe.on_response_body(&mut probe_ctx, &mut probe_chunk, false).unwrap();
+    let per_item = probe_ctx
+        .extensions
+        .get::<ResponsesState>()
+        .unwrap()
+        .stream_accumulated_bytes;
+    assert!(per_item > 1, "streaming an output item must charge the byte budget");
+
+    // Two items fit; the third does not (2*per_item <= cap < 3*per_item).
+    let cap = per_item * 2 + 1;
+    let filter = make_filter_from(&format!("max_accumulated_bytes: {cap}"));
+    let mut ctx = arm_plain_stream(&filter);
+
+    for i in 0..2 {
+        let mut chunk = Some(output_item_added_chunk(i));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(chunk.is_some(), "round-0 items stay under the aggregate cap");
+    }
+
+    // Re-arm as the IRR runner would before the next round's request phase. A
+    // per-round counter would reset to zero here; the request-wide one must not.
+    filter.arm(&mut ctx);
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().stream_accumulated_bytes,
+        per_item * 2,
+        "the request-wide byte budget must survive the per-round re-arm"
+    );
+
+    // Round 1: one more item crosses the cap because round-0 bytes still count.
+    let mut overflow = Some(output_item_added_chunk(2));
+    filter.on_response_body(&mut ctx, &mut overflow, false).unwrap();
+    assert!(
+        overflow.is_none(),
+        "bytes charged in round 0 must carry into round 1 and fail the stream closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "a stream that overflows the request-wide byte budget must not be persisted"
+    );
+}
+
+#[tokio::test]
+async fn accumulation_terminal_snapshot_charged_against_byte_budget() {
+    // A terminal `response.completed` snapshots the full accumulated output plus
+    // usage into `response_object` and is retained again as the deferred terminal,
+    // so a terminal frame that alone exceeds the byte ceiling must fail closed
+    // rather than slip through just because it fits `max_buffer_bytes`. Regression
+    // for the uncharged terminal snapshot (#556 review finding 2).
+    let filter = make_filter_from("max_accumulated_bytes: 500\nmax_output_items: 100000");
+    let mut ctx = arm_plain_stream(&filter);
+
+    let big_text = "x".repeat(2000);
+    let mut completed = Some(make_sse_chunk(
+        "response.completed",
+        &json!({
+            "response": {
+                "id": "resp_big_terminal",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "m1",
+                    "content": [{"type": "output_text", "text": big_text}]
+                }]
+            },
+            "sequence_number": 9
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut completed, false).unwrap();
+    assert!(
+        completed.is_none(),
+        "a terminal snapshot larger than the byte ceiling must fail the stream closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_parse_error"),
+        Some("true"),
+        "an over-cap terminal snapshot must be recorded as a stream parse error"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "an over-cap terminal snapshot must not be persisted"
+    );
+}
+
 /// Record execution provenance for every item currently in `accumulated_output`,
 /// mirroring what a dispatch filter (`openai_mcp_dispatch`, `openai_web_search`)
 /// records when it actually executes a tool. Tests that seed `accumulated_output`
@@ -875,6 +1808,49 @@ async fn logical_stream_failed_mcp_call_emits_failed_outcome_event() {
     assert!(
         added < failed && failed < done,
         "outcome must be ordered added -> failed -> done: {delta}"
+    );
+}
+
+#[tokio::test]
+async fn logical_stream_successful_mcp_list_tools_emits_lifecycle_events() {
+    // Locally generated deferred listings must surface as incremental
+    // added / in_progress / completed / done events, not only the final
+    // response snapshot.
+    let (filter, mut ctx) = arm_resumed_round_with_accumulated(
+        "openai_mcp_dispatch",
+        vec![json!({
+            "type": "mcp_list_tools",
+            "id": "mcpl_1",
+            "server_label": "weather",
+            "tools": [{"name": "get_weather", "input_schema": {"type": "object"}}],
+        })],
+    )
+    .await;
+
+    let delta = resumed_text_delta(&filter, &mut ctx);
+    assert!(
+        delta.contains("event: response.output_item.added") && delta.contains("event: response.output_item.done"),
+        "a locally generated listing must surface as incremental output-item events: {delta}"
+    );
+    assert!(
+        delta.contains("event: response.mcp_list_tools.in_progress"),
+        "a successful listing must emit an in_progress progress event: {delta}"
+    );
+    assert!(
+        delta.contains("event: response.mcp_list_tools.completed"),
+        "a successful listing must emit a completed outcome event: {delta}"
+    );
+    assert!(
+        !delta.contains("event: response.mcp_list_tools.failed"),
+        "a successful listing must not emit a failed outcome event: {delta}"
+    );
+    let added = delta.find("event: response.output_item.added").unwrap();
+    let in_progress = delta.find("event: response.mcp_list_tools.in_progress").unwrap();
+    let completed = delta.find("event: response.mcp_list_tools.completed").unwrap();
+    let done = delta.find("event: response.output_item.done").unwrap();
+    assert!(
+        added < in_progress && in_progress < completed && completed < done,
+        "listing lifecycle must be ordered added -> in_progress -> completed -> done: {delta}"
     );
 }
 
@@ -3126,6 +4102,8 @@ fn parse_error_sets_metadata() {
         tool_call_args: std::collections::HashMap::new(),
         rejected_tool_call_args: std::collections::HashSet::new(),
         max_tool_call_argument_bytes: 1024 * 1024,
+        max_accumulated_bytes: 64 * 1024 * 1024,
+        max_output_items: 100_000,
         iteration: 0,
         output_index_offset: 0,
         deferred_terminal: None,
@@ -3730,6 +4708,12 @@ async fn on_response_disarms_for_non_sse_content_type() {
 #[tokio::test]
 async fn on_response_stays_armed_for_sse_with_charset() {
     let (filter, mut ctx) = make_armed_context();
+    ctx.extensions.insert(ResponsesState {
+        local_completion_response_template: json!({
+            "id":"resp_prior", "object":"response", "status":"completed", "output":[]
+        }),
+        ..ResponsesState::default()
+    });
 
     let resp = Box::leak(Box::new(crate::test_utils::make_response()));
     resp.headers.insert(
@@ -3743,6 +4727,14 @@ async fn on_response_stays_armed_for_sse_with_charset() {
     assert!(
         ctx.get_filter_state::<StreamEventsState>().is_some(),
         "filter should stay armed for text/event-stream with charset parameter"
+    );
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .local_completion_response_template
+            .is_null(),
+        "upstream response headers make the request-side fallback unreachable"
     );
 }
 
@@ -3886,6 +4878,8 @@ impl OpenaiStreamEventsFilter {
                 timeout: std::time::Duration::from_secs(300),
             },
             max_tool_call_argument_bytes: 1024 * 1024,
+            max_accumulated_bytes: 64 * 1024 * 1024,
+            max_output_items: 100_000,
         }
     }
 }
@@ -4115,35 +5109,31 @@ async fn logical_stream_finalize_clears_provider_streamed_terminal_ids() {
 }
 
 #[test]
-fn logical_stream_continues_recognizes_file_search_loop() {
+fn logical_stream_continues_recognizes_owner_loop() {
     use super::logical_stream_continues;
 
+    // After the #1046 unification the loop owner (`openai_agentic_loop`) is the
+    // single continuation authority: its `action="loop"` — covering pending
+    // file_search assignments, web_search calls, and MCP-classified tool calls
+    // alike — is what keeps the logical stream open.
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.filter_results
-        .entry("openai_file_search_callout")
+        .entry("openai_agentic_loop")
         .or_default()
         .set("action", "loop")
         .unwrap();
     assert!(
         logical_stream_continues(&ctx),
-        "file_search action=loop must continue the logical stream"
+        "owner action=loop must continue the logical stream"
     );
 }
 
 #[test]
-fn arm_publishes_file_search_marker_on_logical_stream() {
-    let req = make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
-    OpenaiStreamEventsFilter::test_filter().arm(&mut ctx);
-    assert_eq!(ctx.get_metadata("responses.logical_stream.file_search"), Some("true"));
-}
-
-#[test]
-fn drain_offset_discipline_emits_round_local_then_offset() {
-    // accumulated len 6; the synthesized call sits at absolute index 5. With
-    // output_index_offset 5, round_local = 5 - 5 = 0, and normalize re-adds the offset
-    // → wire output_index = 0 + 5 = 5 (no double-offset, no underflow).
+fn drain_emits_absolute_output_index() {
+    // accumulated len 6; the reconciled call sits at absolute index 5. The queue
+    // stores absolute indices and drain normalizes with a zero offset, so the wire
+    // `output_index` is the absolute 5 (no per-round offset arithmetic).
     let mut ctx = test_ctx_without_file_search_tool();
     let mut state = ResponsesState::default();
     state.accumulated_output = (0..6)
@@ -4152,11 +5142,33 @@ fn drain_offset_discipline_emits_round_local_then_offset() {
     state.pending_local_tool_synthesis = vec![(5, SynthesisKind::Native)];
     ctx.extensions.insert(state);
     let mut out = Vec::new();
-    super::local_tools::drain_local_tool_synthesis(&mut ctx, 5, &mut out);
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, &mut out);
     let emitted = String::from_utf8(out).unwrap();
     assert!(
         emitted.contains("\"output_index\":5"),
-        "absolute 5 with offset 5 → round_local 0 → wire output_index 5; got: {emitted}"
+        "absolute index 5 is emitted verbatim as the wire output_index; got: {emitted}"
+    );
+}
+
+#[test]
+fn drain_defers_still_pending_item() {
+    // A queued item whose owner placeholder is not yet reconciled (the dispatcher
+    // runs next round) is re-queued for a later finalize, not synthesized now.
+    let mut ctx = test_ctx_without_file_search_tool();
+    let mut state = ResponsesState::default();
+    state.accumulated_output = vec![json!({"type":"file_search_call","status":"in_progress"})];
+    state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Private)];
+    ctx.extensions.insert(state);
+    let mut out = Vec::new();
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, &mut out);
+    assert!(out.is_empty(), "a still-pending item emits no lifecycle yet");
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .pending_local_tool_synthesis,
+        vec![(0, SynthesisKind::Private)],
+        "the pending item is re-queued for the finalize that follows its reconciliation"
     );
 }
 
@@ -4169,7 +5181,7 @@ fn drain_pre_existing_error_suppresses_synthesis() {
     state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Native)]; // a VALID queued item
     ctx.extensions.insert(state);
     let mut out = Vec::new();
-    super::local_tools::drain_local_tool_synthesis(&mut ctx, 0, &mut out);
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, &mut out);
     assert!(
         out.is_empty(),
         "a valid queued item is discarded when an error is already committed"
@@ -4189,10 +5201,11 @@ fn drain_invalid_index_sets_error_and_no_gap() {
     let mut ctx = test_ctx_without_file_search_tool();
     let mut state = ResponsesState::default();
     state.accumulated_output = vec![json!({"type":"file_search_call","status":"completed","results":[]})];
-    state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Native)]; // offset 3 > absolute 0 → None
+    // Absolute index 5 is out of range for a one-item output → invariant failure.
+    state.pending_local_tool_synthesis = vec![(5, SynthesisKind::Native)];
     ctx.extensions.insert(state);
     let mut out = Vec::new();
-    super::local_tools::drain_local_tool_synthesis(&mut ctx, 3, &mut out);
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, &mut out);
     assert!(out.is_empty(), "no guessed frame on invariant failure");
     assert!(
         ctx.get_metadata("responses.stream_error_code").is_some(),
@@ -4285,15 +5298,17 @@ async fn native_progress_precedes_closed_error_ordering() {
 #[test]
 fn drain_atomicity_valid_item_before_invalid_both_suppressed() {
     let mut ctx = test_ctx_without_file_search_tool();
-    // accumulated len 6; queue [(5,Native)=valid round_local 0, (2,Native)=underflows with offset 5].
+    // accumulated len 6; queue [(5,Native)=valid, (99,Native)=out of range]. The
+    // resolution pass validates every index before emitting any frame, so the
+    // out-of-range item suppresses the valid one too.
     let mut state = ResponsesState::default();
     state.accumulated_output = (0..6)
         .map(|_| json!({"type":"file_search_call","status":"completed","results":[]}))
         .collect();
-    state.pending_local_tool_synthesis = vec![(5, SynthesisKind::Native), (2, SynthesisKind::Native)];
+    state.pending_local_tool_synthesis = vec![(5, SynthesisKind::Native), (99, SynthesisKind::Native)];
     ctx.extensions.insert(state);
     let mut out = Vec::new();
-    super::local_tools::drain_local_tool_synthesis(&mut ctx, 5, &mut out);
+    super::local_tools::drain_local_tool_synthesis(&mut ctx, &mut out);
     assert!(
         out.is_empty(),
         "atomicity: the VALID item is not emitted when a later queued item is invalid"

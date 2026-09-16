@@ -16,8 +16,8 @@ use tracing::info;
 use super::{
     pool::{PoolConfig, apply_pool_config},
     schemas::{
-        ColumnCheck, PENDING_APPROVALS_COLUMNS, SCHEMA_VERSION, TableNames, VERSION_COLUMNS, check_column_presence,
-        expected_table_columns, generate_ddl, pending_approvals_table, schema_version_table,
+        ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, TableNames, check_schema,
+        expected_tables, generate_ddl, pending_approvals_table, pg_key_column_folding, schema_version_table,
         validate_postgres_identifiers,
     },
     trait_def::{ConversationItemStore, ResponseStore},
@@ -248,53 +248,213 @@ fn pg_connect_options(
     Ok(options)
 }
 
-/// Query column metadata for each table and verify expected columns exist.
-#[expect(clippy::too_many_lines, reason = "linear per-table column verification")]
-async fn validate_schema(pool: &sqlx::PgPool, tables: &TableNames) -> Result<(), StoreError> {
-    let version_table = schema_version_table(&tables.responses);
-    let approvals_table = pending_approvals_table(&tables.responses);
-    let expected = expected_table_columns(tables);
-    let mut results = Vec::with_capacity(expected.len() + 2);
+/// Fetch column names for a `PostgreSQL` table from `information_schema`.
+async fn table_column_names(pool: &sqlx::PgPool, table: &str) -> Result<Vec<String>, StoreError> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1",
+    )
+    .bind(table)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| StoreError::Database(e.to_string()))
+}
 
-    for (table_name, expected_cols) in &expected {
-        let actual: Vec<String> = sqlx::query_scalar::<_, String>(
-            "SELECT column_name FROM information_schema.columns \
-             WHERE table_schema = current_schema() AND table_name = $1",
-        )
-        .bind(*table_name)
+/// Fetch a `PostgreSQL` table's primary key columns with the metadata needed to
+/// prove each preserves distinct key values, plus whether the key is immediate.
+///
+/// Reading the key from `pg_index.indisprimary` scoped to `t.relname = $1`
+/// returns only *this* table's own primary key, so a same-named constraint on
+/// another table cannot leak in. Only the leading `indnkeyatts` attributes are
+/// key columns, excluding any `PRIMARY KEY ... INCLUDE (...)` covering column; a
+/// primary key never contains an expression column, so `attname` and `typname`
+/// are always present.
+///
+/// Each key column carries: its type OID (`pg_attribute.atttypid`, read without
+/// resolving domains -- a domain reports its own OID and fails the allow-list
+/// with no recursive walk); whether its collation is deterministic
+/// (`pg_collation.collisdeterministic`, `NULL` for a non-collatable column); and
+/// whether its operator class is the built-in default B-tree class for the
+/// column type -- keyed structurally on `pg_opclass.opcnamespace = 'pg_catalog'`,
+/// `pg_am.amname = 'btree'`, `pg_opclass.opcdefault`, and `pg_opclass.opcintype =
+/// text` (see [`PRIMARY_KEY_QUERY`] for why the input type is `text`, not the
+/// column's own OID), never on a spoofable class name, and read as `NULL`/untrusted
+/// fail-closed. [`pg_key_column_folding`] turns that metadata into a verdict.
+/// `pg_index.indimmediate` is constant across the index's rows; a deferrable key
+/// cannot arbitrate an `ON CONFLICT` upsert.
+async fn table_primary_key(pool: &sqlx::PgPool, table: &str) -> Result<(Vec<ActualKeyColumn>, bool), StoreError> {
+    let rows = sqlx::query(PRIMARY_KEY_QUERY)
+        .bind(table)
         .fetch_all(pool)
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        results.push((*table_name, *expected_cols, actual));
+    let mut columns = Vec::with_capacity(rows.len());
+    // A table with no primary key yields no rows; report it as immediate so the
+    // empty key fails the shape check rather than the deferrable check.
+    let mut immediate = true;
+    for row in &rows {
+        let (column, row_immediate) = pk_row_to_key_column(row)?;
+        immediate = row_immediate;
+        columns.push(column);
+    }
+    Ok((columns, immediate))
+}
+
+/// Parse one row from [`PRIMARY_KEY_QUERY`] into a key column plus the index's
+/// `indimmediate` flag. That flag is index-level, so it is identical for every
+/// row of the key; the caller keeps the last one read.
+fn pk_row_to_key_column(row: &PgRow) -> Result<(ActualKeyColumn, bool), StoreError> {
+    let name: String = row
+        .try_get("column_name")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let type_oid: i64 = row
+        .try_get("type_oid")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let type_name: String = row
+        .try_get("type_name")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let immediate: bool = row
+        .try_get("immediate")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let collation_deterministic: Option<bool> = row
+        .try_get("collation_deterministic")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    // A missing operator class classifies as untrusted (fail-closed).
+    let operator_class_trusted: Option<bool> = row
+        .try_get("operator_class_trusted")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let column = ActualKeyColumn {
+        folding: pg_key_column_folding(
+            type_oid,
+            &type_name,
+            collation_deterministic,
+            operator_class_trusted.unwrap_or(false),
+        ),
+        name,
+    };
+    Ok((column, immediate))
+}
+
+/// Catalog query backing [`table_primary_key`]. `$1` binds the table name; see
+/// that function's docs for how each selected column is interpreted.
+///
+/// `operator_class_trusted` is true only for `text_ops`, the `pg_catalog` default
+/// B-tree operator class whose input type is `text`. `PostgreSQL` backs both
+/// `text` and `varchar` key columns with `text_ops`: `varchar` is binary-coercible
+/// to `text`, so its default B-tree class is `text_ops` and reports
+/// `opcintype = text` even though the column's own type OID is `varchar`. (A
+/// built-in `varchar_ops` exists but is non-default and is never auto-selected for
+/// a column.) The check therefore compares against `text`'s OID rather than the
+/// column's own type, so both allow-listed key types (`text`, `varchar`) pass,
+/// while `bpchar_ops`, `citext_ops`, and any non-default custom class fail
+/// (`opcdefault` is false for a non-default class, and no second default class can
+/// exist for `text`).
+const PRIMARY_KEY_QUERY: &str = "SELECT a.attname AS column_name, a.atttypid::int8 AS type_oid, \
+            ty.typname AS type_name, i.indimmediate AS immediate, \
+            coll.collisdeterministic AS collation_deterministic, \
+            (oc.opcnamespace = 'pg_catalog'::regnamespace \
+             AND am.amname = 'btree' \
+             AND oc.opcdefault \
+             AND oc.opcintype = 'pg_catalog.text'::regtype) AS operator_class_trusted \
+     FROM pg_index i \
+     JOIN pg_class t ON t.oid = i.indrelid \
+     JOIN pg_namespace n ON n.oid = t.relnamespace \
+     CROSS JOIN LATERAL unnest(i.indkey::int2[], i.indcollation::oid[], i.indclass::oid[]) \
+         WITH ORDINALITY AS k(attnum, colloid, opclassoid, ord) \
+     JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+     JOIN pg_type ty ON ty.oid = a.atttypid \
+     LEFT JOIN pg_collation coll ON coll.oid = k.colloid \
+     JOIN pg_opclass oc ON oc.oid = k.opclassoid \
+     JOIN pg_am am ON am.oid = oc.opcmethod \
+     WHERE i.indisprimary \
+       AND k.ord <= i.indnkeyatts \
+       AND t.relname = $1 \
+       AND n.nspname = current_schema() \
+     ORDER BY k.ord";
+
+/// Query for the unique indexes on a `PostgreSQL` table other than the primary
+/// key, each with the columns it covers.
+///
+/// `pg_index.indisunique AND NOT indisprimary` covers every `UNIQUE` constraint
+/// and standalone `CREATE UNIQUE INDEX`. No `indisready`/`indislive` filter is
+/// applied: an invalid or half-built unique index is still an unexpected
+/// deviation from the generated schema and is compared fail-closed. Each index's
+/// columns are resolved through `indkey` so [`check_schema`] can accept exactly
+/// the store's own generated unique indexes by column set and reject any other --
+/// a narrower key that reintroduces cross-tenant data loss, or a redundant one.
+///
+/// Expression index members have `attnum = 0` and are dropped by the
+/// `pg_attribute` join, so an expression-based unique index resolves to fewer
+/// columns than any expected set and is rejected fail-closed.
+const UNIQUE_INDEX_QUERY: &str = "SELECT ix.relname AS index_name, \
+            array_agg(a.attname ORDER BY k.ord) AS columns \
+     FROM pg_index i \
+     JOIN pg_class t ON t.oid = i.indrelid \
+     JOIN pg_class ix ON ix.oid = i.indexrelid \
+     JOIN pg_namespace n ON n.oid = t.relnamespace \
+     JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+     JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+     WHERE i.indisunique \
+       AND NOT i.indisprimary \
+       AND t.relname = $1 \
+       AND n.nspname = current_schema() \
+     GROUP BY ix.relname \
+     ORDER BY ix.relname";
+
+/// Fetch the unique indexes on a `PostgreSQL` table other than the primary key,
+/// each with the columns it covers, via [`UNIQUE_INDEX_QUERY`].
+async fn table_extra_unique_indexes(pool: &sqlx::PgPool, table: &str) -> Result<Vec<ActualUniqueIndex>, StoreError> {
+    let rows = sqlx::query(UNIQUE_INDEX_QUERY)
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    rows.iter().map(pg_row_to_unique_index).collect()
+}
+
+/// Convert one [`UNIQUE_INDEX_QUERY`] row into an [`ActualUniqueIndex`].
+fn pg_row_to_unique_index(row: &PgRow) -> Result<ActualUniqueIndex, StoreError> {
+    let name: String = row
+        .try_get("index_name")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    let columns: Vec<String> = row
+        .try_get("columns")
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+    Ok(ActualUniqueIndex { name, columns })
+}
+
+/// Discover each tenant-scoped table's schema and compare it against the schema
+/// this store generates before the schema version is stamped.
+///
+/// The single [`check_schema`] comparison fails closed on any deviation -- a
+/// missing column, a primary key that is not the exact ordered contract, a key
+/// column with a folding type/collation/operator class, a deferrable key, or a
+/// unique index whose column set is not one the store itself generates -- because
+/// `CREATE TABLE IF NOT EXISTS` preserves a pre-existing table that could
+/// silently lose data across tenants. The global schema version table holds no
+/// tenant data and is validated by value in [`check_schema_version`], not here.
+async fn validate_schema(pool: &sqlx::PgPool, tables: &TableNames) -> Result<(), StoreError> {
+    let expected = expected_tables(tables);
+    let mut actuals = Vec::with_capacity(expected.len());
+    for (table_name, _) in &expected {
+        let columns = table_column_names(pool, table_name).await?;
+        let (primary_key, primary_key_immediate) = table_primary_key(pool, table_name).await?;
+        let unique_indexes = table_extra_unique_indexes(pool, table_name).await?;
+        actuals.push(ActualTable {
+            columns,
+            primary_key,
+            primary_key_immediate,
+            unique_indexes,
+        });
     }
 
-    let actual: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT column_name FROM information_schema.columns \
-         WHERE table_schema = current_schema() AND table_name = $1",
-    )
-    .bind(version_table.as_str())
-    .fetch_all(pool)
-    .await
-    .map_err(|e| StoreError::Database(e.to_string()))?;
-    results.push((version_table.as_str(), VERSION_COLUMNS, actual));
-
-    let actual: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT column_name FROM information_schema.columns \
-         WHERE table_schema = current_schema() AND table_name = $1",
-    )
-    .bind(approvals_table.as_str())
-    .fetch_all(pool)
-    .await
-    .map_err(|e| StoreError::Database(e.to_string()))?;
-    results.push((approvals_table.as_str(), PENDING_APPROVALS_COLUMNS, actual));
-
-    let refs: Vec<ColumnCheck<'_>> = results
+    let checks: Vec<SchemaCheck<'_>> = expected
         .iter()
-        .map(|(name, expected, actual)| (*name, *expected, actual.as_slice()))
+        .zip(&actuals)
+        .map(|((name, contract), actual)| (name.as_str(), *contract, actual))
         .collect();
-
-    check_column_presence(&refs)
+    check_schema(&checks)
 }
 
 /// Stamp or validate the schema version.
@@ -645,6 +805,29 @@ impl ConversationItemStore for PostgresResponseStore {
 
         let result = sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(&messages)
+            .bind(conversation_id)
+            .bind(tenant_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    async fn update_conversation_metadata(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<bool, StoreError> {
+        let metadata = serde_json::to_string(metadata).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let sql = format!(
+            "UPDATE {} SET metadata = $1 WHERE conversation_id = $2 AND tenant_id = $3",
+            self.tables.conversations
+        );
+
+        let result = sqlx::query(AssertSqlSafe(sql.as_str()))
+            .bind(&metadata)
             .bind(conversation_id)
             .bind(tenant_id)
             .execute(&self.pool)

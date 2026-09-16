@@ -85,6 +85,11 @@ filter_chains:
               # composes, so it must run inside this IRR step.
               - filter: openai_stream_events
                 # max_tool_call_argument_bytes: 1048576
+                # Aggregate accumulation budget bounding total process memory even
+                # when every individual SSE event is within max_buffer_bytes. The
+                # stream fails closed once either dimension is exceeded.
+                # max_accumulated_bytes: 67108864
+                # max_output_items: 100000
 
               - filter: headers
                 request_set:

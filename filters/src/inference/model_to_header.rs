@@ -45,6 +45,10 @@ fn default_header() -> String {
 
 /// Promotes the JSON `"model"` field from the request body to a request header.
 ///
+/// Promotion is deferred until end-of-stream so a later body-writing filter
+/// (for example `llmisvc_model_provider_resolver`) can observe the pending
+/// header in the same `StreamBuffer` pre-read pass.
+///
 /// # YAML configuration
 ///
 /// ```yaml
@@ -152,6 +156,10 @@ impl HttpFilter for ModelToHeaderFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+
         self.inner.on_request_body(ctx, body, end_of_stream).await
     }
 
@@ -239,6 +247,22 @@ mod tests {
             ),
             "body mode should be StreamBuffer with a default size limit"
         );
+    }
+
+    #[tokio::test]
+    async fn waits_for_end_of_stream() {
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let json = br#"{"model":"mistral-large-latest","prompt":"hello"}"#;
+        let mut body = Some(Bytes::from_static(json));
+        let original = body.clone();
+
+        let action = filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(body, original, "must not promote before end_of_stream");
+        assert!(ctx.extra_request_headers.is_empty());
     }
 
     #[tokio::test]

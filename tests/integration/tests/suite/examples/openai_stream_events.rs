@@ -21,7 +21,7 @@ const RESPONSES_TABLE: &str = "openai_responses";
 
 const STREAMING_EXAMPLES: [(&str, u64); 5] = [
     ("openai/responses/agentic-loop.yaml", 360_000),
-    ("openai/responses/full-flow.yaml", 360_000),
+    ("openai/responses/full-flow-agentic.yaml", 300_000),
     ("openai/responses/irr-terminal-streaming.yaml", 360_000),
     ("openai/responses/responses-to-chat-completions.yaml", 660_000),
     ("openai/responses/stream-events.yaml", 360_000),
@@ -272,6 +272,88 @@ async fn stream_events_forwards_backend_error_transparently() {
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("backend JSON should be forwarded intact");
     assert_eq!(parsed["error"]["message"], "model not found");
     assert_eq!(parsed["error"]["code"], "model_not_found");
+
+    drop(proxy);
+    cleanup_sqlite_files(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_events_fails_closed_when_accumulation_budget_exceeded() {
+    // #556: a backend that streams many individually-valid SSE events whose
+    // aggregate accumulated state crosses the budget must fail the stream closed —
+    // the client sees a terminal error rather than a success, and nothing is
+    // persisted. Exercised end-to-end through the proxy with a tiny
+    // `max_accumulated_bytes` so a small body trips the aggregate byte ceiling.
+    let mut sse_body = String::new();
+    for i in 0..10 {
+        sse_body.push_str(&format!(
+            "event: response.output_item.added\n\
+             data: {{\"type\":\"response.output_item.added\",\"output_index\":{i},\
+             \"item\":{{\"type\":\"message\",\"id\":\"item_{i}\",\"content\":[]}}}}\n\n"
+        ));
+    }
+    sse_body.push_str(&format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{RESPONSE_JSON}}}\n\n"
+    ));
+    sse_body.push_str("event: done\ndata: [DONE]\n\n");
+
+    let backend_guard = Backend::fixed(&sse_body)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let (db_url, db_path) = temp_sqlite_url("stream_events_overflow");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
+        .expect("example config should exist");
+    // Inject a tiny aggregate byte ceiling so the streamed items trip the budget.
+    let yaml = yaml.replace(
+        "- filter: openai_stream_events\n",
+        "- filter: openai_stream_events\n                max_accumulated_bytes: 512\n",
+    );
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
+        ),
+    );
+
+    // Streaming headers are already sent when the budget trips mid-body, so the
+    // failure surfaces as an in-band terminal error event, not an HTTP status.
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streaming request returns 200 before the body trips the budget"
+    );
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("event: error"),
+        "budget overflow must terminate the logical stream with an error event: {body}"
+    );
+    assert!(
+        !body.contains("response.completed"),
+        "the poisoned terminal must be suppressed, not forwarded as success: {body}"
+    );
+
+    let pool = sqlx::SqlitePool::connect(&db_url)
+        .await
+        .expect("should connect to test database");
+    let sql = format!("SELECT COUNT(*) AS n FROM {RESPONSES_TABLE}");
+    let row: sqlx::sqlite::SqliteRow = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .fetch_one(&pool)
+        .await
+        .expect("count query should succeed");
+    let persisted: i64 = row.get("n");
+    pool.close().await;
+    assert_eq!(persisted, 0, "a budget-overflow stream must not persist any response");
 
     drop(proxy);
     cleanup_sqlite_files(&db_path);
