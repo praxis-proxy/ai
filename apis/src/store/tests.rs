@@ -4213,7 +4213,7 @@ async fn pg_conversation_item_insert_rejects_existing() {
 
 #[tokio::test]
 #[ignore]
-async fn pg_conversation_item_upsert_allows_same_item_id_in_different_conversations() {
+async fn pg_conversation_item_id_collision_cannot_move_between_conversations() {
     let store = make_pg_store_with_items().await;
     let item_conv1 = ConversationItemRecord {
         item_data: json!({"conversation": "conv_1"}),
@@ -4228,10 +4228,11 @@ async fn pg_conversation_item_upsert_allows_same_item_id_in_different_conversati
         .create_test_items(&[item_conv1])
         .await
         .expect("initial item insert should succeed");
-    store
-        .create_test_items(&[item_conv2])
-        .await
-        .expect("same item_id in another conversation should insert");
+    let collision = store.create_test_items(&[item_conv2]).await;
+    assert!(
+        collision.is_err(),
+        "same item id must not be rebound to another conversation"
+    );
 
     let conv1_item = store
         .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_shared")
@@ -4241,22 +4242,15 @@ async fn pg_conversation_item_upsert_allows_same_item_id_in_different_conversati
     let conv2_item = store
         .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_2", "item_shared")
         .await
-        .expect("conv_2 get should succeed")
-        .expect("conv_2 item should exist");
+        .expect("conv_2 get should succeed");
 
     assert_eq!(conv1_item.conversation_id, "conv_1", "conv_1 row should remain scoped");
-    assert_eq!(conv2_item.conversation_id, "conv_2", "conv_2 row should be inserted");
+    assert!(conv2_item.is_none(), "colliding conversation must not acquire the item");
     assert_eq!(
         conv1_item.item_data,
         json!({"conversation": "conv_1"}),
         "conv_1 item data should not be overwritten"
     );
-    assert_eq!(
-        conv2_item.item_data,
-        json!({"conversation": "conv_2"}),
-        "conv_2 item data should be stored separately"
-    );
-
     let conv1_items = store
         .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 100, true)
         .await
@@ -4266,7 +4260,7 @@ async fn pg_conversation_item_upsert_allows_same_item_id_in_different_conversati
         .await
         .expect("conv_2 list should succeed");
     assert_item_ids(&conv1_items, &["item_shared"]);
-    assert_item_ids(&conv2_items, &["item_shared"]);
+    assert!(conv2_items.is_empty(), "colliding conversation must remain empty");
 }
 
 #[tokio::test]

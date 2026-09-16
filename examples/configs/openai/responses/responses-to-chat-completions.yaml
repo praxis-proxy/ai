@@ -52,6 +52,10 @@ filter_chains:
 
       - filter: openai_responses_validate
 
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
       - filter: openai_response_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
