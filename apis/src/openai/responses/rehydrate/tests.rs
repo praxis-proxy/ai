@@ -1397,8 +1397,7 @@ async fn same_tenant_different_owner_rejects_conversation() {
     ctx.extensions.insert(registry.clone());
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.extensions.insert(
-        StateOwner::from_trusted_parts("default", "test-issuer", "other-subject")
-            .expect("test owner should be valid"),
+        StateOwner::from_trusted_parts("default", "test-issuer", "other-subject").expect("test owner should be valid"),
     );
     let mut body = Some(Bytes::from(
         r#"{"model":"gpt-4.1","input":"Hi","conversation":"conv_abc"}"#,
