@@ -44,10 +44,14 @@ on:
       - ".github/workflows/vllm-integration.yaml"
   merge_group:
     branches: [main]
+  schedule:
+    # Avoid overlapping the repository's 02:47 UTC nightly workflow and
+    # 03:02 UTC CodeQL schedule.
+    - cron: "17 4 * * *"
   workflow_dispatch:
     inputs:
       run_live_vllm:
-        description: Run the full live CPU vLLM inference and compatibility set
+        description: Run the complete Responses SDK suite only against live CPU vLLM
         required: false
         default: false
         type: boolean
@@ -124,6 +128,8 @@ jobs:
     needs: [changes]
     if: |
       always() &&
+      github.event_name != 'schedule' &&
+      (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -285,8 +291,8 @@ jobs:
           fi
 
   # ----------------------------------------------------------------------------
-  # Critical live CPU smoke tests on every relevant change. The broader live
-  # set remains on demand until it moves to GPU runners.
+  # Critical live CPU smoke tests on every relevant change. Nightly and
+  # explicitly requested dispatches run the complete Responses SDK suite.
   # ----------------------------------------------------------------------------
 
   vllm-live-cpu:
@@ -294,9 +300,11 @@ jobs:
     if: |
       always() &&
       (
+        github.event_name == 'schedule' ||
         (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) ||
         (
           github.event_name != 'workflow_dispatch' &&
+          github.event_name != 'schedule' &&
           (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
         )
       )
@@ -366,19 +374,19 @@ jobs:
           done
 
       - name: Run critical live vLLM smoke tests
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
         env:
           VLLM_TEST_BACKEND: live
         run: |
           uv run tests/integration/sdk/openai/test_openai_responses_vllm.py \
             -s -m "critical_vllm"
 
-      - name: Run remaining live inference and compatibility tests
-        if: github.event_name == 'workflow_dispatch' && inputs.run_live_vllm
+      - name: Run complete live vLLM Responses suite
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm)
         env:
           VLLM_TEST_BACKEND: live
         run: |
-          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py \
-            -s -m "(real_inference or vllm_compat) and not critical_vllm"
+          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 
       - name: vLLM container logs
         if: failure()
@@ -407,6 +415,8 @@ jobs:
     needs: [changes]
     if: |
       always() &&
+      github.event_name != 'schedule' &&
+      (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
