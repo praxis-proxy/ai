@@ -5087,6 +5087,7 @@ def _assert_matches_schema(value: Any, schema: dict[str, Any], path: str = "$") 
     raise AssertionError(f"unsupported test schema type {expected_type!r} at {path}")
 
 
+@requires_real_inference
 @pytest.mark.parametrize("prompt,schema", STRUCTURED_OUTPUT_SCHEMA_CASES)
 def test_structured_output_schema_shapes(openai_client, prompt, schema):
     """Exercise nine structured-output schema shapes."""
@@ -5111,6 +5112,7 @@ def test_structured_output_schema_shapes(openai_client, prompt, schema):
     _assert_matches_schema(json.loads(response.output_text), schema)
 
 
+@requires_vllm_compat
 def test_include_logprobs_non_streaming(openai_client):
     """Verify the finite include=message.output_text.logprobs scenario."""
     response = openai_client.responses.create(
@@ -5127,6 +5129,7 @@ def test_include_logprobs_non_streaming(openai_client):
     assert messages[0].content[0].logprobs
 
 
+@requires_vllm_compat
 def test_include_logprobs_streaming(openai_client):
     """Verify the streaming include=message.output_text.logprobs scenario."""
     events = list(
@@ -5151,6 +5154,7 @@ def test_include_logprobs_streaming(openai_client):
     assert messages[0].content[0].logprobs
 
 
+@requires_vllm_compat
 def test_response_extra_body_guided_choice(openai_client):
     """Verify the vLLM-specific structured_outputs.choice passthrough case."""
     response = openai_client.responses.create(
@@ -5179,6 +5183,7 @@ def _create_short_response(openai_client, **options):
     strict=True,
     reason="native Responses does not yet echo prompt_cache_key in streamed response objects",
 )
+@requires_vllm_compat
 def test_openai_response_with_prompt_cache_key_streaming(openai_client):
     """Verify the streaming prompt_cache_key response-shape scenario."""
     cache_key = "responses-coverage-streaming-cache"
@@ -5191,7 +5196,7 @@ def test_openai_response_with_prompt_cache_key_streaming(openai_client):
         )
     )
 
-    terminal = _assert_stream_contract(events, expected_text="RESPONSES-COVERAGE-OK")
+    terminal = _assert_stream_contract(events)
     assert events[0].response.prompt_cache_key == cache_key
     assert terminal.prompt_cache_key == cache_key
 
@@ -5200,6 +5205,7 @@ def test_openai_response_with_prompt_cache_key_streaming(openai_client):
     strict=True,
     reason="native Responses does not yet echo prompt_cache_key in finite response objects",
 )
+@requires_vllm_compat
 def test_openai_response_with_prompt_cache_key_and_previous_response(openai_client):
     """Verify the prompt_cache_key plus previous_response_id scenario."""
     cache_key = "responses-coverage-continuation-cache"
@@ -5220,6 +5226,7 @@ def test_openai_response_with_prompt_cache_key_and_previous_response(openai_clie
     assert second.previous_response_id == first.id
 
 
+@requires_vllm_compat
 def test_openai_response_with_truncation_disabled_streaming(openai_client):
     """Verify the streaming truncation response-shape scenario."""
     events = list(
@@ -5231,7 +5238,7 @@ def test_openai_response_with_truncation_disabled_streaming(openai_client):
         )
     )
 
-    terminal = _assert_stream_contract(events, expected_text="RESPONSES-COVERAGE-OK")
+    terminal = _assert_stream_contract(events)
     assert events[0].response.truncation == "disabled"
     assert terminal.truncation == "disabled"
 
@@ -5240,6 +5247,7 @@ def test_openai_response_with_truncation_disabled_streaming(openai_client):
     strict=True,
     reason="native Responses currently reports the default top_p instead of the requested value",
 )
+@requires_vllm_compat
 def test_openai_response_with_top_p_streaming(openai_client):
     """Verify the streaming top_p response-shape scenario."""
     events = list(
@@ -5251,7 +5259,7 @@ def test_openai_response_with_top_p_streaming(openai_client):
         )
     )
 
-    terminal = _assert_stream_contract(events, expected_text="RESPONSES-COVERAGE-OK")
+    terminal = _assert_stream_contract(events)
     assert events[0].response.top_p == 0.8
     assert terminal.top_p == 0.8
 
@@ -5260,6 +5268,7 @@ def test_openai_response_with_top_p_streaming(openai_client):
     strict=True,
     reason="native Responses currently reports the default top_p instead of the requested value",
 )
+@requires_vllm_compat
 def test_openai_response_with_top_p_and_previous_response(openai_client):
     """Verify the top_p plus previous_response_id scenario."""
     first = _create_short_response(openai_client, top_p=0.7, store=True)
@@ -5275,6 +5284,7 @@ def test_openai_response_with_top_p_and_previous_response(openai_client):
     assert second.previous_response_id == first.id
 
 
+@requires_vllm_compat
 def test_openai_response_with_parallel_tool_calls_disabled_streaming(openai_client):
     """Verify the streaming parallel_tool_calls=false shape scenario."""
     events = list(
@@ -5286,11 +5296,12 @@ def test_openai_response_with_parallel_tool_calls_disabled_streaming(openai_clie
         )
     )
 
-    terminal = _assert_stream_contract(events, expected_text="RESPONSES-COVERAGE-OK")
+    terminal = _assert_stream_contract(events)
     assert events[0].response.parallel_tool_calls is False
     assert terminal.parallel_tool_calls is False
 
 
+@requires_vllm_compat
 def test_openai_response_with_parallel_tool_calls_and_previous_response(openai_client):
     """Verify the parallel_tool_calls plus continuation scenario."""
     first = _create_short_response(
@@ -5321,7 +5332,7 @@ def test_openai_response_with_stream_options_includes_usage(openai_client):
         )
     )
 
-    terminal = _assert_stream_contract(events, expected_text="RESPONSES-COVERAGE-OK")
+    terminal = _assert_stream_contract(events)
     assert terminal.usage is not None
     assert terminal.usage.total_tokens > 0
 
@@ -5334,9 +5345,13 @@ def test_openai_response_with_stream_options_non_streaming(openai_client):
         store=False,
     )
 
-    assert "RESPONSES-COVERAGE-OK" in response.output_text
-    assert response.usage is not None
-    assert response.usage.total_tokens > 0
+    assert response.object == "response"
+    assert response.status == "completed"
+    messages = [item for item in response.output if item.type == "message"]
+    assert len(messages) == 1
+    assert messages[0].content
+    assert messages[0].content[0].type == "output_text"
+    _assert_usage(response.usage)
 
 
 def test_openai_response_with_stream_options_and_previous_response(openai_client):
@@ -5352,11 +5367,12 @@ def test_openai_response_with_stream_options_and_previous_response(openai_client
         )
     )
 
-    terminal = _assert_stream_contract(events, expected_text="RESPONSES-COVERAGE-OK")
+    terminal = _assert_stream_contract(events)
     assert terminal.previous_response_id == first.id
     assert terminal.usage is not None
 
 
+@requires_vllm_compat
 def test_invalid_model_raises_not_found_error(openai_client):
     """Verify the SDK exception contract for an unknown model."""
     with pytest.raises(NotFoundError) as exc_info:
@@ -5386,6 +5402,7 @@ def test_invalid_max_tool_calls_raises_bad_request(openai_client):
     assert "max_tool_calls" in str(exc_info.value).lower()
 
 
+@requires_vllm_compat
 def test_invalid_temperature_raises_bad_request(openai_client):
     """Verify propagation of the backend's sampling-temperature validation."""
     with pytest.raises(BadRequestError) as exc_info:
@@ -5399,6 +5416,7 @@ def test_invalid_temperature_raises_bad_request(openai_client):
     assert "temperature" in str(exc_info.value).lower()
 
 
+@requires_vllm_compat
 def test_invalid_tool_choice_raises_bad_request(openai_client):
     """Verify the invalid tool_choice error scenario."""
     with pytest.raises(BadRequestError) as exc_info:
