@@ -6,8 +6,7 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, example_config_path, free_port, http_send, json_post, parse_body, parse_header, parse_status, patch_yaml,
-    start_proxy,
+    Backend, example_config_path, free_port, http_send, parse_body, parse_header, parse_status, patch_yaml, start_proxy,
 };
 use sqlx::Row as _;
 
@@ -322,7 +321,7 @@ async fn stream_events_fails_closed_when_accumulation_budget_exceeded() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
+        &json_post_with_owner(
             "/v1/responses",
             r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
         ),

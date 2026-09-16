@@ -15,10 +15,6 @@ listeners:
 filter_chains:
   - name: agentic-fixture
     filters:
-      - filter: state_owner
-        mode: single_tenant
-        tenant_id: local
-
       - filter: openai_responses_format
         on_invalid: reject
         headers:

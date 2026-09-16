@@ -8,7 +8,6 @@
 # store -> rehydrate -> proxy path deterministically.
 #
 # Pipeline ordering:
-#   0. state_owner        — installs the explicit shared local owner
 #   1. openai_responses_format   — classifies body, promotes metadata
 #   2. openai_responses_validate — parses JSON, enriches metadata, IDs
 #   3. openai_response_store     — initializes store, registers in ctx
@@ -34,10 +33,6 @@ listeners:
 filter_chains:
   - name: responses-rehydrate-fixture
     filters:
-      - filter: state_owner
-        mode: single_tenant
-        tenant_id: local
-
       - filter: openai_responses_format
         on_invalid: reject
 
