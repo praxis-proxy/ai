@@ -31,7 +31,13 @@ import time
 
 import httpx
 import pytest
-from openai import AuthenticationError, BadRequestError, NotFoundError, OpenAI
+from openai import (
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    NotFoundError,
+    OpenAI,
+)
 
 # When set to a postgres:// URL (the vllm-responses-postgres CI job), the
 # conversations store runs against PostgreSQL instead of the default in-memory
@@ -124,7 +130,14 @@ def _write_config(port: int) -> str:
         "filter_chains": [
             {
                 "name": "conversations-pipeline",
-                "filters": [_conversations_filter()],
+                "filters": [
+                    {
+                        "filter": "state_owner",
+                        "mode": "single_tenant",
+                        "tenant_id": "default",
+                    },
+                    _conversations_filter(),
+                ],
             }
         ],
     }
@@ -384,7 +397,7 @@ class TestOpenAIConversations:
             openai_client.conversations.retrieve(conversation.id)
         assert exc_info.value.status_code == 404
 
-    def test_conversation_delete_preserves_items(self, openai_client):
+    def test_deleted_conversation_hides_preserved_items(self, openai_client):
         conversation = openai_client.conversations.create(
             items=[
                 {
@@ -397,14 +410,12 @@ class TestOpenAIConversations:
         )
         openai_client.conversations.delete(conversation.id)
 
-        item = openai_client.conversations.items.retrieve(
-            "item_keep",
-            conversation_id=conversation.id,
-        )
-
-        assert item.id == "item_keep"
-        assert item.type == "message"
-        assert item.content[0].text == "keep me"
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.retrieve(
+                "item_keep",
+                conversation_id=conversation.id,
+            )
+        assert exc_info.value.status_code == 404
 
     def test_empty_item_list_is_sdk_compatible(self, openai_client):
         conversation = openai_client.conversations.create()
@@ -1112,7 +1123,7 @@ class TestConversationTenantIsolation:
         page = tenant_a.conversations.items.list(conversation.id)
         assert [item.id for item in page.data] == ["item_tenant_private"]
 
-    def test_same_item_id_can_exist_in_both_tenants(self, tenant_clients):
+    def test_item_id_cannot_transfer_between_tenants(self, tenant_clients):
         tenant_a, tenant_b = tenant_clients
         conversation_a = tenant_a.conversations.create(
             items=[
@@ -1124,27 +1135,24 @@ class TestConversationTenantIsolation:
                 }
             ],
         )
-        conversation_b = tenant_b.conversations.create(
-            items=[
-                {
-                    "id": "item_shared_across_tenants",
-                    "type": "message",
-                    "role": "user",
-                    "content": "tenant-b value",
-                }
-            ],
-        )
+        with pytest.raises(InternalServerError) as exc_info:
+            tenant_b.conversations.create(
+                items=[
+                    {
+                        "id": "item_shared_across_tenants",
+                        "type": "message",
+                        "role": "user",
+                        "content": "tenant-b value",
+                    }
+                ],
+            )
+        assert exc_info.value.status_code == 500
 
         item_a = tenant_a.conversations.items.retrieve(
             "item_shared_across_tenants",
             conversation_id=conversation_a.id,
         )
-        item_b = tenant_b.conversations.items.retrieve(
-            "item_shared_across_tenants",
-            conversation_id=conversation_b.id,
-        )
         assert item_a.content[0].text == "tenant-a value"
-        assert item_b.content[0].text == "tenant-b value"
 
     def test_denied_access_does_not_affect_callers_own_resources(
         self,

@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Test-only Praxis server that resolves SDK bearer tokens to tenant metadata.
+//! Test-only Praxis server that resolves SDK bearer tokens to immutable owners.
 
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use praxis_ai_apis::StateOwner;
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection};
-
-/// Metadata key consumed by the OpenAI Conversations handler.
-const TENANT_METADATA_KEY: &str = "responses.tenant_id";
 
 /// Fixed identities used by the SDK integration suite.
 const TENANT_TOKENS: [(&str, &str); 2] = [("tenant-a-token", "tenant-a"), ("tenant-b-token", "tenant-b")];
+
+/// Stable identity provider for deterministic test owners.
+const TEST_ISSUER: &str = "urn:praxis:test-sdk-auth";
+
+/// Stable subject shared across tenant namespaces in the SDK isolation tests.
+const TEST_SUBJECT: &str = "sdk-user";
 
 /// Resolve deterministic test credentials into trusted request metadata.
 struct TestTenantIdentityFilter;
@@ -50,7 +54,9 @@ impl HttpFilter for TestTenantIdentityFilter {
         let Some(tenant_id) = tenant_id else {
             return Ok(unauthorized());
         };
-        ctx.set_metadata(TENANT_METADATA_KEY, tenant_id);
+        let owner = StateOwner::from_trusted_parts(tenant_id, TEST_ISSUER, TEST_SUBJECT)
+            .map_err(|error| -> FilterError { Box::new(error) })?;
+        ctx.extensions.insert(owner);
         Ok(FilterAction::Continue)
     }
 }
