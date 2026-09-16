@@ -59,3 +59,7 @@ jobs:
         uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           category: "/language:${{ matrix.language }}"
+          # Keep CodeQL a required merge-queue gate, but skip SARIF upload for
+          # the ephemeral gh-readonly-queue ref (uploads are rejected there).
+          # PR and main runs continue uploading code-scanning results.
+          upload: ${{ github.event_name == 'merge_group' && 'never' || 'always' }}
