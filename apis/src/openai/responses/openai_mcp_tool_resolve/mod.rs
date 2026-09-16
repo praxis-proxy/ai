@@ -366,18 +366,14 @@ impl McpToolResolveFilter {
             debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
             return Ok(Some(cached));
         }
-        let forwarded_headers = is_connector.then_some(forwarded_headers);
-        let tools = fetch_tools(
-            entry,
-            server_url,
-            &self.forward_headers,
-            forwarded_headers,
-            self.timeout,
-            self.max_tools,
-            self.allow_loopback,
-        )
-        .await?;
-        Ok(Some(tools))
+        let options = FetchToolsOptions {
+            forwarded_header_names: &self.forward_headers,
+            forwarded_headers: is_connector.then_some(forwarded_headers),
+            timeout: self.timeout,
+            max_tools: self.max_tools,
+            allow_loopback: self.allow_loopback,
+        };
+        fetch_tools(entry, server_url, options).await.map(Some)
     }
 }
 
@@ -1483,16 +1479,26 @@ fn count_distinct_servers(entries: &[serde_json::Value]) -> usize {
     seen.len()
 }
 
+/// Options shared by eager and deferred MCP `tools/list` requests.
+struct FetchToolsOptions<'a> {
+    /// Trusted header names removed from client-controlled MCP configuration.
+    forwarded_header_names: &'a [http::HeaderName],
+    /// Trusted header values projected for an operator-configured connector.
+    forwarded_headers: Option<&'a http::HeaderMap>,
+    /// End-to-end MCP request timeout.
+    timeout: Duration,
+    /// Maximum accepted tools in the listing.
+    max_tools: usize,
+    /// Whether loopback destinations are permitted.
+    allow_loopback: bool,
+}
+
 /// Call `tools/list` on the MCP server with per-page
 /// `max_tools` enforcement.
 async fn fetch_tools(
     entry: &serde_json::Value,
     server_url: &str,
-    forwarded_header_names: &[http::HeaderName],
-    forwarded_headers: Option<&http::HeaderMap>,
-    timeout: Duration,
-    max_tools: usize,
-    allow_loopback: bool,
+    options: FetchToolsOptions<'_>,
 ) -> Result<Vec<serde_json::Value>, ResolveError> {
     let display_url = mcp_client::parse_display_url(server_url);
     debug!(label = server_label(entry), url = %display_url, "calling MCP tools/list");
@@ -1501,11 +1507,11 @@ async fn fetch_tools(
         server_url,
         entry.get("headers"),
         auth,
-        forwarded_header_names,
-        forwarded_headers,
-        timeout,
-        max_tools,
-        allow_loopback,
+        options.forwarded_header_names,
+        options.forwarded_headers,
+        options.timeout,
+        options.max_tools,
+        options.allow_loopback,
     )
     .await
     .map_err(|source| ResolveError::Client {
@@ -2262,20 +2268,19 @@ async fn list_deferred_connector(
     mcp_client::validate_mcp_url(&connector.server_url, connector.timeout, connector.allow_loopback)
         .await
         .map_err(|source| deferred_connector_client_error(connector, source))?;
-    fetch_tools(
-        &entry,
-        &connector.server_url,
+    let options = FetchToolsOptions {
         forwarded_header_names,
-        Some(forwarded_headers),
-        connector.timeout,
-        connector.max_tools,
-        connector.allow_loopback,
-    )
-    .await
-    .map_err(|err| match err {
-        ResolveError::Client { source, .. } => deferred_connector_client_error(connector, source),
-        other => other,
-    })
+        forwarded_headers: Some(forwarded_headers),
+        timeout: connector.timeout,
+        max_tools: connector.max_tools,
+        allow_loopback: connector.allow_loopback,
+    };
+    fetch_tools(&entry, &connector.server_url, options)
+        .await
+        .map_err(|err| match err {
+            ResolveError::Client { source, .. } => deferred_connector_client_error(connector, source),
+            other => other,
+        })
 }
 
 /// URL-redacted connector failure for deferred `tools/list`.
