@@ -3,9 +3,23 @@ name: OpenAI Conformance
 on:
   push:
     branches: [main]
+    paths:
+      - "apis/**"
+      - "xtask/**"
+      - "docs/conformance/**"
+      - ".github/workflows/openai-conformance.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - "apis/**"
+      - "xtask/**"
+      - "docs/conformance/**"
+      - ".github/workflows/openai-conformance.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
   merge_group:
     branches: [main]
   workflow_dispatch:
@@ -18,9 +32,48 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  # CI never reads backtraces from these builds; skipping debuginfo trims both
+  # the cold compile and the cached target/ size.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
+  # merge_group events cannot use trigger-level `paths` filters, so gate the
+  # expensive job on a git diff over the same relevant paths. push/pull_request
+  # are already filtered above and skip this job (result == 'skipped').
+  changes:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect relevant path changes
+        id: filter
+        run: |
+          CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
+                                         "${{ github.event.merge_group.head_sha }}" -- \
+            'apis/' \
+            'xtask/' \
+            'docs/conformance/' \
+            '.github/workflows/openai-conformance.yaml' \
+            'Cargo.toml' 'Cargo.lock')
+          if [ -n "$CHANGED" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
   conformance:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -31,13 +84,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@6190aa5fb88a88ee71c12769924bbe63a9ab152e # 1.96.0
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        with:
+          cache-suffix: openai-conformance
 
       - name: Install Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6.0.0
         with:
           go-version: "1.26.x"
+          cache: false
 
       - name: Install pinned oasdiff
         run: go install github.com/oasdiff/oasdiff@v1.23.0
