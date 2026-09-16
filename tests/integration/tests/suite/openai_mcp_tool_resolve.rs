@@ -1383,6 +1383,9 @@ filter_chains:
         on_invalid: reject
       - filter: openai_responses_validate
       - filter: openai_tool_parse
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
       - filter: openai_response_store
         backend: sqlite
         database_url: "{db_url}"
@@ -1432,6 +1435,9 @@ filter_chains:
         on_invalid: reject
       - filter: openai_responses_validate
       - filter: openai_tool_parse
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
       - filter: openai_response_store
         backend: sqlite
         database_url: "{db_url}"
@@ -1483,6 +1489,9 @@ filter_chains:
       - filter: openai_responses_format
         on_invalid: reject
       - filter: openai_tool_parse
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
       - filter: openai_response_store
         backend: sqlite
         database_url: "{db_url}"
