@@ -1,4 +1,9 @@
 name: vLLM Integration
+run-name: >-
+  ${{ github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+      github.event.label.name == 'vllm-full-suite' &&
+      format('vLLM full suite label - PR #{0}', github.event.pull_request.number) ||
+      format('vLLM Integration - {0}', github.ref_name) }}
 
 # ------------------------------------------------------------------------------
 # Workflow Settings
@@ -25,26 +30,7 @@ on:
       - ".github/workflows/vllm-integration.yaml"
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened]
-    paths:
-      - "apis/src/openai/responses/**"
-      - "apis/src/openai/conversations/**"
-      - "apis/src/openai/sse/**"
-      - "apis/src/store/**"
-      - "server/**"
-      - "tests/integration/sdk/openai/**"
-      - "tests/utils/examples/conversations_tenant_proxy.rs"
-      - "tests/integration/ogx-constraints.txt"
-      - "examples/configs/openai/responses/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "Makefile"
-      - ".github/actions/start-vllm/**"
-      - ".github/actions/wait-vllm/**"
-      - ".github/workflows/vllm-integration.yaml"
-  pull_request_target:
-    branches: [main]
-    types: [labeled]
+    types: [opened, synchronize, reopened, labeled]
   merge_group:
     branches: [main]
   schedule:
@@ -60,9 +46,7 @@ on:
         type: boolean
 
 concurrency:
-  # Label-triggered runs must not share main's concurrency group. They are
-  # explicit requests and should each report their own completion result.
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request_target' && github.run_id || github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions: {}
@@ -83,11 +67,13 @@ env:
 
 jobs:
   # ----------------------------------------------------------------------------
-  # Path filter for merge_group (which does not support on.paths)
+  # Path filter for pull_request and merge_group. The pull_request trigger is
+  # intentionally unfiltered so a vllm-full-suite label can request a run on
+  # any PR; ordinary PR events still avoid the expensive jobs when irrelevant.
   # ----------------------------------------------------------------------------
 
   changes:
-    if: github.event_name == 'merge_group'
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.action != 'labeled')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -101,9 +87,11 @@ jobs:
 
       - name: Detect relevant path changes
         id: filter
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
-          CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
-                                         "${{ github.event.merge_group.head_sha }}" -- \
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
             'apis/src/openai/responses/' \
             'apis/src/openai/conversations/' \
             'apis/src/openai/sse/' \
@@ -134,7 +122,7 @@ jobs:
     if: |
       always() &&
       github.event_name != 'schedule' &&
-      github.event_name != 'pull_request_target' &&
+      (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
       (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
@@ -297,60 +285,26 @@ jobs:
           fi
 
   # ----------------------------------------------------------------------------
-  # A vllm-full-suite label is an explicit request to run the complete live
-  # suite for a PR. Notify from separate hosted jobs so the start comment is
-  # posted even when the vLLM runner is queued, and use the GitHub App token
-  # required for automated PR comments.
-  # ----------------------------------------------------------------------------
-
-  vllm-full-suite-start:
-    if: |
-      github.event_name == 'pull_request_target' &&
-      github.event.action == 'labeled' &&
-      github.event.label.name == 'vllm-full-suite'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Generate token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
-          private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
-
-      - name: Comment that the full suite started
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REQUESTED_BY: ${{ github.actor }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          gh pr comment "$PR_NUMBER" --repo "$GH_REPO" --body \
-            "Full live vLLM Responses suite started by @${REQUESTED_BY}: [run ${RUN_ID}](${RUN_URL})."
-
-  # ----------------------------------------------------------------------------
   # Critical live CPU smoke tests on every relevant change. Nightly, explicitly
   # requested dispatches, and vllm-full-suite labels run the complete suite.
   # ----------------------------------------------------------------------------
 
   vllm-live-cpu:
-    needs: [changes, vllm-full-suite-start]
+    needs: [changes]
     if: |
       always() &&
       (
         github.event_name == 'schedule' ||
         (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) ||
         (
-          github.event_name == 'pull_request_target' &&
+          github.event_name == 'pull_request' &&
           github.event.action == 'labeled' &&
           github.event.label.name == 'vllm-full-suite'
         ) ||
         (
           github.event_name != 'workflow_dispatch' &&
           github.event_name != 'schedule' &&
-          github.event_name != 'pull_request_target' &&
+          (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
           (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
         )
       )
@@ -365,10 +319,6 @@ jobs:
           docker system prune -af
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # pull_request_target keeps the trusted workflow definition from main;
-          # only this read-only test job checks out and executes the PR merge ref.
-          ref: ${{ github.event_name == 'pull_request_target' && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.sha }}
 
       - name: Setup Rust
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
@@ -424,7 +374,7 @@ jobs:
           done
 
       - name: Run critical live vLLM smoke tests
-        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && github.event_name != 'pull_request_target'
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && (github.event_name != 'pull_request' || github.event.action != 'labeled')
         env:
           VLLM_TEST_BACKEND: live
         run: |
@@ -432,7 +382,7 @@ jobs:
             -s -m "critical_vllm"
 
       - name: Run complete live vLLM Responses suite
-        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) || github.event_name == 'pull_request_target'
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) || (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'vllm-full-suite')
         env:
           VLLM_TEST_BACKEND: live
         run: |
@@ -457,41 +407,6 @@ jobs:
             kill "$(cat /tmp/ogx.pid)" 2>/dev/null || true
           fi
 
-  vllm-full-suite-finish:
-    needs: [vllm-live-cpu]
-    if: |
-      always() &&
-      github.event_name == 'pull_request_target' &&
-      github.event.action == 'labeled' &&
-      github.event.label.name == 'vllm-full-suite'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Generate token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
-          private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
-
-      - name: Comment with the full suite result
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          GH_REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          RESULT: ${{ needs.vllm-live-cpu.result }}
-          RUN_ID: ${{ github.run_id }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          case "$RESULT" in
-            success) icon="✅" ;;
-            failure) icon="❌" ;;
-            cancelled) icon="⏹️" ;;
-            *) icon="⚪" ;;
-          esac
-          gh pr comment "$PR_NUMBER" --repo "$GH_REPO" --body \
-            "${icon} Full live vLLM Responses suite finished with **${RESULT}**: [run ${RUN_ID}](${RUN_URL})."
-
   # ----------------------------------------------------------------------------
   # Fast Responses API integration tests with PostgreSQL store backend
   # ----------------------------------------------------------------------------
@@ -501,7 +416,7 @@ jobs:
     if: |
       always() &&
       github.event_name != 'schedule' &&
-      github.event_name != 'pull_request_target' &&
+      (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
       (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
