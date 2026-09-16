@@ -22,6 +22,12 @@ jobs:
   start-runner:
     name: Start ephemeral EC2 GPU runner
     runs-on: ubuntu-24.04
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-2' }}
+      AWS_GPU_AMI_ID: ${{ vars.AWS_GPU_AMI_ID }}
+      # Use region-specific subnet and security group variable names.
+      AWS_SUBNET_ID: ${{ vars.AWS_SUBNET_ID || vars.US_EAST_2A_SUBNET_ID }}
+      AWS_SECURITY_GROUP_ID: ${{ vars.AWS_SECURITY_GROUP_ID || vars.US_EAST_2_SG_ID }}
     permissions:
       id-token: write
       contents: read
@@ -33,8 +39,35 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e3ddf4a3c70b81927282e7806a74ba64ab497e47 # v4.0.2
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+          aws-region: ${{ env.AWS_REGION }}
           role-session-name: praxis-gpu-smoke-start
+
+      - name: Validate EC2 runner configuration
+        run: |
+          set -euo pipefail
+
+          for name in AWS_GPU_AMI_ID AWS_SUBNET_ID AWS_SECURITY_GROUP_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "Required repository variable for $name is not configured" >&2
+              exit 1
+            fi
+          done
+
+          if validation="$(aws ec2 run-instances \
+            --region "$AWS_REGION" \
+            --image-id "$AWS_GPU_AMI_ID" \
+            --instance-type g4dn.xlarge \
+            --subnet-id "$AWS_SUBNET_ID" \
+            --security-group-ids "$AWS_SECURITY_GROUP_ID" \
+            --dry-run 2>&1)"; then
+            echo "EC2 dry-run unexpectedly succeeded without returning DryRunOperation" >&2
+            exit 1
+          elif [[ "$validation" != *DryRunOperation* ]]; then
+            echo "$validation" >&2
+            exit 1
+          fi
+
+          echo "Validated AMI, subnet, and security group for g4dn.xlarge in $AWS_REGION"
 
       - name: Start EC2 runner
         id: start-ec2-runner
@@ -42,10 +75,10 @@ jobs:
         with:
           mode: start
           github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
-          ec2-image-id: ${{ vars.AWS_GPU_AMI_ID }}
+          ec2-image-id: ${{ env.AWS_GPU_AMI_ID }}
           ec2-instance-type: g4dn.xlarge
-          subnet-id: ${{ vars.AWS_SUBNET_ID }}
-          security-group-id: ${{ vars.AWS_SECURITY_GROUP_ID }}
+          subnet-id: ${{ env.AWS_SUBNET_ID }}
+          security-group-id: ${{ env.AWS_SECURITY_GROUP_ID }}
 
   vllm-gpu-hello:
     name: Run vLLM GPU hello-world smoke
