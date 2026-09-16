@@ -14,11 +14,12 @@ use sqlx::{
 use tracing::info;
 
 use super::{
+    compression::{StoreCompressionConfig, decode},
     pool::{PoolConfig, apply_pool_config},
     schemas::{
-        ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, TableNames, check_schema,
-        expected_tables, generate_ddl, pending_approvals_table, pg_key_column_folding, schema_version_table,
-        validate_postgres_identifiers,
+        ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
+        check_schema, expected_tables, generate_ddl, pending_approvals_table, pg_key_column_folding,
+        schema_version_table, validate_postgres_identifiers,
     },
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
@@ -84,6 +85,8 @@ pub struct PostgresResponseStore {
     pool: sqlx::PgPool,
     /// Configured table names.
     tables: TableNames,
+    /// Payload compression codec applied on write.
+    compression: StoreCompressionConfig,
 }
 
 impl PostgresResponseStore {
@@ -106,13 +109,19 @@ impl PostgresResponseStore {
     /// CA. Certificate path existence is validated at connection
     /// time, not at construction.
     ///
+    /// `compression` selects the optional codec applied to the
+    /// responses table's payload columns on write; when omitted, those
+    /// payloads are stored as raw JSON bytes. Reads auto-detect the
+    /// format, so records written under any setting remain readable.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Database`] if the connection, schema
     /// initialization, or table name validation fails.
     #[expect(
         clippy::too_many_arguments,
-        reason = "constructor mirrors SqliteResponseStore::new with SSL and pool additions"
+        clippy::too_many_lines,
+        reason = "constructor mirrors SqliteResponseStore::new with SSL, pool, and compression additions"
     )]
     pub async fn new(
         database_url: &str,
@@ -122,6 +131,7 @@ impl PostgresResponseStore {
         ssl_mode: Option<SslMode>,
         ssl_root_cert: Option<&str>,
         pool_config: Option<&PoolConfig>,
+        compression: Option<&StoreCompressionConfig>,
     ) -> Result<Self, StoreError> {
         let tables = TableNames {
             responses: responses_table.to_owned(),
@@ -129,7 +139,7 @@ impl PostgresResponseStore {
             items: items_table.map(str::to_owned),
         };
         validate_postgres_identifiers(&tables)?;
-        let ddl = generate_ddl(&tables)?;
+        let ddl = generate_ddl(&tables, SqlDialect::Postgres)?;
 
         let options = pg_connect_options(database_url, ssl_mode, ssl_root_cert)?;
         let pool = Box::pin(apply_pool_config(PgPoolOptions::new(), pool_config).connect_with(options))
@@ -151,7 +161,11 @@ impl PostgresResponseStore {
             conversations = conversations_table,
             "postgres response store initialized"
         );
-        Ok(Self { pool, tables })
+        Ok(Self {
+            pool,
+            tables,
+            compression: compression.cloned().unwrap_or_default(),
+        })
     }
 
     /// Insert or update a conversation row shared by both store traits.
@@ -487,10 +501,9 @@ async fn check_schema_version(pool: &sqlx::PgPool, tables: &TableNames) -> Resul
 #[async_trait]
 impl ResponseStore for PostgresResponseStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
-        let response_object =
-            serde_json::to_string(&record.response_object).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let input = serde_json::to_string(&record.input).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let messages = serde_json::to_string(&record.messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let response_object = self.compression.encode(&record.response_object)?;
+        let input = self.compression.encode(&record.input)?;
+        let messages = self.compression.encode(&record.messages)?;
 
         let sql = format!(
             "INSERT INTO {} \
@@ -633,10 +646,9 @@ impl ResponseStore for PostgresResponseStore {
             return self.upsert_response(record).await;
         }
 
-        let response_object =
-            serde_json::to_string(&record.response_object).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let input = serde_json::to_string(&record.input).map_err(|e| StoreError::Serialization(e.to_string()))?;
-        let messages = serde_json::to_string(&record.messages).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let response_object = self.compression.encode(&record.response_object)?;
+        let input = self.compression.encode(&record.input)?;
+        let messages = self.compression.encode(&record.messages)?;
 
         let upsert_sql = format!(
             "INSERT INTO {} \
@@ -1333,11 +1345,11 @@ fn row_to_pending_approval_record(row: &PgRow) -> Result<PendingApprovalRecord, 
 
 /// Convert a sqlx row to a [`ResponseRecord`].
 fn row_to_response_record(row: &PgRow) -> Result<ResponseRecord, StoreError> {
-    let response_object_json: String = row
+    let response_object_json: Vec<u8> = row
         .try_get("response_object")
         .map_err(|e| StoreError::Database(e.to_string()))?;
-    let input_json: String = row.try_get("input").map_err(|e| StoreError::Database(e.to_string()))?;
-    let messages_json: String = row
+    let input_json: Vec<u8> = row.try_get("input").map_err(|e| StoreError::Database(e.to_string()))?;
+    let messages_json: Vec<u8> = row
         .try_get("messages")
         .map_err(|e| StoreError::Database(e.to_string()))?;
 
@@ -1350,10 +1362,9 @@ fn row_to_response_record(row: &PgRow) -> Result<ResponseRecord, StoreError> {
             .try_get("created_at")
             .map_err(|e| StoreError::Database(e.to_string()))?,
         model: row.try_get("model").map_err(|e| StoreError::Database(e.to_string()))?,
-        response_object: serde_json::from_str(&response_object_json)
-            .map_err(|e| StoreError::Serialization(e.to_string()))?,
-        input: serde_json::from_str(&input_json).map_err(|e| StoreError::Serialization(e.to_string()))?,
-        messages: serde_json::from_str(&messages_json).map_err(|e| StoreError::Serialization(e.to_string()))?,
+        response_object: decode(&response_object_json)?,
+        input: decode(&input_json)?,
+        messages: decode(&messages_json)?,
     })
 }
 

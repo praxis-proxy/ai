@@ -2005,7 +2005,7 @@ async fn seed_weather_approval(store: &dyn ResponseStore, response_id: &str, id:
 /// A fresh in-memory SQLite store for the approval-consumption path.
 async fn make_approval_store() -> Arc<dyn ResponseStore> {
     Arc::new(
-        SqliteResponseStore::new("sqlite::memory:", "resp", "conv", None, None)
+        SqliteResponseStore::new("sqlite::memory:", "resp", "conv", None, None, None)
             .await
             .expect("in-memory store should initialize"),
     )
