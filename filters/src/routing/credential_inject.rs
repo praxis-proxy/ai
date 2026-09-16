@@ -529,7 +529,10 @@ fn strategy_label(strategy: &str) -> &'static str {
 /// `header`; `apikey` injects the configured `header`, defaulting to
 /// `x-api-key`.  Reserved internal header prefixes are rejected because the
 /// Praxis upstream boundary would strip the injected credential in flight,
-/// and `authorization` stays owned by the `bearer_token` strategy.
+/// transport-controlled headers are rejected because injecting into them
+/// corrupts authority selection or HTTP framing (and `proxy-authorization`
+/// would hand the credential to an intermediary), and `authorization` stays
+/// owned by the `bearer_token` strategy.
 #[expect(
     clippy::too_many_lines,
     reason = "injection header selection and validation is intentionally kept together"
@@ -568,6 +571,13 @@ fn resolve_header_name(entry: &CredentialEntryConfig) -> Result<HeaderName, Filt
             if name == AUTHORIZATION {
                 return Err(format!(
                     "credential_inject: header 'authorization' for '{}/{}/{}' must use strategy 'bearer_token'",
+                    entry.name, entry.namespace, entry.key
+                )
+                .into());
+            }
+            if praxis_ai_apis::promotion::is_transport_controlled_header_lowercase(name.as_str()) {
+                return Err(format!(
+                    "credential_inject: header '{header}' for '{}/{}/{}' is transport-controlled and must not receive the provider credential",
                     entry.name, entry.namespace, entry.key
                 )
                 .into());
@@ -1007,6 +1017,31 @@ mod tests {
             err.to_string().contains("must use strategy 'bearer_token'"),
             "authorization must stay owned by the bearer strategy: {err}"
         );
+    }
+
+    #[test]
+    fn apikey_transport_controlled_header_rejected() {
+        // Syntactically valid names the transport owns: injecting the provider
+        // credential into any of them corrupts authority selection or HTTP
+        // framing, or hands the credential to an intermediary.
+        for header in [
+            "host",
+            "content-length",
+            "connection",
+            "proxy-authorization",
+            "transfer-encoding",
+        ] {
+            let yaml = format!(
+                "credentials:\n  - name: s\n    namespace: ns\n    key: k\n    strategy: apikey\n    value: tok\n    header: {header}"
+            );
+            let err = parse(&yaml)
+                .err()
+                .expect("transport-controlled header must be rejected");
+            assert!(
+                err.to_string().contains("transport-controlled"),
+                "{header} must be rejected as a transport-controlled injection header: {err}"
+            );
+        }
     }
 
     #[test]
