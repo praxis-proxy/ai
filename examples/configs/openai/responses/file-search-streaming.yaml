@@ -6,8 +6,8 @@
 # model inference before finalizing the SSE lifecycle with citation annotations.
 #
 # This config uses the streaming step order mandated by §5 of the #313 spec:
-# `openai_stream_events` is REQUIRED ahead of `openai_file_search_callout` and
-# `openai_responses_proxy`. It always composes the current IRR execution into
+# `openai_stream_events` is REQUIRED ahead of `openai_file_search_dispatch` and
+# `openai_proxy`. It always composes the current IRR execution into
 # one logical Responses stream. The proxy derives
 # the streaming transport automatically from the effective outbound `stream:
 # true`; there is no operator opt-in. Typed streaming commits response.completed
@@ -19,7 +19,7 @@
 #
 # openai_agentic_loop is the sole loop owner: it parses each streamed
 # model round, records file-search assignments, and publishes the single
-# continuation signal (action=loop|done). openai_file_search_callout is a
+# continuation signal (action=loop|done). openai_file_search_dispatch is a
 # request-phase dispatcher that executes those assignments at request-body
 # EOS on IRR re-entry (#1046). openai_stream_events composes every round
 # into one logical Responses stream.
@@ -51,8 +51,8 @@ listeners:
 filter_chains:
   - name: file-search-streaming-pipeline
     filters:
-      - filter: openai_responses_format
-      - filter: openai_responses_validate
+      - filter: openai_format
+      - filter: openai_validate
       - filter: openai_tool_parse
       - filter: iterative_request_router
         initial_step: inference
@@ -71,7 +71,7 @@ filter_chains:
               # assigned in the prior streamed round, reconciling each in place
               # inside ResponsesState.accumulated_output. It never parses the
               # response body and never decides whether another round runs.
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 vector_store_url: http://127.0.0.1:8001
                 allow_private_url: true
                 timeout_ms: 5000
@@ -89,7 +89,7 @@ filter_chains:
               # must stay below the IRR max_iterations safety cap (7 + 1 = 8).
               - filter: openai_agentic_loop
                 max_infer_iters: 7
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
               - filter: headers
                 request_set:
                   - name: Content-Type

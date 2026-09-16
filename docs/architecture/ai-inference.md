@@ -65,7 +65,7 @@ The format filter promotes classified facts using
 three channels:
 
 - **Filter metadata**: durable key-value pairs
-  (e.g. `openai_responses_format.model`) that
+  (e.g. `openai_format.model`) that
   persist across Pingora phases. Used for
   cross-filter communication.
 - **Extra request headers**: added to the upstream
@@ -132,13 +132,13 @@ and promotes it to a configurable header (default
 `X-Model`). Enables header-based routing to
 provider-specific clusters.
 
-### `openai_responses_format`
+### `openai_format`
 
 Classifies AI API request bodies and promotes format,
 model, stream, store, background, and mode to
 headers, metadata, and filter results.
 
-### `openai_responses_validate`
+### `openai_validate`
 
 Parses Responses API request JSON, enriches filter metadata,
 and generates cryptographically random response and
@@ -163,7 +163,7 @@ Per-cluster API key injection with client credential
 stripping. Supports inline values and environment
 variable sources.
 
-### `openai_response_store`
+### `openai_store`
 
 Persists non-streaming Responses API responses. See
 [Response Store](response-store.md) for details.

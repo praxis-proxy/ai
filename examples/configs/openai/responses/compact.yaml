@@ -45,7 +45,7 @@ listeners:
 filter_chains:
   - name: compact-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -53,11 +53,11 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: openai_tool_parse
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
@@ -68,7 +68,7 @@ filter_chains:
       # inside an `iterative_request_router` step. This compaction demo proxies
       # finite responses, so it would be inert here. See `stream-events.yaml`
       # and `agentic-loop.yaml` for the in-IRR streaming examples.
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
@@ -84,7 +84,7 @@ filter_chains:
         allow_pre_security_callout: true
         on_unsupported: continue
 
-      - filter: openai_responses_compact
+      - filter: openai_compact
         # This direct summarization callout is anonymous; no downstream or
         # cluster authentication headers are forwarded.
         allow_pre_security_callout: true
@@ -93,7 +93,7 @@ filter_chains:
         default_model: llama3.2:1b
         timeout_ms: 60000
 
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
         name: inference
 
       - filter: router

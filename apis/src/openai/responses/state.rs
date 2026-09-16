@@ -5,21 +5,17 @@
 //!
 //! [`ResponsesState`] is stored in [`RequestExtensions`] and shared
 //! across filter phases. It holds the heavy data needed by the
-//! validate → rehydrate → `openai_tool_parse` → `openai_responses_proxy` →
+//! validate → rehydrate → `openai_tool_parse` → `openai_proxy` →
 //! `stream_events` → `openai_agentic_loop` pipeline.
 //!
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
 
-use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    fmt,
-    time::Duration,
-};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
 use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
 
-use super::{bounded_json_size, error::responses_error_rejection, file_search_callout::citations::annotate_response};
+use super::{bounded_json_size, error::responses_error_rejection, file_search_dispatch::citations::annotate_response};
 
 /// Maximum citation file mappings retained during one response execution.
 pub(crate) const MAX_CITATION_FILES: usize = 1_024;
@@ -37,7 +33,7 @@ pub(crate) enum SynthesisKind {
 }
 
 /// One `file_search_call` the parse owner (`openai_agentic_loop`) accumulated
-/// this round and handed to `openai_file_search_callout` for execution.
+/// this round and handed to `openai_file_search_dispatch` for execution.
 ///
 /// The owner is the sole parser: it appends the canonical `file_search_call`
 /// output item to [`ResponsesState::accumulated_output`] and records its
@@ -59,7 +55,7 @@ pub(crate) struct FileSearchAssignment {
 
 /// A terminal failure a request-phase dispatcher recorded in shared state.
 ///
-/// A dispatcher (e.g. `openai_file_search_callout`) never rejects or rewrites a
+/// A dispatcher (e.g. `openai_file_search_dispatch`) never rejects or rewrites a
 /// response itself — that would make it a second terminal-response owner. Instead
 /// it records the failure here and returns `Continue`; the parse owner
 /// (`openai_agentic_loop`), which runs next in the same request phase, converts it
@@ -218,9 +214,9 @@ pub(crate) enum McpApprovalState {
 
 /// Request-scoped state shared across Responses API filters.
 ///
-/// Created by `openai_responses_validate` for every Responses API
+/// Created by `openai_validate` for every Responses API
 /// create request. When `previous_response_id` is present,
-/// `openai_responses_rehydrate` replaces it with an enriched
+/// `openai_rehydrate` replaces it with an enriched
 /// version that includes conversation history. Uses
 /// [`serde_json::Value`] for flexibility while the Responses API
 /// types stabilize; can be refactored to typed structs later
@@ -289,16 +285,6 @@ pub(crate) struct ResponsesState {
     /// `openai_agentic_loop` at the start of each new inference round.
     pub iteration: u32,
 
-    /// Configured MCP connectors waiting for `tool_search` discovery.
-    ///
-    /// Populated by `openai_mcp_tool_resolve` when a request uses
-    /// `connector_id` with `defer_loading: true`. Consumed by
-    /// `openai_mcp_dispatch` on a later `tool_search_call` to load
-    /// definitions from the internally resolved endpoint. Holds the
-    /// pipeline-local URL and credentials; never serialized to the
-    /// inference backend, client responses, or persisted records.
-    pub deferred_mcp: Vec<DeferredMcpConnector>,
-
     /// Maximum number of built-in tool invocations.
     ///
     /// Enforced by built-in tool filters across retained output.
@@ -333,7 +319,7 @@ pub(crate) struct ResponsesState {
     /// Initialized from the current request's input. When
     /// `previous_response_id` is set, `rehydrate` prepends stored
     /// history. `openai_agentic_loop` appends tool results during agentic
-    /// loops. `openai_responses_proxy` reads this as the authoritative
+    /// loops. `openai_proxy` reads this as the authoritative
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
     pub messages: Vec<serde_json::Value>,
@@ -360,7 +346,7 @@ pub(crate) struct ResponsesState {
 
     /// Whether the store filter armed persistence for this exchange.
     ///
-    /// Set by `openai_response_store` during the request phase only after it
+    /// Set by `openai_store` during the request phase only after it
     /// initializes and registers a backend AND classifies this request as one
     /// whose response will be persisted. `mcp_dispatch` reads this
     /// exchange-scoped marker before emitting an `mcp_approval_request`: unlike
@@ -375,7 +361,7 @@ pub(crate) struct ResponsesState {
 
     /// Whether the streaming `previous_response_id` wire rewrite was armed.
     ///
-    /// Set in the response header phase by `openai_responses_rehydrate`
+    /// Set in the response header phase by `openai_rehydrate`
     /// (`arm_streaming_restore`) to the result of `eligible_previous_response_id_stream`:
     /// `true` only for a `200 OK`, identity-coded, validator-free event stream from
     /// a rehydrated turn carrying a caller id. The persistence source
@@ -439,13 +425,6 @@ pub(crate) struct ResponsesState {
     /// duplicate dispatch.
     pub tool_calls: Vec<serde_json::Value>,
 
-    /// `tool_search_call` items from the current inference response.
-    ///
-    /// Cleared by `openai_agentic_loop` at the start of each iteration.
-    /// `openai_mcp_dispatch` consumes these to load deferred connector
-    /// tools before the next inference round.
-    pub tool_search_calls: Vec<serde_json::Value>,
-
     /// Web search calls from the current inference response only.
     ///
     /// Cleared by `openai_agentic_loop` at the start of each iteration.
@@ -464,7 +443,7 @@ pub(crate) struct ResponsesState {
 
     /// Absolute indices into [`Self::accumulated_output`] (+ synthesis origin)
     /// of the `file_search_call` items `openai_agentic_loop` accumulated this
-    /// round for `openai_file_search_callout` to execute.
+    /// round for `openai_file_search_dispatch` to execute.
     ///
     /// The parse owner records one [`FileSearchAssignment`] per hosted file-search
     /// call it appended to `accumulated_output` (including private
@@ -535,7 +514,7 @@ pub(crate) struct ResponsesState {
     pub locally_executed_output_items: HashSet<String>,
 
     /// Absolute `output_index` values into `accumulated_output` (+ origin) for the
-    /// items `openai_file_search_callout` reconciled this round on the streaming
+    /// items `openai_file_search_dispatch` reconciled this round on the streaming
     /// path. Drained exactly once by `stream_events` at finalize (§4.2). Index + a
     /// 1-byte tag (no owned `Value`) so it needs no separate `continuation_state_fits` charge.
     pub pending_local_tool_synthesis: Vec<(usize, SynthesisKind)>,
@@ -617,62 +596,6 @@ pub(crate) struct EmittedItem {
     pub content_digest: u64,
 }
 
-/// Internally resolved MCP connector waiting for deferred discovery.
-#[derive(Clone)]
-pub(crate) struct DeferredMcpConnector {
-    /// Allow loopback MCP endpoints for this listing.
-    pub allow_loopback: bool,
-
-    /// Request `authorization` forwarded to the MCP endpoint.
-    pub authorization: Option<String>,
-
-    /// Original `allowed_tools` filter from the request entry.
-    pub allowed_tools: Option<serde_json::Value>,
-
-    /// Pipeline-local connector identifier from the request.
-    pub connector_id: String,
-
-    /// Request `headers` forwarded to the MCP endpoint.
-    pub headers: Option<serde_json::Value>,
-
-    /// Maximum size of the provider-visible body after deferred expansion.
-    pub max_rewritten_body_bytes: usize,
-
-    /// Maximum tools accepted from a single `tools/list` response.
-    pub max_tools: usize,
-
-    /// Request `require_approval` policy preserved for later dispatch.
-    pub require_approval: Option<serde_json::Value>,
-
-    /// Public server label used in function-name encoding and dispatch.
-    pub server_label: String,
-
-    /// Configured MCP endpoint URL. Never written to backend requests,
-    /// client-visible responses, logs, or persisted response state.
-    pub server_url: String,
-
-    /// Per-server timeout for the deferred `tools/list` call.
-    pub timeout: Duration,
-}
-
-impl fmt::Debug for DeferredMcpConnector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DeferredMcpConnector")
-            .field("allow_loopback", &self.allow_loopback)
-            .field("authorization", &self.authorization.as_ref().map(|_| "<redacted>"))
-            .field("allowed_tools", &self.allowed_tools)
-            .field("connector_id", &self.connector_id)
-            .field("headers", &self.headers.as_ref().map(|_| "<redacted>"))
-            .field("max_rewritten_body_bytes", &self.max_rewritten_body_bytes)
-            .field("max_tools", &self.max_tools)
-            .field("require_approval", &self.require_approval)
-            .field("server_label", &self.server_label)
-            .field("server_url", &"<redacted>")
-            .field("timeout", &self.timeout)
-            .finish()
-    }
-}
-
 /// Whether the proxy can preserve the original request bytes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum RequestBodyRebuild {
@@ -698,7 +621,6 @@ impl Default for ResponsesState {
             history_rehydrated: false,
             input: Vec::new(),
             iteration: 0,
-            deferred_mcp: Vec::new(),
             max_tool_calls: None,
             mcp_approval_state: McpApprovalState::None,
             deferred_tool_limit_completion: false,
@@ -721,7 +643,6 @@ impl Default for ResponsesState {
             response_object: serde_json::Value::Null,
             local_completion_response_template: serde_json::Value::Null,
             tool_calls: Vec::new(),
-            tool_search_calls: Vec::new(),
             web_search_calls: Vec::new(),
             web_search_calls_executed: 0,
             file_search_assignments: Vec::new(),
@@ -873,7 +794,7 @@ impl ResponsesState {
 
     /// Move the file-search assignment queue out, leaving it empty.
     ///
-    /// `openai_file_search_callout` drains this exactly once at request-body EOS
+    /// `openai_file_search_dispatch` drains this exactly once at request-body EOS
     /// so each assigned `file_search_call` is executed and reconciled a single
     /// time (drain-once), mirroring [`Self::drain_pending_local_tool_synthesis`].
     pub fn drain_file_search_assignments(&mut self) -> Vec<FileSearchAssignment> {
@@ -982,27 +903,6 @@ fn current_round_tool_call_admissions_by<'a>(
         }
     }
     admissions
-}
-
-/// Whether a queued hosted `tool_search_call` may still consume built-in budget.
-///
-/// Deferred connector discovery is the server-side execution of that search, so
-/// it must not run `tools/list` or start another inference round after
-/// `max_tool_calls` is exhausted. An omitted limit leaves discovery allowed.
-/// When the current round's output is not yet replayable, remaining prior-round
-/// budget is the admission signal.
-pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> bool {
-    let Some(max) = state.max_tool_calls else {
-        return true;
-    };
-    let remaining = usize::try_from(max)
-        .unwrap_or(usize::MAX)
-        .saturating_sub(consumed_builtin_tool_calls_before_current_round(state));
-    if remaining == 0 {
-        return false;
-    }
-    let admissions = current_round_tool_call_admissions(state, &state.tool_search_calls);
-    admissions.is_empty() || admissions.into_iter().any(|admitted| admitted)
 }
 
 /// Normalize the `input` field into a message array.
@@ -1393,47 +1293,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_search_discovery_rejects_exhausted_budget() {
-        let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
-        let exhausted = ResponsesState {
-            max_tool_calls: Some(0),
-            tool_search_calls: vec![search.clone()],
-            ..ResponsesState::default()
-        };
-        assert!(
-            !tool_search_discovery_is_within_budget(&exhausted),
-            "a zero remaining budget must not admit deferred tools/list"
-        );
-
-        let admitted = ResponsesState {
-            max_tool_calls: Some(1),
-            tool_search_calls: vec![search],
-            ..ResponsesState::default()
-        };
-        assert!(
-            tool_search_discovery_is_within_budget(&admitted),
-            "the first admitted hosted search may still list deferred connectors"
-        );
-    }
-
-    #[test]
-    fn tool_search_discovery_follows_current_round_admission_order() {
-        let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
-        let web = json!({"type": "web_search_call", "id": "ws_1", "status": "completed"});
-        let displaced = ResponsesState {
-            max_tool_calls: Some(1),
-            accumulated_output: vec![web.clone(), search.clone()],
-            response_object: json!({"output": [web, search.clone()]}),
-            tool_search_calls: vec![search],
-            ..ResponsesState::default()
-        };
-        assert!(
-            !tool_search_discovery_is_within_budget(&displaced),
-            "an earlier current-round built-in call consumes the shared cap first"
-        );
-    }
-
-    #[test]
     fn current_provider_execution_does_not_double_charge_round_admission() {
         let web_first = json!({"type":"web_search_call", "id":"ws_current", "status":"completed"});
         let web_second = json!({"type":"web_search_call", "id":"ws_second", "status":"completed"});
@@ -1513,43 +1372,40 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "exhaustive one-assert-per-field check of every default value"
+    )]
     fn default_produces_expected_values() {
         let state = ResponsesState::default();
         assert!(state.context_management.is_none());
         assert!(state.conversation.is_none());
+        assert!(state.include.is_empty());
+        assert!(state.input.is_empty());
         assert_eq!(state.iteration, 0);
         assert!(state.max_tool_calls.is_none());
+        assert!(state.mcp_tool_map.is_empty());
+        assert!(state.messages.is_empty());
+        assert!(state.output_items().is_empty());
         assert!(state.parallel_tool_calls);
         assert!(state.persisted_messages.is_empty());
         assert!(!state.store_persist_armed);
         assert!(state.previous_response_id.is_none());
+        assert!(state.previous_tools.is_empty());
         assert!(state.previous_usage.is_none());
         assert!(state.request_body.is_null());
         assert!(state.response_object.is_null());
+        assert!(state.tool_calls.is_empty());
+        assert!(state.web_search_calls.is_empty());
         assert_eq!(state.web_search_calls_executed, 0);
         assert!(
             state.file_search_assignments.is_empty(),
             "file-search assignments must start empty"
         );
         assert_eq!(state.tool_choice, json!("auto"));
-        assert!(state.usage.is_null());
-    }
-
-    #[test]
-    fn default_produces_empty_collections() {
-        let state = ResponsesState::default();
-        assert!(state.include.is_empty());
-        assert!(state.input.is_empty());
-        assert!(state.mcp_tool_map.is_empty());
-        assert!(state.messages.is_empty());
-        assert!(state.output_items().is_empty());
-        assert!(state.persisted_messages.is_empty());
-        assert!(state.previous_tools.is_empty());
-        assert!(state.tool_calls.is_empty());
-        assert!(state.tool_search_calls.is_empty());
-        assert!(state.deferred_mcp.is_empty());
-        assert!(state.web_search_calls.is_empty());
         assert!(state.tools.is_empty());
+        assert!(state.usage.is_null());
         assert!(state.accumulated_output.is_empty());
         assert!(state.emitted_output_items.is_empty());
         assert!(state.locally_executed_output_items.is_empty());

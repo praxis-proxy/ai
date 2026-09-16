@@ -15,7 +15,7 @@ use serde::Deserialize;
 /// Deserialized YAML config for the model rewrite filter.
 ///
 /// ```yaml
-/// filter: openai_responses_model_rewrite
+/// filter: openai_model_rewrite
 /// default_model: "llama-3.3-70b"
 /// model_aliases:
 ///   "codex-mini-latest": "llama-3.3-70b"
@@ -143,15 +143,14 @@ pub(super) enum OnInvalidBehavior {
 pub(super) fn validate_config(cfg: &ModelRewriteConfig) -> Result<(), FilterError> {
     if cfg.default_model.is_none() && cfg.model_aliases.is_empty() {
         return Err(
-            "openai_responses_model_rewrite: at least one of 'default_model' or 'model_aliases' must be configured"
-                .into(),
+            "openai_model_rewrite: at least one of 'default_model' or 'model_aliases' must be configured".into(),
         );
     }
 
     if let Some(dm) = &cfg.default_model
         && dm.trim().is_empty()
     {
-        return Err("openai_responses_model_rewrite: 'default_model' must not be empty".into());
+        return Err("openai_model_rewrite: 'default_model' must not be empty".into());
     }
 
     validate_aliases(&cfg.model_aliases)?;
@@ -165,7 +164,7 @@ fn validate_promotion_headers(headers: &ModelRewriteHeaders) -> Result<(), Filte
     validate_header_name("effective_model", headers.effective_model.as_deref())?;
     validate_header_name("original_model", headers.original_model.as_deref())?;
     crate::promotion::reject_duplicate_promotion_fields(
-        "openai_responses_model_rewrite",
+        "openai_model_rewrite",
         &[
             ("effective_model", headers.effective_model.as_deref()),
             ("original_model", headers.original_model.as_deref()),
@@ -177,18 +176,15 @@ fn validate_promotion_headers(headers: &ModelRewriteHeaders) -> Result<(), Filte
 fn validate_aliases(aliases: &HashMap<String, String>) -> Result<(), FilterError> {
     for (source, target) in aliases {
         if source.is_empty() {
-            return Err("openai_responses_model_rewrite: alias source name must not be empty".into());
+            return Err("openai_model_rewrite: alias source name must not be empty".into());
         }
         if source.chars().filter(|&c| c == '*').count() > 1 {
-            return Err(format!(
-                "openai_responses_model_rewrite: alias source pattern '{source}' must contain at most one '*'",
-            )
-            .into());
+            return Err(
+                format!("openai_model_rewrite: alias source pattern '{source}' must contain at most one '*'",).into(),
+            );
         }
         if target.is_empty() {
-            return Err(
-                format!("openai_responses_model_rewrite: alias target for '{source}' must not be empty").into(),
-            );
+            return Err(format!("openai_model_rewrite: alias target for '{source}' must not be empty").into());
         }
     }
     Ok(())
@@ -196,7 +192,7 @@ fn validate_aliases(aliases: &HashMap<String, String>) -> Result<(), FilterError
 
 /// Validate a configured promotion header name.
 fn validate_header_name(field: &str, name: Option<&str>) -> Result<(), FilterError> {
-    crate::promotion::validate_model_identity_promotion_header("openai_responses_model_rewrite", field, name)
+    crate::promotion::validate_model_identity_promotion_header("openai_model_rewrite", field, name)
 }
 
 // -----------------------------------------------------------------------------

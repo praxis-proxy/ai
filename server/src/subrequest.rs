@@ -192,7 +192,7 @@ on_failure: closed
         )
         .unwrap();
         registry
-            .create("openai_file_search_callout", &filter_config)
+            .create("openai_file_search_dispatch", &filter_config)
             .expect("file-search factory should build against the shared client");
     }
 

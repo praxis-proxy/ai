@@ -5,27 +5,27 @@
 # compatibility filter privately exposes file_search to that backend as a
 # function tool; openai_agentic_loop then normalizes the returned function
 # call into a file_search_call and records it as an assignment, and
-# openai_file_search_callout executes it before one more finite inference
+# openai_file_search_dispatch executes it before one more finite inference
 # round (#1046).
 #
 # Request order (forward):
-#   1. openai_responses_format classifies the client request.
-#   2. openai_responses_validate creates canonical ResponsesState.
+#   1. openai_format classifies the client request.
+#   2. openai_validate creates canonical ResponsesState.
 #   3. iterative_request_router owns the finite model-search-model loop.
-#   4. openai_file_search_callout dispatches the owner's pending hosted
+#   4. openai_file_search_dispatch dispatches the owner's pending hosted
 #      search assignments at request-body EOS on IRR re-entry.
 #   5. openai_agentic_loop prepares the next inference round.
-#   6. responses_to_chat_completions synthesizes the private function tool.
+#   6. openai_responses_to_chat_completions synthesizes the private function tool.
 #   7. path_rewrite selects /v1/chat/completions explicitly.
 #
 # Response filters run in reverse order. Each Chat Completions response is
 # therefore converted into a Responses resource by
-# responses_to_chat_completions before openai_agentic_loop inspects it. A
+# openai_responses_to_chat_completions before openai_agentic_loop inspects it. A
 # returned function_call(name="file_search") is normalized to
 # file_search_call, recorded as an assignment, executed through the vector
 # store on the next re-entry, and retained in the client-visible final
 # Responses output. openai_agentic_loop is the sole loop owner and publishes
-# the single continuation signal (action=loop|done); openai_file_search_callout
+# the single continuation signal (action=loop|done); openai_file_search_dispatch
 # is a request-phase dispatcher with no response phase.
 #
 # This pipeline is finite only. Streaming file-search orchestration is not
@@ -39,14 +39,14 @@ listeners:
 filter_chains:
   - name: responses-file-search-chat
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: iterative_request_router
         initial_step: inference
@@ -63,7 +63,7 @@ filter_chains:
               # assigned in the prior (translated) response, reconciling each in
               # place inside ResponsesState.accumulated_output. It never parses
               # the response body and never decides whether another round runs.
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 vector_store_url: http://127.0.0.1:8001
                 allow_private_url: true
                 timeout_ms: 5000
@@ -75,7 +75,7 @@ filter_chains:
                   - authorization
 
               # Sole loop owner: on the response phase it runs after
-              # responses_to_chat_completions has converted the Chat Completions
+              # openai_responses_to_chat_completions has converted the Chat Completions
               # reply into a Responses resource, so it parses the normalized
               # file_search_call items, records assignments for the dispatcher,
               # and publishes the single continuation signal (action=loop|done).
@@ -83,7 +83,7 @@ filter_chains:
               - filter: openai_agentic_loop
                 max_infer_iters: 7
 
-              - filter: responses_to_chat_completions
+              - filter: openai_responses_to_chat_completions
                 max_rewritten_body_bytes: 67108864
 
               - filter: path_rewrite
