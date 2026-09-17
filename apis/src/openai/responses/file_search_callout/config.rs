@@ -55,14 +55,20 @@ pub(crate) struct FileSearchFilterConfig {
     /// an upstream-selecting filter. Private-address gating is centralized in
     /// `insecure_options.allow_private_upstreams`.
     ///
-    /// Must be defined **inline** (`outbound_chain: { name: ..., filters:
-    /// [...] }`). A `Named` reference to a top-level `filter_chains` entry is
-    /// rejected at construction by [`require_inline_outbound_chain`]: this filter
-    /// runs nested inside an `iterative_request_router` step, whose pipeline is
-    /// built with an empty named-chain map, so a named reference could never
+    /// Optional. Callouts always run through the shared sub-request executor;
+    /// this chain only adds filters along the way. When omitted it defaults to
+    /// an empty inline chain (pure passthrough) via `default_outbound_chain`.
+    /// Provide it only to attach cross-cutting concerns.
+    ///
+    /// When provided, it must be defined **inline** (`outbound_chain: { name:
+    /// ..., filters: [...] }`). A `Named` reference to a top-level `filter_chains`
+    /// entry is rejected at construction by [`require_inline_outbound_chain`]: this
+    /// filter runs nested inside an `iterative_request_router` step, whose pipeline
+    /// is built with an empty named-chain map, so a named reference could never
     /// resolve there.
     ///
     /// [`ChainBindingContext::bind_chain`]: praxis_filter::ChainBindingContext::bind_chain
+    #[serde(default = "default_outbound_chain")]
     pub outbound_chain: ChainRef,
 
     /// Behaviour when a vector-store callout fails.
@@ -90,6 +96,21 @@ pub(crate) struct FileSearchFilterConfig {
 
     /// Base URL for the vector store API.
     pub vector_store_url: String,
+}
+
+/// Default `outbound_chain` when the field is omitted: an empty inline chain.
+///
+/// `outbound_chain` is optional. Callouts still run through the shared
+/// sub-request executor (that dispatch is unconditional); an empty chain simply
+/// applies no extra filters (pure passthrough). Operators supply a chain only to
+/// attach cross-cutting concerns such as credential injection, tracing, or
+/// request tagging. The name is a label only — inline chains are not looked up,
+/// so it never needs to be globally unique.
+fn default_outbound_chain() -> ChainRef {
+    ChainRef::Inline {
+        name: "openai_file_search_callout_outbound".to_owned(),
+        filters: Vec::new(),
+    }
 }
 
 /// Validated configuration.
@@ -290,5 +311,18 @@ mod tests {
             filters: Vec::new(),
         };
         require_inline_outbound_chain(&inline).unwrap();
+    }
+
+    #[test]
+    fn config_defaults_omitted_outbound_chain_to_empty_inline() {
+        // `outbound_chain` is optional: omitting it yields an empty inline chain
+        // (pure passthrough) rather than a config error.
+        let cfg: FileSearchFilterConfig = serde_yaml::from_str("vector_store_url: http://vector-store:8321\n").unwrap();
+        assert!(
+            matches!(&cfg.outbound_chain, ChainRef::Inline { filters, .. } if filters.is_empty()),
+            "omitted outbound_chain should default to an empty inline chain"
+        );
+        // The default must satisfy the inline-only requirement enforced at build.
+        require_inline_outbound_chain(&cfg.outbound_chain).unwrap();
     }
 }

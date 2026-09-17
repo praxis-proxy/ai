@@ -190,17 +190,16 @@ runtime:
         let registry = crate::build_full_registry(&client);
         // The file-search filter binds an outbound chain at construction, so it
         // must be built through `build_with_chains` (which supplies the
-        // `ChainBindingContext`) rather than the plain `create` path. A DNS target
-        // passes config-time URL validation; the factory captures the shared
+        // `ChainBindingContext`) rather than the plain `create` path. `outbound_chain`
+        // is optional: omitting it defaults to an empty inline chain, which still
+        // binds through the same path — so this also exercises the default. A DNS
+        // target passes config-time URL validation; the factory captures the shared
         // client without dialing.
         let mut entries: Vec<FilterEntry> = serde_yaml::from_str(
             "
 - filter: openai_file_search_callout
   vector_store_url: http://vector-store.test
   on_failure: closed
-  outbound_chain:
-    name: vector_store_chain
-    filters: []
 ",
         )
         .unwrap();
