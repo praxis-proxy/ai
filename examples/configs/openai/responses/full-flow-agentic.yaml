@@ -332,8 +332,18 @@ filter_chains:
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
-        allow_private_files_api_url: true
         allow_pre_security_callout: true
+        # file_id callouts run through this outbound filter chain via the
+        # filtered subrequest executor. SSRF protection for files_api_url
+        # derives from the pipeline's allow_private_upstreams; client
+        # file_url downloads never traverse this chain.
+        outbound_chain:
+          name: files-api-outbound
+          filters:
+            - filter: headers
+              request_set:
+                - name: x-file-callout
+                  value: file-resolve
         forward_headers:
           - authorization
           - x-tenant-id
@@ -558,6 +568,7 @@ filter_chains:
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends
-  # Central SSRF control: permits the vector_store_url's resolved address to be
-  # private/loopback at connect time (needed for local/private vector stores).
+  # Central SSRF control: permits resolved callout addresses (vector_store_url,
+  # file_id Files API) to be private/loopback at connect time (needed for
+  # local/private vector stores and Files API backends).
   allow_private_upstreams: true

@@ -27,10 +27,8 @@ use crate::{
 
 #[test]
 fn from_config_with_valid_url_succeeds() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        "files_api_url: \"http://files-api:8321\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true",
-    )
-    .unwrap();
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("files_api_url: \"http://files-api:8321\"\nallow_pre_security_callout: true").unwrap();
     let filter = FileResolveFilter::from_config(&yaml).unwrap();
     assert_eq!(filter.name(), "openai_file_resolve", "filter name should match");
 }
@@ -51,10 +49,8 @@ fn from_config_empty_url_rejected() {
 
 #[test]
 fn from_config_unknown_field_rejected() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        "files_api_url: \"http://files-api:8321\"\nallow_private_files_api_url: true\non_mising: reject",
-    )
-    .unwrap();
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("files_api_url: \"http://files-api:8321\"\non_mising: reject").unwrap();
     let result = FileResolveFilter::from_config(&yaml);
     assert!(result.is_err(), "typo in config field should be rejected");
 }
@@ -457,7 +453,6 @@ async fn file_url_resolution_updates_responses_state_with_data_uri() {
     let file_url = format!("{origin}/state.txt");
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"files_api_url: "http://127.0.0.1:1"
-allow_private_files_api_url: true
 allow_pre_security_callout: true
 file_url: resolve
 allowed_file_url_origins:
@@ -563,7 +558,7 @@ async fn sync_state_uses_independent_history_offsets() {
 #[tokio::test]
 async fn resolves_history_when_current_input_has_no_file_id() {
     let files_api_url = start_files_api_stub();
-    let filter = make_filter_for_url(&files_api_url);
+    let filter = make_filter_with_outbound_for_url(&files_api_url);
     let req = Box::leak(Box::new(crate::test_utils::make_request(
         http::Method::POST,
         "/v1/responses",
@@ -634,7 +629,7 @@ async fn mirrored_history_has_independent_inline_budget() {
     state.messages.push(history.clone());
     state.persisted_messages.push(history);
     ctx.extensions.insert(state);
-    let mut budget = client.resolution_budget();
+    let mut budget = client.resolution_budget(None);
 
     let request_headers = ctx.request.headers.clone();
     let resolver = HistoryResolver {
@@ -667,11 +662,9 @@ async fn rejects_resolved_history_when_rebuilt_body_exceeds_limit() {
     state.persisted_messages.insert(0, history);
     let unresolved_len = serialized_outbound_body_len(&state).unwrap();
 
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "files_api_url: \"{files_api_url}\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\nmax_rewritten_body_bytes: {unresolved_len}"
-    ))
-    .unwrap();
-    let filter = FileResolveFilter::from_config(&yaml).unwrap();
+    let filter = make_filter_with_outbound_from_yaml(&format!(
+        "files_api_url: \"{files_api_url}\"\nallow_pre_security_callout: true\nmax_rewritten_body_bytes: {unresolved_len}"
+    ));
     let req = Box::leak(Box::new(crate::test_utils::make_request(
         http::Method::POST,
         "/v1/responses",
@@ -695,11 +688,9 @@ async fn max_resolved_bytes_bounds_individual_content_independent_of_rewritten_l
     // The stub serves 7 bytes of content for file-history. A tiny
     // max_resolved_bytes must reject it even though the rewritten-body
     // limit is left at the 64 MiB ceiling: the two limits are decoupled.
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "files_api_url: \"{files_api_url}\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\non_missing: reject\nmax_resolved_bytes: 1\nmax_rewritten_body_bytes: 67108864"
-    ))
-    .unwrap();
-    let filter = FileResolveFilter::from_config(&yaml).unwrap();
+    let filter = make_filter_with_outbound_from_yaml(&format!(
+        "files_api_url: \"{files_api_url}\"\nallow_pre_security_callout: true\non_missing: reject\nmax_resolved_bytes: 1\nmax_rewritten_body_bytes: 67108864"
+    ));
     let req = Box::leak(Box::new(crate::test_utils::make_request(
         http::Method::POST,
         "/v1/responses",
@@ -730,11 +721,9 @@ async fn max_resolved_bytes_default_allows_resolution() {
     // Same request as the decoupling reject test, but with a large
     // max_resolved_bytes: the content now fits and resolution succeeds,
     // proving the previous rejection was attributable to max_resolved_bytes.
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "files_api_url: \"{files_api_url}\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\nmax_resolved_bytes: 67108864\nmax_rewritten_body_bytes: 67108864"
-    ))
-    .unwrap();
-    let filter = FileResolveFilter::from_config(&yaml).unwrap();
+    let filter = make_filter_with_outbound_from_yaml(&format!(
+        "files_api_url: \"{files_api_url}\"\nallow_pre_security_callout: true\nmax_resolved_bytes: 67108864\nmax_rewritten_body_bytes: 67108864"
+    ));
     let req = Box::leak(Box::new(crate::test_utils::make_request(
         http::Method::POST,
         "/v1/responses",
@@ -772,7 +761,7 @@ async fn max_resolved_bytes_default_allows_resolution() {
 #[tokio::test]
 async fn rejects_unresolvable_history_when_configured_to_reject() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
-        "files_api_url: \"http://files-api:8321\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true\non_missing: reject",
+        "files_api_url: \"http://files-api:8321\"\nallow_pre_security_callout: true\non_missing: reject",
     )
     .unwrap();
     let filter = FileResolveFilter::from_config(&yaml).unwrap();
@@ -887,10 +876,42 @@ fn make_filter() -> Box<dyn HttpFilter> {
 
 fn make_filter_for_url(files_api_url: &str) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        "files_api_url: \"{files_api_url}\"\nallow_private_files_api_url: true\nallow_pre_security_callout: true"
+        "files_api_url: \"{files_api_url}\"\nallow_pre_security_callout: true"
     ))
     .unwrap();
     FileResolveFilter::from_config(&yaml).unwrap()
+}
+
+/// Build a minimal outbound pipeline that permits private upstreams, so
+/// `file_id` callouts through the chain path can reach a loopback stub the
+/// way the production `register_file_resolve` path does.
+///
+/// The configured Files API destination is staged through Praxis core, so the
+/// operator chain can be empty. SSRF policy (`allow_private_upstreams`) is what
+/// these resolution tests otherwise exercise.
+fn private_outbound_pipeline() -> Arc<FilterPipeline> {
+    let registry = praxis_filter::FilterRegistry::with_builtins();
+    let mut entries = [];
+    let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+    pipeline.set_allow_private_upstreams(true);
+    Arc::new(pipeline)
+}
+
+/// Build a filter whose `file_id` callouts traverse a private-upstream
+/// outbound chain, mirroring the production chain-binding path against a
+/// loopback Files API stub.
+fn make_filter_with_outbound_for_url(files_api_url: &str) -> Box<dyn HttpFilter> {
+    make_filter_with_outbound_from_yaml(&format!(
+        "files_api_url: \"{files_api_url}\"\nallow_pre_security_callout: true"
+    ))
+}
+
+/// Build a filter with a private-upstream outbound chain from arbitrary
+/// filter YAML.
+fn make_filter_with_outbound_from_yaml(yaml_str: &str) -> Box<dyn HttpFilter> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(yaml_str).unwrap();
+    let client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+    FileResolveFilter::from_config_with_outbound(&yaml, client, private_outbound_pipeline()).unwrap()
 }
 
 fn make_client() -> FilesApiClient {

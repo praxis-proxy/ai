@@ -396,26 +396,35 @@ fn register_anthropic_web_search(registry: &mut FilterRegistry, subrequest_clien
     }
 }
 
-/// Register `openai_file_resolve` with the shared client when
-/// available, otherwise fall back to an isolated per-filter connector.
+/// Register `openai_file_resolve` as a chain-binding filter.
+///
+/// Configured Files API (`file_id`) callouts run through the
+/// `outbound_chain` filter pipeline, which is resolved and validated at
+/// build/hot-reload time via [`ChainBindingContext::bind_chain`]. The chain
+/// is required: registration fails the build when it is missing or cannot be
+/// bound. The shared [`SubRequestClient`] is captured when available;
+/// otherwise the filter falls back to an isolated per-filter connector.
+///
+/// [`ChainBindingContext::bind_chain`]: praxis_filter::ChainBindingContext::bind_chain
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
 fn register_file_resolve(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
-    if let Some(client) = subrequest_client {
-        let client = client.clone();
-        registry
-            .register(
-                "openai_file_resolve",
-                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
-                    praxis_ai_apis::openai::FileResolveFilter::from_config_with_client(config, client.clone())
-                })),
-            )
-            .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_resolve'"));
-    } else {
-        praxis_filter::register_filters!(
-            @register registry,
-            http "openai_file_resolve" => praxis_ai_apis::openai::FileResolveFilter::from_config
-        );
-    }
+    let shared = subrequest_client.cloned();
+    registry
+        .register_chain_binding(
+            "openai_file_resolve",
+            std::sync::Arc::new(move |config, ctx| {
+                let chain_ref = praxis_ai_apis::openai::FileResolveFilter::outbound_chain_ref(config)?.ok_or_else(
+                    || -> praxis_filter::FilterError { "openai_file_resolve: 'outbound_chain' is required".into() },
+                )?;
+                let outbound = std::sync::Arc::new(ctx.bind_chain(&chain_ref)?);
+                let client = match &shared {
+                    Some(client) => client.clone(),
+                    None => SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+                };
+                praxis_ai_apis::openai::FileResolveFilter::from_config_with_outbound(config, client, outbound)
+            }),
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_resolve'"));
 }
 
 /// Register `openai_responses_compact` with the shared client when
@@ -489,7 +498,13 @@ fn register_web_search(registry: &mut FilterRegistry, subrequest_client: Option<
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::expect_used, reason = "tests")]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests"
+)]
 mod tests {
     use std::collections::HashMap;
 
