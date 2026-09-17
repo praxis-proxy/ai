@@ -612,7 +612,7 @@ async fn blocked_urls_report_actionable_reason() {
         ("http://localhost/mcp", "localhost hostnames are not allowed"),
         (
             "http://127.0.0.1/mcp",
-            "address is loopback, link-local, unique-local, unspecified, or cloud metadata",
+            "address is a private, loopback, link-local, unique-local, unspecified, or cloud-metadata range",
         ),
     ];
 
@@ -632,9 +632,25 @@ async fn ssrf_allows_public_ips() {
 }
 
 #[tokio::test]
-async fn ssrf_allows_private_rfc1918() {
-    assert!(validate_url("http://10.0.0.5/mcp").await.is_ok());
-    assert!(validate_url("http://192.168.1.100/mcp").await.is_ok());
+async fn ssrf_blocks_private_rfc1918_by_default() {
+    // The 0.5.6 migration hardens the default posture: RFC1918 ranges are
+    // blocked unless the callout explicitly permits private upstreams.
+    assert!(validate_url("http://10.0.0.5/mcp").await.is_err());
+    assert!(validate_url("http://192.168.1.100/mcp").await.is_err());
+}
+
+#[tokio::test]
+async fn ssrf_allows_private_rfc1918_when_private_permitted() {
+    assert!(
+        validate_mcp_url("http://10.0.0.5/mcp", TEST_TIMEOUT, true)
+            .await
+            .is_ok()
+    );
+    assert!(
+        validate_mcp_url("http://192.168.1.100/mcp", TEST_TIMEOUT, true)
+            .await
+            .is_ok()
+    );
 }
 
 #[test]
@@ -688,17 +704,17 @@ async fn ssrf_blocks_aws_imds_ipv6() {
 }
 
 #[test]
-fn aws_imds_v6_detected_by_is_ssrf_sensitive() {
+fn aws_imds_v6_detected_by_is_always_sensitive() {
     let ip = "fd00:ec2::254".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&ip), "fd00:ec2::254 should be SSRF-sensitive");
+    assert!(is_always_sensitive(&ip), "fd00:ec2::254 should be SSRF-sensitive");
 }
 
 #[test]
-fn unspecified_ip_detected_by_is_ssrf_sensitive() {
+fn unspecified_ip_detected_by_is_always_sensitive() {
     let v4 = "0.0.0.0".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&v4), "0.0.0.0 should be SSRF-sensitive");
+    assert!(is_always_sensitive(&v4), "0.0.0.0 should be SSRF-sensitive");
     let v6 = "::".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&v6), ":: should be SSRF-sensitive");
+    assert!(is_always_sensitive(&v6), ":: should be SSRF-sensitive");
 }
 
 #[test]
@@ -712,13 +728,13 @@ fn no_authorization_field_injects_no_auth_header() {
 }
 
 #[test]
-fn ipv6_link_local_detected_by_is_ssrf_sensitive() {
+fn ipv6_link_local_detected_by_is_always_sensitive() {
     let fe80 = "fe80::1".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&fe80), "fe80::1 should be SSRF-sensitive");
+    assert!(is_always_sensitive(&fe80), "fe80::1 should be SSRF-sensitive");
     let febf = "febf::1".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&febf), "febf::1 should be SSRF-sensitive");
+    assert!(is_always_sensitive(&febf), "febf::1 should be SSRF-sensitive");
     let fe00 = "fe00::1".parse::<IpAddr>().unwrap();
-    assert!(!is_ssrf_sensitive(&fe00), "fe00::1 is not link-local");
+    assert!(!is_always_sensitive(&fe00), "fe00::1 is not link-local");
 }
 
 #[tokio::test]
@@ -728,13 +744,13 @@ async fn ssrf_blocks_ipv6_unique_local() {
 }
 
 #[test]
-fn ipv6_unique_local_detected_by_is_ssrf_sensitive() {
+fn ipv6_unique_local_detected_by_is_always_sensitive() {
     let fc00 = "fc00::1".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&fc00), "fc00::1 should be SSRF-sensitive");
+    assert!(is_always_sensitive(&fc00), "fc00::1 should be SSRF-sensitive");
     let fd00 = "fd00:ec2::23".parse::<IpAddr>().unwrap();
-    assert!(is_ssrf_sensitive(&fd00), "fd00:ec2::23 should be SSRF-sensitive");
+    assert!(is_always_sensitive(&fd00), "fd00:ec2::23 should be SSRF-sensitive");
     let fb00 = "fb00::1".parse::<IpAddr>().unwrap();
-    assert!(!is_ssrf_sensitive(&fb00), "fb00::1 is not unique-local");
+    assert!(!is_always_sensitive(&fb00), "fb00::1 is not unique-local");
 }
 
 // =========================================================================
@@ -913,9 +929,16 @@ const TEST_MAX_RESULT_BYTES: usize = 1_048_576;
 #[tokio::test]
 async fn list_tools_returns_all_tools() {
     let (url, ct) = start_test_mcp_server().await;
-    let tools = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 128, true)
-        .await
-        .unwrap();
+    let tools = list_tools(
+        &url,
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     ct.cancel();
 
     let names: Vec<&str> = tools
@@ -932,9 +955,16 @@ async fn list_tools_returns_all_tools() {
 #[tokio::test]
 async fn list_tools_contains_expected_schema() {
     let (url, ct) = start_test_mcp_server().await;
-    let tools = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 128, true)
-        .await
-        .unwrap();
+    let tools = list_tools(
+        &url,
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     ct.cancel();
 
     let add_tool = tools
@@ -959,7 +989,15 @@ async fn list_tools_contains_expected_schema() {
 #[tokio::test]
 async fn list_tools_enforces_max_tools() {
     let (url, ct) = start_test_mcp_server().await;
-    let result = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 2, true).await;
+    let result = list_tools(
+        &url,
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        2,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
     ct.cancel();
 
     let err = result.expect_err("should fail with TooManyTools");
@@ -974,9 +1012,16 @@ async fn list_tools_enforces_max_tools() {
 async fn list_tools_with_custom_headers() {
     let (url, ct) = start_test_mcp_server().await;
     let headers = serde_json::json!({"x-custom-header": "test-value"});
-    let tools = list_tools(&url, Some(&headers), None, INTEGRATION_TIMEOUT, 128, true)
-        .await
-        .unwrap();
+    let tools = list_tools(
+        &url,
+        Some(&headers),
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     ct.cancel();
 
     assert_eq!(tools.len(), 4, "should still return all 4 tools");
@@ -985,9 +1030,16 @@ async fn list_tools_with_custom_headers() {
 #[tokio::test]
 async fn list_tools_with_authorization() {
     let (url, ct) = start_test_mcp_server().await;
-    let tools = list_tools(&url, None, Some("test-token"), INTEGRATION_TIMEOUT, 128, true)
-        .await
-        .unwrap();
+    let tools = list_tools(
+        &url,
+        None,
+        Some("test-token"),
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     ct.cancel();
 
     assert_eq!(tools.len(), 4, "should still return all 4 tools");
@@ -1004,7 +1056,7 @@ async fn call_tool_echo() {
         serde_json::json!({"message": "hello world"}),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
-        true,
+        &McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1030,7 +1082,7 @@ async fn call_tool_add_with_arguments() {
         serde_json::json!({"a": 17, "b": 25}),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
-        true,
+        &McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1056,7 +1108,7 @@ async fn call_tool_add_with_string_arguments() {
         serde_json::Value::String(r#"{"a": 3, "b": 7}"#.to_owned()),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
-        true,
+        &McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1082,7 +1134,7 @@ async fn call_tool_error_returns_is_error() {
         serde_json::json!({"message": "something broke"}),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
-        true,
+        &McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1112,7 +1164,7 @@ async fn call_tool_nonexistent_tool() {
         serde_json::json!({}),
         INTEGRATION_TIMEOUT,
         TEST_MAX_RESULT_BYTES,
-        true,
+        &McpCallout::fabricated(true).unwrap(),
     )
     .await;
     ct.cancel();
@@ -1132,7 +1184,7 @@ async fn call_tool_timeout() {
         serde_json::json!({"sleep_ms": 5000}),
         short_timeout,
         TEST_MAX_RESULT_BYTES,
-        true,
+        &McpCallout::fabricated(true).unwrap(),
     )
     .await;
     ct.cancel();
@@ -1209,7 +1261,15 @@ async fn start_slow_list_mcp_server(delay_per_page: Duration) -> (String, tokio_
 async fn list_tools_cumulative_pagination_timeout() {
     let (url, ct) = start_slow_list_mcp_server(Duration::from_millis(150)).await;
     let short_timeout = Duration::from_millis(200);
-    let result = list_tools(&url, None, None, short_timeout, 128, true).await;
+    let result = list_tools(
+        &url,
+        None,
+        None,
+        short_timeout,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
     ct.cancel();
 
     let err = result.expect_err("cumulative pagination time exceeding timeout should time out");
@@ -1282,15 +1342,32 @@ async fn list_tools_rejects_oversized_response() {
     // the transport was size-bounded the entire body was downloaded and
     // deserialized regardless — the memory-exhaustion vector this guards.
     let (url, ct) = start_oversized_list_mcp_server(2 * 1024 * 1024).await;
-    let result = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 128, true).await;
+    let result = list_tools(
+        &url,
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
     ct.cancel();
 
     let err = result.expect_err("oversized tools/list response must be rejected before buffering");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("tools/list failed"),
-        "oversized response should surface as a tools/list failure: {msg}"
-    );
+    // The filtered-subrequest transport classifies the over-ceiling body as
+    // `CalloutOutcome::ResponseTooLarge`; the caller reads that typed overflow
+    // back out-of-band (rmcp discards the transport error) and surfaces the
+    // dedicated `ResponseTooLarge` variant, which callers map to HTTP 413 —
+    // distinct from the generic 502 a plain `ListTools` failure yields.
+    match err {
+        McpClientError::ResponseTooLarge { limit, .. } => {
+            assert_eq!(
+                limit, MAX_CONTROL_RESPONSE_BYTES,
+                "control-plane tools/list is bounded to the control ceiling"
+            );
+        },
+        other => panic!("oversized response should surface as ResponseTooLarge, got: {other:?}"),
+    }
 }
 
 /// MCP server that paginates `tools/list`, returning one tool per page whose
@@ -1376,7 +1453,15 @@ async fn list_tools_rejects_oversized_cumulative_pagination() {
     // regression that dropped the budget check fails cleanly (bounded transfer)
     // instead of streaming tens of MiB.
     let (url, ct) = start_multi_page_list_mcp_server(900 * 1024, 12).await;
-    let result = list_tools(&url, None, None, INTEGRATION_TIMEOUT, 128, true).await;
+    let result = list_tools(
+        &url,
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
     ct.cancel();
 
     let err = result.expect_err("cumulative tools/list bytes exceeding the budget must be rejected");

@@ -9,7 +9,7 @@ Executes MCP tool calls against upstream MCP servers within the Responses API ag
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `allow_loopback` | bool | no | Allow connections to loopback addresses (default: false). |
+| `outbound_chain` | ChainRef | no | Inline outbound filter chain the MCP `tools/call` callout runs through. `openai_mcp_dispatch` runs inside an `iterative_request_router` step, whose filters praxis core builds without a chain-binding context, so only an inline chain is supported; a named reference (which would resolve against the top-level `filter_chains`) is rejected at build time. The chain carries only operator-configured cross-cutting filters — the SSRF-validated dial target is staged by the transport, so no upstream-selecting filter is prepended. When omitted, the callout runs through an empty chain and dials the staged target directly. Whether loopback/private MCP destinations are permitted is governed by the operator's global insecure posture, not a per-filter flag. |
 | `forward_headers` | string[] | no | Trusted request headers forwarded to connector-backed MCP `tools/call` requests. No request headers are forwarded by default. Credential headers such as `authorization` are rejected because MCP destinations are client-selected; use the MCP tool entry's dedicated `authorization` field instead. Direct, client-selected `server_url` targets never receive ambient request headers. |
 | `timeout_ms` | integer | no | Per-call timeout in milliseconds for `tools/call` calls. |
 | `max_calls_per_round` | integer | no | Hard cap on MCP calls processed from one model response (1..=1024; default: 32). |

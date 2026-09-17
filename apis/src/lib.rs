@@ -59,6 +59,19 @@ pub(crate) mod test_utils {
     /// Deterministic ID generator for tests (seed=0).
     static TEST_ID_GENERATOR: LazyLock<IdGenerator> = LazyLock::new(|| IdGenerator::with_seed(0));
 
+    /// Shared sub-request transport for filter unit tests.
+    ///
+    /// Filters that dial an outbound callout (e.g. the MCP `tools/list` and
+    /// `tools/call` filters) read their parent transport from
+    /// [`HttpFilterContext::subrequest_client`]; a `None` client makes them fail
+    /// closed. This static provides a real (loopback-capable) connector so tests
+    /// exercise the callout path. Whether a private/loopback destination is then
+    /// permitted is governed by the filter's bound outbound pipeline posture, not
+    /// this client.
+    static TEST_SUBREQUEST_CLIENT: LazyLock<praxis_core::subrequest::SubRequestClient> = LazyLock::new(|| {
+        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(1, None))
+    });
+
     /// Build a minimal request for filter unit tests.
     pub(crate) fn make_request(method: Method, path: &str) -> Request {
         Request {
@@ -108,7 +121,7 @@ pub(crate) mod test_utils {
             response_body_mode: praxis_filter::BodyMode::Stream,
             response_header: None,
             response_headers_modified: false,
-            subrequest_client: None,
+            subrequest_client: Some(&TEST_SUBREQUEST_CLIENT),
             subrequest_response_mode: praxis_filter::SubRequestResponseMode::Buffered,
             attempted_endpoints: Vec::new(),
             retry_policy: None,

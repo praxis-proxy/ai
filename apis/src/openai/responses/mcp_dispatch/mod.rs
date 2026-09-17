@@ -46,14 +46,16 @@ mod tests;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::Duration,
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{FutureExt as _, future::join_all};
+use praxis_core::config::InsecureOptions;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    BodyAccess, BodyMode, FilterAction, FilterError, FilterPipeline, HttpFilter, HttpFilterContext, Rejection,
     body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::{debug, warn};
@@ -141,8 +143,15 @@ pub(super) fn is_connector_tool_entry(entry: &serde_json::Value) -> bool {
 /// receive ambient request headers. Credential headers are rejected; use the
 /// MCP tool entry's dedicated `authorization` field for per-target credentials.
 pub struct McpDispatchFilter {
-    /// Allow connections to loopback addresses.
-    allow_loopback: bool,
+    /// Bound outbound pipeline the `tools/call` and deferred `tools/list`
+    /// callouts dial through.
+    ///
+    /// Carries only operator-configured cross-cutting filters (if any); the dial
+    /// target is staged by the transport, so no upstream-selecting filter is
+    /// prepended. This filter runs inside an `iterative_request_router` step and
+    /// so supports only an inline `outbound_chain` (or none): a named reference
+    /// cannot be resolved without a chain-binding context (see [`Self::from_config`]).
+    outbound_pipeline: Arc<FilterPipeline>,
     /// Trusted request headers explicitly allowed across the MCP boundary.
     forward_headers: Vec<http::HeaderName>,
     /// Timeout for MCP tool calls.
@@ -160,14 +169,37 @@ pub struct McpDispatchFilter {
 impl McpDispatchFilter {
     /// Build from parsed YAML config.
     ///
+    /// `openai_mcp_dispatch` is registered as a plain builtin (not chain-binding)
+    /// because it runs inside an `iterative_request_router` step, whose filters
+    /// praxis core builds without a [`ChainBindingContext`]. It therefore builds
+    /// its outbound pipeline directly from an inline `outbound_chain` (or an empty
+    /// one when none is configured) and rejects a named reference, which cannot be
+    /// resolved here. The transport stages the SSRF-validated dial target, so the
+    /// built pipeline carries only cross-cutting outbound filters.
+    ///
+    /// [`ChainBindingContext`]: praxis_filter::ChainBindingContext
+    ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the config is invalid.
+    /// Returns [`FilterError`] if the config is invalid, carries a named
+    /// `outbound_chain` (unsupported without chain binding), or the inline
+    /// outbound pipeline cannot be built.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: McpDispatchConfig = parse_filter_config("openai_mcp_dispatch", config)?;
-        let validated = build_config(cfg)?;
-        Ok(Box::new(Self {
-            allow_loopback: validated.allow_loopback,
+        let mut validated = build_config(cfg)?;
+        let outbound_chain = validated.outbound_chain.take();
+        // Inline (or empty) pipeline; a named reference cannot be resolved without
+        // a chain-binding context. Posture stays at its safe default until pipeline
+        // finalization propagates the operator's global insecure options.
+        let outbound_pipeline = mcp_client::build_inline_outbound_pipeline(outbound_chain, false)
+            .map_err(|error| FilterError::from(format!("openai_mcp_dispatch: {error}")))?;
+        Ok(Self::assemble(&validated, outbound_pipeline))
+    }
+
+    /// Assemble the filter from a validated config and a bound outbound pipeline.
+    fn assemble(validated: &McpDispatchConfig, outbound_pipeline: Arc<FilterPipeline>) -> Box<dyn HttpFilter> {
+        Box::new(Self {
+            outbound_pipeline,
             forward_headers: validated
                 .forward_headers
                 .iter()
@@ -178,7 +210,7 @@ impl McpDispatchFilter {
             max_parallel_calls: validated.max_parallel_calls,
             max_result_bytes: validated.max_result_bytes,
             max_total_result_bytes: validated.max_total_result_bytes,
-        }))
+        })
     }
 
     /// Execute the pending MCP calls admitted by the per-round MCP limit.
@@ -193,6 +225,7 @@ impl McpDispatchFilter {
         mcp_calls: &[&serde_json::Value],
         tool_index: &McpToolIndex<'_>,
         forwarded_headers: &http::HeaderMap,
+        callout: &mcp_client::McpCallout,
     ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
         debug!(
             count = mcp_calls.len(),
@@ -207,11 +240,10 @@ impl McpDispatchFilter {
             max_result_bytes: per_result_limit,
             max_total_result_bytes: execution_batch_limit,
             timeout: self.timeout,
-            allow_loopback: self.allow_loopback,
             forwarded_header_names: &self.forward_headers,
             forwarded_headers: Some(forwarded_headers),
         };
-        execute_mcp_calls(mcp_calls, tool_index, options).await
+        execute_mcp_calls(mcp_calls, tool_index, options, callout).await
     }
 
     /// Select only configured headers from the effective body-phase request.
@@ -255,6 +287,22 @@ impl McpDispatchFilter {
         }
         let tool_index = McpToolIndex::new(&state.mcp_tool_map);
         state.tool_calls.retain(|call| !is_mcp_tool_call(call, &tool_index));
+    }
+
+    /// Fail closed when no shared sub-request client is available to dial the
+    /// MCP `tools/call` callout.
+    ///
+    /// The filtered-subrequest transport requires the parent transport captured
+    /// from the request context; without it the callout cannot be issued, so the
+    /// request is rejected with an HTTP 500 rather than silently skipping MCP
+    /// execution (which would return the model's unresolved tool calls to the
+    /// client).
+    fn no_subrequest_client_action() -> FilterAction {
+        FilterAction::Reject(responses_error_rejection(
+            500,
+            "server_error",
+            "no sub-request client available for the MCP tools/call callout",
+        ))
     }
 
     /// Record a terminal failure without retaining an oversized result batch.
@@ -629,6 +677,26 @@ impl HttpFilter for McpDispatchFilter {
         "openai_mcp_dispatch"
     }
 
+    fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
+        // Propagate runtime resources and the finalized SSRF posture into the
+        // bound outbound pipeline. It is uniquely owned during configuration, so
+        // `Arc::get_mut` succeeds; a shared handle would mean the pipeline was
+        // already cloned before finalization, which must not happen.
+        if let Some(pipeline) = Arc::get_mut(&mut self.outbound_pipeline) {
+            visitor(pipeline);
+        } else {
+            debug_assert!(false, "outbound pipeline must be uniquely owned during configuration");
+        }
+    }
+
+    fn referenced_files(&self) -> Vec<std::path::PathBuf> {
+        self.outbound_pipeline.referenced_files()
+    }
+
+    fn apply_insecure_options(&self, options: &InsecureOptions) {
+        self.outbound_pipeline.apply_insecure_options(options);
+    }
+
     fn request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadOnly
     }
@@ -688,6 +756,16 @@ impl HttpFilter for McpDispatchFilter {
         if !needs_discovery && (state.tool_calls.is_empty() || state.mcp_tool_map.is_empty()) {
             return Ok(FilterAction::Continue);
         }
+
+        // Capture the parent transport and downstream attributes once, pairing
+        // them with the bound outbound pipeline. Both deferred `tools/list`
+        // discovery and `tools/call` execution dial through it. Fail closed if the
+        // pipeline exposes no shared sub-request client: an MCP callout cannot dial
+        // without it, so reject rather than silently skip MCP work.
+        let Some(callout) = mcp_client::McpCallout::from_context(ctx, Arc::clone(&self.outbound_pipeline)) else {
+            return Ok(Self::no_subrequest_client_action());
+        };
+
         if needs_discovery {
             let fallback = if body.as_ref().is_none_or(Bytes::is_empty) {
                 ctx.extensions
@@ -701,7 +779,8 @@ impl HttpFilter for McpDispatchFilter {
                 .as_ref()
                 .filter(|bytes| !bytes.is_empty())
                 .map_or(fallback.as_slice(), |bytes| bytes.as_ref());
-            let action = discover_pending_connectors(ctx, bytes, &self.forward_headers, &forwarded_headers).await?;
+            let action =
+                discover_pending_connectors(ctx, bytes, &self.forward_headers, &forwarded_headers, &callout).await?;
             if !matches!(action, FilterAction::Continue) {
                 return Ok(action);
             }
@@ -721,7 +800,7 @@ impl HttpFilter for McpDispatchFilter {
         }
 
         let results = match self
-            .execute_pending_calls(state, &mcp_calls, &tool_index, &forwarded_headers)
+            .execute_pending_calls(state, &mcp_calls, &tool_index, &forwarded_headers, &callout)
             .await
         {
             Ok(results) => results,
@@ -739,12 +818,15 @@ async fn discover_pending_connectors(
     body: &[u8],
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: &http::HeaderMap,
+    callout: &mcp_client::McpCallout,
 ) -> Result<FilterAction, FilterError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
         warn!("ResponsesState missing when discovering deferred MCP connectors");
         return Ok(FilterAction::Continue);
     };
-    match discover_deferred_connectors_with_forwarded_headers(state, forwarded_header_names, forwarded_headers).await {
+    match discover_deferred_connectors_with_forwarded_headers(state, forwarded_header_names, forwarded_headers, callout)
+        .await
+    {
         Ok(()) => Ok(FilterAction::Continue),
         Err(err) => {
             let streaming = ctx
@@ -1165,8 +1247,6 @@ struct McpExecutionOptions<'a> {
     max_total_result_bytes: usize,
     /// Timeout applied independently to each MCP call.
     timeout: Duration,
-    /// Whether MCP endpoints may resolve to loopback addresses.
-    allow_loopback: bool,
     /// Names reserved for trusted forwarding, including when values are absent.
     forwarded_header_names: &'a [http::HeaderName],
     /// Trusted request headers selected by operator configuration.
@@ -1179,6 +1259,7 @@ async fn execute_mcp_calls(
     mcp_calls: &[&serde_json::Value],
     tool_index: &McpToolIndex<'_>,
     options: McpExecutionOptions<'_>,
+    callout: &mcp_client::McpCallout,
 ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
     let minimum_reservation = mcp_calls
         .len()
@@ -1198,9 +1279,9 @@ async fn execute_mcp_calls(
         ..options
     };
     if options.parallel {
-        Ok(execute_parallel(mcp_calls, tool_index, bounded_options).await)
+        Ok(execute_parallel(mcp_calls, tool_index, bounded_options, callout).await)
     } else {
-        Ok(execute_sequential(mcp_calls, tool_index, bounded_options).await)
+        Ok(execute_sequential(mcp_calls, tool_index, bounded_options, callout).await)
     }
 }
 
@@ -1213,6 +1294,7 @@ async fn execute_parallel(
     mcp_calls: &[&serde_json::Value],
     tool_index: &McpToolIndex<'_>,
     options: McpExecutionOptions<'_>,
+    callout: &mcp_client::McpCallout,
 ) -> Vec<McpCallResult> {
     let mut results = Vec::with_capacity(mcp_calls.len());
     let mut remaining_calls = mcp_calls;
@@ -1220,9 +1302,9 @@ async fn execute_parallel(
         let chunk_size = remaining_calls.len().min(options.max_parallel_calls);
         let (chunk, rest) = remaining_calls.split_at(chunk_size);
         remaining_calls = rest;
-        let futures = chunk
-            .iter()
-            .map(|tc| std::panic::AssertUnwindSafe(execute_single_call(tc, tool_index, &options)).catch_unwind());
+        let futures = chunk.iter().map(|tc| {
+            std::panic::AssertUnwindSafe(execute_single_call(tc, tool_index, &options, callout)).catch_unwind()
+        });
         for (tc, outcome) in chunk.iter().zip(join_all(futures).await) {
             let result = match outcome {
                 Ok(Some(result)) => result,
@@ -1247,10 +1329,11 @@ async fn execute_sequential(
     mcp_calls: &[&serde_json::Value],
     tool_index: &McpToolIndex<'_>,
     options: McpExecutionOptions<'_>,
+    callout: &mcp_client::McpCallout,
 ) -> Vec<McpCallResult> {
     let mut results = Vec::with_capacity(mcp_calls.len());
     for tc in mcp_calls {
-        let result = if let Some(result) = execute_single_call(tc, tool_index, &options).await {
+        let result = if let Some(result) = execute_single_call(tc, tool_index, &options, callout).await {
             result
         } else {
             warn!(tool = ?tc.get("name"), "sequential MCP call returned None, emitting error");
@@ -1387,6 +1470,7 @@ async fn execute_single_call(
     tool_call: &serde_json::Value,
     tool_index: &McpToolIndex<'_>,
     options: &McpExecutionOptions<'_>,
+    callout: &mcp_client::McpCallout,
 ) -> Option<McpCallResult> {
     let encoded_name = tool_call.get("name").and_then(serde_json::Value::as_str)?;
     let call_id = tool_call
@@ -1454,7 +1538,7 @@ async fn execute_single_call(
         arguments,
         options.timeout,
         payload_limit,
-        options.allow_loopback,
+        callout,
     )
     .await;
     Some(process_call_result(

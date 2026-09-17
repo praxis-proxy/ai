@@ -3,6 +3,7 @@
 
 //! Configuration for the `openai_mcp_dispatch` filter.
 
+use praxis_core::config::ChainRef;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
@@ -40,9 +41,20 @@ pub(super) const MIN_RETAINED_RESULT_BYTES: usize = 1_024;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpDispatchConfig {
-    /// Allow connections to loopback addresses (default: false).
+    /// Inline outbound filter chain the MCP `tools/call` callout runs through.
+    ///
+    /// `openai_mcp_dispatch` runs inside an `iterative_request_router` step, whose
+    /// filters praxis core builds without a chain-binding context, so only an
+    /// inline chain is supported; a named reference (which would resolve against
+    /// the top-level `filter_chains`) is rejected at build time. The chain carries
+    /// only operator-configured cross-cutting filters — the SSRF-validated dial
+    /// target is staged by the transport, so no upstream-selecting filter is
+    /// prepended. When omitted, the callout runs through an empty chain and dials
+    /// the staged target directly. Whether loopback/private MCP destinations are
+    /// permitted is governed by the operator's global insecure posture, not a
+    /// per-filter flag.
     #[serde(default)]
-    pub allow_loopback: bool,
+    pub outbound_chain: Option<ChainRef>,
 
     /// Trusted request headers forwarded to connector-backed MCP `tools/call` requests.
     /// No request headers are forwarded by default. Credential headers such as

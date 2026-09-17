@@ -72,7 +72,13 @@ fn openai_mcp_dispatch_example_rejects_ssrf_mcp_url() {
     );
     let proxy = start_proxy(&config);
 
-    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"evil","server_url":"http://127.0.0.1/mcp","allowed_tools":["x"]}]}"#;
+    // The MCP callout's SSRF posture is driven by
+    // `insecure_options.allow_private_upstreams`. The integration harness forces
+    // that flag on so loopback test backends dial, which means loopback is no
+    // longer the SSRF representative here. Link-local metadata (169.254.0.0/16)
+    // is blocked unconditionally — even when private upstreams are permitted — so
+    // it proves the SSRF guard still runs on the MCP callout path.
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"evil","server_url":"http://169.254.169.254/mcp","allowed_tools":["x"]}]}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
     assert_eq!(parse_status(&raw), 502, "SSRF URL should be rejected");

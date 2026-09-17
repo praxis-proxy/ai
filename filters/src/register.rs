@@ -4,7 +4,7 @@
 //! Public AI filter registration for consumers outside `praxis-ai-proxy`.
 
 use praxis_core::subrequest::SubRequestClient;
-use praxis_filter::FilterRegistry;
+use praxis_filter::{ChainBindingContext, FilterRegistry};
 
 #[cfg(feature = "azure-ad-filter")]
 use crate::AzureAdFilter;
@@ -320,10 +320,7 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
         @register registry,
         http "responses_to_chat_completions" => praxis_ai_apis::openai::ResponsesToChatCompletionsFilter::from_config
     );
-    praxis_filter::register_filters!(
-        @register registry,
-        http "openai_mcp_tool_resolve" => praxis_ai_apis::openai::McpToolResolveFilter::from_config
-    );
+    register_mcp_callout_filters(registry);
     praxis_filter::register_filters!(
         @register registry,
         http "openai_tool_parse" => praxis_ai_apis::openai::ToolParseFilter::from_config
@@ -336,12 +333,52 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
     register_openai_agentic_filters(registry);
 }
 
-/// Register OpenAI agentic loop and MCP dispatch filters.
-fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
+/// Register the two MCP callout filters (`openai_mcp_tool_resolve`,
+/// `openai_mcp_dispatch`).
+///
+/// Neither filter selects the dial target through a pipeline filter: the MCP
+/// subrequest transport stages the SSRF-validated [`StagedUpstream`] into the
+/// per-request extensions and the executor seeds the nested context's upstream
+/// from it before the request phase. A configured `outbound_chain` therefore
+/// carries only the operator's cross-cutting outbound filters.
+///
+/// `openai_mcp_tool_resolve` runs top-level (one-shot `tools/list` discovery
+/// before the agentic loop) and is registered as **chain-binding**: its
+/// configured `outbound_chain` is resolved and prebuilt at pipeline-build time.
+/// Because it binds at top level with a live [`ChainBindingContext`], both an
+/// inline chain and a named reference (resolved against the top-level
+/// `filter_chains`) are supported.
+///
+/// `openai_mcp_dispatch` runs **inside** the `iterative_request_router` step
+/// pipeline (the per-round `tools/call` executor). praxis core resolves IRR
+/// step filters via the plain [`FilterPipeline::build`], which has no
+/// [`ChainBindingContext`], so a named reference cannot be resolved there. It is
+/// therefore registered as a plain builtin that builds its outbound pipeline
+/// directly from an inline `outbound_chain` (or an empty one) and rejects a
+/// named reference at build time. SSRF posture is propagated from the operator's
+/// global insecure options at pipeline finalization.
+///
+/// [`FilterPipeline::build`]: praxis_filter::FilterPipeline::build
+/// [`ChainBindingContext`]: praxis_filter::ChainBindingContext
+/// [`StagedUpstream`]: praxis_filter::StagedUpstream
+#[expect(clippy::panic, reason = "matches register_filters! macro convention")]
+fn register_mcp_callout_filters(registry: &mut FilterRegistry) {
+    registry
+        .register_chain_binding(
+            "openai_mcp_tool_resolve",
+            ::std::sync::Arc::new(|config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
+                praxis_ai_apis::openai::McpToolResolveFilter::from_config_with_binding(config, ctx)
+            }),
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_mcp_tool_resolve'"));
     praxis_filter::register_filters!(
         @register registry,
         http "openai_mcp_dispatch" => praxis_ai_apis::openai::McpDispatchFilter::from_config
     );
+}
+
+/// Register OpenAI agentic loop filters.
+fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "openai_agentic_loop" => praxis_ai_apis::openai::AgenticLoopFilter::from_config

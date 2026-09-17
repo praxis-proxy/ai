@@ -24,7 +24,7 @@ On successful discovery, one `mcp_list_tools` output item per resolved server (i
 | `timeout_ms` | integer | no | Per-server timeout in milliseconds for `tools/list` calls. |
 | `max_servers` | integer | no | Maximum number of distinct MCP servers per request. |
 | `max_tools` | integer | no | Maximum number of tools returned by a single MCP server. |
-| `allow_loopback` | bool | no | Allow connections to loopback addresses (`127.0.0.0/8`, `::1`, `localhost`). Disabled by default for SSRF protection; enable for development environments where MCP servers run locally. |
+| `outbound_chain` | ChainRef | no | Outbound filter chain the MCP `tools/list` callout runs through. The chain is bound at build time and carries only operator-configured cross-cutting filters, which observe and can act on the outbound MCP request. The SSRF-validated dial target is staged by the transport, so no upstream-selecting filter is prepended. Both an inline chain and a named reference (resolved against the top-level `filter_chains`) are accepted, because this filter binds at top level. When omitted, the callout runs through an empty chain and dials the staged target directly. Whether loopback/private MCP destinations are permitted is governed by the operator's global insecure posture (which pipeline finalization applies to this bound chain), not a per-filter flag. |
 | `connectors` | ConnectorConfig[] | no | Named connectors mapping connector IDs to server URLs. |
 | `connectors[].id` | string | yes | Connector identifier referenced in requests. |
 | `connectors[].server_url` | string | yes | MCP server URL for this connector. |

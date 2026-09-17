@@ -1,0 +1,1189 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
+//! Route the outbound MCP Streamable-HTTP exchange through a filtered
+//! subrequest.
+//!
+//! This is the `#957` seam: instead of dialing the MCP server with an inline
+//! `reqwest` client, the [`rmcp`] [`StreamableHttpClient`] adapter here targets
+//! the dynamic MCP URL through praxis's URL-aware target preparation
+//! ([`prepare_url_target`]) and runs the request through a bound outbound
+//! [`FilteredSubrequestExecutor`] chain. The chain reuses praxis's own SSRF/DNS
+//! validation, TLS/SNI handling, Host binding, deadline, and response-size
+//! guardrails rather than reimplementing them per call.
+//!
+//! The adapter buffers each exchange: JSON responses are parsed directly, and
+//! `text/event-stream` responses are buffered and reparsed to their terminal
+//! JSON-RPC message. Server-initiated GET streams are not supported
+//! ([`get_stream`](StreamableHttpClient::get_stream) returns
+//! [`StreamableHttpError::ServerDoesNotSupportSse`]); this prototype covers the
+//! request/response MCP surface (initialize, notifications, `tools/list` +
+//! pagination, `tools/call`, session cleanup).
+
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
+
+use bytes::Bytes;
+use futures::stream::BoxStream;
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+#[cfg(test)]
+use praxis_core::subrequest::SubRequestConnector;
+use praxis_core::{
+    config::ChainRef,
+    connectivity::{UrlTargetError, prepare_url_target},
+    subrequest::{DEPTH_HEADER, SubRequestClient},
+};
+use praxis_filter::{
+    CalloutOutcome, CalloutResponse, ChainBindingContext, FilterEntry, FilterError, FilterPipeline, FilterRegistry,
+    FilteredSubrequestExecutor, HttpFilterContext, IterationState, RequestExtensions, StagedUpstream,
+    StagedUpstreamFallback, SubRequest, SubResponse, SubrequestRuntime,
+};
+use rmcp::{
+    model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage},
+    transport::{
+        common::http_header::{HEADER_LAST_EVENT_ID, HEADER_SESSION_ID},
+        streamable_http_client::{
+            AuthRequiredError, InsufficientScopeError, StreamableHttpClient, StreamableHttpError,
+            StreamableHttpPostResponse,
+        },
+    },
+};
+use sse_stream::{Error as SseError, Sse};
+
+use super::{McpClientError, McpDisplayUrl};
+
+/// Wire byte ceiling for a control-plane MCP response.
+///
+/// Bounds the buffered body of `initialize`, each `tools/list` page, and any
+/// other non-`tools/call` exchange before deserialization, so an untrusted
+/// server cannot exhaust proxy memory with an oversized control response. Ported
+/// from the previous reqwest-layer `bounded_http` client; this is now the single
+/// home for the MCP response tiers, since the dial runs through the executor.
+/// `mod.rs` derives its cumulative `tools/list` budget from this value.
+pub(super) const MAX_CONTROL_RESPONSE_BYTES: usize = 1_048_576;
+
+/// JSON-RPC envelope allowance added on top of the configured `tools/call`
+/// result cap, covering the surrounding result object beyond the raw payload.
+const MAX_TOOL_RESULT_ENVELOPE_BYTES: usize = 65_536;
+
+/// Worst-case expansion factor for a UTF-8 payload rendered as JSON (`\u00XX`
+/// escaping), applied to the configured `tools/call` result cap so the wire
+/// ceiling admits any result that fits within the decoded cap.
+const MAX_JSON_STRING_EXPANSION: usize = 6;
+
+/// Translate a configured *decoded* `tools/call` result cap into the *wire* byte
+/// ceiling to enforce before deserialization (worst-case JSON expansion plus the
+/// JSON-RPC envelope allowance).
+fn tool_result_wire_cap(max_result_bytes: usize) -> usize {
+    max_result_bytes
+        .saturating_mul(MAX_JSON_STRING_EXPANSION)
+        .saturating_add(MAX_TOOL_RESULT_ENVELOPE_BYTES)
+}
+
+/// The `mcp-session-id` header carrying the Streamable-HTTP session token.
+fn session_id_header() -> HeaderName {
+    HeaderName::from_static("mcp-session-id")
+}
+
+// -----------------------------------------------------------------------------
+// McpTransportError
+// -----------------------------------------------------------------------------
+
+/// Failure categories for the filtered-subrequest MCP transport.
+///
+/// Every variant is credential-safe: its `Display` never echoes the MCP URL,
+/// userinfo, query, or any header value. This is the `Error` associated type of
+/// [`McpSubrequestClient`], surfaced to `rmcp` as
+/// [`StreamableHttpError::Client`].
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum McpTransportError {
+    /// The filtered subrequest failed to complete the exchange (transport
+    /// failure, deadline, or an unexpected streaming response).
+    #[error("mcp subrequest transport failed")]
+    Transport,
+
+    /// The MCP target URL could not be prepared into a dial target.
+    #[error("mcp target preparation failed")]
+    Target,
+
+    /// The MCP target resolved to an address the SSRF policy rejected.
+    #[error("mcp target blocked by address policy")]
+    SsrfBlocked,
+
+    /// The outbound JSON-RPC message could not be serialized.
+    #[error("failed to serialize mcp request")]
+    Serialize,
+
+    /// The server returned a status or a session/auth header the transport
+    /// could not represent.
+    #[error("mcp server returned an unrepresentable status or header")]
+    InvalidStatus,
+
+    /// The outbound MCP pipeline or TLS material could not be constructed.
+    #[error("failed to set up the mcp outbound path")]
+    Setup,
+
+    /// The server's response exceeded the configured size limit.
+    ///
+    /// The filtered callout classifies the oversized response as
+    /// [`CalloutOutcome::ResponseTooLarge`]; the transport records the typed
+    /// overflow out-of-band (see [`ResponseOverflow`]) and returns this variant so
+    /// the caller can map it to HTTP 413.
+    #[error("mcp server returned a response exceeding the size limit")]
+    ResponseTooLarge,
+}
+
+// -----------------------------------------------------------------------------
+// ResponseOverflow
+// -----------------------------------------------------------------------------
+
+/// A response-size overflow observed on an MCP callout, carried out-of-band past
+/// `rmcp`'s opaque transport-error mapping.
+///
+/// `rmcp`'s `StreamableHttpClient` funnels every transport failure through an
+/// opaque `.map_err(|_source| …)` that discards the typed [`McpTransportError`],
+/// so a [`CalloutOutcome::ResponseTooLarge`] classification cannot ride out on
+/// the returned `StreamableHttpError`. [`McpSubrequestClient::execute`] records
+/// it here instead (first overflow wins), and the free-standing caller in
+/// `mod.rs` reads it back via [`overflow_client_error`] after the rmcp
+/// `serve`/pagination call fails.
+#[derive(Clone, Copy)]
+pub(crate) struct ResponseOverflow {
+    /// The effective response-size limit that was exceeded.
+    limit: usize,
+}
+
+// -----------------------------------------------------------------------------
+// Outbound chain construction
+// -----------------------------------------------------------------------------
+
+/// Resolve a chain-binding MCP filter's configured `outbound_chain` into a bound
+/// outbound [`FilterPipeline`].
+///
+/// No upstream-selecting filter is needed: [`McpSubrequestClient::execute`]
+/// stages a [`StagedUpstream`] (and a [`StagedUpstreamFallback`]) in the
+/// per-request extensions, and the executor seeds the nested context's upstream
+/// from it before the request phase. The bound chain therefore carries only the
+/// operator's cross-cutting filters (observability, security, credentials),
+/// which observe and may act on the outbound MCP request while the callout keeps
+/// full control of the validated destination.
+///
+/// Both reference shapes are honored, because this runs at top-level build time
+/// with a live [`ChainBindingContext`]: an inline chain is bound directly, and a
+/// [`ChainRef::Named`] reference resolves against the top-level `filter_chains`.
+/// When `outbound_chain` is [`None`] the bound chain is an empty inline chain
+/// named `chain_name`, so the callout dials the staged upstream with no extra
+/// filters.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if [`ChainBindingContext::bind_chain`] rejects the
+/// chain (an unknown named reference, a cycle, excessive nesting, a terminal
+/// filter, or an ordering violation).
+pub(crate) fn bind_mcp_outbound_chain(
+    outbound_chain: Option<ChainRef>,
+    ctx: &ChainBindingContext<'_>,
+    chain_name: &str,
+) -> Result<Arc<FilterPipeline>, FilterError> {
+    let chain_ref = match outbound_chain {
+        None => ChainRef::Inline {
+            name: chain_name.to_owned(),
+            filters: Vec::new(),
+        },
+        Some(chain_ref) => chain_ref,
+    };
+    let pipeline = ctx.bind_chain(&chain_ref)?;
+    Ok(Arc::new(pipeline))
+}
+
+/// Build an inline (or empty) MCP outbound pipeline without a chain-binding
+/// context, for a filter that cannot resolve named chains.
+///
+/// `openai_mcp_dispatch` runs inside an `iterative_request_router` step, whose
+/// filters praxis core builds via the plain [`FilterPipeline::build`] with no
+/// [`ChainBindingContext`]. A named reference resolves against the top-level
+/// `filter_chains`, which are unreachable here, so a [`ChainRef::Named`] is
+/// rejected; an inline chain carries its own filters and is built directly, and
+/// [`None`] yields an empty pipeline. In every case the executor seeds the dial
+/// target from the staged upstream, so the built filters run purely as
+/// cross-cutting outbound filters.
+///
+/// `allow_private` seeds the private-upstream posture; pipeline finalization
+/// later propagates the operator's global insecure options onto the stored
+/// pipeline (see the filter's `apply_insecure_options`).
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if the reference is a named chain, or if the inline
+/// filters cannot be built into a pipeline.
+pub(crate) fn build_inline_outbound_pipeline(
+    outbound_chain: Option<ChainRef>,
+    allow_private: bool,
+) -> Result<Arc<FilterPipeline>, FilterError> {
+    let mut entries = match outbound_chain {
+        None => Vec::new(),
+        Some(ChainRef::Inline { filters, .. }) => filters,
+        Some(ChainRef::Named(_)) => {
+            return Err(FilterError::from(
+                "mcp outbound_chain must be an inline chain here; a named reference cannot be \
+                 resolved without a chain-binding context",
+            ));
+        },
+    };
+    let registry = FilterRegistry::with_builtins();
+    let mut pipeline = FilterPipeline::build(&mut entries, &registry)?;
+    pipeline.set_allow_private_upstreams(allow_private);
+    Ok(Arc::new(pipeline))
+}
+
+/// Build the bare, empty outbound pipeline used when no operator `outbound_chain`
+/// is bound.
+///
+/// No upstream-selecting filter is needed: [`McpSubrequestClient::execute`]
+/// stages a [`StagedUpstream`] the executor seeds the dial target from before the
+/// request phase, so a zero-filter pipeline dials the validated destination
+/// directly. `allow_private` mirrors the operator's global private-upstream
+/// posture: the executor's peer builder consults
+/// [`FilterPipeline::allow_private_upstreams`] and refuses private/reserved dial
+/// targets unless it is set, so the pipeline must carry the same policy the
+/// [`ssrf_validate`] hook enforces. Plain-builtin filter registration
+/// (`from_config`) builds this with the safe default posture (private denied) and
+/// lets pipeline finalization propagate the operator's global insecure options.
+/// Unit tests that construct a callout without a live pipeline build
+/// (`McpCallout::fabricated`) bake the posture directly.
+///
+/// # Errors
+///
+/// Returns [`McpClientError::Connection`] if the empty pipeline cannot be built.
+pub(crate) fn build_bare_outbound_pipeline(allow_private: bool) -> Result<Arc<FilterPipeline>, McpClientError> {
+    let registry = FilterRegistry::with_builtins();
+    let mut entries: Vec<FilterEntry> = Vec::new();
+    let mut pipeline = FilterPipeline::build(&mut entries, &registry).map_err(|_error| McpClientError::Connection {
+        url: McpDisplayUrl::invalid(),
+    })?;
+    pipeline.set_allow_private_upstreams(allow_private);
+    Ok(Arc::new(pipeline))
+}
+
+// -----------------------------------------------------------------------------
+// McpCallout
+// -----------------------------------------------------------------------------
+
+/// The request-scoped resources an MCP callout dials through.
+///
+/// This bundles the *real* parent subrequest transport and downstream
+/// attributes read off the owning [`HttpFilterContext`] together with the bound
+/// outbound [`FilterPipeline`] the chain-binding MCP filter resolved at build
+/// time. Both `openai_mcp_tool_resolve` and `openai_mcp_dispatch` construct one
+/// of these per request via [`from_context`](Self::from_context) and thread it
+/// down to [`list_tools`](super::list_tools)/[`call_tool`](super::call_tool),
+/// which build an [`McpSubrequestClient`] from it.
+///
+/// It deliberately does *not* fabricate a fresh connector or a default runtime:
+/// the callout must share the server's connection pool and carry the originating
+/// client's address, TLS posture, peer identity, and request start so the nested
+/// pipeline sees the same downstream context the top-level request does.
+#[derive(Clone)]
+pub(crate) struct McpCallout {
+    /// Shared parent sub-request transport (connection pool included).
+    client: SubRequestClient,
+    /// Downstream attributes captured from the owning request context.
+    downstream: SubrequestRuntime,
+    /// Operator-configured (or empty) outbound pipeline for the callout; the
+    /// dial target is staged separately via [`StagedUpstream`], not selected by
+    /// a pipeline filter.
+    pipeline: Arc<FilterPipeline>,
+    /// Sub-request nesting depth for callouts issued from this context.
+    depth: u8,
+    /// Whether private/loopback MCP destinations are permitted, taken from the
+    /// bound pipeline's finalized posture (never a per-filter opt-in).
+    allow_private: bool,
+}
+
+impl McpCallout {
+    /// Capture the parent transport and downstream attributes from `ctx`,
+    /// pairing them with the already-bound outbound `pipeline`.
+    ///
+    /// Returns [`None`] when the pipeline exposes no shared sub-request client
+    /// (for example a pipeline built without a server runtime): an MCP callout
+    /// cannot proceed without the parent transport, so the caller fails closed.
+    ///
+    /// `allow_private` is read from the bound pipeline
+    /// ([`FilterPipeline::allow_private_upstreams`]), which pipeline
+    /// finalization sets from the operator's global insecure posture — the same
+    /// value the executor's peer builder enforces — so the SSRF hook here and the
+    /// executor agree without a per-filter flag.
+    pub(crate) fn from_context(ctx: &HttpFilterContext<'_>, pipeline: Arc<FilterPipeline>) -> Option<Self> {
+        let client = ctx.subrequest_client?.clone();
+        let downstream = SubrequestRuntime::new(
+            ctx.client_addr,
+            ctx.downstream_tls,
+            ctx.peer_identity.clone(),
+            ctx.request_start,
+        );
+        let allow_private = pipeline.allow_private_upstreams();
+        let depth = resolve_callout_depth(
+            ctx.extensions.get::<IterationState>().map(IterationState::depth),
+            &ctx.request.headers,
+        );
+        Some(Self {
+            client,
+            downstream,
+            pipeline,
+            depth,
+            allow_private,
+        })
+    }
+
+    /// Whether private/loopback MCP destinations are permitted for this callout.
+    pub(crate) fn allow_private(&self) -> bool {
+        self.allow_private
+    }
+
+    /// Build a callout backed by a fabricated connector and a bare, empty
+    /// outbound pipeline, for unit tests that exercise the transport without a
+    /// live pipeline build.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpClientError`] if the bare outbound pipeline cannot be built.
+    #[cfg(test)]
+    pub(crate) fn fabricated(allow_private: bool) -> Result<Self, McpClientError> {
+        let pipeline = build_bare_outbound_pipeline(allow_private)?;
+        Ok(Self {
+            client: SubRequestClient::new(SubRequestConnector::new(1, None)),
+            downstream: SubrequestRuntime::new(None, false, None, Instant::now()),
+            pipeline,
+            depth: 0,
+            allow_private,
+        })
+    }
+}
+
+/// Resolve the sub-request nesting depth for an MCP callout issued from a
+/// filter context.
+///
+/// The executor increments this value for the nested request
+/// ([`FrameworkHeaders::set_depth`] emits `self.depth + 1`), so it must reflect
+/// the depth of the *current* request, not a fixed zero. Sources, in order:
+///
+/// 1. The iterative-router's [`IterationState::depth`], when the callout is issued from inside an IRR step (the
+///    dispatch filter's case).
+/// 2. Otherwise the reserved `x-praxis-iterative-depth` header on the incoming request, set by the framework when this
+///    proxy is itself reached as a nested sub-request. The header uses the `x-praxis-*` reserved prefix, so ingress
+///    rejects client-spoofed values; a malformed value falls back to 0.
+/// 3. Otherwise 0, for a genuine top-level request.
+///
+/// Hard-coding 0 would let a nested callout under-report its depth and defeat the
+/// executor's loop-prevention bound.
+///
+/// [`FrameworkHeaders::set_depth`]: praxis_core::subrequest::FrameworkHeaders::set_depth
+fn resolve_callout_depth(iteration_state_depth: Option<u8>, headers: &HeaderMap) -> u8 {
+    if let Some(depth) = iteration_state_depth {
+        return depth;
+    }
+    headers
+        .get(DEPTH_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| raw.parse::<u8>().ok())
+        .unwrap_or(0)
+}
+
+// -----------------------------------------------------------------------------
+// McpSubrequestClient
+// -----------------------------------------------------------------------------
+
+/// `rmcp` Streamable-HTTP client that routes each exchange through a filtered
+/// subrequest.
+#[derive(Clone)]
+pub(crate) struct McpSubrequestClient {
+    /// Request-scoped transport, downstream attributes, and bound pipeline.
+    callout: McpCallout,
+    /// Wire byte ceiling applied to a `tools/call` response on this client.
+    ///
+    /// Control-plane exchanges (`initialize`, `tools/list`, ...) are always
+    /// bounded to [`MAX_CONTROL_RESPONSE_BYTES`]; only `tools/call` responses use
+    /// this configured, JSON-expansion-adjusted ceiling (see [`Self::response_limit`]).
+    tool_result_bytes: usize,
+    /// Per-exchange duration ceiling.
+    step_timeout: Duration,
+    /// Out-of-band record of a response-size overflow observed on a callout.
+    ///
+    /// `rmcp` discards the typed [`McpTransportError`] on failure, so a
+    /// [`CalloutOutcome::ResponseTooLarge`] classification is recorded here (first
+    /// overflow wins) and read back by the caller via [`overflow_client_error`]
+    /// after the rmcp `serve`/pagination call fails. Shared through the [`Clone`]
+    /// the transport requires, so the handle taken before the client is moved into
+    /// the rmcp transport observes writes made during the exchange.
+    overflow: Arc<OnceLock<ResponseOverflow>>,
+}
+
+impl McpSubrequestClient {
+    /// Build a client for the control-plane exchanges performed by
+    /// [`list_tools`](super::list_tools): `initialize` and `tools/list`.
+    ///
+    /// No `tools/call` result flows over this transport, so every response is
+    /// bounded to [`MAX_CONTROL_RESPONSE_BYTES`] before deserialization.
+    pub(crate) fn control(callout: McpCallout, step_timeout: Duration) -> Self {
+        Self::with_wire_cap(callout, step_timeout, MAX_CONTROL_RESPONSE_BYTES)
+    }
+
+    /// Build a client for [`call_tool`](super::call_tool): `initialize` uses the
+    /// control ceiling and the `tools/call` response is bounded to the configured
+    /// `max_result_bytes` cap, expanded for worst-case JSON string escaping.
+    ///
+    /// `step_timeout` bounds each individual HTTP exchange; the `callout` carries
+    /// the parent transport and the bound outbound pipeline whose finalized
+    /// posture decides whether loopback destinations are permitted.
+    pub(crate) fn for_tool(callout: McpCallout, step_timeout: Duration, max_result_bytes: usize) -> Self {
+        Self::with_wire_cap(callout, step_timeout, tool_result_wire_cap(max_result_bytes))
+    }
+
+    /// Shared constructor: move in the callout and pin the `tools/call` wire
+    /// ceiling.
+    fn with_wire_cap(callout: McpCallout, step_timeout: Duration, tool_result_bytes: usize) -> Self {
+        Self {
+            callout,
+            tool_result_bytes,
+            step_timeout,
+            overflow: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Take a handle to this client's overflow record before the client is moved
+    /// into the rmcp transport.
+    ///
+    /// The returned [`Arc`] aliases the same [`OnceLock`] the transport writes to
+    /// during an exchange, so the caller can read back a
+    /// [`CalloutOutcome::ResponseTooLarge`] classification after the rmcp
+    /// `serve`/pagination call fails (see [`overflow_client_error`]).
+    pub(crate) fn overflow_handle(&self) -> Arc<OnceLock<ResponseOverflow>> {
+        Arc::clone(&self.overflow)
+    }
+
+    /// Select the wire byte ceiling for one outbound message.
+    ///
+    /// `tools/call` responses use the configured tool-result ceiling; every other
+    /// exchange (`initialize`, `tools/list`, notifications, ...) is bounded to the
+    /// control ceiling so an untrusted server cannot exhaust proxy memory on the
+    /// control plane.
+    fn response_limit(&self, message: &ClientJsonRpcMessage) -> usize {
+        match message {
+            ClientJsonRpcMessage::Request(request) if matches!(request.request, ClientRequest::CallToolRequest(_)) => {
+                self.tool_result_bytes
+            },
+            _ => MAX_CONTROL_RESPONSE_BYTES,
+        }
+    }
+
+    /// Prepare, validate, and dial `uri`, returning the buffered response.
+    ///
+    /// SSRF/DNS validation, TLS/SNI, Host binding, and the response-size ceiling
+    /// are enforced by [`prepare_url_target`] and the executor.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear prepare/validate/dial sequence reads clearest inline"
+    )]
+    #[expect(clippy::large_stack_frames, reason = "rmcp/executor futures are inherently large")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "method/uri/body/headers/limit describe one dial call"
+    )]
+    async fn execute(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Bytes,
+        headers: HeaderMap,
+        max_response_bytes: usize,
+    ) -> Result<SubResponse, StreamableHttpError<McpTransportError>> {
+        let deadline = Instant::now()
+            .checked_add(self.step_timeout)
+            .ok_or(StreamableHttpError::Client(McpTransportError::Setup))?;
+        let allow_private = self.callout.allow_private;
+        let target = prepare_url_target(uri, deadline, move |addrs| ssrf_validate(addrs, allow_private))
+            .await
+            .map_err(|error| map_prepare_error(&error))?;
+        let staged = StagedUpstream::from_prepared_target(&target)
+            .map_err(|_error| StreamableHttpError::Client(McpTransportError::Setup))?;
+        let fallback = StagedUpstreamFallback::from_prepared_target(&target);
+        let origin = origin_form(uri).map_err(StreamableHttpError::Client)?;
+
+        let request = SubRequest {
+            method,
+            uri: origin,
+            headers,
+            body,
+        };
+        // Stage the validated dial target (and its DNS-failover set) so the
+        // executor seeds the nested context's upstream before the request phase.
+        // The bound outbound pipeline therefore never has to select the upstream.
+        let mut extensions = RequestExtensions::default();
+        extensions.insert(staged);
+        extensions.insert(fallback);
+
+        let executor = FilteredSubrequestExecutor::for_callout(
+            self.callout.client.clone(),
+            self.callout.downstream.clone(),
+            self.callout.depth,
+            max_response_bytes,
+            self.step_timeout,
+        );
+        let outcome = Box::pin(executor.run_classified(&self.callout.pipeline, &request, extensions, deadline))
+            .await
+            .map_err(|_error| StreamableHttpError::Client(McpTransportError::Transport))?;
+        match outcome {
+            CalloutOutcome::Response(CalloutResponse::Buffered(response)) => Ok(response),
+            CalloutOutcome::ResponseTooLarge { actual, limit } => {
+                tracing::debug!(actual = ?actual, limit, "mcp callout response exceeded size limit");
+                // First overflow wins; the caller reads this back after rmcp
+                // discards the typed error (see `overflow_client_error`).
+                self.overflow.get_or_init(|| ResponseOverflow { limit });
+                Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+            },
+            // A single request/response MCP exchange never selects streaming, and
+            // `CalloutOutcome` is `#[non_exhaustive]`: fail closed on any other
+            // outcome (streaming or a future variant).
+            _ => Err(StreamableHttpError::Client(McpTransportError::Transport)),
+        }
+    }
+}
+
+impl StreamableHttpClient for McpSubrequestClient {
+    type Error = McpTransportError;
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "response classification mirrors the rmcp reference client"
+    )]
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
+        let session_was_attached = session_id.is_some();
+        let mut headers = build_request_headers(auth_header, custom_headers)?;
+        headers.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream, application/json"),
+        );
+        headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Some(session) = &session_id {
+            let value = HeaderValue::from_str(session)
+                .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
+            headers.insert(session_id_header(), value);
+        }
+
+        let max_response_bytes = self.response_limit(&message);
+        let body =
+            serde_json::to_vec(&message).map_err(|_error| StreamableHttpError::Client(McpTransportError::Serialize))?;
+        let response =
+            Box::pin(self.execute(Method::POST, &uri, Bytes::from(body), headers, max_response_bytes)).await?;
+
+        let status = StatusCode::from_u16(response.status)
+            .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
+
+        if status == StatusCode::UNAUTHORIZED
+            && let Some(header) = www_authenticate(&response.headers)
+        {
+            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(header)));
+        }
+        if status == StatusCode::FORBIDDEN
+            && let Some(header) = www_authenticate(&response.headers)
+        {
+            return Err(StreamableHttpError::InsufficientScope(InsufficientScopeError::new(
+                header, None,
+            )));
+        }
+        if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+        if status == StatusCode::NOT_FOUND && session_was_attached {
+            return Err(StreamableHttpError::SessionExpired);
+        }
+
+        let session_id_out = response
+            .headers
+            .get(session_id_header())
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let content_type = response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+
+        // A framing-only success for a one-way client message is an ack.
+        if status.is_success()
+            && response.body.is_empty()
+            && matches!(
+                message,
+                ClientJsonRpcMessage::Notification(_)
+                    | ClientJsonRpcMessage::Response(_)
+                    | ClientJsonRpcMessage::Error(_)
+            )
+        {
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+
+        if !status.is_success() {
+            if content_type.as_deref().is_some_and(is_json_content_type) {
+                let body = String::from_utf8_lossy(&response.body);
+                if let Some(message) = parse_json_rpc_error(&body) {
+                    return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
+                }
+            }
+            return Err(StreamableHttpError::UnexpectedServerResponse(
+                format!("HTTP {status}").into(),
+            ));
+        }
+
+        match content_type.as_deref() {
+            Some(content_type) if is_event_stream_content_type(content_type) => {
+                match parse_buffered_sse_terminal(&response.body) {
+                    Some(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
+                    None => Err(StreamableHttpError::UnexpectedServerResponse(
+                        "buffered SSE stream contained no JSON-RPC message".into(),
+                    )),
+                }
+            },
+            Some(content_type) if is_json_content_type(content_type) => {
+                match serde_json::from_slice::<ServerJsonRpcMessage>(&response.body) {
+                    Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
+                    Err(_error) => Ok(StreamableHttpPostResponse::Accepted),
+                }
+            },
+            other => Err(StreamableHttpError::UnexpectedContentType(other.map(str::to_owned))),
+        }
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), StreamableHttpError<McpTransportError>> {
+        let mut headers = build_request_headers(auth_header, custom_headers)?;
+        let value = HeaderValue::from_str(&session_id)
+            .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
+        headers.insert(session_id_header(), value);
+
+        let response =
+            Box::pin(self.execute(Method::DELETE, &uri, Bytes::new(), headers, MAX_CONTROL_RESPONSE_BYTES)).await?;
+        let status = StatusCode::from_u16(response.status)
+            .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
+        // A server that does not support session deletion is not an error.
+        if status == StatusCode::METHOD_NOT_ALLOWED {
+            return Ok(());
+        }
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(StreamableHttpError::UnexpectedServerResponse(
+                format!("HTTP {status}").into(),
+            ))
+        }
+    }
+
+    async fn get_stream(
+        &self,
+        _uri: Arc<str>,
+        _session_id: Option<Arc<str>>,
+        _last_event_id: Option<String>,
+        _auth_header: Option<String>,
+        _custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<McpTransportError>> {
+        // Server-initiated GET streams are out of scope for the buffered
+        // request/response prototype.
+        Err(StreamableHttpError::ServerDoesNotSupportSse)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// Merge caller custom headers and an optional bearer token into a header map.
+///
+/// Reserved Streamable-HTTP headers (`Accept`, `Mcp-Session-Id`,
+/// `Last-Event-ID`) are rejected before insertion: the transport sets them from
+/// trusted state (content negotiation, the `rmcp`-owned session token, and — for
+/// GET resumption — the last event id), so a caller-supplied value could
+/// otherwise select or fix a session or override content negotiation. This
+/// mirrors `rmcp`'s own reqwest transport, which fails closed on the same set.
+///
+/// # Errors
+///
+/// Returns [`StreamableHttpError::ReservedHeaderConflict`] if a caller header is
+/// reserved, or [`StreamableHttpError::Client`] with
+/// [`McpTransportError::InvalidStatus`] if the auth token is not a valid header
+/// value.
+fn build_request_headers(
+    auth_header: Option<String>,
+    custom_headers: HashMap<HeaderName, HeaderValue>,
+) -> Result<HeaderMap, StreamableHttpError<McpTransportError>> {
+    let mut headers = HeaderMap::new();
+    for (name, value) in custom_headers {
+        if is_reserved_streamable_http_header(&name) {
+            return Err(StreamableHttpError::ReservedHeaderConflict(name.to_string()));
+        }
+        headers.insert(name, value);
+    }
+    if let Some(token) = auth_header {
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
+        headers.insert(http::header::AUTHORIZATION, value);
+    }
+    Ok(headers)
+}
+
+/// Whether `name` is a reserved Streamable-HTTP header the transport owns.
+///
+/// Matches `Accept`, `Mcp-Session-Id`, and `Last-Event-ID` case-insensitively.
+/// `MCP-Protocol-Version` is deliberately *not* reserved: callers may pin it.
+fn is_reserved_streamable_http_header(name: &HeaderName) -> bool {
+    name == http::header::ACCEPT
+        || name.as_str().eq_ignore_ascii_case(HEADER_SESSION_ID)
+        || name.as_str().eq_ignore_ascii_case(HEADER_LAST_EVENT_ID)
+}
+
+/// Extract a `WWW-Authenticate` header value, if present and printable.
+fn www_authenticate(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(http::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+/// Compute the origin-form request target (path + query) for `url`.
+///
+/// # Errors
+///
+/// Returns [`McpTransportError::Target`] if the URL or its path/query cannot be
+/// parsed into a URI.
+fn origin_form(url: &str) -> Result<http::Uri, McpTransportError> {
+    let uri: http::Uri = url.parse().map_err(|_error| McpTransportError::Target)?;
+    let path_and_query = uri.path_and_query().map_or("/", http::uri::PathAndQuery::as_str);
+    path_and_query.parse().map_err(|_error| McpTransportError::Target)
+}
+
+/// Read back a recorded response-size overflow as a caller-facing
+/// [`McpClientError`], if one was observed on the callout.
+///
+/// `rmcp` discards the typed [`McpTransportError`] the transport returns, so a
+/// [`CalloutOutcome::ResponseTooLarge`] classification is recorded out-of-band in
+/// the client's overflow [`OnceLock`] (see
+/// [`McpSubrequestClient::overflow_handle`]) and read back here after the rmcp
+/// `serve`/pagination call fails. Returns [`None`] when no overflow was recorded,
+/// so the caller can fall back to its generic connection error. `url` carries the
+/// credential-safe display URL for the surfaced error.
+pub(crate) fn overflow_client_error(
+    overflow: &OnceLock<ResponseOverflow>,
+    url: &McpDisplayUrl,
+) -> Option<McpClientError> {
+    let recorded = overflow.get()?;
+    Some(McpClientError::ResponseTooLarge {
+        url: url.clone(),
+        limit: recorded.limit,
+    })
+}
+
+/// SSRF policy hook applied to the resolved MCP addresses.
+///
+/// Delegates to [`super::is_ssrf_blocked_ip`] so this hook enforces exactly the
+/// policy the literal-IP and DNS-resolution paths do: link-local, unspecified,
+/// cloud-metadata, and IPv6 unique-local addresses are always rejected, while
+/// loopback and the RFC1918/CGNAT/`0.0.0.0/8` private ranges are rejected unless
+/// `allow_private` is set. Sharing the helper closes the gap where an RFC1918
+/// address slipped past this hook with private upstreams disabled.
+///
+/// # Errors
+///
+/// Returns an opaque, credential-free error when any address is SSRF-sensitive.
+fn ssrf_validate(addrs: &[SocketAddr], allow_private: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    for addr in addrs {
+        if super::is_ssrf_blocked_ip(&addr.ip(), allow_private) {
+            return Err(super::SSRF_BLOCK_REASON.into());
+        }
+    }
+    Ok(())
+}
+
+/// Map a target-preparation failure to a credential-safe transport error.
+fn map_prepare_error(error: &UrlTargetError) -> StreamableHttpError<McpTransportError> {
+    match error {
+        UrlTargetError::PolicyRejected(_) => StreamableHttpError::Client(McpTransportError::SsrfBlocked),
+        _ => StreamableHttpError::Client(McpTransportError::Target),
+    }
+}
+
+/// Whether a `Content-Type` value denotes JSON.
+fn is_json_content_type(value: &str) -> bool {
+    value.trim_start().starts_with("application/json")
+}
+
+/// Whether a `Content-Type` value denotes an SSE event stream.
+fn is_event_stream_content_type(value: &str) -> bool {
+    value.trim_start().starts_with("text/event-stream")
+}
+
+/// Parse a JSON-RPC error message from a response body, if it is one.
+fn parse_json_rpc_error(body: &str) -> Option<ServerJsonRpcMessage> {
+    match serde_json::from_str::<ServerJsonRpcMessage>(body) {
+        Ok(message @ JsonRpcMessage::Error(_)) => Some(message),
+        _ => None,
+    }
+}
+
+/// Collect the concatenated `data:` payload of each SSE event in `text`.
+///
+/// Follows the SSE framing rules the transport needs: `data:` lines within an
+/// event are joined with `\n`, and a blank line terminates the event.
+fn sse_data_events(text: &str) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut data = String::new();
+    let mut has_data = false;
+    for line in text.lines() {
+        if line.is_empty() {
+            if has_data {
+                events.push(std::mem::take(&mut data));
+                has_data = false;
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            if has_data {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+            has_data = true;
+        }
+    }
+    if has_data {
+        events.push(data);
+    }
+    events
+}
+
+/// Reparse a buffered SSE body to its terminal JSON-RPC message.
+///
+/// Returns the first `Response`/`Error` message (the terminal answer for a
+/// request/response exchange), falling back to the last parseable message.
+fn parse_buffered_sse_terminal(body: &[u8]) -> Option<ServerJsonRpcMessage> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut last = None;
+    for data in sse_data_events(text) {
+        let Ok(message) = serde_json::from_str::<ServerJsonRpcMessage>(&data) else {
+            continue;
+        };
+        if matches!(message, JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_)) {
+            return Some(message);
+        }
+        last = Some(message);
+    }
+    last
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "tests"
+)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::*;
+
+    // -- Reserved-header hygiene (codex finding: reserved MCP session header) ---
+
+    #[test]
+    fn reserved_streamable_http_headers_are_recognized_case_insensitively() {
+        assert!(is_reserved_streamable_http_header(&http::header::ACCEPT));
+        assert!(is_reserved_streamable_http_header(&HeaderName::from_static(
+            "mcp-session-id"
+        )));
+        assert!(is_reserved_streamable_http_header(&HeaderName::from_static(
+            "last-event-id"
+        )));
+        // MCP-Protocol-Version is intentionally caller-settable, not reserved.
+        assert!(!is_reserved_streamable_http_header(&HeaderName::from_static(
+            "mcp-protocol-version"
+        )));
+        assert!(!is_reserved_streamable_http_header(&HeaderName::from_static(
+            "x-tenant"
+        )));
+    }
+
+    #[test]
+    fn build_request_headers_rejects_a_caller_supplied_session_id() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            HeaderName::from_static("mcp-session-id"),
+            HeaderValue::from_static("attacker-fixed"),
+        );
+        let error = build_request_headers(None, custom).expect_err("reserved header must be rejected");
+        assert!(
+            matches!(error, StreamableHttpError::ReservedHeaderConflict(name) if name.eq_ignore_ascii_case("mcp-session-id")),
+            "expected a ReservedHeaderConflict for mcp-session-id"
+        );
+    }
+
+    #[test]
+    fn build_request_headers_keeps_allowed_headers_and_injects_bearer() {
+        let mut custom = HashMap::new();
+        custom.insert(HeaderName::from_static("x-tenant"), HeaderValue::from_static("acme"));
+        let headers = build_request_headers(Some("secret-token".to_owned()), custom).expect("allowed headers");
+        assert_eq!(headers.get("x-tenant").unwrap(), "acme");
+        assert_eq!(headers.get(http::header::AUTHORIZATION).unwrap(), "Bearer secret-token");
+    }
+
+    #[test]
+    fn build_request_headers_without_auth_sets_no_authorization() {
+        let headers = build_request_headers(None, HashMap::new()).expect("no headers");
+        assert!(headers.get(http::header::AUTHORIZATION).is_none());
+    }
+
+    // -- SSE reparse (codex finding: SSE behavior untested by JSON path) --------
+
+    #[test]
+    fn sse_data_events_joins_multiline_data_and_splits_on_blank_lines() {
+        let text = "data: line-one\ndata: line-two\n\ndata:second-event\n\n";
+        assert_eq!(sse_data_events(text), vec!["line-one\nline-two", "second-event"]);
+    }
+
+    #[test]
+    fn sse_data_events_emits_trailing_event_without_terminating_blank_line() {
+        assert_eq!(sse_data_events("data: only\n"), vec!["only"]);
+    }
+
+    #[test]
+    fn parse_buffered_sse_terminal_returns_first_response_message() {
+        let body = concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+        );
+        let message = parse_buffered_sse_terminal(body.as_bytes()).expect("terminal response");
+        assert!(matches!(message, JsonRpcMessage::Response(_)));
+    }
+
+    #[test]
+    fn parse_buffered_sse_terminal_returns_error_message_as_terminal() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32000,\"message\":\"boom\"}}\n\n";
+        let message = parse_buffered_sse_terminal(body.as_bytes()).expect("terminal error");
+        assert!(matches!(message, JsonRpcMessage::Error(_)));
+    }
+
+    #[test]
+    fn parse_buffered_sse_terminal_without_json_is_none() {
+        assert!(parse_buffered_sse_terminal(b"data: not-json\n\n").is_none());
+        assert!(parse_buffered_sse_terminal(b"").is_none());
+    }
+
+    // -- Content-type classification -------------------------------------------
+
+    #[test]
+    fn content_type_classification_tolerates_parameters_and_whitespace() {
+        assert!(is_json_content_type("application/json"));
+        assert!(is_json_content_type(" application/json; charset=utf-8"));
+        assert!(!is_json_content_type("text/event-stream"));
+        assert!(is_event_stream_content_type("text/event-stream"));
+        assert!(is_event_stream_content_type(" text/event-stream; charset=utf-8"));
+        assert!(!is_event_stream_content_type("application/json"));
+    }
+
+    // -- Response-limit tiers (codex finding: response-limit regressions) -------
+
+    #[test]
+    fn tool_result_wire_cap_expands_and_saturates() {
+        assert_eq!(
+            tool_result_wire_cap(2048),
+            2048 * MAX_JSON_STRING_EXPANSION + MAX_TOOL_RESULT_ENVELOPE_BYTES
+        );
+        // Overflow saturates rather than wrapping to a tiny ceiling.
+        assert_eq!(tool_result_wire_cap(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn response_limit_uses_tool_cap_only_for_tools_call() {
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            2048,
+        );
+        let call: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
+        )
+        .expect("deserialize tools/call");
+        assert_eq!(client.response_limit(&call), tool_result_wire_cap(2048));
+
+        let list: ClientJsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
+                .expect("deserialize tools/list");
+        assert_eq!(client.response_limit(&list), MAX_CONTROL_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn control_client_never_exceeds_the_control_ceiling() {
+        let client = McpSubrequestClient::control(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+        );
+        let call: ClientJsonRpcMessage = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
+        )
+        .expect("deserialize tools/call");
+        assert_eq!(client.response_limit(&call), MAX_CONTROL_RESPONSE_BYTES);
+    }
+
+    // -- SSRF hook (codex finding: chain propagates real posture) --------------
+
+    fn addr(literal: &str) -> SocketAddr {
+        literal.parse().expect("socket addr")
+    }
+
+    #[test]
+    fn ssrf_validate_gates_loopback_on_allow_private() {
+        assert!(ssrf_validate(&[addr("127.0.0.1:443")], true).is_ok());
+        assert!(ssrf_validate(&[addr("127.0.0.1:443")], false).is_err());
+        assert!(ssrf_validate(&[addr("[::1]:443")], true).is_ok());
+        assert!(ssrf_validate(&[addr("[::1]:443")], false).is_err());
+    }
+
+    #[test]
+    fn ssrf_validate_always_blocks_metadata_and_link_local_even_when_private_allowed() {
+        assert!(ssrf_validate(&[addr("169.254.169.254:80")], true).is_err());
+        assert!(ssrf_validate(&[addr("169.254.1.1:80")], true).is_err());
+    }
+
+    #[test]
+    fn ssrf_validate_allows_public_addresses() {
+        assert!(ssrf_validate(&[addr("93.184.216.34:443")], false).is_ok());
+    }
+
+    #[test]
+    fn ssrf_validate_rejects_when_any_address_is_sensitive() {
+        // A resolved set mixing a public and a metadata address must fail closed.
+        assert!(ssrf_validate(&[addr("93.184.216.34:443"), addr("169.254.169.254:80")], true).is_err());
+    }
+
+    #[test]
+    fn ssrf_validate_gates_rfc1918_ranges_on_allow_private() {
+        // Codex finding (RFC1918 SSRF bypass): a pinned private literal must be
+        // refused by ssrf_validate itself when private upstreams are disabled —
+        // the executor's resolve_address_checked short-circuits an already
+        // resolved address, so this hook is the only gate for pinned literals.
+        for private in ["10.0.0.1:443", "172.16.5.4:443", "192.168.1.1:443"] {
+            assert!(
+                ssrf_validate(&[addr(private)], false).is_err(),
+                "{private} must be blocked when private upstreams are disabled"
+            );
+            assert!(
+                ssrf_validate(&[addr(private)], true).is_ok(),
+                "{private} must be reachable when private upstreams are enabled"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_validate_gates_cgnat_and_zero_net_on_allow_private() {
+        // CGNAT (100.64.0.0/10) and the 0.0.0.0/8 block are private ranges under
+        // praxis_core::connectivity::is_private_ip, so they follow the same gate.
+        for private in ["100.64.0.1:443", "0.1.2.3:443"] {
+            assert!(
+                ssrf_validate(&[addr(private)], false).is_err(),
+                "{private} must be blocked when private upstreams are disabled"
+            );
+            assert!(
+                ssrf_validate(&[addr(private)], true).is_ok(),
+                "{private} must be reachable when private upstreams are enabled"
+            );
+        }
+    }
+
+    #[test]
+    fn ssrf_validate_always_blocks_unspecified_ipv4_even_when_private_allowed() {
+        // 0.0.0.0 is unspecified: connect(2) routes it to loopback, so it is
+        // refused unconditionally rather than gated on allow_private.
+        assert!(ssrf_validate(&[addr("0.0.0.0:443")], true).is_err());
+        assert!(ssrf_validate(&[addr("0.0.0.0:443")], false).is_err());
+    }
+
+    // -- Callout depth resolution (codex finding: nested depth reset to zero) ---
+
+    #[test]
+    fn resolve_callout_depth_prefers_iteration_state_over_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(DEPTH_HEADER, HeaderValue::from_static("7"));
+        // Inside an IRR step the iterative-router's depth is authoritative and
+        // must win over any incoming header value.
+        assert_eq!(resolve_callout_depth(Some(3), &headers), 3);
+    }
+
+    #[test]
+    fn resolve_callout_depth_falls_back_to_reserved_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(DEPTH_HEADER, HeaderValue::from_static("4"));
+        // Without IterationState, a nested sub-request carries its depth in the
+        // reserved x-praxis-iterative-depth header so the callout does not reset
+        // to zero and under-report its nesting.
+        assert_eq!(resolve_callout_depth(None, &headers), 4);
+    }
+
+    #[test]
+    fn resolve_callout_depth_defaults_to_zero_for_top_level_request() {
+        assert_eq!(resolve_callout_depth(None, &HeaderMap::new()), 0);
+    }
+
+    #[test]
+    fn resolve_callout_depth_defaults_to_zero_on_unparsable_header() {
+        for raw in ["not-a-number", "256", "-1", ""] {
+            let mut headers = HeaderMap::new();
+            headers.insert(DEPTH_HEADER, HeaderValue::from_str(raw).unwrap());
+            assert_eq!(
+                resolve_callout_depth(None, &headers),
+                0,
+                "malformed depth {raw:?} must fall back to 0"
+            );
+        }
+    }
+
+    // -- Origin-form target derivation -----------------------------------------
+
+    #[test]
+    fn origin_form_extracts_path_and_query() {
+        assert_eq!(
+            origin_form("https://mcp.example/mcp?cursor=2").unwrap(),
+            "/mcp?cursor=2"
+        );
+    }
+
+    #[test]
+    fn origin_form_defaults_to_root_when_path_absent() {
+        assert_eq!(origin_form("https://mcp.example").unwrap(), "/");
+    }
+
+    // -- JSON-RPC error extraction ---------------------------------------------
+
+    #[test]
+    fn parse_json_rpc_error_returns_only_error_messages() {
+        assert!(parse_json_rpc_error(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"x"}}"#).is_some());
+        assert!(parse_json_rpc_error(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).is_none());
+        assert!(parse_json_rpc_error("not json").is_none());
+    }
+}

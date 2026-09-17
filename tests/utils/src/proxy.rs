@@ -78,6 +78,10 @@ fn resolve_listener_pipeline(
             config.insecure_options.allow_unbounded_body,
         )
         .unwrap();
+    // Test backends always live on loopback, so permit private upstreams
+    // unconditionally: the runtime peer builders (and the filtered-subrequest
+    // path) refuse private/reserved dial targets unless the pipeline opts in.
+    pipeline.set_allow_private_upstreams(true);
     pipeline.set_subrequest_client(client.clone());
     // Mirror the server: propagate the private-upstream override into the
     // pipeline and its nested callout chains (e.g. `openai_file_resolve`'s
