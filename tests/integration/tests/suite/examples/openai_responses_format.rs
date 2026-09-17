@@ -11,29 +11,55 @@ use praxis_test_utils::{
 };
 
 // -----------------------------------------------------------------------------
+// Test Utilities
+// -----------------------------------------------------------------------------
+
+/// Running format-routing example with the three documented backends.
+struct Harness {
+    /// Responses cluster.
+    _responses: praxis_test_utils::BackendGuard,
+    /// Chat Completions cluster.
+    _chat: praxis_test_utils::BackendGuard,
+    /// Default cluster.
+    _default: praxis_test_utils::BackendGuard,
+    /// The running proxy.
+    proxy: praxis_test_utils::ProxyGuard,
+}
+
+/// Start the example config against all three backends.
+fn start() -> Harness {
+    let responses = start_backend_with_shutdown("responses-backend");
+    let chat = start_backend_with_shutdown("chat-backend");
+    let default = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+    let config = load_example_config(
+        "openai/responses/format-routing.yaml",
+        proxy_port,
+        HashMap::from([
+            ("127.0.0.1:3001", responses.port()),
+            ("127.0.0.1:3002", chat.port()),
+            ("127.0.0.1:3003", default.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+    Harness {
+        _responses: responses,
+        _chat: chat,
+        _default: default,
+        proxy,
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
 #[test]
 fn openai_responses_format_routing_example_routes_responses_input() {
-    let responses_guard = start_backend_with_shutdown("responses-backend");
-    let chat_guard = start_backend_with_shutdown("chat-backend");
-    let default_guard = start_backend_with_shutdown("default-backend");
-    let proxy_port = free_port();
-
-    let config = load_example_config(
-        "openai/responses/format-routing.yaml",
-        proxy_port,
-        HashMap::from([
-            ("127.0.0.1:3001", responses_guard.port()),
-            ("127.0.0.1:3002", chat_guard.port()),
-            ("127.0.0.1:3003", default_guard.port()),
-        ]),
-    );
-    let proxy = start_proxy(&config);
+    let h = start();
 
     let body = r#"{"model":"gpt-4.1-mini","input":"Hello, world!"}"#;
-    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    let raw = http_send(h.proxy.addr(), &json_post("/v1/responses", body));
 
     assert_eq!(parse_status(&raw), 200, "responses request should return 200");
     assert_eq!(
@@ -45,24 +71,10 @@ fn openai_responses_format_routing_example_routes_responses_input() {
 
 #[test]
 fn openai_responses_format_routing_example_routes_chat_completions() {
-    let responses_guard = start_backend_with_shutdown("responses-backend");
-    let chat_guard = start_backend_with_shutdown("chat-backend");
-    let default_guard = start_backend_with_shutdown("default-backend");
-    let proxy_port = free_port();
-
-    let config = load_example_config(
-        "openai/responses/format-routing.yaml",
-        proxy_port,
-        HashMap::from([
-            ("127.0.0.1:3001", responses_guard.port()),
-            ("127.0.0.1:3002", chat_guard.port()),
-            ("127.0.0.1:3003", default_guard.port()),
-        ]),
-    );
-    let proxy = start_proxy(&config);
+    let h = start();
 
     let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hi"}]}"#;
-    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", body));
+    let raw = http_send(h.proxy.addr(), &json_post("/v1/chat/completions", body));
 
     assert_eq!(parse_status(&raw), 200, "chat completions should return 200");
     assert_eq!(
@@ -73,25 +85,59 @@ fn openai_responses_format_routing_example_routes_chat_completions() {
 }
 
 #[test]
-fn openai_responses_format_routing_example_unknown_falls_to_default() {
-    let responses_guard = start_backend_with_shutdown("responses-backend");
-    let chat_guard = start_backend_with_shutdown("chat-backend");
-    let default_guard = start_backend_with_shutdown("default-backend");
-    let proxy_port = free_port();
+fn openai_responses_format_routing_example_chat_identity_ignores_the_body() {
+    let h = start();
 
-    let config = load_example_config(
-        "openai/responses/format-routing.yaml",
-        proxy_port,
-        HashMap::from([
-            ("127.0.0.1:3001", responses_guard.port()),
-            ("127.0.0.1:3002", chat_guard.port()),
-            ("127.0.0.1:3003", default_guard.port()),
-        ]),
+    for (name, request) in [
+        (
+            "malformed JSON",
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\n\
+             not json",
+        ),
+        (
+            "empty body",
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            "list has no body",
+            "GET /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ),
+    ] {
+        let raw = http_send(h.proxy.addr(), request);
+        assert_eq!(parse_status(&raw), 200, "{name} should return 200");
+        assert_eq!(
+            parse_body(&raw),
+            "chat-backend",
+            "{name} must still route to chat-backend without reading the body"
+        );
+    }
+}
+
+#[test]
+fn openai_responses_format_routing_example_unsupported_chat_method_falls_to_default() {
+    let h = start();
+
+    let raw = http_send(
+        h.proxy.addr(),
+        "PUT /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
-    let proxy = start_proxy(&config);
+
+    assert_eq!(parse_status(&raw), 200, "unsupported method should return 200");
+    assert_eq!(
+        parse_body(&raw),
+        "default-backend",
+        "PUT /v1/chat/completions must not be classified as Chat Completions"
+    );
+}
+
+#[test]
+fn openai_responses_format_routing_example_unknown_falls_to_default() {
+    let h = start();
 
     let body = r#"{"prompt":"hello"}"#;
-    let raw = http_send(proxy.addr(), &json_post("/other/path", body));
+    let raw = http_send(h.proxy.addr(), &json_post("/other/path", body));
 
     assert_eq!(parse_status(&raw), 200, "unknown path should return 200");
     assert_eq!(

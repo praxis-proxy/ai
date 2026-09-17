@@ -10,16 +10,17 @@
 #   GET  /v1/responses/{id}/input_items — paginated input items
 #   DELETE /v1/responses/{id}   — deleted from local store (200 or 404)
 #
-# The `openai_responses_format` filter must run first to classify
-# the request body — `openai_response_store` reads its metadata
-# to decide whether to persist POST responses.
-# A `state_owner` filter must also establish the immutable owner
-# used for every store operation. This standalone example uses an
-# explicit shared owner; multi-user deployments should use a trusted
-# owner mode instead.
+# The `openai_responses_format` filter must run before the store to classify
+# the request body — `openai_response_store` reads its metadata to decide
+# whether to persist POST responses.
+#
+# Persisted state always requires an explicit owner source. This standalone
+# example uses `single_tenant`, which deliberately shares one owner and
+# is not user isolation. See `state-ownership.yaml` for a trusted multi-user
+# boundary and the versioned assertion format.
 #
 # POST persistence:
-#   The `openai_responses_format` filter must run first to
+#   The `openai_responses_format` filter must run before the store to
 #   classify the request body — `openai_response_store` reads its
 #   metadata to decide whether to persist. Streaming responses
 #   (`stream: true`) are skipped; streaming persistence will be

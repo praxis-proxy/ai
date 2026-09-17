@@ -6,8 +6,7 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, example_config_path, free_port, http_send, json_post, parse_body, parse_header, parse_status, patch_yaml,
-    start_proxy,
+    Backend, example_config_path, free_port, http_send, parse_body, parse_header, parse_status, patch_yaml, start_proxy,
 };
 use sqlx::Row as _;
 
@@ -18,6 +17,8 @@ use sqlx::Row as _;
 const RESPONSE_JSON: &str = r#"{"id":"resp_stream_example","created_at":1000,"model":"gpt-4.1","object":"response","status":"completed","input":"Hello streaming","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi from stream"}]}]}"#;
 
 const RESPONSES_TABLE: &str = "openai_responses";
+
+const OWNER_ASSERTION: &str = "v1.WyJzdHJlYW0tdGVuYW50IiwidXJuOnByYXhpczp0ZXN0IiwiYWxpY2UiXQ";
 
 const STREAMING_EXAMPLES: [(&str, u64); 5] = [
     ("openai/responses/agentic-loop.yaml", 360_000),
@@ -83,7 +84,7 @@ async fn stream_events_accumulates_state_and_persists_response_to_sqlite() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
+        &json_post_with_owner(
             "/v1/responses",
             r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
         ),
@@ -123,7 +124,7 @@ async fn stream_events_accumulates_state_and_persists_response_to_sqlite() {
     let model: String = row.get("model");
 
     assert_eq!(id, "resp_stream_example", "persisted id should match stream");
-    assert_eq!(tenant_id, "default", "default tenant should be used");
+    assert_eq!(tenant_id, "stream-tenant", "trusted owner tenant should be persisted");
     assert_eq!(created_at, 1000, "persisted created_at should match stream");
     assert_eq!(model, "gpt-4.1", "persisted model should match stream");
 
@@ -197,7 +198,7 @@ async fn stream_events_incremental_accumulation_before_terminal() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
+        &json_post_with_owner(
             "/v1/responses",
             r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
         ),
@@ -255,7 +256,7 @@ async fn stream_events_forwards_backend_error_transparently() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
+        &json_post_with_owner(
             "/v1/responses",
             r#"{"model":"nonexistent","input":"Hello","stream":true}"#,
         ),
@@ -320,7 +321,7 @@ async fn stream_events_fails_closed_when_accumulation_budget_exceeded() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
+        &json_post_with_owner(
             "/v1/responses",
             r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
         ),
@@ -372,6 +373,15 @@ fn temp_sqlite_url(test_name: &str) -> (String, std::path::PathBuf) {
         .as_nanos();
     let db_path = std::env::temp_dir().join(format!("praxis_integ_{test_name}_{}_{nanos}.db", std::process::id()));
     (format!("sqlite://{}?mode=rwc", db_path.display()), db_path)
+}
+
+fn json_post_with_owner(path: &str, body: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         x-authenticated-state-owner: {OWNER_ASSERTION}\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 fn cleanup_sqlite_files(db_path: &std::path::Path) {

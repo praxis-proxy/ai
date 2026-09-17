@@ -1379,6 +1379,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: test
       - filter: openai_responses_format
         on_invalid: reject
       - filter: openai_responses_validate
@@ -1431,6 +1434,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: test
       - filter: openai_responses_format
         on_invalid: reject
       - filter: openai_responses_validate
@@ -1486,6 +1492,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: test
       - filter: openai_responses_format
         on_invalid: reject
       - filter: openai_tool_parse

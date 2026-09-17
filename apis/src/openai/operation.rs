@@ -315,6 +315,8 @@ pub enum OpenAiApiFamily {
     Responses,
     /// `OpenAI` Conversations API.
     Conversations,
+    /// `OpenAI` Chat Completions API.
+    ChatCompletions,
     /// `OpenAI` Files API.
     Files,
     /// `OpenAI` Vector Stores API.
@@ -334,6 +336,7 @@ impl OpenAiApiFamily {
         match self {
             Self::Responses => "openai_responses",
             Self::Conversations => "openai_conversations",
+            Self::ChatCompletions => "openai_chat_completions",
             Self::Files => "openai_files",
             Self::VectorStores => "openai_vector_stores",
         }
@@ -917,6 +920,10 @@ mod tests {
         assert_eq!(
             OpenAiApiFamily::Conversations.application_protocol(),
             "openai_conversations"
+        );
+        assert_eq!(
+            OpenAiApiFamily::ChatCompletions.application_protocol(),
+            "openai_chat_completions"
         );
         assert_eq!(OpenAiApiFamily::Files.application_protocol(), "openai_files");
         assert_eq!(

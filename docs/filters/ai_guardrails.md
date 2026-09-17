@@ -5,6 +5,10 @@
 
 Calls an external AI guardrail provider to evaluate request and response bodies. The provider determines whether content should be passed, blocked, or redacted.
 
+## Configuration Notes
+
+**Wire format:** Chat Completions only (`messages` on requests, `choices[].message` on responses). Responses API, Anthropic Messages, and MCP are not supported yet (see ai#1043).
+
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -21,7 +25,7 @@ Calls an external AI guardrail provider to evaluate request and response bodies.
 filter: ai_guardrails
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
   allow_private_endpoint: true
   timeout_ms: 5000
 phase:
