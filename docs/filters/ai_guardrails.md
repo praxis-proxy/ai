@@ -5,6 +5,10 @@
 
 Calls an external AI guardrail provider to evaluate request and response bodies. The provider determines whether content should be passed, blocked, or redacted.
 
+## Configuration Notes
+
+**Wire format:** Chat Completions only (`messages` on requests, `choices[].message` on responses). Responses API, Anthropic Messages, and MCP are not supported yet (see ai#1043).
+
 ## Configuration
 
 | Field | Type | Required | Description |

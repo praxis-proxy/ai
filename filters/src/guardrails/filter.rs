@@ -26,6 +26,10 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// response bodies. The provider determines whether content should
 /// be passed, blocked, or redacted.
 ///
+/// **Wire format:** Chat Completions only (`messages` on requests,
+/// `choices[].message` on responses). Responses API, Anthropic Messages,
+/// and MCP are not supported yet (see ai#1043).
+///
 /// # YAML configuration
 ///
 /// ```yaml
