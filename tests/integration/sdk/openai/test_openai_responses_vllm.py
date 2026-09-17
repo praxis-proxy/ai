@@ -4269,7 +4269,13 @@ filter_chains:
               # (#1046).
               - filter: openai_file_search_callout
                 vector_store_url: http://{ogx_endpoint}
-                allow_private_url: true
+                outbound_chain:
+                  name: vector-store-outbound
+                  filters:
+                    - filter: headers
+                      request_set:
+                        - name: X-Vector-Store-Client
+                          value: praxis-ai-gateway
                 timeout_ms: 30000
                 max_response_bytes: 10485760
                 max_total_response_bytes: 67108864
@@ -4308,15 +4314,76 @@ filter_chains:
 
 insecure_options:
   allow_private_endpoints: true
+  # Central SSRF gate for the vector-store callout: permits the loopback OGX
+  # endpoint's resolved address at connect time.
+  allow_private_upstreams: true
 """
 
 
+class VectorStoreWitnessHandler(BaseHTTPRequestHandler):
+    """Recording shim between the file-search callout and OGX.
+
+    Captures the request headers of every vector-store request the callout
+    forwards, then proxies transparently to OGX so the search still runs and
+    the full pipeline completes. Tests assert the configured ``outbound_chain``
+    actually ran by checking the marker header it injects
+    (``X-Vector-Store-Client``) is present on every captured request — proving
+    the callout dispatched through the ``FilteredSubrequestExecutor`` outbound
+    chain rather than reaching OGX by some other path (or not at all).
+    """
+
+    captured_headers: ClassVar[list[dict[str, str]]] = []
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _forward(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        type(self).captured_headers.append(
+            {k.lower(): v for k, v in self.headers.items()}
+        )
+        headers = {
+            k: v
+            for k, v in self.headers.items()
+            if k.lower() not in ("host", "content-length")
+        }
+        url = f"{OGX_BASE_URL.rstrip('/')}{self.path}"
+        with httpx.Client(timeout=300.0) as client:
+            with client.stream(
+                self.command, url, headers=headers, content=body
+            ) as upstream:
+                self.send_response(upstream.status_code)
+                for key, value in upstream.headers.items():
+                    if key.lower() in (
+                        "transfer-encoding",
+                        "content-length",
+                        "connection",
+                    ):
+                        continue
+                    self.send_header(key, value)
+                self.end_headers()
+                for chunk in upstream.iter_raw():
+                    if chunk:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+
+    def do_POST(self):
+        self._forward()
+
+    def do_GET(self):
+        self._forward()
+
+    def do_DELETE(self):
+        self._forward()
+
+
 def _write_file_search_config(
-    praxis_port: int, backend_endpoint: str
+    praxis_port: int, backend_endpoint: str, ogx_endpoint: str | None = None
 ) -> str:
     config = FILE_SEARCH_CONFIG_TEMPLATE.format(
         praxis_port=praxis_port,
-        ogx_endpoint=_ogx_endpoint(),
+        ogx_endpoint=ogx_endpoint or _ogx_endpoint(),
         vllm_endpoint=backend_endpoint,
     )
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -4402,9 +4469,21 @@ def vector_store():
 
 @pytest.fixture(scope="session")
 def file_search_proxy(tmp_path_factory, request, backend_endpoint):
-    """Start a Praxis proxy with the file-search-callout pipeline."""
+    """Start a Praxis proxy with the file-search-callout pipeline.
+
+    The vector-store callout is pointed at an in-process recording shim
+    (:class:`VectorStoreWitnessHandler`) that forwards transparently to OGX, so
+    a test can assert the configured ``outbound_chain`` ran by inspecting the
+    headers the shim captured.
+    """
+    VectorStoreWitnessHandler.captured_headers = []
+    shim_port = _free_port()
+    shim = HTTPServer(("127.0.0.1", shim_port), VectorStoreWitnessHandler)
+    shim_thread = threading.Thread(target=shim.serve_forever, daemon=True)
+    shim_thread.start()
+
     port = _free_port()
-    config_path = _write_file_search_config(port, backend_endpoint)
+    config_path = _write_file_search_config(port, backend_endpoint, ogx_endpoint=f"127.0.0.1:{shim_port}")
     binary = _find_binary()
 
     log_dir = tmp_path_factory.mktemp("file-search")
@@ -4429,6 +4508,7 @@ def file_search_proxy(tmp_path_factory, request, backend_endpoint):
             proc.kill()
             proc.wait()
         log_file.close()
+        shim.shutdown()
         if not started or request.session.testsfailed > 0:
             with open(log_path) as f:
                 print(
@@ -4508,6 +4588,23 @@ class TestFileSearchVLLM:
             result.file_id and result.filename and result.score is not None
             for result in decoded_results
         ), "decoded file-search results should retain typed result metadata"
+
+        # Prove the callout actually dispatched the vector-store search through
+        # the configured FilteredSubrequestExecutor outbound chain — not merely
+        # that a file_search_call item surfaced. The recording shim in front of
+        # OGX captured each forwarded request; every one must carry the marker
+        # header the inline outbound_chain injects, which only the executor path
+        # can add.
+        captured = VectorStoreWitnessHandler.captured_headers
+        assert captured, (
+            "the file-search callout must forward at least one vector-store "
+            "request through the outbound chain to OGX"
+        )
+        for headers in captured:
+            assert headers.get("x-vector-store-client") == "praxis-ai-gateway", (
+                "every vector-store request must carry the outbound_chain marker "
+                f"header, proving the callout ran; got headers: {headers}"
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -405,3 +405,85 @@ fn file_search_callout_example_rejects_non_success_search_response() {
         "the vector-store callout should still fire before the closed rejection"
     );
 }
+
+#[test]
+fn file_search_callout_example_rejects_oversized_search_response_with_413() {
+    // A vector-store response larger than the dispatcher's `max_response_bytes`
+    // is surfaced by the 0.5.6 executor as `CalloutOutcome::ResponseTooLarge`,
+    // not an opaque callout error. The dispatcher records an actionable 413 and
+    // the loop owner rejects the client request with it — distinct from the
+    // generic 502 a rate-limited or malformed search produces.
+    let first_model_response = json!({
+        "id": "resp_search",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "id": "fs_1",
+            "type": "file_search_call",
+            "status": "searching",
+            "queries": ["What were the Q4 results?"]
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    });
+    let model = start_stateful_backend(vec![
+        (200, r#"{"status":"ready"}"#.to_owned()),
+        (200, first_model_response.to_string()),
+        (200, r#"{"id":"resp_should_not_run"}"#.to_owned()),
+    ]);
+    // A well-formed search body far larger than the shrunk per-callout ceiling.
+    let oversized = json!({
+        "data": [{
+            "file_id": "file-q4",
+            "filename": "q4-results.txt",
+            "score": 0.99,
+            "content": [{"type": "text", "text": "x".repeat(4096)}],
+            "attributes": null
+        }]
+    })
+    .to_string();
+    let search = start_stateful_backend(vec![(200, oversized)]);
+    let proxy_port = free_port();
+
+    // Shrink only the dispatcher's per-callout ceiling; the enclosing router keeps
+    // its 67108864-byte limit, so the unique literal targets the filter alone.
+    let path = praxis_test_utils::example_config_path("openai/responses/file-search-callout.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml.replace("max_response_bytes: 10485760", "max_response_bytes: 512");
+    let patched = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model.port()), ("127.0.0.1:8001", search.port())]),
+    );
+    let config = Config::from_yaml(&patched).unwrap_or_else(|e| panic!("parse file-search-callout.yaml: {e}"));
+    let proxy = start_file_search_proxy(&config);
+
+    let request = json!({
+        "model": "llama-3.3-70b",
+        "input": "What do the uploaded documents say about Q4 results?",
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_q4"]}]
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(
+        parse_status(&raw),
+        413,
+        "oversized search response should reject with 413: {raw}"
+    );
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("rejection should be JSON");
+    assert_eq!(response["error"]["type"], "invalid_request_error");
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("openai_file_search_callout"),
+        "413 should carry the dispatcher's filter error: {response}"
+    );
+    assert!(
+        message.contains("exceeded"),
+        "413 should explain the size overflow: {response}"
+    );
+    let inference_calls = model
+        .requests()
+        .into_iter()
+        .filter(|request| request.starts_with("POST /v1/responses "))
+        .count();
+    assert_eq!(inference_calls, 1, "oversized search failure must not reinfer");
+}

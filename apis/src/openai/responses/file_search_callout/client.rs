@@ -5,19 +5,30 @@
 
 use std::{
     fmt, io,
+    net::SocketAddr,
     sync::{Arc, LazyLock},
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use http::HeaderMap;
+use praxis_core::connectivity::{PreparedSubrequest, PreparedTarget, is_private_ip, prepare_url_target};
+use praxis_filter::{
+    CalloutOutcome, CalloutResponse, FilterPipeline, FilteredSubrequestExecutor, RequestExtensions, StagedUpstream,
+    StagedUpstreamFallback, SubRequest, SubrequestRuntime,
+};
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Value, value::RawValue};
 
-use crate::{callout_policy::OnFailure, openai::api_client::ApiClient};
+use crate::{
+    callout_policy::OnFailure,
+    http_hop::{connection_nominates_header, is_hop_by_hop},
+    openai::api_client::resource_url,
+    subrequest::SubRequestClient,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -271,6 +282,37 @@ pub(crate) enum FileSearchError {
         /// Vector store ID.
         store_id: String,
     },
+
+    /// The vector-store response exceeded the configured size limit.
+    ///
+    /// Surfaced by [`FilteredSubrequestExecutor::run_classified`] as
+    /// [`CalloutOutcome::ResponseTooLarge`] and mapped by the loop owner to an
+    /// HTTP 413 rejection, distinguishing an oversized upstream body from a
+    /// generic callout failure (502).
+    ResponseTooLarge {
+        /// Observed response size that tripped the limit, when known.
+        actual: Option<usize>,
+
+        /// Effective per-response byte ceiling that was exceeded.
+        limit: usize,
+
+        /// Vector store ID.
+        store_id: String,
+    },
+}
+
+impl FileSearchError {
+    /// Map this failure to the loop owner's terminal HTTP status and error code.
+    ///
+    /// An oversized response is a client-actionable `413 invalid_request_error`,
+    /// mirroring the continuation-state ceiling; every other failure is an opaque
+    /// upstream or callout error surfaced as `502 server_error`.
+    pub(super) fn dispatch_status(&self) -> (u16, &'static str) {
+        match self {
+            Self::ResponseTooLarge { .. } => (413, "invalid_request_error"),
+            Self::Callout { .. } | Self::Deserialize { .. } => (502, "server_error"),
+        }
+    }
 }
 
 impl fmt::Display for FileSearchError {
@@ -289,6 +331,20 @@ impl fmt::Display for FileSearchError {
                     f,
                     "invalid vector-store response from store {store_id:?} at line {line}, column {column}"
                 )
+            },
+            Self::ResponseTooLarge {
+                actual,
+                limit,
+                store_id,
+            } => match actual {
+                Some(actual) => write!(
+                    f,
+                    "vector-store response from store {store_id:?} exceeded the {limit}-byte limit (observed {actual} bytes)"
+                ),
+                None => write!(
+                    f,
+                    "vector-store response from store {store_id:?} exceeded the {limit}-byte limit"
+                ),
             },
         }
     }
@@ -347,13 +403,19 @@ impl SearchBatch {
 
 /// Construction parameters for [`FileSearchClient`].
 pub(crate) struct FileSearchClientConfig {
-    /// Shared OpenAI-compatible API client.
-    pub api_client: ApiClient,
+    /// Vector-store API base URL (trailing slash stripped).
+    pub base_url: String,
+
+    /// Shared sub-request transport driving the outbound chain.
+    pub subrequest_client: SubRequestClient,
+
+    /// Header names forwarded from the original request to the vector store.
+    pub forward_header_names: Vec<http::HeaderName>,
 
     /// Whether one failed chunk stops scheduling later callouts.
     pub on_failure: OnFailure,
 
-    /// Maximum response body size enforced by the core client.
+    /// Maximum response body size enforced by the sub-request executor.
     pub max_response_bytes: usize,
 
     /// Maximum successful response bytes retained across the fan-out.
@@ -363,15 +425,35 @@ pub(crate) struct FileSearchClientConfig {
     pub timeout: Duration,
 }
 
+/// Per-request binding of the outbound chain and downstream attributes.
+///
+/// A [`FileSearchCalloutFilter`](super::FileSearchCalloutFilter) builds one of
+/// these from its bound outbound pipeline and the live request context, then
+/// hands it to [`FileSearchClient::search`] so the whole fan-out routes through
+/// the same filtered sub-request transport.
+pub(crate) struct CalloutTransport<'a> {
+    /// Prebuilt outbound filter chain every vector-store sub-request runs through.
+    pub outbound: &'a Arc<FilterPipeline>,
+
+    /// Downstream client attributes forwarded into each sub-request.
+    pub downstream: SubrequestRuntime,
+}
+
 /// Client for vector store search API.
 pub(crate) struct FileSearchClient {
-    /// Shared OpenAI-compatible API client.
-    api_client: ApiClient,
+    /// Vector-store API base URL (trailing slash stripped).
+    base_url: String,
+
+    /// Shared sub-request transport driving the outbound chain.
+    subrequest_client: SubRequestClient,
+
+    /// Header names forwarded from the original request to the vector store.
+    forward_header_names: Vec<http::HeaderName>,
 
     /// Whether one failed chunk stops scheduling later callouts.
     on_failure: OnFailure,
 
-    /// Maximum response body size enforced by the core client.
+    /// Maximum response body size enforced by the sub-request executor.
     max_response_bytes: usize,
 
     /// Maximum successful response bytes retained across the fan-out.
@@ -385,7 +467,9 @@ impl FileSearchClient {
     /// Create a new client.
     pub fn new(config: FileSearchClientConfig) -> Self {
         Self {
-            api_client: config.api_client,
+            base_url: config.base_url,
+            subrequest_client: config.subrequest_client,
+            forward_header_names: config.forward_header_names,
             on_failure: config.on_failure,
             max_response_bytes: config.max_response_bytes,
             max_total_response_bytes: config.max_total_response_bytes,
@@ -403,12 +487,30 @@ impl FileSearchClient {
         specs: &[SearchSpec<'_>],
         call_count: usize,
         request_headers: &HeaderMap,
+        transport: &CalloutTransport<'_>,
     ) -> SearchBatch {
         let mut batch = SearchBatch::new(call_count);
         let mut consumed_response_bytes = 0_usize;
         let mut deadline_recorded = false;
         let mut next_spec = 0_usize;
         let execution_started = Instant::now();
+        // Read the SSRF policy once from the bound outbound pipeline. The
+        // executor's transport pins the resolved literal address and so never
+        // re-runs the private-IP check (literal targets bypass it), making the
+        // `prepare_url_target` validation hook the sole runtime SSRF gate.
+        let allow_private = transport.outbound.allow_private_upstreams();
+        // One executor drives the whole fan-out: `run` takes `&self`, so the
+        // concurrent sub-requests share a single transport and downstream
+        // projection. Outbound headers are identical across specs, so they are
+        // built once and cloned only at each owned `SubRequest` boundary.
+        let executor = FilteredSubrequestExecutor::for_callout(
+            self.subrequest_client.clone(),
+            transport.downstream.clone(),
+            0,
+            self.max_response_bytes,
+            self.timeout,
+        );
+        let outbound_headers = self.build_outbound_headers(request_headers);
         let admission = match self.acquire_execution_admission(specs.len(), execution_started).await {
             Ok(admission) => admission,
             Err(message) => {
@@ -436,9 +538,17 @@ impl FileSearchClient {
             let Some(chunk) = specs.get(next_spec..next_spec.saturating_add(chunk_len)) else {
                 break;
             };
-            let futures = chunk
-                .iter()
-                .map(|spec| self.search_one(spec, execution_started, Arc::clone(&admission), request_headers));
+            let futures = chunk.iter().map(|spec| {
+                self.search_one(
+                    spec,
+                    execution_started,
+                    Arc::clone(&admission),
+                    &executor,
+                    transport.outbound,
+                    &outbound_headers,
+                    allow_private,
+                )
+            });
             let chunk_results = futures::future::join_all(futures).await;
             let chunk_failed = merge_chunk_results(
                 &mut batch,
@@ -470,18 +580,33 @@ impl FileSearchClient {
     }
 
     /// Search a single vector store.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one sub-request threads the shared executor, chain, and prepared headers"
+    )]
     async fn search_one(
         &self,
         spec: &SearchSpec<'_>,
         execution_started: Instant,
         response_admission: Arc<ResponseAdmission>,
-        request_headers: &HeaderMap,
+        executor: &FilteredSubrequestExecutor,
+        outbound: &Arc<FilterPipeline>,
+        outbound_headers: &HeaderMap,
+        allow_private: bool,
     ) -> Result<SearchResponse, FileSearchError> {
         deadline_remaining(self.timeout, execution_started, spec.store_id)?;
         let request = self.build_request(spec, execution_started)?;
         deadline_remaining(self.timeout, execution_started, spec.store_id)?;
         let body = self
-            .execute_request(request, spec.store_id, execution_started, request_headers)
+            .execute_request(
+                request,
+                spec.store_id,
+                execution_started,
+                executor,
+                outbound,
+                outbound_headers,
+                allow_private,
+            )
             .await?;
         parse_response_body_with_deadline(
             body,
@@ -541,31 +666,173 @@ impl FileSearchClient {
         Ok(PreparedSearchRequest { body, url })
     }
 
-    /// Execute a callout with a deadline covering body collection.
+    /// Resolve and validate the vector-store URL under the shared deadline.
+    ///
+    /// Because the returned [`PreparedTarget`] is later staged as a
+    /// [`StagedUpstream`] (plus a [`StagedUpstreamFallback`] carrying the full
+    /// resolved set) pinning the resolved literal addresses, the executor's
+    /// transport never re-runs DNS resolution, so this `prepare_url_target`
+    /// validation hook is the sole runtime SSRF gate: unless the outbound
+    /// pipeline opts into `insecure_options.allow_private_upstreams`, it rejects
+    /// the whole resolved address set if any entry is private or reserved.
+    /// Vetting the whole set together closes the resolve-then-dial race — every
+    /// address the executor may dial (the primary, and any fallback the executor
+    /// tries after a refused connection) was vetted here. The large resolver
+    /// future is boxed so it stays off this call's stack frame.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "target preparation threads the deadline, deadline clock, and SSRF policy"
+    )]
+    async fn prepare_search_target(
+        &self,
+        url: &str,
+        store_id: &str,
+        execution_started: Instant,
+        deadline: Instant,
+        allow_private: bool,
+    ) -> Result<PreparedTarget, FileSearchError> {
+        let remaining = deadline_remaining(self.timeout, execution_started, store_id)?;
+        tokio::time::timeout(
+            remaining,
+            Box::pin(prepare_url_target(url, deadline, |addresses: &[SocketAddr]| {
+                if !allow_private && addresses.iter().any(|address| is_private_ip(&address.ip())) {
+                    return Err::<(), Box<dyn std::error::Error + Send + Sync>>(
+                        "vector-store target resolved to a private or reserved address".into(),
+                    );
+                }
+                Ok(())
+            })),
+        )
+        .await
+        .map_err(|_elapsed| execution_deadline_error(store_id))?
+        .map_err(|_error| request_error(store_id, "vector-store target preparation failed"))
+    }
+
+    /// Execute a callout through the outbound chain with a deadline covering
+    /// target preparation and body collection.
+    ///
+    /// The destination is prepared from the search URL and staged as a
+    /// [`StagedUpstream`] (with a [`StagedUpstreamFallback`] carrying the full
+    /// validated address set so a refused connection falls back to the next
+    /// resolved address) so the outbound chain carries only cross-cutting
+    /// filters and never resolves a cluster. The SSRF gate lives in
+    /// [`Self::prepare_search_target`]. A streaming response is rejected —
+    /// file-search requires a buffered body.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one sub-request threads the shared executor, chain, prepared headers, and SSRF policy"
+    )]
     async fn execute_request(
         &self,
         request: PreparedSearchRequest,
         store_id: &str,
         execution_started: Instant,
-        request_headers: &HeaderMap,
+        executor: &FilteredSubrequestExecutor,
+        outbound: &Arc<FilterPipeline>,
+        outbound_headers: &HeaderMap,
+        allow_private: bool,
+    ) -> Result<Bytes, FileSearchError> {
+        let deadline = execution_started
+            .checked_add(self.timeout)
+            .ok_or_else(|| execution_deadline_error(store_id))?;
+        let target = self
+            .prepare_search_target(&request.url, store_id, execution_started, deadline, allow_private)
+            .await?;
+        let staged = StagedUpstream::from_prepared_target(&target)
+            .map_err(|_error| request_error(store_id, "vector-store upstream preparation failed"))?;
+        // Stage the full validated address set so the executor can fall back
+        // past a refused connection to the next resolved address, preserving the
+        // DNS behavior of the low-level transport. Built before `bind` consumes
+        // the target.
+        let fallback = StagedUpstreamFallback::from_prepared_target(&target);
+
+        let prepared = target.bind(SubRequest {
+            method: http::Method::POST,
+            uri: http::Uri::default(),
+            headers: outbound_headers.clone(),
+            body: Bytes::from(request.body),
+        });
+        let mut extensions = RequestExtensions::default();
+        extensions.insert(staged);
+        extensions.insert(fallback);
+
+        self.run_outbound(
+            executor,
+            outbound,
+            &prepared,
+            extensions,
+            store_id,
+            execution_started,
+            deadline,
+        )
+        .await
+    }
+
+    /// Drive the bound sub-request through the outbound chain under the shared
+    /// deadline and return its buffered body.
+    ///
+    /// Isolated from [`Self::execute_request`] so the large executor future,
+    /// boxed onto the heap, stays within this call's stack frame instead of
+    /// inflating the caller's.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one sub-request threads the shared executor, chain, bound request, and deadline clock"
+    )]
+    async fn run_outbound(
+        &self,
+        executor: &FilteredSubrequestExecutor,
+        outbound: &Arc<FilterPipeline>,
+        prepared: &PreparedSubrequest,
+        extensions: RequestExtensions,
+        store_id: &str,
+        execution_started: Instant,
+        deadline: Instant,
     ) -> Result<Bytes, FileSearchError> {
         let remaining = deadline_remaining(self.timeout, execution_started, store_id)?;
-        let response = tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             remaining,
-            self.api_client
-                .post_json_bytes(request.url, request.body, request_headers),
+            Box::pin(executor.run_classified(outbound, prepared.request(), extensions, deadline)),
         )
         .await
         .map_err(|_elapsed| execution_deadline_error(store_id))?
-        .map_err(|_error| request_error(store_id, "vector-store transport request failed"))?;
-        if !(200..300).contains(&response.status) {
-            return Err(request_error(
+        .map_err(|_error| request_error(store_id, "vector-store filtered sub-request failed"))?;
+        match outcome {
+            CalloutOutcome::Response(response) => read_buffered_response(response, store_id),
+            // `run_classified` preserves the typed size-overflow classification
+            // (transport-level or executor-side) that `run` would collapse into an
+            // opaque 502, so the loop owner can map it to an actionable HTTP 413.
+            CalloutOutcome::ResponseTooLarge { actual, limit } => Err(FileSearchError::ResponseTooLarge {
+                actual,
+                limit,
+                store_id: bounded_store_id(store_id),
+            }),
+            // `CalloutOutcome` is `#[non_exhaustive]`: fail closed on any future
+            // classified outcome rather than silently treating it as a success.
+            _ => Err(request_error(
                 store_id,
-                format!("vector-store returned status {}", response.status),
-            ));
+                "vector-store returned an unrecognized callout outcome",
+            )),
         }
+    }
 
-        Ok(response.body)
+    /// Build the outbound header set: forwarded request headers plus a JSON
+    /// content type, mirroring the previous shared API client.
+    fn build_outbound_headers(&self, request_headers: &HeaderMap) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for name in &self.forward_header_names {
+            if is_hop_by_hop(name.as_str()) || connection_nominates_header(request_headers, name) {
+                continue;
+            }
+            if let Some(value) = request_headers.get(name) {
+                map.insert(name.clone(), value.clone());
+            }
+        }
+        map.remove(http::header::CONTENT_TYPE);
+        map.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("application/json"),
+        );
+        map
     }
 
     /// Calculate a chunk whose worst-case bodies fit the remaining budget.
@@ -591,8 +858,7 @@ impl FileSearchClient {
             ));
         }
 
-        self.api_client
-            .resource_url("v1/vector_stores", store_id, Some("search"))
+        resource_url(&self.base_url, "v1/vector_stores", store_id, Some("search"))
             .map_err(|error| request_error(store_id, error.to_string()))
     }
 }
@@ -1563,6 +1829,26 @@ fn serialize_bounded_request(
     Ok(writer.body)
 }
 
+/// Return the buffered success body, or a typed error for a non-2xx status or a
+/// streaming response — file-search requires a buffered body.
+fn read_buffered_response(response: CalloutResponse, store_id: &str) -> Result<Bytes, FileSearchError> {
+    match response {
+        CalloutResponse::Buffered(response) => {
+            if !(200..300).contains(&response.status) {
+                return Err(request_error(
+                    store_id,
+                    format!("vector-store returned status {}", response.status),
+                ));
+            }
+            Ok(response.body)
+        },
+        CalloutResponse::Streaming { .. } => Err(request_error(
+            store_id,
+            "vector-store returned a streaming response; file-search requires a buffered body",
+        )),
+    }
+}
+
 /// Build an outbound request error without copying an unbounded identifier.
 pub(super) fn request_error(store_id: &str, message: impl Into<String>) -> FileSearchError {
     FileSearchError::Callout {
@@ -1735,7 +2021,9 @@ fn merge_search_result(
     let body_bytes = match &response {
         Ok(response) => response.body_bytes,
         Err(FileSearchError::Deserialize { body_bytes, .. }) => *body_bytes,
-        Err(FileSearchError::Callout { .. }) => 0,
+        // An oversized response was rejected before any body was retained, so it
+        // charges nothing against the aggregate budget, like a callout failure.
+        Err(FileSearchError::Callout { .. } | FileSearchError::ResponseTooLarge { .. }) => 0,
     };
     let total = consumed_bytes
         .checked_add(body_bytes)
