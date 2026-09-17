@@ -38,7 +38,7 @@ async fn sqlite_store_initializes_schema() {
     .expect("store creation should succeed");
 
     let result = store
-        .get_response("tenant_a", "nonexistent")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "nonexistent")
         .await
         .expect("get should succeed");
 
@@ -57,13 +57,13 @@ async fn upsert_and_get_response() {
     store.upsert_response(&record).await.expect("upsert should succeed");
 
     let fetched = store
-        .get_response("tenant_a", "resp_1")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
 
     assert_eq!(fetched.id, "resp_1", "ID should match");
-    assert_eq!(fetched.tenant_id, "tenant_a", "tenant should match");
+    assert_eq!(fetched.owner.tenant_id(), "tenant_a", "tenant should match");
     assert_eq!(fetched.created_at, 1000, "created_at should match");
     assert_eq!(fetched.model, "gpt-4.1", "model should match");
     assert_eq!(
@@ -103,7 +103,7 @@ async fn upsert_overwrites_existing_response() {
         .expect("second upsert should succeed");
 
     let fetched = store
-        .get_response("tenant_a", "resp_1")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -121,7 +121,7 @@ async fn get_missing_response_returns_none() {
     let store = make_store().await;
 
     let result = store
-        .get_response("tenant_a", "nonexistent")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "nonexistent")
         .await
         .expect("get should succeed");
 
@@ -135,14 +135,14 @@ async fn delete_existing_response() {
     store.upsert_response(&record).await.expect("upsert should succeed");
 
     let deleted = store
-        .delete_response("tenant_a", "resp_1")
+        .delete_response(&crate::test_utils::test_owner("tenant_a"), "resp_1")
         .await
         .expect("delete should succeed");
 
     assert!(deleted, "delete should return true for existing record");
 
     let fetched = store
-        .get_response("tenant_a", "resp_1")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_1")
         .await
         .expect("get should succeed");
 
@@ -154,7 +154,7 @@ async fn delete_missing_response_returns_false() {
     let store = make_store().await;
 
     let deleted = store
-        .delete_response("tenant_a", "nonexistent")
+        .delete_response(&crate::test_utils::test_owner("tenant_a"), "nonexistent")
         .await
         .expect("delete should succeed");
 
@@ -172,7 +172,7 @@ async fn tenant_isolation_on_get() {
     store.upsert_response(&record).await.expect("upsert should succeed");
 
     let result = store
-        .get_response("tenant_b", "resp_1")
+        .get_response(&crate::test_utils::test_owner("tenant_b"), "resp_1")
         .await
         .expect("get should succeed");
 
@@ -186,14 +186,14 @@ async fn tenant_isolation_on_delete() {
     store.upsert_response(&record).await.expect("upsert should succeed");
 
     let deleted = store
-        .delete_response("tenant_b", "resp_1")
+        .delete_response(&crate::test_utils::test_owner("tenant_b"), "resp_1")
         .await
         .expect("delete should succeed");
 
     assert!(!deleted, "tenant_b should not be able to delete tenant_a records");
 
     let still_exists = store
-        .get_response("tenant_a", "resp_1")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_1")
         .await
         .expect("get should succeed");
 
@@ -204,32 +204,216 @@ async fn tenant_isolation_on_delete() {
 }
 
 #[tokio::test]
-async fn same_response_id_can_exist_in_multiple_tenants() {
+async fn response_id_collision_cannot_transfer_ownership() {
     let store = make_store().await;
     store
         .upsert_response(&make_response_record("resp_shared", "tenant_a", 1000))
         .await
         .expect("tenant_a upsert should succeed");
-    store
+    let collision = store
         .upsert_response(&make_response_record("resp_shared", "tenant_b", 2000))
-        .await
-        .expect("tenant_b upsert should succeed");
+        .await;
+    assert!(collision.is_err(), "a colliding owner must be rejected");
 
     let tenant_a = store
-        .get_response("tenant_a", "resp_shared")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_shared")
         .await
         .expect("tenant_a get should succeed")
         .expect("tenant_a record should exist");
     let tenant_b = store
-        .get_response("tenant_b", "resp_shared")
+        .get_response(&crate::test_utils::test_owner("tenant_b"), "resp_shared")
         .await
-        .expect("tenant_b get should succeed")
-        .expect("tenant_b record should exist");
+        .expect("tenant_b get should succeed");
 
-    assert_eq!(tenant_a.tenant_id, "tenant_a", "tenant_a record should be isolated");
-    assert_eq!(tenant_b.tenant_id, "tenant_b", "tenant_b record should be isolated");
+    assert_eq!(
+        tenant_a.owner.tenant_id(),
+        "tenant_a",
+        "tenant_a record should be isolated"
+    );
     assert_eq!(tenant_a.created_at, 1000, "tenant_a record should not be overwritten");
-    assert_eq!(tenant_b.created_at, 2000, "tenant_b record should not be overwritten");
+    assert!(tenant_b.is_none(), "colliding owner must not acquire the response id");
+}
+
+/// Shared ownership contract exercised unchanged against every SQL backend.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "one shared cross-backend security contract is intentionally linear"
+)]
+async fn ownership_contract<S>(store: &S)
+where
+    S: ResponseStore + ConversationItemStore,
+{
+    let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let same_tenant_subject = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
+    let same_tenant_issuer = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-b", "alice").unwrap();
+    let cross_tenant = crate::StateOwner::from_trusted_parts("tenant-b", "issuer-a", "alice").unwrap();
+    let outsiders = [&same_tenant_subject, &same_tenant_issuer, &cross_tenant];
+
+    let response = ResponseRecord {
+        owner: owner.clone(),
+        ..make_response_record("resp_owner_contract", "ignored", 1_000)
+    };
+    store.upsert_response(&response).await.unwrap();
+    for outsider in outsiders {
+        assert!(store.get_response(outsider, &response.id).await.unwrap().is_none());
+        assert!(!store.delete_response(outsider, &response.id).await.unwrap());
+    }
+    let colliding_response = ResponseRecord {
+        owner: same_tenant_subject.clone(),
+        created_at: 2_000,
+        ..response.clone()
+    };
+    assert!(store.upsert_response(&colliding_response).await.is_err());
+    let persisted = store.get_response(&owner, &response.id).await.unwrap().unwrap();
+    assert_eq!(persisted.owner, owner);
+    assert_eq!(
+        persisted.created_at, 1_000,
+        "response collision must not mutate the owner record"
+    );
+
+    let conversation = ConversationRecord {
+        conversation_id: "conv_owner_contract".to_owned(),
+        owner: owner.clone(),
+        created_at: 1_000,
+        metadata: json!({"source": "original"}),
+        messages: json!([]),
+    };
+    store.upsert_conversation(&conversation).await.unwrap();
+    for outsider in outsiders {
+        assert!(
+            ConversationItemStore::get_conversation(store, outsider, &conversation.conversation_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !store
+                .update_conversation_metadata(outsider, &conversation.conversation_id, &json!({"source": "attack"}))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .delete_conversation(outsider, &conversation.conversation_id)
+                .await
+                .unwrap()
+        );
+    }
+    let colliding_conversation = ConversationRecord {
+        owner: same_tenant_subject.clone(),
+        metadata: json!({"source": "attack"}),
+        ..conversation.clone()
+    };
+    assert!(store.upsert_conversation(&colliding_conversation).await.is_err());
+    let persisted = ConversationItemStore::get_conversation(store, &owner, &conversation.conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.owner, owner);
+    assert_eq!(persisted.metadata, json!({"source": "original"}));
+
+    let item = ConversationItemRecord {
+        item_id: "item_owner_contract".to_owned(),
+        owner: owner.clone(),
+        conversation_id: conversation.conversation_id.clone(),
+        item_data: json!({"type": "message", "role": "user", "content": "private"}),
+        created_at: 1_000,
+        position: 1,
+    };
+    store.create_test_items(&[item]).await.unwrap();
+    let wrong_owner_item = ConversationItemRecord {
+        item_id: "item_wrong_owner_contract".to_owned(),
+        owner: same_tenant_subject.clone(),
+        conversation_id: conversation.conversation_id.clone(),
+        item_data: json!({"type": "message"}),
+        created_at: 1_000,
+        position: 2,
+    };
+    assert!(store.create_conversation_items(&[wrong_owner_item]).await.is_err());
+    for outsider in outsiders {
+        assert!(
+            store
+                .get_conversation_item(outsider, &conversation.conversation_id, "item_owner_contract")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .list_conversation_items(outsider, &conversation.conversation_id, None, 100, true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .delete_conversation_item(outsider, &conversation.conversation_id, "item_owner_contract")
+                .await
+                .unwrap()
+        );
+    }
+
+    let approval = make_pending("approval_owner_contract");
+    store
+        .record_pending_approvals(&owner, &response.id, std::slice::from_ref(&approval), 1_000)
+        .await
+        .unwrap();
+    for outsider in outsiders {
+        assert!(
+            store
+                .get_pending_approvals(outsider, &response.id, &[approval.approval_id.as_str()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .consume_approvals(outsider, &response.id, &[approval.approval_id.as_str()], 2_000)
+                .await
+                .unwrap(),
+            Some(0),
+            "an outsider must not claim an approval"
+        );
+    }
+    assert_eq!(
+        store
+            .consume_approvals(&owner, &response.id, &[approval.approval_id.as_str()], 2_000)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn sqlite_passes_shared_ownership_contract() {
+    ownership_contract(&make_store_with_items().await).await;
+}
+
+#[tokio::test]
+async fn conversation_item_must_inherit_live_parent_owner() {
+    let store = make_store_with_items().await;
+    let parent_owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let other_owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
+    store
+        .upsert_conversation(&ConversationRecord {
+            conversation_id: "conv_parent_owner".to_owned(),
+            owner: parent_owner,
+            created_at: 1_000,
+            metadata: json!({}),
+            messages: json!([]),
+        })
+        .await
+        .unwrap();
+    let item = ConversationItemRecord {
+        item_id: "item_wrong_owner".to_owned(),
+        owner: other_owner,
+        conversation_id: "conv_parent_owner".to_owned(),
+        item_data: json!({"type": "message"}),
+        created_at: 1_000,
+        position: 1,
+    };
+
+    assert!(store.create_conversation_items(&[item]).await.is_err());
 }
 
 // -----------------------------------------------------------------------------
@@ -242,7 +426,7 @@ async fn consume_approval_first_call_claims() {
     seed_pending(&store, "tenant_a", RESP, &["call_abc"]).await;
 
     let conflict = store
-        .consume_approvals("tenant_a", RESP, &["call_abc"], 1000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_abc"], 1000)
         .await
         .expect("consume should succeed");
 
@@ -257,7 +441,12 @@ async fn consume_approval_without_pending_row_is_rejected() {
     // has no server-owned row to claim and must fail closed rather than
     // conjuring consent from nothing.
     let conflict = store
-        .consume_approvals("tenant_a", RESP, &["call_never_issued"], 1000)
+        .consume_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            RESP,
+            &["call_never_issued"],
+            1000,
+        )
         .await
         .expect("consume should succeed");
 
@@ -274,11 +463,11 @@ async fn consume_approval_replay_is_rejected() {
     seed_pending(&store, "tenant_a", RESP, &["call_abc"]).await;
 
     let first = store
-        .consume_approvals("tenant_a", RESP, &["call_abc"], 1000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_abc"], 1000)
         .await
         .expect("first consume should succeed");
     let replay = store
-        .consume_approvals("tenant_a", RESP, &["call_abc"], 2000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_abc"], 2000)
         .await
         .expect("replay consume should succeed");
 
@@ -296,11 +485,11 @@ async fn consume_approval_distinct_ids_each_claim() {
     seed_pending(&store, "tenant_a", RESP, &["call_1", "call_2"]).await;
 
     let first = store
-        .consume_approvals("tenant_a", RESP, &["call_1"], 1000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_1"], 1000)
         .await
         .expect("consume should succeed");
     let second = store
-        .consume_approvals("tenant_a", RESP, &["call_2"], 1000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_2"], 1000)
         .await
         .expect("consume should succeed");
 
@@ -309,25 +498,21 @@ async fn consume_approval_distinct_ids_each_claim() {
 }
 
 #[tokio::test]
-async fn consume_approval_is_tenant_scoped() {
+async fn consume_approval_is_owner_scoped() {
     let store = make_store().await;
     seed_pending(&store, "tenant_a", RESP, &["call_shared"]).await;
-    seed_pending(&store, "tenant_b", RESP, &["call_shared"]).await;
 
     let tenant_a = store
-        .consume_approvals("tenant_a", RESP, &["call_shared"], 1000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_shared"], 1000)
         .await
         .expect("tenant_a consume should succeed");
     let tenant_b = store
-        .consume_approvals("tenant_b", RESP, &["call_shared"], 1000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_b"), RESP, &["call_shared"], 1000)
         .await
         .expect("tenant_b consume should succeed");
 
     assert!(tenant_a.is_none(), "tenant_a should claim its own approval");
-    assert!(
-        tenant_b.is_none(),
-        "tenant_b sharing an approval id with tenant_a should still claim independently"
-    );
+    assert_eq!(tenant_b, Some(0), "the issuing owner must remain immutable");
 }
 
 #[tokio::test]
@@ -336,7 +521,12 @@ async fn consume_approvals_batch_claims_all_distinct_ids() {
     seed_pending(&store, "tenant_a", RESP, &["call_1", "call_2", "call_3"]).await;
 
     let conflict = store
-        .consume_approvals("tenant_a", RESP, &["call_1", "call_2", "call_3"], 1000)
+        .consume_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            RESP,
+            &["call_1", "call_2", "call_3"],
+            1000,
+        )
         .await
         .expect("batch consume should succeed");
 
@@ -350,21 +540,26 @@ async fn consume_approvals_batch_is_all_or_nothing_on_replay() {
 
     // Claim call_1 on its own.
     store
-        .consume_approvals("tenant_a", RESP, &["call_1"], 1000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_1"], 1000)
         .await
         .expect("first claim should succeed");
 
     // A batch that replays call_1 alongside a fresh call_2 must reject the
     // whole batch and leave call_2 unclaimed.
     let conflict = store
-        .consume_approvals("tenant_a", RESP, &["call_1", "call_2"], 2000)
+        .consume_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            RESP,
+            &["call_1", "call_2"],
+            2000,
+        )
         .await
         .expect("batch consume should succeed");
     assert_eq!(conflict, Some(0), "the replayed id's index should be reported");
 
     // Proof of rollback: call_2 was never burned, so it still claims cleanly.
     let call_2 = store
-        .consume_approvals("tenant_a", RESP, &["call_2"], 3000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_2"], 3000)
         .await
         .expect("call_2 consume should succeed");
     assert!(
@@ -381,14 +576,19 @@ async fn consume_approvals_rejects_intra_batch_duplicate() {
     // The same id twice in one batch is a duplicate: the first occurrence claims
     // the row inside the transaction, so the second finds nothing outstanding.
     let conflict = store
-        .consume_approvals("tenant_a", RESP, &["call_dup", "call_dup"], 1000)
+        .consume_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            RESP,
+            &["call_dup", "call_dup"],
+            1000,
+        )
         .await
         .expect("batch consume should succeed");
     assert_eq!(conflict, Some(1), "the duplicate's index should be reported");
 
     // Proof of rollback: the id was never burned by the rejected batch.
     let retry = store
-        .consume_approvals("tenant_a", RESP, &["call_dup"], 2000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_dup"], 2000)
         .await
         .expect("retry consume should succeed");
     assert!(
@@ -414,8 +614,16 @@ async fn consume_approvals_concurrent_claims_exactly_once() {
 
     let store_a = Arc::clone(&store);
     let store_b = Arc::clone(&store);
-    let task_a = tokio::spawn(async move { store_a.consume_approvals("tenant_a", RESP, &["call_race"], 1000).await });
-    let task_b = tokio::spawn(async move { store_b.consume_approvals("tenant_a", RESP, &["call_race"], 1000).await });
+    let task_a = tokio::spawn(async move {
+        store_a
+            .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_race"], 1000)
+            .await
+    });
+    let task_b = tokio::spawn(async move {
+        store_b
+            .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_race"], 1000)
+            .await
+    });
 
     let a = task_a
         .await
@@ -441,12 +649,21 @@ async fn record_and_get_pending_approval_round_trips_fields() {
     let store = make_store().await;
     let record = make_pending("call_abc");
     store
-        .record_pending_approvals("tenant_a", RESP, std::slice::from_ref(&record), 1000)
+        .upsert_response(&make_response_record(RESP, "tenant_a", 1000))
+        .await
+        .expect("issuing response should be stored");
+    store
+        .record_pending_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            RESP,
+            std::slice::from_ref(&record),
+            1000,
+        )
         .await
         .expect("record should succeed");
 
     let fetched = store
-        .get_pending_approvals("tenant_a", RESP, &["call_abc"])
+        .get_pending_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_abc"])
         .await
         .expect("get should succeed");
 
@@ -463,7 +680,7 @@ async fn get_pending_approvals_absent_id_returns_empty() {
     seed_pending(&store, "tenant_a", RESP, &["call_present"]).await;
 
     let fetched = store
-        .get_pending_approvals("tenant_a", RESP, &["call_absent"])
+        .get_pending_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_absent"])
         .await
         .expect("get should succeed");
 
@@ -479,7 +696,7 @@ async fn get_pending_approvals_is_tenant_scoped() {
     seed_pending(&store, "tenant_a", RESP, &["call_shared"]).await;
 
     let other_tenant = store
-        .get_pending_approvals("tenant_b", RESP, &["call_shared"])
+        .get_pending_approvals(&crate::test_utils::test_owner("tenant_b"), RESP, &["call_shared"])
         .await
         .expect("get should succeed");
 
@@ -494,7 +711,7 @@ async fn get_pending_approvals_returns_consumed_rows() {
     let store = make_store().await;
     seed_pending(&store, "tenant_a", RESP, &["call_abc"]).await;
     store
-        .consume_approvals("tenant_a", RESP, &["call_abc"], 2000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_abc"], 2000)
         .await
         .expect("consume should succeed");
 
@@ -502,7 +719,7 @@ async fn get_pending_approvals_returns_consumed_rows() {
     // "already used" (row present, consume rejects) from "never issued"
     // (row absent).
     let fetched = store
-        .get_pending_approvals("tenant_a", RESP, &["call_abc"])
+        .get_pending_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_abc"])
         .await
         .expect("get should succeed");
 
@@ -515,7 +732,7 @@ async fn record_pending_approvals_is_idempotent_and_never_resets_consumption() {
     let store = make_store().await;
     seed_pending(&store, "tenant_a", RESP, &["call_abc"]).await;
     store
-        .consume_approvals("tenant_a", RESP, &["call_abc"], 2000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_abc"], 2000)
         .await
         .expect("first consume should succeed");
 
@@ -525,7 +742,7 @@ async fn record_pending_approvals_is_idempotent_and_never_resets_consumption() {
     seed_pending(&store, "tenant_a", RESP, &["call_abc"]).await;
 
     let replay = store
-        .consume_approvals("tenant_a", RESP, &["call_abc"], 3000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_abc"], 3000)
         .await
         .expect("replay consume should succeed");
 
@@ -542,7 +759,7 @@ async fn get_pending_approvals_is_response_scoped() {
     seed_pending(&store, "tenant_a", "resp_1", &["call_shared"]).await;
 
     let other_response = store
-        .get_pending_approvals("tenant_a", "resp_2", &["call_shared"])
+        .get_pending_approvals(&crate::test_utils::test_owner("tenant_a"), "resp_2", &["call_shared"])
         .await
         .expect("get should succeed");
 
@@ -563,7 +780,12 @@ async fn consume_approvals_is_response_scoped() {
 
     // Claiming the token under an unrelated response id finds no row and rejects.
     let wrong = store
-        .consume_approvals("tenant_a", "resp_other", &["call_shared"], 1000)
+        .consume_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            "resp_other",
+            &["call_shared"],
+            1000,
+        )
         .await
         .expect("consume should succeed");
     assert_eq!(
@@ -574,11 +796,21 @@ async fn consume_approvals_is_response_scoped() {
 
     // Each issuing response's token is claimable exactly once, independently.
     let first = store
-        .consume_approvals("tenant_a", "resp_1", &["call_shared"], 1000)
+        .consume_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            "resp_1",
+            &["call_shared"],
+            1000,
+        )
         .await
         .expect("consume should succeed");
     let second = store
-        .consume_approvals("tenant_a", "resp_2", &["call_shared"], 1000)
+        .consume_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            "resp_2",
+            &["call_shared"],
+            1000,
+        )
         .await
         .expect("consume should succeed");
     assert!(first.is_none(), "resp_1's token should claim cleanly");
@@ -589,7 +821,12 @@ async fn consume_approvals_is_response_scoped() {
 
     // Replaying resp_1's now-consumed token rejects: it is single-use per response.
     let replay = store
-        .consume_approvals("tenant_a", "resp_1", &["call_shared"], 2000)
+        .consume_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            "resp_1",
+            &["call_shared"],
+            2000,
+        )
         .await
         .expect("consume should succeed");
     assert_eq!(replay, Some(0), "resp_1's token is single-use");
@@ -606,14 +843,14 @@ async fn delete_response_removes_its_pending_approvals() {
     seed_pending(&store, "tenant_a", "resp_del", &["call_abc"]).await;
 
     let deleted = store
-        .delete_response("tenant_a", "resp_del")
+        .delete_response(&crate::test_utils::test_owner("tenant_a"), "resp_del")
         .await
         .expect("delete should succeed");
     assert!(deleted, "the response should be deleted");
 
     // The approval issued by the deleted response is gone: neither retrievable...
     let fetched = store
-        .get_pending_approvals("tenant_a", "resp_del", &["call_abc"])
+        .get_pending_approvals(&crate::test_utils::test_owner("tenant_a"), "resp_del", &["call_abc"])
         .await
         .expect("get should succeed");
     assert!(
@@ -623,7 +860,12 @@ async fn delete_response_removes_its_pending_approvals() {
 
     // ...nor consumable (no server-owned row remains to claim).
     let claim = store
-        .consume_approvals("tenant_a", "resp_del", &["call_abc"], 1000)
+        .consume_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            "resp_del",
+            &["call_abc"],
+            1000,
+        )
         .await
         .expect("consume should succeed");
     assert_eq!(claim, Some(0), "a deleted response's approval must not be consumable");
@@ -647,13 +889,17 @@ async fn persist_response_with_pending_approvals_writes_both() {
         .expect("atomic persist should succeed");
 
     let fetched_response = store
-        .get_response("tenant_a", "resp_persist")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_persist")
         .await
         .expect("get should succeed");
     assert!(fetched_response.is_some(), "the response must be written");
 
     let fetched_approvals = store
-        .get_pending_approvals("tenant_a", "resp_persist", &["call_persist"])
+        .get_pending_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            "resp_persist",
+            &["call_persist"],
+        )
         .await
         .expect("get should succeed");
     assert_eq!(
@@ -699,7 +945,7 @@ async fn persist_response_with_pending_approvals_rolls_back_response_on_approval
     );
 
     let fetched = store
-        .get_response("tenant_a", "resp_rollback")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_rollback")
         .await
         .expect("get should succeed");
     assert!(
@@ -953,7 +1199,7 @@ async fn upsert_and_get_conversation() {
     let store = make_store().await;
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([{"role": "user", "content": "Hi"}]),
@@ -961,7 +1207,7 @@ async fn upsert_and_get_conversation() {
 
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
-    let fetched = ResponseStore::get_conversation(&store, "tenant_a", "conv_1")
+    let fetched = ResponseStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -979,7 +1225,7 @@ async fn upsert_conversation_overwrites() {
     let store = make_store().await;
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([{"role": "user", "content": "v1"}]),
@@ -988,7 +1234,7 @@ async fn upsert_conversation_overwrites() {
 
     let updated = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 2000,
         metadata: json!({"topic": "updated"}),
         messages: json!([{"role": "user", "content": "v2"}]),
@@ -998,7 +1244,7 @@ async fn upsert_conversation_overwrites() {
         .await
         .expect("second upsert should succeed");
 
-    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+    let fetched = ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -1021,7 +1267,7 @@ async fn update_conversation_messages_preserves_metadata() {
     let store = make_store().await;
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({"version": "v1"}),
         messages: json!([{"role": "user", "content": "v1"}]),
@@ -1029,12 +1275,16 @@ async fn update_conversation_messages_preserves_metadata() {
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
     let updated = store
-        .update_conversation_messages("tenant_a", "conv_1", &json!([{"role": "assistant", "content": "v2"}]))
+        .update_conversation_messages(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_1",
+            &json!([{"role": "assistant", "content": "v2"}]),
+        )
         .await
         .expect("message update should succeed");
     assert!(updated, "conversation should be updated");
 
-    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+    let fetched = ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -1056,7 +1306,7 @@ async fn update_conversation_metadata_preserves_messages() {
     let store = make_store().await;
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({"version": "v1"}),
         messages: json!([{"role": "user", "content": "keep me"}]),
@@ -1064,12 +1314,16 @@ async fn update_conversation_metadata_preserves_messages() {
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
     let updated = store
-        .update_conversation_metadata("tenant_a", "conv_1", &json!({"version": "v2"}))
+        .update_conversation_metadata(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_1",
+            &json!({"version": "v2"}),
+        )
         .await
         .expect("metadata update should succeed");
     assert!(updated, "conversation should be updated");
 
-    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+    let fetched = ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -1088,7 +1342,11 @@ async fn update_conversation_metadata_nonexistent_returns_false() {
     let store = make_store().await;
 
     let updated = store
-        .update_conversation_metadata("tenant_a", "nonexistent", &json!({"topic": "x"}))
+        .update_conversation_metadata(
+            &crate::test_utils::test_owner("tenant_a"),
+            "nonexistent",
+            &json!({"topic": "x"}),
+        )
         .await
         .expect("update should succeed");
 
@@ -1100,7 +1358,7 @@ async fn update_conversation_metadata_tenant_isolation() {
     let store = make_store().await;
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({"owner": "a"}),
         messages: json!([{"role": "user", "content": "original"}]),
@@ -1108,12 +1366,16 @@ async fn update_conversation_metadata_tenant_isolation() {
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
     let updated = store
-        .update_conversation_metadata("tenant_b", "conv_1", &json!({"owner": "hijack"}))
+        .update_conversation_metadata(
+            &crate::test_utils::test_owner("tenant_b"),
+            "conv_1",
+            &json!({"owner": "hijack"}),
+        )
         .await
         .expect("cross-tenant update should succeed");
     assert!(!updated, "tenant_b should not be able to update tenant_a metadata");
 
-    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+    let fetched = ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -1130,7 +1392,7 @@ async fn compare_and_swap_conversation_messages_rejects_stale_snapshot() {
     let initial = json!([{"role":"user","content":"initial"}]);
     let record = ConversationRecord {
         conversation_id: "conv_cas".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: initial.clone(),
@@ -1140,20 +1402,31 @@ async fn compare_and_swap_conversation_messages_rejects_stale_snapshot() {
     let first = json!([{"role":"assistant","content":"first"}]);
     assert!(
         store
-            .compare_and_swap_conversation_messages("tenant_a", "conv_cas", &initial, &first)
+            .compare_and_swap_conversation_messages(
+                &crate::test_utils::test_owner("tenant_a"),
+                "conv_cas",
+                &initial,
+                &first
+            )
             .await
             .expect("first compare-and-swap should succeed")
     );
     assert!(
         !store
-            .compare_and_swap_conversation_messages("tenant_a", "conv_cas", &initial, &json!([]))
+            .compare_and_swap_conversation_messages(
+                &crate::test_utils::test_owner("tenant_a"),
+                "conv_cas",
+                &initial,
+                &json!([])
+            )
             .await
             .expect("stale compare-and-swap should be conflict-free")
     );
-    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_cas")
-        .await
-        .expect("get should succeed")
-        .expect("conversation should exist");
+    let fetched =
+        ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_cas")
+            .await
+            .expect("get should succeed")
+            .expect("conversation should exist");
     assert_eq!(fetched.messages, first);
 }
 
@@ -1161,9 +1434,10 @@ async fn compare_and_swap_conversation_messages_rejects_stale_snapshot() {
 async fn get_missing_conversation_returns_none() {
     let store = make_store().await;
 
-    let result = ConversationItemStore::get_conversation(&store, "tenant_a", "nonexistent")
-        .await
-        .expect("get should succeed");
+    let result =
+        ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "nonexistent")
+            .await
+            .expect("get should succeed");
 
     assert!(result.is_none(), "missing conversation should return None");
 }
@@ -1173,14 +1447,14 @@ async fn conversation_tenant_isolation() {
     let store = make_store().await;
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
     };
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
-    let result = ConversationItemStore::get_conversation(&store, "tenant_b", "conv_1")
+    let result = ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_b"), "conv_1")
         .await
         .expect("get should succeed");
 
@@ -1192,7 +1466,7 @@ async fn delete_existing_conversation() {
     let store = make_store().await;
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -1200,13 +1474,13 @@ async fn delete_existing_conversation() {
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
     let deleted = store
-        .delete_conversation("tenant_a", "conv_1")
+        .delete_conversation(&crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("delete should succeed");
 
     assert!(deleted, "delete should return true for existing conversation");
 
-    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+    let fetched = ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("get should succeed");
 
@@ -1218,7 +1492,7 @@ async fn delete_missing_conversation_returns_false() {
     let store = make_store().await;
 
     let deleted = store
-        .delete_conversation("tenant_a", "nonexistent")
+        .delete_conversation(&crate::test_utils::test_owner("tenant_a"), "nonexistent")
         .await
         .expect("delete should succeed");
 
@@ -1230,7 +1504,7 @@ async fn delete_conversation_tenant_isolation() {
     let store = make_store().await;
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -1238,15 +1512,16 @@ async fn delete_conversation_tenant_isolation() {
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
     let deleted = store
-        .delete_conversation("tenant_b", "conv_1")
+        .delete_conversation(&crate::test_utils::test_owner("tenant_b"), "conv_1")
         .await
         .expect("delete should succeed");
 
     assert!(!deleted, "tenant_b should not be able to delete tenant_a conversation");
 
-    let still_exists = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
-        .await
-        .expect("get should succeed");
+    let still_exists =
+        ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
+            .await
+            .expect("get should succeed");
 
     assert!(
         still_exists.is_some(),
@@ -1268,30 +1543,42 @@ async fn conversation_items_paginate_ascending_and_descending() {
         make_conversation_item("item_4", "tenant_a", "conv_1", 4),
     ];
     store
-        .create_conversation_items(&items)
+        .create_test_items(&items)
         .await
         .expect("item insert should succeed");
 
     let asc = store
-        .list_conversation_items("tenant_a", "conv_1", None, 2, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 2, true)
         .await
         .expect("ascending list should succeed");
     assert_item_ids(&asc, &["item_1", "item_2"]);
 
     let asc_page2 = store
-        .list_conversation_items("tenant_a", "conv_1", Some("item_2"), 2, true)
+        .list_conversation_items(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_1",
+            Some("item_2"),
+            2,
+            true,
+        )
         .await
         .expect("ascending page 2 should succeed");
     assert_item_ids(&asc_page2, &["item_3", "item_4"]);
 
     let desc = store
-        .list_conversation_items("tenant_a", "conv_1", None, 2, false)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 2, false)
         .await
         .expect("descending list should succeed");
     assert_item_ids(&desc, &["item_4", "item_3"]);
 
     let desc_page2 = store
-        .list_conversation_items("tenant_a", "conv_1", Some("item_3"), 2, false)
+        .list_conversation_items(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_1",
+            Some("item_3"),
+            2,
+            false,
+        )
         .await
         .expect("descending page 2 should succeed");
     assert_item_ids(&desc_page2, &["item_2", "item_1"]);
@@ -1302,13 +1589,13 @@ async fn duplicate_position_rejected_by_unique_constraint() {
     let store = make_store_with_items().await;
     let first = [make_conversation_item("item_a", "tenant_a", "conv_1", 1)];
     store
-        .create_conversation_items(&first)
+        .create_test_items(&first)
         .await
         .expect("first insert should succeed");
 
     let duplicate = [make_conversation_item("item_b", "tenant_a", "conv_1", 1)];
     store
-        .create_conversation_items(&duplicate)
+        .create_test_items(&duplicate)
         .await
         .expect_err("duplicate position should fail");
 }
@@ -1319,24 +1606,24 @@ async fn conversation_item_single_ops_scope_to_conversation() {
     let item_conv1 = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
     let item_conv2 = make_conversation_item("item_2", "tenant_a", "conv_2", 1);
     store
-        .create_conversation_items(&[item_conv1, item_conv2])
+        .create_test_items(&[item_conv1, item_conv2])
         .await
         .expect("item insert should succeed");
 
     let get_wrong_conv = store
-        .get_conversation_item("tenant_a", "conv_2", "item_1")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_2", "item_1")
         .await
         .expect("get should succeed");
     assert!(get_wrong_conv.is_none(), "item_1 should not be visible in conv_2");
 
     let delete_wrong_conv = store
-        .delete_conversation_item("tenant_a", "conv_2", "item_1")
+        .delete_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_2", "item_1")
         .await
         .expect("delete should succeed");
     assert!(!delete_wrong_conv, "deleting item_1 from conv_2 should return false");
 
     let still_exists = store
-        .get_conversation_item("tenant_a", "conv_1", "item_1")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_1")
         .await
         .expect("get should succeed");
     assert!(still_exists.is_some(), "item_1 should still exist in conv_1");
@@ -1346,7 +1633,7 @@ async fn conversation_item_single_ops_scope_to_conversation() {
 async fn max_item_position_returns_zero_when_empty() {
     let store = make_store_with_items().await;
     let max = store
-        .max_item_position("tenant_a", "conv_1")
+        .max_item_position(&crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("max_item_position should succeed");
     assert_eq!(max, 0, "empty conversation should have max position 0");
@@ -1361,12 +1648,12 @@ async fn max_item_position_returns_highest() {
         make_conversation_item("item_3", "tenant_a", "conv_1", 3),
     ];
     store
-        .create_conversation_items(&items)
+        .create_test_items(&items)
         .await
         .expect("item insert should succeed");
 
     let max = store
-        .max_item_position("tenant_a", "conv_1")
+        .max_item_position(&crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("max_item_position should succeed");
     assert_eq!(max, 10, "max position should be 10");
@@ -1377,18 +1664,18 @@ async fn conversation_item_tenant_isolation() {
     let store = make_store_with_items().await;
     let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
     store
-        .create_conversation_items(&[item])
+        .create_test_items(&[item])
         .await
         .expect("item insert should succeed");
 
     let cross_tenant = store
-        .get_conversation_item("tenant_b", "conv_1", "item_1")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_b"), "conv_1", "item_1")
         .await
         .expect("cross-tenant get should succeed");
     assert!(cross_tenant.is_none(), "tenant_b should not see tenant_a items");
 
     let cross_tenant_list = store
-        .list_conversation_items("tenant_b", "conv_1", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_b"), "conv_1", None, 100, true)
         .await
         .expect("cross-tenant list should succeed");
     assert!(cross_tenant_list.is_empty(), "tenant_b should see no items");
@@ -1406,16 +1693,16 @@ async fn conversation_item_insert_rejects_existing() {
     };
 
     store
-        .create_conversation_items(&[original])
+        .create_test_items(&[original])
         .await
         .expect("initial item insert should succeed");
     store
-        .create_conversation_items(&[updated])
+        .create_test_items(&[updated])
         .await
         .expect_err("duplicate item insert should fail");
 
     let fetched = store
-        .get_conversation_item("tenant_a", "conv_1", "item_1")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_1")
         .await
         .expect("get should succeed")
         .expect("item should exist after duplicate insert");
@@ -1430,7 +1717,7 @@ async fn conversation_item_insert_rejects_existing() {
 }
 
 #[tokio::test]
-async fn conversation_item_upsert_allows_same_item_id_in_different_conversations() {
+async fn conversation_item_id_collision_cannot_move_between_conversations() {
     let store = make_store_with_items().await;
     let item_conv1 = ConversationItemRecord {
         item_data: json!({"conversation": "conv_1"}),
@@ -1442,48 +1729,42 @@ async fn conversation_item_upsert_allows_same_item_id_in_different_conversations
     };
 
     store
-        .create_conversation_items(&[item_conv1])
+        .create_test_items(&[item_conv1])
         .await
         .expect("initial item insert should succeed");
-    store
-        .create_conversation_items(&[item_conv2])
-        .await
-        .expect("same item_id in another conversation should insert");
+    let collision = store.create_test_items(&[item_conv2]).await;
+    assert!(
+        collision.is_err(),
+        "same item id must not be rebound to another conversation"
+    );
 
     let conv1_item = store
-        .get_conversation_item("tenant_a", "conv_1", "item_shared")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_shared")
         .await
         .expect("conv_1 get should succeed")
         .expect("conv_1 item should still exist");
     let conv2_item = store
-        .get_conversation_item("tenant_a", "conv_2", "item_shared")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_2", "item_shared")
         .await
-        .expect("conv_2 get should succeed")
-        .expect("conv_2 item should exist");
+        .expect("conv_2 get should succeed");
 
     assert_eq!(conv1_item.conversation_id, "conv_1", "conv_1 row should remain scoped");
-    assert_eq!(conv2_item.conversation_id, "conv_2", "conv_2 row should be inserted");
+    assert!(conv2_item.is_none(), "colliding conversation must not acquire the item");
     assert_eq!(
         conv1_item.item_data,
         json!({"conversation": "conv_1"}),
         "conv_1 item data should not be overwritten"
     );
-    assert_eq!(
-        conv2_item.item_data,
-        json!({"conversation": "conv_2"}),
-        "conv_2 item data should be stored separately"
-    );
-
     let conv1_items = store
-        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 100, true)
         .await
         .expect("conv_1 list should succeed");
     let conv2_items = store
-        .list_conversation_items("tenant_a", "conv_2", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_2", None, 100, true)
         .await
         .expect("conv_2 list should succeed");
     assert_item_ids(&conv1_items, &["item_shared"]);
-    assert_item_ids(&conv2_items, &["item_shared"]);
+    assert!(conv2_items.is_empty(), "colliding conversation must remain empty");
 }
 
 #[tokio::test]
@@ -1491,25 +1772,25 @@ async fn get_conversation_item_returns_all_fields() {
     let store = make_store_with_items().await;
     let item = ConversationItemRecord {
         item_id: "item_99".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         conversation_id: "conv_1".to_owned(),
         item_data: json!({"type": "function_call", "name": "search"}),
         created_at: 5000,
         position: 42,
     };
     store
-        .create_conversation_items(&[item])
+        .create_test_items(&[item])
         .await
         .expect("item insert should succeed");
 
     let fetched = store
-        .get_conversation_item("tenant_a", "conv_1", "item_99")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_99")
         .await
         .expect("get should succeed")
         .expect("item should exist");
 
     assert_eq!(fetched.item_id, "item_99", "item_id should match");
-    assert_eq!(fetched.tenant_id, "tenant_a", "tenant_id should match");
+    assert_eq!(fetched.owner.tenant_id(), "tenant_a", "tenant_id should match");
     assert_eq!(fetched.conversation_id, "conv_1", "conversation_id should match");
     assert_eq!(
         fetched.item_data,
@@ -1525,12 +1806,18 @@ async fn list_conversation_items_nonexistent_cursor_returns_empty() {
     let store = make_store_with_items().await;
     let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
     store
-        .create_conversation_items(&[item])
+        .create_test_items(&[item])
         .await
         .expect("item insert should succeed");
 
     let result = store
-        .list_conversation_items("tenant_a", "conv_1", Some("nonexistent"), 10, true)
+        .list_conversation_items(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_1",
+            Some("nonexistent"),
+            10,
+            true,
+        )
         .await
         .expect("list with nonexistent cursor should succeed");
 
@@ -1542,7 +1829,7 @@ async fn delete_conversation_preserves_items() {
     let store = make_store_with_items().await;
     let conv = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -1557,18 +1844,18 @@ async fn delete_conversation_preserves_items() {
         make_conversation_item("item_2", "tenant_a", "conv_1", 2),
     ];
     store
-        .create_conversation_items(&items)
+        .create_test_items(&items)
         .await
         .expect("item insert should succeed");
 
     let deleted = store
-        .delete_conversation("tenant_a", "conv_1")
+        .delete_conversation(&crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("delete_conversation should succeed");
     assert!(deleted, "conversation should have been deleted");
 
     let remaining = store
-        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 100, true)
         .await
         .expect("list should succeed");
     assert_item_ids(&remaining, &["item_1", "item_2"]);
@@ -1583,12 +1870,16 @@ async fn get_existing_conversation_item_ids_returns_matching() {
         make_conversation_item("item_3", "tenant_a", "conv_1", 3),
     ];
     store
-        .create_conversation_items(&items)
+        .create_test_items(&items)
         .await
         .expect("item insert should succeed");
 
     let existing = store
-        .get_existing_conversation_item_ids("tenant_a", "conv_1", &["item_1", "item_3", "item_99"])
+        .get_existing_conversation_item_ids(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_1",
+            &["item_1", "item_3", "item_99"],
+        )
         .await
         .expect("get_existing should succeed");
 
@@ -1602,12 +1893,12 @@ async fn get_existing_conversation_item_ids_empty_input() {
     let store = make_store_with_items().await;
     let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
     store
-        .create_conversation_items(&[item])
+        .create_test_items(&[item])
         .await
         .expect("item insert should succeed");
 
     let existing = store
-        .get_existing_conversation_item_ids("tenant_a", "conv_1", &[])
+        .get_existing_conversation_item_ids(&crate::test_utils::test_owner("tenant_a"), "conv_1", &[])
         .await
         .expect("get_existing with empty input should succeed");
 
@@ -1619,12 +1910,12 @@ async fn get_existing_conversation_item_ids_tenant_isolation() {
     let store = make_store_with_items().await;
     let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
     store
-        .create_conversation_items(&[item])
+        .create_test_items(&[item])
         .await
         .expect("item insert should succeed");
 
     let existing = store
-        .get_existing_conversation_item_ids("tenant_b", "conv_1", &["item_1"])
+        .get_existing_conversation_item_ids(&crate::test_utils::test_owner("tenant_b"), "conv_1", &["item_1"])
         .await
         .expect("get_existing should succeed");
 
@@ -1639,24 +1930,24 @@ async fn delete_conversation_item_returns_true() {
         make_conversation_item("item_2", "tenant_a", "conv_1", 2),
     ];
     store
-        .create_conversation_items(&items)
+        .create_test_items(&items)
         .await
         .expect("item insert should succeed");
 
     let deleted = store
-        .delete_conversation_item("tenant_a", "conv_1", "item_1")
+        .delete_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_1")
         .await
         .expect("delete should succeed");
     assert!(deleted, "delete should return true for existing item");
 
     let fetched = store
-        .get_conversation_item("tenant_a", "conv_1", "item_1")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_1")
         .await
         .expect("get should succeed");
     assert!(fetched.is_none(), "deleted item should not be retrievable");
 
     let remaining = store
-        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 100, true)
         .await
         .expect("list should succeed");
     assert_item_ids(&remaining, &["item_2"]);
@@ -1667,7 +1958,7 @@ async fn delete_nonexistent_conversation_item_returns_false() {
     let store = make_store_with_items().await;
 
     let deleted = store
-        .delete_conversation_item("tenant_a", "conv_1", "nonexistent")
+        .delete_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "nonexistent")
         .await
         .expect("delete should succeed");
 
@@ -1682,12 +1973,12 @@ async fn conversation_item_position_returns_existing() {
         make_conversation_item("item_2", "tenant_a", "conv_1", 10),
     ];
     store
-        .create_conversation_items(&items)
+        .create_test_items(&items)
         .await
         .expect("item insert should succeed");
 
     let position = store
-        .conversation_item_position("tenant_a", "conv_1", "item_2")
+        .conversation_item_position(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_2")
         .await
         .expect("position lookup should succeed");
 
@@ -1699,7 +1990,7 @@ async fn conversation_item_position_returns_none_for_missing() {
     let store = make_store_with_items().await;
 
     let position = store
-        .conversation_item_position("tenant_a", "conv_1", "nonexistent")
+        .conversation_item_position(&crate::test_utils::test_owner("tenant_a"), "conv_1", "nonexistent")
         .await
         .expect("position lookup should succeed");
 
@@ -1711,7 +2002,11 @@ async fn update_conversation_messages_nonexistent_returns_false() {
     let store = make_store().await;
 
     let updated = store
-        .update_conversation_messages("tenant_a", "nonexistent", &json!({"new": "messages"}))
+        .update_conversation_messages(
+            &crate::test_utils::test_owner("tenant_a"),
+            "nonexistent",
+            &json!({"new": "messages"}),
+        )
         .await
         .expect("update should succeed");
 
@@ -1723,7 +2018,7 @@ async fn update_conversation_messages_tenant_isolation() {
     let store = make_store().await;
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([{"role": "user", "content": "original"}]),
@@ -1731,12 +2026,16 @@ async fn update_conversation_messages_tenant_isolation() {
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
     let updated = store
-        .update_conversation_messages("tenant_b", "conv_1", &json!([{"role": "user", "content": "hijack"}]))
+        .update_conversation_messages(
+            &crate::test_utils::test_owner("tenant_b"),
+            "conv_1",
+            &json!([{"role": "user", "content": "hijack"}]),
+        )
         .await
         .expect("cross-tenant update should succeed");
     assert!(!updated, "tenant_b should not be able to update tenant_a messages");
 
-    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+    let fetched = ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -1752,18 +2051,18 @@ async fn delete_conversation_item_tenant_isolation() {
     let store = make_store_with_items().await;
     let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
     store
-        .create_conversation_items(&[item])
+        .create_test_items(&[item])
         .await
         .expect("item insert should succeed");
 
     let deleted = store
-        .delete_conversation_item("tenant_b", "conv_1", "item_1")
+        .delete_conversation_item(&crate::test_utils::test_owner("tenant_b"), "conv_1", "item_1")
         .await
         .expect("cross-tenant delete should succeed");
     assert!(!deleted, "tenant_b should not be able to delete tenant_a items");
 
     let still_exists = store
-        .get_conversation_item("tenant_a", "conv_1", "item_1")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_1")
         .await
         .expect("get should succeed");
     assert!(
@@ -1780,12 +2079,16 @@ async fn get_existing_conversation_item_ids_conversation_isolation() {
         make_conversation_item("item_2", "tenant_a", "conv_2", 1),
     ];
     store
-        .create_conversation_items(&items)
+        .create_test_items(&items)
         .await
         .expect("item insert should succeed");
 
     let existing = store
-        .get_existing_conversation_item_ids("tenant_a", "conv_1", &["item_1", "item_2"])
+        .get_existing_conversation_item_ids(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_1",
+            &["item_1", "item_2"],
+        )
         .await
         .expect("get_existing should succeed");
 
@@ -1801,12 +2104,12 @@ async fn conversation_item_position_tenant_isolation() {
     let store = make_store_with_items().await;
     let item = make_conversation_item("item_1", "tenant_a", "conv_1", 5);
     store
-        .create_conversation_items(&[item])
+        .create_test_items(&[item])
         .await
         .expect("item insert should succeed");
 
     let position = store
-        .conversation_item_position("tenant_b", "conv_1", "item_1")
+        .conversation_item_position(&crate::test_utils::test_owner("tenant_b"), "conv_1", "item_1")
         .await
         .expect("cross-tenant position lookup should succeed");
 
@@ -1818,12 +2121,12 @@ async fn conversation_item_position_conversation_isolation() {
     let store = make_store_with_items().await;
     let item = make_conversation_item("item_1", "tenant_a", "conv_1", 5);
     store
-        .create_conversation_items(&[item])
+        .create_test_items(&[item])
         .await
         .expect("item insert should succeed");
 
     let position = store
-        .conversation_item_position("tenant_a", "conv_2", "item_1")
+        .conversation_item_position(&crate::test_utils::test_owner("tenant_a"), "conv_2", "item_1")
         .await
         .expect("cross-conversation position lookup should succeed");
 
@@ -1835,14 +2138,14 @@ async fn conversation_item_methods_fail_without_items_table() {
     let store = make_store().await;
     let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
 
-    let err = store.create_conversation_items(&[item]).await.unwrap_err();
+    let err = store.create_test_items(&[item]).await.unwrap_err();
     assert!(
         matches!(err, StoreError::Unavailable(_)),
         "create should return Unavailable"
     );
 
     let err = store
-        .list_conversation_items("tenant_a", "conv_1", None, 10, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 10, true)
         .await
         .unwrap_err();
     assert!(
@@ -1851,7 +2154,7 @@ async fn conversation_item_methods_fail_without_items_table() {
     );
 
     let err = store
-        .get_conversation_item("tenant_a", "conv_1", "item_1")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_1")
         .await
         .unwrap_err();
     assert!(
@@ -1860,7 +2163,7 @@ async fn conversation_item_methods_fail_without_items_table() {
     );
 
     let err = store
-        .delete_conversation_item("tenant_a", "conv_1", "item_1")
+        .delete_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_1")
         .await
         .unwrap_err();
     assert!(
@@ -1869,7 +2172,7 @@ async fn conversation_item_methods_fail_without_items_table() {
     );
 
     let err = store
-        .conversation_item_position("tenant_a", "conv_1", "item_1")
+        .conversation_item_position(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_1")
         .await
         .unwrap_err();
     assert!(
@@ -1877,7 +2180,10 @@ async fn conversation_item_methods_fail_without_items_table() {
         "position should return Unavailable"
     );
 
-    let err = store.max_item_position("tenant_a", "conv_1").await.unwrap_err();
+    let err = store
+        .max_item_position(&crate::test_utils::test_owner("tenant_a"), "conv_1")
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, StoreError::Unavailable(_)),
         "max_position should return Unavailable"
@@ -1885,7 +2191,7 @@ async fn conversation_item_methods_fail_without_items_table() {
 
     let sync_item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
     let err = store
-        .create_items_and_sync_messages("tenant_a", "conv_1", &[sync_item])
+        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", &[sync_item])
         .await
         .unwrap_err();
     assert!(
@@ -1894,7 +2200,7 @@ async fn conversation_item_methods_fail_without_items_table() {
     );
 
     let err = store
-        .delete_item_and_sync_messages("tenant_a", "conv_1", "item_1")
+        .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_1")
         .await
         .unwrap_err();
     assert!(
@@ -1912,7 +2218,7 @@ async fn create_items_and_sync_messages_assigns_positions() {
     let store = make_store_with_items().await;
     let conv = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -1924,22 +2230,23 @@ async fn create_items_and_sync_messages_assigns_positions() {
         make_conversation_item("item_b", "tenant_a", "conv_1", 0),
     ];
     store
-        .create_items_and_sync_messages("tenant_a", "conv_1", &items)
+        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", &items)
         .await
         .expect("create_items_and_sync should succeed");
 
     let fetched = store
-        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 100, true)
         .await
         .expect("list should succeed");
     assert_item_ids(&fetched, &["item_a", "item_b"]);
     assert_eq!(fetched[0].position, 1, "first item should get position 1");
     assert_eq!(fetched[1].position, 2, "second item should get position 2");
 
-    let conv_record = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
-        .await
-        .expect("get should succeed")
-        .expect("conversation should exist");
+    let conv_record =
+        ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
+            .await
+            .expect("get should succeed")
+            .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
     assert_eq!(messages.len(), 2, "messages cache should have 2 items");
 }
@@ -1949,7 +2256,7 @@ async fn create_items_and_sync_messages_continues_from_max_position() {
     let store = make_store_with_items().await;
     let conv = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -1958,7 +2265,7 @@ async fn create_items_and_sync_messages_continues_from_max_position() {
 
     let first_batch = [make_conversation_item("item_a", "tenant_a", "conv_1", 0)];
     store
-        .create_items_and_sync_messages("tenant_a", "conv_1", &first_batch)
+        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", &first_batch)
         .await
         .expect("first batch should succeed");
 
@@ -1967,12 +2274,12 @@ async fn create_items_and_sync_messages_continues_from_max_position() {
         make_conversation_item("item_c", "tenant_a", "conv_1", 0),
     ];
     store
-        .create_items_and_sync_messages("tenant_a", "conv_1", &second_batch)
+        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", &second_batch)
         .await
         .expect("second batch should succeed");
 
     let fetched = store
-        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 100, true)
         .await
         .expect("list should succeed");
     assert_item_ids(&fetched, &["item_a", "item_b", "item_c"]);
@@ -1980,10 +2287,11 @@ async fn create_items_and_sync_messages_continues_from_max_position() {
     assert_eq!(fetched[1].position, 2);
     assert_eq!(fetched[2].position, 3);
 
-    let conv_record = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
-        .await
-        .expect("get should succeed")
-        .expect("conversation should exist");
+    let conv_record =
+        ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
+            .await
+            .expect("get should succeed")
+            .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
     assert_eq!(messages.len(), 3, "messages cache should include all 3 items");
 }
@@ -1993,7 +2301,7 @@ async fn create_items_and_sync_messages_empty_batch_is_noop() {
     let store = make_store_with_items().await;
     let empty: [ConversationItemRecord; 0] = [];
     store
-        .create_items_and_sync_messages("tenant_a", "conv_1", &empty)
+        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", &empty)
         .await
         .expect("empty batch should succeed");
 }
@@ -2005,7 +2313,7 @@ async fn create_items_and_sync_messages_missing_conversation_errors() {
     // deleted between the handler's existence check and this transaction.
     let items = [make_conversation_item("item_a", "tenant_a", "conv_gone", 0)];
     let err = store
-        .create_items_and_sync_messages("tenant_a", "conv_gone", &items)
+        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_gone", &items)
         .await
         .expect_err("create against a missing conversation should error");
     assert!(
@@ -2015,7 +2323,7 @@ async fn create_items_and_sync_messages_missing_conversation_errors() {
 
     // The transaction must roll back — no orphaned items may persist.
     let fetched = store
-        .list_conversation_items("tenant_a", "conv_gone", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_gone", None, 100, true)
         .await
         .expect("list should succeed");
     assert!(fetched.is_empty(), "items must not persist when the message sync fails");
@@ -2030,7 +2338,7 @@ async fn delete_item_and_sync_messages_updates_cache() {
     let store = make_store_with_items().await;
     let conv = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -2042,26 +2350,27 @@ async fn delete_item_and_sync_messages_updates_cache() {
         make_conversation_item("item_b", "tenant_a", "conv_1", 0),
     ];
     store
-        .create_items_and_sync_messages("tenant_a", "conv_1", &items)
+        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", &items)
         .await
         .expect("create should succeed");
 
     let deleted = store
-        .delete_item_and_sync_messages("tenant_a", "conv_1", "item_a")
+        .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_a")
         .await
         .expect("delete should succeed");
     assert!(deleted, "item_a should have been deleted");
 
     let remaining = store
-        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 100, true)
         .await
         .expect("list should succeed");
     assert_item_ids(&remaining, &["item_b"]);
 
-    let conv_record = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
-        .await
-        .expect("get should succeed")
-        .expect("conversation should exist");
+    let conv_record =
+        ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
+            .await
+            .expect("get should succeed")
+            .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
     assert_eq!(messages.len(), 1, "messages cache should reflect deletion");
 }
@@ -2071,7 +2380,7 @@ async fn delete_item_and_sync_messages_nonexistent_returns_false() {
     let store = make_store_with_items().await;
     let conv = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -2079,7 +2388,7 @@ async fn delete_item_and_sync_messages_nonexistent_returns_false() {
     store.upsert_conversation(&conv).await.expect("upsert should succeed");
 
     let deleted = store
-        .delete_item_and_sync_messages("tenant_a", "conv_1", "nonexistent")
+        .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", "nonexistent")
         .await
         .expect("delete should succeed");
     assert!(!deleted, "nonexistent item should return false");
@@ -2090,7 +2399,7 @@ async fn delete_item_and_sync_messages_missing_conversation_errors() {
     let store = make_store_with_items().await;
     let conv = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -2099,17 +2408,17 @@ async fn delete_item_and_sync_messages_missing_conversation_errors() {
 
     let items = [make_conversation_item("item_a", "tenant_a", "conv_1", 0)];
     store
-        .create_items_and_sync_messages("tenant_a", "conv_1", &items)
+        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", &items)
         .await
         .expect("create should succeed");
 
     // Delete the conversation row; items intentionally survive (no FK).
-    ConversationItemStore::delete_conversation(&store, "tenant_a", "conv_1")
+    ConversationItemStore::delete_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("delete conversation should succeed");
 
     let err = store
-        .delete_item_and_sync_messages("tenant_a", "conv_1", "item_a")
+        .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_a")
         .await
         .expect_err("delete-item sync against a missing conversation should error");
     assert!(
@@ -2119,7 +2428,7 @@ async fn delete_item_and_sync_messages_missing_conversation_errors() {
 
     // The transaction must roll back — the item deletion must not persist.
     let remaining = store
-        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 100, true)
         .await
         .expect("list should succeed");
     assert_item_ids(&remaining, &["item_a"]);
@@ -2167,7 +2476,7 @@ async fn file_backed_store_crud() {
     store.upsert_response(&record).await.expect("upsert should succeed");
 
     let fetched = store
-        .get_response("tenant_a", "resp_1")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -2202,7 +2511,7 @@ async fn schema_migration_is_idempotent() {
         .expect("second init with same tables should succeed");
 
     let fetched = store2
-        .get_response("tenant_a", "resp_1")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_1")
         .await
         .expect("get should succeed")
         .expect("record should survive re-init");
@@ -2251,10 +2560,14 @@ async fn sqlite_rejects_table_with_missing_columns() {
     assert!(msg.contains("model"), "error should list missing column: {msg}");
 }
 
+// -----------------------------------------------------------------------------
+// Schema Validation (primary keys)
+// -----------------------------------------------------------------------------
+
 #[tokio::test]
-async fn sqlite_rejects_items_table_with_missing_columns() {
+async fn sqlite_rejects_table_with_incompatible_primary_key() {
     let dir = tempfile::tempdir().expect("tempdir should succeed");
-    let db_path = dir.path().join("bad_items.db");
+    let db_path = dir.path().join("bad_pk.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
 
     let options = url
@@ -2264,19 +2577,23 @@ async fn sqlite_rejects_items_table_with_missing_columns() {
     let pool = sqlx::SqlitePool::connect_with(options)
         .await
         .expect("pool should connect");
+    // Every expected column is present, but the legacy table uses a composite
+    // tenant/id key instead of the globally owner-immutable response id.
     sqlx::query(
-        "CREATE TABLE bad_items (item_id TEXT NOT NULL, tenant_id TEXT NOT NULL, \
-         conversation_id TEXT NOT NULL, created_at BIGINT NOT NULL, position BIGINT NOT NULL, \
-         PRIMARY KEY (item_id, tenant_id, conversation_id))",
+        "CREATE TABLE bad_pk_responses (\
+         id TEXT NOT NULL, tenant_id TEXT NOT NULL, owner_issuer TEXT NOT NULL, \
+         owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+         model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+         messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id))",
     )
     .execute(&pool)
     .await
     .expect("manual create should succeed");
     pool.close().await;
 
-    let result = SqliteResponseStore::new(&url, "ok_responses", "ok_conversations", Some("bad_items"), None).await;
+    let result = SqliteResponseStore::new(&url, "bad_pk_responses", "ok_conversations", None, None).await;
     let Err(err) = result else {
-        panic!("init should fail on items schema mismatch");
+        panic!("init should fail on incompatible primary key");
     };
 
     let msg = err.to_string();
@@ -2284,8 +2601,158 @@ async fn sqlite_rejects_items_table_with_missing_columns() {
         msg.contains("schema validation failed"),
         "error should mention schema validation: {msg}"
     );
-    assert!(msg.contains("bad_items"), "error should name the table: {msg}");
-    assert!(msg.contains("item_data"), "error should list missing column: {msg}");
+    assert!(msg.contains("bad_pk_responses"), "error should name the table: {msg}");
+    assert!(
+        msg.contains("primary key"),
+        "error should mention the primary key: {msg}"
+    );
+    assert!(
+        msg.contains("expected (id)"),
+        "error should mention the expected id key: {msg}"
+    );
+    assert!(
+        msg.contains("migration"),
+        "error should tell the operator a migration is required: {msg}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Schema Validation (unique constraints)
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sqlite_rejects_table_with_tenant_leaking_unique_constraint() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("leak_unique.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse")
+        .create_if_missing(true);
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    // The primary key is correct, but an extra unique constraint changes the
+    // store's collision semantics and must be rejected.
+    sqlx::query(
+        "CREATE TABLE leak_responses (\
+         tenant_id TEXT NOT NULL, id TEXT PRIMARY KEY, owner_issuer TEXT NOT NULL, \
+         owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+         model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+         messages TEXT NOT NULL, UNIQUE (tenant_id))",
+    )
+    .execute(&pool)
+    .await
+    .expect("manual create should succeed");
+    pool.close().await;
+
+    let result = SqliteResponseStore::new(&url, "leak_responses", "leak_conversations", None, None).await;
+    let Err(err) = result else {
+        panic!("init should fail on an unexpected unique constraint");
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("schema validation failed"),
+        "error should mention schema validation: {msg}"
+    );
+    assert!(msg.contains("leak_responses"), "error should name the table: {msg}");
+    assert!(
+        msg.contains("unexpected unique index") && msg.contains("only the primary key"),
+        "error should explain a unique index beyond the primary key is rejected: {msg}"
+    );
+    assert!(
+        msg.contains("migration"),
+        "error should tell the operator a migration is required: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_rejects_table_with_case_insensitive_collation_on_key() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("collate_key.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse")
+        .create_if_missing(true);
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    // The global id key must preserve distinct response identifiers.
+    sqlx::query(
+        "CREATE TABLE collate_responses (\
+         tenant_id TEXT NOT NULL, id TEXT PRIMARY KEY COLLATE NOCASE, owner_issuer TEXT NOT NULL, \
+         owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+         model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+         messages TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("manual create should succeed");
+    pool.close().await;
+
+    let result = SqliteResponseStore::new(&url, "collate_responses", "collate_conversations", None, None).await;
+    let Err(err) = result else {
+        panic!("init should fail on a case-insensitive collation over a primary key column");
+    };
+
+    let msg = err.to_string();
+    assert!(msg.contains("schema validation failed"), "{msg}");
+    assert!(msg.contains("collate_responses"), "error should name the table: {msg}");
+    assert!(msg.contains("id"), "error should name the offending column: {msg}");
+    assert!(
+        msg.to_ascii_lowercase().contains("collation"),
+        "error should explain the collation is unsafe: {msg}"
+    );
+    assert!(msg.contains("migration"), "{msg}");
+}
+
+#[tokio::test]
+async fn sqlite_rejects_table_with_non_text_affinity_key() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("affinity_key.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse")
+        .create_if_missing(true);
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    // id is declared INTEGER, so it has numeric affinity: the distinct text ids
+    // "1" and "01" are both stored as the integer 1 and collide, letting
+    // INSERT OR REPLACE delete a distinct response. The column names and
+    // collation look correct, so only an affinity check rejects it.
+    sqlx::query(
+        "CREATE TABLE affinity_responses (\
+         tenant_id TEXT NOT NULL, id INTEGER PRIMARY KEY, owner_issuer TEXT NOT NULL, \
+         owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+         model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+         messages TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("manual create should succeed");
+    pool.close().await;
+
+    let result = SqliteResponseStore::new(&url, "affinity_responses", "affinity_conversations", None, None).await;
+    let Err(err) = result else {
+        panic!("init should fail on a primary key column without TEXT affinity");
+    };
+
+    let msg = err.to_string();
+    assert!(msg.contains("schema validation failed"), "{msg}");
+    assert!(msg.contains("affinity_responses"), "error should name the table: {msg}");
+    assert!(msg.contains("id"), "error should name the offending column: {msg}");
+    assert!(
+        msg.to_ascii_lowercase().contains("affinity"),
+        "error should explain the affinity is unsafe: {msg}"
+    );
+    assert!(msg.contains("migration"), "{msg}");
 }
 
 // -----------------------------------------------------------------------------
@@ -2312,7 +2779,7 @@ async fn sqlite_stamps_schema_version_on_fresh_db() {
         .fetch_one(&pool)
         .await
         .expect("version row should exist");
-    assert_eq!(version, 1, "fresh store should stamp version 1");
+    assert_eq!(version, 2, "fresh store should stamp version 2");
 }
 
 #[tokio::test]
@@ -2398,7 +2865,10 @@ async fn concurrent_upserts_do_not_lose_data() {
 
     for i in 0..20 {
         let id = format!("resp_{i}");
-        let fetched = store.get_response("tenant_a", &id).await.expect("get should succeed");
+        let fetched = store
+            .get_response(&crate::test_utils::test_owner("tenant_a"), &id)
+            .await
+            .expect("get should succeed");
         assert!(fetched.is_some(), "response {id} should exist after concurrent upsert");
     }
 }
@@ -2420,7 +2890,7 @@ async fn concurrent_reads_and_writes() {
         let store = Arc::clone(&store);
         handles.push(tokio::spawn(async move {
             let fetched = store
-                .get_response("tenant_a", "resp_rw")
+                .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_rw")
                 .await
                 .expect("concurrent read should succeed");
             assert!(fetched.is_some(), "seeded record should be readable under contention");
@@ -2451,7 +2921,7 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
 
     let conv = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -2464,7 +2934,7 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
     let handle_a = tokio::spawn(async move {
         let items = [make_conversation_item("item_a", "tenant_a", "conv_1", 0)];
         store_a
-            .create_items_and_sync_messages("tenant_a", "conv_1", &items)
+            .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", &items)
             .await
             .expect("task A should succeed");
     });
@@ -2472,7 +2942,7 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
     let handle_b = tokio::spawn(async move {
         let items = [make_conversation_item("item_b", "tenant_a", "conv_1", 0)];
         store_b
-            .create_items_and_sync_messages("tenant_a", "conv_1", &items)
+            .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", &items)
             .await
             .expect("task B should succeed");
     });
@@ -2481,7 +2951,7 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
     handle_b.await.expect("task B should not panic");
 
     let items = store
-        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 100, true)
         .await
         .expect("list should succeed");
 
@@ -2494,10 +2964,11 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
         "positions should be 1 and 2, got {positions:?}",
     );
 
-    let conv_record = ConversationItemStore::get_conversation(&*store, "tenant_a", "conv_1")
-        .await
-        .expect("get should succeed")
-        .expect("conversation should exist");
+    let conv_record =
+        ConversationItemStore::get_conversation(&*store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
+            .await
+            .expect("get should succeed")
+            .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
     assert_eq!(messages.len(), 2, "messages cache should include both items");
 }
@@ -2507,22 +2978,41 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn registry_register_and_get() {
+async fn registry_register_and_get_scoped() {
     let registry = ResponseStoreRegistry::new();
     let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
     registry
         .register(&Arc::from("primary"), Arc::clone(&store))
         .expect("register should succeed");
 
-    let fetched = registry.get("primary");
+    let owner = crate::test_utils::test_owner("tenant-a");
+    let fetched = registry.get_scoped("primary", &owner);
     assert!(fetched.is_some(), "registered store should be retrievable");
+}
+
+#[tokio::test]
+async fn registry_scoped_handle_rejects_a_record_from_another_owner() {
+    let registry = ResponseStoreRegistry::new();
+    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    registry.register(&Arc::from("primary"), store).unwrap();
+    let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
+    let scoped = registry.get_scoped("primary", &owner).unwrap();
+    let record = ResponseRecord {
+        owner: other,
+        ..make_response_record("resp_wrong_owner", "ignored", 1_000)
+    };
+
+    let result = scoped.upsert_response(&record).await;
+
+    assert!(matches!(result, Err(StoreError::InvalidInput(_))));
 }
 
 #[test]
 fn registry_get_missing_returns_none() {
     let registry = ResponseStoreRegistry::new();
     assert!(
-        registry.get("nonexistent").is_none(),
+        !registry.contains("nonexistent"),
         "get on empty registry should return None"
     );
 }
@@ -2546,10 +3036,7 @@ async fn registry_duplicate_registration_fails() {
 #[test]
 fn registry_default_is_empty() {
     let registry = ResponseStoreRegistry::default();
-    assert!(
-        registry.get("anything").is_none(),
-        "default registry should have no stores"
-    );
+    assert!(!registry.contains("anything"), "default registry should have no stores");
 }
 
 #[test]
@@ -2588,6 +3075,116 @@ fn pg_unique_suffix() -> String {
     format!("{id}_{tid:?}")
         .replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_")
         .to_lowercase()
+}
+
+/// Fixture for the `PostgreSQL` schema-validation integration tests.
+///
+/// Each of those tests hand-crafts a pre-existing schema, points
+/// `PostgresResponseStore::new` at it, and asserts that startup validation accepts
+/// or rejects it. The connect -> pre-clean -> craft -> init -> assert -> clean-up
+/// boilerplate is identical across them; only the crafted DDL and the expected
+/// error text differ. This fixture collapses that boilerplate so each test reads as
+/// "given this schema, init must reject it because <reason>".
+///
+/// Table names are suffix-scoped via [`pg_unique_suffix`] so tests running on
+/// separate threads never collide. Because the suffix is deterministic per thread,
+/// a prior run that panicked before cleanup can leave tables behind; every init
+/// drops the managed set first so a stale table cannot mask the crafted one.
+struct PgSchemaFixture {
+    url: String,
+    suffix: String,
+    responses: String,
+    conversations: String,
+    version: String,
+}
+
+impl PgSchemaFixture {
+    fn new(prefix: &str) -> Self {
+        let suffix = pg_unique_suffix();
+        let responses = format!("{prefix}_responses_{suffix}");
+        let conversations = format!("{prefix}_conversations_{suffix}");
+        let version = format!("{responses}_schema_version");
+        Self {
+            url: pg_database_url(),
+            suffix,
+            responses,
+            conversations,
+            version,
+        }
+    }
+
+    /// A suffix-scoped name for a non-table object (a collation) so parallel
+    /// threads never collide.
+    fn name(&self, base: &str) -> String {
+        format!("{base}_{}", self.suffix)
+    }
+
+    /// Every table this fixture owns, in drop order.
+    fn all_tables(&self) -> Vec<&str> {
+        vec![&self.responses, &self.conversations, &self.version]
+    }
+
+    /// Drop every owned table, then run `teardown` (drops for non-table objects such
+    /// as collations, which must follow the tables that depend on them). All
+    /// statements are idempotent (`IF EXISTS`).
+    async fn drop_all(&self, pool: &sqlx::PgPool, teardown: &[String]) {
+        use sqlx::AssertSqlSafe;
+        for table in self.all_tables() {
+            let sql = format!("DROP TABLE IF EXISTS {table}");
+            sqlx::query(AssertSqlSafe(sql.as_str()))
+                .execute(pool)
+                .await
+                .expect("drop table should succeed");
+        }
+        for stmt in teardown {
+            sqlx::query(AssertSqlSafe(stmt.as_str()))
+                .execute(pool)
+                .await
+                .expect("teardown should succeed");
+        }
+    }
+
+    /// Pre-clean, run `setup` to craft the schema, run init, clean up, and return the
+    /// init result. `teardown` runs as both pre-clean and post-clean.
+    async fn init(&self, setup: &[String], teardown: &[String]) -> Result<PostgresResponseStore, StoreError> {
+        use sqlx::AssertSqlSafe;
+
+        let options: sqlx::postgres::PgConnectOptions = self.url.parse().expect("url should parse");
+        let pool = Box::pin(sqlx::PgPool::connect_with(options))
+            .await
+            .expect("pool should connect");
+        self.drop_all(&pool, teardown).await;
+        for stmt in setup {
+            sqlx::query(AssertSqlSafe(stmt.as_str()))
+                .execute(&pool)
+                .await
+                .expect("setup should succeed");
+        }
+        pool.close().await;
+
+        let result = Box::pin(PostgresResponseStore::new(
+            &self.url,
+            &self.responses,
+            &self.conversations,
+            None,
+            Some(SslMode::Disable),
+            None,
+            None,
+        ))
+        .await;
+
+        let cleanup_pool = Box::pin(sqlx::PgPool::connect(&self.url)).await.expect("cleanup pool");
+        self.drop_all(&cleanup_pool, teardown).await;
+        result
+    }
+
+    /// Init against the crafted schema, require rejection, and return the error text.
+    async fn expect_rejected(&self, setup: &[String], teardown: &[String]) -> String {
+        match self.init(setup, teardown).await {
+            Ok(_) => panic!("init should reject the crafted schema"),
+            Err(err) => err.to_string(),
+        }
+    }
 }
 
 #[test]
@@ -2665,116 +3262,245 @@ async fn pg_nonexistent_ssl_root_cert_fails() {
 #[tokio::test]
 #[ignore]
 async fn pg_rejects_table_with_missing_columns() {
-    use sqlx::AssertSqlSafe;
+    let fx = PgSchemaFixture::new("missing_cols");
+    let msg = fx
+        .expect_rejected(
+            &[format!(
+                "CREATE TABLE {} (tenant_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (tenant_id, id))",
+                fx.responses
+            )],
+            &[],
+        )
+        .await;
 
-    let url = pg_database_url();
-    let suffix = pg_unique_suffix();
-    let table_name = format!("bad_responses_{suffix}");
-
-    let options: sqlx::postgres::PgConnectOptions = url.parse().expect("url should parse");
-    let pool = Box::pin(sqlx::PgPool::connect_with(options))
-        .await
-        .expect("pool should connect");
-    let create_sql = format!(
-        "CREATE TABLE IF NOT EXISTS {table_name} \
-         (tenant_id TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (tenant_id, id))"
-    );
-    sqlx::query(AssertSqlSafe(create_sql.as_str()))
-        .execute(&pool)
-        .await
-        .expect("manual create should succeed");
-    pool.close().await;
-
-    let result = Box::pin(PostgresResponseStore::new(
-        &url,
-        &table_name,
-        &format!("ok_conversations_{suffix}"),
-        None,
-        Some(SslMode::Disable),
-        None,
-        None,
-    ))
-    .await;
-    let Err(err) = result else {
-        panic!("init should fail on schema mismatch");
-    };
-
-    let msg = err.to_string();
     assert!(
         msg.contains("schema validation failed"),
         "error should mention schema validation: {msg}"
     );
-    assert!(msg.contains(&table_name), "error should name the table: {msg}");
+    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
     assert!(msg.contains("created_at"), "error should list missing column: {msg}");
+}
 
-    let cleanup_pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("cleanup pool");
-    let conv_table = format!("ok_conversations_{suffix}");
-    let ver_table = format!("{table_name}_schema_version");
-    for table in [&table_name, &conv_table, &ver_table] {
-        let drop_sql = format!("DROP TABLE IF EXISTS {table}");
-        sqlx::query(AssertSqlSafe(drop_sql.as_str()))
-            .execute(&cleanup_pool)
-            .await
-            .expect("cleanup should succeed");
-    }
+#[tokio::test]
+#[ignore]
+async fn pg_rejects_table_with_incompatible_primary_key() {
+    let fx = PgSchemaFixture::new("bad_pk");
+    // Every column is present, but the legacy table uses a composite tenant/id
+    // key instead of the globally owner-immutable response id.
+    let msg = fx
+        .expect_rejected(
+            &[format!(
+                "CREATE TABLE {} (\
+                 id TEXT NOT NULL, tenant_id TEXT NOT NULL, owner_issuer TEXT NOT NULL, \
+                 owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+                 model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+                 messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id))",
+                fx.responses
+            )],
+            &[],
+        )
+        .await;
+
+    assert!(
+        msg.contains("schema validation failed"),
+        "error should mention schema validation: {msg}"
+    );
+    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
+    assert!(
+        msg.contains("primary key"),
+        "error should mention the primary key: {msg}"
+    );
+    assert!(
+        msg.contains("migration"),
+        "error should tell the operator a migration is required: {msg}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_rejects_table_with_tenant_leaking_unique_constraint() {
+    let fx = PgSchemaFixture::new("leak");
+    // The primary key is correct, but an extra unique constraint changes the
+    // store's collision semantics and must be rejected.
+    let msg = fx
+        .expect_rejected(
+            &[format!(
+                "CREATE TABLE {} (\
+                 tenant_id TEXT NOT NULL, id TEXT PRIMARY KEY, owner_issuer TEXT NOT NULL, \
+                 owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+                 model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+                 messages TEXT NOT NULL, UNIQUE (tenant_id))",
+                fx.responses
+            )],
+            &[],
+        )
+        .await;
+
+    assert!(
+        msg.contains("schema validation failed"),
+        "error should mention schema validation: {msg}"
+    );
+    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
+    assert!(
+        msg.contains("unexpected unique index") && msg.contains("only the primary key"),
+        "error should explain a unique index beyond the primary key is rejected: {msg}"
+    );
+    assert!(
+        msg.contains("migration"),
+        "error should tell the operator a migration is required: {msg}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_rejects_table_with_deferrable_primary_key() {
+    let fx = PgSchemaFixture::new("defer_pk");
+    // The key is correct, but a DEFERRABLE primary key cannot serve as
+    // an ON CONFLICT arbiter: PostgreSQL rejects every upsert with "ON CONFLICT
+    // does not support deferrable unique constraints ... as arbiters". A check
+    // that only inspects columns would accept this and break every write, so
+    // init must reject it at startup.
+    let msg = fx
+        .expect_rejected(
+            &[format!(
+                "CREATE TABLE {} (\
+                 tenant_id TEXT NOT NULL, id TEXT NOT NULL, owner_issuer TEXT NOT NULL, \
+                 owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+                 model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+                 messages TEXT NOT NULL, PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED)",
+                fx.responses
+            )],
+            &[],
+        )
+        .await;
+
+    assert!(msg.contains("schema validation failed"), "{msg}");
+    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
+    assert!(
+        msg.to_ascii_lowercase().contains("deferrable"),
+        "error should explain the constraint is deferrable: {msg}"
+    );
+    assert!(msg.contains("migration"), "{msg}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_rejects_table_with_case_insensitive_collation_on_key() {
+    let fx = PgSchemaFixture::new("ci_coll");
+    let collation = fx.name("ci_coll");
+    // A non-deterministic collation on the id key folds distinct response IDs.
+    let msg = fx
+        .expect_rejected(
+            &[
+                format!(
+                    "CREATE COLLATION {collation} (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"
+                ),
+                format!(
+                    "CREATE TABLE {} (\
+                     tenant_id TEXT NOT NULL, id TEXT COLLATE {collation} PRIMARY KEY, \
+                     owner_issuer TEXT NOT NULL, owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+                     model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+                     messages TEXT NOT NULL)",
+                    fx.responses
+                ),
+            ],
+            &[format!("DROP COLLATION IF EXISTS {collation}")],
+        )
+        .await;
+
+    assert!(msg.contains("schema validation failed"), "{msg}");
+    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
+    assert!(
+        msg.to_ascii_lowercase().contains("collation"),
+        "error should explain the collation folds comparisons: {msg}"
+    );
+    assert!(msg.contains("migration"), "{msg}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_rejects_table_with_citext_key() {
+    let fx = PgSchemaFixture::new("citext");
+    // citext is case-insensitive by type, so it is invalid for the global id
+    // key. The extension is shared and left in place.
+    let msg = fx
+        .expect_rejected(
+            &[
+                "CREATE EXTENSION IF NOT EXISTS citext".to_owned(),
+                format!(
+                    "CREATE TABLE {} (\
+                     tenant_id TEXT NOT NULL, id CITEXT PRIMARY KEY, owner_issuer TEXT NOT NULL, \
+                     owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+                     model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+                     messages TEXT NOT NULL)",
+                    fx.responses
+                ),
+            ],
+            &[],
+        )
+        .await;
+
+    assert!(msg.contains("schema validation failed"), "{msg}");
+    assert!(msg.contains(&fx.responses), "error should name the table: {msg}");
+    assert!(
+        msg.to_ascii_lowercase().contains("citext"),
+        "error should name the case-insensitive type: {msg}"
+    );
+    assert!(msg.contains("migration"), "{msg}");
+}
+
+#[tokio::test]
+#[ignore]
+async fn pg_accepts_varchar_key_columns() {
+    let fx = PgSchemaFixture::new("varchar_key");
+    // varchar is allow-listed alongside text, but PostgreSQL backs a varchar key
+    // with the text_ops operator class (opcintype = text), not a varchar_ops. A
+    // trusted-opclass check that compared the class input type to the column type
+    // would see text != varchar and wrongly reject a valid schema, so varchar keys
+    // must be accepted.
+    let result = fx
+        .init(
+            &[format!(
+                "CREATE TABLE {} (\
+                 tenant_id TEXT NOT NULL, id VARCHAR PRIMARY KEY, owner_issuer TEXT NOT NULL, \
+                 owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, \
+                 model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
+                 messages TEXT NOT NULL)",
+                fx.responses
+            )],
+            &[],
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "varchar keys use the text_ops operator class and must be accepted: {:?}",
+        result.err()
+    );
 }
 
 #[tokio::test]
 #[ignore]
 async fn pg_rejects_schema_version_mismatch() {
-    use sqlx::AssertSqlSafe;
+    let fx = PgSchemaFixture::new("ver");
+    // Seed only the version table with an unsupported version. Init creates the
+    // (valid) responses and conversations tables, so validation passes and the
+    // version check is what rejects startup.
+    let msg = fx
+        .expect_rejected(
+            &[
+                format!("CREATE TABLE {} (version BIGINT NOT NULL PRIMARY KEY)", fx.version),
+                format!("INSERT INTO {} (version) VALUES (99)", fx.version),
+            ],
+            &[],
+        )
+        .await;
 
-    let url = pg_database_url();
-    let suffix = pg_unique_suffix();
-    let resp_table = format!("vr_{suffix}");
-    let conv_table = format!("vc_{suffix}");
-    let ver_table = format!("{resp_table}_schema_version");
-
-    let options: sqlx::postgres::PgConnectOptions = url.parse().expect("url should parse");
-    let pool = Box::pin(sqlx::PgPool::connect_with(options))
-        .await
-        .expect("pool should connect");
-    let create_sql = format!("CREATE TABLE IF NOT EXISTS {ver_table} (version BIGINT NOT NULL PRIMARY KEY)");
-    sqlx::query(AssertSqlSafe(create_sql.as_str()))
-        .execute(&pool)
-        .await
-        .expect("create should succeed");
-    let insert_sql = format!("INSERT INTO {ver_table} (version) VALUES (99)");
-    sqlx::query(AssertSqlSafe(insert_sql.as_str()))
-        .execute(&pool)
-        .await
-        .expect("insert should succeed");
-    pool.close().await;
-
-    let result = Box::pin(PostgresResponseStore::new(
-        &url,
-        &resp_table,
-        &conv_table,
-        None,
-        Some(SslMode::Disable),
-        None,
-        None,
-    ))
-    .await;
-    let Err(err) = result else {
-        panic!("init should fail on version mismatch");
-    };
-
-    let msg = err.to_string();
     assert!(
         msg.contains("schema version mismatch"),
         "error should mention version mismatch: {msg}"
     );
     assert!(msg.contains("99"), "error should show stored version: {msg}");
-
-    let cleanup_pool = Box::pin(sqlx::PgPool::connect(&url)).await.expect("cleanup pool");
-    for table in [&ver_table, &resp_table, &conv_table] {
-        let drop_sql = format!("DROP TABLE IF EXISTS {table}");
-        sqlx::query(AssertSqlSafe(drop_sql.as_str()))
-            .execute(&cleanup_pool)
-            .await
-            .expect("cleanup should succeed");
-    }
 }
 
 async fn make_pg_store() -> PostgresResponseStore {
@@ -2799,7 +3525,7 @@ async fn pg_store_initializes_schema() {
     let store = make_pg_store().await;
 
     let result = store
-        .get_response("tenant_a", "nonexistent")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "nonexistent")
         .await
         .expect("get should succeed");
 
@@ -2816,13 +3542,13 @@ async fn pg_upsert_and_get_response() {
     store.upsert_response(&record).await.expect("upsert should succeed");
 
     let fetched = store
-        .get_response("tenant_a", "resp_1")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
 
     assert_eq!(fetched.id, "resp_1", "ID should match");
-    assert_eq!(fetched.tenant_id, "tenant_a", "tenant should match");
+    assert_eq!(fetched.owner.tenant_id(), "tenant_a", "tenant should match");
     assert_eq!(fetched.created_at, 1000, "created_at should match");
     assert_eq!(fetched.model, "gpt-4.1", "model should match");
     assert_eq!(
@@ -2854,7 +3580,7 @@ async fn pg_upsert_overwrites_existing_response() {
         .expect("second upsert should succeed");
 
     let fetched = store
-        .get_response("tenant_a", "resp_1")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -2876,14 +3602,14 @@ async fn pg_delete_existing_response() {
     store.upsert_response(&record).await.expect("upsert should succeed");
 
     let deleted = store
-        .delete_response("tenant_a", "resp_1")
+        .delete_response(&crate::test_utils::test_owner("tenant_a"), "resp_1")
         .await
         .expect("delete should succeed");
 
     assert!(deleted, "delete should return true for existing record");
 
     let fetched = store
-        .get_response("tenant_a", "resp_1")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_1")
         .await
         .expect("get should succeed");
 
@@ -2896,7 +3622,7 @@ async fn pg_delete_missing_response_returns_false() {
     let store = make_pg_store().await;
 
     let deleted = store
-        .delete_response("tenant_a", "nonexistent")
+        .delete_response(&crate::test_utils::test_owner("tenant_a"), "nonexistent")
         .await
         .expect("delete should succeed");
 
@@ -2912,7 +3638,7 @@ async fn pg_tenant_isolation_on_get() {
     store.upsert_response(&record).await.expect("upsert should succeed");
 
     let result = store
-        .get_response("tenant_b", "resp_1")
+        .get_response(&crate::test_utils::test_owner("tenant_b"), "resp_1")
         .await
         .expect("get should succeed");
 
@@ -2928,14 +3654,14 @@ async fn pg_tenant_isolation_on_delete() {
     store.upsert_response(&record).await.expect("upsert should succeed");
 
     let deleted = store
-        .delete_response("tenant_b", "resp_1")
+        .delete_response(&crate::test_utils::test_owner("tenant_b"), "resp_1")
         .await
         .expect("delete should succeed");
 
     assert!(!deleted, "tenant_b should not be able to delete tenant_a records");
 
     let still_exists = store
-        .get_response("tenant_a", "resp_1")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_1")
         .await
         .expect("get should succeed");
 
@@ -2947,33 +3673,41 @@ async fn pg_tenant_isolation_on_delete() {
 
 #[tokio::test]
 #[ignore]
-async fn pg_same_response_id_can_exist_in_multiple_tenants() {
+async fn pg_response_id_collision_cannot_transfer_ownership() {
     let store = make_pg_store().await;
 
     store
         .upsert_response(&make_response_record("resp_shared", "tenant_a", 1000))
         .await
         .expect("tenant_a upsert should succeed");
-    store
+    let collision = store
         .upsert_response(&make_response_record("resp_shared", "tenant_b", 2000))
-        .await
-        .expect("tenant_b upsert should succeed");
+        .await;
+    assert!(collision.is_err(), "a colliding owner must be rejected");
 
     let tenant_a = store
-        .get_response("tenant_a", "resp_shared")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_shared")
         .await
         .expect("tenant_a get should succeed")
         .expect("tenant_a record should exist");
     let tenant_b = store
-        .get_response("tenant_b", "resp_shared")
+        .get_response(&crate::test_utils::test_owner("tenant_b"), "resp_shared")
         .await
-        .expect("tenant_b get should succeed")
-        .expect("tenant_b record should exist");
+        .expect("tenant_b get should succeed");
 
-    assert_eq!(tenant_a.tenant_id, "tenant_a", "tenant_a record should be isolated");
-    assert_eq!(tenant_b.tenant_id, "tenant_b", "tenant_b record should be isolated");
+    assert_eq!(
+        tenant_a.owner.tenant_id(),
+        "tenant_a",
+        "tenant_a record should be isolated"
+    );
     assert_eq!(tenant_a.created_at, 1000, "tenant_a record should not be overwritten");
-    assert_eq!(tenant_b.created_at, 2000, "tenant_b record should not be overwritten");
+    assert!(tenant_b.is_none(), "colliding owner must not acquire the response id");
+}
+
+#[tokio::test]
+#[ignore]
+async fn postgres_passes_shared_ownership_contract() {
+    ownership_contract(&make_pg_store_with_items().await).await;
 }
 
 #[tokio::test]
@@ -2983,11 +3717,11 @@ async fn pg_consume_approval_replay_is_rejected() {
     seed_pending(&store, "tenant_a", RESP, &["call_abc"]).await;
 
     let first = store
-        .consume_approvals("tenant_a", RESP, &["call_abc"], 1000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_abc"], 1000)
         .await
         .expect("first consume should succeed");
     let replay = store
-        .consume_approvals("tenant_a", RESP, &["call_abc"], 2000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_abc"], 2000)
         .await
         .expect("replay consume should succeed");
 
@@ -3012,13 +3746,17 @@ async fn pg_persist_response_with_pending_approvals_writes_both() {
         .expect("atomic persist should succeed");
 
     let fetched_response = store
-        .get_response("tenant_a", "resp_persist")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_persist")
         .await
         .expect("get should succeed");
     assert!(fetched_response.is_some(), "the response must be written");
 
     let fetched_approvals = store
-        .get_pending_approvals("tenant_a", "resp_persist", &["call_persist"])
+        .get_pending_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            "resp_persist",
+            &["call_persist"],
+        )
         .await
         .expect("get should succeed");
     assert_eq!(
@@ -3030,25 +3768,21 @@ async fn pg_persist_response_with_pending_approvals_writes_both() {
 
 #[tokio::test]
 #[ignore]
-async fn pg_consume_approval_is_tenant_scoped() {
+async fn pg_consume_approval_is_owner_scoped() {
     let store = make_pg_store().await;
     seed_pending(&store, "tenant_a", RESP, &["call_shared"]).await;
-    seed_pending(&store, "tenant_b", RESP, &["call_shared"]).await;
 
     let tenant_a = store
-        .consume_approvals("tenant_a", RESP, &["call_shared"], 1000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_shared"], 1000)
         .await
         .expect("tenant_a consume should succeed");
     let tenant_b = store
-        .consume_approvals("tenant_b", RESP, &["call_shared"], 1000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_b"), RESP, &["call_shared"], 1000)
         .await
         .expect("tenant_b consume should succeed");
 
     assert!(tenant_a.is_none(), "tenant_a should claim its own approval");
-    assert!(
-        tenant_b.is_none(),
-        "tenant_b sharing an approval id with tenant_a should still claim independently"
-    );
+    assert_eq!(tenant_b, Some(0), "the issuing owner must remain immutable");
 }
 
 #[tokio::test]
@@ -3058,18 +3792,23 @@ async fn pg_consume_approvals_batch_is_all_or_nothing_on_replay() {
     seed_pending(&store, "tenant_a", RESP, &["call_1", "call_2"]).await;
 
     store
-        .consume_approvals("tenant_a", RESP, &["call_1"], 1000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_1"], 1000)
         .await
         .expect("first claim should succeed");
 
     let conflict = store
-        .consume_approvals("tenant_a", RESP, &["call_1", "call_2"], 2000)
+        .consume_approvals(
+            &crate::test_utils::test_owner("tenant_a"),
+            RESP,
+            &["call_1", "call_2"],
+            2000,
+        )
         .await
         .expect("batch consume should succeed");
     assert_eq!(conflict, Some(0), "the replayed id's index should be reported");
 
     let call_2 = store
-        .consume_approvals("tenant_a", RESP, &["call_2"], 3000)
+        .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &["call_2"], 3000)
         .await
         .expect("call_2 consume should succeed");
     assert!(
@@ -3085,7 +3824,7 @@ async fn pg_upsert_and_get_conversation() {
 
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([{"role": "user", "content": "Hi"}]),
@@ -3093,7 +3832,7 @@ async fn pg_upsert_and_get_conversation() {
 
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
-    let fetched = ResponseStore::get_conversation(&store, "tenant_a", "conv_1")
+    let fetched = ResponseStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -3113,7 +3852,7 @@ async fn pg_upsert_conversation_overwrites() {
 
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([{"role": "user", "content": "v1"}]),
@@ -3122,7 +3861,7 @@ async fn pg_upsert_conversation_overwrites() {
 
     let updated = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 2000,
         metadata: json!({"topic": "updated"}),
         messages: json!([{"role": "user", "content": "v2"}]),
@@ -3132,7 +3871,7 @@ async fn pg_upsert_conversation_overwrites() {
         .await
         .expect("second upsert should succeed");
 
-    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+    let fetched = ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -3157,7 +3896,7 @@ async fn pg_update_conversation_messages_preserves_metadata() {
 
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({"version": "v1"}),
         messages: json!([{"role": "user", "content": "v1"}]),
@@ -3165,12 +3904,16 @@ async fn pg_update_conversation_messages_preserves_metadata() {
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
     let updated = store
-        .update_conversation_messages("tenant_a", "conv_1", &json!([{"role": "assistant", "content": "v2"}]))
+        .update_conversation_messages(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_1",
+            &json!([{"role": "assistant", "content": "v2"}]),
+        )
         .await
         .expect("message update should succeed");
     assert!(updated, "conversation should be updated");
 
-    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+    let fetched = ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -3194,7 +3937,7 @@ async fn pg_update_conversation_metadata_preserves_messages() {
 
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({"version": "v1"}),
         messages: json!([{"role": "user", "content": "keep me"}]),
@@ -3202,12 +3945,16 @@ async fn pg_update_conversation_metadata_preserves_messages() {
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
     let updated = store
-        .update_conversation_metadata("tenant_a", "conv_1", &json!({"version": "v2"}))
+        .update_conversation_metadata(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_1",
+            &json!({"version": "v2"}),
+        )
         .await
         .expect("metadata update should succeed");
     assert!(updated, "conversation should be updated");
 
-    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+    let fetched = ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -3228,7 +3975,7 @@ async fn pg_delete_existing_conversation() {
 
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -3236,13 +3983,13 @@ async fn pg_delete_existing_conversation() {
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
     let deleted = store
-        .delete_conversation("tenant_a", "conv_1")
+        .delete_conversation(&crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("delete should succeed");
 
     assert!(deleted, "delete should return true for existing conversation");
 
-    let fetched = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_1")
+    let fetched = ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("get should succeed");
 
@@ -3256,14 +4003,14 @@ async fn pg_conversation_tenant_isolation() {
 
     let record = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
     };
     store.upsert_conversation(&record).await.expect("upsert should succeed");
 
-    let result = ConversationItemStore::get_conversation(&store, "tenant_b", "conv_1")
+    let result = ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_b"), "conv_1")
         .await
         .expect("get should succeed");
 
@@ -3285,30 +4032,42 @@ async fn pg_conversation_items_paginate_ascending_and_descending() {
         make_conversation_item("item_4", "tenant_a", "conv_1", 4),
     ];
     store
-        .create_conversation_items(&items)
+        .create_test_items(&items)
         .await
         .expect("item insert should succeed");
 
     let asc = store
-        .list_conversation_items("tenant_a", "conv_1", None, 2, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 2, true)
         .await
         .expect("ascending list should succeed");
     assert_item_ids(&asc, &["item_1", "item_2"]);
 
     let asc_page2 = store
-        .list_conversation_items("tenant_a", "conv_1", Some("item_2"), 2, true)
+        .list_conversation_items(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_1",
+            Some("item_2"),
+            2,
+            true,
+        )
         .await
         .expect("ascending page 2 should succeed");
     assert_item_ids(&asc_page2, &["item_3", "item_4"]);
 
     let desc = store
-        .list_conversation_items("tenant_a", "conv_1", None, 2, false)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 2, false)
         .await
         .expect("descending list should succeed");
     assert_item_ids(&desc, &["item_4", "item_3"]);
 
     let desc_page2 = store
-        .list_conversation_items("tenant_a", "conv_1", Some("item_3"), 2, false)
+        .list_conversation_items(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_1",
+            Some("item_3"),
+            2,
+            false,
+        )
         .await
         .expect("descending page 2 should succeed");
     assert_item_ids(&desc_page2, &["item_2", "item_1"]);
@@ -3320,13 +4079,13 @@ async fn pg_duplicate_position_rejected_by_unique_constraint() {
     let store = make_pg_store_with_items().await;
     let first = [make_conversation_item("item_a", "tenant_a", "conv_1", 1)];
     store
-        .create_conversation_items(&first)
+        .create_test_items(&first)
         .await
         .expect("first insert should succeed");
 
     let duplicate = [make_conversation_item("item_b", "tenant_a", "conv_1", 1)];
     store
-        .create_conversation_items(&duplicate)
+        .create_test_items(&duplicate)
         .await
         .expect_err("duplicate position should fail");
 }
@@ -3338,24 +4097,24 @@ async fn pg_conversation_item_single_ops_scope_to_conversation() {
     let item_conv1 = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
     let item_conv2 = make_conversation_item("item_2", "tenant_a", "conv_2", 1);
     store
-        .create_conversation_items(&[item_conv1, item_conv2])
+        .create_test_items(&[item_conv1, item_conv2])
         .await
         .expect("item insert should succeed");
 
     let get_wrong_conv = store
-        .get_conversation_item("tenant_a", "conv_2", "item_1")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_2", "item_1")
         .await
         .expect("get should succeed");
     assert!(get_wrong_conv.is_none(), "item_1 should not be visible in conv_2");
 
     let delete_wrong_conv = store
-        .delete_conversation_item("tenant_a", "conv_2", "item_1")
+        .delete_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_2", "item_1")
         .await
         .expect("delete should succeed");
     assert!(!delete_wrong_conv, "deleting item_1 from conv_2 should return false");
 
     let still_exists = store
-        .get_conversation_item("tenant_a", "conv_1", "item_1")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_1")
         .await
         .expect("get should succeed");
     assert!(still_exists.is_some(), "item_1 should still exist in conv_1");
@@ -3366,7 +4125,7 @@ async fn pg_conversation_item_single_ops_scope_to_conversation() {
 async fn pg_max_item_position_returns_zero_when_empty() {
     let store = make_pg_store_with_items().await;
     let max = store
-        .max_item_position("tenant_a", "conv_1")
+        .max_item_position(&crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("max_item_position should succeed");
     assert_eq!(max, 0, "empty conversation should have max position 0");
@@ -3382,12 +4141,12 @@ async fn pg_max_item_position_returns_highest() {
         make_conversation_item("item_3", "tenant_a", "conv_1", 3),
     ];
     store
-        .create_conversation_items(&items)
+        .create_test_items(&items)
         .await
         .expect("item insert should succeed");
 
     let max = store
-        .max_item_position("tenant_a", "conv_1")
+        .max_item_position(&crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("max_item_position should succeed");
     assert_eq!(max, 10, "max position should be 10");
@@ -3399,18 +4158,18 @@ async fn pg_conversation_item_tenant_isolation() {
     let store = make_pg_store_with_items().await;
     let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
     store
-        .create_conversation_items(&[item])
+        .create_test_items(&[item])
         .await
         .expect("item insert should succeed");
 
     let cross_tenant = store
-        .get_conversation_item("tenant_b", "conv_1", "item_1")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_b"), "conv_1", "item_1")
         .await
         .expect("cross-tenant get should succeed");
     assert!(cross_tenant.is_none(), "tenant_b should not see tenant_a items");
 
     let cross_tenant_list = store
-        .list_conversation_items("tenant_b", "conv_1", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_b"), "conv_1", None, 100, true)
         .await
         .expect("cross-tenant list should succeed");
     assert!(cross_tenant_list.is_empty(), "tenant_b should see no items");
@@ -3429,16 +4188,16 @@ async fn pg_conversation_item_insert_rejects_existing() {
     };
 
     store
-        .create_conversation_items(&[original])
+        .create_test_items(&[original])
         .await
         .expect("initial item insert should succeed");
     store
-        .create_conversation_items(&[updated])
+        .create_test_items(&[updated])
         .await
         .expect_err("duplicate item insert should fail");
 
     let fetched = store
-        .get_conversation_item("tenant_a", "conv_1", "item_1")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_1")
         .await
         .expect("get should succeed")
         .expect("item should exist after duplicate insert");
@@ -3454,7 +4213,7 @@ async fn pg_conversation_item_insert_rejects_existing() {
 
 #[tokio::test]
 #[ignore]
-async fn pg_conversation_item_upsert_allows_same_item_id_in_different_conversations() {
+async fn pg_conversation_item_id_collision_cannot_move_between_conversations() {
     let store = make_pg_store_with_items().await;
     let item_conv1 = ConversationItemRecord {
         item_data: json!({"conversation": "conv_1"}),
@@ -3466,48 +4225,42 @@ async fn pg_conversation_item_upsert_allows_same_item_id_in_different_conversati
     };
 
     store
-        .create_conversation_items(&[item_conv1])
+        .create_test_items(&[item_conv1])
         .await
         .expect("initial item insert should succeed");
-    store
-        .create_conversation_items(&[item_conv2])
-        .await
-        .expect("same item_id in another conversation should insert");
+    let collision = store.create_test_items(&[item_conv2]).await;
+    assert!(
+        collision.is_err(),
+        "same item id must not be rebound to another conversation"
+    );
 
     let conv1_item = store
-        .get_conversation_item("tenant_a", "conv_1", "item_shared")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_shared")
         .await
         .expect("conv_1 get should succeed")
         .expect("conv_1 item should still exist");
     let conv2_item = store
-        .get_conversation_item("tenant_a", "conv_2", "item_shared")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_2", "item_shared")
         .await
-        .expect("conv_2 get should succeed")
-        .expect("conv_2 item should exist");
+        .expect("conv_2 get should succeed");
 
     assert_eq!(conv1_item.conversation_id, "conv_1", "conv_1 row should remain scoped");
-    assert_eq!(conv2_item.conversation_id, "conv_2", "conv_2 row should be inserted");
+    assert!(conv2_item.is_none(), "colliding conversation must not acquire the item");
     assert_eq!(
         conv1_item.item_data,
         json!({"conversation": "conv_1"}),
         "conv_1 item data should not be overwritten"
     );
-    assert_eq!(
-        conv2_item.item_data,
-        json!({"conversation": "conv_2"}),
-        "conv_2 item data should be stored separately"
-    );
-
     let conv1_items = store
-        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 100, true)
         .await
         .expect("conv_1 list should succeed");
     let conv2_items = store
-        .list_conversation_items("tenant_a", "conv_2", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_2", None, 100, true)
         .await
         .expect("conv_2 list should succeed");
     assert_item_ids(&conv1_items, &["item_shared"]);
-    assert_item_ids(&conv2_items, &["item_shared"]);
+    assert!(conv2_items.is_empty(), "colliding conversation must remain empty");
 }
 
 #[tokio::test]
@@ -3516,25 +4269,25 @@ async fn pg_get_conversation_item_returns_all_fields() {
     let store = make_pg_store_with_items().await;
     let item = ConversationItemRecord {
         item_id: "item_99".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         conversation_id: "conv_1".to_owned(),
         item_data: json!({"type": "function_call", "name": "search"}),
         created_at: 5000,
         position: 42,
     };
     store
-        .create_conversation_items(&[item])
+        .create_test_items(&[item])
         .await
         .expect("item insert should succeed");
 
     let fetched = store
-        .get_conversation_item("tenant_a", "conv_1", "item_99")
+        .get_conversation_item(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_99")
         .await
         .expect("get should succeed")
         .expect("item should exist");
 
     assert_eq!(fetched.item_id, "item_99", "item_id should match");
-    assert_eq!(fetched.tenant_id, "tenant_a", "tenant_id should match");
+    assert_eq!(fetched.owner.tenant_id(), "tenant_a", "tenant_id should match");
     assert_eq!(fetched.conversation_id, "conv_1", "conversation_id should match");
     assert_eq!(
         fetched.item_data,
@@ -3551,12 +4304,18 @@ async fn pg_list_conversation_items_nonexistent_cursor_returns_empty() {
     let store = make_pg_store_with_items().await;
     let item = make_conversation_item("item_1", "tenant_a", "conv_1", 1);
     store
-        .create_conversation_items(&[item])
+        .create_test_items(&[item])
         .await
         .expect("item insert should succeed");
 
     let result = store
-        .list_conversation_items("tenant_a", "conv_1", Some("nonexistent"), 10, true)
+        .list_conversation_items(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_1",
+            Some("nonexistent"),
+            10,
+            true,
+        )
         .await
         .expect("list with nonexistent cursor should succeed");
 
@@ -3569,7 +4328,7 @@ async fn pg_delete_conversation_preserves_items() {
     let store = make_pg_store_with_items().await;
     let conv = ConversationRecord {
         conversation_id: "conv_1".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -3584,18 +4343,18 @@ async fn pg_delete_conversation_preserves_items() {
         make_conversation_item("item_2", "tenant_a", "conv_1", 2),
     ];
     store
-        .create_conversation_items(&items)
+        .create_test_items(&items)
         .await
         .expect("item insert should succeed");
 
     let deleted = store
-        .delete_conversation("tenant_a", "conv_1")
+        .delete_conversation(&crate::test_utils::test_owner("tenant_a"), "conv_1")
         .await
         .expect("delete_conversation should succeed");
     assert!(deleted, "conversation should have been deleted");
 
     let remaining = store
-        .list_conversation_items("tenant_a", "conv_1", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_1", None, 100, true)
         .await
         .expect("list should succeed");
     assert_item_ids(&remaining, &["item_1", "item_2"]);
@@ -3611,7 +4370,7 @@ async fn pg_create_items_and_sync_messages_assigns_positions() {
     let store = make_pg_store_with_items().await;
     let conv = ConversationRecord {
         conversation_id: "conv_sync".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -3623,22 +4382,23 @@ async fn pg_create_items_and_sync_messages_assigns_positions() {
         make_conversation_item("item_b", "tenant_a", "conv_sync", 0),
     ];
     store
-        .create_items_and_sync_messages("tenant_a", "conv_sync", &items)
+        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_sync", &items)
         .await
         .expect("create_items_and_sync should succeed");
 
     let fetched = store
-        .list_conversation_items("tenant_a", "conv_sync", None, 100, true)
+        .list_conversation_items(&crate::test_utils::test_owner("tenant_a"), "conv_sync", None, 100, true)
         .await
         .expect("list should succeed");
     assert_item_ids(&fetched, &["item_a", "item_b"]);
     assert_eq!(fetched[0].position, 1, "first item should get position 1");
     assert_eq!(fetched[1].position, 2, "second item should get position 2");
 
-    let conv_record = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_sync")
-        .await
-        .expect("get should succeed")
-        .expect("conversation should exist");
+    let conv_record =
+        ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_sync")
+            .await
+            .expect("get should succeed")
+            .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
     assert_eq!(messages.len(), 2, "messages cache should have 2 items");
 }
@@ -3653,7 +4413,7 @@ async fn pg_delete_item_and_sync_messages_updates_cache() {
     let store = make_pg_store_with_items().await;
     let conv = ConversationRecord {
         conversation_id: "conv_del_sync".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -3665,26 +4425,33 @@ async fn pg_delete_item_and_sync_messages_updates_cache() {
         make_conversation_item("item_b", "tenant_a", "conv_del_sync", 0),
     ];
     store
-        .create_items_and_sync_messages("tenant_a", "conv_del_sync", &items)
+        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_del_sync", &items)
         .await
         .expect("create should succeed");
 
     let deleted = store
-        .delete_item_and_sync_messages("tenant_a", "conv_del_sync", "item_a")
+        .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_del_sync", "item_a")
         .await
         .expect("delete should succeed");
     assert!(deleted, "item_a should have been deleted");
 
     let remaining = store
-        .list_conversation_items("tenant_a", "conv_del_sync", None, 100, true)
+        .list_conversation_items(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_del_sync",
+            None,
+            100,
+            true,
+        )
         .await
         .expect("list should succeed");
     assert_item_ids(&remaining, &["item_b"]);
 
-    let conv_record = ConversationItemStore::get_conversation(&store, "tenant_a", "conv_del_sync")
-        .await
-        .expect("get should succeed")
-        .expect("conversation should exist");
+    let conv_record =
+        ConversationItemStore::get_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_del_sync")
+            .await
+            .expect("get should succeed")
+            .expect("conversation should exist");
     let messages = conv_record.messages.as_array().expect("messages should be an array");
     assert_eq!(messages.len(), 1, "messages cache should reflect deletion");
 }
@@ -3697,7 +4464,7 @@ async fn pg_create_items_and_sync_messages_missing_conversation_errors() {
     // handler's existence check and this transaction.
     let items = [make_conversation_item("item_a", "tenant_a", "conv_missing", 0)];
     let err = store
-        .create_items_and_sync_messages("tenant_a", "conv_missing", &items)
+        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_missing", &items)
         .await
         .expect_err("create against a missing conversation should error");
     assert!(
@@ -3707,7 +4474,13 @@ async fn pg_create_items_and_sync_messages_missing_conversation_errors() {
 
     // The transaction must roll back — no orphaned items may persist.
     let fetched = store
-        .list_conversation_items("tenant_a", "conv_missing", None, 100, true)
+        .list_conversation_items(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_missing",
+            None,
+            100,
+            true,
+        )
         .await
         .expect("list should succeed");
     assert!(fetched.is_empty(), "items must not persist when the message sync fails");
@@ -3719,7 +4492,7 @@ async fn pg_delete_item_and_sync_messages_missing_conversation_errors() {
     let store = make_pg_store_with_items().await;
     let conv = ConversationRecord {
         conversation_id: "conv_del_missing".to_owned(),
-        tenant_id: "tenant_a".to_owned(),
+        owner: crate::test_utils::test_owner("tenant_a"),
         created_at: 1000,
         metadata: json!({}),
         messages: json!([]),
@@ -3728,17 +4501,17 @@ async fn pg_delete_item_and_sync_messages_missing_conversation_errors() {
 
     let items = [make_conversation_item("item_a", "tenant_a", "conv_del_missing", 0)];
     store
-        .create_items_and_sync_messages("tenant_a", "conv_del_missing", &items)
+        .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_del_missing", &items)
         .await
         .expect("create should succeed");
 
     // Delete the conversation row; items intentionally survive (no FK).
-    ConversationItemStore::delete_conversation(&store, "tenant_a", "conv_del_missing")
+    ConversationItemStore::delete_conversation(&store, &crate::test_utils::test_owner("tenant_a"), "conv_del_missing")
         .await
         .expect("delete conversation should succeed");
 
     let err = store
-        .delete_item_and_sync_messages("tenant_a", "conv_del_missing", "item_a")
+        .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_del_missing", "item_a")
         .await
         .expect_err("delete-item sync against a missing conversation should error");
     assert!(
@@ -3748,7 +4521,13 @@ async fn pg_delete_item_and_sync_messages_missing_conversation_errors() {
 
     // The transaction must roll back — the item deletion must not persist.
     let remaining = store
-        .list_conversation_items("tenant_a", "conv_del_missing", None, 100, true)
+        .list_conversation_items(
+            &crate::test_utils::test_owner("tenant_a"),
+            "conv_del_missing",
+            None,
+            100,
+            true,
+        )
         .await
         .expect("list should succeed");
     assert_item_ids(&remaining, &["item_a"]);
@@ -3757,6 +4536,33 @@ async fn pg_delete_item_and_sync_messages_missing_conversation_errors() {
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
+
+/// Test-only convenience that creates any missing parents before exercising
+/// raw item-store behavior. Production request paths authorize and create the
+/// parent explicitly.
+#[async_trait::async_trait]
+trait TestConversationItemsExt: ConversationItemStore {
+    async fn create_test_items(&self, items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+        for item in items {
+            if ConversationItemStore::get_conversation(self, &item.owner, &item.conversation_id)
+                .await?
+                .is_none()
+            {
+                self.upsert_conversation(&ConversationRecord {
+                    conversation_id: item.conversation_id.clone(),
+                    owner: item.owner.clone(),
+                    created_at: item.created_at,
+                    metadata: json!({}),
+                    messages: json!([]),
+                })
+                .await?;
+            }
+        }
+        self.create_conversation_items(items).await
+    }
+}
+
+impl<T> TestConversationItemsExt for T where T: ConversationItemStore + ?Sized {}
 
 async fn make_store() -> SqliteResponseStore {
     SqliteResponseStore::new(
@@ -3817,7 +4623,7 @@ fn make_conversation_item(
 ) -> ConversationItemRecord {
     ConversationItemRecord {
         item_id: item_id.to_owned(),
-        tenant_id: tenant_id.to_owned(),
+        owner: crate::test_utils::test_owner(tenant_id),
         conversation_id: conversation_id.to_owned(),
         item_data: json!({"type": "message", "role": "user", "content": "test"}),
         created_at: 1000,
@@ -3850,8 +4656,13 @@ fn make_pending(approval_id: &str) -> PendingApprovalRecord {
 /// the SQLite and Postgres suites share it.
 async fn seed_pending(store: &dyn ResponseStore, tenant_id: &str, response_id: &str, approval_ids: &[&str]) {
     let records: Vec<PendingApprovalRecord> = approval_ids.iter().map(|id| make_pending(id)).collect();
+    let owner = crate::test_utils::test_owner(tenant_id);
     store
-        .record_pending_approvals(tenant_id, response_id, &records, 1000)
+        .upsert_response(&make_response_record(response_id, tenant_id, 1000))
+        .await
+        .expect("seeding issuing response should succeed");
+    store
+        .record_pending_approvals(&owner, response_id, &records, 1000)
         .await
         .expect("seeding pending approvals should succeed");
 }
@@ -3859,7 +4670,7 @@ async fn seed_pending(store: &dyn ResponseStore, tenant_id: &str, response_id: &
 fn make_response_record(id: &str, tenant_id: &str, created_at: i64) -> ResponseRecord {
     ResponseRecord {
         id: id.to_owned(),
-        tenant_id: tenant_id.to_owned(),
+        owner: crate::test_utils::test_owner(tenant_id),
         created_at,
         model: "gpt-4.1".to_owned(),
         response_object: json!({"status": "completed"}),

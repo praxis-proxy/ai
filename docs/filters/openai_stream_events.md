@@ -19,6 +19,8 @@ All fields are optional; omitted values fall back to [`SseParserConfig`] default
 | `max_events` | integer | no | Maximum number of SSE events before the parser errors. Default: 100,000. |
 | `timeout_secs` | integer | no | Maximum seconds from first chunk to stream completion. Default: 300 (5 minutes). |
 | `max_tool_call_argument_bytes` | integer | no | Maximum bytes accepted per function-call argument string from `function_call_arguments.delta` or `function_call_arguments.done` events. Default: 1 MiB. |
+| `max_accumulated_bytes` | integer | no | Maximum aggregate bytes accumulated across streaming output items and function-call argument buffers before the stream fails closed. Bounds total process memory even when every individual event is within `max_buffer_bytes`. Default: 64 MiB. |
+| `max_output_items` | integer | no | Maximum number of streaming output items accumulated before the stream fails closed. Default: 100,000. |
 
 ## Example
 
@@ -29,4 +31,6 @@ filter: openai_stream_events
 # max_events: 100000
 # timeout_secs: 300
 # max_tool_call_argument_bytes: 1048576
+# max_accumulated_bytes: 67108864
+# max_output_items: 100000
 ```

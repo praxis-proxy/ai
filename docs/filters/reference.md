@@ -28,6 +28,13 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`openai_chat_completions_to_azureai_chat_completions`](openai_chat_completions_to_azureai_chat_completions.md) | Transforms requests targeting Azure OpenAI deployments into standard Chat Completions-compatible form and normalizes responses back. |
 
+### General
+
+| Filter | Description |
+|--------|-------------|
+| [`state_owner`](state_owner.md) | Establishes a normalized [`StateOwner`] from trusted identity sources. |
+| [`state_owner_headers`](state_owner_headers.md) | Projects a normalized [`StateOwner`] into destination-specific HTTP headers. |
+
 ### OpenAI
 
 | Filter | Description |
@@ -39,6 +46,7 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_file_search_callout`](openai_file_search_callout.md) | Dispatches the loop owner's pending file-search assignments against a vector store API compatible backend. |
 | [`openai_mcp_dispatch`](openai_mcp_dispatch.md) | Executes MCP tool calls against upstream MCP servers within the Responses API agentic loop. |
 | [`openai_mcp_tool_resolve`](openai_mcp_tool_resolve.md) | Resolves MCP tool entries from the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server. |
+| [`openai_operation`](openai_operation.md) | Classifies supported OpenAI operations from the request head. |
 | [`openai_response_store`](openai_response_store.md) | Persists Responses API responses to the configured response store backend. |
 | [`openai_responses_compact`](openai_responses_compact.md) | Summarizes conversation history when the token count exceeds a configured threshold. |
 | [`openai_responses_format`](openai_responses_format.md) | Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body. |
@@ -100,6 +108,7 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
+| [`llmisvc_model_provider_resolver`](llmisvc_model_provider_resolver.md) | Rewrites publisher-ID body `model` values to the short model name for `LLMISvc` / `KServe` routing; the routing header is left unchanged. |
 | [`model_to_header`](model_to_header.md) | Promotes the JSON `"model"` field from the request body to a request header. |
 
 ### Metering

@@ -3,6 +3,7 @@
 
 //! Integration tests for example configurations.
 
+mod operation_classifier;
 mod test_utils;
 #[expect(unreachable_pub)]
 pub use test_utils::load_example_config;
@@ -27,11 +28,14 @@ mod guardrails;
 mod guardrails_response;
 mod identity_header_guard;
 mod inference_fallback;
+mod intelligent_route_hardening;
+mod intelligent_route_management_skip;
 mod irr_terminal_streaming;
 #[cfg(feature = "http-callout-filter")]
 mod lakera_guard;
 #[cfg(feature = "llmd-ext-proc")]
 mod llmd_ext_proc;
+mod llmisvc_model_provider_resolver;
 mod mcp_broker;
 mod model_to_header;
 mod openai_agentic_loop;
@@ -58,6 +62,7 @@ mod responses_routing;
 mod responses_to_chat_completions;
 mod responses_to_chat_completions_conformance;
 mod session_replay;
+mod state_owner_headers;
 mod time_to_first_token;
 mod token_count;
 mod token_counting;

@@ -284,9 +284,23 @@ pub(crate) enum SseParseError {
         /// Event type observed after termination.
         event_type: String,
     },
+
+    /// Accumulated streaming state exceeded an aggregate budget dimension.
+    AccumulationLimitExceeded {
+        /// Which budget dimension tripped (e.g. `accumulated_bytes`).
+        dimension: &'static str,
+        /// The observed value for that dimension.
+        value: usize,
+        /// The configured limit for that dimension.
+        limit: usize,
+    },
 }
 
 impl fmt::Display for SseParseError {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one linear write! arm per error variant; splitting would obscure the format table"
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BufferOverflow { buffered_bytes, limit } => write!(
@@ -316,6 +330,14 @@ impl fmt::Display for SseParseError {
             Self::EventAfterTerminal { event_type } => {
                 write!(f, "SSE event '{event_type}' arrived after terminal event")
             },
+            Self::AccumulationLimitExceeded {
+                dimension,
+                value,
+                limit,
+            } => write!(
+                f,
+                "SSE accumulation limit exceeded: {dimension} {value} exceeds {limit} limit"
+            ),
         }
     }
 }
@@ -689,6 +711,19 @@ mod tests {
             "should mention the event type"
         );
         assert!(msg.contains("terminal"), "should mention terminal context");
+    }
+
+    #[test]
+    fn display_accumulation_limit_exceeded() {
+        let err = SseParseError::AccumulationLimitExceeded {
+            dimension: "accumulated_bytes",
+            value: 70_000,
+            limit: 65_536,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("accumulated_bytes"), "should mention the dimension");
+        assert!(msg.contains("70000"), "should mention the observed value");
+        assert!(msg.contains("65536"), "should mention the limit");
     }
 
     // -------------------------------------------------------------------------

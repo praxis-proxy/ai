@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use http::HeaderName;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, builtins::JsonBodyFieldFilter,
     parse_filter_config,
@@ -45,6 +46,10 @@ fn default_header() -> String {
 
 /// Promotes the JSON `"model"` field from the request body to a request header.
 ///
+/// Promotion is deferred until end-of-stream so a later body-writing filter
+/// (for example `llmisvc_model_provider_resolver`) can observe the pending
+/// header in the same `StreamBuffer` pre-read pass.
+///
 /// # YAML configuration
 ///
 /// ```yaml
@@ -65,6 +70,9 @@ pub struct ModelToHeaderFilter {
     /// Delegated body-field extraction filter (type-erased
     /// `JsonBodyFieldFilter`).
     inner: Box<dyn HttpFilter>,
+    /// The promotion-target header this filter owns; a client-supplied copy is
+    /// stripped before promotion so routing cannot be spoofed. See #1039.
+    header: HeaderName,
 }
 
 impl ModelToHeaderFilter {
@@ -88,13 +96,8 @@ impl ModelToHeaderFilter {
     /// ```
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ModelToHeaderConfig = parse_filter_config("model_to_header", config)?;
-        let header = &cfg.header;
-        praxis_ai_apis::promotion::validate_dedicated_promotion_header(
-            "model_to_header",
-            "header",
-            Some(header.as_str()),
-            &[],
-        )?;
+        let header =
+            praxis_ai_apis::promotion::parse_dedicated_promotion_header("model_to_header", "header", &cfg.header, &[])?;
 
         let mut inner_config = serde_yaml::Mapping::new();
         inner_config.insert(
@@ -103,12 +106,12 @@ impl ModelToHeaderFilter {
         );
         inner_config.insert(
             serde_yaml::Value::String("header".into()),
-            serde_yaml::Value::String(header.to_owned()),
+            serde_yaml::Value::String(cfg.header.clone()),
         );
 
         let inner = JsonBodyFieldFilter::from_config(&serde_yaml::Value::Mapping(inner_config))?;
 
-        Ok(Box::new(Self { inner }))
+        Ok(Box::new(Self { inner, header }))
     }
 }
 
@@ -152,6 +155,16 @@ impl HttpFilter for ModelToHeaderFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+        if !ctx.request_headers_to_remove.contains(&self.header) {
+            ctx.request_headers_to_remove.push(self.header.clone());
+            tracing::debug!(
+                header = %self.header,
+                "model_to_header: dropping client-supplied promotion header (anti-spoofing)"
+            );
+        }
         self.inner.on_request_body(ctx, body, end_of_stream).await
     }
 
@@ -242,6 +255,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn waits_for_end_of_stream() {
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let json = br#"{"model":"mistral-large-latest","prompt":"hello"}"#;
+        let mut body = Some(Bytes::from_static(json));
+        let original = body.clone();
+
+        let action = filter.on_request_body(&mut ctx, &mut body, false).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(body, original, "must not promote before end_of_stream");
+        assert!(ctx.extra_request_headers.is_empty());
+    }
+
+    #[tokio::test]
     async fn extracts_model_field() {
         let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
@@ -262,6 +291,52 @@ mod tests {
         assert_eq!(
             value, "mistral-large-latest",
             "model value should be promoted to X-Model header"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_client_header_alongside_promotion() {
+        // A body-derived promotion must queue a Remove of the owned header in
+        // the same pre-read pass as the Add, so the pass's remove -> set -> add
+        // application drops any spoofed client copy. See praxis-proxy/ai#1039.
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let json = br#"{"model":"llama-3.2-8b","messages":[]}"#;
+        let mut body = Some(Bytes::from_static(json));
+
+        let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(
+            ctx.request_headers_to_remove.iter().any(|h| h == "x-model"),
+            "the owned header must be queued for removal before promotion"
+        );
+        let (name, value) = &ctx.extra_request_headers[0];
+        assert_eq!(name, "X-Model", "the body-derived value must still be promoted");
+        assert_eq!(value, "llama-3.2-8b", "the promoted value must be the body model");
+    }
+
+    #[tokio::test]
+    async fn strips_client_header_even_without_body_model() {
+        // Fail-closed: the client header is never trusted, so it is removed
+        // even when the body carries no model to promote.
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let json = br#"{"prompt":"hello"}"#;
+        let mut body = Some(Bytes::from_static(json));
+
+        let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(
+            ctx.request_headers_to_remove.iter().any(|h| h == "x-model"),
+            "the owned header must be removed even when no body model is promoted"
+        );
+        assert!(
+            ctx.extra_request_headers.is_empty(),
+            "no header is promoted when the body has no model"
         );
     }
 

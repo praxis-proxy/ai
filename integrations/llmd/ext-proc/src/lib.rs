@@ -1004,6 +1004,7 @@ impl ExtProcFilter {
             } else {
                 Some(Bytes::from(coalesced))
             };
+            mutations::begin_ordered_pre_read_mutations(ctx);
             ctx.request_headers_to_remove.push(CONTENT_LENGTH);
             ctx.pre_read_mutations
                 .push(TrustedHeaderMutation::Remove(CONTENT_LENGTH));

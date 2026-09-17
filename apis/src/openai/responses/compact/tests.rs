@@ -982,6 +982,45 @@ fn parse_compact_request_body_with_previous_response_id() {
     assert_eq!(req.instructions.as_deref(), Some("Be concise"));
 }
 
+#[tokio::test]
+async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
+    let backend: std::sync::Arc<dyn crate::store::ResponseStore> = std::sync::Arc::new(
+        crate::store::SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", None, None)
+            .await
+            .unwrap(),
+    );
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
+    let other = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
+    backend
+        .upsert_response(&ResponseRecord {
+            id: "resp_private".to_owned(),
+            owner: owner.clone(),
+            created_at: 1_000,
+            model: "gpt-4.1".to_owned(),
+            response_object: json!({"id": "resp_private", "status": "completed"}),
+            input: json!([]),
+            messages: json!([{"role": "user", "content": "private"}]),
+        })
+        .await
+        .unwrap();
+    let registry = ResponseStoreRegistry::new();
+    registry.register(&std::sync::Arc::from("default"), backend).unwrap();
+    let request = parse_compact_request_body(&Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","previous_response_id":"resp_private"}"#,
+    )))
+    .unwrap();
+
+    let wrong_store = registry.get_scoped("default", &other).unwrap();
+    let Err(FilterAction::Reject(rejection)) = collect_compact_messages(&wrong_store, &request).await else {
+        panic!("wrong-owner compaction must fail before its callout");
+    };
+    assert_eq!(rejection.status, 404);
+
+    let owner_store = registry.get_scoped("default", &owner).unwrap();
+    let messages = collect_compact_messages(&owner_store, &request).await.unwrap();
+    assert_eq!(messages, vec![json!({"role": "user", "content": "private"})]);
+}
+
 #[test]
 fn parse_compact_request_body_with_string_input() {
     let body = Some(Bytes::from(

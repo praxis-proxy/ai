@@ -13,6 +13,10 @@
 # The `openai_responses_format` filter must run first to classify
 # the request body — `openai_response_store` reads its metadata
 # to decide whether to persist POST responses.
+# A `state_owner` filter must also establish the immutable owner
+# used for every store operation. This standalone example uses an
+# explicit shared owner; multi-user deployments should use a trusted
+# owner mode instead.
 #
 # POST persistence:
 #   The `openai_responses_format` filter must run first to
@@ -42,6 +46,10 @@ filter_chains:
   - name: responses-pipeline
     filters:
       - filter: openai_responses_format
+
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
 
       - filter: openai_response_store
         backend: sqlite

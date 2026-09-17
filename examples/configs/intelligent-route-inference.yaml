@@ -1,8 +1,10 @@
 # Intelligent Route: Inference Model Routing
 #
 # Routes requests to different upstream clusters based on the inference
-# model name extracted from a configured request header.  The header
-# value is set by an earlier filter such as `json_body_field`.
+# model name carried in a configured request header.  The header value is
+# set by the `model_to_header` filter, which promotes the JSON body's
+# `model` field and strips any client-supplied copy of the header so
+# routing cannot be spoofed from the wire.
 #
 # `intelligent_route` selects a candidate by static scoring and writes the
 # cluster name into `ctx.cluster`.  The downstream `load_balancer` reads
@@ -26,9 +28,9 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      # Extract model name from the JSON body into a request header.
-      - filter: json_body_field
-        field: model
+      # Promote the JSON body's `model` field into X-Model and strip any
+      # client-supplied X-Model so the routed model cannot be spoofed.
+      - filter: model_to_header
         header: X-Model
 
       # Route to the cluster that serves the requested model.

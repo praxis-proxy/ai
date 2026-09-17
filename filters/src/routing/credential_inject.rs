@@ -69,10 +69,19 @@
 //! Secret entry and must match what the configuration producer wrote into the
 //! routing overlay candidate.
 
-use std::{collections::HashMap, fs::File, io::Read as _};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::Read as _,
+    path::{Path, PathBuf},
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use http::{HeaderValue, header::AUTHORIZATION};
+use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -133,7 +142,9 @@ struct CredentialEntryConfig {
     #[serde(default)]
     env_var: Option<String>,
 
-    /// Path to a file containing the token, read once at filter construction.
+    /// Path to a file containing the token. The initial value is validated at
+    /// filter construction. A watcher revalidates the file after atomic
+    /// projected-volume changes so Secret rotation does not require a restart.
     ///
     /// The file contents are trimmed of leading/trailing whitespace before use.
     /// The file must exist, be readable, and be non-empty; construction fails
@@ -167,6 +178,7 @@ struct CredentialRef {
 }
 
 /// Resolved credential ready for request-time injection.
+#[derive(Clone)]
 struct ResolvedCredential {
     /// Full `Authorization` header value ("Bearer {token}"), zeroized on drop.
     ///
@@ -174,6 +186,59 @@ struct ResolvedCredential {
     /// until the request context is dropped.  This is the same accepted residual
     /// as in the Praxis `credential_injection` filter.
     header_value: Zeroizing<String>,
+}
+
+/// A configured credential and its request-time source.
+///
+/// File-backed credentials are refreshed by the directory watcher when the
+/// atomically projected Secret path changes. Requests load a complete snapshot,
+/// so they observe either the old or new credential and never a partial file.
+struct CredentialSnapshot {
+    /// Validated immutable credential, or None when the latest replacement is invalid.
+    credential: Option<ResolvedCredential>,
+}
+
+/// Shared atomic credential state used by request handlers.
+struct ConfiguredCredential {
+    /// Current complete snapshot.
+    snapshot: Arc<ArcSwap<CredentialSnapshot>>,
+}
+
+/// File-backed credential and its reference identity.
+struct WatchedCredential {
+    /// Projected file path.
+    path: PathBuf,
+    /// Secret reference used for safe diagnostics.
+    reference: CredentialRef,
+    /// Snapshot published to requests.
+    snapshot: Arc<ArcSwap<CredentialSnapshot>>,
+}
+
+/// Messages delivered to the watcher thread. Keeping shutdown on the same
+/// channel as filesystem events makes teardown wakeable instead of dependent
+/// on the receive timeout.
+enum WatcherMessage {
+    /// Filesystem notification delivered by `notify`.
+    Event(notify::Event),
+    /// Stop the watcher and join its thread.
+    Shutdown,
+}
+
+/// Owns the bounded-lifetime projection watcher.
+struct CredentialReloadHandle {
+    /// Wakeable shutdown signal delivered to the watcher thread.
+    shutdown: mpsc::Sender<WatcherMessage>,
+    /// Watcher thread joined during filter destruction.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for CredentialReloadHandle {
+    fn drop(&mut self) {
+        drop(self.shutdown.send(WatcherMessage::Shutdown));
+        if let Some(thread) = self.thread.take() {
+            drop(thread.join());
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -190,14 +255,18 @@ struct ResolvedCredential {
 /// documentation for the complete data flow and configuration.
 pub struct CredentialInjectFilter {
     /// Credential reference → resolved injectable credential.
-    credentials: HashMap<CredentialRef, ResolvedCredential>,
+    credentials: HashMap<CredentialRef, ConfiguredCredential>,
+    /// Bounded watcher lifetime for file-backed credentials.
+    _reload_handle: Option<CredentialReloadHandle>,
 }
 
 impl CredentialInjectFilter {
     /// Create from YAML config.
     ///
     /// Resolves all credentials (inline values, environment variables, or files) at
-    /// construction time; per-request processing is a pure map lookup.
+    /// construction time. File-backed entries are revalidated by a bounded,
+    /// event-driven watcher and atomically replaced when Kubernetes updates the
+    /// projected volume.
     ///
     /// # Errors
     ///
@@ -208,6 +277,10 @@ impl CredentialInjectFilter {
     /// - any `file` does not exist, is unreadable, or is empty
     /// - any strategy is not `"bearer_token"`
     /// - the assembled header value is not valid HTTP
+    #[expect(
+        clippy::too_many_lines,
+        reason = "credential configuration validation is intentionally kept together"
+    )]
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: CredentialInjectConfig = parse_filter_config("credential_inject", config)?;
 
@@ -217,14 +290,21 @@ impl CredentialInjectFilter {
 
         let mut credentials = HashMap::with_capacity(cfg.credentials.len());
 
+        let mut watched = Vec::new();
         for entry in &cfg.credentials {
             validate_strategy(&entry.strategy)?;
             validate_credential_ref(entry)?;
-            let resolved = resolve_credential(entry)?;
             let cred_ref = CredentialRef {
                 name: entry.name.clone(),
                 namespace: entry.namespace.clone(),
                 key: entry.key.clone(),
+            };
+            let resolved = match (&entry.value, &entry.env_var, &entry.file) {
+                (None, None, Some(path)) => {
+                    validate_bounded("file", path, MAX_SOURCE_LEN)?;
+                    resolve_file_credential(path, &cred_ref)?
+                },
+                _ => resolve_credential(entry)?,
             };
             if credentials.contains_key(&cred_ref) {
                 return Err(format!(
@@ -233,10 +313,29 @@ impl CredentialInjectFilter {
                 )
                 .into());
             }
-            credentials.insert(cred_ref, resolved);
+            let snapshot = Arc::new(ArcSwap::from_pointee(CredentialSnapshot {
+                credential: Some(resolved),
+            }));
+            if let Some(path) = &entry.file {
+                watched.push(WatchedCredential {
+                    path: PathBuf::from(path),
+                    reference: cred_ref.clone(),
+                    snapshot: Arc::clone(&snapshot),
+                });
+            }
+            credentials.insert(cred_ref, ConfiguredCredential { snapshot });
         }
 
-        Ok(Box::new(Self { credentials }))
+        let reload_handle = if watched.is_empty() {
+            None
+        } else {
+            Some(spawn_credential_watcher(watched)?)
+        };
+
+        Ok(Box::new(Self {
+            credentials,
+            _reload_handle: reload_handle,
+        }))
     }
 }
 
@@ -246,6 +345,10 @@ impl HttpFilter for CredentialInjectFilter {
         "credential_inject"
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "request filter preserves the security decision as one operation"
+    )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         let Some(selected) = selected_credential_ref(ctx) else {
             tracing::debug!("credential_inject: no selected credential; skipping");
@@ -255,7 +358,7 @@ impl HttpFilter for CredentialInjectFilter {
             return Ok(FilterAction::Reject(Rejection::status(503)));
         };
 
-        let Some(cred) = self.credentials.get(&cred_ref) else {
+        let Some(configured) = self.credentials.get(&cred_ref) else {
             // Log the reference identity (not the token) to assist debugging.
             tracing::debug!(
                 name = %cred_ref.name,
@@ -263,6 +366,14 @@ impl HttpFilter for CredentialInjectFilter {
                 key = %cred_ref.key,
                 "credential_inject: no configured token for selected credential; failing closed"
             );
+            return Ok(FilterAction::Reject(Rejection::status(503)));
+        };
+
+        // Request handling only looks up and atomically loads an immutable
+        // snapshot. Filesystem I/O, validation, and publication happen in the
+        // bounded watcher thread after projected-volume events.
+        let snapshot = configured.snapshot.load_full();
+        let Some(cred) = snapshot.credential.as_ref() else {
             return Ok(FilterAction::Reject(Rejection::status(503)));
         };
 
@@ -277,6 +388,7 @@ impl HttpFilter for CredentialInjectFilter {
             format!("credential_inject: invalid resolved Authorization header: {e}").into()
         })?;
         ctx.request_headers_to_remove.push(AUTHORIZATION);
+        ctx.request_headers_to_remove.push(HeaderName::from_static("x-api-key"));
         ctx.request_headers_to_set.push((AUTHORIZATION, header_value));
 
         Ok(FilterAction::Continue)
@@ -351,6 +463,186 @@ fn resolve_credential(entry: &CredentialEntryConfig) -> Result<ResolvedCredentia
     })
 }
 
+/// Resolve a credential from one projected Secret file.
+fn resolve_file_credential(path: &str, reference: &CredentialRef) -> Result<ResolvedCredential, FilterError> {
+    let token = read_projected_token(path, reference)?;
+    validate_token(&token)?;
+    let header_value = format!("Bearer {}", &*token);
+    HeaderValue::from_str(&header_value).map_err(|error| {
+        format!(
+            "credential_inject: projected credential is not valid for '{}/{}/{}': {error}",
+            reference.name, reference.namespace, reference.key
+        )
+    })?;
+    Ok(ResolvedCredential {
+        header_value: Zeroizing::new(header_value),
+    })
+}
+
+/// Read one projected credential using the same bounded validation path for
+/// startup and reload. The credential value is never included in diagnostics.
+fn read_projected_token(path: &str, reference: &CredentialRef) -> Result<Zeroizing<String>, FilterError> {
+    let file = File::open(Path::new(path)).map_err(|error| {
+        format!(
+            "credential_inject: cannot read file '{path}' for '{}/{}/{}': {error}",
+            reference.name, reference.namespace, reference.key
+        )
+    })?;
+    let mut content = Zeroizing::new(String::new());
+    file.take(MAX_TOKEN_READ_BYTES)
+        .read_to_string(&mut content)
+        .map_err(|error| {
+            format!(
+                "credential_inject: cannot read projected credential for '{}/{}/{}': {error}",
+                reference.name, reference.namespace, reference.key
+            )
+        })?;
+    if content.len() > MAX_TOKEN_BYTES {
+        return Err(format!("credential_inject: projected credential exceeds {MAX_TOKEN_BYTES} bytes").into());
+    }
+    let token = Zeroizing::new(content.trim().to_owned());
+    validate_token(&token)?;
+    Ok(token)
+}
+
+/// Publish the current file state, failing closed when it cannot be read or
+/// validated.
+fn reload_credential(item: &WatchedCredential) {
+    let credential = match resolve_file_credential(item.path.to_string_lossy().as_ref(), &item.reference) {
+        Ok(credential) => Some(credential),
+        Err(error) => {
+            tracing::warn!(
+                name = %item.reference.name,
+                namespace = %item.reference.namespace,
+                key = %item.reference.key,
+                error = %error,
+                "credential_inject: projected credential unavailable; failing closed"
+            );
+            None
+        },
+    };
+    item.snapshot.store(Arc::new(CredentialSnapshot { credential }));
+}
+
+/// Reread every configured file and publish each result, failing closed per
+/// credential when a replacement is unavailable or invalid.
+fn reload_all_credentials(watched: &[WatchedCredential]) {
+    for item in watched {
+        reload_credential(item);
+    }
+}
+
+/// Apply one filesystem event, using a full rescan when notify cannot identify
+/// the affected path or reports that events may have been lost.
+fn process_watcher_event(event: &notify::Event, watched: &[WatchedCredential]) {
+    if event.need_rescan() || matches!(event.kind, EventKind::Other) {
+        reload_all_credentials(watched);
+        return;
+    }
+    if !matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) {
+        return;
+    }
+    for item in watched {
+        let affected = event
+            .paths
+            .iter()
+            .any(|path| path == &item.path || path.parent() == item.path.parent());
+        if affected {
+            reload_credential(item);
+        }
+    }
+}
+
+/// Start a directory watcher and wait until all parent directories are registered.
+#[expect(
+    clippy::too_many_lines,
+    reason = "watcher setup and lifecycle are intentionally bounded in one function"
+)]
+fn spawn_credential_watcher(watched: Vec<WatchedCredential>) -> Result<CredentialReloadHandle, FilterError> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (message_tx, message_rx) = mpsc::channel();
+    let callback_tx = message_tx.clone();
+    let thread = std::thread::Builder::new()
+        .name("credential-inject-watcher".to_owned())
+        .spawn(move || {
+            let mut watcher: RecommendedWatcher = match notify::recommended_watcher(move |event| {
+                if let Ok(event) = event {
+                    drop(callback_tx.send(WatcherMessage::Event(event)));
+                }
+            }) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    drop(ready_tx.send(Err(format!("failed to create credential watcher: {error}"))));
+                    return;
+                },
+            };
+
+            let mut directories = std::collections::HashSet::new();
+            for item in &watched {
+                let directory = item.path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+                if directories.insert(directory.clone())
+                    && watcher.watch(&directory, RecursiveMode::NonRecursive).is_err()
+                {
+                    drop(ready_tx.send(Err(format!(
+                        "failed to watch credential directory {}",
+                        directory.display()
+                    ))));
+                    return;
+                }
+            }
+
+            // The watcher is live before this authoritative read. Any event
+            // arriving during the read remains queued and is processed by the
+            // loop after readiness has been reported. Publish only after every
+            // file has been read successfully so readiness observes one
+            // complete startup snapshot.
+            let mut initial = Vec::with_capacity(watched.len());
+            for item in &watched {
+                match resolve_file_credential(item.path.to_string_lossy().as_ref(), &item.reference) {
+                    Ok(credential) => initial.push((Arc::clone(&item.snapshot), credential)),
+                    Err(error) => {
+                        drop(ready_tx.send(Err(format!("failed authoritative credential read: {error}"))));
+                        return;
+                    },
+                }
+            }
+            for (snapshot, credential) in initial {
+                snapshot.store(Arc::new(CredentialSnapshot {
+                    credential: Some(credential),
+                }));
+            }
+            drop(ready_tx.send(Ok(())));
+
+            while let Ok(message) = message_rx.recv() {
+                let WatcherMessage::Event(event) = message else {
+                    break;
+                };
+                process_watcher_event(&event, &watched);
+            }
+        })
+        .map_err(|error| format!("credential_inject: failed to spawn watcher: {error}"))?;
+    let ready = match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(ready) => ready,
+        Err(error) => {
+            drop(message_tx.send(WatcherMessage::Shutdown));
+            drop(thread.join());
+            return Err(format!("credential_inject: credential watcher did not initialize: {error}").into());
+        },
+    };
+    if let Err(error) = ready {
+        drop(message_tx.send(WatcherMessage::Shutdown));
+        drop(thread.join());
+        return Err(format!("credential_inject: {error}").into());
+    }
+    Ok(CredentialReloadHandle {
+        shutdown: message_tx,
+        thread: Some(thread),
+    })
+}
+
 /// Resolve the raw token from inline value, environment variable, or file.
 #[expect(
     clippy::too_many_lines,
@@ -374,29 +666,12 @@ fn resolve_token(entry: &CredentialEntryConfig) -> Result<Zeroizing<String>, Fil
         },
         (None, None, Some(path)) => {
             validate_bounded("file", path, MAX_SOURCE_LEN)?;
-            let file = File::open(path).map_err(|e| -> FilterError {
-                format!(
-                    "credential_inject: cannot read file '{path}' for '{}/{}/{}': {e}",
-                    entry.name, entry.namespace, entry.key
-                )
-                .into()
-            })?;
-            let mut content = Zeroizing::new(String::new());
-            file.take(MAX_TOKEN_READ_BYTES)
-                .read_to_string(&mut content)
-                .map_err(|e| -> FilterError {
-                    format!(
-                        "credential_inject: cannot read file '{path}' for '{}/{}/{}': {e}",
-                        entry.name, entry.namespace, entry.key
-                    )
-                    .into()
-                })?;
-            if content.len() > MAX_TOKEN_BYTES {
-                return Err(format!("credential_inject: file '{path}' exceeds {MAX_TOKEN_BYTES} bytes").into());
-            }
-            let token = Zeroizing::new(content.trim().to_owned());
-            validate_token(&token)?;
-            Ok(token)
+            let reference = CredentialRef {
+                name: entry.name.clone(),
+                namespace: entry.namespace.clone(),
+                key: entry.key.clone(),
+            };
+            read_projected_token(path, &reference)
         },
         (None, None, None) => Err(format!(
             "credential_inject: '{}/{}/{}' must have exactly one of 'value', 'env_var', or 'file'",
@@ -550,6 +825,8 @@ mod tests {
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
         req.headers
             .insert(AUTHORIZATION, HeaderValue::from_static("Bearer customer-token"));
+        req.headers
+            .insert("x-api-key", HeaderValue::from_static("customer-key"));
         let mut ctx = crate::test_utils::make_filter_context(&req);
         set_credential_metadata(&mut ctx, "bearer_token", "my-secret", "grid-system", "token");
 
@@ -561,6 +838,11 @@ mod tests {
         assert!(
             ctx.request_headers_to_remove.contains(&AUTHORIZATION),
             "customer Authorization must be removed"
+        );
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static("x-api-key")),
+            "customer x-api-key must be removed"
         );
         assert_eq!(ctx.request_headers_to_set.len(), 1, "exactly one header injected");
         let (header_name, header_value) = &ctx.request_headers_to_set[0];
@@ -610,6 +892,147 @@ mod tests {
             ctx.request_headers_to_set[0].1.to_str().unwrap(),
             "Bearer file-sourced-token",
             "file-sourced token must be injected (whitespace trimmed)"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "rotation test covers construction, unchanged reads, atomic replacement, and convergence"
+    )]
+    async fn projected_file_rotation_uses_new_snapshot_without_rebuilding_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "token-a\n").unwrap();
+        let yaml = format!(
+            "credentials:\n  - name: s\n    namespace: ns\n    key: k\n    file: {}",
+            path.display()
+        );
+        let f = parse(&yaml).unwrap();
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+
+        for _ in 0..8 {
+            let mut unchanged = crate::test_utils::make_filter_context(&req);
+            set_credential_metadata(&mut unchanged, "bearer_token", "s", "ns", "k");
+            drop(f.on_request(&mut unchanged).await.unwrap());
+        }
+
+        let mut first = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut first, "bearer_token", "s", "ns", "k");
+        drop(f.on_request(&mut first).await.unwrap());
+        assert_eq!(first.request_headers_to_set[0].1, "Bearer token-a");
+
+        // A projected Secret update replaces the complete file atomically.
+        let replacement = dir.path().join("token.next");
+        std::fs::write(&replacement, "token-b\n").unwrap();
+        std::fs::rename(replacement, &path).unwrap();
+
+        let mut second = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut second, "bearer_token", "s", "ns", "k");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                second.request_headers_to_set.clear();
+                drop(f.on_request(&mut second).await.unwrap());
+                if second.request_headers_to_set[0].1 == "Bearer token-b" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("projected credential watcher did not publish the replacement");
+        assert_eq!(second.request_headers_to_set[0].1, "Bearer token-b");
+    }
+
+    #[tokio::test]
+    async fn invalid_projected_replacement_fails_closed_without_secret_leak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "token-a\n").unwrap();
+        let yaml = format!(
+            "credentials:\n  - name: s\n    namespace: ns\n    key: k\n    file: {}",
+            path.display()
+        );
+        let f = parse(&yaml).unwrap();
+        std::fs::write(&path, "\n").unwrap();
+        let req = crate::test_utils::make_request(Method::POST, "/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        set_credential_metadata(&mut ctx, "bearer_token", "s", "ns", "k");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                ctx.request_headers_to_set.clear();
+                let action = f.on_request(&mut ctx).await.unwrap();
+                if matches!(action, FilterAction::Reject(rejection) if rejection.status == 503) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("invalid projected replacement was not observed");
+        assert!(ctx.request_headers_to_set.is_empty());
+    }
+
+    #[test]
+    fn authoritative_startup_reread_replaces_pre_watcher_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "token-b\n").unwrap();
+        let snapshot = initial_snapshot(&path, "s");
+        let watched = watched_file(path.clone(), "s", &snapshot);
+        std::fs::write(&path, "token-c\n").unwrap();
+
+        let handle = spawn_credential_watcher(vec![watched]).unwrap();
+        let current = snapshot.load_full();
+        assert_eq!(
+            current.credential.as_ref().unwrap().header_value.as_str(),
+            "Bearer token-c"
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn rescan_invalidates_all_credentials_and_later_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first");
+        let second_path = dir.path().join("second");
+        std::fs::write(&first_path, "token-a\n").unwrap();
+        std::fs::write(&second_path, "token-b\n").unwrap();
+        let first_snapshot = initial_snapshot(&first_path, "first");
+        let second_snapshot = initial_snapshot(&second_path, "second");
+        let watched = vec![
+            watched_file(first_path.clone(), "first", &first_snapshot),
+            watched_file(second_path.clone(), "second", &second_snapshot),
+        ];
+
+        std::fs::write(&first_path, "\n").unwrap();
+        process_watcher_event(&notify::Event::new(EventKind::Other), &watched);
+        assert!(first_snapshot.load().credential.is_none());
+        assert!(second_snapshot.load().credential.is_some());
+
+        std::fs::write(&first_path, "token-c\n").unwrap();
+        process_watcher_event(&notify::Event::new(EventKind::Other), &watched);
+        assert_eq!(
+            first_snapshot.load().credential.as_ref().unwrap().header_value.as_str(),
+            "Bearer token-c"
+        );
+    }
+
+    #[test]
+    fn watcher_shutdown_wakes_without_receive_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "token-a\n").unwrap();
+        let yaml = format!(
+            "credentials:\n  - name: s\n    namespace: ns\n    key: k\n    file: {}",
+            path.display()
+        );
+        let filter = parse(&yaml).unwrap();
+        let started = std::time::Instant::now();
+        drop(filter);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "watcher teardown should be woken immediately"
         );
     }
 
@@ -801,6 +1224,29 @@ mod tests {
     // -------------------------------------------------------------------------
     // Test Utilities
     // -------------------------------------------------------------------------
+
+    fn credential_reference(name: &str) -> CredentialRef {
+        CredentialRef {
+            name: name.to_owned(),
+            namespace: "ns".to_owned(),
+            key: "k".to_owned(),
+        }
+    }
+
+    fn initial_snapshot(path: &Path, name: &str) -> Arc<ArcSwap<CredentialSnapshot>> {
+        let reference = credential_reference(name);
+        Arc::new(ArcSwap::from_pointee(CredentialSnapshot {
+            credential: Some(resolve_file_credential(path.to_string_lossy().as_ref(), &reference).unwrap()),
+        }))
+    }
+
+    fn watched_file(path: PathBuf, name: &str, snapshot: &Arc<ArcSwap<CredentialSnapshot>>) -> WatchedCredential {
+        WatchedCredential {
+            path,
+            reference: credential_reference(name),
+            snapshot: Arc::clone(snapshot),
+        }
+    }
 
     fn parse(yaml: &str) -> Result<Box<dyn HttpFilter>, FilterError> {
         let val: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();

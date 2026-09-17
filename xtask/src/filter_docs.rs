@@ -314,7 +314,7 @@ fn parse_shared_config_items(root: &Path) -> ModuleItems {
     let mut items = ModuleItems::new();
     let praxis_root = root.join("../praxis");
     let dirs = if praxis_root.is_dir() {
-        vec![praxis_root.join("filter/src/builtins/http/payload_processing")]
+        vec![praxis_root.join("crates/filter/src/builtins/http/payload_processing")]
     } else {
         resolve_praxis_source_dirs()
     };
@@ -808,7 +808,8 @@ fn build_filter(items: &ModuleItems, name: &str, config_type: Option<&str>) -> F
     let description_doc = items
         .struct_docs
         .iter()
-        .find(|doc| !doc.is_empty())
+        .find(|doc| !extract_yaml_examples(doc).is_empty())
+        .or_else(|| items.struct_docs.iter().find(|doc| !doc.is_empty()))
         .or_else(|| items.module_docs.iter().find(|doc| !doc.is_empty()))
         .cloned()
         .unwrap_or_default();
@@ -2485,6 +2486,31 @@ mod tests {
             vec!["filter: module_filter\nanswer: 42".to_owned()],
             "module-level YAML examples should be rendered"
         );
+    }
+
+    #[test]
+    fn filter_description_prefers_the_struct_that_owns_a_yaml_example() {
+        let source = "
+            /// Unrelated public support type.
+            pub struct SupportType;
+
+            /// Security filter description.
+            ///
+            /// # YAML configuration
+            ///
+            /// ```yaml
+            /// filter: security_filter
+            /// mode: strict
+            /// ```
+            pub struct SecurityFilter;
+        ";
+        let file: syn::File = syn::parse_str(source).unwrap();
+        let mut items = ModuleItems::new();
+        parse_file_items(&file, &mut items);
+
+        let filter = build_filter(&items, "security_filter", None);
+
+        assert_eq!(filter.description, "Security filter description.");
     }
 
     #[test]

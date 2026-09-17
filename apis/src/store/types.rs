@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+use crate::StateOwner;
+
 // -----------------------------------------------------------------------------
 // ResponseRecord
 // -----------------------------------------------------------------------------
@@ -20,8 +22,8 @@ pub struct ResponseRecord {
     /// Unique response ID (e.g., `"resp_abc123"`).
     pub id: String,
 
-    /// Tenant ID for multi-tenant isolation.
-    pub tenant_id: String,
+    /// Immutable tenant-qualified resource owner.
+    pub owner: StateOwner,
 
     /// Unix timestamp when the response was created.
     pub created_at: i64,
@@ -52,12 +54,13 @@ pub struct ResponseRecord {
 /// conversation ID. The `messages` field is used by the rehydrate
 /// filter for multi-turn context; `metadata` and `created_at` are
 /// exposed via the `/v1/conversations` API.
+#[derive(Clone, Debug)]
 pub struct ConversationRecord {
     /// Conversation ID (e.g., `"conv_abc123"`).
     pub conversation_id: String,
 
-    /// Tenant ID for multi-tenant isolation.
-    pub tenant_id: String,
+    /// Immutable tenant-qualified resource owner.
+    pub owner: StateOwner,
 
     /// Unix timestamp when the conversation was created.
     ///
@@ -86,8 +89,8 @@ pub struct ConversationItemRecord {
     /// Unique item ID (e.g., `"item_abc123"`).
     pub item_id: String,
 
-    /// Tenant ID for multi-tenant isolation.
-    pub tenant_id: String,
+    /// Immutable owner inherited from the parent conversation.
+    pub owner: StateOwner,
 
     /// Parent conversation ID.
     pub conversation_id: String,

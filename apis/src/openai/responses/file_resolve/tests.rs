@@ -636,9 +636,14 @@ async fn mirrored_history_has_independent_inline_budget() {
     ctx.extensions.insert(state);
     let mut budget = client.resolution_budget();
 
-    resolve_state_history(&mut ctx, &client, OnMissing::Reject, None, &mut budget)
-        .await
-        .unwrap();
+    let request_headers = ctx.request.headers.clone();
+    let resolver = HistoryResolver {
+        client: &client,
+        on_missing: OnMissing::Reject,
+        request_headers: &request_headers,
+        url_resolver: None,
+    };
+    resolve_state_history(&mut ctx, resolver, &mut budget).await.unwrap();
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.messages[0]["content"][0]["file_data"], "aGlzdG9yeQ==");

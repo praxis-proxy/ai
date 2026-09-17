@@ -20,6 +20,12 @@ listeners:
 filter_chains:
   - name: conversations-pipeline
     filters:
+      # Standalone compatibility mode: all callers share one owner.
+      # Multi-user deployments should use a trusted owner mode instead.
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
       - filter: openai_conversations
         backend: sqlite
         # In-memory:

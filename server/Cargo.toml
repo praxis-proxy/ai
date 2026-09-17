@@ -29,6 +29,9 @@ http-callout-filter = ["praxis-ai-filters/http-callout-filter", "experimental"]
 azure-ad-filter = ["praxis-ai-filters/azure-ad-filter", "experimental"]
 # Experimental: the gcp_adc (GCP ADC) auth filter (see praxis-ai-filters).
 gcp-adc-filter = ["praxis-ai-filters/gcp-adc-filter", "experimental"]
+# Experimental: the released Praxis Basic Auth filter, which publishes
+# AuthenticatedIdentity for downstream filters.
+basic-auth-filter = ["praxis-filter/basic-auth-filter", "experimental"]
 # Experimental: the token_rate_limit filter (see praxis-ai-filters).
 token-rate-limit-filter = ["praxis-ai-filters/token-rate-limit-filter", "experimental"]
 # Marker feature activated transitively by any experimental feature.

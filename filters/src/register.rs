@@ -16,8 +16,8 @@ use crate::HttpCalloutFilter;
 use crate::TokenRateLimitFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
-    IntelligentRouteFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter, ProviderRouteFilter, Sigv4SignFilter,
-    TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
+    ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -111,6 +111,8 @@ fn register_gcp_filters(registry: &mut FilterRegistry) {
 
 /// Register general-purpose AI filters.
 fn register_general_ai_filters(registry: &mut FilterRegistry) {
+    register_state_owner(registry);
+    register_state_owner_headers(registry);
     #[cfg(feature = "http-callout-filter")]
     praxis_filter::register_filters!(
         @register registry,
@@ -123,6 +125,10 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "model_to_header" => ModelToHeaderFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "llmisvc_model_provider_resolver" => LlmisvcModelProviderResolverFilter::from_config
     );
     praxis_filter::register_filters!(
         @register registry,
@@ -236,6 +242,36 @@ fn register_openai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
         @register registry,
         http "openai_conversations" => praxis_ai_apis::openai::OpenaiConversationsFilter::from_config
     );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_operation" => praxis_ai_apis::openai::OpenaiOperationFilter::from_config
+    );
+}
+
+/// Register the trusted state owner adapter as security-critical.
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_state_owner(registry: &mut FilterRegistry) {
+    registry
+        .register_with_class(
+            "state_owner",
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(praxis_ai_apis::StateOwnerFilter::from_config)),
+            praxis_filter::SecurityClass::Security,
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'state_owner'"));
+}
+
+/// Register the destination-bound state-owner header projection as security-critical.
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_state_owner_headers(registry: &mut FilterRegistry) {
+    registry
+        .register_with_class(
+            "state_owner_headers",
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(
+                praxis_ai_apis::StateOwnerHeadersFilter::from_config,
+            )),
+            praxis_filter::SecurityClass::Security,
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'state_owner_headers'"));
 }
 
 /// Register OpenAI Responses API filters.
@@ -459,6 +495,9 @@ mod tests {
         let expected = [
             "ai_guardrails",
             "identity_header_guard",
+            "llmisvc_model_provider_resolver",
+            "state_owner",
+            "state_owner_headers",
             "openai_responses_validate",
             "responses_to_chat_completions",
             "a2a",

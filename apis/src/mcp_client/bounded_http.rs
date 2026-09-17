@@ -49,7 +49,8 @@ impl BoundedMcpHttpClient {
     }
 
     /// Wrap a pinned reqwest client for the control-plane exchanges performed
-    /// by [`list_tools`](super::list_tools): `initialize` and `tools/list`.
+    /// by [`list_tools_with_forwarded_headers`](super::list_tools_with_forwarded_headers):
+    /// `initialize` and `tools/list`.
     ///
     /// No `tools/call` result flows over this transport, so every response —
     /// JSON body, per-event SSE, and the session GET stream — is bounded to

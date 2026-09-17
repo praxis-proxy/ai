@@ -33,6 +33,9 @@ use crate::{openai::responses::openai_mcp_tool_resolve::encode_function_name, st
 /// Item type of a client-supplied approval decision.
 const APPROVAL_RESPONSE_TYPE: &str = "mcp_approval_response";
 
+/// Private tool-map field binding approvals to ambient connector identity.
+const FORWARDED_HEADERS_FINGERPRINT: &str = "_praxis_forwarded_headers_fingerprint";
+
 /// A parsed client-supplied `mcp_approval_response`.
 ///
 /// Carries only what the client legitimately supplies: the correlation id, the
@@ -154,8 +157,9 @@ pub(crate) fn parse_approval_response(response: &serde_json::Value) -> Result<Ap
 /// The decision is bound to the **complete** pending call the proxy recorded
 /// when it emitted the `mcp_approval_request`: that record's `(server_label,
 /// tool_name)` must resolve to exactly one entry in the current `tool_map`, and
-/// that entry's target identity (URL, headers, authorization, connector) must
-/// match the fingerprint captured when approval was requested. An unresolved
+/// that entry's target identity (URL, headers, authorization, connector, and
+/// forwarded request context) must match the fingerprint captured when approval
+/// was requested. An unresolved
 /// target, ambiguous encoding, missing fingerprint, or target-identity change
 /// fails closed so a stale, forged, or redirected response can never execute an
 /// unintended tool against an unapproved destination.
@@ -236,15 +240,16 @@ fn bind_target<'a>(
 /// Compute a stable, credential-safe fingerprint of a resolved MCP target.
 ///
 /// Binds an approval to the concrete destination resolved at approval time: the
-/// server URL, request headers, authorization credential, and connector id. On
-/// resume the proxy recomputes this from the *current* tool-map entry and
+/// server URL, request headers, authorization credential, connector id, and a
+/// digest of ambient headers forwarded to configured connectors. On resume the
+/// proxy recomputes this from the *current* tool-map entry and
 /// rejects the call if it differs, so a client cannot keep the approved
 /// `(server_label, tool_name)` while redirecting execution elsewhere or swapping
 /// credentials.
 ///
 /// A SHA-256 digest — not the raw fields — is emitted so the value is safe to
 /// embed in the client-visible, at-rest `mcp_approval_request`: it never
-/// discloses the authorization token, and it is deterministic across processes
+/// discloses the authorization token or trusted identity, and it is deterministic across processes
 /// (unlike the std hasher's per-process seed) so the request-time and
 /// resume-time computations agree. Fields are length-framed and headers are
 /// key-sorted so the digest is independent of JSON key ordering.
@@ -255,7 +260,12 @@ fn bind_target<'a>(
 /// produce a matchable fingerprint.
 pub(crate) fn target_fingerprint(entry: &serde_json::Value) -> String {
     let mut hasher = Sha256::new();
-    for field in ["server_url", "authorization", "connector_id"] {
+    for field in [
+        "server_url",
+        "authorization",
+        "connector_id",
+        FORWARDED_HEADERS_FINGERPRINT,
+    ] {
         hash_segment(&mut hasher, field.as_bytes());
         hash_segment(&mut hasher, &scalar_bytes(entry.get(field)));
     }
@@ -280,11 +290,54 @@ pub(crate) fn target_fingerprint(entry: &serde_json::Value) -> String {
             hash_segment(&mut hasher, &scalar_bytes(headers.get(key)));
         }
     }
-    let digest = hasher.finalize();
+    hex_digest(hasher.finalize())
+}
+
+/// Bind a connector tool-map entry to the exact ambient headers used for calls.
+///
+/// Only a digest is retained, so trusted identity values do not enter persisted
+/// continuation state. Direct client-selected URLs never receive ambient
+/// headers and therefore carry no binding.
+pub(crate) fn bind_forwarded_header_context(
+    entry: &mut serde_json::Value,
+    configured_names: &[http::HeaderName],
+    headers: &http::HeaderMap,
+) {
+    let connector = super::is_connector_tool_entry(entry);
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+    if connector {
+        object.insert(
+            FORWARDED_HEADERS_FINGERPRINT.to_owned(),
+            serde_json::Value::String(forwarded_header_fingerprint(configured_names, headers)),
+        );
+    } else {
+        object.remove(FORWARDED_HEADERS_FINGERPRINT);
+    }
+}
+
+/// Deterministically hash every reserved name and its optional wire values.
+fn forwarded_header_fingerprint(configured_names: &[http::HeaderName], headers: &http::HeaderMap) -> String {
+    let mut hasher = Sha256::new();
+    let mut names: Vec<_> = configured_names.iter().collect();
+    names.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    for name in names {
+        hash_segment(&mut hasher, name.as_str().as_bytes());
+        for value in headers.get_all(name) {
+            hash_segment(&mut hasher, value.as_bytes());
+        }
+    }
+    hex_digest(hasher.finalize())
+}
+
+/// Encode a SHA-256 digest as lowercase hexadecimal.
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    let digest = digest.as_ref();
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        hex.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
-        hex.push(char::from_digit(u32::from(byte & 0x0F), 16).unwrap_or('0'));
+        hex.push(char::from_digit(u32::from(*byte >> 4), 16).unwrap_or('0'));
+        hex.push(char::from_digit(u32::from(*byte & 0x0F), 16).unwrap_or('0'));
     }
     hex
 }

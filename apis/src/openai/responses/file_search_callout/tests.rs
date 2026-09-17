@@ -12,14 +12,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use praxis_filter::{BodyMode, FilterAction, HttpFilter};
+use praxis_filter::{BodyMode, FilterAction, HttpFilter, TrustedHeaderMutation};
 use serde_json::{Value, json};
 
 use super::{
     client::{
         ContentChunk, ContentChunkType, FileSearchClient, FileSearchClientConfig, MAX_CONCURRENT_SEARCHES,
         MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchResult, VectorStoreSearchRequest,
-        VectorStoreSearchResponse, request_error,
+        request_error,
     },
     config::{FileSearchFilterConfig, ValidatedConfig, build_config, build_config_with_client},
     *,
@@ -228,28 +228,18 @@ fn hybrid_ranking_translation_rejects_untranslatable_weights() {
 }
 
 #[test]
-fn search_response_requires_page_data_and_result_content() {
-    let response: VectorStoreSearchResponse = serde_json::from_value(json!({
-        "data": [{
-            "file_id": "file-a",
-            "filename": "a.txt",
-            "score": 0.5,
-            "content": []
-        }]
+fn search_result_requires_content() {
+    let response: SearchResult = serde_json::from_value(json!({
+        "file_id": "file-a",
+        "filename": "a.txt",
+        "score": 0.5,
+        "content": []
     }))
     .unwrap();
-    assert!(response.data[0].content.is_empty());
-    assert!(response.data[0].attributes.is_none());
-
+    assert!(response.content.is_empty());
+    assert!(response.attributes.is_none());
     assert!(
-        serde_json::from_value::<VectorStoreSearchResponse>(json!({})).is_err(),
-        "page data is required"
-    );
-    assert!(
-        serde_json::from_value::<VectorStoreSearchResponse>(json!({
-            "data": [{"file_id":"file-a","filename":"a.txt","score":0.5}]
-        }))
-        .is_err(),
+        serde_json::from_value::<SearchResult>(json!({"file_id":"file-a","filename":"a.txt","score":0.5})).is_err(),
         "result content is required"
     );
 }
@@ -449,6 +439,32 @@ fn continuation_header_replay_excludes_connection_nominated_headers() {
 
     assert!(connection_nominates_header(&headers, &nominated));
     assert!(!connection_nominates_header(&headers, &http::header::AUTHORIZATION));
+}
+
+#[test]
+fn callout_headers_apply_trusted_body_phase_overlay() {
+    let mut request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    request
+        .headers
+        .insert("x-auth-user", http::HeaderValue::from_static("raw-assertion"));
+    request
+        .headers
+        .insert("x-user-id", http::HeaderValue::from_static("spoofed-user"));
+    let request = Box::leak(Box::new(request));
+    let mut ctx = crate::test_utils::make_filter_context(request);
+    ctx.pre_read_mutations
+        .push(TrustedHeaderMutation::Remove(http::HeaderName::from_static(
+            "x-auth-user",
+        )));
+    ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(
+        http::HeaderName::from_static("x-user-id"),
+        http::HeaderValue::from_static("alice"),
+    ));
+
+    let headers = callout_request_headers(&ctx);
+
+    assert!(headers.get("x-auth-user").is_none());
+    assert_eq!(headers.get("x-user-id").unwrap(), "alice");
 }
 
 #[tokio::test]

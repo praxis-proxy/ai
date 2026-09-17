@@ -59,7 +59,8 @@ use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{error::responses_error_rejection, state::ResponsesState};
 use crate::{
     callout_policy::OnFailure,
-    store::{ResponseRecord, ResponseStoreRegistry},
+    state_owner::{StateOwner, require_state_owner},
+    store::{OwnerScopedResponseStore, ResponseRecord, ResponseStoreRegistry},
     subrequest::{self, SubRequest, SubRequestClient},
 };
 
@@ -329,13 +330,13 @@ impl CompactFilter {
         body: &Option<Bytes>,
     ) -> Result<FilterAction, FilterAction> {
         let req = parse_compact_request_body(body)?;
-        let (store, tenant_id) = resolve_store_and_tenant(ctx)?;
-        let messages = collect_compact_messages(&*store, &tenant_id, &req).await?;
+        let (store, owner) = resolve_store_and_owner(ctx)?;
+        let messages = collect_compact_messages(&store, &req).await?;
         let writer = CompactionWriter {
             filter: self,
             ctx,
-            store: &*store,
-            tenant_id: &tenant_id,
+            store: &store,
+            owner: &owner,
             req: &req,
             messages: &messages,
         };
@@ -617,17 +618,17 @@ fn parse_compact_input(input: Option<&Value>) -> Vec<Value> {
     }
 }
 
-/// Look up the store and tenant from the request context.
-fn resolve_store_and_tenant(
+/// Look up the store and immutable owner from the request context.
+fn resolve_store_and_owner(
     ctx: &HttpFilterContext<'_>,
-) -> Result<(std::sync::Arc<dyn crate::store::ResponseStore>, String), FilterAction> {
+) -> Result<(OwnerScopedResponseStore, StateOwner), FilterAction> {
+    let owner = require_state_owner(ctx)?.clone();
     let store = ctx
         .extensions
         .get::<ResponseStoreRegistry>()
-        .and_then(|r| r.get("default"))
+        .and_then(|r| r.get_scoped("default", &owner))
         .ok_or_else(|| reject_compact(500, "server_error", "response store not available"))?;
-    let tenant_id = ctx.get_metadata("responses.tenant_id").unwrap_or("default").to_owned();
-    Ok((store, tenant_id))
+    Ok((store, owner))
 }
 
 /// Assemble the conversation to compact from stored history and inline input.
@@ -635,13 +636,12 @@ fn resolve_store_and_tenant(
 /// When `previous_response_id` is set, its stored messages are loaded
 /// first and the inline `input` items are appended after.
 async fn collect_compact_messages(
-    store: &dyn crate::store::ResponseStore,
-    tenant_id: &str,
+    store: &OwnerScopedResponseStore,
     req: &ExplicitCompactRequest,
 ) -> Result<Vec<Value>, FilterAction> {
     let mut messages = Vec::new();
     if let Some(prev) = req.previous_response_id.as_deref() {
-        let record = fetch_response(store, tenant_id, prev).await?;
+        let record = fetch_response(store, prev).await?;
         messages.extend(stored_message_array(record.messages));
     }
     messages.extend(req.input.iter().cloned());
@@ -652,12 +652,8 @@ async fn collect_compact_messages(
 }
 
 /// Fetch a stored response by id.
-async fn fetch_response(
-    store: &dyn crate::store::ResponseStore,
-    tenant_id: &str,
-    response_id: &str,
-) -> Result<ResponseRecord, FilterAction> {
-    match store.get_response(tenant_id, response_id).await {
+async fn fetch_response(store: &OwnerScopedResponseStore, response_id: &str) -> Result<ResponseRecord, FilterAction> {
+    match store.get_response(response_id).await {
         Ok(Some(r)) => Ok(r),
         Ok(None) => Err(reject_compact(404, "not_found_error", "response not found")),
         Err(e) => {
@@ -683,9 +679,9 @@ struct CompactionWriter<'a> {
     /// Request context, used for id and timestamp generation.
     ctx: &'a HttpFilterContext<'a>,
     /// Response store the compaction record is persisted to.
-    store: &'a dyn crate::store::ResponseStore,
-    /// Tenant the record is scoped to.
-    tenant_id: &'a str,
+    store: &'a OwnerScopedResponseStore,
+    /// Immutable owner the record is scoped to.
+    owner: &'a StateOwner,
     /// The parsed explicit compact request (supplies the response model).
     req: &'a ExplicitCompactRequest,
     /// The conversation being compacted.
@@ -745,7 +741,7 @@ impl CompactionWriter<'_> {
 
         let record = ResponseRecord {
             id: resp_id,
-            tenant_id: self.tenant_id.to_owned(),
+            owner: self.owner.clone(),
             created_at,
             model: self.req.model.clone(),
             response_object: response_object.clone(),

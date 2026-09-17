@@ -59,8 +59,8 @@ use tracing::{debug, trace, warn};
 
 use super::{
     super::{
-        DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, append_stored_input_items,
-        compact::is_explicit_compact_request, error::responses_error_rejection, state::ResponsesState,
+        DEFAULT_STORE_NAME, append_stored_input_items, compact::is_explicit_compact_request,
+        error::responses_error_rejection, state::ResponsesState,
     },
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, StorageBackend, revalidate_postgres_host, validate_config},
@@ -70,6 +70,7 @@ use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
     openai::include::{IncludeFields, decode_query_component_strict, parse_include},
+    state_owner::{StateOwner, require_state_owner},
     store::{
         PendingApprovalRecord, PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry,
         SqliteResponseStore, StoreError,
@@ -228,21 +229,21 @@ impl ResponseStoreFilter {
     }
 
     /// Handle `DELETE /v1/responses/{id}` by deleting from the store.
-    async fn handle_delete(&self, tenant_id: &str, id: &str) -> Result<FilterAction, FilterError> {
+    async fn handle_delete(&self, owner: &StateOwner, id: &str) -> Result<FilterAction, FilterError> {
         let Some(store) = self.ensure_store().await else {
             return Ok(FilterAction::Reject(reject_store_error()));
         };
 
         let deleted = store
-            .delete_response(tenant_id, id)
+            .delete_response(owner, id)
             .await
             .map_err(|e| FilterError::from(format!("openai_response_store: delete failed: {e}")))?;
 
         if deleted {
-            debug!(id, tenant_id, "response deleted");
+            debug!(id, "response deleted");
             Ok(FilterAction::Reject(delete_success_rejection(id)?))
         } else {
-            debug!(id, tenant_id, "response not found for delete");
+            debug!(id, "response not found for delete");
             Ok(FilterAction::Reject(delete_not_found_rejection(id)))
         }
     }
@@ -287,20 +288,19 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let tenant_id = ctx
-            .get_metadata(TENANT_METADATA_KEY)
-            .unwrap_or(DEFAULT_TENANT_ID)
-            .to_owned();
-
-        let request_input = ctx
-            .remove_filter_state::<ResponseStoreRequestState>()
-            .map(|state| state.input);
+        let Some(capture) = ctx.extensions.remove::<ResponseStoreRequestState>() else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+        let Some(owner) = capture.owner else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+        let request_input = capture.input;
 
         // Capture the proxy-issued pending approvals before building the record;
         // the borrow is released before `build_record_from_state` re-borrows ctx.
         let pending_approvals = pending_approvals_from_ctx(ctx);
 
-        let Some(record) = build_record_from_state(ctx, &tenant_id, request_input) else {
+        let Some(record) = build_record_from_state(ctx, owner, request_input) else {
             trace!("skipping streaming persistence: no accumulated state");
             return Ok(FilterAction::Continue);
         };
@@ -318,19 +318,19 @@ impl ResponseStoreFilter {
         let Some((store, bytes)) = self.terminal_store_and_body(ctx, body) else {
             return Ok(FilterAction::Continue);
         };
-        let tenant_id = ctx
-            .get_metadata(TENANT_METADATA_KEY)
-            .unwrap_or(DEFAULT_TENANT_ID)
-            .to_owned();
-        let request_input = ctx
-            .remove_filter_state::<ResponseStoreRequestState>()
-            .map(|state| state.input);
+        let Some(capture) = ctx.extensions.remove::<ResponseStoreRequestState>() else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+        let Some(owner) = capture.owner else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+        let request_input = capture.input;
         let state_messages = ctx
             .extensions
             .get::<ResponsesState>()
             .map(|state| state.persisted_messages.clone());
         let pending_approvals = pending_approvals_from_ctx(ctx);
-        let Some(record) = parse_response_record(bytes, &tenant_id, request_input, state_messages) else {
+        let Some(record) = parse_response_record(bytes, owner, request_input, state_messages) else {
             return Ok(FilterAction::Continue);
         };
 
@@ -344,9 +344,32 @@ impl ResponseStoreFilter {
 // -----------------------------------------------------------------------------
 
 /// Request-phase data needed when persisting the response.
+#[derive(Default)]
 struct ResponseStoreRequestState {
     /// Original `input` value from the Responses API create request.
-    input: Value,
+    input: Option<Value>,
+    /// Owner captured before inference begins.
+    owner: Option<StateOwner>,
+}
+
+/// Capture the immutable owner once, before inference or a body-first consumer.
+fn capture_persistence_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterAction> {
+    if !request_will_persist_response(ctx) {
+        return Ok(());
+    }
+    let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
+    if state.owner.is_none() {
+        state.owner = Some(require_state_owner(ctx)?.clone());
+    }
+    ctx.extensions.insert(state);
+    Ok(())
+}
+
+/// Retain request input alongside the already captured owner.
+fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) {
+    let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
+    state.input = Some(input);
+    ctx.extensions.insert(state);
 }
 
 /// Fields extracted from the response JSON for the store record.
@@ -430,7 +453,7 @@ fn register_store_in_context(ctx: &HttpFilterContext<'_>, store: &Arc<dyn Respon
     // process has one default Responses store shared by listener pipelines.
     // If multi-store-per-instance support is added later, this registry key
     // must become config- or listener-scoped instead of "default".
-    if registry.get(DEFAULT_STORE_NAME).is_some() {
+    if registry.contains(DEFAULT_STORE_NAME) {
         return;
     }
     let name: Arc<str> = Arc::from(DEFAULT_STORE_NAME);
@@ -611,7 +634,7 @@ fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
 /// `None` for invalid JSON or missing required fields.
 fn parse_response_record(
     bytes: &[u8],
-    tenant_id: &str,
+    owner: StateOwner,
     request_input: Option<Value>,
     state_messages: Option<Vec<Value>>,
 ) -> Option<ResponseRecord> {
@@ -636,7 +659,7 @@ fn parse_response_record(
 
     Some(ResponseRecord {
         id: id.to_owned(),
-        tenant_id: tenant_id.to_owned(),
+        owner,
         created_at,
         model: model.to_owned(),
         response_object: json,
@@ -652,7 +675,7 @@ fn parse_response_record(
 /// are missing.
 pub(super) fn build_record_from_state(
     ctx: &HttpFilterContext<'_>,
-    tenant_id: &str,
+    owner: StateOwner,
     request_input: Option<Value>,
 ) -> Option<ResponseRecord> {
     let state = ctx.extensions.get::<ResponsesState>()?;
@@ -677,7 +700,7 @@ pub(super) fn build_record_from_state(
 
     Some(ResponseRecord {
         id: id.to_owned(),
-        tenant_id: tenant_id.to_owned(),
+        owner,
         created_at,
         model: model.to_owned(),
         response_object: json.clone(),
@@ -772,6 +795,10 @@ impl HttpFilter for ResponseStoreFilter {
         BodyMode::Stream
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "request routing and pre-inference owner capture remain one lifecycle hook"
+    )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if is_responses_format(ctx) && !is_streaming_request(ctx) {
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
@@ -788,10 +815,17 @@ impl HttpFilter for ResponseStoreFilter {
 
         if ctx.request.method == http::Method::DELETE {
             if let Some(id) = extract_response_id(ctx.request.uri.path()) {
-                let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-                return self.handle_delete(tenant_id, id).await;
+                let owner = match require_state_owner(ctx) {
+                    Ok(owner) => owner.clone(),
+                    Err(action) => return Ok(action),
+                };
+                return self.handle_delete(&owner, id).await;
             }
             return Ok(FilterAction::Continue);
+        }
+
+        if let Err(action) = capture_persistence_owner(ctx) {
+            return Ok(action);
         }
 
         if !should_init_store_for_request(ctx) {
@@ -819,10 +853,13 @@ impl HttpFilter for ResponseStoreFilter {
         if !end_of_stream || ctx.request.method != http::Method::POST {
             return Ok(FilterAction::Continue);
         }
+        if let Err(action) = capture_persistence_owner(ctx) {
+            return Ok(action);
+        }
         if !should_skip(ctx)
             && let Some(input) = extract_request_input(body)
         {
-            ctx.insert_filter_state(ResponseStoreRequestState { input });
+            capture_request_input(ctx, input);
         }
         if should_init_store_for_request(ctx) {
             match &self.get_or_init_store().await {
@@ -921,6 +958,10 @@ impl ResponseStoreFilter {
         clippy::cognitive_complexity,
         reason = "query validation adds one early-return branch"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "owner-scoped lookup and OpenAI response mapping are one handler"
+    )]
     async fn handle_get_response(&self, ctx: &HttpFilterContext<'_>, id: &str) -> FilterAction {
         if let Err(msg) = validate_get_response_query_params(ctx.request.uri.query()) {
             debug!(response_id = id, error = %msg, "invalid get-response query parameter");
@@ -931,10 +972,13 @@ impl ResponseStoreFilter {
             return FilterAction::Reject(reject_store_error());
         };
 
-        let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-        debug!(response_id = id, tenant_id, "retrieving stored response");
+        let owner = match require_state_owner(ctx) {
+            Ok(owner) => owner,
+            Err(action) => return action,
+        };
+        debug!(response_id = id, "retrieving stored response");
 
-        match store.get_response(tenant_id, id).await {
+        match store.get_response(owner, id).await {
             Ok(Some(record)) => {
                 let body = serde_json::to_vec(&record.response_object).unwrap_or_default();
                 FilterAction::Reject(
@@ -961,10 +1005,10 @@ impl ResponseStoreFilter {
             return Err(FilterAction::Reject(reject_store_error()));
         };
 
-        let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-        debug!(response_id = id, tenant_id, "retrieving input items");
+        let owner = require_state_owner(ctx)?;
+        debug!(response_id = id, "retrieving input items");
 
-        match store.get_response(tenant_id, id).await {
+        match store.get_response(owner, id).await {
             Ok(Some(r)) => Ok(r),
             Ok(None) => {
                 debug!(response_id = id, "response not found for input_items");

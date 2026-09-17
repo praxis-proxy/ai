@@ -1,0 +1,122 @@
+# OpenAI Operation Classifier
+#
+# Identifies supported OpenAI operations from the request head — method,
+# normalized path, and protocol headers — and publishes the result so a
+# pipeline can branch on a proxy-owned fact instead of a path prefix.
+#
+# The filter reads no request body and declares no buffering, so the
+# classification is available before any body-handling decision is made.
+#
+# Published per matched request:
+#   - a typed OpenAiOperationMatch in request extensions
+#   - metadata: openai_operation.application_protocol,
+#     openai_operation.operation_id
+#   - filter results: application_protocol, operation_id
+#   - headers: x-praxis-ai-application-protocol, x-praxis-ai-operation
+#
+# The application protocol is provider-qualified (openai_responses,
+# openai_conversations, ...) so one identifier space can describe every AI
+# application protocol the proxy classifies. This matches the cluster-side
+# `application_protocol` vocabulary in praxis-proxy/praxis#1106.
+#
+# Consuming the classification:
+#   The classifier runs in the header phase. Its headers are pending
+#   mutations applied when the request is forwarded, so the `router`
+#   filter — which matches the *downstream* request headers — does not
+#   see them in the same phase. Branch on the published filter results
+#   with `on_result`, which are visible immediately; downstream filters
+#   read the typed match from request extensions; the backend reads the
+#   forwarded headers.
+#
+# Anti-spoofing:
+#   Both headers are proxy-owned. On a match they are overwritten with the
+#   classifier's values; when nothing matches they are removed. A client
+#   cannot supply either name and have it survive to the backend. Header
+#   targets carrying authentication or framing state (authorization, host,
+#   content-length, ...) are rejected at config load, as is pointing both
+#   outputs at one header name.
+#
+# Unmatched requests are forwarded to the default backend unchanged apart
+# from the stripped headers. Whether they are rejected, sent to a fallback
+# backend, or handled some other way is a routing policy decision this
+# filter does not make.
+#
+# Example requests:
+#
+#   # classified openai_responses/createResponse -> responses backend
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Hello"}'
+#
+#   # classified openai_responses/Getinputtokencounts — a static endpoint,
+#   # not a response whose ID is "input_tokens"
+#   curl -X POST http://localhost:8080/v1/responses/input_tokens \
+#     -H "Content-Type: application/json" -d '{"model":"gpt-4.1"}'
+#
+#   # classified openai_conversations/getConversation -> conversations backend
+#   curl http://localhost:8080/v1/conversations/conv_123
+#
+#   # unsupported method: no operation matches, headers stripped,
+#   # falls through to the default backend
+#   curl -X PUT http://localhost:8080/v1/responses
+#
+#   # spoofing attempt: the supplied header is replaced, not honored
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "x-praxis-ai-application-protocol: openai_files" \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","input":"Hello"}'
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [operation-pipeline]
+
+filter_chains:
+  - name: operation-pipeline
+    filters:
+      # Classify from the request head. Header names are configurable;
+      # set either to null to publish metadata and results without a
+      # header.
+      - filter: openai_operation
+        headers:
+          application_protocol: x-praxis-ai-application-protocol
+          operation: x-praxis-ai-operation
+        # Branch on the published filter result, not on a path prefix.
+        # The Conversations family is served by its own backend; every
+        # other classified or unclassified request falls through.
+        branch_chains:
+          - name: conversations
+            on_result:
+              filter: openai_operation
+              key: application_protocol
+              result: openai_conversations
+            chains:
+              - name: conversations-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "conversations-backend"
+            rejoin: shared_load_balancer
+
+      # Default: anything that did not branch, classified or not.
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "responses-backend"
+
+      - name: shared_load_balancer
+        filter: load_balancer
+        clusters:
+          - name: "responses-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+          - name: "conversations-backend"
+            endpoints:
+              - "127.0.0.1:3002"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

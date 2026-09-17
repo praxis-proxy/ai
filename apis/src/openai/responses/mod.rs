@@ -150,10 +150,8 @@ impl io::Write for BoundedJsonCounter {
 /// per-request registry.
 pub(crate) const DEFAULT_STORE_NAME: &str = "default";
 
-/// Metadata key for tenant isolation.
-pub(crate) const TENANT_METADATA_KEY: &str = "responses.tenant_id";
-
-/// Fallback tenant ID when no tenant metadata is present.
+/// Legacy test tenant value retained for fixture compatibility.
+#[cfg(test)]
 pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 
 // -----------------------------------------------------------------------------

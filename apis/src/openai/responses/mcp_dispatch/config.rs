@@ -44,6 +44,14 @@ pub(crate) struct McpDispatchConfig {
     #[serde(default)]
     pub allow_loopback: bool,
 
+    /// Trusted request headers forwarded to connector-backed MCP `tools/call` requests.
+    /// No request headers are forwarded by default. Credential headers such as
+    /// `authorization` are rejected because MCP destinations are client-selected;
+    /// use the MCP tool entry's dedicated `authorization` field instead. Direct,
+    /// client-selected `server_url` targets never receive ambient request headers.
+    #[serde(default)]
+    pub forward_headers: Vec<String>,
+
     /// Per-call timeout in milliseconds for `tools/call` calls.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
@@ -95,7 +103,9 @@ fn default_max_total_result_bytes() -> usize {
     clippy::too_many_lines,
     reason = "related call, concurrency, and retained-byte invariants are validated together"
 )]
-pub(crate) fn build_config(cfg: McpDispatchConfig) -> Result<McpDispatchConfig, FilterError> {
+pub(crate) fn build_config(mut cfg: McpDispatchConfig) -> Result<McpDispatchConfig, FilterError> {
+    crate::openai::api_client::validate_forward_headers("openai_mcp_dispatch", &mut cfg.forward_headers)?;
+    reject_mcp_sensitive_forward_headers("openai_mcp_dispatch", &cfg.forward_headers)?;
     if cfg.timeout_ms == 0 {
         return Err("openai_mcp_dispatch: timeout_ms must be greater than 0".into());
     }
@@ -141,4 +151,20 @@ pub(crate) fn build_config(cfg: McpDispatchConfig) -> Result<McpDispatchConfig, 
         );
     }
     Ok(cfg)
+}
+
+/// Reject ambient credentials and protocol-controlled fields at MCP's
+/// client-selected destination boundary.
+fn reject_mcp_sensitive_forward_headers(filter: &str, headers: &[String]) -> Result<(), FilterError> {
+    for configured in headers {
+        let name = http::HeaderName::from_bytes(configured.as_bytes())
+            .map_err(|error| -> FilterError { format!("{filter}: invalid forward header: {error}").into() })?;
+        if crate::mcp_client::is_blocked_mcp_header(&name) {
+            return Err(format!(
+                "{filter}: 'forward_headers' must not include credential or MCP-controlled header '{name}'"
+            )
+            .into());
+        }
+    }
+    Ok(())
 }

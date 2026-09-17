@@ -70,18 +70,23 @@ fn file_search_callout_example_runs_model_search_model_round_trip() {
         (200, first_model_response.to_string()),
         (200, final_model_response.to_string()),
     ]);
-    let search = start_capturing_backend(
-        &json!({
-            "data": [{
-                "file_id": "file-q4",
-                "filename": "q4-results.txt",
-                "score": 0.99,
-                "content": [{"type": "text", "text": "Q4 revenue was $42 million."}],
-                "attributes": null
-            }]
+    let mut search_results = vec![json!({
+        "file_id": "file-q4",
+        "filename": "q4-results.txt",
+        "score": 0.99,
+        "content": [{"type": "text", "text": "Q4 revenue was $42 million."}],
+        "attributes": null
+    })];
+    search_results.extend((0..10_000).map(|index| {
+        json!({
+            "file_id": format!("file-noise-{index}"),
+            "filename": "noise.txt",
+            "score": 0.01,
+            "content": []
         })
-        .to_string(),
-    );
+    }));
+    let high_cardinality_search_response = json!({"data": search_results}).to_string();
+    let search = start_capturing_backend(&high_cardinality_search_response);
     let proxy_port = free_port();
     let config = load_file_search_callout_config(
         proxy_port,
@@ -108,6 +113,7 @@ fn file_search_callout_example_runs_model_search_model_round_trip() {
     assert_eq!(response["output"][0]["type"], "file_search_call");
     assert_eq!(response["output"][0]["status"], "completed");
     assert_eq!(response["output"][0]["results"][0]["file_id"], "file-q4");
+    assert_eq!(response["output"][0]["results"].as_array().map(Vec::len), Some(10));
     assert_eq!(response["output"][1]["type"], "message");
     assert_eq!(
         response["output"][1]["content"][0]["text"],

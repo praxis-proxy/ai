@@ -135,6 +135,7 @@ fn remove_request_headers(names: &[String], ctx: &mut HttpFilterContext<'_>) {
             continue;
         }
         if let Ok(header_name) = http::HeaderName::try_from(name.as_str()) {
+            begin_ordered_pre_read_mutations(ctx);
             ctx.request_headers_to_remove.push(header_name.clone());
             ctx.pre_read_mutations.push(TrustedHeaderMutation::Remove(header_name));
         }
@@ -156,6 +157,10 @@ fn set_request_headers(headers: &[HeaderValueOption], ctx: &mut HttpFilterContex
 }
 
 /// Route a single request header mutation to the correct context queue.
+#[expect(
+    clippy::too_many_lines,
+    reason = "append-action variants each preserve ordered pre-read provenance"
+)]
 fn dispatch_request_header(
     hvo: &HeaderValueOption,
     hv: &HeaderValue,
@@ -169,6 +174,7 @@ fn dispatch_request_header(
     match resolve_append_action(hvo) {
         HeaderAppendAction::OverwriteIfExistsOrAdd => {
             if let Ok(v) = http::HeaderValue::try_from(&value) {
+                begin_ordered_pre_read_mutations(ctx);
                 ctx.request_headers_to_set.push((name.clone(), v.clone()));
                 ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(name, v));
             }
@@ -177,22 +183,63 @@ fn dispatch_request_header(
             if ctx.request.headers.contains_key(&name)
                 && let Ok(v) = http::HeaderValue::try_from(&value)
             {
+                begin_ordered_pre_read_mutations(ctx);
                 ctx.request_headers_to_set.push((name.clone(), v.clone()));
                 ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(name, v));
             }
         },
         HeaderAppendAction::AddIfAbsent => {
             if !ctx.request.headers.contains_key(&name) {
+                begin_ordered_pre_read_mutations(ctx);
                 ctx.extra_request_headers
                     .push((Cow::Owned(hv.key.clone()), value.clone()));
                 ctx.pre_read_mutations.push(TrustedHeaderMutation::Add(name, value));
             }
         },
         HeaderAppendAction::AppendIfExistsOrAdd => {
+            begin_ordered_pre_read_mutations(ctx);
             ctx.extra_request_headers
                 .push((Cow::Owned(hv.key.clone()), value.clone()));
             ctx.pre_read_mutations.push(TrustedHeaderMutation::Add(name, value));
         },
+    }
+}
+
+/// Preserve earlier legacy body mutations before activating ordered mode.
+///
+/// Core treats a non-empty ordered log as authoritative for the entire
+/// pre-read pass. Seed it from the grouped queues before the first ext-proc
+/// mutation so filters that ran earlier are not silently discarded.
+///
+/// This does not make later legacy producers composable with ordered mode;
+/// ext-proc already activated that mode before this bridge existed. Unifying
+/// the two mutation APIs is owned by Praxis Core issue #1072. This bridge is
+/// deliberately limited to retaining mutations that are knowable when
+/// ext-proc crosses the existing ordered-mode boundary.
+pub(crate) fn begin_ordered_pre_read_mutations(ctx: &mut HttpFilterContext<'_>) {
+    if !ctx.pre_read_mutations.is_empty() {
+        return;
+    }
+    ctx.pre_read_mutations.extend(
+        ctx.request_headers_to_remove
+            .iter()
+            .cloned()
+            .map(TrustedHeaderMutation::Remove),
+    );
+    ctx.pre_read_mutations.extend(
+        ctx.request_headers_to_set
+            .iter()
+            .cloned()
+            .map(|(name, value)| TrustedHeaderMutation::Set(name, value)),
+    );
+    for (name, value) in &ctx.extra_request_headers {
+        if let (Ok(name), Ok(_value)) = (
+            http::HeaderName::from_bytes(name.as_bytes()),
+            http::HeaderValue::from_str(value),
+        ) {
+            ctx.pre_read_mutations
+                .push(TrustedHeaderMutation::Add(name, value.clone()));
+        }
     }
 }
 

@@ -9,6 +9,8 @@ Resolves MCP tool entries from the Responses API `tools` array into concrete too
 
 Rejects the request with HTTP 400 before any callouts if two or more resolvable MCP entries share the same `server_label` (including entries that differ only by credentials).
 
+Configured `connector_id` entries with `defer_loading: true` are accepted when the request also includes a `tool_search` tool. Those entries are resolved to an internal endpoint without an eager `tools/list` call; `connector_id`, the configured URL, and credentials are stripped from the outbound body. Deferred loading requires `openai_mcp_dispatch` inside an agentic loop. The first inference round keeps a sanitized `type: mcp` stub plus `tool_search` (an OpenAI-shaped hosted-tool backend); any later `tool_search_call` loads every pending deferred connector.
+
 For streaming requests, a runtime or response-processing failure from `tools/list` is returned as a successful SSE transport containing `response.mcp_list_tools.failed` and a terminal `response.failed` event. Local policy failures such as SSRF blocking remain HTTP error responses.
 
 On successful discovery, one `mcp_list_tools` output item per resolved server (in request order, including servers that resolve to zero tools) is seeded into `ResponsesState` for a downstream response-finalizing filter to surface: a buffered finalizer (`openai_agentic_loop` or `openai_mcp_dispatch`) lists it in `output`, and `openai_stream_events`, when placed inside the agentic loop on the streaming path, synthesizes its `output_item.added` → `mcp_list_tools.in_progress` → `mcp_list_tools.completed` → `output_item.done` lifecycle ahead of the model output. Unlike the failure lifecycle above — which this filter emits itself as a terminal SSE — a successful discovery must still proceed to inference, so it cannot be surfaced without one of those downstream filters; the minimal `mcp-tool-resolve.yaml` example therefore demonstrates resolution and the failure lifecycle only (see `agentic-loop.yaml` for a pipeline that surfaces successful listings). A previous-response cache hit surfaces the same item without re-calling `tools/list`, and internal retries reuse the item and its id rather than emitting a second discovery.
@@ -17,6 +19,7 @@ On successful discovery, one `mcp_list_tools` output item per resolved server (i
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
+| `forward_headers` | string[] | no | Trusted request headers forwarded to connector-backed MCP `initialize` and `tools/list` requests. No request headers are forwarded by default. Credential headers such as `authorization` are rejected because MCP destinations are client-selected; use the MCP tool entry's dedicated `authorization` field instead. Direct, client-selected `server_url` targets never receive ambient request headers. |
 | `max_rewritten_body_bytes` | integer | no | Maximum size in bytes of the request body this filter *produces* after expanding `mcp` tool entries into `function` entries. Raw request body size is governed by the pipeline's `body_limits`, not this field. This bounds only the post-expansion body, which can grow larger than the raw input. |
 | `timeout_ms` | integer | no | Per-server timeout in milliseconds for `tools/list` calls. |
 | `max_servers` | integer | no | Maximum number of distinct MCP servers per request. |
@@ -38,7 +41,13 @@ filter: openai_mcp_tool_resolve
 
 ```yaml
 filter: openai_mcp_tool_resolve
+forward_headers:
+  - x-tenant-id
+  - x-user-id
 timeout_ms: 5000
 max_rewritten_body_bytes: 67108864
 max_tools: 128
+connectors:
+  - id: corp_drive
+    server_url: https://drive-mcp.internal/mcp
 ```

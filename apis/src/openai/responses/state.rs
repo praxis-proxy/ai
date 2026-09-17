@@ -10,7 +10,11 @@
 //!
 //! [`RequestExtensions`]: praxis_filter::RequestExtensions
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    fmt,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
@@ -285,6 +289,16 @@ pub(crate) struct ResponsesState {
     /// `openai_agentic_loop` at the start of each new inference round.
     pub iteration: u32,
 
+    /// Configured MCP connectors waiting for `tool_search` discovery.
+    ///
+    /// Populated by `openai_mcp_tool_resolve` when a request uses
+    /// `connector_id` with `defer_loading: true`. Consumed by
+    /// `openai_mcp_dispatch` on a later `tool_search_call` to load
+    /// definitions from the internally resolved endpoint. Holds the
+    /// pipeline-local URL and credentials; never serialized to the
+    /// inference backend, client responses, or persisted records.
+    pub deferred_mcp: Vec<DeferredMcpConnector>,
+
     /// Maximum number of built-in tool invocations.
     ///
     /// Enforced by built-in tool filters across retained output.
@@ -323,6 +337,10 @@ pub(crate) struct ResponsesState {
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
     pub messages: Vec<serde_json::Value>,
+
+    /// Number of leading messages already persisted by a provider-owned
+    /// conversation. Internal continuations send only the remaining delta.
+    pub provider_history_len: usize,
 
     /// Whether tool calls may execute concurrently within an
     /// iteration. Defaults to `true` per the API spec.
@@ -425,6 +443,13 @@ pub(crate) struct ResponsesState {
     /// duplicate dispatch.
     pub tool_calls: Vec<serde_json::Value>,
 
+    /// `tool_search_call` items from the current inference response.
+    ///
+    /// Cleared by `openai_agentic_loop` at the start of each iteration.
+    /// `openai_mcp_dispatch` consumes these to load deferred connector
+    /// tools before the next inference round.
+    pub tool_search_calls: Vec<serde_json::Value>,
+
     /// Web search calls from the current inference response only.
     ///
     /// Cleared by `openai_agentic_loop` at the start of each iteration.
@@ -474,6 +499,18 @@ pub(crate) struct ResponsesState {
     /// trace. `openai_agentic_loop` writes model items, `mcp_dispatch`
     /// writes `mcp_call` and `mcp_approval_request` items.
     pub accumulated_output: Vec<serde_json::Value>,
+
+    /// Aggregate wire bytes `openai_stream_events` has charged against its
+    /// accumulation budget across every IRR round of this request.
+    ///
+    /// Request-wide (not per-round) because the memory it bounds —
+    /// [`Self::accumulated_output`], [`Self::emitted_output_items`], and the
+    /// terminal snapshot — persists across rounds: resetting the counter each
+    /// round would let a multi-round stream accumulate unbounded state while no
+    /// single round trips the cap. Monotonically non-decreasing, so once the
+    /// budget is exceeded the stream stays failed closed. A fixed `usize`, so it
+    /// contributes nothing meaningful to `max_state_bytes`.
+    pub stream_accumulated_bytes: usize,
 
     /// Client-visible lifecycle progress of output items, keyed by item id.
     ///
@@ -584,6 +621,62 @@ pub(crate) struct EmittedItem {
     pub content_digest: u64,
 }
 
+/// Internally resolved MCP connector waiting for deferred discovery.
+#[derive(Clone)]
+pub(crate) struct DeferredMcpConnector {
+    /// Allow loopback MCP endpoints for this listing.
+    pub allow_loopback: bool,
+
+    /// Request `authorization` forwarded to the MCP endpoint.
+    pub authorization: Option<String>,
+
+    /// Original `allowed_tools` filter from the request entry.
+    pub allowed_tools: Option<serde_json::Value>,
+
+    /// Pipeline-local connector identifier from the request.
+    pub connector_id: String,
+
+    /// Request `headers` forwarded to the MCP endpoint.
+    pub headers: Option<serde_json::Value>,
+
+    /// Maximum size of the provider-visible body after deferred expansion.
+    pub max_rewritten_body_bytes: usize,
+
+    /// Maximum tools accepted from a single `tools/list` response.
+    pub max_tools: usize,
+
+    /// Request `require_approval` policy preserved for later dispatch.
+    pub require_approval: Option<serde_json::Value>,
+
+    /// Public server label used in function-name encoding and dispatch.
+    pub server_label: String,
+
+    /// Configured MCP endpoint URL. Never written to backend requests,
+    /// client-visible responses, logs, or persisted response state.
+    pub server_url: String,
+
+    /// Per-server timeout for the deferred `tools/list` call.
+    pub timeout: Duration,
+}
+
+impl fmt::Debug for DeferredMcpConnector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeferredMcpConnector")
+            .field("allow_loopback", &self.allow_loopback)
+            .field("authorization", &self.authorization.as_ref().map(|_| "<redacted>"))
+            .field("allowed_tools", &self.allowed_tools)
+            .field("connector_id", &self.connector_id)
+            .field("headers", &self.headers.as_ref().map(|_| "<redacted>"))
+            .field("max_rewritten_body_bytes", &self.max_rewritten_body_bytes)
+            .field("max_tools", &self.max_tools)
+            .field("require_approval", &self.require_approval)
+            .field("server_label", &self.server_label)
+            .field("server_url", &"<redacted>")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
 /// Whether the proxy can preserve the original request bytes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum RequestBodyRebuild {
@@ -609,12 +702,14 @@ impl Default for ResponsesState {
             history_rehydrated: false,
             input: Vec::new(),
             iteration: 0,
+            deferred_mcp: Vec::new(),
             max_tool_calls: None,
             mcp_approval_state: McpApprovalState::None,
             deferred_tool_limit_completion: false,
             deferred_stream_done: false,
             mcp_tool_map: HashMap::new(),
             messages: Vec::new(),
+            provider_history_len: 0,
             parallel_tool_calls: true,
             persisted_messages: Vec::new(),
             pending_approvals: Vec::new(),
@@ -631,6 +726,7 @@ impl Default for ResponsesState {
             response_object: serde_json::Value::Null,
             local_completion_response_template: serde_json::Value::Null,
             tool_calls: Vec::new(),
+            tool_search_calls: Vec::new(),
             web_search_calls: Vec::new(),
             web_search_calls_executed: 0,
             file_search_assignments: Vec::new(),
@@ -638,6 +734,7 @@ impl Default for ResponsesState {
             tools: Vec::new(),
             usage: serde_json::Value::Null,
             accumulated_output: Vec::new(),
+            stream_accumulated_bytes: 0,
             emitted_output_items: HashMap::new(),
             locally_executed_output_items: HashSet::new(),
             pending_local_tool_synthesis: Vec::new(),
@@ -665,6 +762,7 @@ impl ResponsesState {
             input: messages.clone(),
             max_tool_calls: extract_u32(&body, "max_tool_calls"),
             messages,
+            provider_history_len: 0,
             parallel_tool_calls: extract_bool_or(&body, "parallel_tool_calls", true),
             persisted_messages,
             previous_response_id: extract_string(&body, "previous_response_id"),
@@ -890,6 +988,27 @@ fn current_round_tool_call_admissions_by<'a>(
         }
     }
     admissions
+}
+
+/// Whether a queued hosted `tool_search_call` may still consume built-in budget.
+///
+/// Deferred connector discovery is the server-side execution of that search, so
+/// it must not run `tools/list` or start another inference round after
+/// `max_tool_calls` is exhausted. An omitted limit leaves discovery allowed.
+/// When the current round's output is not yet replayable, remaining prior-round
+/// budget is the admission signal.
+pub(crate) fn tool_search_discovery_is_within_budget(state: &ResponsesState) -> bool {
+    let Some(max) = state.max_tool_calls else {
+        return true;
+    };
+    let remaining = usize::try_from(max)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(consumed_builtin_tool_calls_before_current_round(state));
+    if remaining == 0 {
+        return false;
+    }
+    let admissions = current_round_tool_call_admissions(state, &state.tool_search_calls);
+    admissions.is_empty() || admissions.into_iter().any(|admitted| admitted)
 }
 
 /// Normalize the `input` field into a message array.
@@ -1280,6 +1399,47 @@ mod tests {
     }
 
     #[test]
+    fn tool_search_discovery_rejects_exhausted_budget() {
+        let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
+        let exhausted = ResponsesState {
+            max_tool_calls: Some(0),
+            tool_search_calls: vec![search.clone()],
+            ..ResponsesState::default()
+        };
+        assert!(
+            !tool_search_discovery_is_within_budget(&exhausted),
+            "a zero remaining budget must not admit deferred tools/list"
+        );
+
+        let admitted = ResponsesState {
+            max_tool_calls: Some(1),
+            tool_search_calls: vec![search],
+            ..ResponsesState::default()
+        };
+        assert!(
+            tool_search_discovery_is_within_budget(&admitted),
+            "the first admitted hosted search may still list deferred connectors"
+        );
+    }
+
+    #[test]
+    fn tool_search_discovery_follows_current_round_admission_order() {
+        let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
+        let web = json!({"type": "web_search_call", "id": "ws_1", "status": "completed"});
+        let displaced = ResponsesState {
+            max_tool_calls: Some(1),
+            accumulated_output: vec![web.clone(), search.clone()],
+            response_object: json!({"output": [web, search.clone()]}),
+            tool_search_calls: vec![search],
+            ..ResponsesState::default()
+        };
+        assert!(
+            !tool_search_discovery_is_within_budget(&displaced),
+            "an earlier current-round built-in call consumes the shared cap first"
+        );
+    }
+
+    #[test]
     fn current_provider_execution_does_not_double_charge_round_admission() {
         let web_first = json!({"type":"web_search_call", "id":"ws_current", "status":"completed"});
         let web_second = json!({"type":"web_search_call", "id":"ws_second", "status":"completed"});
@@ -1359,40 +1519,43 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::cognitive_complexity,
-        clippy::too_many_lines,
-        reason = "exhaustive one-assert-per-field check of every default value"
-    )]
     fn default_produces_expected_values() {
         let state = ResponsesState::default();
         assert!(state.context_management.is_none());
         assert!(state.conversation.is_none());
-        assert!(state.include.is_empty());
-        assert!(state.input.is_empty());
         assert_eq!(state.iteration, 0);
         assert!(state.max_tool_calls.is_none());
-        assert!(state.mcp_tool_map.is_empty());
-        assert!(state.messages.is_empty());
-        assert!(state.output_items().is_empty());
         assert!(state.parallel_tool_calls);
         assert!(state.persisted_messages.is_empty());
         assert!(!state.store_persist_armed);
         assert!(state.previous_response_id.is_none());
-        assert!(state.previous_tools.is_empty());
         assert!(state.previous_usage.is_none());
         assert!(state.request_body.is_null());
         assert!(state.response_object.is_null());
-        assert!(state.tool_calls.is_empty());
-        assert!(state.web_search_calls.is_empty());
         assert_eq!(state.web_search_calls_executed, 0);
         assert!(
             state.file_search_assignments.is_empty(),
             "file-search assignments must start empty"
         );
         assert_eq!(state.tool_choice, json!("auto"));
-        assert!(state.tools.is_empty());
         assert!(state.usage.is_null());
+    }
+
+    #[test]
+    fn default_produces_empty_collections() {
+        let state = ResponsesState::default();
+        assert!(state.include.is_empty());
+        assert!(state.input.is_empty());
+        assert!(state.mcp_tool_map.is_empty());
+        assert!(state.messages.is_empty());
+        assert!(state.output_items().is_empty());
+        assert!(state.persisted_messages.is_empty());
+        assert!(state.previous_tools.is_empty());
+        assert!(state.tool_calls.is_empty());
+        assert!(state.tool_search_calls.is_empty());
+        assert!(state.deferred_mcp.is_empty());
+        assert!(state.web_search_calls.is_empty());
+        assert!(state.tools.is_empty());
         assert!(state.accumulated_output.is_empty());
         assert!(state.emitted_output_items.is_empty());
         assert!(state.locally_executed_output_items.is_empty());

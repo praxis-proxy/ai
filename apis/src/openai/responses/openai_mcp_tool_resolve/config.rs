@@ -53,6 +53,15 @@ pub(crate) struct ConnectorConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpToolResolveConfig {
+    /// Trusted request headers forwarded to connector-backed MCP `initialize`
+    /// and `tools/list` requests.
+    /// No request headers are forwarded by default. Credential headers such as
+    /// `authorization` are rejected because MCP destinations are client-selected;
+    /// use the MCP tool entry's dedicated `authorization` field instead. Direct,
+    /// client-selected `server_url` targets never receive ambient request headers.
+    #[serde(default)]
+    pub forward_headers: Vec<String>,
+
     /// Maximum size in bytes of the request body this filter *produces*
     /// after expanding `mcp` tool entries into `function` entries.
     ///
@@ -107,7 +116,9 @@ fn default_max_tools() -> usize {
 }
 
 /// Validate the parsed configuration.
-pub(crate) fn build_config(cfg: McpToolResolveConfig) -> Result<McpToolResolveConfig, FilterError> {
+pub(crate) fn build_config(mut cfg: McpToolResolveConfig) -> Result<McpToolResolveConfig, FilterError> {
+    crate::openai::api_client::validate_forward_headers("openai_mcp_tool_resolve", &mut cfg.forward_headers)?;
+    reject_mcp_sensitive_forward_headers(&cfg.forward_headers)?;
     validate_size_limit(
         "openai_mcp_tool_resolve",
         "max_rewritten_body_bytes",
@@ -124,6 +135,23 @@ pub(crate) fn build_config(cfg: McpToolResolveConfig) -> Result<McpToolResolveCo
     }
     validate_connectors(&cfg.connectors)?;
     Ok(cfg)
+}
+
+/// Reject ambient credentials and protocol-controlled fields at MCP's
+/// client-selected destination boundary.
+fn reject_mcp_sensitive_forward_headers(headers: &[String]) -> Result<(), FilterError> {
+    for configured in headers {
+        let name = http::HeaderName::from_bytes(configured.as_bytes()).map_err(|error| -> FilterError {
+            format!("openai_mcp_tool_resolve: invalid forward header: {error}").into()
+        })?;
+        if crate::mcp_client::is_blocked_mcp_header(&name) {
+            return Err(format!(
+                "openai_mcp_tool_resolve: 'forward_headers' must not include credential or MCP-controlled header '{name}'"
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Validate connector configuration entries.
