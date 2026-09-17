@@ -447,6 +447,10 @@ impl McpToolResolveFilter {
     /// across all entries sharing this resolution task; it is passed
     /// to [`find_cached_listing`] so the cache is only used when it
     /// covers every entry in the group.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "callout threads the per-request MCP subrequest executor through per-entry resolution"
+    )]
     async fn resolve_entry(
         &self,
         entry: &serde_json::Value,

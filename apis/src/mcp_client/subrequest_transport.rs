@@ -280,8 +280,10 @@ pub(crate) fn build_bare_outbound_pipeline(allow_private: bool) -> Result<Arc<Fi
 /// outbound [`FilterPipeline`] the chain-binding MCP filter resolved at build
 /// time. Both `openai_mcp_tool_resolve` and `openai_mcp_dispatch` construct one
 /// of these per request via [`from_context`](Self::from_context) and thread it
-/// down to [`list_tools`](super::list_tools)/[`call_tool`](super::call_tool),
-/// which build an [`McpSubrequestClient`] from it.
+/// down to
+/// [`list_tools_with_forwarded_headers`](super::list_tools_with_forwarded_headers)/
+/// [`call_tool_with_forwarded_headers`](super::call_tool_with_forwarded_headers), which build an
+/// [`McpSubrequestClient`] from it.
 ///
 /// It deliberately does *not* fabricate a fresh connector or a default runtime:
 /// the callout must share the server's connection pool and carry the originating
@@ -424,7 +426,8 @@ pub(crate) struct McpSubrequestClient {
 
 impl McpSubrequestClient {
     /// Build a client for the control-plane exchanges performed by
-    /// [`list_tools`](super::list_tools): `initialize` and `tools/list`.
+    /// [`list_tools_with_forwarded_headers`](super::list_tools_with_forwarded_headers):
+    /// `initialize` and `tools/list`.
     ///
     /// No `tools/call` result flows over this transport, so every response is
     /// bounded to [`MAX_CONTROL_RESPONSE_BYTES`] before deserialization.
@@ -432,9 +435,11 @@ impl McpSubrequestClient {
         Self::with_wire_cap(callout, step_timeout, MAX_CONTROL_RESPONSE_BYTES)
     }
 
-    /// Build a client for [`call_tool`](super::call_tool): `initialize` uses the
-    /// control ceiling and the `tools/call` response is bounded to the configured
-    /// `max_result_bytes` cap, expanded for worst-case JSON string escaping.
+    /// Build a client for
+    /// [`call_tool_with_forwarded_headers`](super::call_tool_with_forwarded_headers):
+    /// `initialize` uses the control ceiling and the `tools/call` response is
+    /// bounded to the configured `max_result_bytes` cap, expanded for worst-case
+    /// JSON string escaping.
     ///
     /// `step_timeout` bounds each individual HTTP exchange; the `callout` carries
     /// the parent transport and the bound outbound pipeline whose finalized
