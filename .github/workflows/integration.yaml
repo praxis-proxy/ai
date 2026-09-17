@@ -234,18 +234,64 @@ jobs:
           test -x "$CODEX_BIN"
           test "$("./$CODEX_BIN" --version)" = "codex-cli 0.144.1"
 
-      - name: Run pinned Codex HTTP acceptance test
+      - name: Build pinned Codex HTTP acceptance test
         env:
           PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           test -x "$PRAXIS_TEST_CODEX_BIN"
-          unshare --user --map-root-user --net -- bash -c '
+          cargo test -p praxis-tests-integration --test suite --no-run
+
+      - name: Run pinned Codex HTTP acceptance test without external network access
+        env:
+          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
+        run: |
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          runner_home="$HOME"
+          runner_cargo_home="$CARGO_HOME"
+          runner_path="$PATH"
+
+          sudo unshare --net -- bash -ceu '
+            runner_uid="$1"
+            runner_gid="$2"
+            runner_home="$3"
+            runner_cargo_home="$4"
+            runner_path="$5"
+            codex_bin="$6"
+
             ip link set lo up
-            cargo test -p praxis-tests-integration --test suite \
-              codex_http::pinned_codex_completes_chat_backend_coding_workflow_over_http -- --exact
-            cargo test -p praxis-tests-integration --test suite \
-              codex_http::pinned_codex_uses_responses_http_through_full_flow -- --exact
-          '
+            ip -brief link show lo
+            if ip route show default | grep -q .; then
+              echo "unexpected default route in Codex test namespace" >&2
+              exit 1
+            fi
+            if ip route get 1.1.1.1 >/dev/null 2>&1; then
+              echo "external route available in Codex test namespace" >&2
+              exit 1
+            fi
+
+            setpriv \
+              --reuid="$runner_uid" \
+              --regid="$runner_gid" \
+              --clear-groups \
+              -- env \
+                HOME="$runner_home" \
+                CARGO_HOME="$runner_cargo_home" \
+                PATH="$runner_path" \
+                PRAXIS_TEST_CODEX_BIN="$codex_bin" \
+                bash -ceu "
+                  cargo test --offline -p praxis-tests-integration --test suite \
+                    codex_http::pinned_codex_completes_chat_backend_coding_workflow_over_http -- --exact
+                  cargo test --offline -p praxis-tests-integration --test suite \
+                    codex_http::pinned_codex_uses_responses_http_through_full_flow -- --exact
+                "
+          ' bash \
+            "$runner_uid" \
+            "$runner_gid" \
+            "$runner_home" \
+            "$runner_cargo_home" \
+            "$runner_path" \
+            "$PRAXIS_TEST_CODEX_BIN"
 
   # ----------------------------------------------------------------------------
   # Pinned Codex CLI WebSocket acceptance
