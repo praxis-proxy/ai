@@ -311,6 +311,7 @@ jobs:
               -- env \
                 HOME="$runner_home" \
                 CARGO_HOME="$runner_cargo_home" \
+                CARGO_INCREMENTAL=0 \
                 PATH="$runner_path" \
                 PRAXIS_TEST_CODEX_BIN="$codex_bin" \
                 bash -ceu "
