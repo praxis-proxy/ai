@@ -1,6 +1,6 @@
 # Trusted OpenAI State Ownership
 #
-# Provider-neutral owner isolation for persisted Responses and Conversations.
+# Provider-neutral owner isolation for persisted OpenAI Responses and Conversations.
 # A trusted authentication boundary must replace (not merely preserve) the
 # configured header before traffic reaches this listener. Direct untrusted
 # access to this listener would let a caller forge an owner assertion.

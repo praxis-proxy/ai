@@ -28,21 +28,32 @@
 #
 # Example requests:
 #
+#   # For local testing, encode the readable [tenant, issuer, subject] tuple.
+#   # In production, a trusted authentication boundary constructs this value.
+#   OWNER_COMPONENTS='["tenant-a","https://issuer.example","user-123"]'
+#   OWNER_PAYLOAD=$(
+#     printf '%s' "$OWNER_COMPONENTS" |
+#       openssl base64 -A |
+#       tr '+/' '-_' |
+#       tr -d '='
+#   )
+#   OWNER_ASSERTION="v1.${OWNER_PAYLOAD}"
+#
 #   # Streaming with persistence (store defaults to true)
 #   curl -N http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
-#     -H "x-authenticated-state-owner: v1.<base64url assertion>" \
+#     -H "x-authenticated-state-owner: ${OWNER_ASSERTION}" \
 #     -d '{"model":"Qwen/Qwen3-0.6B","input":"Say hello","stream":true}'
 #
 #   # Non-streaming (still persisted via the buffered path)
 #   curl http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
-#     -H "x-authenticated-state-owner: v1.<base64url assertion>" \
+#     -H "x-authenticated-state-owner: ${OWNER_ASSERTION}" \
 #     -d '{"model":"Qwen/Qwen3-0.6B","input":"Say hello"}'
 #
 #   # Retrieve stored response
 #   curl http://localhost:8080/v1/responses/<response-id> \
-#     -H "x-authenticated-state-owner: v1.<base64url assertion>"
+#     -H "x-authenticated-state-owner: ${OWNER_ASSERTION}"
 #
 # Requires the ai-inference feature:
 #   cargo build -p praxis --features ai-inference
