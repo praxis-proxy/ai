@@ -107,8 +107,12 @@ jobs:
     # The four make test-* steps each build a distinct cargo feature
     # permutation (default, EXPERIMENTAL_FEATURES, llmd-ext-proc), so this
     # job serially recompiles large parts of the tree; the llmd-ext-proc
-    # gRPC/proto build lands last. 30m was insufficient on slow runners.
-    timeout-minutes: 45
+    # gRPC/proto build lands last. Praxis 0.5.6 turns the policy filter on by
+    # default, pulling the praxis-policy-* / OPA / Cedar stack into every
+    # permutation, which pushed the serial recompile past 45m on slow runners.
+    # 75m gives headroom for cache-cold runs; warmed caches on later runs
+    # finish well inside this budget.
+    timeout-minutes: 75
     permissions:
       contents: read
     steps:

@@ -53,6 +53,7 @@ mod openai_responses_format;
 mod openai_responses_model_rewrite;
 mod openai_responses_proxy;
 mod openai_responses_validate;
+mod openai_state_ownership;
 mod openai_stream_events;
 mod openai_tool_parse;
 mod prompt_enrichment;
