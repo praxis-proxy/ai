@@ -5423,9 +5423,10 @@ fn load_unified_dispatch_config(
         1,
     );
     // Retarget MCP resolution and dispatch at the in-test loopback MCP server.
-    // Loopback is permitted through `insecure_options.allow_private_upstreams`
-    // below (propagated to each callout's outbound pipeline), not a per-filter
-    // opt-in, so no `allow_loopback` field is injected.
+    // Loopback is permitted through the example config's
+    // `insecure_options.allow_private_upstreams` (propagated to each callout's
+    // outbound pipeline), not a per-filter opt-in, so no `allow_loopback` field
+    // is injected.
     let yaml = yaml.replacen(
         "      - filter: openai_mcp_tool_resolve\n        connectors:\n          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
         &format!(
@@ -5436,14 +5437,6 @@ fn load_unified_dispatch_config(
     let yaml = yaml.replacen(
         "              - filter: openai_mcp_dispatch\n",
         "              - filter: state_owner_headers\n                tenant_header: x-tenant-id\n                subject_header: x-user-id\n              - filter: openai_mcp_dispatch\n                forward_headers: [x-tenant-id]\n",
-        1,
-    );
-    // Permit the loopback MCP callout against the in-test MCP server. The callout's
-    // SSRF posture is governed by `insecure_options.allow_private_upstreams`, not a
-    // per-filter opt-in.
-    let yaml = yaml.replacen(
-        "insecure_options:\n",
-        "insecure_options:\n  allow_private_upstreams: true\n",
         1,
     );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse unified dispatch config")
@@ -6826,11 +6819,6 @@ fn load_loopback_mcp_config_inner(
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "insecure_options:\n",
-        "insecure_options:\n  allow_private_upstreams: true\n",
-        1,
-    );
     let yaml = if forward_headers {
         yaml.replacen(
             "      - filter: openai_mcp_tool_resolve\n",
@@ -6866,11 +6854,6 @@ fn load_loopback_mcp_config_with_connectors(
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "insecure_options:\n",
-        "insecure_options:\n  allow_private_upstreams: true\n",
-        1,
-    );
     let connector_yaml: String = connectors
         .iter()
         .map(|(id, url)| format!("          - id: {id}\n            server_url: {url}\n"))
@@ -6897,11 +6880,6 @@ fn load_loopback_mcp_config_without_rehydrate(proxy_port: u16, model_port: u16) 
         !yaml.contains("      - filter: openai_responses_rehydrate\n"),
         "expected to remove rehydration from the agentic-loop config"
     );
-    let yaml = yaml.replacen(
-        "insecure_options:\n",
-        "insecure_options:\n  allow_private_upstreams: true\n",
-        1,
-    );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse loopback MCP config without rehydration")
 }
 
@@ -6913,11 +6891,6 @@ fn load_approval_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxi
     let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "insecure_options:\n",
-        "insecure_options:\n  allow_private_upstreams: true\n",
-        1,
-    );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse approval round-trip config")
 }
 
@@ -6930,11 +6903,6 @@ fn load_approval_config_without_store(proxy_port: u16, model_port: u16) -> praxi
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "insecure_options:\n",
-        "insecure_options:\n  allow_private_upstreams: true\n",
-        1,
-    );
     let store_block = "      - filter: openai_response_store\n        backend: sqlite\n        database_url: \"sqlite://responses.db?mode=rwc\"\n        responses_table: openai_responses\n        conversations_table: openai_conversations\n\n";
     let without_store = yaml.replacen(store_block, "", 1);
     assert_ne!(

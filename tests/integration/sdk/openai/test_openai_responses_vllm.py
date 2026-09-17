@@ -803,12 +803,8 @@ def _write_agentic_config(
     config = config.replace("http://127.0.0.1:8001", f"http://{_ogx_endpoint()}")
     config = _patch_store_backend(config, db_path)
     # The loopback MCP callout's SSRF posture is governed by
-    # ``insecure_options.allow_private_upstreams`` (no per-filter opt-in).
-    config = config.replace(
-        "insecure_options:\n",
-        "insecure_options:\n  allow_private_upstreams: true\n",
-        1,
-    )
+    # ``insecure_options.allow_private_upstreams`` (no per-filter opt-in), which
+    # agentic-loop.yaml already enables -- so no injection is needed here.
     config = config.replace(
         "max_iterations: 11\n",
         # agentic-loop.yaml already sets the IRR's overall ``timeout_ms``;

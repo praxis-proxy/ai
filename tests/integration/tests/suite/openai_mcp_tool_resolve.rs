@@ -63,18 +63,18 @@ fn mcp_loopback_permitted_when_private_upstreams_allowed() {
     let backend_guard = start_backend_with_shutdown("inference");
     let proxy_port = free_port();
 
-    let yaml = resolve_yaml(proxy_port, backend_guard.port());
+    let yaml = resolve_yaml_loopback(proxy_port, backend_guard.port());
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     // Loopback is no longer blocked by a per-filter opt-in: the MCP callout's
     // SSRF posture is the pipeline's `insecure_options.allow_private_upstreams`,
-    // which the integration harness forces on. Under that posture a loopback MCP
-    // URL passes the SSRF gate and is actually dialed; with no server listening
-    // it fails as a connection error, not an SSRF rejection. Loopback-blocking
-    // when private upstreams are disabled is covered by the `mcp_client` unit
-    // tests; link-local metadata stays blocked regardless (see
-    // `mcp_metadata_url_rejected_as_ssrf`).
+    // which this config enables. Under that posture a loopback MCP URL passes
+    // the SSRF gate and is actually dialed; with no server listening it fails as
+    // a connection error, not an SSRF rejection. Loopback-blocking when private
+    // upstreams are disabled is covered by `mcp_localhost_url_rejected_as_ssrf`
+    // and the `mcp_client` unit tests; link-local metadata stays blocked
+    // regardless (see `mcp_metadata_url_rejected_as_ssrf`).
     let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"loop","server_url":"http://127.0.0.1/mcp","allowed_tools":["x"]}]}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
