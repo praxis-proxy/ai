@@ -600,8 +600,8 @@ pub(crate) struct ActualKeyColumn {
     /// A human-readable reason the column folds distinct key values together --
     /// a wrong type or affinity, a folding collation, or an untrusted operator
     /// class -- or `None` when the column preserves distinctness. Each backend
-    /// computes this at discovery via [`pg_key_column_folding`] or
-    /// [`sqlite_key_column_folding`] so the comparison stays backend-agnostic.
+    /// computes this at discovery via its key-column folding check so the
+    /// comparison stays backend-agnostic.
     pub folding: Option<String>,
 }
 
