@@ -5,6 +5,7 @@ scope:
   - responses_agentic_loop
   - responses_native_passthrough
   - responses_to_chat_completions
+  - responses_client_tool_compat
 features:
   - id: messages.request.minimal
     scopes:
@@ -279,6 +280,15 @@ features:
     status: synthetic_only
     scenarios:
       - responses/chat-tool-echo
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.client_tool_compat.lower_restore
+    scopes:
+      - responses_client_tool_compat
+    status: synthetic_only
+    scenarios:
+      - responses/client-tool-compat
     providers:
       synthetic:
         status: synthetic_only

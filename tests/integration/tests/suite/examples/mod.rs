@@ -39,6 +39,7 @@ mod llmisvc_model_provider_resolver;
 mod mcp_broker;
 mod model_to_header;
 mod openai_agentic_loop;
+mod openai_client_tool_compat;
 mod openai_conversations;
 mod openai_doc_extract;
 mod openai_embeddings_routing;

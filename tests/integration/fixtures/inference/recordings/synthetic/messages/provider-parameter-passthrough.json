@@ -41,6 +41,24 @@
                 "user_id": "user-1"
               },
               "model": "synthetic-passthrough-model",
+              "output_config": {
+                "effort": "high",
+                "format": {
+                  "schema": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "answer": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "answer"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "json_schema"
+                }
+              },
               "stream": false,
               "thinking": {
                 "budget_tokens": 1024,
@@ -64,7 +82,7 @@
               "content": [
                 {
                   "citations": null,
-                  "text": "4",
+                  "text": "{\"answer\": \"4\"}",
                   "type": "text"
                 }
               ],
@@ -109,7 +127,26 @@
                 }
               ],
               "model": "synthetic-passthrough-model",
-              "safety_identifier": "user-1",
+              "reasoning_effort": "high",
+              "response_format": {
+                "json_schema": {
+                  "name": "output_format",
+                  "schema": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "answer": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "answer"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "type": "json_schema"
+              },
+              "safety_identifier": "c6c289e49e9c05b2145860387b73bcb18df43fb09a1e4a4a9713c76c88bb541b",
               "stream": false,
               "top_k": 40
             }
@@ -130,7 +167,7 @@
                   "finish_reason": "stop",
                   "index": 0,
                   "message": {
-                    "content": "4",
+                    "content": "{\"answer\": \"4\"}",
                     "role": "assistant"
                   }
                 }

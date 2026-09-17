@@ -13,7 +13,7 @@ Completions translation.
 Starts Praxis with the shipped `messages-to-openai` example, retargeted at a
 local stub backend that records the translated request, and verifies through
 the official Anthropic Python SDK that unmapped fields reach the backend, that
-`metadata.user_id` becomes `safety_identifier`, that `thinking` is dropped,
+`metadata.user_id` becomes a hashed `safety_identifier`, that `thinking` is dropped,
 and that fields the translation cannot honor are rejected before any backend
 call.
 
@@ -22,22 +22,54 @@ Usage:
     uv run tests/integration/sdk/anthropic/test_anthropic_messages_to_chat_completions.py -s -v
 """
 
+import hashlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 from anthropic import Anthropic, BadRequestError
 
-from conftest import find_binary, free_port, wait_for_proxy
-
 CONFIG_PATH = "examples/configs/anthropic/messages-to-openai.yaml"
 MODEL = "stub-model"
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _find_binary() -> str:
+    configured = os.environ.get("PRAXIS_AI_BIN")
+    if configured:
+        if os.path.isfile(configured):
+            return configured
+        raise FileNotFoundError(f"PRAXIS_AI_BIN={configured!r} not found")
+    for candidate in ["target/debug/praxis-ai", "target/release/praxis-ai"]:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "praxis-ai binary not found — run `cargo build -p praxis-ai-proxy` first"
+    )
+
+
+def _wait_for_proxy(port: int, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise TimeoutError(f"proxy did not start within {timeout}s on port {port}")
 
 
 class RecordingBackend(BaseHTTPRequestHandler):
@@ -92,19 +124,19 @@ def _write_config(proxy_port: int, backend_port: int) -> str:
 
 @pytest.fixture(scope="module")
 def anthropic_client():
-    backend_port = free_port()
+    backend_port = _free_port()
     backend = HTTPServer(("127.0.0.1", backend_port), RecordingBackend)
     threading.Thread(target=backend.serve_forever, daemon=True).start()
 
-    proxy_port = free_port()
+    proxy_port = _free_port()
     config_path = _write_config(proxy_port, backend_port)
     proc = subprocess.Popen(
-        [find_binary(), "-c", config_path],
+        [_find_binary(), "-c", config_path],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     try:
-        wait_for_proxy(proxy_port)
+        _wait_for_proxy(proxy_port)
         yield Anthropic(
             base_url=f"http://127.0.0.1:{proxy_port}",
             api_key="not-needed",
@@ -138,7 +170,7 @@ class TestRequestFieldHandling:
         assert response.content[0].text == "4"
         [upstream] = RecordingBackend.bodies
         assert upstream["top_k"] == 40
-        assert upstream["safety_identifier"] == "user-1"
+        assert upstream["safety_identifier"] == hashlib.sha256(b"user-1").hexdigest()
         assert "metadata" not in upstream
         assert "thinking" not in upstream
 

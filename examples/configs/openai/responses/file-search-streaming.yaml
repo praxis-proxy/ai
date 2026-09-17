@@ -25,8 +25,19 @@
 # into one logical Responses stream.
 #
 # Configuration:
-#   vector_store_url:         Vector store API base URL
-#   allow_private_url:        Permit local-sensitive targets for development only
+#   vector_store_url:         Vector store API base URL. Structural validation at
+#                             startup rejects a non-http(s) scheme, userinfo, or a
+#                             query/fragment. Private/loopback targets (literal or
+#                             resolved) are gated at connect time and permitted
+#                             only when insecure_options.allow_private_upstreams
+#                             is set.
+#   outbound_chain:           Filter chain every vector-store sub-request runs
+#                             through (cross-cutting concerns such as credential
+#                             injection). Must be inline ({ name, filters }); a
+#                             named filter_chains reference cannot resolve inside
+#                             the iterative_request_router step this filter runs
+#                             in. The destination comes from vector_store_url, so
+#                             the chain never selects an upstream.
 #   timeout_ms:               Whole-call timeout in milliseconds
 #   max_response_bytes:       Maximum response bytes retained per callout
 #   max_total_response_bytes: Maximum successful bytes across one fan-out
@@ -73,7 +84,19 @@ filter_chains:
               # response body and never decides whether another round runs.
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:8001
-                allow_private_url: true
+                # Every vector-store sub-request runs through this chain. It must
+                # be inline ({ name, filters }): this filter runs inside an
+                # iterative_request_router step, whose pipeline is built with an
+                # empty named-chain map, so a top-level filter_chains reference
+                # cannot resolve here. The destination comes from
+                # vector_store_url, so the chain never selects an upstream.
+                outbound_chain:
+                  name: vector-store-outbound
+                  filters:
+                    - filter: headers
+                      request_set:
+                        - name: X-Vector-Store-Client
+                          value: praxis-ai-gateway
                 timeout_ms: 5000
                 max_response_bytes: 10485760
                 max_total_response_bytes: 67108864
@@ -113,3 +136,7 @@ filter_chains:
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends
+  # Central SSRF control for outbound callouts: permits the vector_store_url's
+  # resolved address to be private/loopback at connect time. Required only when
+  # the vector store runs on a private network (e.g. local development).
+  allow_private_upstreams: true

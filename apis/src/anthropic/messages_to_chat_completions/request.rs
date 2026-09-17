@@ -4,6 +4,7 @@
 //! Anthropic Messages to Chat Completions-compatible request transformation.
 
 use serde_json::{Map, Value, json};
+use sha2::{Digest as _, Sha256};
 use tracing::warn;
 
 // -----------------------------------------------------------------------------
@@ -22,16 +23,13 @@ const UNREPRESENTABLE_FIELDS: [&str; 4] = ["service_tier", "container", "inferen
 
 /// Anthropic Messages fields dropped with a warning instead of forwarded.
 ///
-/// Claude Code sends all of these on every request, and none has a Chat
-/// Completions equivalent this translation implements: the translated
-/// response carries no thinking blocks, so `thinking` is visibly absent and
-/// `context_management` (which only edits thinking blocks) has nothing to
-/// act on; `output_config` (and its deprecated `output_format` spelling)
-/// carries `effort` and a structured-output `format` whose mapping to
-/// `response_format` is future work. Forwarding them would make the outcome
-/// depend on the backend, since vLLM ignores unknown fields and the OpenAI
-/// API rejects them.
-const DROPPED_FIELDS: [&str; 4] = ["thinking", "context_management", "output_config", "output_format"];
+/// Claude Code sends both on every request, and neither has a Chat
+/// Completions equivalent: the translated response carries no thinking
+/// blocks, so `thinking` is visibly absent and `context_management` (which
+/// only edits thinking blocks) has nothing to act on. Forwarding them would
+/// make the outcome depend on the backend, since vLLM ignores unknown fields
+/// and the OpenAI API rejects them.
+const DROPPED_FIELDS: [&str; 2] = ["thinking", "context_management"];
 
 /// Transform a parsed Anthropic Messages request body into Chat
 /// Completions-compatible format.
@@ -63,7 +61,6 @@ pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
     let stop_sequences = body.remove("stop_sequences");
     let temperature = body.remove("temperature");
     let top_p = body.remove("top_p");
-    let metadata = body.remove("metadata");
     let tools = body.remove("tools");
     let tool_choice = body.remove("tool_choice");
     let had_tools = tools.is_some();
@@ -74,7 +71,8 @@ pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
     insert_if_some(&mut chat, "max_completion_tokens", max_tokens);
     convert_stream(&mut chat, stream, stream_options);
     map_parameters(&mut chat, stop_sequences, temperature, top_p);
-    map_metadata(&mut chat, metadata);
+    map_metadata(&mut chat, body.remove("metadata"));
+    map_output_config(&mut chat, body.remove("output_config"), body.remove("output_format"));
     convert_tools(&mut chat, tools);
     convert_parallel_tool_calls(&mut chat, tool_choice.as_ref());
     convert_tool_choice(&mut chat, tool_choice, had_tools);
@@ -675,13 +673,47 @@ fn map_parameters(
 /// Map Anthropic `metadata.user_id` to Chat Completions `safety_identifier`,
 /// the field with the same abuse-detection purpose.
 ///
-/// Chat Completions has its own `metadata` field with different semantics,
-/// so the Anthropic object itself never travels.
+/// The identifier is sent as its SHA-256 hex digest: Anthropic allows up to
+/// 512 characters while `safety_identifier` allows 64, and the digest is
+/// exactly 64. A null `user_id` is omitted because `safety_identifier` is not
+/// nullable. Chat Completions has its own `metadata` field with different
+/// semantics, so the Anthropic object itself never travels.
 fn map_metadata(chat: &mut Map<String, Value>, metadata: Option<Value>) {
     if let Some(Value::Object(mut metadata)) = metadata
-        && let Some(user_id) = metadata.remove("user_id")
+        && let Some(user_id) = take_string(&mut metadata, "user_id")
     {
-        chat.insert("safety_identifier".to_owned(), user_id);
+        let digest = Sha256::digest(user_id.as_bytes());
+        let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        chat.insert("safety_identifier".to_owned(), Value::String(hex));
+    }
+}
+
+/// Map Anthropic `output_config` to the Chat Completions controls with the
+/// same meaning: `effort` to `reasoning_effort`, whose enum contains every
+/// Anthropic level, and a `json_schema` `format` to `response_format`.
+///
+/// The deprecated top-level `output_format` is the older spelling of
+/// `output_config.format`.
+fn map_output_config(chat: &mut Map<String, Value>, output_config: Option<Value>, output_format: Option<Value>) {
+    let mut config = match output_config {
+        Some(Value::Object(config)) => config,
+        _ => Map::new(),
+    };
+    insert_if_some(
+        chat,
+        "reasoning_effort",
+        config.remove("effort").filter(|effort| !effort.is_null()),
+    );
+
+    if let Some(Value::Object(mut format)) = config.remove("format").or(output_format)
+        && format.get("type").and_then(Value::as_str) == Some("json_schema")
+        && let Some(schema) = format.remove("schema")
+    {
+        let response_format = json!({
+            "type": "json_schema",
+            "json_schema": {"name": "output_format", "schema": schema},
+        });
+        chat.insert("response_format".to_owned(), response_format);
     }
 }
 
@@ -1339,12 +1371,17 @@ mod tests {
     }
 
     #[test]
-    fn metadata_user_id_maps_to_safety_identifier() {
+    fn metadata_user_id_is_hashed_into_safety_identifier() {
         let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"metadata":{"user_id":"user-1"},"messages":[{"role":"user","content":"Hi"}]}"#;
         let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
-        assert_eq!(parsed["safety_identifier"], "user-1", "user_id mapped");
+        let expected: String = Sha256::digest(b"user-1")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(expected.len(), 64, "digest fits the 64-character limit");
+        assert_eq!(parsed["safety_identifier"], expected.as_str(), "user_id hashed");
         assert!(
             parsed.get("metadata").is_none(),
             "Anthropic metadata must not reach a Chat Completions backend"
@@ -1352,12 +1389,49 @@ mod tests {
     }
 
     #[test]
-    fn client_default_fields_are_dropped_not_forwarded() {
-        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"thinking":{"type":"enabled","budget_tokens":1024},"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"output_config":{"effort":"high"},"messages":[{"role":"user","content":"Hi"}]}"#;
+    fn metadata_null_user_id_is_omitted() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"metadata":{"user_id":null},"messages":[{"role":"user","content":"Hi"}]}"#;
         let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
-        for field in ["thinking", "context_management", "output_config"] {
+        assert!(
+            parsed.get("safety_identifier").is_none(),
+            "safety_identifier is not nullable"
+        );
+    }
+
+    #[test]
+    fn output_config_maps_to_chat_generation_controls() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"output_config":{"effort":"high","format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}}}}},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["reasoning_effort"], "high", "effort mapped");
+        assert_eq!(parsed["response_format"]["type"], "json_schema", "format mapped");
+        assert_eq!(
+            parsed["response_format"]["json_schema"]["schema"]["properties"]["title"]["type"], "string",
+            "schema carried"
+        );
+        assert!(parsed.get("output_config").is_none(), "output_config must not travel");
+    }
+
+    #[test]
+    fn deprecated_output_format_maps_to_response_format() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"output_format":{"type":"json_schema","schema":{"type":"object"}},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        assert_eq!(parsed["response_format"]["type"], "json_schema", "format mapped");
+        assert!(parsed.get("output_format").is_none(), "output_format must not travel");
+    }
+
+    #[test]
+    fn client_default_fields_are_dropped_not_forwarded() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"thinking":{"type":"enabled","budget_tokens":1024},"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        for field in ["thinking", "context_management"] {
             assert!(
                 parsed.get(field).is_none(),
                 "`{field}` has no Chat Completions equivalent"

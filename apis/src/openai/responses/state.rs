@@ -75,6 +75,65 @@ pub(crate) struct DispatchFailure {
     pub message: String,
 }
 
+/// How a lowered private `function` call is restored to its canonical
+/// client-owned typed output item on a function-only Responses backend (#1131).
+///
+/// Recorded by `openai_client_tool_compat` when it lowers a rich client tool
+/// declaration (`custom`, `namespace` member, local `shell`, or
+/// client-executed `tool_search`) to a private `function` tool on the outbound
+/// request. The buffered and streaming restoration paths look up a returned
+/// `function_call` by name to rebuild the exact typed item the client expects.
+/// Praxis never executes these tools; restoration only re-types the model's call
+/// before it reaches the client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LoweredClientTool {
+    /// The canonical tool name the client declared, restored onto the output item.
+    /// For a `namespace` member this is the bare MEMBER name (namespace stripped).
+    pub original_name: String,
+    /// The declared namespace to re-add for a `namespace` member; `None` otherwise.
+    pub namespace: Option<String>,
+    /// The typed output item the returned `function_call` must be restored to.
+    pub restore: ClientToolRestore,
+}
+
+/// The canonical output-item type a lowered `function` call restores to (#1131).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClientToolRestore {
+    /// A freeform `custom` tool: `function_call` → `custom_tool_call`, unwrapping
+    /// the single string parameter into the plain-string `input` field.
+    Custom,
+    /// A `function` member of a `namespace`: keep `function_call`, restore the
+    /// original member name and re-add the `namespace`.
+    Namespace,
+    /// A `custom` member of a `namespace`: `function_call` → `custom_tool_call`
+    /// with the original member name, the re-added `namespace`, and the single
+    /// string parameter unwrapped into the plain-string `input` field.
+    NamespaceCustom,
+    /// A local `shell` tool: `function_call` → `shell_call` with
+    /// `environment.type == "local"`.
+    Shell,
+    /// A client-executed `tool_search` tool: `function_call` → `tool_search_call`
+    /// with `execution == "client"`.
+    ToolSearch,
+}
+
+/// Verbatim snapshot of the client-declared `tools`/`tool_choice` taken before
+/// `openai_client_tool_compat` lowers rich client tools to private `function`
+/// declarations (#1131).
+///
+/// The backend echoes the lowered request shape back in `response.tools` and
+/// `response.tool_choice`. Restoring these two fields from the snapshot keeps
+/// the canonical client-owned declarations (and private lowered names such as
+/// `agentic_ns__{ns}__{member}`) out of client-visible output. Captured once on
+/// the first lowered round and reused unchanged across IRR continuations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClientToolEcho {
+    /// The client's original `tools` array, verbatim.
+    pub tools: Vec<serde_json::Value>,
+    /// The client's original `tool_choice`, verbatim; `Null` when it was absent.
+    pub tool_choice: serde_json::Value,
+}
+
 /// Return whether an output item consumes the response-wide built-in tool-call budget.
 ///
 /// All local built-in dispatchers share this classifier so adding a provider
@@ -311,6 +370,23 @@ pub(crate) struct ResponsesState {
     /// Built by `openai_mcp_tool_resolve` from `tools/list` responses.
     /// Consumed by `mcp_tool` (#27) for dispatch routing.
     pub mcp_tool_map: HashMap<(String, String), serde_json::Value>,
+
+    /// Reverse map from a lowered private `function` tool name to the canonical
+    /// client-owned tool it restores to, for a function-only Responses backend.
+    ///
+    /// Populated by `openai_client_tool_compat` during request lowering (#1131)
+    /// and read by its buffered restoration and by `openai_stream_events` on the
+    /// streaming path. Empty for native passthrough. Bounded by the declared tool
+    /// count. Private lowered names never leak to client output.
+    pub client_tool_lowering: HashMap<String, LoweredClientTool>,
+
+    /// Original client-declared `tools`/`tool_choice`, snapshotted before
+    /// lowering so the echoed `response.tools`/`response.tool_choice` can be
+    /// restored to their canonical shapes without leaking private `function`
+    /// names into client-visible output (#1131). `None` for native passthrough
+    /// (nothing lowered). Set once on the first lowered round and reused across
+    /// IRR continuations.
+    pub client_tool_echo: Option<ClientToolEcho>,
 
     /// Lifecycle state for an MCP batch that must return after execution.
     pub mcp_approval_state: McpApprovalState,
@@ -708,6 +784,8 @@ impl Default for ResponsesState {
             deferred_tool_limit_completion: false,
             deferred_stream_done: false,
             mcp_tool_map: HashMap::new(),
+            client_tool_lowering: HashMap::new(),
+            client_tool_echo: None,
             messages: Vec::new(),
             provider_history_len: 0,
             parallel_tool_calls: true,
@@ -1525,6 +1603,7 @@ mod tests {
         assert!(state.conversation.is_none());
         assert_eq!(state.iteration, 0);
         assert!(state.max_tool_calls.is_none());
+        assert!(state.client_tool_lowering.is_empty());
         assert!(state.parallel_tool_calls);
         assert!(state.persisted_messages.is_empty());
         assert!(!state.store_persist_armed);
