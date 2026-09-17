@@ -25,7 +25,7 @@ use tracing::{debug, warn};
 use super::resolve_url::{FileUrlResolver, redact_url};
 use crate::{
     callout_policy::OnMissing,
-    openai::api_client::{ApiClient, ApiClientError},
+    openai::api_client::{ApiClient, ApiClientError, DownstreamRuntime, OutboundExecution},
 };
 
 /// Files API path prefix used in resource URL construction.
@@ -175,6 +175,10 @@ pub(crate) struct ResolutionBudget {
     references_seen: usize,
     /// Inline bytes still available across current input and state history.
     remaining_resolved_bytes: usize,
+    /// Bound outbound chain execution for configured Files API
+    /// (`file_id`) callouts. `None` on the chain-less construction paths,
+    /// which fall back to the direct client transport.
+    outbound: Option<OutboundExecution>,
 }
 
 /// Count and byte accounting saved while a mirrored state
@@ -263,11 +267,12 @@ impl ResolutionBudget {
 
         self.register_reference()?;
 
+        let outbound = self.outbound.as_ref();
         let resolution = tokio::time::timeout_at(self.deadline, async {
             match source {
                 ReferenceSource::FileId(file_id) => {
                     client
-                        .resolve_file(file_id, request_headers, max_resolved_bytes, part_type)
+                        .resolve_file(file_id, request_headers, max_resolved_bytes, part_type, outbound)
                         .await
                 },
                 ReferenceSource::FileUrl(url) => {
@@ -345,7 +350,10 @@ impl FilesApiClient {
     }
 
     /// Create request-scoped resolution limits and cache state.
-    pub(crate) fn resolution_budget(&self) -> ResolutionBudget {
+    ///
+    /// `outbound` carries the bound Files API callout chain, when one was
+    /// configured; every `file_id` callout in the request routes through it.
+    pub(crate) fn resolution_budget(&self, outbound: Option<OutboundExecution>) -> ResolutionBudget {
         ResolutionBudget {
             cache: HashMap::new(),
             deadline: tokio::time::Instant::now() + self.resolution_timeout,
@@ -353,25 +361,43 @@ impl FilesApiClient {
             max_resolved_bytes: self.max_resolved_bytes,
             references_seen: 0,
             remaining_resolved_bytes: self.max_resolved_bytes,
+            outbound,
         }
     }
 
+    /// Build an [`OutboundExecution`] binding `pipeline` and the originating
+    /// downstream attributes to this client's shared transport.
+    pub(crate) fn outbound_execution(
+        &self,
+        pipeline: std::sync::Arc<praxis_filter::FilterPipeline>,
+        runtime: DownstreamRuntime,
+    ) -> OutboundExecution {
+        self.client.outbound_execution(pipeline, runtime)
+    }
+
     /// Fetch file metadata from `GET /v1/files/{file_id}`.
+    ///
+    /// When `outbound` is present the callout routes through the bound
+    /// outbound filter chain; otherwise it uses the direct client transport.
     async fn fetch_metadata(
         &self,
         file_id: &str,
         request_headers: &http::HeaderMap,
+        outbound: Option<&OutboundExecution>,
     ) -> Result<FileMetadata, ResolveError> {
         let url = self
             .client
             .resource_url(FILES_PATH_PREFIX, file_id, None)
             .map_err(|e| map_api_error(e, file_id))?;
 
-        let response = self
-            .client
-            .get(&url, request_headers, self.client.max_response_bytes())
-            .await
-            .map_err(|e| map_api_error(e, file_id))?;
+        let max_bytes = self.client.max_response_bytes();
+        // Box the callout future so the large transport frame is not inlined
+        // into this and every ancestor resolve future (clippy::large_futures).
+        let response = match outbound {
+            Some(outbound) => Box::pin(self.client.get_via_chain(&url, request_headers, max_bytes, outbound)).await,
+            None => Box::pin(self.client.get(&url, request_headers, max_bytes)).await,
+        }
+        .map_err(|e| map_api_error(e, file_id))?;
         if !(200..300).contains(&response.status) {
             return Err(ResolveError::CalloutFailed {
                 file_id: file_id.to_owned(),
@@ -388,29 +414,42 @@ impl FilesApiClient {
 
     /// Fetch file content from `GET /v1/files/{file_id}/content`
     /// using bounded reads.
+    ///
+    /// When `outbound` is present the callout routes through the bound
+    /// outbound filter chain; otherwise it uses the direct client transport.
+    #[expect(clippy::too_many_arguments, reason = "byte bounds and callout routing stay explicit")]
     async fn fetch_content(
         &self,
         file_id: &str,
         request_headers: &http::HeaderMap,
         max_content_bytes: usize,
         max_resolved_bytes: usize,
+        outbound: Option<&OutboundExecution>,
     ) -> Result<bytes::Bytes, ResolveError> {
         let url = self
             .client
             .resource_url(FILES_PATH_PREFIX, file_id, Some("content"))
             .map_err(|e| map_api_error(e, file_id))?;
 
-        let response = self
-            .client
-            .get(&url, request_headers, max_content_bytes)
-            .await
-            .map_err(|e| match e {
-                ApiClientError::ResponseTooLarge { .. } => ResolveError::TooLarge {
-                    reference: file_id.to_owned(),
-                    limit: max_resolved_bytes,
-                },
-                other => map_api_error(other, file_id),
-            })?;
+        // Box the callout future so the large transport frame is not inlined
+        // into this and every ancestor resolve future (clippy::large_futures).
+        let response = match outbound {
+            Some(outbound) => {
+                Box::pin(
+                    self.client
+                        .get_via_chain(&url, request_headers, max_content_bytes, outbound),
+                )
+                .await
+            },
+            None => Box::pin(self.client.get(&url, request_headers, max_content_bytes)).await,
+        }
+        .map_err(|e| match e {
+            ApiClientError::ResponseTooLarge { .. } => ResolveError::TooLarge {
+                reference: file_id.to_owned(),
+                limit: max_resolved_bytes,
+            },
+            other => map_api_error(other, file_id),
+        })?;
         if !(200..300).contains(&response.status) {
             return Err(ResolveError::CalloutFailed {
                 file_id: file_id.to_owned(),
@@ -423,14 +462,22 @@ impl FilesApiClient {
 
     /// Fetch metadata and content, returning the base64 content
     /// and MIME type for the caller to format per the schema.
+    ///
+    /// Both callouts route through `outbound` when a chain is bound.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "byte bounds and callout routing stay explicit; sequential metadata fetch, content fetch, and per-part formatting"
+    )]
     async fn resolve_file(
         &self,
         file_id: &str,
         request_headers: &http::HeaderMap,
         max_resolved_bytes: usize,
         part_type: &str,
+        outbound: Option<&OutboundExecution>,
     ) -> Result<ResolvedFile, ResolveError> {
-        let metadata = self.fetch_metadata(file_id, request_headers).await?;
+        let metadata = self.fetch_metadata(file_id, request_headers, outbound).await?;
         let max_content_bytes = match part_type {
             "input_image" => max_content_bytes_for_data_url(max_resolved_bytes, &metadata.content_type),
             _ => Some(max_content_bytes_for_base64(max_resolved_bytes)),
@@ -449,7 +496,13 @@ impl FilesApiClient {
             });
         }
         let content = self
-            .fetch_content(file_id, request_headers, max_content_bytes, max_resolved_bytes)
+            .fetch_content(
+                file_id,
+                request_headers,
+                max_content_bytes,
+                max_resolved_bytes,
+                outbound,
+            )
             .await?;
         let base64 = BASE64.encode(&content);
 
@@ -516,7 +569,7 @@ pub(crate) async fn resolve_input(
     request_headers: &http::HeaderMap,
     url_resolver: Option<&FileUrlResolver>,
 ) -> Result<usize, ResolveError> {
-    let mut budget = client.resolution_budget();
+    let mut budget = client.resolution_budget(None);
     resolve_input_with_budget(body, client, on_missing, request_headers, url_resolver, &mut budget).await
 }
 
@@ -1039,7 +1092,10 @@ mod tests {
                 stream.write_all(response.as_bytes()).unwrap();
             });
             let client = test_client(&format!("http://{address}"));
-            let Err(err) = client.fetch_metadata("file-missing", &http::HeaderMap::new()).await else {
+            let Err(err) = client
+                .fetch_metadata("file-missing", &http::HeaderMap::new(), None)
+                .await
+            else {
                 panic!("metadata response must fail for a non-success status");
             };
             assert!(
@@ -1064,7 +1120,7 @@ mod tests {
             });
             let client = test_client(&format!("http://{address}"));
             let err = client
-                .fetch_content("file-failed", &http::HeaderMap::new(), 1024, 1024)
+                .fetch_content("file-failed", &http::HeaderMap::new(), 1024, 1024, None)
                 .await
                 .unwrap_err();
             assert!(
@@ -1091,7 +1147,7 @@ mod tests {
         let client = test_client(&format!("http://{address}"));
 
         let err = client
-            .fetch_content("file-redirect", &http::HeaderMap::new(), 1024, 1024)
+            .fetch_content("file-redirect", &http::HeaderMap::new(), 1024, 1024, None)
             .await
             .unwrap_err();
 
@@ -1112,7 +1168,7 @@ mod tests {
         let client = test_client(&format!("http://{address}"));
 
         let err = client
-            .fetch_content("file-disconnect", &http::HeaderMap::new(), 1024, 1024)
+            .fetch_content("file-disconnect", &http::HeaderMap::new(), 1024, 1024, None)
             .await
             .unwrap_err();
 
@@ -1137,7 +1193,7 @@ mod tests {
         let client = test_client(&format!("http://{address}"));
 
         let err = client
-            .fetch_content("file-large", &http::HeaderMap::new(), 8, 1024)
+            .fetch_content("file-large", &http::HeaderMap::new(), 8, 1024, None)
             .await
             .unwrap_err();
 
@@ -1274,7 +1330,7 @@ mod tests {
     #[tokio::test]
     async fn cached_successes_share_request_wide_byte_budget() {
         let client = test_client_with_limits("http://files-api:8321", 8, 1_000);
-        let mut budget = client.resolution_budget();
+        let mut budget = client.resolution_budget(None);
         budget.cache.insert(
             (
                 "input_file".to_owned(),
