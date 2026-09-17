@@ -43,6 +43,8 @@ mod model_to_header;
 #[cfg(feature = "store-sqlite")]
 mod openai_agentic_loop;
 #[cfg(feature = "store-sqlite")]
+mod openai_client_tool_compat;
+#[cfg(feature = "store-sqlite")]
 mod openai_conversations;
 mod openai_doc_extract;
 mod openai_embeddings_routing;

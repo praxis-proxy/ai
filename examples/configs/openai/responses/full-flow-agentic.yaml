@@ -497,7 +497,15 @@ filter_chains:
               # so it is inert unless the model emits a hosted file_search_call.
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:3002
-                allow_private_url: true
+                # Cross-cutting outbound chain every vector-store sub-request runs
+                # through; the destination comes from vector_store_url.
+                outbound_chain:
+                  name: vector-store-outbound
+                  filters:
+                    - filter: headers
+                      request_set:
+                        - name: X-Vector-Store-Client
+                          value: praxis-ai-gateway
                 timeout_ms: 5000
                 max_response_bytes: 10485760
                 max_total_response_bytes: 67108864
@@ -551,3 +559,6 @@ filter_chains:
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends
+  # Central SSRF control: permits the vector_store_url's resolved address to be
+  # private/loopback at connect time (needed for local/private vector stores).
+  allow_private_upstreams: true

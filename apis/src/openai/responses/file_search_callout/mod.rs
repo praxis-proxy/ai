@@ -25,24 +25,25 @@ mod model_context;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderMap;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
-    body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
+    HttpFilterContext, IterationState, SubrequestRuntime, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::warn;
 
 use self::{
     client::{
-        FileSearchClient, FileSearchClientConfig, MAX_QUERY_BYTES, MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES,
-        SearchBatch, SearchFailure, SearchSpec, request_error,
+        CalloutTransport, FileSearchClient, FileSearchClientConfig, FileSearchError, MAX_QUERY_BYTES,
+        MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchBatch, SearchFailure, SearchSpec, request_error,
     },
-    config::{FileSearchFilterConfig, ValidatedConfig, build_config, build_config_with_client},
+    config::{FileSearchFilterConfig, ValidatedConfig, build_config_with_client, require_inline_outbound_chain},
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
 };
 use crate::{
@@ -86,6 +87,12 @@ pub struct FileSearchCalloutFilter {
     /// Callout client for the vector store API.
     client: FileSearchClient,
 
+    /// Prebuilt outbound filter chain every vector-store sub-request runs
+    /// through. Held directly (not inside [`FileSearchClient`]) so
+    /// [`Arc::get_mut`] succeeds during configuration when the framework visits
+    /// nested pipelines.
+    outbound: Arc<FilterPipeline>,
+
     /// Combined router and filter continuation-state ceiling.
     max_state_bytes: usize,
 
@@ -94,43 +101,38 @@ pub struct FileSearchCalloutFilter {
 }
 
 impl FileSearchCalloutFilter {
-    /// Create a filter from parsed YAML configuration.
+    /// Create a filter, binding its configured `outbound_chain` into a prebuilt
+    /// pipeline through the chain-binding context.
     ///
-    /// Falls back to a dedicated per-filter sub-request connector with a
-    /// pool size of 4. Prefer [`from_config_with_client`] when a shared
-    /// server-level sub-request client is available.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] when configuration or callout client
-    /// construction fails.
-    ///
-    /// [`from_config_with_client`]: Self::from_config_with_client
-    pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: FileSearchFilterConfig = parse_filter_config("openai_file_search_callout", config)?;
-        let validated = build_config(&cfg)?;
-        Ok(Self::build(validated))
-    }
-
-    /// Create a filter using a shared sub-request client.
+    /// This is the only construction path: the filter is registered via
+    /// [`FilterRegistry::register_chain_binding`], which supplies the
+    /// [`ChainBindingContext`] used to resolve `outbound_chain`. `client` is the
+    /// shared (or dedicated) sub-request transport that drives the bound chain.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] when configuration or callout client
-    /// construction fails.
-    pub fn from_config_with_client(
+    /// Returns [`FilterError`] when configuration is invalid or the outbound
+    /// chain cannot be built.
+    ///
+    /// [`FilterRegistry::register_chain_binding`]: praxis_filter::FilterRegistry::register_chain_binding
+    pub fn from_config_with_binding(
         config: &serde_yaml::Value,
         client: SubRequestClient,
+        ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileSearchFilterConfig = parse_filter_config("openai_file_search_callout", config)?;
+        require_inline_outbound_chain(&cfg.outbound_chain)?;
+        let outbound = ctx.bind_chain(&cfg.outbound_chain)?;
         let validated = build_config_with_client(&cfg, client)?;
-        Ok(Self::build(validated))
+        Ok(Self::build(validated, Arc::new(outbound)))
     }
 
-    /// Assemble a filter from validated config.
-    fn build(validated: ValidatedConfig) -> Box<dyn HttpFilter> {
+    /// Assemble a filter from validated config and a bound outbound pipeline.
+    fn build(validated: ValidatedConfig, outbound: Arc<FilterPipeline>) -> Box<dyn HttpFilter> {
         let client = FileSearchClient::new(FileSearchClientConfig {
-            api_client: validated.api_client,
+            base_url: validated.base_url,
+            subrequest_client: validated.subrequest_client,
+            forward_header_names: validated.forward_header_names,
             on_failure: validated.on_failure,
             max_response_bytes: validated.max_response_bytes,
             max_total_response_bytes: validated.max_total_response_bytes,
@@ -139,6 +141,7 @@ impl FileSearchCalloutFilter {
 
         Box::new(Self {
             client,
+            outbound,
             max_state_bytes: validated.max_state_bytes,
             on_failure: validated.on_failure,
         })
@@ -247,7 +250,12 @@ impl FileSearchCalloutFilter {
         clippy::too_many_lines,
         reason = "separates global, per-call, and transport planning failures"
     )]
-    async fn execute_plan(&self, plan: &SearchPlan, request_headers: &HeaderMap) -> SearchBatch {
+    async fn execute_plan(
+        &self,
+        plan: &SearchPlan,
+        request_headers: &HeaderMap,
+        transport: &CalloutTransport<'_>,
+    ) -> SearchBatch {
         if let Some(message) = plan.planning_error {
             return SearchBatch::with_failures(
                 plan.calls.len(),
@@ -276,7 +284,9 @@ impl FileSearchCalloutFilter {
         let mut batch = if specs.is_empty() {
             SearchBatch::new(plan.calls.len())
         } else {
-            self.client.search(&specs, plan.calls.len(), request_headers).await
+            self.client
+                .search(&specs, plan.calls.len(), request_headers, transport)
+                .await
         };
         batch.failures.extend(planning_failures);
         batch
@@ -296,12 +306,21 @@ impl FileSearchCalloutFilter {
                 "vector store search failed"
             );
         }
-        let failure = (self.on_failure == OnFailure::Closed)
-            .then(|| batch.failures.first())
-            .flatten()?;
+        if self.on_failure != OnFailure::Closed {
+            return None;
+        }
+        // Prefer an oversized-response failure so it maps to the actionable 413
+        // instead of being masked by an earlier generic callout failure recorded
+        // in the same batch.
+        let failure = batch
+            .failures
+            .iter()
+            .find(|failure| matches!(failure.error, FileSearchError::ResponseTooLarge { .. }))
+            .or_else(|| batch.failures.first())?;
+        let (status, code) = failure.error.dispatch_status();
         Some(DispatchFailure {
-            status: 502,
-            code: "server_error",
+            status,
+            code,
             message: format!("openai_file_search_callout: {}", failure.error),
         })
     }
@@ -330,7 +349,21 @@ impl FileSearchCalloutFilter {
         };
         let plan = build_search_plan(state, &assignments);
         let hdrs = callout_request_headers(ctx);
-        let batch = self.execute_plan(&plan, &hdrs).await;
+        // Capture the downstream client attributes forwarded into every filtered
+        // sub-request, then bind the request-scoped transport to the prebuilt
+        // outbound chain. `run` takes `&self`, so one transport drives the whole
+        // bounded fan-out.
+        let downstream = SubrequestRuntime::new(
+            ctx.client_addr,
+            ctx.downstream_tls,
+            ctx.peer_identity.clone(),
+            ctx.request_start,
+        );
+        let transport = CalloutTransport {
+            outbound: &self.outbound,
+            downstream,
+        };
+        let batch = self.execute_plan(&plan, &hdrs, &transport).await;
         if let Some(failure) = self.dispatch_failure(&batch) {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.dispatch_failure = Some(failure);
@@ -359,6 +392,29 @@ impl FileSearchCalloutFilter {
 impl HttpFilter for FileSearchCalloutFilter {
     fn name(&self) -> &'static str {
         "openai_file_search_callout"
+    }
+
+    /// Propagate server-provided runtime resources into the bound outbound
+    /// pipeline. The pipeline is uniquely owned during configuration, so
+    /// [`Arc::get_mut`] succeeds; a live clone would mean this ran after request
+    /// dispatch, which the framework never does.
+    fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
+        if let Some(pipeline) = Arc::get_mut(&mut self.outbound) {
+            visitor(pipeline);
+        } else {
+            debug_assert!(false, "outbound pipeline must be uniquely owned during configuration");
+        }
+    }
+
+    /// Surface the bound chain's referenced files so hot-reload discovers them.
+    fn referenced_files(&self) -> Vec<std::path::PathBuf> {
+        self.outbound.referenced_files()
+    }
+
+    /// Apply the operator's insecure posture to the bound chain, so central
+    /// `allow_private_upstreams` gating reaches every filtered sub-request.
+    fn apply_insecure_options(&self, options: &praxis_core::config::InsecureOptions) {
+        self.outbound.apply_insecure_options(options);
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -502,10 +558,37 @@ fn continuation_state_fits(
         // ceiling as every other request-scoped field, so one round streaming many distinct
         // native ids cannot bypass max_state_bytes (finalize clears it between rounds).
         .chain(state.provider_streamed_terminal_ids.iter().map(String::len))
+        // #1131: charge the client-tool lowering reverse map (private name -> original name,
+        // plus the optional restored namespace) against the same ceiling; `ClientToolRestore`
+        // is a 1-byte `Copy` tag with no owned payload, so only the strings need accounting.
+        .chain(state.client_tool_lowering.iter().map(|(name, lowered)| {
+            name.len()
+                .saturating_add(lowered.original_name.len())
+                .saturating_add(lowered.namespace.as_ref().map_or(0, String::len))
+        }))
         .fold(0_usize, usize::saturating_add);
     used = used.saturating_add(string_bytes);
     for value in state.mcp_tool_map.values() {
         let Some(size) = bounded_json_size(value, max_bytes.saturating_sub(used)).ok().flatten() else {
+            return false;
+        };
+        used = used.saturating_add(size);
+    }
+    // #1131: charge the pre-lowering echo snapshot (the client's original `tools`
+    // array and `tool_choice`, restored onto the echoed response) against the same
+    // ceiling as every other request-scoped field.
+    if let Some(echo) = state.client_tool_echo.as_ref() {
+        let Some(size) = bounded_json_size(&echo.tools, max_bytes.saturating_sub(used))
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        used = used.saturating_add(size);
+        let Some(size) = bounded_json_size(&echo.tool_choice, max_bytes.saturating_sub(used))
+            .ok()
+            .flatten()
+        else {
             return false;
         };
         used = used.saturating_add(size);

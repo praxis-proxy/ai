@@ -69,6 +69,9 @@ TRUSTED_OWNER_HEADERS = {
     "x-auth-tenant": "test-tenant",
     "x-auth-user": "test-user",
 }
+CLIENT_TOOL_COMPAT_CONFIG_PATH = (
+    "examples/configs/openai/responses/client-tool-compat.yaml"
+)
 
 TERMINAL_RESPONSE_EVENTS = {
     "response.cancelled",
@@ -268,6 +271,26 @@ def _write_chat_streaming_config(
 
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", backend_endpoint)
+    config = _patch_store_backend(config, db_path)
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+def _write_client_tool_compat_config(praxis_port: int, db_path: str) -> str:
+    """Patch the client-tool-compat example for live vLLM.
+
+    The compat config only references the proxy listener, a single
+    inference-backend cluster endpoint, and the SQLite store, so patching is
+    limited to those three (no OGX, no mock side-servers).
+    """
+    with open(CLIENT_TOOL_COMPAT_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
     config = _patch_store_backend(config, db_path)
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -967,6 +990,56 @@ def chat_streaming_proxy(tmp_path_factory, request, backend_endpoint):
                     file=sys.stderr,
                 )
         os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def client_tool_compat_proxy(tmp_path_factory, request):
+    """Start the client-tool-compat example against live vLLM."""
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("client-tool-compat")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_client_tool_compat_config(port, db_path)
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Client tool compat Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def client_tool_compat_client(client_tool_compat_proxy):
+    """Return an SDK client using the client-tool-compat pipeline."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{client_tool_compat_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -2713,6 +2786,87 @@ def _assert_multi_round_usage_and_trace(response, *, transport):
     )
 
 
+class TestClientToolCompatVLLM:
+    """Issue #1131: rich Codex client tools round-trip through a function-only
+    vLLM Responses backend via ``openai_client_tool_compat``.
+
+    The compat filter lowers ``custom``/``namespace``/``shell``/``tool_search``
+    declarations to private ``function`` tools on the request (vLLM only ever
+    sees functions) and restores the returned ``function_call`` items to their
+    canonical typed items on the buffered response — over ``POST /v1/responses``,
+    never ``/v1/chat/completions``, and without executing any client tool inside
+    Praxis.
+    """
+
+    def test_custom_tool_round_trip_lowers_and_restores(
+        self, client_tool_compat_client
+    ):
+        """A ``custom`` client tool is lowered to a private ``function`` vLLM
+        accepts; the returned ``function_call`` is restored to a
+        ``custom_tool_call`` with the original ``custom`` tool echoed back."""
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            # Force the call so the small CI model is deterministic; the compat
+            # filter lowers this custom selector to a function selector for vLLM.
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        # Response phase: the function_call is restored to a custom_tool_call.
+        custom_calls = [
+            item for item in response.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            "compat filter must restore the function_call to a custom_tool_call; "
+            f"got output types: {[i.type for i in response.output]}"
+        )
+        assert custom_calls[0].name == "apply_patch"
+        assert isinstance(custom_calls[0].input, str)
+        # No un-restored private function_call may leak to the client.
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        # Request phase echo: the client sees its original ``custom`` tool back.
+        assert any(t.type == "custom" for t in response.tools), response.tools
+
+    def test_streaming_rich_client_tool_fails_closed(
+        self, client_tool_compat_client
+    ):
+        """Streaming + a rich client tool fails closed with HTTP 400 before any
+        upstream call (SSE restoration is a deliberate follow-up), so a lowered
+        private function name is never streamed un-restored to the client."""
+        with pytest.raises(BadRequestError) as exc_info:
+            client_tool_compat_client.responses.create(
+                model=VLLM_MODEL,
+                input="Apply the patch.",
+                tools=[
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Apply a unified diff.",
+                    }
+                ],
+                stream=True,
+                store=False,
+            )
+        assert exc_info.value.status_code == 400
+        assert "streaming is not supported" in str(exc_info.value)
+
+
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
 
@@ -4269,7 +4423,13 @@ filter_chains:
               # (#1046).
               - filter: openai_file_search_callout
                 vector_store_url: http://{ogx_endpoint}
-                allow_private_url: true
+                outbound_chain:
+                  name: vector-store-outbound
+                  filters:
+                    - filter: headers
+                      request_set:
+                        - name: X-Vector-Store-Client
+                          value: praxis-ai-gateway
                 timeout_ms: 30000
                 max_response_bytes: 10485760
                 max_total_response_bytes: 67108864
@@ -4308,15 +4468,76 @@ filter_chains:
 
 insecure_options:
   allow_private_endpoints: true
+  # Central SSRF gate for the vector-store callout: permits the loopback OGX
+  # endpoint's resolved address at connect time.
+  allow_private_upstreams: true
 """
 
 
+class VectorStoreWitnessHandler(BaseHTTPRequestHandler):
+    """Recording shim between the file-search callout and OGX.
+
+    Captures the request headers of every vector-store request the callout
+    forwards, then proxies transparently to OGX so the search still runs and
+    the full pipeline completes. Tests assert the configured ``outbound_chain``
+    actually ran by checking the marker header it injects
+    (``X-Vector-Store-Client``) is present on every captured request — proving
+    the callout dispatched through the ``FilteredSubrequestExecutor`` outbound
+    chain rather than reaching OGX by some other path (or not at all).
+    """
+
+    captured_headers: ClassVar[list[dict[str, str]]] = []
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _forward(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        type(self).captured_headers.append(
+            {k.lower(): v for k, v in self.headers.items()}
+        )
+        headers = {
+            k: v
+            for k, v in self.headers.items()
+            if k.lower() not in ("host", "content-length")
+        }
+        url = f"{OGX_BASE_URL.rstrip('/')}{self.path}"
+        with httpx.Client(timeout=300.0) as client:
+            with client.stream(
+                self.command, url, headers=headers, content=body
+            ) as upstream:
+                self.send_response(upstream.status_code)
+                for key, value in upstream.headers.items():
+                    if key.lower() in (
+                        "transfer-encoding",
+                        "content-length",
+                        "connection",
+                    ):
+                        continue
+                    self.send_header(key, value)
+                self.end_headers()
+                for chunk in upstream.iter_raw():
+                    if chunk:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+
+    def do_POST(self):
+        self._forward()
+
+    def do_GET(self):
+        self._forward()
+
+    def do_DELETE(self):
+        self._forward()
+
+
 def _write_file_search_config(
-    praxis_port: int, backend_endpoint: str
+    praxis_port: int, backend_endpoint: str, ogx_endpoint: str | None = None
 ) -> str:
     config = FILE_SEARCH_CONFIG_TEMPLATE.format(
         praxis_port=praxis_port,
-        ogx_endpoint=_ogx_endpoint(),
+        ogx_endpoint=ogx_endpoint or _ogx_endpoint(),
         vllm_endpoint=backend_endpoint,
     )
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -4402,9 +4623,21 @@ def vector_store():
 
 @pytest.fixture(scope="session")
 def file_search_proxy(tmp_path_factory, request, backend_endpoint):
-    """Start a Praxis proxy with the file-search-callout pipeline."""
+    """Start a Praxis proxy with the file-search-callout pipeline.
+
+    The vector-store callout is pointed at an in-process recording shim
+    (:class:`VectorStoreWitnessHandler`) that forwards transparently to OGX, so
+    a test can assert the configured ``outbound_chain`` ran by inspecting the
+    headers the shim captured.
+    """
+    VectorStoreWitnessHandler.captured_headers = []
+    shim_port = _free_port()
+    shim = HTTPServer(("127.0.0.1", shim_port), VectorStoreWitnessHandler)
+    shim_thread = threading.Thread(target=shim.serve_forever, daemon=True)
+    shim_thread.start()
+
     port = _free_port()
-    config_path = _write_file_search_config(port, backend_endpoint)
+    config_path = _write_file_search_config(port, backend_endpoint, ogx_endpoint=f"127.0.0.1:{shim_port}")
     binary = _find_binary()
 
     log_dir = tmp_path_factory.mktemp("file-search")
@@ -4429,6 +4662,7 @@ def file_search_proxy(tmp_path_factory, request, backend_endpoint):
             proc.kill()
             proc.wait()
         log_file.close()
+        shim.shutdown()
         if not started or request.session.testsfailed > 0:
             with open(log_path) as f:
                 print(
@@ -4508,6 +4742,23 @@ class TestFileSearchVLLM:
             result.file_id and result.filename and result.score is not None
             for result in decoded_results
         ), "decoded file-search results should retain typed result metadata"
+
+        # Prove the callout actually dispatched the vector-store search through
+        # the configured FilteredSubrequestExecutor outbound chain — not merely
+        # that a file_search_call item surfaced. The recording shim in front of
+        # OGX captured each forwarded request; every one must carry the marker
+        # header the inline outbound_chain injects, which only the executor path
+        # can add.
+        captured = VectorStoreWitnessHandler.captured_headers
+        assert captured, (
+            "the file-search callout must forward at least one vector-store "
+            "request through the outbound chain to OGX"
+        )
+        for headers in captured:
+            assert headers.get("x-vector-store-client") == "praxis-ai-gateway", (
+                "every vector-store request must carry the outbound_chain marker "
+                f"header, proving the callout ran; got headers: {headers}"
+            )
 
 
 # ---------------------------------------------------------------------------

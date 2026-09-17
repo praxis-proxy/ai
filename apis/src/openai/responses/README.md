@@ -6,6 +6,7 @@ Pipeline overview for filters under `apis/src/openai/responses/`.
      Do not edit by hand. -->
 
 - **`openai_agentic_loop`** — Agentic loop controller for the Responses API pipeline.
+- **`openai_client_tool_compat`** — Lowers rich client-owned tool declarations to private `function` tools for a function-only Responses backend and restores the typed items on the way back.
 - **`openai_doc_extract`** — Converts `input_file` content parts to `input_text` for backends that do not support `input_file` natively (e.g. vLLM, llm-d).
 - **`openai_file_resolve`** — Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field.
 - **`openai_file_search_callout`** — Dispatches the loop owner's pending file-search assignments against a vector store API compatible backend.
@@ -30,6 +31,7 @@ Body-phase columns show `Access / Mode` when the hook is implemented.
 | Filter | `on_request` | `on_request_body` | `on_response` | `on_response_body` |
 |--------|:------------:|:-----------------:|:--------------:|:------------------:|
 | `openai_agentic_loop` | ✓ | ReadOnly / StreamBuffer | — | ReadWrite / Stream |
+| `openai_client_tool_compat` | — | ReadOnly / Stream | — | ReadWrite / Stream |
 | `openai_doc_extract` | — | ReadWrite / StreamBuffer | — | — |
 | `openai_file_resolve` | — | ReadWrite / StreamBuffer | — | — |
 | `openai_file_search_callout` | — | ReadOnly / StreamBuffer | — | — |
