@@ -9,6 +9,12 @@
 //! request classification, shared hop-by-hop header sanitization,
 //! JSON body-mutation helpers, and response storage backends.
 
+#[cfg(all(
+    any(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"),
+    not(any(feature = "callout-rustls", feature = "callout-native-tls"))
+))]
+compile_error!("at least one callout TLS backend is required: enable `callout-rustls` or `callout-native-tls`");
+
 pub mod anthropic;
 pub mod azure;
 mod callout_credentials;

@@ -3,14 +3,63 @@
 
 //! Versioned wire fixtures and inference scenarios for integration tests.
 
+#[cfg_attr(
+    not(any(feature = "callout-rustls", feature = "callout-native-tls")),
+    allow(
+        dead_code,
+        clippy::allow_attributes,
+        reason = "recording infrastructure requires a TLS callout backend"
+    )
+)]
 mod bounds;
 mod coverage;
 mod external;
+#[cfg_attr(
+    not(any(feature = "callout-rustls", feature = "callout-native-tls")),
+    allow(
+        dead_code,
+        clippy::allow_attributes,
+        reason = "recording infrastructure requires a TLS callout backend"
+    )
+)]
 mod header_policy;
+#[cfg_attr(
+    not(any(feature = "callout-rustls", feature = "callout-native-tls")),
+    allow(
+        dead_code,
+        clippy::allow_attributes,
+        reason = "recording infrastructure requires a TLS callout backend"
+    )
+)]
 mod http_server;
+#[cfg(any(feature = "callout-rustls", feature = "callout-native-tls"))]
 mod record;
+#[cfg_attr(
+    not(any(feature = "callout-rustls", feature = "callout-native-tls")),
+    allow(
+        dead_code,
+        clippy::allow_attributes,
+        reason = "recording infrastructure requires a TLS callout backend"
+    )
+)]
 mod replay;
+#[cfg_attr(
+    not(any(feature = "callout-rustls", feature = "callout-native-tls")),
+    allow(
+        dead_code,
+        clippy::allow_attributes,
+        reason = "recording infrastructure requires a TLS callout backend"
+    )
+)]
 mod sanitize;
+#[cfg_attr(
+    not(any(feature = "callout-rustls", feature = "callout-native-tls")),
+    allow(
+        dead_code,
+        clippy::allow_attributes,
+        reason = "recording infrastructure requires a TLS callout backend"
+    )
+)]
 mod schema;
 
 /// Default maximum request body bytes an ad-hoc HTTP recorder should retain.
@@ -43,6 +92,7 @@ pub use coverage::{
     ScenarioSnapshot, check_coverage, discover_recordings, discover_scenario_snapshots, discover_scenarios,
 };
 pub use external::{ImportedUpstream, import_external_recording};
+#[cfg(any(feature = "callout-rustls", feature = "callout-native-tls"))]
 pub use record::{ProviderTarget, RecordingProxy, RecordingProxyGuard};
 pub use replay::{ReplayReport, ScenarioRunner};
 pub use sanitize::{RedactionRules, sanitize_fixture, validate_commit_safe, validate_commit_safe_with_rules};

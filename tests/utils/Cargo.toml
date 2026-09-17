@@ -22,7 +22,9 @@ openai-conversations = ["store", "praxis-ai-proxy/openai-conversations"]
 openai-compact = ["store", "praxis-ai-proxy/openai-compact"]
 openai-mcp-tools = ["store", "praxis-ai-proxy/openai-mcp-tools"]
 openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
-full = ["standard", "openai-all", "store-postgres"]
+full = ["standard", "openai-all", "store-postgres", "callout-rustls"]
+callout-rustls = ["praxis-ai-apis/callout-rustls", "praxis-ai-proxy/callout-rustls", "reqwest/rustls"]
+callout-native-tls = ["praxis-ai-apis/callout-native-tls", "praxis-ai-proxy/callout-native-tls", "reqwest/native-tls"]
 llmd-ext-proc = [
     "praxis-ai-proxy/llmd-ext-proc",
     "dep:praxis-ai-llmd-ext-proc",

@@ -36,7 +36,9 @@ openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream"]
 # Every OpenAI group, without choosing a store backend.
 openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
 # Every non-experimental opt-in; equals the pre-feature-split capability.
-full = ["openai-all", "store-postgres"]
+full = ["openai-all", "store-postgres", "callout-rustls"]
+callout-rustls = ["reqwest/rustls", "rmcp/reqwest"]
+callout-native-tls = ["reqwest/native-tls", "rmcp/reqwest-native-tls"]
 praxis-main = []
 
 [lints]

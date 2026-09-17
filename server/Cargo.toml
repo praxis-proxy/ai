@@ -49,7 +49,9 @@ openai-mcp-tools = ["store", "praxis-ai-filters/openai-mcp-tools"]
 # Every OpenAI group, without choosing a store backend.
 openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
 # Every non-experimental filter; equals the pre-feature-split capability.
-full = ["standard", "openai-all", "store-postgres"]
+full = ["standard", "openai-all", "store-postgres", "callout-rustls"]
+callout-rustls = ["praxis-ai-filters/callout-rustls"]
+callout-native-tls = ["praxis-ai-filters/callout-native-tls"]
 # Experimental: the generic http_callout filter (see praxis-ai-filters).
 http-callout-filter = ["praxis-ai-filters/http-callout-filter", "experimental"]
 # Experimental: the azure_ad (Entra ID) auth filter (see praxis-ai-filters).
