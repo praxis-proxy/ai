@@ -73,6 +73,19 @@ struct ConversationResponseState {
     append_owner: Option<StateOwner>,
 }
 
+/// Owner captured on the request path before inference begins.
+struct CapturedAppendOwner(StateOwner);
+
+/// Capture the append-back owner once for the lifetime of the exchange.
+fn capture_append_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterAction> {
+    if !should_append_back(ctx) || ctx.extensions.get::<CapturedAppendOwner>().is_some() {
+        return Ok(());
+    }
+    ctx.extensions
+        .insert(CapturedAppendOwner(require_state_owner(ctx)?.clone()));
+    Ok(())
+}
+
 impl OpenaiConversationsFilter {
     /// Create a filter from parsed YAML config.
     ///
@@ -412,6 +425,9 @@ impl HttpFilter for OpenaiConversationsFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if let Err(action) = capture_append_owner(ctx) {
+            return Ok(action);
+        }
         let Some(route) = routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path()) else {
             if should_append_back(ctx) {
                 drop(self.get_or_init_store().await);
@@ -437,6 +453,9 @@ impl HttpFilter for OpenaiConversationsFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream || ctx.request.method != http::Method::POST {
             return Ok(FilterAction::Continue);
+        }
+        if let Err(action) = capture_append_owner(ctx) {
+            return Ok(action);
         }
 
         let empty: &[u8] = &[];
@@ -487,10 +506,11 @@ impl HttpFilter for OpenaiConversationsFilter {
             trace!("conversation append-back skipped (non-2xx or non-JSON response)");
         }
         if armed {
-            let owner = match require_state_owner(ctx) {
-                Ok(owner) => owner.clone(),
-                Err(action) => return Ok(action),
-            };
+            let owner = ctx
+                .extensions
+                .get::<CapturedAppendOwner>()
+                .map(|captured| captured.0.clone())
+                .ok_or_else(|| FilterError::from("openai_conversations: append-back owner was not captured"))?;
             ctx.insert_filter_state(ConversationResponseState {
                 append_owner: Some(owner),
             });

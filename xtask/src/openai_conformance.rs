@@ -9,6 +9,8 @@ use clap::Parser;
 
 /// Conformance areas included in this task.
 mod area;
+/// Chat Completions registry drift check against the pinned specification.
+mod chat_completions_registry;
 /// Operation coverage calculation.
 mod coverage;
 /// Source-derived Conversation item schema artifact.
@@ -23,6 +25,8 @@ mod oasdiff;
 mod print;
 /// Complete reference verification and semantic area projection.
 mod reference;
+/// Shared comparison rules for family registry drift checks.
+mod registry_check;
 /// Responses registry drift check against the pinned specification.
 mod responses_registry;
 /// Semantic YAML tree used for full-spec projection.
@@ -120,6 +124,17 @@ pub(crate) struct Args {
 /// Run the Responses registry drift check and report the outcome.
 pub(crate) fn run_responses_registry_check() {
     match responses_registry::check() {
+        Ok(summary) => println!("{summary}"),
+        Err(failures) => {
+            eprintln!("{failures}");
+            std::process::exit(1);
+        },
+    }
+}
+
+/// Run the Chat Completions registry drift check and report the outcome.
+pub(crate) fn run_chat_completions_registry_check() {
+    match chat_completions_registry::check() {
         Ok(summary) => println!("{summary}"),
         Err(failures) => {
             eprintln!("{failures}");

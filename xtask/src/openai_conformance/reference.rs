@@ -12,7 +12,7 @@ use sha2::{Digest as _, Sha256};
 use super::{
     HTTP_METHODS,
     area::{OPENAI_REFERENCE_MANIFEST, OPENAI_REFERENCE_SPEC},
-    model::{OperationScope, ReferenceProvenance},
+    model::{OperationKey, OperationScope, ReferenceProvenance, SpecOperation},
     semantic_yaml::{Mapping as YamlMapping, Value as YamlValue},
     spec::repo_root,
 };
@@ -223,6 +223,30 @@ impl ReferenceDocument {
             .map_err(|e| format!("failed to serialize reference projection: {e}"))?;
         Ok(ensure_trailing_newline(content))
     }
+
+    /// Extract scoped operations directly from the complete document.
+    ///
+    /// Registry drift checks only need path-operation metadata. Building a
+    /// projected subset and re-parsing it with generic YAML would fail on schema
+    /// bounds outside `i64`, such as those referenced by Chat Completions bodies.
+    pub(super) fn scoped_operations(&self, scope: OperationScope) -> Result<Vec<SpecOperation>, String> {
+        let root = self
+            .document
+            .as_mapping()
+            .ok_or_else(|| "upstream OpenAPI document is not an object".to_owned())?;
+        let paths = yaml_get(root, "paths")
+            .and_then(YamlValue::as_mapping)
+            .ok_or_else(|| "upstream OpenAPI document does not contain a paths object".to_owned())?;
+        let mut operations = collect_scoped_operations(paths, scope);
+        if operations.is_empty() {
+            return Err(format!(
+                "upstream OpenAPI did not contain any {} operations",
+                scope.label
+            ));
+        }
+        operations.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(operations)
+    }
 }
 
 /// Parse and project one complete source in a single call.
@@ -351,6 +375,53 @@ fn copy_root_field(source: &YamlMapping, target: &mut YamlMapping, name: &str) {
 /// Get a string-keyed value from a YAML mapping.
 fn yaml_get<'a>(mapping: &'a YamlMapping, key: &str) -> Option<&'a YamlValue> {
     mapping.get(&YamlValue::String(key.to_owned()))
+}
+
+/// Collect operations whose paths belong to `scope`.
+fn collect_scoped_operations(paths: &YamlMapping, scope: OperationScope) -> Vec<SpecOperation> {
+    let mut operations = Vec::new();
+    for (path, path_item) in paths.iter() {
+        let Some(path) = path.as_str() else {
+            continue;
+        };
+        if !scope.matches(path) {
+            continue;
+        }
+        let Some(path_item) = path_item.as_mapping() else {
+            continue;
+        };
+        for method in HTTP_METHODS {
+            let Some(operation) = yaml_get(path_item, method).and_then(YamlValue::as_mapping) else {
+                continue;
+            };
+            operations.push(parse_semantic_operation(path, method, operation, scope.label));
+        }
+    }
+    operations
+}
+
+/// Parse one operation object from the semantic YAML tree.
+fn parse_semantic_operation(path: &str, method: &str, operation: &YamlMapping, area: &'static str) -> SpecOperation {
+    SpecOperation {
+        key: OperationKey::new(method.to_ascii_uppercase(), path),
+        tag: first_semantic_tag(operation),
+        area,
+        operation_id: yaml_get(operation, "operationId")
+            .and_then(YamlValue::as_str)
+            .map(str::to_owned),
+        deprecated: matches!(yaml_get(operation, "deprecated"), Some(YamlValue::Bool(true))),
+        beta: path.contains("?beta=true"),
+    }
+}
+
+/// Return the first tag on one semantic operation, or `untagged`.
+fn first_semantic_tag(operation: &YamlMapping) -> String {
+    yaml_get(operation, "tags")
+        .and_then(YamlValue::as_sequence)
+        .and_then(|tags| tags.first())
+        .and_then(YamlValue::as_str)
+        .unwrap_or("untagged")
+        .to_owned()
 }
 
 /// Write a refreshed manifest and exact complete upstream source.

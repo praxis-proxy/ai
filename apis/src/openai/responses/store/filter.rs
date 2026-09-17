@@ -288,14 +288,13 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let owner = match require_state_owner(ctx) {
-            Ok(owner) => owner.clone(),
-            Err(action) => return Ok(action),
+        let Some(capture) = ctx.extensions.remove::<ResponseStoreRequestState>() else {
+            return Ok(FilterAction::Reject(reject_store_error()));
         };
-
-        let request_input = ctx
-            .remove_filter_state::<ResponseStoreRequestState>()
-            .map(|state| state.input);
+        let Some(owner) = capture.owner else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+        let request_input = capture.input;
 
         // Capture the proxy-issued pending approvals before building the record;
         // the borrow is released before `build_record_from_state` re-borrows ctx.
@@ -319,13 +318,13 @@ impl ResponseStoreFilter {
         let Some((store, bytes)) = self.terminal_store_and_body(ctx, body) else {
             return Ok(FilterAction::Continue);
         };
-        let owner = match require_state_owner(ctx) {
-            Ok(owner) => owner.clone(),
-            Err(action) => return Ok(action),
+        let Some(capture) = ctx.extensions.remove::<ResponseStoreRequestState>() else {
+            return Ok(FilterAction::Reject(reject_store_error()));
         };
-        let request_input = ctx
-            .remove_filter_state::<ResponseStoreRequestState>()
-            .map(|state| state.input);
+        let Some(owner) = capture.owner else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+        let request_input = capture.input;
         let state_messages = ctx
             .extensions
             .get::<ResponsesState>()
@@ -345,9 +344,32 @@ impl ResponseStoreFilter {
 // -----------------------------------------------------------------------------
 
 /// Request-phase data needed when persisting the response.
+#[derive(Default)]
 struct ResponseStoreRequestState {
     /// Original `input` value from the Responses API create request.
-    input: Value,
+    input: Option<Value>,
+    /// Owner captured before inference begins.
+    owner: Option<StateOwner>,
+}
+
+/// Capture the immutable owner once, before inference or a body-first consumer.
+fn capture_persistence_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterAction> {
+    if !request_will_persist_response(ctx) {
+        return Ok(());
+    }
+    let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
+    if state.owner.is_none() {
+        state.owner = Some(require_state_owner(ctx)?.clone());
+    }
+    ctx.extensions.insert(state);
+    Ok(())
+}
+
+/// Retain request input alongside the already captured owner.
+fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) {
+    let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
+    state.input = Some(input);
+    ctx.extensions.insert(state);
 }
 
 /// Fields extracted from the response JSON for the store record.
@@ -773,6 +795,10 @@ impl HttpFilter for ResponseStoreFilter {
         BodyMode::Stream
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "request routing and pre-inference owner capture remain one lifecycle hook"
+    )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if is_responses_format(ctx) && !is_streaming_request(ctx) {
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
@@ -796,6 +822,10 @@ impl HttpFilter for ResponseStoreFilter {
                 return self.handle_delete(&owner, id).await;
             }
             return Ok(FilterAction::Continue);
+        }
+
+        if let Err(action) = capture_persistence_owner(ctx) {
+            return Ok(action);
         }
 
         if !should_init_store_for_request(ctx) {
@@ -823,10 +853,13 @@ impl HttpFilter for ResponseStoreFilter {
         if !end_of_stream || ctx.request.method != http::Method::POST {
             return Ok(FilterAction::Continue);
         }
+        if let Err(action) = capture_persistence_owner(ctx) {
+            return Ok(action);
+        }
         if !should_skip(ctx)
             && let Some(input) = extract_request_input(body)
         {
-            ctx.insert_filter_state(ResponseStoreRequestState { input });
+            capture_request_input(ctx, input);
         }
         if should_init_store_for_request(ctx) {
             match &self.get_or_init_store().await {

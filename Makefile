@@ -149,6 +149,7 @@ lint:
 	cargo xtask sync-responses-readme
 	cargo xtask check-inference
 	cargo xtask check-responses-registry
+	cargo xtask check-chat-completions-registry
 	cargo xtask openresponses-coverage
 
 fmt:

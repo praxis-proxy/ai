@@ -33,8 +33,9 @@ use tracing::debug;
 
 use self::config::{OperationClassifierConfig, ValidatedConfig, build_config};
 use crate::openai::{
+    chat_completions::routes as chat_completions_routes,
     conversations::routes as conversations_routes,
-    operation::{OpenAiApiFamily, OpenAiTransport},
+    operation::{OpenAiApiFamily, OpenAiOperationSpec, OpenAiTransport},
     responses::routes as responses_routes,
 };
 
@@ -174,29 +175,32 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch)
 
 /// Match a request head against every registered API family.
 ///
-/// Families are consulted in registration order. Their path spaces do not
-/// overlap, so at most one can match a given method and path.
+/// HTTP-only families are consulted from a shared list so adding one does not
+/// introduce Chat- or Conversations-specific branching here. Responses is
+/// matched separately because transport is part of its operation identity.
+/// Family path spaces do not overlap, so at most one match can succeed.
 fn classify(method: &str, path: &str, transport: OpenAiTransport) -> Option<OpenAiOperationMatch> {
-    if let Some(route) = conversations_routes::match_route(method, path) {
-        // Conversations is reached over plain HTTP only.
-        if transport == OpenAiTransport::Http {
-            return Some(OpenAiOperationMatch {
-                family: route.spec.family,
-                operation_id: route.spec.operation_id,
-                transport: route.spec.transport,
-            });
-        }
-    }
+    let http_match = (transport == OpenAiTransport::Http).then(|| {
+        [
+            conversations_routes::match_route(method, path).map(|route| classified(route.spec)),
+            chat_completions_routes::match_route(method, path).map(|route| classified(route.spec)),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+    });
+    http_match
+        .flatten()
+        .or_else(|| responses_routes::match_route(method, path, transport).map(|route| classified(route.spec)))
+}
 
-    if let Some(route) = responses_routes::match_route(method, path, transport) {
-        return Some(OpenAiOperationMatch {
-            family: route.spec.family,
-            operation_id: route.spec.operation_id,
-            transport: route.spec.transport,
-        });
+/// Build the published match from shared operation metadata.
+fn classified(spec: &OpenAiOperationSpec) -> OpenAiOperationMatch {
+    OpenAiOperationMatch {
+        family: spec.family,
+        operation_id: spec.operation_id,
+        transport: spec.transport,
     }
-
-    None
 }
 
 /// Determine the transport a request arrived over.

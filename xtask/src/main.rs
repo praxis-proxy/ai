@@ -56,6 +56,10 @@ enum Command {
     /// the pinned OpenAI specification.
     CheckResponsesRegistry,
 
+    /// Check the runtime Chat Completions operation registry against
+    /// the pinned OpenAI specification.
+    CheckChatCompletionsRegistry,
+
     /// Start a quick HTTP test server returning a static
     /// response to every request.
     Echo(echo::Args),
@@ -131,6 +135,7 @@ fn main() {
     match cli.command {
         Command::CheckInference(args) => inference_fixtures::run_check(&args),
         Command::CheckResponsesRegistry => openai_conformance::run_responses_registry_check(),
+        Command::CheckChatCompletionsRegistry => openai_conformance::run_chat_completions_registry_check(),
         Command::Echo(args) => echo::run(args),
         Command::Debug(args) => debug::run(&args),
         Command::LintDeps(args) => lint_deps::run(args),

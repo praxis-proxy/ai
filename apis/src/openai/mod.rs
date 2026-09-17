@@ -9,6 +9,7 @@
     reason = "the shared API client intentionally exposes operations used by different OpenAI filters"
 )]
 pub(crate) mod api_client;
+pub(crate) mod chat_completions;
 pub(crate) mod conversations;
 pub(crate) mod error_response_formatter;
 pub(crate) mod include;
@@ -24,6 +25,9 @@ pub(crate) mod sse;
 pub(crate) mod translation;
 pub(crate) mod url_security;
 
+pub use chat_completions::routes::{
+    ChatCompletionsOperation, ChatCompletionsOperationSpec, operation_specs as chat_completions_operation_specs,
+};
 pub use conversations::{
     ConversationOperation, ConversationOperationSpec, OpenaiConversationsFilter,
     implementation_openapi_json as conversations_openapi_json, operation_specs as conversations_operation_specs,
