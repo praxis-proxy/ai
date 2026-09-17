@@ -3067,6 +3067,45 @@ async fn list_items_desc_order() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test]
+async fn create_conversation_preserves_configuration_update_item() {
+    let filter = build_test_filter();
+
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let body_json = serde_json::json!({
+        "items": [{
+            "id": "item_configuration",
+            "type": "configuration_update",
+            "reasoning": {"effort": "high"}
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from create conversation");
+    };
+    assert_eq!(rejection.status, 200, "create should return 200");
+    let response = rejection_body(&rejection);
+    let conversation_id = response["id"].as_str().unwrap();
+
+    let req = make_request(
+        Method::GET,
+        &format!("/v1/conversations/{conversation_id}/items/item_configuration"),
+    );
+    let mut ctx = make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject from get item");
+    };
+    assert_eq!(rejection.status, 200, "get item should return 200");
+    let response = rejection_body(&rejection);
+    assert_eq!(response["type"], "configuration_update");
+    assert_eq!(response["reasoning"], serde_json::json!({"effort": "high"}));
+}
+
+#[tokio::test]
 async fn create_conversation_with_non_array_items_returns_400() {
     let filter = build_test_filter();
 
