@@ -77,6 +77,24 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.request.provider_parameter_passthrough
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/provider-parameter-passthrough
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.unrepresentable_parameters
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/unrepresentable-parameters
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.native.request
     scopes:
       - messages_native_passthrough

@@ -47,6 +47,12 @@ const RESPONSE_REQUEST_ID_KEY: &str = "anthropic_messages_to_chat_completions.re
 /// the Chat Completions wire shape, not the OpenAI Responses API; any Chat
 /// Completions-compatible backend is a valid target, not only OpenAI.
 ///
+/// Request fields the translation does not map are forwarded untouched for
+/// the backend to validate. Fields whose effect the translated response could
+/// not report truthfully (`service_tier`, `thinking`, `container`,
+/// `inference_geo`, `output_config`, `output_format`, `mcp_servers`) are
+/// rejected with a 400.
+///
 /// # YAML
 ///
 /// ```yaml

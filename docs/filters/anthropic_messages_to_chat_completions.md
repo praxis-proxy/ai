@@ -5,6 +5,10 @@
 
 Transforms Anthropic Messages API requests to Chat Completions-compatible request bodies and transforms compatible responses back. The name refers to the Chat Completions wire shape, not the OpenAI Responses API; any Chat Completions-compatible backend is a valid target, not only OpenAI.
 
+## Configuration Notes
+
+Request fields the translation does not map are forwarded untouched for the backend to validate. Fields whose effect the translated response could not report truthfully (`service_tier`, `thinking`, `container`, `inference_geo`, `output_config`, `output_format`, `mcp_servers`) are rejected with a 400.
+
 ## Configuration
 
 | Field | Type | Required | Description |
