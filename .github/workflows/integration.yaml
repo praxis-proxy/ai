@@ -370,5 +370,5 @@ jobs:
           PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           test -x "$PRAXIS_TEST_CODEX_BIN"
-          cargo test -p praxis-tests-integration --test suite \
+          cargo test -p praxis-tests-integration --features store-sqlite --test suite \
             codex_websocket::pinned_codex_uses_responses_websocket_through_full_flow -- --exact
