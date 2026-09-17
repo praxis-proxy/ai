@@ -179,6 +179,30 @@ fn emit_status_uses_valid_key() {
         "status should be stored with underscore-separated key"
     );
 }
+
+#[test]
+fn parse_search_request_prefers_current_field_and_rejects_invalid_current_field() {
+    let both = serde_json::json!({
+        "action": {"query": "legacy", "queries": ["current one", "current two"]}
+    });
+    let current = parse_search_request(&both, "ws_both").unwrap();
+    assert_eq!(current.queries, ["current one", "current two"]);
+    assert_eq!(
+        current.action,
+        serde_json::json!({"type": "search", "queries": ["current one", "current two"]})
+    );
+
+    let legacy = serde_json::json!({"action": {"query": "legacy"}});
+    let legacy = parse_search_request(&legacy, "ws_legacy").unwrap();
+    assert_eq!(legacy.queries, ["legacy"]);
+    assert_eq!(legacy.action, serde_json::json!({"type": "search", "query": "legacy"}));
+
+    let invalid_current = serde_json::json!({"action": {"query": "legacy", "queries": []}});
+    assert!(
+        parse_search_request(&invalid_current, "ws_invalid").is_none(),
+        "a present but invalid queries field must not fall back to query"
+    );
+}
 // -----------------------------------------------------------------------------
 // Response ownership
 // -----------------------------------------------------------------------------
@@ -406,6 +430,78 @@ async fn on_request_body_executes_search_and_populates_state() {
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0]["type"], "url");
     assert_eq!(sources[0]["url"], "https://rust-lang.org");
+}
+
+#[tokio::test]
+async fn on_request_body_executes_current_queries_without_duplicating_legacy_query() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_search_responses(listener, vec![(200, brave_ok_body()), (200, brave_ok_body())]);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test"}));
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_queries",
+        "action": {
+            "type": "search",
+            "query": "first query",
+            "queries": ["first query", "second query"]
+        }
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.web_search_calls_executed, 1, "one hosted action was dispatched");
+    let output = &state.accumulated_output[0];
+    assert_eq!(
+        output["action"]["queries"],
+        serde_json::json!(["first query", "second query"])
+    );
+    assert!(
+        output["action"].get("query").is_none(),
+        "current output must not retain deprecated query"
+    );
+    let bridge = state
+        .messages
+        .iter()
+        .find(|message| message["type"] == "function_call")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(bridge["arguments"].as_str().unwrap()).unwrap(),
+        serde_json::json!({"queries": ["first query", "second query"]})
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_does_not_fall_back_to_legacy_query_when_queries_is_empty() {
+    let yaml = make_filter_yaml("brave", "test-key");
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test"}));
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_invalid_queries",
+        "action": {"type": "search", "query": "legacy query", "queries": []}
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.web_search_calls_executed, 0);
+    assert_eq!(state.accumulated_output[0]["status"], "incomplete");
+    assert_eq!(state.messages.last().unwrap()["output"], MISSING_QUERY_OUTPUT);
 }
 
 #[tokio::test]
@@ -886,7 +982,13 @@ async fn web_search_continuation_serializes_backend_valid_input() {
 
 #[test]
 fn build_output_item_completed_with_sources_included() {
-    let item = build_output_item("ws_123", "completed", "test query", &[], true);
+    let item = build_output_item(
+        "ws_123",
+        "completed",
+        serde_json::json!({"type": "search", "query": "test query"}),
+        &[],
+        true,
+    );
     assert_eq!(item["type"], "web_search_call");
     assert_eq!(item["id"], "ws_123");
     assert_eq!(item["status"], "completed");
@@ -903,7 +1005,13 @@ fn build_output_item_omits_sources_when_not_included() {
         url: "https://rust-lang.org".into(),
         snippet: "Systems".into(),
     }];
-    let item = build_output_item("ws_123", "completed", "test query", &results, false);
+    let item = build_output_item(
+        "ws_123",
+        "completed",
+        serde_json::json!({"type": "search", "query": "test query"}),
+        &results,
+        false,
+    );
     assert_eq!(item["action"]["type"], "search");
     assert_eq!(item["action"]["query"], "test query");
     assert!(
@@ -926,7 +1034,13 @@ fn build_output_item_with_results() {
             snippet: "Packages".into(),
         },
     ];
-    let item = build_output_item("ws_123", "completed", "search query", &results, true);
+    let item = build_output_item(
+        "ws_123",
+        "completed",
+        serde_json::json!({"type": "search", "query": "search query"}),
+        &results,
+        true,
+    );
     assert!(item.get("sources").is_none(), "no top-level sources");
     let sources = item["action"]["sources"].as_array().unwrap();
     assert_eq!(sources.len(), 2);
@@ -939,7 +1053,13 @@ fn build_output_item_with_results() {
 
 #[test]
 fn build_tool_result_messages_empty() {
-    let [call, output] = build_tool_result_messages("ws_123", "completed", "rust", &[]);
+    let [call, output] = build_tool_result_messages(
+        "ws_123",
+        "completed",
+        &serde_json::json!({"type": "search", "query": "rust"}),
+        &[],
+        "Web search not performed.",
+    );
     assert_eq!(
         call["type"], "function_call",
         "continuation bridge is a backend-valid function_call/function_call_output pair, never a hosted web_search_call"
@@ -960,7 +1080,13 @@ fn build_tool_result_messages_with_results() {
         url: "https://example.com".into(),
         snippet: "A description".into(),
     }];
-    let [call, output] = build_tool_result_messages("ws_123", "completed", "example query", &results);
+    let [call, output] = build_tool_result_messages(
+        "ws_123",
+        "completed",
+        &serde_json::json!({"type": "search", "query": "example query"}),
+        &results,
+        "Web search not performed.",
+    );
     assert_eq!(call["type"], "function_call");
     assert_eq!(call["arguments"], r#"{"query":"example query"}"#);
     assert_eq!(output["type"], "function_call_output");
@@ -1020,8 +1146,14 @@ fn bridge_call_id_is_unique_for_absent_source_ids() {
 }
 
 #[test]
-fn build_failed_tool_result_messages_carry_bounded_notice() {
-    let [call, output] = build_failed_tool_result_messages("ws_123", "rust");
+fn build_tool_result_messages_failed_carry_bounded_notice() {
+    let [call, output] = build_tool_result_messages(
+        "ws_123",
+        "failed",
+        &serde_json::json!({"type": "search", "query": "rust"}),
+        &[],
+        SEARCH_UNAVAILABLE,
+    );
     assert_eq!(
         call["type"], "function_call",
         "failure bridge is a backend-valid function_call/function_call_output pair, never a hosted web_search_call"
@@ -1102,7 +1234,13 @@ fn upsert_output_item_replaces_missing_id_placeholders_independently() {
 fn build_tool_result_messages_incomplete_reports_not_performed() {
     // A non-dispatched call (over-budget or missing query) must not be
     // misrepresented to the model as a completed search with no results.
-    let [call, output] = build_tool_result_messages("ws_123", "incomplete", "rust", &[]);
+    let [call, output] = build_tool_result_messages(
+        "ws_123",
+        "incomplete",
+        &serde_json::json!({"type": "search", "query": "rust"}),
+        &[],
+        "Web search not performed.",
+    );
     assert_eq!(call["type"], "function_call");
     assert_eq!(call["call_id"], "ws_123");
     assert_eq!(output["type"], "function_call_output");

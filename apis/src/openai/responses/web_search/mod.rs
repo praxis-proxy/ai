@@ -89,6 +89,17 @@ struct PendingSearchBatch<'a> {
     context_size: SearchContextSize,
 }
 
+/// A normalized hosted search action ready for dispatch.
+///
+/// The owned action is moved into the public output item after the bridge has
+/// serialized its arguments; no query data is cloned between those paths.
+struct SearchRequest<'a> {
+    /// Queries in provider-supplied order.
+    queries: Vec<&'a str>,
+    /// Canonical client-visible search action.
+    action: Value,
+}
+
 // -----------------------------------------------------------------------------
 // WebSearchFilter
 // -----------------------------------------------------------------------------
@@ -211,28 +222,34 @@ impl WebSearchFilter {
         context_size: SearchContextSize,
     ) -> bool {
         let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
-        let query = call.get("action").and_then(|a| a.get("query")).and_then(Value::as_str);
-
-        let Some(query) = query else {
-            warn!(call_id, "web_search_call missing action.query, skipping");
+        let Some(request) = parse_search_request(call, call_id) else {
+            warn!(
+                call_id,
+                "web_search_call missing valid action.queries or action.query, skipping"
+            );
             let bridge = bridge_call_id(call_id, "", index);
             let ids = SearchCallIds::new(call_id, &bridge, index);
             append_incomplete(ctx, &ids);
             return false;
         };
 
-        let bridge = bridge_call_id(call_id, query, index);
+        let bridge = bridge_call_id(call_id, request.queries[0], index);
         let ids = SearchCallIds::new(call_id, &bridge, index);
-        match self.search_client.search(query, Some(context_size)).await {
-            SearchOutcome::Results(results) => append_result(ctx, &ids, "completed", query, &results),
-            SearchOutcome::Failed => {
-                warn!(
-                    call_id,
-                    "web search provider failed; continuing with a failed tool result"
-                );
-                append_failed(ctx, &ids, query);
-            },
+        let mut results = Vec::new();
+        for query in &request.queries {
+            match self.search_client.search(query, Some(context_size)).await {
+                SearchOutcome::Results(mut query_results) => results.append(&mut query_results),
+                SearchOutcome::Failed => {
+                    warn!(
+                        call_id,
+                        "web search provider failed; continuing with a failed tool result"
+                    );
+                    append_search_turn(ctx, &ids, "failed", request, &[], SEARCH_UNAVAILABLE);
+                    return true;
+                },
+            }
         }
+        append_search_turn(ctx, &ids, "completed", request, &results, "Web search not performed.");
         true
     }
 
@@ -395,6 +412,38 @@ fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
     })
 }
 
+/// Parse a hosted search action while preserving legacy compatibility.
+///
+/// A valid, non-empty `queries` array is authoritative. If it is present but
+/// invalid, do not fall back to `query`: doing so would execute an action other
+/// than the one the provider supplied. When both forms are valid, `query` is
+/// intentionally not appended to the current array, preventing duplicate
+/// dispatch of the same search.
+fn parse_search_request<'a>(call: &'a Value, call_id: &str) -> Option<SearchRequest<'a>> {
+    let action = call.get("action")?;
+    let legacy_query = action.get("query").and_then(Value::as_str);
+    match action.get("queries") {
+        Some(Value::Array(values)) if !values.is_empty() => {
+            let queries = values.iter().map(Value::as_str).collect::<Option<Vec<_>>>()?;
+            if legacy_query.is_some() {
+                warn!(
+                    call_id,
+                    "web_search_call contains deprecated action.query and action.queries; using action.queries"
+                );
+            }
+            Some(SearchRequest {
+                action: serde_json::json!({"type": "search", "queries": queries}),
+                queries,
+            })
+        },
+        Some(_) => None,
+        None => legacy_query.map(|query| SearchRequest {
+            queries: vec![query],
+            action: serde_json::json!({"type": "search", "query": query}),
+        }),
+    }
+}
+
 /// Public and bridge identifiers for one appended web-search result.
 ///
 /// `public` is the hosted, client-facing `web_search_call.id` retained on the
@@ -449,14 +498,15 @@ fn remaining_web_search_budget(state: &ResponsesState) -> usize {
 /// bridge `call_id` unique, mirroring [`WebSearchFilter::execute_single_search`].
 fn append_excess_incomplete(ctx: &mut HttpFilterContext<'_>, call: &Value, index: usize) {
     let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
-    let query = call
-        .get("action")
-        .and_then(|a| a.get("query"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let bridge = bridge_call_id(call_id, query, index);
+    let Some(request) = parse_search_request(call, call_id) else {
+        let bridge = bridge_call_id(call_id, "", index);
+        let ids = SearchCallIds::new(call_id, &bridge, index);
+        append_incomplete(ctx, &ids);
+        return;
+    };
+    let bridge = bridge_call_id(call_id, request.queries[0], index);
     let ids = SearchCallIds::new(call_id, &bridge, index);
-    append_result(ctx, &ids, "incomplete", query, &[]);
+    append_search_turn(ctx, &ids, "incomplete", request, &[], "Web search not performed.");
 }
 
 /// Append a completed search turn to [`ResponsesState`].
@@ -468,16 +518,17 @@ fn append_excess_incomplete(ctx: &mut HttpFilterContext<'_>, call: &Value, index
 /// model-facing history never contradicts the client-visible incomplete output
 /// item or pollutes durable rehydration history. A missing-query call uses the
 /// more specific [`append_incomplete`] instead.
-fn append_result(
+fn append_search_turn(
     ctx: &mut HttpFilterContext<'_>,
     ids: &SearchCallIds<'_>,
     status: &str,
-    query: &str,
+    request: SearchRequest<'_>,
     results: &[SearchResult],
+    failure_output: &'static str,
 ) {
     let include_sources = include_action_sources(ctx);
-    let output_item = build_output_item(ids.public, status, query, results, include_sources);
-    let bridge = build_tool_result_messages(ids.bridge, status, query, results);
+    let bridge = build_tool_result_messages(ids.bridge, status, &request.action, results, failure_output);
+    let output_item = build_output_item(ids.public, status, request.action, results, include_sources);
     push_search_turn(ctx, output_item, bridge, ids.index);
 }
 
@@ -489,38 +540,29 @@ fn append_result(
 /// as a successful search with zero results.
 fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
     let include_sources = include_action_sources(ctx);
-    let output_item = build_output_item(ids.public, "incomplete", "", &[], include_sources);
+    let output_item = build_output_item(
+        ids.public,
+        "incomplete",
+        serde_json::json!({"type": "search", "query": ""}),
+        &[],
+        include_sources,
+    );
     let bridge = build_incomplete_tool_result_messages(ids.bridge);
-    push_search_turn(ctx, output_item, bridge, ids.index);
-}
-
-/// Append a failed search turn to [`ResponsesState`].
-///
-/// The public output item is marked `status: "failed"` and the model receives
-/// the bounded [`SEARCH_UNAVAILABLE`] message through a backend-valid
-/// `function_call`/`function_call_output` bridge — never a hosted
-/// `web_search_call`, which is not a valid `OpenResponses` input (issue #808) —
-/// so the agentic loop continues without exposing provider details to the client.
-fn append_failed(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>, query: &str) {
-    let include_sources = include_action_sources(ctx);
-    let output_item = build_output_item(ids.public, "failed", query, &[], include_sources);
-    let bridge = build_failed_tool_result_messages(ids.bridge, query);
     push_search_turn(ctx, output_item, bridge, ids.index);
 }
 
 /// Append a bounded failure for a call rejected by `max_tool_calls`.
 fn append_tool_limit_exceeded(ctx: &mut HttpFilterContext<'_>, call: &Value, index: usize) {
     let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
-    let query = call
-        .get("action")
-        .and_then(|action| action.get("query"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let bridge_id = bridge_call_id(call_id, query, index);
-    let include_sources = include_action_sources(ctx);
-    let output_item = build_output_item(call_id, "failed", query, &[], include_sources);
-    let bridge = build_failed_tool_result_messages_with_output(&bridge_id, query, TOOL_LIMIT_OUTPUT);
-    push_search_turn(ctx, output_item, bridge, index);
+    let Some(request) = parse_search_request(call, call_id) else {
+        let bridge = bridge_call_id(call_id, "", index);
+        let ids = SearchCallIds::new(call_id, &bridge, index);
+        append_incomplete(ctx, &ids);
+        return;
+    };
+    let bridge = bridge_call_id(call_id, request.queries[0], index);
+    let ids = SearchCallIds::new(call_id, &bridge, index);
+    append_search_turn(ctx, &ids, "failed", request, &[], TOOL_LIMIT_OUTPUT);
 }
 
 /// Whether `action.sources` should be included in output items, per the
@@ -597,15 +639,10 @@ pub(crate) fn emit_status(ctx: &mut HttpFilterContext<'_>, call_id: &str, status
 pub(crate) fn build_output_item(
     call_id: &str,
     status: &str,
-    query: &str,
+    mut action: Value,
     results: &[SearchResult],
     include_sources: bool,
 ) -> Value {
-    let mut action = serde_json::json!({
-        "type": "search",
-        "query": query,
-    });
-
     if include_sources {
         let sources: Vec<Value> = results
             .iter()
@@ -650,17 +687,18 @@ pub(crate) fn build_output_item(
 pub(crate) fn build_tool_result_messages(
     call_id: &str,
     status: &str,
-    query: &str,
+    action: &Value,
     results: &[SearchResult],
+    failure_output: &'static str,
 ) -> [Value; 2] {
     let content = if status != "completed" {
-        "Web search not performed.".to_owned()
+        failure_output.to_owned()
     } else if results.is_empty() {
         "No search results found.".to_owned()
     } else {
         format_search_results(results)
     };
-    let arguments = serde_json::json!({ "query": query }).to_string();
+    let arguments = search_arguments(action).to_string();
 
     [
         serde_json::json!({
@@ -676,6 +714,14 @@ pub(crate) fn build_tool_result_messages(
             "output": content,
         }),
     ]
+}
+
+/// Derive the private function arguments from the client-visible action.
+fn search_arguments(action: &Value) -> Value {
+    match action.get("queries") {
+        Some(queries) => serde_json::json!({"queries": queries}),
+        None => serde_json::json!({"query": action.get("query").and_then(Value::as_str).unwrap_or_default()}),
+    }
 }
 
 /// Build the backend-valid continuation for a call missing `action.query`.
@@ -726,40 +772,4 @@ pub(crate) fn bridge_call_id(source_id: &str, query: &str, index: usize) -> Stri
         }
     }
     format!("ws_{index}_{hash:016x}")
-}
-
-/// Build the backend-valid continuation for a failed search.
-///
-/// Mirrors [`build_tool_result_messages`] but carries the bounded
-/// [`SEARCH_UNAVAILABLE`] notice as the `function_call_output`, so the agentic
-/// loop continues with a truthful failure instead of a fabricated empty result.
-/// A hosted `web_search_call` is not a valid `OpenResponses` input item (issue
-/// #808), so a failure — like a success — must bridge through a synthetic
-/// `function_call` + `function_call_output` pair.
-///
-/// `call_id` must be a bounded, backend-valid identifier from
-/// [`bridge_call_id`]: the raw hosted id can exceed the `OpenResponses`
-/// 64-character `call_id` limit.
-pub(crate) fn build_failed_tool_result_messages(call_id: &str, query: &str) -> [Value; 2] {
-    build_failed_tool_result_messages_with_output(call_id, query, SEARCH_UNAVAILABLE)
-}
-
-/// Build a failed web-search bridge with a caller-selected bounded message.
-fn build_failed_tool_result_messages_with_output(call_id: &str, query: &str, output: &'static str) -> [Value; 2] {
-    let arguments = serde_json::json!({ "query": query }).to_string();
-
-    [
-        serde_json::json!({
-            "type": "function_call",
-            "call_id": call_id,
-            "name": "web_search",
-            "arguments": arguments,
-            "status": "completed",
-        }),
-        serde_json::json!({
-            "type": "function_call_output",
-            "call_id": call_id,
-            "output": output,
-        }),
-    ]
 }
