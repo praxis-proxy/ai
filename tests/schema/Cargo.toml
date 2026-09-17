@@ -8,10 +8,12 @@ readme = "../../README.md"
 publish = false
 
 [features]
-default = ["store-postgres"]
+default = ["store-postgres", "callout-rustls"]
 store-postgres = ["praxis-test-utils/store-postgres"]
 store-sqlite = ["praxis-test-utils/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
+callout-rustls = ["praxis-test-utils/callout-rustls"]
+callout-native-tls = ["praxis-test-utils/callout-native-tls"]
 praxis-main = ["praxis-test-utils/praxis-main"]
 
 [lints]

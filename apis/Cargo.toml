@@ -13,11 +13,13 @@ publish = false
 name = "praxis_ai_apis"
 
 [features]
-default = ["store-postgres"]
+default = ["store-postgres", "callout-rustls"]
 store = ["dep:sqlx", "dep:dashmap"]
 store-postgres = ["store", "sqlx/postgres", "sqlx/tls-native-tls"]
 store-sqlite = ["store", "sqlx/sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
+callout-rustls = ["reqwest/rustls", "rmcp/reqwest"]
+callout-native-tls = ["reqwest/native-tls", "rmcp/reqwest-native-tls"]
 praxis-main = []
 
 [lints]

@@ -58,3 +58,32 @@ A new filter that opens an outbound HTTP connection must:
 7. Document the authentication mode and cover loopback/private/link-local,
    mixed DNS answers, redirects, userinfo, and credential non-disclosure in
    tests.
+
+## TLS backend
+
+By default, outbound callout clients use **rustls** for TLS (the
+`callout-rustls` Cargo feature, enabled by default). The `callout-native-tls`
+feature switches all callout client builders to the platform's native TLS
+implementation (OpenSSL on Linux). This is the expected configuration for
+compliance-oriented builds on RHEL/OpenShift where the system FIPS provider
+enforces approved cipher suites.
+
+Build with the native TLS backend:
+
+```console
+cargo build -p praxis-ai-proxy --no-default-features \
+    --features store-postgres,callout-native-tls
+```
+
+The two features are mutually exclusive in intent. If both are activated, both
+backends compile in; the `test-callout-tls-features` Makefile target catches
+this configuration.
+
+The callout builders themselves (`build_pinned_reqwest_client`,
+`mcp_client::build_pinned_client`, `file_resolve::configure_pinned_client`) do
+not configure a TLS backend. They inherit whichever backend reqwest was
+compiled with. All SSRF, DNS-pinning, redirect, proxy, and timeout controls
+are preserved regardless of the TLS backend.
+
+Test TLS infrastructure (`tests/utils/src/net/tls.rs`) always uses rustls for
+mock servers and certificate generation, independent of the callout backend.

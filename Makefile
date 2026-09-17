@@ -14,6 +14,7 @@ V                ?=
 # crate; it is not a praxis-ai-filters feature.
 FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter
 INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter
+CALLOUT_TLS := callout-rustls
 STORE_ALL_WORKSPACE_FEATURES := praxis-ai-proxy/store-all,praxis-tests-integration/store-all,praxis-tests-schema/store-all,praxis-tests-environment/store-all
 
 ifneq ($(V),)
@@ -22,7 +23,7 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit test-schema test-integration test-inference-fixtures \
-	test-store-features \
+	test-store-features test-callout-tls-features \
 	test-postgres-unit test-postgres-integration test-environment \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
@@ -87,10 +88,10 @@ test-unit:
 
 test-store-features:
 	cargo check -p praxis-ai-proxy
-	cargo check -p praxis-ai-proxy --no-default-features --features store-sqlite
-	cargo check -p praxis-ai-proxy --no-default-features --features store-all
-	cargo test -p praxis-ai-apis --no-default-features --features store-sqlite $(_NOCAPTURE)
-	cargo test -p praxis-ai-apis --no-default-features --features store-all $(_NOCAPTURE)
+	cargo check -p praxis-ai-proxy --no-default-features --features store-sqlite,$(CALLOUT_TLS)
+	cargo check -p praxis-ai-proxy --no-default-features --features store-all,$(CALLOUT_TLS)
+	cargo test -p praxis-ai-apis --no-default-features --features store-sqlite,$(CALLOUT_TLS) $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --no-default-features --features store-all,$(CALLOUT_TLS) $(_NOCAPTURE)
 	@if cargo tree -p praxis-ai-proxy --edges normal | grep -q libsqlite3-sys; then \
 		echo "ERROR: default proxy dependency graph contains libsqlite3-sys"; \
 		exit 1; \
@@ -102,22 +103,40 @@ test-store-features:
 		exit 1; \
 	fi
 
+test-callout-tls-features:
+	cargo check -p praxis-ai-proxy
+	cargo check -p praxis-ai-proxy --no-default-features --features store-postgres,callout-native-tls
+	@cargo tree -p praxis-ai-proxy --edges features -i reqwest | grep -q '__rustls' || \
+		(echo "ERROR: default proxy reqwest does not enable rustls"; exit 1)
+	@if cargo tree -p praxis-ai-proxy --edges features -i reqwest | grep -q 'native-tls'; then \
+		echo "ERROR: default proxy reqwest contains native-tls backend"; \
+		exit 1; \
+	fi
+	@cargo tree -p praxis-ai-proxy --no-default-features --features store-postgres,callout-native-tls \
+		--edges features -i reqwest | grep -q 'native-tls' || \
+		(echo "ERROR: callout-native-tls proxy reqwest does not enable native-tls"; exit 1)
+	@if cargo tree -p praxis-ai-proxy --no-default-features --features store-postgres,callout-native-tls \
+		--edges features -i reqwest | grep -q '__rustls'; then \
+		echo "ERROR: callout-native-tls proxy reqwest contains rustls backend"; \
+		exit 1; \
+	fi
+
 test-schema:
-	cargo test -p praxis-tests-schema --no-default-features --features store-all $(_NOCAPTURE)
+	cargo test -p praxis-tests-schema --no-default-features --features store-all,$(CALLOUT_TLS) $(_NOCAPTURE)
 
 test-integration:
-	cargo test -p praxis-tests-integration --no-default-features --features store-all $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --no-default-features --features store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
+	cargo test -p praxis-tests-integration --no-default-features --features store-all,$(CALLOUT_TLS) $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --no-default-features --features store-all,$(CALLOUT_TLS),$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
 		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit \
 		$(if $(V),--nocapture)
 
 test-inference-fixtures:
-	cargo test -p praxis-test-utils --no-default-features --features store-all $(_NOCAPTURE)
-	cargo test -p xtask --no-default-features --features store-all inference_fixtures $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --no-default-features --features store-all --test suite inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-test-utils --no-default-features --features store-all,$(CALLOUT_TLS) $(_NOCAPTURE)
+	cargo test -p xtask --no-default-features --features store-all,$(CALLOUT_TLS) inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --no-default-features --features store-all,$(CALLOUT_TLS) --test suite inference_fixtures $(_NOCAPTURE)
 
 test-postgres-unit:
-	cargo test -p praxis-ai-apis --no-default-features --features store-all store::tests::pg_ -- --ignored $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --no-default-features --features store-all,$(CALLOUT_TLS) store::tests::pg_ -- --ignored $(_NOCAPTURE)
 
 # Every PostgreSQL integration test is #[ignore]d (each spawns its own
 # container), so it runs only when named here. Enumerate every module explicitly:
@@ -261,6 +280,7 @@ help:
 	@echo "  test                 run all tests"
 	@echo "  test-unit            unit tests (providers, filters, server)"
 	@echo "  test-store-features   check PostgreSQL-only, SQLite-only, and combined store builds"
+	@echo "  test-callout-tls-features  check rustls-only and native-tls-only callout TLS builds"
 	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
 	@echo "  test-inference-fixtures  inference fixture and replay tests"
