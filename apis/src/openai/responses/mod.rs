@@ -152,6 +152,7 @@ pub(crate) const DEFAULT_STORE_NAME: &str = "default";
 
 /// Legacy test tenant value retained for fixture compatibility.
 #[cfg(test)]
+#[cfg(feature = "store-sqlite")]
 pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 
 // -----------------------------------------------------------------------------

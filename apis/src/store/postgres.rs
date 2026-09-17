@@ -6,7 +6,6 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use serde::Deserialize;
 use sqlx::{
     AssertSqlSafe, Row as _,
     postgres::{PgConnectOptions, PgPoolOptions, PgRow, PgSslMode},
@@ -14,6 +13,7 @@ use sqlx::{
 use tracing::info;
 
 use super::{
+    SslMode,
     pool::{PoolConfig, apply_pool_config},
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, TableNames, check_schema,
@@ -24,40 +24,6 @@ use super::{
     types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
 };
 use crate::StateOwner;
-
-// -----------------------------------------------------------------------------
-// SslMode
-// -----------------------------------------------------------------------------
-
-/// TLS mode for `PostgreSQL` connections.
-///
-/// Maps to [`PgSslMode`] from sqlx. Defaults to [`VerifyFull`] which
-/// requires TLS and verifies both the server certificate chain and
-/// hostname. Use [`Disable`] or [`Prefer`] only for local development
-/// with an explicit opt-in.
-///
-/// [`VerifyFull`]: SslMode::VerifyFull
-/// [`Disable`]: SslMode::Disable
-/// [`Prefer`]: SslMode::Prefer
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SslMode {
-    /// Do not use TLS.
-    Disable,
-
-    /// Attempt TLS, fall back to plaintext.
-    Prefer,
-
-    /// Require TLS (reject plaintext).
-    Require,
-
-    /// Require TLS and verify the server certificate chain.
-    VerifyCa,
-
-    /// Require TLS and verify both certificate chain and hostname.
-    #[default]
-    VerifyFull,
-}
 
 impl From<SslMode> for PgSslMode {
     fn from(mode: SslMode) -> Self {
@@ -1203,10 +1169,6 @@ impl ConversationItemStore for PostgresResponseStore {
         row.try_get("max_pos").map_err(|e| StoreError::Database(e.to_string()))
     }
 
-    #[expect(
-        clippy::large_stack_frames,
-        reason = "sqlx transaction state is boxed and remains just above the lint threshold"
-    )]
     async fn create_items_and_sync_messages(
         &self,
         owner: &StateOwner,

@@ -1,4 +1,5 @@
 # Streaming Event Accumulation
+# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
 #
 # Demonstrates the `openai_stream_events` filter, which composes the
 # current iterative-request-router (IRR) execution into one logical

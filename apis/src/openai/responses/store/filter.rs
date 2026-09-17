@@ -57,24 +57,27 @@ use serde_json::Value;
 use tokio::sync::OnceCell;
 use tracing::{debug, trace, warn};
 
+#[cfg(feature = "store-postgres")]
+use super::config::revalidate_postgres_host;
 use super::{
     super::{
         DEFAULT_STORE_NAME, append_stored_input_items, compact::is_explicit_compact_request,
         error::responses_error_rejection, state::ResponsesState,
     },
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
-    config::{ResponseStoreConfig, StorageBackend, revalidate_postgres_host, validate_config},
+    config::{ResponseStoreConfig, StorageBackend, validate_config},
     list_input_items,
 };
+#[cfg(feature = "store-postgres")]
+use crate::store::PostgresResponseStore;
+#[cfg(feature = "store-sqlite")]
+use crate::store::SqliteResponseStore;
 use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
     openai::include::{IncludeFields, decode_query_component_strict, parse_include},
     state_owner::{StateOwner, require_state_owner},
-    store::{
-        PendingApprovalRecord, PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry,
-        SqliteResponseStore, StoreError,
-    },
+    store::{PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, StoreError},
 };
 
 /// Persists Responses API responses to the configured response store backend.
@@ -83,10 +86,11 @@ use crate::{
 ///
 /// ```yaml
 /// filter: openai_response_store
-/// backend: sqlite
-/// database_url: sqlite://responses.db?mode=rwc
+/// backend: postgres
+/// database_url: postgres://praxis:password@db.example.com/praxis
 /// responses_table: openai_responses
 /// conversations_table: openai_conversation_messages
+/// allow_private_database_url: true
 /// ```
 pub struct ResponseStoreFilter {
     /// Parsed configuration.
@@ -121,6 +125,7 @@ impl ResponseStoreFilter {
     #[expect(clippy::too_many_lines, reason = "tracing macros inflate complexity")]
     pub(super) async fn build_store(&self) -> Result<Arc<dyn ResponseStore>, StoreError> {
         match self.config.backend {
+            #[cfg(feature = "store-sqlite")]
             StorageBackend::Sqlite => {
                 let store = SqliteResponseStore::new(
                     self.config.database_url.expose_secret(),
@@ -135,7 +140,11 @@ impl ResponseStoreFilter {
                     arc
                 })
             },
-
+            #[cfg(not(feature = "store-sqlite"))]
+            StorageBackend::Sqlite => Err(StoreError::Unavailable(
+                "sqlite backend was not compiled; enable the 'store-sqlite' feature".to_owned(),
+            )),
+            #[cfg(feature = "store-postgres")]
             StorageBackend::Postgres => {
                 revalidate_postgres_host(&self.config).map_err(|e| {
                     StoreError::Unavailable(format!("postgres host validation failed before connect: {e}"))
@@ -159,6 +168,10 @@ impl ResponseStoreFilter {
                     arc
                 })
             },
+            #[cfg(not(feature = "store-postgres"))]
+            StorageBackend::Postgres => Err(StoreError::Unavailable(
+                "postgres backend was not compiled; enable the 'store-postgres' feature".to_owned(),
+            )),
         }
     }
 

@@ -22,7 +22,10 @@ name = "praxis-ai"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["store-postgres"]
+store-postgres = ["praxis-ai-filters/store-postgres", "praxis-ai-apis/store-postgres"]
+store-sqlite = ["praxis-ai-filters/store-sqlite", "praxis-ai-apis/store-sqlite"]
+store-all = ["store-postgres", "store-sqlite"]
 # Experimental: the generic http_callout filter (see praxis-ai-filters).
 http-callout-filter = ["praxis-ai-filters/http-callout-filter", "experimental"]
 # Experimental: the azure_ad (Entra ID) auth filter (see praxis-ai-filters).
