@@ -285,6 +285,21 @@ async fn json_bedrock_converse_extracts_tokens() {
 }
 
 #[tokio::test]
+async fn json_bedrock_converse_includes_prompt_cache_tokens() {
+    let json = br#"{"usage":{"inputTokens":9,"outputTokens":214,"cacheReadInputTokens":1066,"totalTokens":1289}}"#;
+
+    let (input, output, total) = run_json_extraction(ProviderKind::Bedrock, json).await;
+
+    assert_eq!(
+        input.as_deref(),
+        Some("1075"),
+        "uncached 9 + cache read 1066, matching Anthropic normalization"
+    );
+    assert_eq!(output.as_deref(), Some("214"), "Bedrock output tokens");
+    assert_eq!(total.as_deref(), Some("1289"), "Bedrock total tokens include the cache");
+}
+
+#[tokio::test]
 async fn json_azure_extracts_tokens() {
     let json = br#"{"usage":{"prompt_tokens":5,"completion_tokens":10,"total_tokens":15}}"#;
 
@@ -535,6 +550,26 @@ async fn sse_bedrock_metadata_event() {
     assert_eq!(input.as_deref(), Some("30"), "Bedrock SSE input tokens");
     assert_eq!(output.as_deref(), Some("18"), "Bedrock SSE output tokens");
     assert_eq!(total.as_deref(), Some("48"), "Bedrock SSE total tokens (computed)");
+}
+
+#[tokio::test]
+async fn sse_bedrock_metadata_includes_prompt_cache_tokens() {
+    let events =
+        b"data: {\"metadata\":{\"usage\":{\"inputTokens\":9,\"outputTokens\":214,\"cacheReadInputTokens\":1066}}}\n\n";
+
+    let (input, output, total) = run_sse_extraction(ProviderKind::Bedrock, events).await;
+
+    assert_eq!(
+        input.as_deref(),
+        Some("1075"),
+        "uncached 9 + cache read 1066, matching Anthropic normalization"
+    );
+    assert_eq!(output.as_deref(), Some("214"), "Bedrock SSE output tokens");
+    assert_eq!(
+        total.as_deref(),
+        Some("1289"),
+        "computed SSE total must include folded cache tokens"
+    );
 }
 
 #[tokio::test]
@@ -1103,6 +1138,16 @@ async fn json_openai_responses_records_cache_breakdown() {
 }
 
 #[tokio::test]
+async fn json_bedrock_converse_records_cache_breakdown() {
+    let json = br#"{"usage":{"inputTokens":9,"outputTokens":214,"cacheReadInputTokens":1066,"cacheWriteInputTokens":100,"totalTokens":1389}}"#;
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::Bedrock, "application/json", json).await;
+
+    assert_eq!(cache_read.as_deref(), Some("1066"), "Converse cache read tokens");
+    assert_eq!(cache_write.as_deref(), Some("100"), "Converse cache write tokens");
+}
+
+#[tokio::test]
 async fn json_google_records_cached_content_tokens() {
     let json =
         br#"{"usageMetadata":{"promptTokenCount":1200,"candidatesTokenCount":40,"cachedContentTokenCount":1100}}"#;
@@ -1213,6 +1258,17 @@ async fn sse_openai_responses_records_cache_breakdown() {
 
     assert_eq!(cache_read.as_deref(), Some("900"), "Responses API SSE cache reads");
     assert_eq!(cache_write.as_deref(), Some("80"), "Responses API SSE cache writes");
+}
+
+#[tokio::test]
+async fn sse_bedrock_metadata_records_cache_breakdown() {
+    let events =
+        b"data: {\"metadata\":{\"usage\":{\"inputTokens\":9,\"outputTokens\":214,\"cacheReadInputTokens\":1066,\"cacheWriteInputTokens\":100}}}\n\n";
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::Bedrock, "text/event-stream", events).await;
+
+    assert_eq!(cache_read.as_deref(), Some("1066"), "ConverseStream cache read tokens");
+    assert_eq!(cache_write.as_deref(), Some("100"), "ConverseStream cache write tokens");
 }
 
 #[tokio::test]
