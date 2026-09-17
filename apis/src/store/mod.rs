@@ -3,19 +3,24 @@
 
 //! Response store persistence layer for AI API filters.
 //!
-//! Provides the [`ResponseStore`] async trait, [`SqliteResponseStore`]
-//! backend, and supporting types. Used by AI API filters for
-//! persisting response records and conversation history.
+//! Provides the [`ResponseStore`] async trait, optional SQLite and `PostgreSQL`
+//! backends, and supporting types. Used by AI API filters for persisting
+//! response records and conversation history.
 
 mod pool;
+#[cfg(feature = "store-postgres")]
 mod postgres;
+#[cfg(feature = "store-postgres")]
 pub(crate) mod postgres_url;
 mod schemas;
+#[cfg(feature = "store-sqlite")]
 mod sqlite;
+mod ssl_mode;
 mod trait_def;
 mod types;
 
 #[cfg(test)]
+#[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,
@@ -31,15 +36,17 @@ use std::sync::Arc;
 
 use dashmap::{DashMap, mapref::entry::Entry};
 /// Validate response-store table identifiers.
-pub(crate) use schemas::{
-    validate_identifier as validate_table_identifier, validate_postgres_table_identifiers,
-    validate_postgres_table_set_identifiers,
-};
+pub(crate) use schemas::validate_identifier as validate_table_identifier;
+#[cfg(feature = "store-postgres")]
+pub(crate) use schemas::{validate_postgres_table_identifiers, validate_postgres_table_set_identifiers};
 
+#[cfg(feature = "store-postgres")]
+pub use self::postgres::PostgresResponseStore;
+#[cfg(feature = "store-sqlite")]
+pub use self::sqlite::SqliteResponseStore;
 pub use self::{
     pool::PoolConfig,
-    postgres::{PostgresResponseStore, SslMode},
-    sqlite::SqliteResponseStore,
+    ssl_mode::SslMode,
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
 };

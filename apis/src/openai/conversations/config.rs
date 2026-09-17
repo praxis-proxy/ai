@@ -8,14 +8,14 @@ use praxis_filter::{FilterError, has_dot_dot_traversal};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
-use crate::store::{
-    PoolConfig, SslMode,
-    postgres_url::{
-        self, has_postgres_url_ssl_root_cert, is_verified_postgres_sslmode, postgres_url_sslmode,
-        validate_postgres_url_tls_file_params,
-    },
-    validate_postgres_table_set_identifiers, validate_table_identifier,
+#[cfg(feature = "store-postgres")]
+use crate::store::postgres_url::{
+    self, has_postgres_url_ssl_root_cert, is_verified_postgres_sslmode, postgres_url_sslmode,
+    validate_postgres_url_tls_file_params,
 };
+#[cfg(feature = "store-postgres")]
+use crate::store::validate_postgres_table_set_identifiers;
+use crate::store::{PoolConfig, SslMode, validate_table_identifier};
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_conversations";
@@ -28,10 +28,10 @@ const FILTER_NAME: &str = "openai_conversations";
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StorageBackend {
-    /// SQLite backend (file-backed or in-memory).
+    /// SQLite backend (file-backed or in-memory). Requires `store-sqlite`.
     Sqlite,
 
-    /// `PostgreSQL` backend.
+    /// `PostgreSQL` backend. Enabled by default through `store-postgres`.
     Postgres,
 }
 
@@ -120,6 +120,7 @@ impl ConversationsConfig {
 
 /// Validate the parsed configuration.
 pub(crate) fn validate_config(cfg: &ConversationsConfig) -> Result<(), FilterError> {
+    validate_backend_available(cfg.backend)?;
     let database_url = cfg.database_url.expose_secret();
     if database_url.is_empty() {
         return Err(format!("{FILTER_NAME}: 'database_url' must not be empty").into());
@@ -127,20 +128,51 @@ pub(crate) fn validate_config(cfg: &ConversationsConfig) -> Result<(), FilterErr
     if let Some(pool) = &cfg.pool {
         pool.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
     }
-    let responses_table = validate_table_names(cfg)?;
+    validate_table_names(cfg)?;
     match cfg.backend {
         StorageBackend::Sqlite => {
             validate_sqlite_database_url(database_url)?;
             reject_postgres_fields(cfg)?;
         },
         StorageBackend::Postgres => {
-            postgres_url::validate_postgres_database_url(FILTER_NAME, database_url, cfg.allow_private_database_url)?;
-            validate_postgres_table_set_identifiers(&responses_table, &cfg.conversations_table, Some(&cfg.items_table))
-                .map_err(|e| format!("{FILTER_NAME}: invalid postgres table identifier: {e}"))?;
-            validate_postgres_ssl_config(cfg, database_url)?;
+            #[cfg(feature = "store-postgres")]
+            validate_postgres_config(cfg, database_url)?;
         },
     }
     Ok(())
+}
+
+/// Reject a configured backend that was not compiled into this binary.
+#[cfg_attr(
+    all(feature = "store-postgres", feature = "store-sqlite"),
+    expect(clippy::unnecessary_wraps, reason = "other feature sets reject unavailable backends")
+)]
+fn validate_backend_available(backend: StorageBackend) -> Result<(), FilterError> {
+    match backend {
+        #[cfg(not(feature = "store-sqlite"))]
+        StorageBackend::Sqlite => Err(format!(
+            "{FILTER_NAME}: backend 'sqlite' is unavailable; rebuild with the 'store-sqlite' feature"
+        )
+        .into()),
+        #[cfg(feature = "store-sqlite")]
+        StorageBackend::Sqlite => Ok(()),
+        #[cfg(not(feature = "store-postgres"))]
+        StorageBackend::Postgres => Err(format!(
+            "{FILTER_NAME}: backend 'postgres' is unavailable; rebuild with the 'store-postgres' feature"
+        )
+        .into()),
+        #[cfg(feature = "store-postgres")]
+        StorageBackend::Postgres => Ok(()),
+    }
+}
+
+/// Validate configuration that is specific to the `PostgreSQL` backend.
+#[cfg(feature = "store-postgres")]
+fn validate_postgres_config(cfg: &ConversationsConfig, database_url: &str) -> Result<(), FilterError> {
+    postgres_url::validate_postgres_database_url(FILTER_NAME, database_url, cfg.allow_private_database_url)?;
+    validate_postgres_table_set_identifiers(&cfg.responses_table(), &cfg.conversations_table, Some(&cfg.items_table))
+        .map_err(|e| format!("{FILTER_NAME}: invalid postgres table identifier: {e}"))?;
+    validate_postgres_ssl_config(cfg, database_url)
 }
 
 /// Validate all table name identifiers and uniqueness constraints.
@@ -178,12 +210,14 @@ fn validate_sqlite_database_url(database_url: &str) -> Result<(), FilterError> {
 
 /// Re-validate only the `PostgreSQL` host/IP portions of the
 /// connection URL immediately before `SQLx` resolves and connects.
+#[cfg(feature = "store-postgres")]
 pub(crate) fn revalidate_postgres_host(cfg: &ConversationsConfig) -> Result<(), FilterError> {
     let database_url = cfg.database_url.expose_secret();
     postgres_url::revalidate_postgres_host(FILTER_NAME, database_url, cfg.allow_private_database_url)
 }
 
 /// Validate `PostgreSQL` TLS options.
+#[cfg(feature = "store-postgres")]
 fn validate_postgres_ssl_config(cfg: &ConversationsConfig, database_url: &str) -> Result<(), FilterError> {
     validate_postgres_url_tls_file_params(FILTER_NAME, database_url)?;
 
@@ -201,6 +235,7 @@ fn validate_postgres_ssl_config(cfg: &ConversationsConfig, database_url: &str) -
 }
 
 /// Return whether any configured `PostgreSQL` root CA path is present.
+#[cfg(feature = "store-postgres")]
 fn has_postgres_ssl_root_cert(cfg: &ConversationsConfig, database_url: &str) -> bool {
     cfg.ssl_root_cert.is_some() || has_postgres_url_ssl_root_cert(database_url)
 }
@@ -210,6 +245,7 @@ fn has_postgres_ssl_root_cert(cfg: &ConversationsConfig, database_url: &str) -> 
 /// When no explicit `ssl_mode` is set, the runtime default is
 /// [`SslMode::VerifyFull`], so the `None` case is considered verified
 /// unless the URL carries a non-verifying `sslmode`.
+#[cfg(feature = "store-postgres")]
 fn has_verified_postgres_ssl_mode(cfg: &ConversationsConfig, database_url: &str) -> bool {
     match cfg.ssl_mode {
         Some(SslMode::VerifyCa | SslMode::VerifyFull) => true,
@@ -254,4 +290,38 @@ fn sqlite_file_path(database_url: &str) -> Option<&str> {
         .strip_prefix("sqlite://")
         .or_else(|| database_url.strip_prefix("sqlite:"))
         .map(|rest| rest.split_once('?').map_or(rest, |(path, _query)| path))
+}
+
+#[cfg(test)]
+#[cfg(any(not(feature = "store-postgres"), not(feature = "store-sqlite")))]
+#[expect(clippy::allow_attributes, reason = "test-only panic assertions")]
+#[allow(clippy::expect_used, reason = "tests")]
+mod backend_availability_tests {
+    use super::super::OpenaiConversationsFilter;
+
+    #[cfg(not(feature = "store-sqlite"))]
+    #[test]
+    fn from_config_rejects_sqlite_when_backend_is_not_compiled() {
+        let yaml = serde_yaml::from_str("backend: sqlite\ndatabase_url: 'sqlite::memory:'\n").expect("valid YAML");
+
+        let error = OpenaiConversationsFilter::from_config(&yaml)
+            .err()
+            .expect("unavailable SQLite backend must fail during construction");
+
+        assert!(error.to_string().contains("'store-sqlite' feature"), "{error}");
+    }
+
+    #[cfg(not(feature = "store-postgres"))]
+    #[test]
+    fn from_config_rejects_postgres_when_backend_is_not_compiled() {
+        let yaml =
+            serde_yaml::from_str("backend: postgres\ndatabase_url: 'postgres://user:password@example.com/database'\n")
+                .expect("valid YAML");
+
+        let error = OpenaiConversationsFilter::from_config(&yaml)
+            .err()
+            .expect("unavailable PostgreSQL backend must fail during construction");
+
+        assert!(error.to_string().contains("'store-postgres' feature"), "{error}");
+    }
 }

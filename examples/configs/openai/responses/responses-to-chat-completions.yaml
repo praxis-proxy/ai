@@ -1,4 +1,5 @@
 # Responses API to Chat Completions
+# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
 #
 # Accepts OpenAI Responses create requests, including finite stored
 # continuations, while targeting a backend that only implements

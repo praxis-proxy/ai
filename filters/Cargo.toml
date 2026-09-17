@@ -13,8 +13,12 @@ publish = false
 name = "praxis_ai_filters"
 
 [features]
-default = ["apis"]
-apis = ["praxis-ai-apis/default"]
+default = ["store-postgres"]
+# Backwards-compatible alias for the previous default API feature.
+apis = ["store-postgres"]
+store-postgres = ["praxis-ai-apis/store-postgres"]
+store-sqlite = ["praxis-ai-apis/store-sqlite"]
+store-all = ["store-postgres", "store-sqlite"]
 # Experimental: the generic http_callout filter. Work in progress; the config
 # surface may change. Activates the `experimental` marker.
 http-callout-filter = ["experimental"]

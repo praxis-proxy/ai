@@ -8,6 +8,15 @@ readme = "../../README.md"
 publish = false
 
 [features]
+default = ["store-postgres"]
+store-postgres = [
+    "praxis-ai-proxy/store-postgres",
+    "praxis-test-utils/store-postgres",
+    "sqlx/postgres",
+    "sqlx/tls-native-tls",
+]
+store-sqlite = ["praxis-ai-proxy/store-sqlite", "praxis-test-utils/store-sqlite", "sqlx/sqlite"]
+store-all = ["store-postgres", "store-sqlite"]
 cpex-policy-engine = []
 # Experimental: gates the lakera-guard example test, which needs the
 # http_callout filter registered in the in-process proxy registry.

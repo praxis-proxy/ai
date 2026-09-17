@@ -1419,6 +1419,7 @@ fn reject_server_error(message: &str) -> FilterAction {
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg(feature = "store-sqlite")]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,

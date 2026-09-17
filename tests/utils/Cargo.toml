@@ -8,6 +8,10 @@ readme = "../../README.md"
 publish = false
 
 [features]
+default = ["store-postgres"]
+store-postgres = ["praxis-ai-apis/store-postgres", "praxis-ai-proxy/store-postgres"]
+store-sqlite = ["praxis-ai-apis/store-sqlite", "praxis-ai-proxy/store-sqlite"]
+store-all = ["store-postgres", "store-sqlite"]
 llmd-ext-proc = [
     "praxis-ai-proxy/llmd-ext-proc",
     "dep:praxis-ai-llmd-ext-proc",
