@@ -1249,6 +1249,8 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1281,13 +1283,15 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::LiveCovered,
+                CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 25);
-        assert_eq!(report.scenarios_total, 25);
-        assert_eq!(report.recordings_total, 30);
+        assert_eq!(report.features_total, 27);
+        assert_eq!(report.scenarios_total, 26);
+        assert_eq!(report.recordings_total, 31);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1307,6 +1311,7 @@ mod tests {
                 "responses/chat-basic-stream",
                 "responses/chat-file-search",
                 "responses/chat-malformed-compaction",
+                "responses/chat-reasoning-nonstream",
                 "responses/chat-tool-echo",
                 "responses/chat-web-search",
                 "responses/chat-web-search-stream",
@@ -1318,7 +1323,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 25);
+        assert_eq!(manifest.features.len(), 27);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1452,6 +1457,14 @@ mod tests {
                     &vec!["responses/chat-basic-nonstream".to_owned()]
                 ),
                 (
+                    &"responses.chat.reasoning.request".to_owned(),
+                    &vec!["responses/chat-reasoning-nonstream".to_owned()]
+                ),
+                (
+                    &"responses.chat.reasoning.response".to_owned(),
+                    &vec!["responses/chat-reasoning-nonstream".to_owned()]
+                ),
+                (
                     &"responses.chat.malformed_compaction".to_owned(),
                     &vec!["responses/chat-malformed-compaction".to_owned()]
                 ),
@@ -1545,7 +1558,27 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[13..] {
+        for feature in &manifest.features[13..23] {
+            assert_eq!(
+                feature
+                    .providers
+                    .iter()
+                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                    .collect::<Vec<_>>(),
+                vec![("synthetic", CoverageStatus::SyntheticOnly)]
+            );
+        }
+        for feature in &manifest.features[23..25] {
+            assert_eq!(
+                feature
+                    .providers
+                    .iter()
+                    .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                    .collect::<Vec<_>>(),
+                vec![("vllm", CoverageStatus::LiveCovered)]
+            );
+        }
+        for feature in &manifest.features[25..] {
             assert_eq!(
                 feature
                     .providers

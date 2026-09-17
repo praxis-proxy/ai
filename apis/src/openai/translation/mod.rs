@@ -4,6 +4,7 @@
 //! Provider request and response translation helpers.
 
 pub(crate) mod chat_completions;
+pub(crate) mod reasoning;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -17,6 +18,8 @@ pub(crate) mod chat_completions;
 )]
 mod tests {
     use serde_json::{Value, json};
+
+    use super::reasoning::ReasoningOptions;
 
     fn map(request: &Value) -> Value {
         super::chat_completions::responses_request_to_chat_request(request).unwrap()
@@ -1874,6 +1877,18 @@ mod tests {
     // Request translation: reasoning
     // -------------------------------------------------------------------------
 
+    fn vllm_options() -> ReasoningOptions {
+        ReasoningOptions {
+            dialect: super::reasoning::ReasoningDialect::Vllm,
+            ..ReasoningOptions::default()
+        }
+    }
+
+    fn validate_reasoning(request: &Value, reasoning: &ReasoningOptions) -> Result<(), String> {
+        super::reasoning::validate_requested_reasoning(request.as_object().unwrap(), reasoning)
+            .map_err(|error| error.to_string())
+    }
+
     #[test]
     fn reasoning_without_effort_does_not_set_reasoning_effort() {
         let mapped = map(&json!({
@@ -1890,6 +1905,420 @@ mod tests {
         let mapped = map(&json!({"model": "m", "input": "hello"}));
 
         assert!(mapped.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn summary_request_rejected_for_dialect_without_safe_summary() {
+        let error = validate_reasoning(
+            &json!({"model": "m", "input": "hi", "reasoning": {"summary": "auto"}}),
+            &vllm_options(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("reasoning.summary is not supported"));
+    }
+
+    #[test]
+    fn deprecated_generate_summary_request_rejected() {
+        let error = validate_reasoning(
+            &json!({"model": "m", "input": "hi", "reasoning": {"generate_summary": "concise"}}),
+            &vllm_options(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("reasoning.summary is not supported"));
+    }
+
+    #[test]
+    fn conflicting_summary_controls_rejected() {
+        let error = validate_reasoning(
+            &json!({
+                "model": "m",
+                "input": "hi",
+                "reasoning": {"summary": "auto", "generate_summary": "detailed"}
+            }),
+            &vllm_options(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("conflict"));
+    }
+
+    #[test]
+    fn null_summary_is_not_a_request() {
+        validate_reasoning(
+            &json!({"model": "m", "input": "hi", "reasoning": {"summary": Value::Null, "effort": "low"}}),
+            &vllm_options(),
+        )
+        .expect("null summary is not a summary request");
+
+        // Reasoning effort still translates independently of the summary control.
+        let mapped = map(&json!({"model": "m", "input": "hi", "reasoning": {"effort": "low"}}));
+        assert_eq!(mapped["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn matching_summary_controls_still_rejected_by_capability() {
+        let error = validate_reasoning(
+            &json!({
+                "model": "m",
+                "input": "hi",
+                "reasoning": {"summary": "auto", "generate_summary": "auto"}
+            }),
+            &vllm_options(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("reasoning.summary is not supported"));
+    }
+
+    #[test]
+    fn non_string_summary_control_is_rejected() {
+        for control in ["summary", "generate_summary"] {
+            for value in [json!(true), json!(1), json!({}), json!([])] {
+                let error = validate_reasoning(
+                    &json!({"model": "m", "input": "hi", "reasoning": {control: value}}),
+                    &vllm_options(),
+                )
+                .unwrap_err();
+
+                assert!(
+                    error.contains(&format!("reasoning.{control} must be a string or null")),
+                    "expected malformed {control} rejection, got: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_object_reasoning_block_is_rejected() {
+        for value in [json!(true), json!(1), json!("auto"), json!([])] {
+            let error = validate_reasoning(
+                &json!({"model": "m", "input": "hi", "reasoning": value}),
+                &vllm_options(),
+            )
+            .unwrap_err();
+
+            assert!(
+                error.contains("reasoning must be an object or null"),
+                "expected malformed reasoning-block rejection, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn null_reasoning_block_is_accepted() {
+        validate_reasoning(
+            &json!({"model": "m", "input": "hi", "reasoning": Value::Null}),
+            &vllm_options(),
+        )
+        .expect("null reasoning block is not a request");
+    }
+
+    #[test]
+    fn rehydrated_reasoning_input_item_is_dropped_not_rejected() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {
+                    "id": "rs_abc",
+                    "type": "reasoning",
+                    "status": "completed",
+                    "summary": [],
+                    "content": [{"type": "reasoning_text", "text": "prior cot"}]
+                },
+                {"role": "user", "content": "continue"}
+            ]
+        }));
+
+        let messages = mapped["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "continue");
+    }
+
+    // -------------------------------------------------------------------------
+    // Response translation: reasoning extraction
+    // -------------------------------------------------------------------------
+
+    fn vllm_message_response(reasoning_fields: &[(&str, Value)]) -> Value {
+        let mut response = json!({
+            "id": "chatcmpl-r",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [{
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "the answer"
+                }
+            }]
+        });
+        for (field, value) in reasoning_fields {
+            response["choices"][0]["message"][*field] = value.clone();
+        }
+        response
+    }
+
+    /// Legacy vLLM shape: raw reasoning in the deprecated `reasoning_content` field.
+    fn vllm_reasoning_response(reasoning_content: Value) -> Value {
+        vllm_message_response(&[("reasoning_content", reasoning_content)])
+    }
+
+    fn vllm_context(request: &Value) -> super::chat_completions::ResponseContext<'_> {
+        super::chat_completions::ResponseContext::from_responses_request(request, "abc".to_owned(), 0)
+            .with_completed_at(1)
+            .with_reasoning_options(vllm_options())
+    }
+
+    #[test]
+    fn vllm_reasoning_content_becomes_reasoning_item_before_message() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context = vllm_context(&request);
+        let response = vllm_reasoning_response(json!("step by step"));
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        let output = mapped["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["id"], "rs_abc");
+        assert_eq!(output[0]["summary"], json!([]));
+        assert_eq!(output[0]["content"][0]["type"], "reasoning_text");
+        assert_eq!(output[0]["content"][0]["text"], "step by step");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "the answer");
+    }
+
+    #[test]
+    fn current_vllm_reasoning_field_becomes_reasoning_item() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context = vllm_context(&request);
+        let response = vllm_message_response(&[("reasoning", json!("current field cot"))]);
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        let output = mapped["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"][0]["text"], "current field cot");
+        assert_eq!(output[1]["type"], "message");
+    }
+
+    #[test]
+    fn null_legacy_alias_does_not_mask_current_reasoning_field() {
+        // Newer vLLM emits `reasoning` and sets the deprecated `reasoning_content`
+        // alias to null; the null alias must not short-circuit extraction.
+        let request = json!({"model": "m", "input": "hi"});
+        let context = vllm_context(&request);
+        let response = vllm_message_response(&[("reasoning", json!("real cot")), ("reasoning_content", Value::Null)]);
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["output"][0]["type"], "reasoning");
+        assert_eq!(mapped["output"][0]["content"][0]["text"], "real cot");
+    }
+
+    #[test]
+    fn current_reasoning_field_is_preferred_over_legacy_alias() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context = vllm_context(&request);
+        let response =
+            vllm_message_response(&[("reasoning", json!("current")), ("reasoning_content", json!("legacy"))]);
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["output"][0]["content"][0]["text"], "current");
+    }
+
+    #[test]
+    fn empty_current_reasoning_falls_back_to_legacy_alias() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context = vllm_context(&request);
+        let response = vllm_message_response(&[("reasoning", json!("")), ("reasoning_content", json!("legacy cot"))]);
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["output"][0]["type"], "reasoning");
+        assert_eq!(mapped["output"][0]["content"][0]["text"], "legacy cot");
+    }
+
+    #[test]
+    fn reasoning_content_never_populates_summary() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context = vllm_context(&request);
+        let response = vllm_reasoning_response(json!("secret chain of thought"));
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["output"][0]["summary"], json!([]));
+    }
+
+    #[test]
+    fn empty_reasoning_content_yields_no_reasoning_item() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context = vllm_context(&request);
+        let response = vllm_reasoning_response(json!(""));
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["output"][0]["type"], "message");
+    }
+
+    #[test]
+    fn none_dialect_ignores_reasoning_content() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context = super::chat_completions::ResponseContext::from_responses_request(&request, "abc".to_owned(), 0)
+            .with_completed_at(1);
+        let response = vllm_reasoning_response(json!("ignored"));
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["output"][0]["type"], "message");
+    }
+
+    /// A completed choice whose only output is raw reasoning (no content,
+    /// refusal, or tool calls).
+    fn vllm_reasoning_only_response() -> Value {
+        json!({
+            "id": "chatcmpl-r",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [{
+                "finish_reason": "stop",
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "reasoning": "only chain of thought"
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn reasoning_only_completion_is_accepted_as_output() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context = vllm_context(&request);
+        let response = vllm_reasoning_only_response();
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["status"], "completed");
+        let output = mapped["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"][0]["text"], "only chain of thought");
+    }
+
+    #[test]
+    fn reasoning_only_completion_rejected_without_dialect() {
+        // Under the `none` dialect the reasoning is not extractable, so the
+        // completed choice truthfully carries no output and must be rejected.
+        let request = json!({"model": "m", "input": "hi"});
+        let context = super::chat_completions::ResponseContext::from_responses_request(&request, "abc".to_owned(), 0)
+            .with_completed_at(1);
+        let response = vllm_reasoning_only_response();
+
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("first choice message has no supported output"),
+            "expected empty-output rejection, got: {error}"
+        );
+    }
+
+    #[test]
+    fn oversized_reasoning_content_fails_closed() {
+        let request = json!({"model": "m", "input": "hi"});
+        let options = ReasoningOptions {
+            dialect: super::reasoning::ReasoningDialect::Vllm,
+            max_reasoning_bytes: 4,
+        };
+        let context = super::chat_completions::ResponseContext::from_responses_request(&request, "abc".to_owned(), 0)
+            .with_completed_at(1)
+            .with_reasoning_options(options);
+        let response = vllm_reasoning_response(json!("way too long"));
+
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds the configured maximum"));
+    }
+
+    #[test]
+    fn malformed_reasoning_content_fails_closed() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context = vllm_context(&request);
+        let response = vllm_reasoning_response(json!({"unexpected": "object"}));
+
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
+
+        assert!(error.to_string().contains("malformed raw reasoning"));
+    }
+
+    #[test]
+    fn request_reasoning_controls_are_echoed_on_resource() {
+        let request = json!({"model": "m", "input": "hi", "reasoning": {"effort": "high"}});
+        let context = vllm_context(&request);
+        let response = vllm_reasoning_response(json!("cot"));
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["reasoning"]["effort"], "high");
+        assert_eq!(mapped["reasoning"]["summary"], Value::Null);
+    }
+
+    #[test]
+    fn deprecated_generate_summary_is_normalized_on_resource() {
+        let request = json!({"model": "m", "input": "hi", "reasoning": {"generate_summary": "concise"}});
+        let context = vllm_context(&request);
+        let response = vllm_reasoning_response(json!("cot"));
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["reasoning"]["summary"], "concise");
+    }
+
+    #[test]
+    fn conflicting_reasoning_summary_fails_closed_on_resource() {
+        // Request-path validation normally rejects a conflict first, but the
+        // response path must fail closed rather than silently emit summary: null.
+        let request = json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"summary": "detailed", "generate_summary": "concise"},
+        });
+        let context = vllm_context(&request);
+        let response = vllm_reasoning_response(json!("cot"));
+
+        let error = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::chat_completions::TranslationError::ConflictingReasoningSummary
+        ));
+    }
+
+    #[test]
+    fn conflicting_reasoning_summary_fails_closed_on_in_progress_snapshot() {
+        // The streaming lifecycle snapshot must fail closed on the same conflict
+        // rather than silently emit reasoning: null.
+        let request = json!({
+            "model": "m",
+            "input": "hi",
+            "reasoning": {"summary": "detailed", "generate_summary": "concise"},
+        });
+        let context = vllm_context(&request);
+
+        let error = super::chat_completions::in_progress_response_resource(&context).unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::chat_completions::TranslationError::ConflictingReasoningSummary
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -2622,7 +3051,7 @@ mod tests {
     fn null_service_tier_in_request_context_defaults_in_progress_snapshot() {
         let request = json!({"model": "gpt-4.1-mini", "input": "Hi", "service_tier": Value::Null});
         let context = make_response_context(&request);
-        let snapshot = super::chat_completions::in_progress_response_resource(&context);
+        let snapshot = super::chat_completions::in_progress_response_resource(&context).unwrap();
         assert_eq!(snapshot["status"], "in_progress");
         assert_eq!(
             snapshot["service_tier"], "default",

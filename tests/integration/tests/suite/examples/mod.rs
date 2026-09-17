@@ -62,6 +62,7 @@ mod rehydrate;
 mod responses_routing;
 mod responses_to_chat_completions;
 mod responses_to_chat_completions_conformance;
+mod responses_to_chat_completions_reasoning;
 mod session_replay;
 mod state_owner_headers;
 mod time_to_first_token;
