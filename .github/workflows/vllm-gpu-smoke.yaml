@@ -36,7 +36,7 @@ jobs:
       ec2-instance-id: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@e3ddf4a3c70b81927282e7806a74ba64ab497e47 # v4.0.2
+        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -71,7 +71,7 @@ jobs:
 
       - name: Start EC2 runner
         id: start-ec2-runner
-        uses: machulav/ec2-github-runner@fcfb30c508638ca007871b69335805e2d1d07c08 # v2.3.9
+        uses: machulav/ec2-github-runner@a8c20fc0876503410b2b966c124abc2311984ce2 # v2.3.9
         with:
           mode: start
           github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
@@ -199,14 +199,14 @@ jobs:
       contents: read
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@e3ddf4a3c70b81927282e7806a74ba64ab497e47 # v4.0.2
+        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
           role-session-name: praxis-gpu-smoke-stop
 
       - name: Stop EC2 runner
-        uses: machulav/ec2-github-runner@fcfb30c508638ca007871b69335805e2d1d07c08 # v2.3.9
+        uses: machulav/ec2-github-runner@a8c20fc0876503410b2b966c124abc2311984ce2 # v2.3.9
         with:
           mode: stop
           github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
