@@ -2730,6 +2730,37 @@ fn model_output_ordering_survives_all_three_dispatchers() {
     assert_eq!(state.tool_calls[0]["name"], "server__lookup");
 }
 
+#[test]
+fn streamed_provider_conversation_marks_persisted_history() {
+    let mut state = ResponsesState {
+        conversation: Some(json!({"id": "conv_native"})),
+        messages: vec![json!({"role": "user", "content": "weather in SF"})],
+        response_object: json!({
+            "output": [{
+                "type": "function_call",
+                "id": "fc_123",
+                "call_id": "call_123",
+                "name": "weather__get_weather",
+                "arguments": "{}",
+                "status": "completed"
+            }]
+        }),
+        ..ResponsesState::default()
+    };
+
+    super::collect_streaming_output_items(&mut state);
+
+    assert_eq!(
+        state.provider_history_len,
+        state.messages.len(),
+        "provider history must include the streamed function call"
+    );
+    assert_eq!(
+        state.provider_history_len, 2,
+        "prompt and function call should be persisted"
+    );
+}
+
 /// Regression (#955): the sole owner stamps a stable synthetic id on every
 /// id-less output item before accumulation, so the public response never ships an
 /// item without an id. A private `function_call(name=file_search)` that arrives

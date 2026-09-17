@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 
 use super::types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError};
+use crate::StateOwner;
 
 // -----------------------------------------------------------------------------
 // ResponseStore Trait
@@ -14,11 +15,11 @@ use super::types::{ConversationItemRecord, ConversationRecord, PendingApprovalRe
 
 /// Async persistence layer for Responses API records.
 ///
-/// Every query is tenant-scoped. Single-tenant deployments pass a
-/// default sentinel (e.g., `"default"`) as the `tenant_id`.
+/// Every request-driven query is scoped to the exact tenant, issuer, and
+/// subject in [`StateOwner`].
 ///
-/// `get_response` returns `None` for both "not found" and "wrong
-/// tenant" to avoid information leakage.
+/// `get_response` returns `None` for both "not found" and "wrong owner" to
+/// avoid information leakage.
 ///
 /// Conversation access is read-only here so response rehydration can
 /// load cached conversations without taking ownership of conversation
@@ -28,7 +29,8 @@ pub trait ResponseStore: Send + Sync {
     /// Insert or update a response record.
     ///
     /// Uses the record's [`id`] as the primary key. If a record
-    /// with the same ID already exists, it is replaced entirely.
+    /// with the same ID and owner already exists, its mutable fields are
+    /// replaced. A colliding ID owned by another principal is unchanged.
     ///
     /// [`id`]: ResponseRecord::id
     ///
@@ -37,20 +39,20 @@ pub trait ResponseStore: Send + Sync {
     /// Returns [`StoreError`] if the database operation fails.
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError>;
 
-    /// Retrieve a response by ID, scoped to a tenant.
+    /// Retrieve a response by ID, scoped to an exact owner.
     ///
     /// Returns `None` if the response does not exist or belongs
-    /// to a different tenant.
+    /// to a different owner.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if the database operation fails.
-    async fn get_response(&self, tenant_id: &str, id: &str) -> Result<Option<ResponseRecord>, StoreError>;
+    async fn get_response(&self, owner: &StateOwner, id: &str) -> Result<Option<ResponseRecord>, StoreError>;
 
-    /// Delete a response by ID, scoped to a tenant.
+    /// Delete a response by ID, scoped to an exact owner.
     ///
     /// Returns `true` if a record was deleted, `false` if no
-    /// matching record existed for this tenant.
+    /// matching record existed for this owner.
     ///
     /// Any server-owned pending approvals issued by the deleted response are
     /// removed in the same transaction, so deleting a response leaves no
@@ -59,19 +61,19 @@ pub trait ResponseStore: Send + Sync {
     /// # Errors
     ///
     /// Returns [`StoreError`] if the database operation fails.
-    async fn delete_response(&self, tenant_id: &str, id: &str) -> Result<bool, StoreError>;
+    async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError>;
 
-    /// Retrieve conversation messages by conversation ID and tenant.
+    /// Retrieve conversation messages by conversation ID and owner.
     ///
     /// Returns `None` if the conversation does not exist or belongs
-    /// to a different tenant.
+    /// to a different owner.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if the database operation fails.
     async fn get_conversation(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError>;
 
@@ -89,7 +91,7 @@ pub trait ResponseStore: Send + Sync {
     /// originating `previous_response_id` to load or consume it.
     ///
     /// Writes are idempotent: a row that already exists for
-    /// `(tenant_id, response_id, approval_id)` is left untouched, so re-emitting
+    /// `(owner, response_id, approval_id)` is left untouched, so re-emitting
     /// the same pending approval never resets an already-consumed row back to
     /// outstanding (which would enable replay).
     ///
@@ -98,7 +100,7 @@ pub trait ResponseStore: Send + Sync {
     /// Returns [`StoreError`] if the database operation fails.
     async fn record_pending_approvals(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         response_id: &str,
         records: &[PendingApprovalRecord],
         created_at: i64,
@@ -138,7 +140,7 @@ pub trait ResponseStore: Send + Sync {
     ) -> Result<(), StoreError> {
         self.upsert_response(record).await?;
         if !pending_approvals.is_empty() {
-            self.record_pending_approvals(&record.tenant_id, &record.id, pending_approvals, record.created_at)
+            self.record_pending_approvals(&record.owner, &record.id, pending_approvals, record.created_at)
                 .await?;
         }
         Ok(())
@@ -170,7 +172,7 @@ pub trait ResponseStore: Send + Sync {
     /// Returns [`StoreError`] if the database operation fails.
     async fn get_pending_approvals(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         response_id: &str,
         approval_ids: &[&str],
     ) -> Result<Vec<PendingApprovalRecord>, StoreError>;
@@ -180,7 +182,7 @@ pub trait ResponseStore: Send + Sync {
     ///
     /// Within a single database transaction, stamps `consumed_at` (epoch
     /// milliseconds) on each server-owned pending row in `approval_ids` for
-    /// `(tenant_id, response_id)`, transitioning it from outstanding
+    /// `(owner, response_id)`, transitioning it from outstanding
     /// (`consumed_at IS NULL`) to consumed. Callers first look the rows up via
     /// [`get_pending_approvals`] under the same `response_id`, so every id
     /// passed here is known to have a pending row; a row that fails to
@@ -208,7 +210,7 @@ pub trait ResponseStore: Send + Sync {
     /// unclaimed approvals.
     async fn consume_approvals(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         response_id: &str,
         approval_ids: &[&str],
         consumed_at: i64,
@@ -223,7 +225,7 @@ pub trait ResponseStore: Send + Sync {
 ///
 /// Provides full conversation lifecycle management plus CRUD
 /// operations for individual items within a conversation. Every query
-/// is tenant- and conversation-scoped.
+/// is exact-owner- and conversation-scoped.
 #[async_trait]
 pub trait ConversationItemStore: Send + Sync {
     /// Insert or update a conversation message cache.
@@ -236,14 +238,14 @@ pub trait ConversationItemStore: Send + Sync {
     /// Update only the denormalized message cache for a conversation.
     ///
     /// Returns `true` if a record was updated, `false` if no matching
-    /// conversation existed for this tenant.
+    /// conversation existed for this owner.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if the database operation fails.
     async fn update_conversation_messages(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         messages: &serde_json::Value,
     ) -> Result<bool, StoreError>;
@@ -252,7 +254,7 @@ pub trait ConversationItemStore: Send + Sync {
     /// cache untouched.
     ///
     /// Returns `true` if a record was updated, `false` if no matching
-    /// conversation existed for this tenant.
+    /// conversation existed for this owner.
     ///
     /// This is a targeted single-column write: it never reads or rewrites
     /// `messages`, so a metadata update cannot clobber a `messages` cache that a
@@ -268,7 +270,7 @@ pub trait ConversationItemStore: Send + Sync {
     /// Returns [`StoreError`] if serialization or the database operation fails.
     async fn update_conversation_metadata(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         metadata: &serde_json::Value,
     ) -> Result<bool, StoreError>;
@@ -284,30 +286,30 @@ pub trait ConversationItemStore: Send + Sync {
     /// Returns [`StoreError`] if serialization or the database operation fails.
     async fn compare_and_swap_conversation_messages(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         expected_messages: &serde_json::Value,
         messages: &serde_json::Value,
     ) -> Result<bool, StoreError>;
 
-    /// Retrieve conversation messages by conversation ID and tenant.
+    /// Retrieve conversation messages by conversation ID and owner.
     ///
     /// Returns `None` if the conversation does not exist or belongs
-    /// to a different tenant.
+    /// to a different owner.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] if the database operation fails.
     async fn get_conversation(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
     ) -> Result<Option<ConversationRecord>, StoreError>;
 
-    /// Delete a conversation by ID, scoped to a tenant.
+    /// Delete a conversation by ID, scoped to an exact owner.
     ///
     /// Returns `true` if a record was deleted, `false` if no
-    /// matching record existed for this tenant. To match the OpenAI
+    /// matching record existed for this owner. To match the OpenAI
     /// Conversations API, this does not delete conversation item rows; items
     /// are deleted only through [`delete_conversation_item`] or an explicit
     /// retention cleanup path.
@@ -317,12 +319,12 @@ pub trait ConversationItemStore: Send + Sync {
     /// Returns [`StoreError`] if the database operation fails.
     ///
     /// [`delete_conversation_item`]: ConversationItemStore::delete_conversation_item
-    async fn delete_conversation(&self, tenant_id: &str, conversation_id: &str) -> Result<bool, StoreError>;
+    async fn delete_conversation(&self, owner: &StateOwner, conversation_id: &str) -> Result<bool, StoreError>;
 
     /// Insert one or more conversation items.
     ///
-    /// Items are inserted individually. Duplicate `item_id` +
-    /// `tenant_id` + `conversation_id` triples fail.
+    /// Items are inserted individually. A duplicate globally unique `item_id`
+    /// fails and cannot transfer the original item's owner.
     ///
     /// # Errors
     ///
@@ -346,7 +348,7 @@ pub trait ConversationItemStore: Send + Sync {
     )]
     async fn list_conversation_items(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         after_item_id: Option<&str>,
         limit: u32,
@@ -362,16 +364,16 @@ pub trait ConversationItemStore: Send + Sync {
     /// or a database operation fails.
     async fn get_existing_conversation_item_ids(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         item_ids: &[&str],
     ) -> Result<Vec<String>, StoreError>;
 
-    /// Retrieve a single item by ID, scoped to tenant and
+    /// Retrieve a single item by ID, scoped to owner and
     /// conversation.
     ///
     /// Returns `None` if the item does not exist or belongs to a
-    /// different tenant or conversation.
+    /// different owner or conversation.
     ///
     /// # Errors
     ///
@@ -379,12 +381,12 @@ pub trait ConversationItemStore: Send + Sync {
     /// or a database operation fails.
     async fn get_conversation_item(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<Option<ConversationItemRecord>, StoreError>;
 
-    /// Delete a single item by ID, scoped to tenant and
+    /// Delete a single item by ID, scoped to owner and
     /// conversation.
     ///
     /// Returns `true` if an item was deleted, `false` if no matching
@@ -396,7 +398,7 @@ pub trait ConversationItemStore: Send + Sync {
     /// or a database operation fails.
     async fn delete_conversation_item(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError>;
@@ -404,7 +406,7 @@ pub trait ConversationItemStore: Send + Sync {
     /// Look up the position of a specific item.
     ///
     /// Returns `None` if the item does not exist in the given
-    /// tenant and conversation scope.
+    /// owner and conversation scope.
     ///
     /// # Errors
     ///
@@ -412,7 +414,7 @@ pub trait ConversationItemStore: Send + Sync {
     /// or a database operation fails.
     async fn conversation_item_position(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<Option<i64>, StoreError>;
@@ -425,7 +427,7 @@ pub trait ConversationItemStore: Send + Sync {
     ///
     /// Returns [`StoreError`] if the items table is not configured
     /// or a database operation fails.
-    async fn max_item_position(&self, tenant_id: &str, conversation_id: &str) -> Result<i64, StoreError>;
+    async fn max_item_position(&self, owner: &StateOwner, conversation_id: &str) -> Result<i64, StoreError>;
 
     /// Atomically insert items and rebuild the conversation message cache.
     ///
@@ -445,7 +447,7 @@ pub trait ConversationItemStore: Send + Sync {
     /// or a database operation fails.
     async fn create_items_and_sync_messages(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError>;
@@ -466,7 +468,7 @@ pub trait ConversationItemStore: Send + Sync {
     /// or a database operation fails.
     async fn delete_item_and_sync_messages(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         item_id: &str,
     ) -> Result<bool, StoreError>;

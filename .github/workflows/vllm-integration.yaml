@@ -1,4 +1,9 @@
 name: vLLM Integration
+run-name: >-
+  ${{ github.event_name == 'pull_request' && github.event.action == 'labeled' &&
+      github.event.label.name == 'vllm-full-suite' &&
+      format('vLLM full suite label - PR #{0}', github.event.pull_request.number) ||
+      format('vLLM Integration - {0}', github.ref_name) }}
 
 # ------------------------------------------------------------------------------
 # Workflow Settings
@@ -14,6 +19,7 @@ on:
       - "apis/src/store/**"
       - "server/**"
       - "tests/integration/sdk/openai/**"
+      - "tests/utils/examples/conversations_tenant_proxy.rs"
       - "tests/integration/ogx-constraints.txt"
       - "examples/configs/openai/responses/**"
       - "Cargo.toml"
@@ -24,25 +30,20 @@ on:
       - ".github/workflows/vllm-integration.yaml"
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened]
-    paths:
-      - "apis/src/openai/responses/**"
-      - "apis/src/openai/conversations/**"
-      - "apis/src/openai/sse/**"
-      - "apis/src/store/**"
-      - "server/**"
-      - "tests/integration/sdk/openai/**"
-      - "tests/integration/ogx-constraints.txt"
-      - "examples/configs/openai/responses/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "Makefile"
-      - ".github/actions/start-vllm/**"
-      - ".github/actions/wait-vllm/**"
-      - ".github/workflows/vllm-integration.yaml"
+    types: [opened, synchronize, reopened, labeled]
   merge_group:
     branches: [main]
+  schedule:
+    # Avoid overlapping the repository's 02:47 UTC nightly workflow and
+    # 03:02 UTC CodeQL schedule.
+    - cron: "17 4 * * *"
   workflow_dispatch:
+    inputs:
+      run_live_vllm:
+        description: Run the complete Responses SDK suite only against live CPU vLLM
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -54,6 +55,9 @@ env:
   CARGO_TERM_COLOR: always
   VLLM_IMAGE: "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
+  # llm-d-inference-sim v0.11.2 multi-architecture image index.
+  INFERENCE_SIM_IMAGE: "ghcr.io/llm-d/llm-d-inference-sim@sha256:32144df791330a0006b747edfdf2b114a0fe728e023a9d1b3463eeb48d32abb9"
+  INFERENCE_SIM_MODEL: "praxis-test-model"
   # OGX + transformers pins live in tests/integration/ogx-constraints.txt (with
   # the rationale for each pin). Single-sourcing them there lets the uv download
   # cache key depend only on the pins, so editing this workflow or a test file
@@ -63,11 +67,13 @@ env:
 
 jobs:
   # ----------------------------------------------------------------------------
-  # Path filter for merge_group (which does not support on.paths)
+  # Path filter for pull_request and merge_group. The pull_request trigger is
+  # intentionally unfiltered so a vllm-full-suite label can request a run on
+  # any PR; ordinary PR events still avoid the expensive jobs when irrelevant.
   # ----------------------------------------------------------------------------
 
   changes:
-    if: github.event_name == 'merge_group'
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.action != 'labeled')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -81,15 +87,18 @@ jobs:
 
       - name: Detect relevant path changes
         id: filter
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
-          CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
-                                         "${{ github.event.merge_group.head_sha }}" -- \
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
             'apis/src/openai/responses/' \
             'apis/src/openai/conversations/' \
             'apis/src/openai/sse/' \
             'apis/src/store/' \
             'server/' \
             'tests/integration/sdk/openai/' \
+            'tests/utils/examples/conversations_tenant_proxy.rs' \
             'tests/integration/ogx-constraints.txt' \
             'examples/configs/openai/responses/' \
             'Cargo.toml' \
@@ -105,13 +114,16 @@ jobs:
           fi
 
   # ----------------------------------------------------------------------------
-  # Responses API integration tests against a real vLLM CPU backend
+  # Fast Responses API integration tests against llm-d-inference-sim
   # ----------------------------------------------------------------------------
 
   vllm-responses:
     needs: [changes]
     if: |
       always() &&
+      github.event_name != 'schedule' &&
+      (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
+      (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -129,7 +141,7 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
@@ -143,11 +155,16 @@ jobs:
           cache-dependency-glob: |
             tests/integration/ogx-constraints.txt
 
-      - name: Start vLLM
-        uses: ./.github/actions/start-vllm
-        with:
-          image: ${{ env.VLLM_IMAGE }}
-          model: ${{ env.VLLM_MODEL }}
+      - name: Start inference simulator
+        run: |
+          docker run --detach --name inference-sim --network host \
+            "$INFERENCE_SIM_IMAGE" \
+            --model="$INFERENCE_SIM_MODEL" \
+            --served-model-name="$INFERENCE_SIM_MODEL" \
+            --mode=echo \
+            --max-model-len=8192 \
+            --skip-tool-validation \
+            --port=8000
 
       - name: Pre-install OGX dependencies
         run: |
@@ -168,12 +185,36 @@ jobs:
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy
+        run: |
+          cargo build -p praxis-ai-proxy
+          cargo build -p praxis-test-utils --example conversations_tenant_proxy
 
-      - name: Wait for vLLM readiness
-        uses: ./.github/actions/wait-vllm
+      - name: Wait for inference simulator readiness
+        run: |
+          simulator_ready=false
+          for _ in {1..60}; do
+            if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
+               curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; then
+              simulator_ready=true
+              break
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' inference-sim)" != true ]; then
+              echo "::error::inference simulator exited before becoming ready"
+              docker logs inference-sim 2>&1 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$simulator_ready" != true ]; then
+            echo "::error::inference simulator did not become ready within 60s"
+            docker logs inference-sim 2>&1 || true
+            exit 1
+          fi
 
       - name: Run Conversations SDK integration tests
+        env:
+          PRAXIS_TENANT_TEST_BIN: target/debug/examples/conversations_tenant_proxy
+          VLLM_MODEL: ${{ env.INFERENCE_SIM_MODEL }}
         run: |
           uv run tests/integration/sdk/openai/test_openai_conversations.py -s
 
@@ -206,10 +247,14 @@ jobs:
           done
           echo "OGX is ready"
 
-      - name: Run vLLM integration tests
+      - name: Run simulated Responses integration tests
+        env:
+          VLLM_MODEL: ${{ env.INFERENCE_SIM_MODEL }}
+          VLLM_TEST_BACKEND: simulator
         run: |
           test_cmd=(
-            uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+            uv run tests/integration/sdk/openai/test_openai_responses_vllm.py
+            -s -m "not real_inference and not vllm_compat"
           )
           if "${test_cmd[@]}"; then
             exit 0
@@ -217,8 +262,131 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" != "merge_group" ]; then
             exit 1
           fi
-          echo "::warning::Retrying failed vLLM tests once for the merge queue"
+          echo "::warning::Retrying failed simulator tests once for the merge queue"
           "${test_cmd[@]}" --last-failed --last-failed-no-failures none
+
+      - name: Inference simulator logs
+        if: failure()
+        run: docker logs inference-sim 2>&1 || echo "(no simulator container)"
+
+      - name: OGX logs
+        if: failure()
+        run: cat /tmp/ogx.log 2>/dev/null || echo "No OGX log found"
+
+      - name: Stop inference simulator
+        if: always()
+        run: docker rm -f inference-sim || true
+
+      - name: Stop OGX
+        if: always()
+        run: |
+          if [ -f /tmp/ogx.pid ]; then
+            kill "$(cat /tmp/ogx.pid)" 2>/dev/null || true
+          fi
+
+  # ----------------------------------------------------------------------------
+  # Critical live CPU smoke tests on every relevant change. Nightly, explicitly
+  # requested dispatches, and vllm-full-suite labels run the complete suite.
+  # ----------------------------------------------------------------------------
+
+  vllm-live-cpu:
+    needs: [changes]
+    if: |
+      always() &&
+      (
+        github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) ||
+        (
+          github.event_name == 'pull_request' &&
+          github.event.action == 'labeled' &&
+          github.event.label.name == 'vllm-full-suite'
+        ) ||
+        (
+          github.event_name != 'workflow_dispatch' &&
+          github.event_name != 'schedule' &&
+          (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
+          (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+        )
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            tests/integration/ogx-constraints.txt
+
+      - name: Start vLLM
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ env.VLLM_IMAGE }}
+          model: ${{ env.VLLM_MODEL }}
+
+      - name: Pre-install OGX dependencies
+        run: |
+          uv run --with-requirements "$OGX_CONSTRAINTS" ogx --help > /dev/null
+
+      - name: Start OGX
+        run: |
+          uv run --with-requirements "$OGX_CONSTRAINTS" ogx run starter --insecure > /tmp/ogx.log 2>&1 &
+          echo $! > /tmp/ogx.pid
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Wait for vLLM readiness
+        uses: ./.github/actions/wait-vllm
+
+      - name: Wait for OGX readiness
+        run: |
+          dump_ogx_log() {
+            echo "----- /tmp/ogx.log (tail -n 200) -----"
+            tail -n 200 /tmp/ogx.log 2>/dev/null || echo "No OGX log found"
+          }
+          OGX_PID="$(cat /tmp/ogx.pid)"
+          deadline=$((SECONDS + 300))
+          until curl -sf http://127.0.0.1:8321/v1/files > /dev/null 2>&1; do
+            if ! kill -0 "$OGX_PID" 2>/dev/null; then
+              echo "::error::OGX process (pid $OGX_PID) exited before binding port 8321"
+              dump_ogx_log
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::OGX did not become ready within 300s"
+              dump_ogx_log
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Run critical live vLLM smoke tests
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && (github.event_name != 'pull_request' || github.event.action != 'labeled')
+        env:
+          VLLM_TEST_BACKEND: live
+        run: |
+          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py \
+            -s -m "critical_vllm"
+
+      - name: Run complete live vLLM Responses suite
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) || (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'vllm-full-suite')
+        env:
+          VLLM_TEST_BACKEND: live
+        run: |
+          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 
       - name: vLLM container logs
         if: failure()
@@ -240,13 +408,16 @@ jobs:
           fi
 
   # ----------------------------------------------------------------------------
-  # Responses API integration tests with PostgreSQL store backend
+  # Fast Responses API integration tests with PostgreSQL store backend
   # ----------------------------------------------------------------------------
 
   vllm-responses-postgres:
     needs: [changes]
     if: |
       always() &&
+      github.event_name != 'schedule' &&
+      (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
+      (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -278,7 +449,7 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
@@ -292,11 +463,16 @@ jobs:
           cache-dependency-glob: |
             tests/integration/ogx-constraints.txt
 
-      - name: Start vLLM
-        uses: ./.github/actions/start-vllm
-        with:
-          image: ${{ env.VLLM_IMAGE }}
-          model: ${{ env.VLLM_MODEL }}
+      - name: Start inference simulator
+        run: |
+          docker run --detach --name inference-sim --network host \
+            "$INFERENCE_SIM_IMAGE" \
+            --model="$INFERENCE_SIM_MODEL" \
+            --served-model-name="$INFERENCE_SIM_MODEL" \
+            --mode=echo \
+            --max-model-len=8192 \
+            --skip-tool-validation \
+            --port=8000
 
       - name: Pre-install OGX dependencies
         run: |
@@ -317,14 +493,37 @@ jobs:
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy
+        run: |
+          cargo build -p praxis-ai-proxy
+          cargo build -p praxis-test-utils --example conversations_tenant_proxy
 
-      - name: Wait for vLLM readiness
-        uses: ./.github/actions/wait-vllm
+      - name: Wait for inference simulator readiness
+        run: |
+          simulator_ready=false
+          for _ in {1..60}; do
+            if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
+               curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; then
+              simulator_ready=true
+              break
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' inference-sim)" != true ]; then
+              echo "::error::inference simulator exited before becoming ready"
+              docker logs inference-sim 2>&1 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ "$simulator_ready" != true ]; then
+            echo "::error::inference simulator did not become ready within 60s"
+            docker logs inference-sim 2>&1 || true
+            exit 1
+          fi
 
       - name: Run Conversations SDK integration tests (PostgreSQL store)
         env:
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          PRAXIS_TENANT_TEST_BIN: target/debug/examples/conversations_tenant_proxy
+          VLLM_MODEL: ${{ env.INFERENCE_SIM_MODEL }}
         run: |
           uv run tests/integration/sdk/openai/test_openai_conversations.py -s
 
@@ -357,12 +556,15 @@ jobs:
           done
           echo "OGX is ready"
 
-      - name: Run vLLM integration tests (PostgreSQL store)
+      - name: Run simulated Responses integration tests (PostgreSQL store)
         env:
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
+          VLLM_MODEL: ${{ env.INFERENCE_SIM_MODEL }}
+          VLLM_TEST_BACKEND: simulator
         run: |
           test_cmd=(
-            uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+            uv run tests/integration/sdk/openai/test_openai_responses_vllm.py
+            -s -m "not real_inference and not vllm_compat"
           )
           if "${test_cmd[@]}"; then
             exit 0
@@ -370,20 +572,20 @@ jobs:
           if [ "$GITHUB_EVENT_NAME" != "merge_group" ]; then
             exit 1
           fi
-          echo "::warning::Retrying failed vLLM tests once for the merge queue"
+          echo "::warning::Retrying failed simulator tests once for the merge queue"
           "${test_cmd[@]}" --last-failed --last-failed-no-failures none
 
-      - name: vLLM container logs
+      - name: Inference simulator logs
         if: failure()
-        run: docker logs vllm 2>&1 || echo "(no vllm container)"
+        run: docker logs inference-sim 2>&1 || echo "(no simulator container)"
 
       - name: OGX logs
         if: failure()
         run: cat /tmp/ogx.log 2>/dev/null || echo "No OGX log found"
 
-      - name: Stop vLLM
+      - name: Stop inference simulator
         if: always()
-        run: docker rm -f vllm || true
+        run: docker rm -f inference-sim || true
 
       - name: Stop OGX
         if: always()

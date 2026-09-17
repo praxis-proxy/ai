@@ -228,6 +228,7 @@ fn register_admin_endpoints(
                 kv_registry: Some(kv_stores.clone()),
                 pipelines: None,
                 log_level: None,
+                stats: None,
                 verbose: config.admin.verbose,
             },
         );

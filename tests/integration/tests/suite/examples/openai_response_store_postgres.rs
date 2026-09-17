@@ -79,7 +79,10 @@ async fn response_store_persists_response_to_postgres() {
     let pool = Box::pin(sqlx::PgPool::connect(&pg.url()))
         .await
         .expect("should connect to test database");
-    let sql = format!("SELECT id, tenant_id, created_at, model, input, messages FROM {responses_table} WHERE id = $1");
+    let sql = format!(
+        "SELECT id, tenant_id, owner_issuer, owner_subject, created_at, model, input, messages \
+         FROM {responses_table} WHERE id = $1"
+    );
     let row: sqlx::postgres::PgRow = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind("resp_pg_abc")
         .fetch_one(&pool)
@@ -89,11 +92,15 @@ async fn response_store_persists_response_to_postgres() {
 
     let id: String = row.get("id");
     let tenant_id: String = row.get("tenant_id");
+    let owner_issuer: String = row.get("owner_issuer");
+    let owner_subject: String = row.get("owner_subject");
     let created_at: i64 = row.get("created_at");
     let model: String = row.get("model");
 
     assert_eq!(id, "resp_pg_abc", "persisted id should match response");
     assert_eq!(tenant_id, "default", "default tenant should be used");
+    assert_eq!(owner_issuer, "urn:praxis:single-tenant");
+    assert_eq!(owner_subject, "shared");
     assert_eq!(created_at, 2000, "persisted created_at should match response");
     assert_eq!(model, "gpt-4.1", "persisted model should match response");
 

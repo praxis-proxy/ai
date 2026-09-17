@@ -474,6 +474,40 @@ fn unified_gateway_routes_openai_to_correct_backend() {
 }
 
 #[test]
+fn unified_gateway_routes_malformed_chat_completions_without_reading_the_body() {
+    let anthropic_guard = start_backend_with_shutdown("anthropic-backend");
+    let openai_guard = start_backend_with_shutdown("openai-backend");
+    let responses_guard = start_backend_with_shutdown("responses-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "anthropic/unified-gateway.yaml",
+        proxy_port,
+        HashMap::from([
+            ("127.0.0.1:3001", anthropic_guard.port()),
+            ("127.0.0.1:3002", openai_guard.port()),
+            ("127.0.0.1:3003", responses_guard.port()),
+            ("127.0.0.1:3004", default_guard.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\
+         Content-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\n\
+         not json",
+    );
+    assert_eq!(parse_status(&raw), 200, "malformed chat body should still be forwarded");
+    assert_eq!(
+        parse_body(&raw),
+        "openai-backend",
+        "Chat Completions identity must not depend on body heuristics"
+    );
+}
+
+#[test]
 fn unified_gateway_routes_responses_to_correct_backend() {
     let anthropic_guard = start_backend_with_shutdown("anthropic-backend");
     let openai_guard = start_backend_with_shutdown("openai-backend");

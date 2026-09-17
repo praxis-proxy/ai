@@ -9,10 +9,11 @@ OPENAI_CONFORMANCE_ARGS ?=
 RESPONSES_CONFORMANCE_ARGS ?=
 V                ?=
 
-# Experimental filter features are off by default in builds, so lint and
-# test explicitly enable them — otherwise the gated filter code is never
-# compiled, linted, or tested by CI.
-EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter
+# Experimental filter features are package-specific and off by default.
+# Basic Auth is exposed by praxis-ai-proxy and forwarded by the integration-test
+# crate; it is not a praxis-ai-filters feature.
+FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter
+INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter
 
 ifneq ($(V),)
   _NOCAPTURE := -- --nocapture
@@ -77,8 +78,9 @@ test:
 test-unit:
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
-	cargo test -p praxis-ai-filters --features $(EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
+	cargo test -p praxis-ai-filters --features $(FILTER_EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
 	cargo test -p praxis-ai-proxy $(_NOCAPTURE)
+	cargo test -p praxis-ai-proxy --features basic-auth-filter $(_NOCAPTURE)
 	cargo test -p praxis-ai-build-support $(_NOCAPTURE)
 
 test-schema:
@@ -86,7 +88,7 @@ test-schema:
 
 test-integration:
 	cargo test -p praxis-tests-integration $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --features $(EXPERIMENTAL_FEATURES) --test suite \
+	cargo test -p praxis-tests-integration --features $(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
 		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit \
 		$(if $(V),--nocapture)
 
@@ -105,8 +107,10 @@ test-token-rate-limit-valkey-unit:
 	cargo test -p praxis-ai-filters --features token-rate-limit-filter valkey $(_NOCAPTURE)
 
 test-token-rate-limit-valkey-integration:
-	cargo test -p praxis-tests-integration --features token-rate-limit-filter --test suite \
+	cargo test -p praxis-tests-integration --features basic-auth-filter,token-rate-limit-filter --test suite \
 		mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --features basic-auth-filter,token-rate-limit-filter --test suite \
+		authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas $(_NOCAPTURE)
 
 openai-conformance:
 	cargo xtask openai-conformance $(OPENAI_CONFORMANCE_ARGS)
@@ -131,7 +135,7 @@ test-environment:
 lint:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy --workspace --all-targets \
-		--features praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter \
+		--features praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter \
 		-- -D warnings
 	cargo +nightly fmt --all -- --check
 	cargo machete --with-metadata .
@@ -145,6 +149,7 @@ lint:
 	cargo xtask sync-responses-readme
 	cargo xtask check-inference
 	cargo xtask check-responses-registry
+	cargo xtask check-chat-completions-registry
 	cargo xtask openresponses-coverage
 
 fmt:

@@ -62,6 +62,102 @@ pub struct ResponseStoreRegistry {
     stores: Arc<DashMap<Arc<str>, Arc<dyn ResponseStore>>>,
 }
 
+/// Response-store handle permanently bound to one validated owner.
+///
+/// Request-driven consumers obtain this facade from
+/// [`ResponseStoreRegistry::get_scoped`] instead of receiving the raw backend,
+/// so a later operation cannot accidentally substitute an arbitrary tenant or
+/// principal string.
+#[derive(Clone)]
+pub struct OwnerScopedResponseStore {
+    /// Shared backend hidden behind the owner-bound facade.
+    store: Arc<dyn ResponseStore>,
+    /// Immutable scope applied to every operation.
+    owner: crate::StateOwner,
+}
+
+impl OwnerScopedResponseStore {
+    /// Retrieve a response visible to this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn get_response(&self, id: &str) -> Result<Option<ResponseRecord>, StoreError> {
+        self.store.get_response(&self.owner, id).await
+    }
+
+    /// Delete a response visible to this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend mutation fails.
+    pub async fn delete_response(&self, id: &str) -> Result<bool, StoreError> {
+        self.store.delete_response(&self.owner, id).await
+    }
+
+    /// Retrieve a conversation visible to this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn get_conversation(&self, id: &str) -> Result<Option<ConversationRecord>, StoreError> {
+        self.store.get_conversation(&self.owner, id).await
+    }
+
+    /// Persist a response only when its immutable owner matches this handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error for an owner mismatch or the backend
+    /// error from persistence.
+    pub async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
+        self.require_matching_owner(&record.owner)?;
+        self.store.upsert_response(record).await
+    }
+
+    /// Retrieve pending approvals issued to this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn get_pending_approvals(
+        &self,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
+        self.store
+            .get_pending_approvals(&self.owner, response_id, approval_ids)
+            .await
+    }
+
+    /// Atomically consume approvals issued to this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend mutation fails.
+    pub async fn consume_approvals(
+        &self,
+        response_id: &str,
+        approval_ids: &[&str],
+        consumed_at: i64,
+    ) -> Result<Option<usize>, StoreError> {
+        self.store
+            .consume_approvals(&self.owner, response_id, approval_ids, consumed_at)
+            .await
+    }
+
+    /// Reject records built under a different owner scope.
+    fn require_matching_owner(&self, owner: &crate::StateOwner) -> Result<(), StoreError> {
+        if owner == &self.owner {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidInput(
+                "record owner does not match owner-scoped store".to_owned(),
+            ))
+        }
+    }
+}
+
 impl ResponseStoreRegistry {
     /// Create an empty registry.
     #[must_use]
@@ -89,8 +185,22 @@ impl ResponseStoreRegistry {
         }
     }
 
-    /// Look up a store by name.
-    pub fn get(&self, name: &str) -> Option<Arc<dyn ResponseStore>> {
+    /// Look up a store by name and bind all request-driven access to `owner`.
+    pub fn get_scoped(&self, name: &str, owner: &crate::StateOwner) -> Option<OwnerScopedResponseStore> {
+        self.get_backend(name).map(|store| OwnerScopedResponseStore {
+            store,
+            owner: owner.clone(),
+        })
+    }
+
+    /// Return whether a named backend is already registered.
+    #[must_use]
+    pub fn contains(&self, name: &str) -> bool {
+        self.stores.contains_key(name)
+    }
+
+    /// Internal raw lookup used only to construct a constrained facade.
+    fn get_backend(&self, name: &str) -> Option<Arc<dyn ResponseStore>> {
         self.stores.get(name).map(|r| Arc::clone(r.value()))
     }
 

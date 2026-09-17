@@ -25,7 +25,8 @@ use super::{
     routes::{self, ConversationOperation, MatchedConversationRoute},
 };
 use crate::{
-    openai::responses::{DEFAULT_TENANT_ID, TENANT_METADATA_KEY, state::ResponsesState},
+    openai::responses::state::ResponsesState,
+    state_owner::{StateOwner, require_state_owner},
     store::{ConversationItemStore, PostgresResponseStore, SqliteResponseStore, StoreError},
 };
 
@@ -68,8 +69,21 @@ struct ConversationRequestState {
 /// Per-request response-phase state that controls whether append-back
 /// should run during `on_response_body`.
 struct ConversationResponseState {
-    /// Whether response body buffering is armed for append-back.
-    armed: bool,
+    /// Owner captured before response body buffering is armed.
+    append_owner: Option<StateOwner>,
+}
+
+/// Owner captured on the request path before inference begins.
+struct CapturedAppendOwner(StateOwner);
+
+/// Capture the append-back owner once for the lifetime of the exchange.
+fn capture_append_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterAction> {
+    if !should_append_back(ctx) || ctx.extensions.get::<CapturedAppendOwner>().is_some() {
+        return Ok(());
+    }
+    ctx.extensions
+        .insert(CapturedAppendOwner(require_state_owner(ctx)?.clone()));
+    Ok(())
 }
 
 impl OpenaiConversationsFilter {
@@ -360,7 +374,7 @@ impl OpenaiConversationsFilter {
     /// Persist conversation items synchronously using `block_in_place`.
     fn append_items_blocking(
         &self,
-        tenant_id: &str,
+        owner: &StateOwner,
         conversation_id: &str,
         ctx: &HttpFilterContext<'_>,
         items: Vec<Value>,
@@ -373,7 +387,7 @@ impl OpenaiConversationsFilter {
 
         let handle = tokio::runtime::Handle::current();
         tokio::task::block_in_place(|| {
-            handle.block_on(persist_items(store.as_ref(), tenant_id, conversation_id, ctx, items))
+            handle.block_on(persist_items(store.as_ref(), owner, conversation_id, ctx, items))
         })
     }
 }
@@ -411,6 +425,9 @@ impl HttpFilter for OpenaiConversationsFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        if let Err(action) = capture_append_owner(ctx) {
+            return Ok(action);
+        }
         let Some(route) = routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path()) else {
             if should_append_back(ctx) {
                 drop(self.get_or_init_store().await);
@@ -437,6 +454,9 @@ impl HttpFilter for OpenaiConversationsFilter {
         if !end_of_stream || ctx.request.method != http::Method::POST {
             return Ok(FilterAction::Continue);
         }
+        if let Err(action) = capture_append_owner(ctx) {
+            return Ok(action);
+        }
 
         let empty: &[u8] = &[];
         let bytes = body.as_ref().map_or(empty, |b| b.as_ref());
@@ -458,9 +478,13 @@ impl HttpFilter for OpenaiConversationsFilter {
         Box::pin(Self::handle_post_route(ctx, store.as_ref(), &route, bytes)).await
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "append-back eligibility and owner capture are one response-phase decision"
+    )]
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if !should_append_back(ctx) {
-            ctx.insert_filter_state(ConversationResponseState { armed: false });
+            ctx.insert_filter_state(ConversationResponseState { append_owner: None });
             return Ok(FilterAction::Continue);
         }
 
@@ -481,13 +505,21 @@ impl HttpFilter for OpenaiConversationsFilter {
         if !armed {
             trace!("conversation append-back skipped (non-2xx or non-JSON response)");
         }
-        ctx.insert_filter_state(ConversationResponseState { armed });
-
         if armed {
+            let owner = ctx
+                .extensions
+                .get::<CapturedAppendOwner>()
+                .map(|captured| captured.0.clone())
+                .ok_or_else(|| FilterError::from("openai_conversations: append-back owner was not captured"))?;
+            ctx.insert_filter_state(ConversationResponseState {
+                append_owner: Some(owner),
+            });
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
                 max_bytes: Some(MAX_JSON_BODY_BYTES),
             });
             drop(self.get_or_init_store().await);
+        } else {
+            ctx.insert_filter_state(ConversationResponseState { append_owner: None });
         }
 
         Ok(FilterAction::Continue)
@@ -499,19 +531,19 @@ impl HttpFilter for OpenaiConversationsFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        let armed = ctx
+        let append_owner = ctx
             .get_filter_state::<ConversationResponseState>()
-            .is_some_and(|s| s.armed);
+            .and_then(|state| state.append_owner.clone());
 
-        if !armed {
+        let Some(append_owner) = append_owner else {
             return Ok(FilterAction::Release);
-        }
+        };
 
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
 
-        let Some(items) = extract_append_back_items(ctx, body) else {
+        let Some(items) = extract_append_back_items(ctx, body, append_owner) else {
             return Ok(FilterAction::Continue);
         };
 
@@ -528,7 +560,7 @@ impl HttpFilter for OpenaiConversationsFilter {
         // the pipeline logs this error and converts it to Continue, releasing the
         // body even though items were lost. Transactional item insertion and cache
         // rebuild failures reach this `?` before any append-back bytes are released.
-        self.append_items_blocking(&items.tenant_id, &conv_id, ctx, items.all_items)
+        self.append_items_blocking(&items.owner, &conv_id, ctx, items.all_items)
             .inspect_err(|e| warn!(error = %e, conversation_id = %conv_id, "conversation append-back failed"))?;
 
         Ok(FilterAction::Continue)
@@ -552,27 +584,27 @@ fn should_append_back(ctx: &HttpFilterContext<'_>) -> bool {
 struct AppendBackItems {
     /// Target conversation ID.
     conversation_id: String,
-    /// Tenant scope for the conversation.
-    tenant_id: String,
+    /// Immutable owner scope for the conversation.
+    owner: StateOwner,
     /// Input + output items to persist.
     all_items: Vec<Value>,
 }
 
 /// Extract and merge input+output items from the response body for
 /// append-back. Returns `None` when there is nothing to persist.
-fn extract_append_back_items(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> Option<AppendBackItems> {
+fn extract_append_back_items(
+    ctx: &HttpFilterContext<'_>,
+    body: &Option<Bytes>,
+    owner: StateOwner,
+) -> Option<AppendBackItems> {
     let bytes = body.as_ref().filter(|b| !b.is_empty())?;
     let conv_id = ctx.get_metadata("responses.conversation_id")?.to_owned();
-    let tenant_id = ctx
-        .get_metadata(TENANT_METADATA_KEY)
-        .unwrap_or(DEFAULT_TENANT_ID)
-        .to_owned();
 
     let all_items = merge_input_output_items(ctx, bytes)?;
 
     Some(AppendBackItems {
         conversation_id: conv_id,
-        tenant_id,
+        owner,
         all_items,
     })
 }
@@ -619,14 +651,14 @@ fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option
 /// Persist items and refresh the denormalized message cache.
 async fn persist_items(
     store: &dyn ConversationItemStore,
-    tenant_id: &str,
+    owner: &StateOwner,
     conversation_id: &str,
     ctx: &HttpFilterContext<'_>,
     items: Vec<Value>,
 ) -> Result<(), FilterError> {
     let created_at = handlers::current_timestamp(ctx);
 
-    let records = handlers::build_item_records(ctx, tenant_id, conversation_id, created_at, 0, items)
+    let records = handlers::build_item_records(ctx, owner, conversation_id, created_at, 0, items)
         .map_err(|e| -> FilterError { e.into() })?;
 
     if records.is_empty() {
@@ -635,14 +667,11 @@ async fn persist_items(
 
     let count = records.len();
     store
-        .create_items_and_sync_messages(tenant_id, conversation_id, &records)
+        .create_items_and_sync_messages(owner, conversation_id, &records)
         .await
         .map_err(|e| -> FilterError { Box::new(e) })?;
 
-    debug!(
-        conversation_id,
-        tenant_id, count, "conversation items appended from response"
-    );
+    debug!(conversation_id, count, "conversation items appended from response");
 
     Ok(())
 }

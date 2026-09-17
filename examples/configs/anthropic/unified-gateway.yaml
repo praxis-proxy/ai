@@ -4,9 +4,10 @@
 # listener handles Anthropic Messages, OpenAI Chat Completions,
 # and OpenAI Responses requests.
 #
-# `anthropic_messages_format` classifies every request body and
-# promotes `x-praxis-ai-format` for router-based cluster selection.
-# `openai_responses_format` runs second for its own filter results
+# `openai_operation` classifies Chat Completions from the request head
+# without reading the body. `anthropic_messages_format` classifies every
+# request body and promotes `x-praxis-ai-format` for router-based cluster
+# selection. `openai_responses_format` runs for its own filter results
 # but does not promote a format header (avoids overwriting).
 
 listeners:
@@ -17,6 +18,22 @@ listeners:
 filter_chains:
   - name: unified-routing
     filters:
+      - filter: openai_operation
+        branch_chains:
+          - name: chat-completions
+            on_result:
+              filter: openai_operation
+              key: application_protocol
+              result: openai_chat_completions
+            chains:
+              - name: chat-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "openai-backend"
+            rejoin: shared_load_balancer
+
       - filter: anthropic_messages_format
         on_invalid: continue
         headers:
@@ -31,16 +48,13 @@ filter_chains:
           model: ~
           stream: ~
 
-      - filter: router
+      - name: body_classifiers
+        filter: router
         routes:
           - path: "/v1/messages"
             headers:
               x-praxis-ai-format: "anthropic_messages"
             cluster: "anthropic-backend"
-          - path: "/v1/chat/completions"
-            headers:
-              x-praxis-ai-format: "openai_chat_completions"
-            cluster: "openai-backend"
           - path: "/v1/responses"
             headers:
               x-praxis-ai-format: "openai_responses"
@@ -48,7 +62,8 @@ filter_chains:
           - path_prefix: "/"
             cluster: "default-backend"
 
-      - filter: load_balancer
+      - name: shared_load_balancer
+        filter: load_balancer
         clusters:
           - name: "anthropic-backend"
             endpoints:
