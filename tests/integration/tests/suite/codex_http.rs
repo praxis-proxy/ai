@@ -126,7 +126,14 @@ async fn pinned_codex_completes_chat_backend_coding_workflow_over_http() {
     let observer = HttpTransportObserver::start(proxy_port).await;
 
     let prompt = "Inspect input.json, copy its expected_content value into result.txt, run ./verify.sh, then summarize with exactly TASK_COMPLETE.";
-    let output = run_codex(&codex_bin, observer.port(), workspace.path(), prompt, "workspace-write").await;
+    let output = run_codex(
+        &codex_bin,
+        observer.port(),
+        workspace.path(),
+        prompt,
+        "danger-full-access",
+    )
+    .await;
     assert!(
         output.status.success(),
         "Codex failed with status {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
