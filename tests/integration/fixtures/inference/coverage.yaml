@@ -264,6 +264,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.unrepresentable_parameters
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-unrepresentable-parameters
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.tools.function_echo
     scopes:
       - responses_to_chat_completions

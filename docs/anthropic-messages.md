@@ -185,10 +185,13 @@ The `anthropic_messages_to_chat_completions` filter:
 - Maps `stop_sequences` to `stop`,
   `tool_choice` semantics, tool definitions
 - Maps `metadata.user_id` to `safety_identifier`
-- Rejects `service_tier`, `thinking`, `container`,
-  `inference_geo`, `output_config`, `output_format` and
-  `mcp_servers` with a 400, because the translated
+- Rejects `service_tier`, `container`, `inference_geo`
+  and `mcp_servers` with a 400, because the translated
   response cannot report their effect truthfully
+- Drops `thinking`, `context_management`,
+  `output_config` and `output_format` with a log
+  warning; Claude Code sends them on every request and
+  this translation has no equivalent for them yet
 - Forwards every other field untouched (for example
   `top_k`) and leaves its validation to the backend
 - Drops `thinking` content blocks with a log warning

@@ -1,6 +1,6 @@
 version: 1
 id: messages/provider-parameter-passthrough
-description: Unmapped Anthropic request fields reach the Chat Completions backend untouched and metadata.user_id becomes safety_identifier.
+description: Unmapped Anthropic request fields reach the Chat Completions backend untouched, metadata.user_id becomes safety_identifier, and thinking is dropped.
 protocol: anthropic_messages
 example_config: anthropic/messages-to-openai.yaml
 upstream_authority: 127.0.0.1:8000
@@ -21,6 +21,9 @@ turns:
           max_tokens: 64
           stream: false
           top_k: 40
+          thinking:
+            type: enabled
+            budget_tokens: 1024
           metadata:
             user_id: user-1
           messages:

@@ -7,7 +7,7 @@ upstream_authority: 127.0.0.1:8000
 features:
   - messages.request.unrepresentable_parameters
 turns:
-  - name: thinking
+  - name: inference_geo
     request:
       method: POST
       path: /v1/messages
@@ -20,9 +20,7 @@ turns:
           model: ${MODEL}
           max_tokens: 64
           stream: false
-          thinking:
-            type: enabled
-            budget_tokens: 1024
+          inference_geo: us
           messages:
             - role: user
               content: What is 2+2? Reply with just the number.

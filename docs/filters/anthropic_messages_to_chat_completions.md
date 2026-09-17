@@ -7,7 +7,7 @@ Transforms Anthropic Messages API requests to Chat Completions-compatible reques
 
 ## Configuration Notes
 
-Request fields the translation does not map are forwarded untouched for the backend to validate. Fields whose effect the translated response could not report truthfully (`service_tier`, `thinking`, `container`, `inference_geo`, `output_config`, `output_format`, `mcp_servers`) are rejected with a 400.
+Request fields the translation does not map are forwarded untouched for the backend to validate. Fields whose effect the translated response could not report truthfully (`service_tier`, `container`, `inference_geo`, `mcp_servers`) are rejected with a 400. `thinking`, `context_management`, `output_config` and `output_format` are dropped with a warning.
 
 ## Configuration
 

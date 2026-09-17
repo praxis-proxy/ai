@@ -11,7 +11,7 @@ use serde::Deserialize;
 /// filter: ai_guardrails
 /// provider:
 ///   type: nemo
-///   endpoint: "http://nemo:8000/v1/guardrail/checks"
+///   endpoint: "http://nemo:8000/v1/checks"
 ///   timeout_ms: 5000
 /// phase:
 ///   request: true
@@ -32,7 +32,7 @@ pub(super) struct AiGuardrailsConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum ProviderType {
-    /// NVIDIA `NeMo` Guardrails via `/v1/guardrail/checks`.
+    /// NVIDIA `NeMo` Guardrails via `/v1/checks`.
     Nemo,
 }
 

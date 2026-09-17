@@ -14,28 +14,33 @@ use tracing::warn;
 ///
 /// Each one changes behavior that the translated response would then
 /// misreport: `wire.rs` hardcodes `service_tier`, `container` and
-/// `inference_geo` to null, `thinking` and `output_config` (with its
-/// deprecated `output_format` spelling) shape the output, and `mcp_servers`
-/// is a beta server-side feature (`mcp-client-2025-04-04`). Forwarding them
-/// would let the backend ignore the field while the client is told it took
-/// effect, so the request is rejected instead.
-const UNREPRESENTABLE_FIELDS: [&str; 7] = [
-    "service_tier",
-    "thinking",
-    "container",
-    "inference_geo",
-    "output_config",
-    "output_format",
-    "mcp_servers",
-];
+/// `inference_geo` to null, and `mcp_servers` is a beta server-side feature
+/// (`mcp-client-2025-04-04`). Forwarding them would let the backend ignore
+/// the field while the client is told it took effect, so the request is
+/// rejected instead.
+const UNREPRESENTABLE_FIELDS: [&str; 4] = ["service_tier", "container", "inference_geo", "mcp_servers"];
+
+/// Anthropic Messages fields dropped with a warning instead of forwarded.
+///
+/// Claude Code sends all of these on every request, and none has a Chat
+/// Completions equivalent this translation implements: the translated
+/// response carries no thinking blocks, so `thinking` is visibly absent and
+/// `context_management` (which only edits thinking blocks) has nothing to
+/// act on; `output_config` (and its deprecated `output_format` spelling)
+/// carries `effort` and a structured-output `format` whose mapping to
+/// `response_format` is future work. Forwarding them would make the outcome
+/// depend on the backend, since vLLM ignores unknown fields and the OpenAI
+/// API rejects them.
+const DROPPED_FIELDS: [&str; 4] = ["thinking", "context_management", "output_config", "output_format"];
 
 /// Transform a parsed Anthropic Messages request body into Chat
 /// Completions-compatible format.
 ///
-/// Every top-level field falls into one of three buckets:
+/// Every top-level field falls into one of these buckets:
 /// - mapped fields are translated to their Chat Completions equivalent;
 /// - [`UNREPRESENTABLE_FIELDS`] reject the request with an error message, because the proxy would otherwise fabricate
 ///   their effect in the translated response;
+/// - [`DROPPED_FIELDS`] are removed with a warning;
 /// - everything else is forwarded untouched, and the backend validates it.
 ///
 /// A translated field always wins over a forwarded client key of the same
@@ -45,6 +50,7 @@ pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
         return Err("request body is not a JSON object".to_owned());
     };
     reject_unrepresentable_fields(&mut body)?;
+    drop_unsupported_fields(&mut body);
 
     // Take every mapped field up front, in one place. Each becomes an owned
     // local that is moved into the helper emitting it.
@@ -83,6 +89,15 @@ pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
 fn forward_unmapped_fields(chat: &mut Map<String, Value>, body: Map<String, Value>) {
     for (key, value) in body {
         chat.entry(key).or_insert(value);
+    }
+}
+
+/// Remove every [`DROPPED_FIELDS`] entry, warning for each one that carried a value.
+fn drop_unsupported_fields(body: &mut Map<String, Value>) {
+    for field in DROPPED_FIELDS {
+        if body.remove(field).is_some_and(|value| !value.is_null()) {
+            warn!(field, "dropping Anthropic field with no Chat Completions equivalent");
+        }
     }
 }
 
@@ -1337,16 +1352,22 @@ mod tests {
     }
 
     #[test]
+    fn client_default_fields_are_dropped_not_forwarded() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"thinking":{"type":"enabled","budget_tokens":1024},"context_management":{"edits":[{"type":"clear_thinking_20251015"}]},"output_config":{"effort":"high"},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        for field in ["thinking", "context_management", "output_config"] {
+            assert!(
+                parsed.get(field).is_none(),
+                "`{field}` has no Chat Completions equivalent"
+            );
+        }
+    }
+
+    #[test]
     fn unrepresentable_fields_are_rejected() {
-        for field in [
-            "service_tier",
-            "thinking",
-            "container",
-            "inference_geo",
-            "output_config",
-            "output_format",
-            "mcp_servers",
-        ] {
+        for field in ["service_tier", "container", "inference_geo", "mcp_servers"] {
             let body = json!({
                 "model": "claude-opus-4-8",
                 "max_tokens": 1024,

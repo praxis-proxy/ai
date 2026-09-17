@@ -13,8 +13,9 @@ Completions translation.
 Starts Praxis with the shipped `messages-to-openai` example, retargeted at a
 local stub backend that records the translated request, and verifies through
 the official Anthropic Python SDK that unmapped fields reach the backend, that
-`metadata.user_id` becomes `safety_identifier`, and that fields the
-translation cannot honor are rejected before any backend call.
+`metadata.user_id` becomes `safety_identifier`, that `thinking` is dropped,
+and that fields the translation cannot honor are rejected before any backend
+call.
 
 Usage:
     cargo build -p praxis-ai-proxy
@@ -129,6 +130,7 @@ class TestRequestFieldHandling:
             model=MODEL,
             max_tokens=64,
             metadata={"user_id": "user-1"},
+            thinking={"type": "enabled", "budget_tokens": 1024},
             extra_body={"top_k": 40},
             messages=[{"role": "user", "content": "What is 2+2?"}],
         )
@@ -138,6 +140,7 @@ class TestRequestFieldHandling:
         assert upstream["top_k"] == 40
         assert upstream["safety_identifier"] == "user-1"
         assert "metadata" not in upstream
+        assert "thinking" not in upstream
 
     def test_unrepresentable_field_is_rejected_before_the_backend(self, anthropic_client):
         RecordingBackend.bodies.clear()
@@ -146,11 +149,11 @@ class TestRequestFieldHandling:
             anthropic_client.messages.create(
                 model=MODEL,
                 max_tokens=64,
-                thinking={"type": "enabled", "budget_tokens": 1024},
+                service_tier="standard_only",
                 messages=[{"role": "user", "content": "What is 2+2?"}],
             )
 
-        assert "`thinking` is not supported" in str(excinfo.value)
+        assert "`service_tier` is not supported" in str(excinfo.value)
         assert RecordingBackend.bodies == []
 
 

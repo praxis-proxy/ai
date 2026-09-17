@@ -42,6 +42,10 @@
               },
               "model": "synthetic-passthrough-model",
               "stream": false,
+              "thinking": {
+                "budget_tokens": 1024,
+                "type": "enabled"
+              },
               "top_k": 40
             }
           }

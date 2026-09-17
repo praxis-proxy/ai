@@ -14,7 +14,7 @@
   },
   "turns": [
     {
-      "name": "thinking",
+      "name": "inference_geo",
       "client": {
         "request": {
           "method": "POST",
@@ -27,6 +27,7 @@
           "body": {
             "kind": "json",
             "value": {
+              "inference_geo": "us",
               "max_tokens": 64,
               "messages": [
                 {
@@ -35,11 +36,7 @@
                 }
               ],
               "model": "synthetic-unrepresentable-parameters-model",
-              "stream": false,
-              "thinking": {
-                "budget_tokens": 1024,
-                "type": "enabled"
-              }
+              "stream": false
             }
           }
         },
@@ -54,7 +51,7 @@
             "kind": "json",
             "value": {
               "error": {
-                "message": "`thinking` is not supported when translating Anthropic Messages to Chat Completions",
+                "message": "`inference_geo` is not supported when translating Anthropic Messages to Chat Completions",
                 "type": "invalid_request_error"
               },
               "request_id": null,

@@ -32,7 +32,7 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// filter: ai_guardrails
 /// provider:
 ///   type: nemo
-///   endpoint: "http://nemo:8000/v1/guardrail/checks"
+///   endpoint: "http://nemo:8000/v1/checks"
 ///   allow_private_endpoint: true
 ///   timeout_ms: 5000
 /// phase:
@@ -49,7 +49,7 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 ///     r#"
 /// provider:
 ///   type: nemo
-///   endpoint: "http://nemo:8000/v1/guardrail/checks"
+///   endpoint: "http://nemo:8000/v1/checks"
 ///   allow_private_endpoint: true
 /// "#,
 /// )
@@ -270,7 +270,7 @@ fn record_verdict(
         },
         GuardResult::Block { reason } => Ok(enforce_block(body, reason, phase, phase_label, verdict)),
         GuardResult::Redact { reason, .. } => {
-            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict; forwarding unchanged until #579");
+            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict; forwarding unchanged until #49");
             Ok(FilterAction::Continue)
         },
     }
