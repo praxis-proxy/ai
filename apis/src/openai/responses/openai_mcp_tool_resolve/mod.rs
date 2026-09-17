@@ -75,7 +75,7 @@ use super::{
 };
 use crate::{
     callout_headers::effective_body_callout_headers,
-    json_body::{SerializedJson, serialize_json_body},
+    json_body::{SerializedJson, serialize_json_body, serialized_len},
     mcp_client,
 };
 
@@ -895,35 +895,6 @@ const ECHOED_REQUEST_FIELDS: &[&str] = &[
 /// this bound is omitted and falls back to its API default in the snapshot.
 const MAX_ECHOED_OPTIONS_BYTES: usize = 256 * 1024;
 
-/// An [`std::io::Write`] sink that counts bytes and discards them, used to
-/// measure a value's serialized JSON size without allocating a buffer for it.
-struct ByteCounter(usize);
-
-impl std::io::Write for ByteCounter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0 = self.0.saturating_add(buf.len());
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Serialized JSON byte length of `value`, computed without materializing the
-/// serialized bytes so that measuring a large field never copies it.
-fn serialized_len(value: &serde_json::Value) -> usize {
-    let mut counter = ByteCounter(0);
-    // Serializing an in-memory `Value` (no non-string map keys, no non-finite
-    // floats) into a counting sink that never errors cannot fail. Should the
-    // impossible happen, report the value as maximally large so the caller skips
-    // (never echoes) it — fail-safe for the size bound rather than panicking.
-    match serde_json::to_writer(&mut counter, value) {
-        Ok(()) => counter.0,
-        Err(_) => usize::MAX,
-    }
-}
-
 /// Extract the size-bounded, credential-free subset of request options echoed
 /// into a streaming discovery-failure snapshot.
 ///
@@ -945,7 +916,10 @@ fn capture_echoed_options(body: &[u8]) -> Option<serde_json::Value> {
         // Measure before cloning so an oversized field is never copied into the
         // capture, and skip (rather than truncate) any field that would exceed
         // the aggregate bound so the retained JSON stays well-formed.
-        let len = serialized_len(value);
+        // Serializing an in-memory `Value` into the counting sink should not
+        // fail. If it does, treat the field as maximally large so it is skipped
+        // rather than weakening the echoed-options size bound.
+        let len = serialized_len(value).unwrap_or(usize::MAX);
         if total.saturating_add(len) > MAX_ECHOED_OPTIONS_BYTES {
             continue;
         }
@@ -2197,7 +2171,7 @@ fn commit_deferred_listings(
     prepared: Vec<PreparedDeferredListing>,
     max_rewritten_body_bytes: usize,
 ) -> Result<(), ResolveError> {
-    let mut function_tools_by_label: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut function_tools_by_label: HashMap<&str, &[serde_json::Value]> = HashMap::new();
     let mut generated_names = HashSet::new();
     for item in &prepared {
         for name in item
@@ -2207,7 +2181,10 @@ fn commit_deferred_listings(
         {
             generated_names.insert(name.to_owned());
         }
-        function_tools_by_label.insert(item.server_label.clone(), item.functions.clone());
+        function_tools_by_label.insert(
+            item.server_label.as_str(),
+            item.functions.as_slice(),
+        );
     }
 
     let expanded_tools = expand_deferred_tools_array(state.tools.clone(), &function_tools_by_label);
@@ -2232,7 +2209,7 @@ fn commit_deferred_listings(
 /// Expand deferred MCP entries in a cloned request body for size checking.
 fn expanded_request_body(
     request_body: &serde_json::Value,
-    functions_by_label: &HashMap<String, Vec<serde_json::Value>>,
+    functions_by_label: &HashMap<&str, &[serde_json::Value]>,
 ) -> serde_json::Value {
     let mut body = request_body.clone();
     if let Some(obj) = body.as_object_mut()
@@ -2248,7 +2225,7 @@ fn expanded_request_body(
 
 /// Reject an expanded provider body that exceeds `max_rewritten_body_bytes`.
 fn check_json_body_size(body: &serde_json::Value, max_rewritten_body_bytes: usize) -> Result<(), ResolveError> {
-    let actual = serde_json::to_vec(body).map_err(ResolveError::Serialization)?.len();
+    let actual = serialized_len(body).map_err(ResolveError::Serialization)?;
     if actual > max_rewritten_body_bytes {
         return Err(ResolveError::BodyTooLarge {
             actual,
@@ -2367,7 +2344,7 @@ fn mcp_list_tools_id(server_label: &str) -> String {
 /// Swap deferred MCP entries for the given label with generated function tools.
 fn expand_deferred_tools_array(
     tools: Vec<serde_json::Value>,
-    functions_by_label: &HashMap<String, Vec<serde_json::Value>>,
+    functions_by_label: &HashMap<&str, &[serde_json::Value]>,
 ) -> Vec<serde_json::Value> {
     let mut result = Vec::with_capacity(tools.len());
     for tool in tools {
