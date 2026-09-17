@@ -112,9 +112,9 @@ test-integration:
 		$(if $(V),--nocapture)
 
 test-inference-fixtures:
-	cargo test -p praxis-test-utils $(_NOCAPTURE)
-	cargo test -p xtask inference_fixtures $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --test suite inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-test-utils --no-default-features --features store-all $(_NOCAPTURE)
+	cargo test -p xtask --no-default-features --features store-all inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --no-default-features --features store-all --test suite inference_fixtures $(_NOCAPTURE)
 
 test-postgres-unit:
 	cargo test -p praxis-ai-apis --no-default-features --features store-all store::tests::pg_ -- --ignored $(_NOCAPTURE)
