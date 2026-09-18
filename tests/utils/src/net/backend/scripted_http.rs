@@ -199,6 +199,113 @@ pub async fn start_scripted_http_backend_turns(
     }
 }
 
+/// Mutable accumulator shared across [`apply_header_line`] calls.
+#[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the independent header facts make request validation explicit"
+)]
+struct HeaderParseState {
+    /// Declared request body length.
+    body_bytes: usize,
+    /// Whether any `Connection` header listed the `upgrade` token.
+    connection_upgrade: bool,
+    /// Parsed header map.
+    headers: HeaderMap,
+    /// Whether the request head contains a malformed header or content length.
+    malformed: bool,
+    /// Observed `Upgrade` header value (preserved verbatim).
+    upgrade_value: String,
+    /// Whether any `Upgrade` header carried the `websocket` token.
+    websocket_upgrade: bool,
+}
+
+/// Aggregated facts extracted from a request head's header lines.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the independent header facts make request validation explicit"
+)]
+struct ParsedHeaders {
+    /// Declared request body length.
+    body_bytes: usize,
+    /// Whether any `Connection` header listed the `upgrade` token.
+    connection_upgrade: bool,
+    /// Parsed header map.
+    headers: HeaderMap,
+    /// Whether the request head contains a malformed header or content length.
+    malformed: bool,
+    /// Observed `Upgrade` header value (preserved verbatim).
+    upgrade_value: String,
+    /// Whether any `Upgrade` header carried the `websocket` token.
+    websocket_upgrade: bool,
+}
+
+/// Parsed facts needed before reading a request body.
+#[derive(Clone, Debug)]
+struct PeekedHttpRequest {
+    /// Declared request body length.
+    body_bytes: usize,
+    /// Number of bytes through the terminating blank header line.
+    head_bytes: usize,
+    /// Parsed request headers.
+    headers: HeaderMap,
+    /// Whether the request head contains a malformed header or content length.
+    malformed: bool,
+    /// Request method.
+    method: String,
+    /// Request path component.
+    path: String,
+    /// Optional query string from the request target.
+    query: Option<String>,
+    /// Observed `Upgrade` header value.
+    upgrade_value: String,
+    /// Whether the request declares a `WebSocket` upgrade.
+    websocket_upgrade: bool,
+}
+
+/// Method and path accepted by the scripted backend.
+#[derive(Debug)]
+struct RequestExpectation {
+    /// Required HTTP method.
+    method: String,
+    /// Required request path without a query string.
+    path: String,
+}
+
+/// Shared immutable script plus the globally claimed turn index.
+#[derive(Debug)]
+struct ScriptState {
+    /// Method and path accepted by the backend.
+    expectation: RequestExpectation,
+    /// Next response turn claimed by a valid request.
+    turn_index: AtomicUsize,
+    /// Ordered response actions, shared across every connection.
+    turns: Box<[Vec<HttpServerAction>]>,
+}
+
+impl ScriptState {
+    /// Build listener-owned state for one backend instance.
+    fn new(expected_method: &str, expected_path: &str, turns: Vec<Vec<HttpServerAction>>) -> Self {
+        Self {
+            expectation: RequestExpectation {
+                method: expected_method.to_owned(),
+                path: expected_path.to_owned(),
+            },
+            turn_index: AtomicUsize::new(0),
+            turns: turns.into_boxed_slice(),
+        }
+    }
+
+    /// Return whether a parsed request satisfies the configured contract.
+    fn expects(&self, request: &PeekedHttpRequest) -> bool {
+        request.method == self.expectation.method && request.path == self.expectation.path
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Utilities
+// -----------------------------------------------------------------------------
+
 /// Bind an ephemeral IPv4 loopback listener for one backend instance.
 async fn bind_listener() -> TcpListener {
     TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -470,68 +577,6 @@ fn status_reason(status: u16) -> &'static str {
     }
 }
 
-/// Shared immutable script plus the globally claimed turn index.
-#[derive(Debug)]
-struct ScriptState {
-    /// Method and path accepted by the backend.
-    expectation: RequestExpectation,
-    /// Next response turn claimed by a valid request.
-    turn_index: AtomicUsize,
-    /// Ordered response actions, shared across every connection.
-    turns: Box<[Vec<HttpServerAction>]>,
-}
-
-impl ScriptState {
-    /// Build listener-owned state for one backend instance.
-    fn new(expected_method: &str, expected_path: &str, turns: Vec<Vec<HttpServerAction>>) -> Self {
-        Self {
-            expectation: RequestExpectation {
-                method: expected_method.to_owned(),
-                path: expected_path.to_owned(),
-            },
-            turn_index: AtomicUsize::new(0),
-            turns: turns.into_boxed_slice(),
-        }
-    }
-
-    /// Return whether a parsed request satisfies the configured contract.
-    fn expects(&self, request: &PeekedHttpRequest) -> bool {
-        request.method == self.expectation.method && request.path == self.expectation.path
-    }
-}
-
-/// Method and path accepted by the scripted backend.
-#[derive(Debug)]
-struct RequestExpectation {
-    /// Required HTTP method.
-    method: String,
-    /// Required request path without a query string.
-    path: String,
-}
-
-/// Parsed facts needed before reading a request body.
-#[derive(Clone, Debug)]
-struct PeekedHttpRequest {
-    /// Declared request body length.
-    body_bytes: usize,
-    /// Number of bytes through the terminating blank header line.
-    head_bytes: usize,
-    /// Parsed request headers.
-    headers: HeaderMap,
-    /// Whether the request head contains a malformed header or content length.
-    malformed: bool,
-    /// Request method.
-    method: String,
-    /// Request path component.
-    path: String,
-    /// Optional query string from the request target.
-    query: Option<String>,
-    /// Observed `Upgrade` header value.
-    upgrade_value: String,
-    /// Whether the request declares a `WebSocket` upgrade.
-    websocket_upgrade: bool,
-}
-
 /// Inspect an HTTP head without consuming bytes from the TCP stream.
 async fn peek_http_request(stream: &tokio::net::TcpStream, timeout: Duration) -> Option<PeekedHttpRequest> {
     let head_bytes = peek_head_bytes(stream, timeout).await?;
@@ -594,26 +639,6 @@ fn parse_request_line(line: &str) -> Option<(String, String, Option<String>)> {
     Some((method, path, query))
 }
 
-/// Aggregated facts extracted from a request head's header lines.
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "the independent header facts make request validation explicit"
-)]
-struct ParsedHeaders {
-    /// Declared request body length.
-    body_bytes: usize,
-    /// Whether any `Connection` header listed the `upgrade` token.
-    connection_upgrade: bool,
-    /// Parsed header map.
-    headers: HeaderMap,
-    /// Whether the request head contains a malformed header or content length.
-    malformed: bool,
-    /// Observed `Upgrade` header value (preserved verbatim).
-    upgrade_value: String,
-    /// Whether any `Upgrade` header carried the `websocket` token.
-    websocket_upgrade: bool,
-}
-
 /// Parse all header lines and aggregate the connection, upgrade, body length, and header map.
 fn parse_request_headers(lines: &[&str]) -> ParsedHeaders {
     let mut state = HeaderParseState::default();
@@ -628,27 +653,6 @@ fn parse_request_headers(lines: &[&str]) -> ParsedHeaders {
         upgrade_value: state.upgrade_value,
         websocket_upgrade: state.websocket_upgrade,
     }
-}
-
-/// Mutable accumulator shared across [`apply_header_line`] calls.
-#[derive(Default)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "the independent header facts make request validation explicit"
-)]
-struct HeaderParseState {
-    /// Declared request body length.
-    body_bytes: usize,
-    /// Whether any `Connection` header listed the `upgrade` token.
-    connection_upgrade: bool,
-    /// Parsed header map.
-    headers: HeaderMap,
-    /// Whether the request head contains a malformed header or content length.
-    malformed: bool,
-    /// Observed `Upgrade` header value (preserved verbatim).
-    upgrade_value: String,
-    /// Whether any `Upgrade` header carried the `websocket` token.
-    websocket_upgrade: bool,
 }
 
 /// Apply one header line to the parse state.

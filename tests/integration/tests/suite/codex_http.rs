@@ -175,6 +175,40 @@ fn native_sse_response_resources_match_openresponses_schema() {
     );
 }
 
+/// Prove the fixture validator rejects missing fields and malformed usage details.
+#[test]
+fn native_sse_response_schema_validation_is_sensitive() {
+    let mut missing_model = http_response_resource("in_progress", Vec::new(), serde_json::Value::Null);
+    missing_model
+        .as_object_mut()
+        .expect("fixture response should be an object")
+        .remove("model");
+    assert!(
+        OPENRESPONSES_RESPONSE_RESOURCE_VALIDATOR
+            .validate(&missing_model)
+            .is_err(),
+        "schema validation should reject a missing required ResponseResource field"
+    );
+
+    let invalid_usage = http_response_resource(
+        "completed",
+        Vec::new(),
+        serde_json::json!({
+            "input_tokens": 0,
+            "input_tokens_details": null,
+            "output_tokens": 0,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 0
+        }),
+    );
+    assert!(
+        OPENRESPONSES_RESPONSE_RESOURCE_VALIDATOR
+            .validate(&invalid_usage)
+            .is_err(),
+        "schema validation should reject null input token details"
+    );
+}
+
 /// Prove the translated client stream starts before the Chat stream completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn translated_chat_sse_reaches_client_before_upstream_finishes() {
