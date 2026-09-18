@@ -193,7 +193,7 @@ fn response_guardrails_provider_down_replaces_body() {
 fn response_guardrails_non_chat_body_replaces_body() {
     let long_text = "x".repeat(512);
     let backend = start_backend_with_shutdown(&long_text);
-    let nemo = nemo_mock(r#"{"status":"passed","content":"ok"}"#);
+    let nemo = nemo_mock(r#"{"status":"passed","content":"safe"}"#);
     let proxy_port = free_port();
     let config = load_response_config(proxy_port, backend.port(), nemo.port());
     let proxy = start_proxy(&config);

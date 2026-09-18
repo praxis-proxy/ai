@@ -4,7 +4,7 @@
 //! AI guardrails filter: calls external content safety providers
 //! (e.g. `NeMo` Guardrails) to evaluate request and response bodies.
 
-mod config;
+pub(crate) mod config;
 mod filter;
 pub(crate) mod providers;
 

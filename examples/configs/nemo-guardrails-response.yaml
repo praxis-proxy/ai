@@ -1,7 +1,6 @@
 # Guardrails (NeMo) - Response Phase Only
 #
 # Evaluates upstream responses against a NeMo Guardrails service.
-# Requires NeMo Guardrails >= 0.24 (the /v1/checks endpoint).
 # Request-side guardrails are disabled so the request always reaches
 # the upstream. This config is used by integration tests to verify
 # response-phase behavior in isolation.
@@ -10,9 +9,7 @@
 #     passed   - response forwarded to the client unchanged
 #     blocked  - response body replaced with a JSON error payload
 #                (status remains 200 because headers are already committed)
-#     modified - forwarded unchanged until redaction support lands
-#     provider HTTP error - response body replaced with a JSON error payload
-#                (same as blocked; headers are already committed)
+#     modified - redaction verdict recorded; original body forwarded until #49
 
 listeners:
   - name: gateway
@@ -24,11 +21,18 @@ filter_chains:
   - name: nemo-guardrails-response
     filters:
       - filter: ai_guardrails
+        # Optional. Omit for an empty pass-through chain; configure one when
+        # NeMo callouts need credentials, tracing, or destination policy.
+        outbound_chain: nemo-outbound
         provider:
           type: nemo
+          # Requires NeMo Guardrails 0.24.0 or newer.
           endpoint: "http://127.0.0.1:3001/v1/checks"
-          allow_private_endpoint: true
+          model: "check-model"
+          guardrails:
+            config_ids: ["your-config"] # replace with a configuration deployed in NeMo
           timeout_ms: 5000
+          max_message_checks: 32
         phase:
           request: false
           response: true
@@ -44,5 +48,10 @@ filter_chains:
             endpoints:
               - "127.0.0.1:3000"
 
+  - name: nemo-outbound
+    filters:
+      - filter: request_id
+
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends
+  allow_private_upstreams: true # example calls the local NeMo service

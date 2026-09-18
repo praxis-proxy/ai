@@ -3,16 +3,26 @@
 
 //! [`AiGuardrailsFilter`] implementation and `HttpFilter` trait impl.
 
+use std::{sync::Arc, time::Instant};
+
 use async_trait::async_trait;
 use bytes::Bytes;
-use praxis_core::subrequest::{SubRequestClient, SubRequestConnector};
+#[cfg(test)]
+use praxis_core::subrequest::SubRequestConnector;
+use praxis_core::{
+    config::InsecureOptions,
+    subrequest::{DEPTH_HEADER, SubRequestClient},
+};
+#[cfg(test)]
+use praxis_filter::parse_filter_config;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, FilterPipeline, HttpFilter, HttpFilterContext, Rejection,
+    SubrequestRuntime,
 };
 
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
-    providers::{GuardPhase, GuardProvider, GuardResult, nemo::NemoProvider},
+    providers::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult, nemo},
 };
 
 /// Maximum request body size to buffer (1 MiB).
@@ -26,105 +36,166 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// response bodies. The provider determines whether content should
 /// be passed, blocked, or redacted.
 ///
+/// Every provider callout runs through Praxis's filtered-subrequest executor.
+/// The optional `outbound_chain` adds destination-bound authentication,
+/// authorization, audit, and static service credentials; when omitted it
+/// defaults to an empty pass-through chain. Parent and child contexts stay
+/// isolated; user-scoped credential projection is handled separately in #880.
+///
+/// Because this filter reads the request body before the header-phase
+/// security filters on the main chain run, operators should treat the
+/// pre-read body as untrusted input and configure an outbound chain whenever
+/// the provider requires destination-bound policy enforcement.
+///
 /// **Wire format:** Chat Completions only (`messages` on requests,
 /// `choices[].message` on responses). Responses API, Anthropic Messages,
 /// and MCP are not supported yet (see ai#1043).
+///
+/// For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail
+/// configurations. When `provider.guardrails` is omitted, the request omits
+/// `config_ids` so the service can use its default configuration.
 ///
 /// # YAML configuration
 ///
 /// ```yaml
 /// filter: ai_guardrails
+/// outbound_chain: nemo-outbound # optional
 /// provider:
 ///   type: nemo
 ///   endpoint: "http://nemo:8000/v1/checks"
-///   allow_private_endpoint: true
+///   model: "check-model"
+///   guardrails:
+///     config_ids: ["your-config"]
 ///   timeout_ms: 5000
 /// phase:
 ///   request: true
 ///   response: true
-/// ```
-///
-/// # Example
-///
-/// ```ignore
-/// use praxis_ai_filters::AiGuardrailsFilter;
-///
-/// let yaml: serde_yaml::Value = serde_yaml::from_str(
-///     r#"
-/// provider:
-///   type: nemo
-///   endpoint: "http://nemo:8000/v1/checks"
-///   allow_private_endpoint: true
-/// "#,
-/// )
-/// .unwrap();
-/// let filter = AiGuardrailsFilter::from_config(&yaml).unwrap();
-/// assert_eq!(filter.name(), "ai_guardrails");
 /// ```
 pub struct AiGuardrailsFilter {
     /// Guard provider instance.
     provider: Box<dyn GuardProvider>,
     /// Which phases to evaluate.
     phase: PhaseConfig,
+    /// Prebuilt outbound filter chain for provider callouts.
+    outbound: Arc<FilterPipeline>,
+    /// Per-callout deadline derived from the provider configuration.
+    callout_timeout: std::time::Duration,
 }
 
 impl AiGuardrailsFilter {
-    /// Create a filter from parsed YAML config.
-    ///
-    /// Uses an isolated [`SubRequestClient`] with a default pool
-    /// size of 4. Prefer [`from_config_with_client`] when a shared
-    /// client is available.
+    /// Build a filter from parsed config, a bound outbound chain, and a
+    /// shared sub-request client.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if config parsing or validation fails.
-    ///
-    /// [`FilterError`]: praxis_filter::FilterError
-    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-    /// [`from_config_with_client`]: Self::from_config_with_client
-    pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let client = SubRequestClient::new(SubRequestConnector::new(4, None));
-        Self::build(config, client)
-    }
-
-    /// Create a filter using the shared [`SubRequestClient`].
-    ///
-    /// The shared client inherits the server-level pool size and
-    /// connection limits from the runtime configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if config parsing or validation fails.
-    ///
-    /// [`FilterError`]: praxis_filter::FilterError
-    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-    pub fn from_config_with_client(
-        config: &serde_yaml::Value,
+    /// Returns [`FilterError`] if config parsing or provider validation fails.
+    pub(crate) fn build(
+        config: AiGuardrailsConfig,
+        outbound: Arc<FilterPipeline>,
         client: SubRequestClient,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        Self::build(config, client)
-    }
-
-    /// Shared constructor body for [`from_config`](Self::from_config) and
-    /// [`from_config_with_client`](Self::from_config_with_client).
-    fn build(config: &serde_yaml::Value, client: SubRequestClient) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: AiGuardrailsConfig = parse_filter_config("ai_guardrails", config)?;
-
-        let provider: Box<dyn GuardProvider> = match cfg.provider.provider_type {
-            ProviderType::Nemo => Box::new(NemoProvider::from_config(&cfg.provider.config, client)?),
+        let (provider, callout_timeout): (Box<dyn GuardProvider>, _) = match config.provider.provider_type {
+            ProviderType::Nemo => {
+                let provider = nemo::NemoProvider::from_config(&config.provider.config, client)?;
+                let timeout = provider.callout_timeout();
+                (Box::new(provider), timeout)
+            },
         };
 
         Ok(Box::new(Self {
             provider,
-            phase: cfg.phase,
+            phase: config.phase,
+            outbound,
+            callout_timeout,
         }))
     }
+
+    /// Create a filter from parsed YAML config.
+    ///
+    /// Production pipelines must register `ai_guardrails` through
+    /// [`register_chain_binding`](praxis_filter::FilterRegistry::register_chain_binding)
+    /// so the outbound chain is resolved at construction time. This
+    /// constructor exists for tests and builds a permissive outbound test
+    /// pipeline directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if config parsing or validation fails.
+    #[cfg(test)]
+    pub(crate) fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client = SubRequestClient::new(SubRequestConnector::new(4, None));
+        Self::from_config_with_client(config, client)
+    }
+
+    /// Create a filter using the shared [`SubRequestClient`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if config parsing or validation fails.
+    #[cfg(test)]
+    pub(crate) fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let cfg: AiGuardrailsConfig = parse_filter_config("ai_guardrails", config)?;
+        let outbound = test_outbound_chain()?;
+        Self::build(cfg, outbound, client)
+    }
+
+    /// Capture downstream identity, nesting, deadline, and the bound chain for a callout.
+    fn callout_runtime(&self, ctx: &HttpFilterContext<'_>) -> GuardCalloutRuntime<'_> {
+        let deadline = Instant::now()
+            .checked_add(self.callout_timeout)
+            .unwrap_or_else(|| Instant::now() + self.callout_timeout);
+
+        GuardCalloutRuntime {
+            downstream: SubrequestRuntime::new(
+                ctx.client_addr,
+                ctx.downstream_tls,
+                ctx.peer_identity.clone(),
+                ctx.request_start,
+            ),
+            depth: subrequest_depth(ctx),
+            deadline,
+            outbound: &self.outbound,
+        }
+    }
+}
+
+#[cfg(test)]
+/// Build a permissive, minimal outbound pipeline for direct unit tests.
+fn test_outbound_chain() -> Result<Arc<FilterPipeline>, FilterError> {
+    use praxis_core::config::FilterEntry;
+    use praxis_filter::FilterRegistry;
+
+    let registry = FilterRegistry::with_builtins();
+    let mut entries: Vec<FilterEntry> = serde_yaml::from_str("- filter: request_id\n")
+        .map_err(|error| -> FilterError { format!("ai_guardrails: {error}").into() })?;
+    let mut pipeline = FilterPipeline::build(&mut entries, &registry)?;
+    pipeline.set_allow_private_upstreams(true);
+    Ok(Arc::new(pipeline))
 }
 
 #[async_trait]
 impl HttpFilter for AiGuardrailsFilter {
     fn name(&self) -> &'static str {
         "ai_guardrails"
+    }
+
+    fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
+        if let Some(pipeline) = Arc::get_mut(&mut self.outbound) {
+            visitor(pipeline);
+        } else {
+            debug_assert!(false, "outbound pipeline must be uniquely owned during configuration");
+        }
+    }
+
+    fn referenced_files(&self) -> Vec<std::path::PathBuf> {
+        self.outbound.referenced_files()
+    }
+
+    fn apply_insecure_options(&self, options: &InsecureOptions) {
+        self.outbound.apply_insecure_options(options);
     }
 
     async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -173,7 +244,8 @@ impl HttpFilter for AiGuardrailsFilter {
         }
 
         let messages = extract_messages(bytes)?;
-        let result = self.provider.evaluate(messages, GuardPhase::Request).await?;
+        let runtime = self.callout_runtime(ctx);
+        let result = self.provider.evaluate(messages, GuardPhase::Request, &runtime).await?;
         record_verdict(ctx, body, result, GuardPhase::Request)
     }
 
@@ -189,6 +261,10 @@ impl HttpFilter for AiGuardrailsFilter {
         BodyMode::Stream
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps response evaluation and fail-closed mapping together"
+    )]
     fn on_response_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -216,9 +292,12 @@ impl HttpFilter for AiGuardrailsFilter {
 
         let evaluation = extract_response_messages(bytes).and_then(|messages| {
             let handle = tokio::runtime::Handle::current();
+            let runtime = self.callout_runtime(ctx);
             // `on_response_body` is sync (Pingora constraint); use `block_in_place`
             // to bridge into async. See #51 for the plan to make this truly async.
-            tokio::task::block_in_place(|| handle.block_on(self.provider.evaluate(messages, GuardPhase::Response)))
+            tokio::task::block_in_place(|| {
+                handle.block_on(self.provider.evaluate(messages, GuardPhase::Response, &runtime))
+            })
         });
 
         match evaluation {
@@ -241,19 +320,20 @@ impl HttpFilter for AiGuardrailsFilter {
 // Private Utilities
 // -----------------------------------------------------------------------------
 
+/// Extract the current filtered-subrequest depth from the framework header.
+#[expect(clippy::cast_possible_truncation, reason = "depth is clamped to u8::MAX before cast")]
+fn subrequest_depth(ctx: &HttpFilterContext<'_>) -> u8 {
+    ctx.request
+        .headers
+        .get(DEPTH_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0)
+        .min(u32::from(u8::MAX)) as u8
+}
+
 /// Record the provider verdict in `ctx.filter_results` and map it to
 /// the corresponding [`FilterAction`].
-///
-/// The `phase` parameter controls how a `Block` verdict is enforced:
-///
-/// - **Request phase**: returns `FilterAction::Reject(403)` - headers have not been sent yet, so a clean 403 is
-///   possible.
-///
-/// - **Response phase**: response headers (including the upstream's 200 status and `Content-Length`) are already
-///   committed by the time `on_response_body` runs.  A `Reject(403)` would be converted to a 500 by Pingora (see
-///   `praxis-proxy/pingora` issue #51).  Instead, the response body is replaced with a JSON error payload and padded to
-///   the original `Content-Length` so Pingora does not report `PrematureBodyEnd`.  JSON parsers ignore trailing ASCII
-///   spaces, so clients parse the error cleanly.
 fn record_verdict(
     ctx: &mut HttpFilterContext<'_>,
     body: &mut Option<Bytes>,
@@ -307,9 +387,6 @@ fn enforce_block(
 }
 
 /// Replace the response body with an error JSON payload.
-///
-/// Used on the response side when headers are already committed and
-/// the body is the only channel for communicating errors to the client.
 fn replace_body_with_error(body: &mut Option<Bytes>, message: &str, error_type: &str, code: &str) {
     let error_json = serde_json::json!({
         "error": {
@@ -323,17 +400,6 @@ fn replace_body_with_error(body: &mut Option<Bytes>, message: &str, error_type: 
 }
 
 /// Fit `replacement` bytes to the original response body length.
-///
-/// The downstream `Content-Length` is committed by the time
-/// `on_response_body` runs - praxis has no response-side equivalent of
-/// `apply_mutated_content_length`. Emitting fewer bytes than
-/// `Content-Length` causes Pingora to report `PrematureBodyEnd` and
-/// abort the connection. Emitting more bytes is an HTTP/1.1 framing
-/// desync.
-///
-/// Pads with trailing ASCII spaces on shrink (JSON parsers ignore them);
-/// truncates on grow (safe failure mode - corrupts JSON but cannot cause
-/// response smuggling).
 pub(super) fn fit_to_committed_length(replacement: String, original_body: &Option<Bytes>) -> Bytes {
     let original_len = original_body.as_ref().map_or(0, Bytes::len);
     let replacement = replacement.into_bytes();
@@ -364,22 +430,10 @@ pub(super) fn fit_to_committed_length(replacement: String, original_body: &Optio
 }
 
 /// Extract messages from an OpenAI Chat Completion request body.
-///
-/// Supports:
-/// - OpenAI Chat request: `{"messages": [...]}`
-///
-/// Returns an error for unrecognized body formats to prevent
-/// silently skipping guardrail evaluation.
-///
-/// # Errors
-///
-/// Returns [`FilterError`] if the body is not valid JSON or does not
-/// contain a recognizable messages field.
 fn extract_messages(body: &Bytes) -> Result<Vec<serde_json::Value>, FilterError> {
     let mut json: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| -> FilterError { format!("ai_guardrails: request body is not valid JSON: {e}").into() })?;
 
-    // OpenAI Chat format: {"messages": [...]}
     if let Some(messages) = json.get_mut("messages").filter(|m| m.is_array())
         && let serde_json::Value::Array(messages) = std::mem::take(messages)
     {
@@ -390,18 +444,6 @@ fn extract_messages(body: &Bytes) -> Result<Vec<serde_json::Value>, FilterError>
 }
 
 /// Extract assistant messages from an OpenAI Chat Completion response body.
-///
-/// Supports:
-/// - OpenAI Chat Completion response: `{"choices": [{"message": {...}}]}`
-///
-/// Each `message` object from the `choices` array is returned as-is
-/// so the guardrail provider sees the full assistant message
-/// (role, content, `tool_calls`, etc.).
-///
-/// # Errors
-///
-/// Returns [`FilterError`] if the body is not valid JSON or does not
-/// contain a recognizable choices/message structure.
 fn extract_response_messages(body: &Bytes) -> Result<Vec<serde_json::Value>, FilterError> {
     let mut json: serde_json::Value = serde_json::from_slice(body)
         .map_err(|e| -> FilterError { format!("ai_guardrails: response body is not valid JSON: {e}").into() })?;

@@ -1,18 +1,12 @@
 # Guardrails (NeMo) - Request Phase
 #
 # Evaluates incoming requests against a NeMo Guardrails service.
-# Requires NeMo Guardrails >= 0.24 (the /v1/checks endpoint).
 # For response-phase guardrails, see nemo-guardrails-response.yaml.
 #
 #   Request phase:
 #     passed   - request forwarded to the upstream unchanged
-#     blocked  - 403 returned to the client (triggered rail name in body)
-#     modified - forwarded unchanged until redaction support lands (#49)
-#     provider HTTP error - 500 returned to the client
-#
-# Each user message triggers one /v1/checks call (cumulative slices).
-# max_message_checks (default 32) caps the number of calls per request;
-# conversations exceeding the limit are rejected (fail-closed).
+#     blocked  - 403 returned to the client (triggered rail names in body)
+#     modified - redaction verdict recorded; original body forwarded until #49
 #
 # Start a local NeMo Guardrails instance before running this config.
 #
@@ -38,13 +32,20 @@ filter_chains:
   - name: nemo-guardrails
     filters:
       - filter: ai_guardrails
+        # Optional. Omit for an empty pass-through chain; configure one when
+        # NeMo callouts need credentials, tracing, or destination policy.
+        outbound_chain: nemo-outbound
         provider:
           type: nemo
           # NeMo callouts are anonymous; no downstream authentication
           # headers are forwarded to this endpoint.
+          # Requires NeMo Guardrails 0.24.0 or newer.
           endpoint: "http://127.0.0.1:3001/v1/checks"
-          allow_private_endpoint: true
+          model: "check-model"
+          guardrails:
+            config_ids: ["your-config"] # replace with a configuration deployed in NeMo
           timeout_ms: 5000
+          max_message_checks: 32
         phase:
           request: true
           response: false  # see nemo-guardrails-response.yaml for response-phase example
@@ -60,5 +61,12 @@ filter_chains:
             endpoints:
               - "127.0.0.1:3000"
 
+  # Every NeMo callout traverses this independently built chain. Add
+  # destination-bound authentication, authorization, and audit filters here.
+  - name: nemo-outbound
+    filters:
+      - filter: request_id
+
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends
+  allow_private_upstreams: true # example calls the local NeMo service
