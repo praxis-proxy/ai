@@ -85,7 +85,7 @@ where
 
     for spec in specs {
         let spec: &OpenAiOperationSpec = spec;
-        let is_extension = extension_ids.contains(&spec.operation_id);
+        let is_extension = extension_ids.contains(&spec.operation_id());
         if is_extension {
             tally.extensions += 1;
         } else {
@@ -94,13 +94,13 @@ where
 
         let found = operations
             .iter()
-            .find(|candidate| candidate.key.method == spec.method.as_str() && candidate.key.path == spec.spec_path)
+            .find(|candidate| candidate.key.method == spec.method().as_str() && candidate.key.path == spec.spec_path)
             .and_then(|candidate| candidate.operation_id.as_deref());
 
         if let Comparison::Drifted(reason) = compare(
-            spec.method.as_str(),
+            spec.method().as_str(),
             spec.spec_path,
-            spec.operation_id,
+            spec.operation_id(),
             found,
             is_extension,
         ) {

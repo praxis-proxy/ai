@@ -14,6 +14,7 @@ use serde::{
 use serde_json::{Map, Value};
 use tracing::debug;
 #[cfg(test)]
+#[cfg(feature = "store-sqlite")]
 use tracing::warn;
 
 use super::{
@@ -43,6 +44,7 @@ use crate::{
 /// the cache first from the same authoritative rows, so a small bound absorbs
 /// realistic append contention.
 #[cfg(test)]
+#[cfg(feature = "store-sqlite")]
 const MAX_SYNC_ATTEMPTS: usize = 8;
 
 // -----------------------------------------------------------------------------
@@ -1037,6 +1039,7 @@ fn store_error_response(error: &StoreError) -> Result<Rejection, FilterError> {
 /// ceiling. Replace this full-history rebuild with incremental processing; do
 /// not add a non-spec conversation limit as a workaround. Tracked in #532.
 #[cfg(test)]
+#[cfg(feature = "store-sqlite")]
 pub(super) async fn sync_conversation_messages(
     store: &dyn ConversationItemStore,
     tenant_id: &StateOwner,
@@ -1081,6 +1084,7 @@ pub(super) async fn sync_conversation_messages(
 /// swapped in this call — and `Ok(false)` when a concurrent writer won the swap
 /// and the caller should retry with a freshly read snapshot.
 #[cfg(test)]
+#[cfg(feature = "store-sqlite")]
 async fn try_sync_conversation_messages(
     store: &dyn ConversationItemStore,
     tenant_id: &StateOwner,
@@ -1116,6 +1120,7 @@ async fn try_sync_conversation_messages(
 
 /// Collect all item JSON values for a conversation in ascending order.
 #[cfg(test)]
+#[cfg(feature = "store-sqlite")]
 async fn collect_conversation_messages(
     store: &dyn ConversationItemStore,
     tenant_id: &StateOwner,
@@ -1141,6 +1146,7 @@ async fn collect_conversation_messages(
 }
 
 #[cfg(test)]
+#[cfg(feature = "store-sqlite")]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests")]
 mod tests {

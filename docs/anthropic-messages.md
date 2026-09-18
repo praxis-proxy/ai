@@ -188,7 +188,8 @@ The `anthropic_messages_to_chat_completions` filter:
   SHA-256 hex digest, `output_config.effort` to
   `reasoning_effort`, and a `json_schema`
   `output_config.format` (or the deprecated
-  `output_format`) to `response_format`
+  `output_format`) to a strict `response_format`; any
+  other `output_config` key is rejected with a 400
 - Rejects `service_tier`, `container`, `inference_geo`
   and `mcp_servers` with a 400, because the translated
   response cannot report their effect truthfully

@@ -142,7 +142,8 @@
                       "answer"
                     ],
                     "type": "object"
-                  }
+                  },
+                  "strict": true
                 },
                 "type": "json_schema"
               },

@@ -109,23 +109,16 @@ def _run_compliance(suite_dir: Path, listener_port: int, ids: set[str]) -> subpr
 
 
 def _supported_run_groups(ids: set[str]) -> list[set[str]]:
-    """Split supported templates so streaming is not starved by siblings.
+    """Run each template alone so CPU vLLM is not contended.
 
-    The OpenResponses CLI launches every `--filter` id via `Promise.all`. After
-    `openai_stream_events` moved inside IRR, Praxis 0.5.4 applies a hardcoded
-    30s inter-chunk idle timeout to that stream. Concurrent Qwen CPU
-    generations can stall SSE for longer than that and drop the socket
-    (`streaming-response` then fails with "socket connection was closed
-    unexpectedly"). Isolate the streaming template; keep the rest batched.
+    The OpenResponses CLI launches every `--filter` id via `Promise.all`.
+    Concurrent Qwen CPU generations stall one another: streaming then
+    exceeds IRR's 30s idle timeout (`streaming-response` fails with
+    "socket connection was closed unexpectedly"), and a buffered sibling
+    can sit until the suite's 300s client timeout (`basic-response` fails
+    with "The operation timed out.").
     """
-    streaming = {STREAMING_TEMPLATE_ID} & ids
-    rest = ids - {STREAMING_TEMPLATE_ID}
-    groups: list[set[str]] = []
-    if streaming:
-        groups.append(streaming)
-    if rest:
-        groups.append(rest)
-    return groups
+    return [{template_id} for template_id in sorted(ids)]
 
 
 class _WitnessHandler(BaseHTTPRequestHandler):
@@ -141,22 +134,22 @@ class _WitnessHandler(BaseHTTPRequestHandler):
         headers = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "content-length")}
         url = f"{VLLM_BASE_URL}{self.path}"
         with httpx.Client(timeout=300.0) as client:
-            with client.stream(self.command, url, headers=headers, content=body) as upstream:
-                self.send_response(upstream.status_code)
-                for key, value in upstream.headers.items():
-                    if key.lower() in ("transfer-encoding", "content-length", "connection"):
-                        continue
-                    self.send_header(key, value)
-                self.end_headers()
-                try:
+            try:
+                with client.stream(self.command, url, headers=headers, content=body) as upstream:
+                    self.send_response(upstream.status_code)
+                    for key, value in upstream.headers.items():
+                        if key.lower() in ("transfer-encoding", "content-length", "connection"):
+                            continue
+                        self.send_header(key, value)
+                    self.end_headers()
                     for chunk in upstream.iter_raw():
                         if chunk:
                             self.wfile.write(chunk)
                             self.wfile.flush()
-                except BrokenPipeError:
-                    # Praxis (or the suite client) hung up; common when IRR's
-                    # 30s streaming idle timeout wins under concurrent load.
-                    return
+            except (BrokenPipeError, httpx.ReadTimeout, httpx.ConnectTimeout):
+                # Praxis or the suite client hung up, or a concurrent CPU
+                # generation starved this forward until the 300s read budget.
+                return
 
     def do_POST(self):
         self._forward()
@@ -221,10 +214,9 @@ def praxis_proxy(tmp_path):
             witness.shutdown()
 
 
-def test_supported_run_groups_isolates_streaming():
+def test_supported_run_groups_serializes_live_templates():
     groups = _supported_run_groups({"basic-response", STREAMING_TEMPLATE_ID, "tool-calling"})
-    assert groups[0] == {STREAMING_TEMPLATE_ID}
-    assert groups[1] == {"basic-response", "tool-calling"}
+    assert groups == [{"basic-response"}, {STREAMING_TEMPLATE_ID}, {"tool-calling"}]
     assert _supported_run_groups({STREAMING_TEMPLATE_ID}) == [{STREAMING_TEMPLATE_ID}]
     assert _supported_run_groups({"basic-response"}) == [{"basic-response"}]
     assert _supported_run_groups(set()) == []

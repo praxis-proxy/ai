@@ -51,7 +51,15 @@ use crate::agentic::a2a::sse;
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576; // 1 MiB
 
 /// Default maximum scratch bytes for SSE scanner state.
-const DEFAULT_MAX_SCRATCH_BYTES: usize = 65_536; // 64 KiB
+///
+/// Sized to hold the largest usage-carrying SSE event any provider emits:
+/// the OpenAI Responses API `response.completed` event embeds the full
+/// response object and grows with the output, so a 64 KiB default dropped
+/// it under real agentic traffic — usage was lost and consumers that
+/// ignore `token.status=overflow` booked zero spend. Matches
+/// [`DEFAULT_MAX_BODY_BYTES`]: worst-case capture memory per in-flight
+/// stream is 2 MiB either way.
+const DEFAULT_MAX_SCRATCH_BYTES: usize = 1_048_576; // 1 MiB
 
 /// Metadata key prefix for all `token_count` working state.
 const META_PREFIX: &str = "token_count.";
@@ -207,7 +215,9 @@ impl ProviderKind {
 /// filter: token_count
 /// provider: openai   # openai | anthropic | google | bedrock | bedrock_invoke_model | azure
 /// max_body_bytes: 1048576    # optional, JSON capture limit
-/// max_scratch_bytes: 65536   # optional, SSE per-event capture limit
+/// max_scratch_bytes: 1048576 # optional, SSE per-event capture limit; must fit
+///                            # the largest usage event (Responses-API
+///                            # response.completed embeds the full response)
 /// ```
 ///
 /// [`filter_metadata`]: HttpFilterContext::filter_metadata

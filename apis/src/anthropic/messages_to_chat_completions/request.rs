@@ -72,7 +72,7 @@ pub(crate) fn transform_request(value: Value) -> Result<Vec<u8>, String> {
     convert_stream(&mut chat, stream, stream_options);
     map_parameters(&mut chat, stop_sequences, temperature, top_p);
     map_metadata(&mut chat, body.remove("metadata"));
-    map_output_config(&mut chat, body.remove("output_config"), body.remove("output_format"));
+    map_output_config(&mut chat, body.remove("output_config"), body.remove("output_format"))?;
     convert_tools(&mut chat, tools);
     convert_parallel_tool_calls(&mut chat, tool_choice.as_ref());
     convert_tool_choice(&mut chat, tool_choice, had_tools);
@@ -690,11 +690,19 @@ fn map_metadata(chat: &mut Map<String, Value>, metadata: Option<Value>) {
 
 /// Map Anthropic `output_config` to the Chat Completions controls with the
 /// same meaning: `effort` to `reasoning_effort`, whose enum contains every
-/// Anthropic level, and a `json_schema` `format` to `response_format`.
+/// Anthropic level, and a `json_schema` `format` to a strict
+/// `response_format`, since Anthropic structured outputs guarantee schema
+/// conformance. Any other `output_config` key (such as the beta
+/// `task_budget`) has no Chat Completions equivalent and rejects the request
+/// rather than being silently discarded.
 ///
 /// The deprecated top-level `output_format` is the older spelling of
 /// `output_config.format`.
-fn map_output_config(chat: &mut Map<String, Value>, output_config: Option<Value>, output_format: Option<Value>) {
+fn map_output_config(
+    chat: &mut Map<String, Value>,
+    output_config: Option<Value>,
+    output_format: Option<Value>,
+) -> Result<(), String> {
     let mut config = match output_config {
         Some(Value::Object(config)) => config,
         _ => Map::new(),
@@ -704,17 +712,34 @@ fn map_output_config(chat: &mut Map<String, Value>, output_config: Option<Value>
         "reasoning_effort",
         config.remove("effort").filter(|effort| !effort.is_null()),
     );
+    if let Some(format) = config
+        .remove("format")
+        .or(output_format)
+        .filter(|format| !format.is_null())
+    {
+        chat.insert("response_format".to_owned(), response_format(format)?);
+    }
+    match config.keys().next() {
+        Some(key) => Err(format!(
+            "`output_config.{key}` is not supported when translating Anthropic Messages to Chat Completions"
+        )),
+        None => Ok(()),
+    }
+}
 
-    if let Some(Value::Object(mut format)) = config.remove("format").or(output_format)
+/// Build a strict Chat Completions `json_schema` response format from an
+/// Anthropic `json_schema` output format.
+fn response_format(format: Value) -> Result<Value, String> {
+    if let Value::Object(mut format) = format
         && format.get("type").and_then(Value::as_str) == Some("json_schema")
         && let Some(schema) = format.remove("schema")
     {
-        let response_format = json!({
+        return Ok(json!({
             "type": "json_schema",
-            "json_schema": {"name": "output_format", "schema": schema},
-        });
-        chat.insert("response_format".to_owned(), response_format);
+            "json_schema": {"name": "output_format", "strict": true, "schema": schema},
+        }));
     }
+    Err("`output_config.format` must be a `json_schema` object with a `schema` when translating Anthropic Messages to Chat Completions".to_owned())
 }
 
 // -----------------------------------------------------------------------------
@@ -1412,7 +1437,33 @@ mod tests {
             parsed["response_format"]["json_schema"]["schema"]["properties"]["title"]["type"], "string",
             "schema carried"
         );
+        assert_eq!(
+            parsed["response_format"]["json_schema"]["strict"], true,
+            "Anthropic structured outputs guarantee conformance, so the Chat schema must be strict"
+        );
         assert!(parsed.get("output_config").is_none(), "output_config must not travel");
+    }
+
+    #[test]
+    fn unsupported_output_config_keys_are_rejected() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"output_config":{"effort":"high","task_budget":{"type":"tokens","budget":4096}},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+
+        assert!(
+            error.contains("output_config.task_budget"),
+            "rejection must name the unsupported key: {error}"
+        );
+    }
+
+    #[test]
+    fn unsupported_output_format_type_is_rejected() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"output_config":{"format":{"type":"grammar"}},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+
+        assert!(
+            error.contains("output_config.format"),
+            "rejection must name the unsupported format: {error}"
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, IterationState,
-    SubRequestResponseMode, parse_filter_config,
+    StreamTerminationCause, SubRequestResponseMode, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, trace, warn};
@@ -125,6 +125,10 @@ pub(super) struct StreamEventsState {
 ///
 /// Must run inside an `iterative_request_router` step. Running it
 /// elsewhere is a misconfiguration and fails closed at request time.
+/// Place it after `load_balancer` so IRR body hooks run with a selected
+/// peer when needed. `timeout_secs` is an absolute deadline from the first
+/// SSE chunk; each chunk recaps the remaining time onto the live body through
+/// [`praxis_filter::HttpFilterContext::cap_stream_read_timeout`].
 ///
 /// # YAML
 ///
@@ -313,14 +317,6 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         "openai_stream_events"
     }
 
-    fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::None
-    }
-
-    fn request_body_mode(&self) -> BodyMode {
-        BodyMode::Stream
-    }
-
     fn response_body_access(&self) -> BodyAccess {
         // Always ReadWrite: the filter normalizes every armed stream into one
         // logical Responses lifecycle, rewriting per-round SSE bytes.
@@ -409,11 +405,78 @@ impl HttpFilter for OpenaiStreamEventsFilter {
         process_chunk(ctx, body);
 
         if end_of_stream {
+            record_idle_transport_timeout(ctx);
             validate_stream_end(ctx);
             finalize_logical_stream(ctx, body);
         }
 
         Ok(FilterAction::Continue)
+    }
+}
+
+/// Absolute deadline for `timeout_secs` from the first SSE chunk.
+fn stream_deadline_at(state: &StreamEventsState) -> Option<Instant> {
+    state.started_at.and_then(|started| started.checked_add(state.timeout))
+}
+
+/// Publish the absolute stream cutoff for the streaming executor to copy onto
+/// the live body after this body-filter pass.
+fn recap_stream_deadline(ctx: &mut HttpFilterContext<'_>, deadline: Instant) {
+    ctx.cap_stream_read_timeout(deadline.saturating_duration_since(Instant::now()));
+}
+
+/// Whether an `Io` termination is the stream deadline, not a reset.
+///
+/// Praxis 0.5.4 reports a winning peer `read_timeout` as
+/// [`StreamTerminationCause::Io`]. Matching every `Io` would also
+/// label truncated chunks and ordinary resets as timeouts. Only an
+/// open parser that has already seen a chunk and exhausted
+/// `timeout_secs` is a stream timeout.
+fn io_exceeded_stream_deadline(state: &StreamEventsState, now: Instant) -> bool {
+    state
+        .started_at
+        .is_some_and(|started| now.duration_since(started) >= state.timeout)
+}
+
+/// Treat an IRR idle, deadline, or exhausted stream-budget abort as a timeout.
+///
+/// Those failures arrive as end-of-stream with [`StreamTerminationCause`]
+/// set, not as another SSE chunk, so [`check_timeout`] never ran while
+/// the backend was silent. Ordinary `Io` (truncated chunks, resets)
+/// is left unhandled so IRR does not replace committed SSE with a
+/// timeout error. A backend that already sent a terminal event can
+/// still trip a timer while closing the HTTP body; that is not a
+/// stream error.
+fn record_idle_transport_timeout(ctx: &mut HttpFilterContext<'_>) {
+    let Some(cause) = ctx.stream_termination().map(praxis_filter::StreamTermination::cause) else {
+        return;
+    };
+    let timed_out = match cause {
+        StreamTerminationCause::IdleTimeout | StreamTerminationCause::DeadlineExceeded => true,
+        StreamTerminationCause::Io => ctx
+            .get_filter_state::<StreamEventsState>()
+            .is_some_and(|state| io_exceeded_stream_deadline(state, Instant::now())),
+        _ => false,
+    };
+    if !timed_out {
+        return;
+    }
+    publish_idle_timeout_if_incomplete(ctx);
+    ctx.mark_stream_termination_handled();
+}
+
+/// Set timeout error metadata only when the SSE parser never saw a terminal event.
+fn publish_idle_timeout_if_incomplete(ctx: &mut HttpFilterContext<'_>) {
+    let parser_complete = ctx
+        .get_filter_state::<StreamEventsState>()
+        .is_some_and(|state| state.completion_state != CompletionState::Open);
+    if !parser_complete && ctx.get_metadata("responses.stream_error_code").is_none() {
+        ctx.set_metadata("responses.stream_error_code", "server_error");
+        ctx.set_metadata(
+            "responses.stream_error_message",
+            "upstream Responses stream exceeded timeout",
+        );
+        ctx.set_metadata("responses.skip_persist", "true");
     }
 }
 
@@ -433,6 +496,9 @@ fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     let parsed = parse_and_accumulate(&mut state, ctx, bytes, now);
     handle_parse_result(ctx, body, &state, parsed);
 
+    if let Some(deadline) = stream_deadline_at(&state) {
+        recap_stream_deadline(ctx, deadline);
+    }
     ctx.insert_filter_state(state);
 }
 
@@ -466,7 +532,11 @@ fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>,
     ctx.set_metadata("responses.stream_error_code", "server_error");
     ctx.set_metadata(
         "responses.stream_error_message",
-        "upstream Responses stream could not be parsed",
+        if matches!(error, SseParseError::Timeout { .. }) {
+            "upstream Responses stream exceeded timeout"
+        } else {
+            "upstream Responses stream could not be parsed"
+        },
     );
     ctx.set_metadata("responses.skip_persist", "true");
     *body = None;
@@ -1830,7 +1900,7 @@ fn check_timeout(state: &StreamEventsState, now: Instant) -> Result<(), SseParse
         return Ok(());
     };
     let elapsed = now.duration_since(started_at);
-    if elapsed > state.timeout {
+    if elapsed >= state.timeout {
         return Err(SseParseError::Timeout {
             elapsed,
             limit: state.timeout,
@@ -1873,30 +1943,61 @@ fn mark_complete(state: &mut StreamEventsState, new_state: CompletionState, now:
 
 /// Check that the SSE stream terminated with a terminal event.
 fn validate_stream_end(ctx: &mut HttpFilterContext<'_>) {
-    let incomplete = ctx.get_filter_state::<StreamEventsState>().is_some_and(|state| {
-        let checked_at = state.completed_at.unwrap_or_else(Instant::now);
-        if let Err(e) = check_timeout(state, checked_at) {
-            warn!(error = %e, "stream did not terminate cleanly");
-            true
-        } else if state.completion_state == CompletionState::Open {
-            warn!("stream did not terminate cleanly: missing terminal event");
-            true
-        } else {
-            false
-        }
-    });
-    if incomplete {
-        ctx.set_metadata("responses.stream_incomplete", "true".to_owned());
-        if ctx.get_metadata("responses.stream_error_code").is_none() {
-            ctx.set_metadata("responses.stream_error_code", "server_error");
-            ctx.set_metadata(
-                "responses.stream_error_message",
-                "upstream Responses stream did not terminate cleanly",
-            );
-            ctx.set_metadata("responses.skip_persist", "true");
-        }
+    match stream_end_kind(ctx) {
+        StreamEndKind::Complete => {},
+        StreamEndKind::Incomplete { timed_out } => {
+            record_incomplete_stream(ctx, timed_out);
+        },
     }
     debug!("stream_events processing complete");
+}
+
+/// Classify how the current parser state ended.
+fn stream_end_kind(ctx: &HttpFilterContext<'_>) -> StreamEndKind {
+    let Some(state) = ctx.get_filter_state::<StreamEventsState>() else {
+        return StreamEndKind::Complete;
+    };
+    let checked_at = state.completed_at.unwrap_or_else(Instant::now);
+    match check_timeout(state, checked_at) {
+        Err(error) => {
+            warn!(%error, "stream did not terminate cleanly");
+            StreamEndKind::Incomplete { timed_out: true }
+        },
+        Ok(()) if state.completion_state == CompletionState::Open => {
+            warn!("stream did not terminate cleanly: missing terminal event");
+            StreamEndKind::Incomplete { timed_out: false }
+        },
+        Ok(()) => StreamEndKind::Complete,
+    }
+}
+
+/// Publish incomplete-stream metadata for persistence and logical-stream errors.
+fn record_incomplete_stream(ctx: &mut HttpFilterContext<'_>, timed_out: bool) {
+    ctx.set_metadata("responses.stream_incomplete", "true".to_owned());
+    if ctx.get_metadata("responses.stream_error_code").is_some() {
+        return;
+    }
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata(
+        "responses.stream_error_message",
+        if timed_out {
+            "upstream Responses stream exceeded timeout"
+        } else {
+            "upstream Responses stream did not terminate cleanly"
+        },
+    );
+    ctx.set_metadata("responses.skip_persist", "true");
+}
+
+/// How an SSE stream ended from the parser's point of view.
+enum StreamEndKind {
+    /// A terminal lifecycle or error event was observed in time.
+    Complete,
+    /// The stream ended without a clean terminal event.
+    Incomplete {
+        /// Whether the wall-clock budget was exceeded.
+        timed_out: bool,
+    },
 }
 
 /// Whether the response is a successful `text/event-stream` response.
@@ -1926,7 +2027,6 @@ fn response_is_encoded(ctx: &HttpFilterContext<'_>) -> bool {
         .as_ref()
         .is_some_and(|resp| resp.headers.contains_key(http::header::CONTENT_ENCODING))
 }
-
 
 #[cfg(test)]
 mod tests;

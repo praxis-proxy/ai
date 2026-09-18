@@ -1,4 +1,5 @@
 # Streaming Event Accumulation
+# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
 #
 # Demonstrates the `openai_stream_events` filter, which composes the
 # current iterative-request-router (IRR) execution into one logical
@@ -11,6 +12,9 @@
 # `openai_stream_events` always composes a logical stream, so it must
 # run inside an `iterative_request_router` step; placing it anywhere
 # else fails closed at request time. A `stream: true` request arms it.
+# It must sit after `load_balancer` in that step so IRR body hooks see the
+# selected peer when needed; `openai_responses_proxy` buffers the request
+# body, so IRR otherwise runs that phase before load balancing.
 #
 # The `openai_response_store` filter runs pre-IRR (registering the
 # store backend) and persists the accumulated ResponsesState once the
@@ -98,17 +102,6 @@ filter_chains:
             filters:
               - filter: openai_responses_proxy
 
-              # Composes the inference stream into one logical Responses
-              # lifecycle. Armed by a `stream: true` request; always
-              # composes, so it must run inside this IRR step.
-              - filter: openai_stream_events
-                # max_tool_call_argument_bytes: 1048576
-                # Aggregate accumulation budget bounding total process memory even
-                # when every individual SSE event is within max_buffer_bytes. The
-                # stream fails closed once either dimension is exceeded.
-                # max_accumulated_bytes: 67108864
-                # max_output_items: 100000
-
               - filter: headers
                 request_set:
                   - name: Content-Type
@@ -122,8 +115,25 @@ filter_chains:
               - filter: load_balancer
                 clusters:
                   - name: "inference-backend"
+                    # Cluster ceiling. openai_stream_events caps the live body
+                    # at leftover timeout_secs after the first SSE chunk.
+                    read_timeout_ms: 300000
                     endpoints:
                       - "127.0.0.1:8000"
+
+              # After load_balancer so IRR body hooks see the selected peer.
+              # openai_responses_proxy buffers the request body, so IRR runs
+              # that phase before load balancing; an earlier placement never
+              # sees ctx.upstream. timeout_secs is an absolute deadline from
+              # the first SSE chunk (default 300). Each chunk recaps leftover
+              # budget onto the live body through cap_stream_read_timeout.
+              - filter: openai_stream_events
+                # max_tool_call_argument_bytes: 1048576
+                # Aggregate accumulation budget bounding total process memory even
+                # when every individual SSE event is within max_buffer_bytes. The
+                # stream fails closed once either dimension is exceeded.
+                # max_accumulated_bytes: 67108864
+                # max_output_items: 100000
             on_result:
               - default: true
                 done: true

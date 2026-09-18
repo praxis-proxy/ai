@@ -86,6 +86,9 @@ fn configure_pipeline(
     }
     pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
     pipeline.set_subrequest_client(subrequest_client.clone());
+    // Propagate the private-upstream override into the pipeline and its nested
+    // callout chains (e.g. `openai_file_resolve`'s outbound chain) so their
+    // runtime SSRF checks read the configured value on every (re)build.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     pipeline.apply_insecure_options(&config.insecure_options);
     Ok(())
@@ -473,8 +476,14 @@ filter_chains:
     filters:
       - filter: openai_file_resolve
         files_api_url: "http://files-api:8321"
-        allow_private_files_api_url: true
         allow_pre_security_callout: true
+        outbound_chain:
+          name: files-api-outbound
+          filters:
+            - filter: headers
+              request_set:
+                - name: x-file-callout
+                  value: file-resolve
       - filter: openai_doc_extract
         allow_pre_security_callout: true
       - filter: openai_tool_parse

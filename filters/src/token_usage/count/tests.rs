@@ -285,6 +285,21 @@ async fn json_bedrock_converse_extracts_tokens() {
 }
 
 #[tokio::test]
+async fn json_bedrock_converse_includes_prompt_cache_tokens() {
+    let json = br#"{"usage":{"inputTokens":9,"outputTokens":214,"cacheReadInputTokens":1066,"totalTokens":1289}}"#;
+
+    let (input, output, total) = run_json_extraction(ProviderKind::Bedrock, json).await;
+
+    assert_eq!(
+        input.as_deref(),
+        Some("1075"),
+        "uncached 9 + cache read 1066, matching Anthropic normalization"
+    );
+    assert_eq!(output.as_deref(), Some("214"), "Bedrock output tokens");
+    assert_eq!(total.as_deref(), Some("1289"), "Bedrock total tokens include the cache");
+}
+
+#[tokio::test]
 async fn json_azure_extracts_tokens() {
     let json = br#"{"usage":{"prompt_tokens":5,"completion_tokens":10,"total_tokens":15}}"#;
 
@@ -538,6 +553,26 @@ async fn sse_bedrock_metadata_event() {
 }
 
 #[tokio::test]
+async fn sse_bedrock_metadata_includes_prompt_cache_tokens() {
+    let events =
+        b"data: {\"metadata\":{\"usage\":{\"inputTokens\":9,\"outputTokens\":214,\"cacheReadInputTokens\":1066}}}\n\n";
+
+    let (input, output, total) = run_sse_extraction(ProviderKind::Bedrock, events).await;
+
+    assert_eq!(
+        input.as_deref(),
+        Some("1075"),
+        "uncached 9 + cache read 1066, matching Anthropic normalization"
+    );
+    assert_eq!(output.as_deref(), Some("214"), "Bedrock SSE output tokens");
+    assert_eq!(
+        total.as_deref(),
+        Some("1289"),
+        "computed SSE total must include folded cache tokens"
+    );
+}
+
+#[tokio::test]
 async fn sse_zero_token_counts_are_written() {
     let events = b"data: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}}\n\n";
 
@@ -699,6 +734,55 @@ async fn sse_partial_then_oversized_terminal_event_sets_overflow_status() {
         ctx.get_metadata("token.status"),
         Some("overflow"),
         "partial maxima are not a complete capture when the terminal event overflowed"
+    );
+}
+
+#[tokio::test]
+async fn sse_responses_completed_event_larger_than_64kib_captured_at_default_scratch() {
+    let filter = make_filter(ProviderKind::OpenAi);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let mut body = Some(Bytes::from(responses_stream_with_padded_completed_event(65_536 * 3)));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert_eq!(ctx.get_metadata("token.input"), Some("62000"));
+    assert_eq!(ctx.get_metadata("token.output"), Some("13000"));
+    assert_eq!(ctx.get_metadata("token.total"), Some("75000"));
+    assert!(
+        ctx.get_metadata("token.status").is_none(),
+        "a complete capture at the default scratch is not an overflow"
+    );
+}
+
+#[tokio::test]
+async fn sse_responses_completed_event_beyond_scratch_marks_overflow() {
+    let mut filter = make_filter(ProviderKind::OpenAi);
+    filter.max_scratch_bytes = 65_536;
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("text/event-stream");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    let mut body = Some(Bytes::from(responses_stream_with_padded_completed_event(65_536 * 3)));
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    assert!(
+        ctx.get_metadata("token.input").is_none(),
+        "usage exists only in the oversized terminal event, which must be skipped"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.status"),
+        Some("overflow"),
+        "skipping the usage-carrying event must be an explicit overflow, not a silent zero"
     );
 }
 
@@ -1103,6 +1187,16 @@ async fn json_openai_responses_records_cache_breakdown() {
 }
 
 #[tokio::test]
+async fn json_bedrock_converse_records_cache_breakdown() {
+    let json = br#"{"usage":{"inputTokens":9,"outputTokens":214,"cacheReadInputTokens":1066,"cacheWriteInputTokens":100,"totalTokens":1389}}"#;
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::Bedrock, "application/json", json).await;
+
+    assert_eq!(cache_read.as_deref(), Some("1066"), "Converse cache read tokens");
+    assert_eq!(cache_write.as_deref(), Some("100"), "Converse cache write tokens");
+}
+
+#[tokio::test]
 async fn json_google_records_cached_content_tokens() {
     let json =
         br#"{"usageMetadata":{"promptTokenCount":1200,"candidatesTokenCount":40,"cachedContentTokenCount":1100}}"#;
@@ -1213,6 +1307,17 @@ async fn sse_openai_responses_records_cache_breakdown() {
 
     assert_eq!(cache_read.as_deref(), Some("900"), "Responses API SSE cache reads");
     assert_eq!(cache_write.as_deref(), Some("80"), "Responses API SSE cache writes");
+}
+
+#[tokio::test]
+async fn sse_bedrock_metadata_records_cache_breakdown() {
+    let events =
+        b"data: {\"metadata\":{\"usage\":{\"inputTokens\":9,\"outputTokens\":214,\"cacheReadInputTokens\":1066,\"cacheWriteInputTokens\":100}}}\n\n";
+
+    let (cache_read, cache_write) = run_cache_extraction(ProviderKind::Bedrock, "text/event-stream", events).await;
+
+    assert_eq!(cache_read.as_deref(), Some("1066"), "ConverseStream cache read tokens");
+    assert_eq!(cache_write.as_deref(), Some("100"), "ConverseStream cache write tokens");
 }
 
 #[tokio::test]
@@ -1509,6 +1614,25 @@ async fn json_bedrock_anthropic_fallback_records_thinking_tokens() {
 // -----------------------------------------------------------------------------
 
 use std::fmt::Write as _;
+
+/// Builds a Responses-API stream whose terminal `response.completed` event
+/// embeds an output object padded to `pad_bytes`, mirroring how agentic
+/// clients (reasoning summaries, tool items) inflate that event in
+/// production while the smaller events stay tiny.
+fn responses_stream_with_padded_completed_event(pad_bytes: usize) -> Vec<u8> {
+    let mut events =
+        b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_pad\"}}\n\n"
+            .to_vec();
+    events.extend_from_slice(
+        b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+    );
+    events.extend_from_slice(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_pad\",\"output\":[{\"type\":\"output_text\",\"text\":\"");
+    events.extend(std::iter::repeat_n(b'x', pad_bytes));
+    events.extend_from_slice(
+        b"\"}],\"usage\":{\"input_tokens\":62000,\"output_tokens\":13000,\"total_tokens\":75000}}}\n\n",
+    );
+    events
+}
 
 fn make_filter(provider: ProviderKind) -> TokenCountFilter {
     TokenCountFilter {

@@ -26,8 +26,9 @@ All matched requests are served from the local store and never forwarded upstrea
 
 ```yaml
 filter: openai_conversations
-backend: sqlite
-database_url: sqlite://conversations.db?mode=rwc
+backend: postgres
+database_url: postgres://praxis:password@db.example.com/praxis
 conversations_table: conversations
 items_table: conversation_items
+allow_private_database_url: true
 ```

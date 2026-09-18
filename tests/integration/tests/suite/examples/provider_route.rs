@@ -9,6 +9,7 @@ use praxis_core::config::Config;
 use sha2::{Digest as _, Sha256};
 
 const CANDIDATE_ID: &str = "inference_model/mock-model/site-us-west/provider-us-west";
+const ANTHROPIC_CANDIDATE_ID: &str = "inference_model/mock-anthropic-model/site-us-west/provider-us-west";
 
 /// Resolve the complete AI pipeline, including provider-boundary validation.
 fn resolve(yaml: &str) -> Result<(), String> {
@@ -23,18 +24,24 @@ fn resolve(yaml: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-/// Load `provider-route.yaml` and replace its mounted credential with a
-/// temporary file so filter construction exercises the documented file source.
+/// Load `provider-route.yaml` and replace its mounted credentials with
+/// temporary files so filter construction exercises the documented file source.
 fn example_yaml() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("create credential directory");
     let token_path = dir.path().join("token");
     std::fs::write(&token_path, "provider-secret\n").expect("write provider token");
+    let api_key_path = dir.path().join("api-key");
+    std::fs::write(&api_key_path, "provider-api-key\n").expect("write provider api key");
 
     let path = praxis_test_utils::example_config_path("provider-route.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
     let yaml = yaml.replace(
         "/run/secrets/provider-credentials/openai-provider/token",
         token_path.to_str().expect("temporary token path must be UTF-8"),
+    );
+    let yaml = yaml.replace(
+        "/run/secrets/provider-credentials/anthropic-provider/api-key",
+        api_key_path.to_str().expect("temporary api key path must be UTF-8"),
     );
     (dir, yaml)
 }
@@ -56,9 +63,14 @@ fn certificate_digest(path: &Path) -> String {
 
 /// Build one provider request carrying authenticated routing context.
 fn provider_request(candidate: &str) -> String {
-    let body = r#"{"model":"mock-model","messages":[]}"#;
+    provider_request_for(candidate, "/v1/chat/completions", "mock-model")
+}
+
+/// Build one provider request for a specific path and promoted model.
+fn provider_request_for(candidate: &str, path: &str, model: &str) -> String {
+    let body = format!(r#"{{"model":"{model}","messages":[]}}"#);
     format!(
-        "POST /v1/chat/completions HTTP/1.1\r\n\
+        "POST {path} HTTP/1.1\r\n\
          Host: localhost\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
@@ -129,6 +141,22 @@ fn provider_route_example_accepts_authenticated_route_and_replaces_credential() 
     assert!(
         !body.contains("caller-secret"),
         "caller authorization must not reach the private backend: {body}"
+    );
+
+    let anthropic = praxis_test_utils::https_send(
+        proxy.addr(),
+        &provider_request_for(ANTHROPIC_CANDIDATE_ID, "/v1/messages", "mock-anthropic-model"),
+        &request_client,
+    );
+    assert_eq!(praxis_test_utils::parse_status(&anthropic), 200, "{anthropic}");
+    let anthropic_body = praxis_test_utils::parse_body(&anthropic);
+    assert!(
+        anthropic_body.contains("x-api-key: provider-api-key"),
+        "apikey credential must be injected into the default header: {anthropic_body}"
+    );
+    assert!(
+        !anthropic_body.contains("caller-secret") && !anthropic_body.contains("authorization:"),
+        "apikey injection must strip the caller authorization: {anthropic_body}"
     );
 
     let unauthenticated_client = certificates.raw_tls_client_config();

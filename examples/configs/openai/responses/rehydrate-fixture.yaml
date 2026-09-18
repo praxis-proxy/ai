@@ -1,4 +1,5 @@
 # Rehydrate Fixture (native Responses continuation)
+# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
 #
 # Minimal native OpenAI Responses pipeline that stores a first turn,
 # rehydrates a stored `previous_response_id` into the outbound `input`

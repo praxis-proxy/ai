@@ -1,4 +1,5 @@
 # Agentic Loop Controller
+# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
 #
 # Demonstrates the openai_agentic_loop filter with iterative_request_router
 # for step-based model-tool-model looping in the Responses API.
@@ -194,9 +195,10 @@ filter_chains:
               # Composes every inference SSE stream into one logical Responses
               # lifecycle: preserves one response identity across rounds and
               # withholds per-round terminal events until the IRR transition is
-              # known. A single inference round is just a one-round logical
-              # stream, so this filter always composes and must run inside this
-              # IRR step.
+              # known. Stays before openai_agentic_loop so response-phase reverse
+              # order lets the loop parse the raw SSE; timeout_secs therefore
+              # cannot cap ctx.upstream (load_balancer has not run). Pair with
+              # cluster read_timeout_ms below for idle backends.
               #
               # REQUIRED because `openai_responses_proxy` below selects typed
               # streaming automatically for an effective `"stream": true`
@@ -265,6 +267,10 @@ filter_chains:
               - filter: load_balancer
                 clusters:
                   - name: "inference-backend"
+                    # Cap silent upstream reads. IRR also applies a 30s
+                    # streaming idle timeout; the effective idle deadline is
+                    # the minimum of this value and that idle budget.
+                    read_timeout_ms: 300000
                     endpoints:
                       - "127.0.0.1:3001"
             on_result:

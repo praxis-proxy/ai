@@ -12,6 +12,11 @@ on:
       - "apis/src/openai/responses/store/**"
       - "apis/src/openai/conversations/**"
       - "examples/configs/openai/responses/response-store.yaml"
+      - "apis/Cargo.toml"
+      - "filters/Cargo.toml"
+      - "server/Cargo.toml"
+      - "tests/integration/Cargo.toml"
+      - "tests/utils/Cargo.toml"
       - "tests/utils/src/net/postgres.rs"
       - "tests/integration/tests/suite/examples/openai_response_store_postgres.rs"
       - "Cargo.toml"
@@ -26,6 +31,11 @@ on:
       - "apis/src/openai/responses/store/**"
       - "apis/src/openai/conversations/**"
       - "examples/configs/openai/responses/response-store.yaml"
+      - "apis/Cargo.toml"
+      - "filters/Cargo.toml"
+      - "server/Cargo.toml"
+      - "tests/integration/Cargo.toml"
+      - "tests/utils/Cargo.toml"
       - "tests/utils/src/net/postgres.rs"
       - "tests/integration/tests/suite/examples/openai_response_store_postgres.rs"
       - "Cargo.toml"
@@ -79,6 +89,11 @@ jobs:
             'apis/src/openai/responses/store/' \
             'apis/src/openai/conversations/' \
             'examples/configs/openai/responses/response-store.yaml' \
+            'apis/Cargo.toml' \
+            'filters/Cargo.toml' \
+            'server/Cargo.toml' \
+            'tests/integration/Cargo.toml' \
+            'tests/utils/Cargo.toml' \
             'tests/utils/src/net/postgres.rs' \
             'tests/integration/tests/suite/examples/openai_response_store_postgres.rs' \
             'Cargo.toml' \

@@ -251,10 +251,28 @@ jobs:
         run: |
           codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
           mkdir -p "$codex_cache_dir"
-          if [ ! -f "$codex_cache_dir/$CODEX_ARCHIVE" ]; then
-            curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-              --output "$codex_cache_dir/$CODEX_ARCHIVE" \
-              "https://github.com/openai/codex/releases/download/rust-v0.144.1/$CODEX_ARCHIVE"
+          archive_path="$codex_cache_dir/$CODEX_ARCHIVE"
+          if [ ! -f "$archive_path" ]; then
+            tmp_dir="$(mktemp -d)"
+            trap 'rm -rf "$tmp_dir"' EXIT
+            tmp_archive="$tmp_dir/$CODEX_ARCHIVE"
+            if ! curl --proto '=https' --tlsv1.2 --fail --location \
+              --retry 10 --retry-all-errors --retry-delay 10 \
+              --output "$tmp_archive" \
+              "https://github.com/openai/codex/releases/download/rust-v0.144.1/$CODEX_ARCHIVE"; then
+              rm -f "$tmp_archive"
+              gh release download rust-v0.144.1 \
+                --repo openai/codex \
+                --pattern "$CODEX_ARCHIVE" \
+                --dir "$tmp_dir" \
+                --clobber
+            fi
+            (
+              cd "$tmp_dir"
+              sha256sum --check \
+                "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/0.144.1-x86_64-unknown-linux-musl.sha256"
+            )
+            mv "$tmp_archive" "$archive_path"
           fi
 
       - name: Verify and extract pinned Codex CLI

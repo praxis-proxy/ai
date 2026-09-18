@@ -789,10 +789,12 @@ def _write_agentic_config(
     vllm = backend_endpoint if translate_to_chat else _vllm_endpoint()
     if vllm is None:
         raise ValueError("translated agentic config requires a backend endpoint")
-    config = config.replace(
-        '- "127.0.0.1:3001"',
-        f'- "{vllm}"\n                    read_timeout_ms: 300000',
-    )
+    config = config.replace('- "127.0.0.1:3001"', f'- "{vllm}"')
+    if config.count("read_timeout_ms:") != 1:
+        raise RuntimeError(
+            "agentic-loop.yaml must declare exactly one cluster read_timeout_ms; "
+            "the vLLM harness no longer injects a second copy"
+        )
     # agentic-loop.yaml is the canonical unified config (#1046): it wires all
     # three request-phase dispatchers (web_search, mcp_dispatch,
     # file_search_callout) under the single agentic-loop owner. Retarget the
@@ -5734,6 +5736,294 @@ def test_invalid_tool_choice_raises_bad_request(openai_client):
 
     assert exc_info.value.status_code == 400
     assert "tool_choice" in str(exc_info.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# openai_file_resolve outbound-chain (fully stubbed upstreams; no vLLM/OGX)
+# ---------------------------------------------------------------------------
+
+FILE_RESOLVE_CONFIG_PATH = "examples/configs/openai/responses/file-resolve.yaml"
+_FILE_RESOLVE_CONTENT = b"Hello, world!"
+_FILE_RESOLVE_B64 = "SGVsbG8sIHdvcmxkIQ=="  # base64("Hello, world!")
+_FILE_RESOLVE_ID = "test-file-123"
+_FILE_RESOLVE_METADATA = json.dumps(
+    {
+        "id": _FILE_RESOLVE_ID,
+        "object": "file",
+        "bytes": len(_FILE_RESOLVE_CONTENT),
+        "created_at": 1750000000,
+        "filename": "test.txt",
+        "purpose": "user_data",
+    }
+).encode()
+
+# Minimal Responses object the OpenAI SDK can deserialize, so the stubbed
+# inference backend can stand in for vLLM. Shape mirrors
+# fixtures/inference/recordings/vllm/responses/native-basic-nonstream.json.
+_FILE_RESOLVE_STUB_RESPONSE = {
+    "id": "resp_file_resolve_stub",
+    "object": "response",
+    "created_at": 0,
+    "model": "gpt-4.1",
+    "status": "completed",
+    "error": None,
+    "incomplete_details": None,
+    "instructions": None,
+    "max_output_tokens": None,
+    "metadata": {},
+    "parallel_tool_calls": True,
+    "previous_response_id": None,
+    "temperature": 1.0,
+    "tool_choice": "none",
+    "tools": [],
+    "top_p": 1.0,
+    "output": [
+        {
+            "id": "msg_file_resolve_stub",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+        }
+    ],
+    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+}
+
+
+class _FilesApiStubHandler(BaseHTTPRequestHandler):
+    """Files API stub for `file_id` callouts.
+
+    Answers metadata and content only when the outbound chain stamped
+    ``x-file-callout: file-resolve`` on the callout, so a resolved file proves
+    the bound outbound pipeline executed.
+    """
+
+    callout_headers: ClassVar[list[str | None]] = []
+
+    def do_GET(self):
+        header = self.headers.get("x-file-callout")
+        type(self).callout_headers.append(header)
+        if header != "file-resolve":
+            self.send_response(403)
+            self.end_headers()
+            return
+        if self.path == f"/v1/files/{_FILE_RESOLVE_ID}/content":
+            body, ctype = _FILE_RESOLVE_CONTENT, "text/plain"
+        elif self.path == f"/v1/files/{_FILE_RESOLVE_ID}":
+            body, ctype = _FILE_RESOLVE_METADATA, "application/json"
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class _FileUrlStubHandler(BaseHTTPRequestHandler):
+    """Client-controlled `file_url` stub.
+
+    Serves content only when the outbound-chain header is ABSENT, proving the
+    credentialed outbound chain never runs for client-supplied URLs.
+    """
+
+    def do_GET(self):
+        if self.headers.get("x-file-callout") is not None:
+            self.send_response(403)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(_FILE_RESOLVE_CONTENT)))
+        self.end_headers()
+        self.wfile.write(_FILE_RESOLVE_CONTENT)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class _FileResolveBackendHandler(BaseHTTPRequestHandler):
+    """Capturing inference backend: records the forwarded Responses body."""
+
+    captured: ClassVar[list[dict]] = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        try:
+            type(self).captured.append(json.loads(body))
+        except json.JSONDecodeError:
+            pass
+        payload = json.dumps(_FILE_RESOLVE_STUB_RESPONSE).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def _write_file_resolve_config(
+    praxis_port: int,
+    files_port: int,
+    backend_port: int,
+    default_port: int,
+    file_url_port: int,
+) -> str:
+    """Patch the shipped file-resolve example for stubbed upstreams."""
+    with open(FILE_RESOLVE_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    # files_api_url and the files-api cluster endpoint both use :9999.
+    config = config.replace("127.0.0.1:9999", f"127.0.0.1:{files_port}")
+    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
+    config = config.replace("127.0.0.1:3002", f"127.0.0.1:{default_port}")
+    # Allow the loopback file_url stub so the client-URL branch resolves
+    # without traversing the credentialed outbound chain.
+    config = config.replace(
+        "        file_url: resolve",
+        "        file_url: resolve\n"
+        "        allowed_file_url_origins:\n"
+        f'          - "http://127.0.0.1:{file_url_port}"',
+    )
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+@pytest.fixture()
+def file_resolve_stub_env(tmp_path_factory, request):
+    """Function-scoped file-resolve proxy with fully stubbed upstreams.
+
+    Needs only the compiled binary — no vLLM and no OGX — so it exercises the
+    ``openai_file_resolve`` outbound-chain flow through the OpenAI SDK. Yields
+    ``(client, files_stub, backend, file_url)``.
+    """
+    _FilesApiStubHandler.callout_headers = []
+    _FileResolveBackendHandler.captured = []
+
+    files_port = _free_port()
+    backend_port = _free_port()
+    default_port = _free_port()
+    file_url_port = _free_port()
+
+    servers = [
+        HTTPServer(("127.0.0.1", files_port), _FilesApiStubHandler),
+        HTTPServer(("127.0.0.1", backend_port), _FileResolveBackendHandler),
+        HTTPServer(("127.0.0.1", file_url_port), _FileUrlStubHandler),
+    ]
+    for server in servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    port = _free_port()
+    log_dir = tmp_path_factory.mktemp("file-resolve-stub")
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    config_path = _write_file_resolve_config(
+        port, files_port, backend_port, default_port, file_url_port
+    )
+    started = False
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        client = OpenAI(
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="test",
+            max_retries=0,
+            timeout=60,
+        )
+        yield (
+            client,
+            _FilesApiStubHandler,
+            _FileResolveBackendHandler,
+            f"http://127.0.0.1:{file_url_port}/document.txt",
+        )
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        for server in servers:
+            server.shutdown()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== File-resolve Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+class TestFileResolveOutboundChain:
+    """SDK coverage for the openai_file_resolve outbound-chain callout."""
+
+    def test_file_id_resolved_via_outbound_chain_not_file_url(
+        self, file_resolve_stub_env
+    ):
+        """SDK analogue of the Rust functional test
+        ``example_config_outbound_chain_runs_for_file_id_not_file_url``.
+
+        One request carries both a ``file_id`` and a client ``file_url``. The
+        Files API stub answers only when the outbound chain stamped
+        ``x-file-callout``; the ``file_url`` stub answers only when it did not.
+        A single completed response with both parts inlined therefore proves the
+        credentialed outbound chain ran for the ``file_id`` callout but never for
+        the client-controlled ``file_url`` download.
+        """
+        client, files_stub, backend, file_url = file_resolve_stub_env
+
+        response = client.responses.create(
+            model="gpt-4.1",
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_file", "file_id": _FILE_RESOLVE_ID},
+                        {"type": "input_file", "file_url": file_url},
+                        {"type": "input_text", "text": "summarize"},
+                    ],
+                }
+            ],
+            store=False,
+        )
+
+        assert response.status == "completed"
+        assert len(backend.captured) == 1, backend.captured
+        content = backend.captured[0]["input"][0]["content"]
+
+        # file_id inlined as raw base64 file_data (the outbound chain ran).
+        assert content[0]["file_data"] == _FILE_RESOLVE_B64, content
+        assert "file_id" not in content[0], content
+
+        # file_url inlined as a data URI (the outbound chain did NOT run for it).
+        assert content[1]["file_data"] == (
+            f"data:text/plain;base64,{_FILE_RESOLVE_B64}"
+        ), content
+
+        # Every Files API callout carried the outbound-chain marker header.
+        assert files_stub.callout_headers, "Files API stub should receive callouts"
+        assert all(h == "file-resolve" for h in files_stub.callout_headers), (
+            files_stub.callout_headers
+        )
 
 
 if __name__ == "__main__":
