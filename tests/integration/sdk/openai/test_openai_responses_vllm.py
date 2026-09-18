@@ -1638,7 +1638,12 @@ class TestOpenAIResponsesVLLM:
                 conversation={"id": conversation.id},
                 store=True,
                 temperature=0,
-                max_output_tokens=128,
+                # Qwen3 is a hybrid thinking model and its /no_think soft switch
+                # is not honored through this backend, so it emits a reasoning
+                # block before answering. Budget enough output tokens for the
+                # reasoning plus the short answer so the turn completes instead
+                # of truncating to status "incomplete".
+                max_output_tokens=2048,
             )
             # Ask the model to echo the earlier color rather than recall it in
             # free form: the small CI model reliably repeats an exact token from
@@ -1651,7 +1656,7 @@ class TestOpenAIResponsesVLLM:
                 conversation=conversation.id,
                 store=True,
                 temperature=0,
-                max_output_tokens=128,
+                max_output_tokens=2048,
             )
 
             assert first.status == "completed"
@@ -2120,7 +2125,12 @@ class TestResponsesCompactionVLLM:
             input="Remember the marker BELOW-THRESHOLD-2468. /no_think",
             temperature=0,
             store=True,
-            max_output_tokens=64,
+            # Qwen3 emits a reasoning block (its /no_think soft switch is not
+            # honored through this backend), so budget enough tokens for the
+            # reasoning plus the short ack; otherwise the turn truncates to
+            # "incomplete" and the continuation rejects the incomplete
+            # predecessor.
+            max_output_tokens=2048,
         )
         request_count = len(CompactionHandler.requests)
 
@@ -2132,11 +2142,13 @@ class TestResponsesCompactionVLLM:
             context_management=[
                 {
                     "type": "compaction",
-                    "compact_threshold": 1000,
+                    # Comfortably above the reasoning-inflated first-turn history
+                    # so this "below threshold" case reliably skips compaction.
+                    "compact_threshold": 8000,
                 }
             ],
             store=False,
-            max_output_tokens=128,
+            max_output_tokens=2048,
         )
 
         assert second.status == "completed"
@@ -3176,8 +3188,15 @@ class TestAgenticLoopVLLM:
                     "search_context_size": "low",
                 }
             ],
+            # Force the hosted call so the proxy's translate/execute path is
+            # exercised deterministically rather than relying on a small model
+            # electing to call the tool; the agentic loop resets tool_choice to
+            # "auto" on continuation, so the follow-up round answers freely.
+            tool_choice={"type": "web_search"},
             store=False,
-            max_output_tokens=512,
+            # Room for the continuation round's reasoning plus the final message
+            # (Qwen3 emits a reasoning block that /no_think does not suppress).
+            max_output_tokens=2048,
         )
 
         web_search_calls = [
@@ -4480,9 +4499,15 @@ class TestFileSearchVLLM:
                     "vector_store_ids": [store_id],
                 }
             ],
+            # Force the hosted file_search call so the translate/execute path is
+            # exercised deterministically instead of depending on the small
+            # model to elect the tool.
+            tool_choice={"type": "file_search"},
             include=["file_search_call.results"],
             store=False,
-            max_output_tokens=512,
+            # Room for the continuation round's reasoning plus the final message
+            # (Qwen3 emits a reasoning block that /no_think does not suppress).
+            max_output_tokens=2048,
         )
 
         assert response.status in ("completed", "incomplete"), (
@@ -4832,10 +4857,16 @@ class TestFileSearchStreamingVLLM:
             model=VLLM_MODEL,
             input=self._INPUT,
             tools=[{"type": "file_search", "vector_store_ids": [store_id]}],
+            # Force the hosted file_search call so the synthesized lifecycle is
+            # exercised deterministically instead of depending on the small
+            # model to elect the tool.
+            tool_choice={"type": "file_search"},
             include=["file_search_call.results"],
             store=False,
             stream=True,
-            max_output_tokens=512,
+            # Room for the continuation round's reasoning plus the final message
+            # (Qwen3 emits a reasoning block that /no_think does not suppress).
+            max_output_tokens=2048,
         )
 
         event_types, output_items, terminal_status = _drain_response_stream(
