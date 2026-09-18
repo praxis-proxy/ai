@@ -318,7 +318,7 @@ impl McpToolResolveFilter {
         previous_tools: Option<&Vec<serde_json::Value>>,
         forwarded_headers: &http::HeaderMap,
     ) -> Result<Resolution, ResolveError> {
-        let (entry_to_task, task_entries, task_allowed_names) = dedup_entries(entries);
+        let (entry_to_task, task_entries, task_allowed_names) = dedup_entries(entries)?;
 
         let futures: Vec<_> = task_entries
             .iter()
@@ -332,7 +332,7 @@ impl McpToolResolveFilter {
             .collect();
         let task_results = futures::future::try_join_all(futures).await?;
 
-        Ok(collect_resolutions(entries, &entry_to_task, &task_results))
+        collect_resolutions(entries, &entry_to_task, &task_results)
     }
 
     /// Resolve tools for a single MCP entry independently.
@@ -520,6 +520,10 @@ pub(crate) enum ResolveError {
     /// A `tool_choice` references a resolved server with zero tools.
     #[error("tool_choice references server_label \"{0}\" which resolved to zero eligible tools")]
     EmptyResolvedToolChoice(String),
+
+    /// `allowed_tools` has an invalid schema.
+    #[error("{0}")]
+    InvalidAllowedTools(String),
 }
 
 /// Per-entry resolution outcome.
@@ -588,14 +592,15 @@ fn collect_resolutions(
     entries: &[serde_json::Value],
     entry_to_task: &[Option<usize>],
     task_results: &[Option<Vec<serde_json::Value>>],
-) -> Resolution {
+) -> Result<Resolution, ResolveError> {
     let mut tool_map = HashMap::new();
     let mut per_entry = Vec::with_capacity(entries.len());
     let mut has_resolved = false;
     let mut resolved_labels = HashSet::new();
     let mut listings = Vec::new();
     for (entry, task_idx) in entries.iter().zip(entry_to_task) {
-        if let Some((resolution, listing_tools)) = build_entry_resolution(entry, *task_idx, task_results, &mut tool_map)
+        if let Some((resolution, listing_tools)) =
+            build_entry_resolution(entry, *task_idx, task_results, &mut tool_map)?
         {
             has_resolved = true;
             let label = server_label(entry).to_owned();
@@ -611,13 +616,13 @@ fn collect_resolutions(
             per_entry.push(EntryResolution::PassThrough);
         }
     }
-    Resolution {
+    Ok(Resolution {
         per_entry,
         tool_map,
         has_resolved,
         resolved_labels,
         listings,
-    }
+    })
 }
 
 /// Resolve connector IDs to server URLs for MCP tool entries.
@@ -671,6 +676,10 @@ fn validate_connector_entry(entry: &serde_json::Value, connector_id: &str) -> Re
     Ok(())
 }
 
+#[expect(
+    clippy::type_complexity,
+    reason = "wrapping in a named type would obscure the call site"
+)]
 /// Build resolution for a single entry given task results.
 ///
 /// Returns both the body-rewrite [`EntryResolution`] (the function tools that
@@ -683,9 +692,11 @@ fn build_entry_resolution(
     task_idx: Option<usize>,
     task_results: &[Option<Vec<serde_json::Value>>],
     tool_map: &mut HashMap<(String, String), serde_json::Value>,
-) -> Option<(EntryResolution, Vec<serde_json::Value>)> {
-    let tools = task_idx.and_then(|idx| task_results.get(idx)?.clone())?;
-    let allowed = extract_allowed_tools(entry);
+) -> Result<Option<(EntryResolution, Vec<serde_json::Value>)>, ResolveError> {
+    let Some(tools) = task_idx.and_then(|idx| task_results.get(idx)?.clone()) else {
+        return Ok(None);
+    };
+    let allowed = extract_allowed_tools(entry)?;
     let filtered = apply_allowed_tools_filter(tools, &allowed);
     let label = server_label(entry);
     let function_tools: Vec<serde_json::Value> = filtered
@@ -694,7 +705,7 @@ fn build_entry_resolution(
         .collect();
     let listing_tools: Vec<serde_json::Value> = filtered.iter().map(mcp_tool_to_list_tools_entry).collect();
     insert_tools(filtered, entry, tool_map);
-    Some((EntryResolution::Resolved(function_tools), listing_tools))
+    Ok(Some((EntryResolution::Resolved(function_tools), listing_tools)))
 }
 
 /// Replace a [`ResolveError::Client`] with [`ResolveError::ConnectorClient`]
@@ -734,7 +745,8 @@ fn resolve_error_status(err: &ResolveError) -> (u16, &'static str) {
         | ResolveError::MissingToolSearch(_)
         | ResolveError::InvalidConnectorId
         | ResolveError::MissingConnectorLabel(_)
-        | ResolveError::EmptyResolvedToolChoice(_) => (400, "invalid_request_error"),
+        | ResolveError::EmptyResolvedToolChoice(_)
+        | ResolveError::InvalidAllowedTools(_) => (400, "invalid_request_error"),
         ResolveError::BodyTooLarge { .. } => (413, "invalid_request_error"),
         ResolveError::Client { .. } | ResolveError::ConnectorClient { .. } => (502, "server_error"),
         ResolveError::Serialization(_) => (500, "server_error"),
@@ -1412,7 +1424,7 @@ type DedupResult<'a> = (Vec<Option<usize>>, Vec<&'a serde_json::Value>, Vec<Opti
 /// Deduplicate MCP entries into resolution tasks. Non-credentialed
 /// entries sharing the same `(label, url)` map to a single task;
 /// credentialed entries always get their own task.
-fn dedup_entries(entries: &[serde_json::Value]) -> DedupResult<'_> {
+fn dedup_entries(entries: &[serde_json::Value]) -> Result<DedupResult<'_>, ResolveError> {
     let mut entry_to_task: Vec<Option<usize>> = vec![None; entries.len()];
     let mut task_entries: Vec<&serde_json::Value> = Vec::new();
     let mut task_allowed_names: Vec<Option<Vec<String>>> = Vec::new();
@@ -1422,7 +1434,7 @@ fn dedup_entries(entries: &[serde_json::Value]) -> DedupResult<'_> {
         let Some(url) = resolvable_server_url(entry) else {
             continue;
         };
-        let allowed = extract_allowed_tools(entry);
+        let allowed = extract_allowed_tools(entry)?;
         let existing = if has_entry_credentials(entry) {
             None
         } else {
@@ -1444,7 +1456,7 @@ fn dedup_entries(entries: &[serde_json::Value]) -> DedupResult<'_> {
         }
     }
 
-    (entry_to_task, task_entries, task_allowed_names)
+    Ok((entry_to_task, task_entries, task_allowed_names))
 }
 
 /// Merge `new` into `existing` as a union. If either side is
@@ -2175,7 +2187,7 @@ async fn prepare_deferred_listing(
 ) -> Result<PreparedDeferredListing, ResolveError> {
     let listing = list_deferred_connector(connector, forwarded_header_names, forwarded_headers).await?;
     let entry = deferred_entry_view(connector);
-    let allowed = extract_allowed_tools(&entry);
+    let allowed = extract_allowed_tools(&entry)?;
     let filtered = apply_allowed_tools_filter(listing, &allowed);
     let functions: Vec<serde_json::Value> = filtered
         .iter()
@@ -2514,43 +2526,98 @@ fn extract_mcp_entries(body: &[u8]) -> Vec<serde_json::Value> {
 
 /// Extract `allowed_tools` from an MCP tool entry.
 ///
-/// Handles both the string-array form (`["a", "b"]`) and the
-/// `MCPToolFilter` object form (`{"tool_names": ["a"]}`).
-fn extract_allowed_tools(entry: &serde_json::Value) -> AllowedTools {
+/// Handles `null` (unrestricted, matching the OpenAI schema), the
+/// string-array form (`["a", "b"]`), and the `MCPToolFilter` object
+/// form (`{"tool_names": ["a"]}`).
+fn extract_allowed_tools(entry: &serde_json::Value) -> Result<AllowedTools, ResolveError> {
     let Some(value) = entry.get("allowed_tools") else {
-        return AllowedTools::unrestricted();
+        return Ok(AllowedTools::unrestricted());
     };
+    if value.is_null() {
+        return Ok(AllowedTools::unrestricted());
+    }
     if let Some(arr) = value.as_array() {
-        return AllowedTools {
-            names: Some(extract_string_list(arr)),
+        return validate_string_array(arr).map(|names| AllowedTools {
+            names: Some(names),
             read_only: None,
-        };
+        });
     }
     if let Some(obj) = value.as_object() {
         return extract_from_filter_object(obj);
     }
-    AllowedTools::unrestricted()
+    Err(ResolveError::InvalidAllowedTools(format!(
+        "allowed_tools must be an array of strings or an MCPToolFilter object, got {}",
+        json_type_name(value),
+    )))
 }
+
+/// Recognized fields in an `MCPToolFilter` object.
+const ALLOWED_FILTER_FIELDS: &[&str] = &["tool_names", "read_only"];
 
 /// Parse an `MCPToolFilter` object: `{tool_names?, read_only?}`.
-fn extract_from_filter_object(obj: &serde_json::Map<String, serde_json::Value>) -> AllowedTools {
-    let names = obj
-        .get("tool_names")
-        .and_then(serde_json::Value::as_array)
-        .map(|arr| extract_string_list(arr));
-    let read_only = obj.get("read_only").and_then(serde_json::Value::as_bool);
-    AllowedTools { names, read_only }
+fn extract_from_filter_object(obj: &serde_json::Map<String, serde_json::Value>) -> Result<AllowedTools, ResolveError> {
+    for key in obj.keys() {
+        if !ALLOWED_FILTER_FIELDS.contains(&key.as_str()) {
+            return Err(ResolveError::InvalidAllowedTools(format!(
+                "unknown field \"{key}\" in allowed_tools filter object",
+            )));
+        }
+    }
+    let names = match obj.get("tool_names") {
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| {
+                ResolveError::InvalidAllowedTools(format!(
+                    "allowed_tools.tool_names must be an array, got {}",
+                    json_type_name(v),
+                ))
+            })?;
+            Some(validate_string_array(arr)?)
+        },
+        None => None,
+    };
+    let read_only = match obj.get("read_only") {
+        Some(v) => Some(v.as_bool().ok_or_else(|| {
+            ResolveError::InvalidAllowedTools(format!(
+                "allowed_tools.read_only must be a boolean, got {}",
+                json_type_name(v),
+            ))
+        })?),
+        None => None,
+    };
+    Ok(AllowedTools { names, read_only })
 }
 
-/// Collect string elements from a JSON array.
-fn extract_string_list(arr: &[serde_json::Value]) -> Vec<String> {
-    arr.iter()
-        .filter_map(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .collect()
+/// Validate that every element in a JSON array is a string.
+fn validate_string_array(arr: &[serde_json::Value]) -> Result<Vec<String>, ResolveError> {
+    let mut result = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        match item.as_str() {
+            Some(s) => result.push(s.to_owned()),
+            None => {
+                return Err(ResolveError::InvalidAllowedTools(format!(
+                    "allowed_tools[{i}] must be a string, got {}",
+                    json_type_name(item),
+                )));
+            },
+        }
+    }
+    Ok(result)
+}
+
+/// Human-readable JSON type name for error messages.
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 /// Outcome of parsing `allowed_tools`.
+#[derive(Debug)]
 struct AllowedTools {
     /// Optional tool-name allowlist.
     names: Option<Vec<String>>,

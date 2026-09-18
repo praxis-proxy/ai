@@ -767,7 +767,7 @@ fn extract_allowed_tools_string_array() {
         "server_label": "srv",
         "allowed_tools": ["get_weather", "get_forecast"]
     });
-    let allowed = extract_allowed_tools(&entry);
+    let allowed = extract_allowed_tools(&entry).unwrap();
     assert_eq!(
         allowed.as_names().unwrap(),
         &["get_weather", "get_forecast"],
@@ -782,7 +782,7 @@ fn extract_allowed_tools_filter_object() {
         "server_label": "srv",
         "allowed_tools": {"tool_names": ["get_weather"]}
     });
-    let allowed = extract_allowed_tools(&entry);
+    let allowed = extract_allowed_tools(&entry).unwrap();
     assert_eq!(
         allowed.as_names().unwrap(),
         &["get_weather"],
@@ -797,7 +797,7 @@ fn extract_allowed_tools_read_only() {
         "server_label": "srv",
         "allowed_tools": {"read_only": true}
     });
-    let allowed = extract_allowed_tools(&entry);
+    let allowed = extract_allowed_tools(&entry).unwrap();
     assert_eq!(allowed.read_only, Some(true), "should be read_only");
     assert!(allowed.as_names().is_none(), "should have no name list");
 }
@@ -809,7 +809,7 @@ fn extract_allowed_tools_read_only_with_names() {
         "server_label": "srv",
         "allowed_tools": {"read_only": true, "tool_names": ["get_weather"]}
     });
-    let allowed = extract_allowed_tools(&entry);
+    let allowed = extract_allowed_tools(&entry).unwrap();
     assert_eq!(allowed.read_only, Some(true), "should be read_only");
     assert_eq!(
         allowed.as_names().unwrap(),
@@ -825,7 +825,7 @@ fn extract_allowed_tools_read_only_false_filters_writable() {
         "server_label": "srv",
         "allowed_tools": {"read_only": false}
     });
-    let allowed = extract_allowed_tools(&entry);
+    let allowed = extract_allowed_tools(&entry).unwrap();
     assert_eq!(
         allowed.read_only,
         Some(false),
@@ -841,7 +841,7 @@ fn extract_allowed_tools_read_only_false_with_names() {
         "server_label": "srv",
         "allowed_tools": {"read_only": false, "tool_names": ["a"]}
     });
-    let allowed = extract_allowed_tools(&entry);
+    let allowed = extract_allowed_tools(&entry).unwrap();
     assert_eq!(
         allowed.read_only,
         Some(false),
@@ -857,8 +857,182 @@ fn extract_allowed_tools_unrestricted_when_absent() {
         "server_label": "srv"
     });
     assert!(
-        extract_allowed_tools(&entry).as_names().is_none(),
+        extract_allowed_tools(&entry).unwrap().as_names().is_none(),
         "should be unrestricted when absent"
+    );
+}
+
+// =========================================================================
+// allowed_tools validation: fail-closed on malformed input (#939)
+// =========================================================================
+
+#[test]
+fn extract_allowed_tools_rejects_string_value() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": "safe"
+    });
+    let err = extract_allowed_tools(&entry).unwrap_err();
+    assert!(
+        err.to_string().contains("must be an array"),
+        "string value should be rejected: {err}"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_rejects_number_value() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": 42
+    });
+    assert!(extract_allowed_tools(&entry).is_err());
+}
+
+#[test]
+fn extract_allowed_tools_rejects_boolean_value() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": true
+    });
+    assert!(extract_allowed_tools(&entry).is_err());
+}
+
+#[test]
+fn extract_allowed_tools_null_is_unrestricted() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": null
+    });
+    let allowed = extract_allowed_tools(&entry).unwrap();
+    assert!(
+        allowed.as_names().is_none(),
+        "null should be treated as unrestricted (same as absent field)"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_rejects_non_string_array_elements() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": [1, 2, 3]
+    });
+    let err = extract_allowed_tools(&entry).unwrap_err();
+    assert!(
+        err.to_string().contains("allowed_tools[0] must be a string"),
+        "non-string elements should be rejected: {err}"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_rejects_mixed_array_elements() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": ["valid", 42]
+    });
+    let err = extract_allowed_tools(&entry).unwrap_err();
+    assert!(
+        err.to_string().contains("allowed_tools[1]"),
+        "mixed elements should be rejected at the invalid index: {err}"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_rejects_wrong_tool_names_type() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"tool_names": "not_an_array"}
+    });
+    let err = extract_allowed_tools(&entry).unwrap_err();
+    assert!(
+        err.to_string().contains("tool_names must be an array"),
+        "wrong tool_names type should be rejected: {err}"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_rejects_wrong_read_only_type() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"read_only": "yes"}
+    });
+    let err = extract_allowed_tools(&entry).unwrap_err();
+    assert!(
+        err.to_string().contains("read_only must be a boolean"),
+        "wrong read_only type should be rejected: {err}"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_rejects_unknown_filter_fields() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"tool_names": ["a"], "extra_field": true}
+    });
+    let err = extract_allowed_tools(&entry).unwrap_err();
+    assert!(
+        err.to_string().contains("unknown field"),
+        "unknown fields should be rejected: {err}"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_rejects_non_string_in_tool_names() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"tool_names": ["ok", 99]}
+    });
+    let err = extract_allowed_tools(&entry).unwrap_err();
+    assert!(
+        err.to_string().contains("allowed_tools[1] must be a string"),
+        "non-string tool_names elements should be rejected: {err}"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_rejects_null_tool_names() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"tool_names": null}
+    });
+    let err = extract_allowed_tools(&entry).unwrap_err();
+    assert!(
+        err.to_string().contains("tool_names must be an array"),
+        "null tool_names should be rejected (not nullable in schema): {err}"
+    );
+}
+
+#[test]
+fn extract_allowed_tools_rejects_null_read_only() {
+    let entry = serde_json::json!({
+        "type": "mcp",
+        "server_label": "srv",
+        "allowed_tools": {"read_only": null}
+    });
+    let err = extract_allowed_tools(&entry).unwrap_err();
+    assert!(
+        err.to_string().contains("read_only must be a boolean"),
+        "null read_only should be rejected (not nullable in schema): {err}"
+    );
+}
+
+#[test]
+fn dedup_entries_rejects_malformed_allowed_tools() {
+    let entries =
+        vec![serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "allowed_tools": "bad"})];
+    assert!(
+        dedup_entries(&entries).is_err(),
+        "malformed allowed_tools should fail dedup"
     );
 }
 
@@ -1039,7 +1213,7 @@ fn dedup_entries_groups_same_label_url() {
         serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "allowed_tools": ["y"]}),
         serde_json::json!({"server_label": "b", "server_url": "http://10.0.0.2/mcp"}),
     ];
-    let (mapping, tasks, _) = dedup_entries(&entries);
+    let (mapping, tasks, _) = dedup_entries(&entries).unwrap();
 
     assert_eq!(tasks.len(), 2, "two unique servers → two tasks");
     assert_eq!(
@@ -1059,7 +1233,7 @@ fn dedup_entries_keeps_credentialed_independent() {
         serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "authorization": "tok_b"}),
         serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp"}),
     ];
-    let (mapping, tasks, _) = dedup_entries(&entries);
+    let (mapping, tasks, _) = dedup_entries(&entries).unwrap();
 
     assert_eq!(
         tasks.len(),
@@ -1080,7 +1254,7 @@ fn dedup_entries_includes_resolved_connector() {
         serde_json::json!({"server_label": "b", "server_url": "http://10.0.0.1/mcp", "defer_loading": true}),
         serde_json::json!({"server_label": "c", "server_url": "http://10.0.0.2/mcp"}),
     ];
-    let (mapping, tasks, _) = dedup_entries(&entries);
+    let (mapping, tasks, _) = dedup_entries(&entries).unwrap();
 
     assert_eq!(tasks.len(), 2, "resolved connector + direct URL = two tasks");
     assert!(mapping[0].is_some(), "resolved connector entry IS resolvable");
@@ -1098,7 +1272,7 @@ fn dedup_entries_merges_allowed_names_union() {
         serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "allowed_tools": ["a"]}),
         serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "allowed_tools": ["b"]}),
     ];
-    let (_, _, allowed) = dedup_entries(&entries);
+    let (_, _, allowed) = dedup_entries(&entries).unwrap();
 
     assert_eq!(allowed.len(), 1, "one task");
     let names = allowed[0].as_ref().expect("should have merged names");
@@ -1112,7 +1286,7 @@ fn dedup_entries_unrestricted_entry_forces_unrestricted() {
         serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp", "allowed_tools": ["a"]}),
         serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"}),
     ];
-    let (_, _, allowed) = dedup_entries(&entries);
+    let (_, _, allowed) = dedup_entries(&entries).unwrap();
 
     assert_eq!(allowed.len(), 1, "one task");
     assert!(
@@ -1224,7 +1398,7 @@ fn filter_and_insert(
     entry: &serde_json::Value,
     tool_map: &mut HashMap<(String, String), serde_json::Value>,
 ) {
-    let allowed = extract_allowed_tools(entry);
+    let allowed = extract_allowed_tools(entry).unwrap();
     insert_tools(apply_allowed_tools_filter(tools, &allowed), entry, tool_map);
 }
 
@@ -5121,4 +5295,61 @@ fn parse_named_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
             (name, serde_json::from_str(payload).expect("valid SSE JSON payload"))
         })
         .collect()
+}
+
+// =========================================================================
+// Filter-level regression: malformed allowed_tools rejects before rewrite (#939)
+// =========================================================================
+
+/// Reproduces the original issue: a cache contains tools "safe" and "destructive",
+/// the request specifies `"allowed_tools": "safe"` (a string, not an array).
+/// Previously this silently became unrestricted and exposed both tools.
+/// Now it must be rejected with 400 before the body is rewritten or tool map populated.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "filter-level regression requires setup, action, and multi-assert verification"
+)]
+async fn malformed_allowed_tools_string_rejects_before_rewrite() {
+    let filter = McpToolResolveFilter::from_config(&serde_yaml::from_str("{}").unwrap()).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+
+    let server_url = "http://10.0.0.5/mcp";
+    let body_json = serde_json::json!({
+        "model": "gpt-4o", "input": "test",
+        "tools": [{"type": "mcp", "server_label": "weather",
+                    "server_url": server_url, "allowed_tools": "safe"}]
+    });
+    let mut state = ResponsesState::from_request_body(body_json.clone());
+    state.previous_tools = vec![serde_json::json!({
+        "server_label": "weather", "server_url": server_url,
+        "tools": [
+            {"name": "safe", "description": "Safe tool"},
+            {"name": "destructive", "description": "Destructive tool"}
+        ]
+    })];
+    ctx.extensions.insert(state);
+
+    let original_body = serde_json::to_vec(&body_json).unwrap();
+    let mut body = Some(Bytes::from(original_body.clone()));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject for malformed allowed_tools, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 400, "malformed allowed_tools should be 400");
+    assert_eq!(
+        body.as_deref(),
+        Some(original_body.as_slice()),
+        "request body must not be rewritten into function tools on validation failure"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>();
+    assert!(
+        state.is_none() || state.unwrap().mcp_tool_map.is_empty(),
+        "mcp_tool_map must not be populated on validation failure"
+    );
 }
