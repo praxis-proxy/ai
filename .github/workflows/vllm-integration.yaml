@@ -40,7 +40,7 @@ on:
   workflow_dispatch:
     inputs:
       run_live_vllm:
-        description: Run the complete Responses SDK suite only against live CPU vLLM
+        description: Run the complete Responses SDK suite against live vLLM on a GPU runner
         required: false
         default: false
         type: boolean
@@ -55,6 +55,10 @@ env:
   CARGO_TERM_COLOR: always
   VLLM_IMAGE: "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
+  # CUDA image used by the GPU full-suite jobs on the ephemeral EC2 runner.
+  # The model is downloaded from Hugging Face at container start (not baked in),
+  # unlike the CPU image above.
+  VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
   # llm-d-inference-sim v0.11.2 multi-architecture image index.
   INFERENCE_SIM_IMAGE: "ghcr.io/llm-d/llm-d-inference-sim@sha256:32144df791330a0006b747edfdf2b114a0fe728e023a9d1b3463eeb48d32abb9"
   INFERENCE_SIM_MODEL: "praxis-test-model"
@@ -285,29 +289,19 @@ jobs:
           fi
 
   # ----------------------------------------------------------------------------
-  # Critical live CPU smoke tests on every relevant change. Nightly, explicitly
-  # requested dispatches, and vllm-full-suite labels run the complete suite.
+  # Critical live CPU smoke tests on every relevant change. Nightly runs,
+  # `run_live_vllm` dispatches, and vllm-full-suite labels run the *complete*
+  # suite on a real GPU instead (see the gpu-* jobs below).
   # ----------------------------------------------------------------------------
 
   vllm-live-cpu:
     needs: [changes]
     if: |
       always() &&
-      (
-        github.event_name == 'schedule' ||
-        (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) ||
-        (
-          github.event_name == 'pull_request' &&
-          github.event.action == 'labeled' &&
-          github.event.label.name == 'vllm-full-suite'
-        ) ||
-        (
-          github.event_name != 'workflow_dispatch' &&
-          github.event_name != 'schedule' &&
-          (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
-          (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
-        )
-      )
+      github.event_name != 'schedule' &&
+      (github.event_name != 'workflow_dispatch' || !inputs.run_live_vllm) &&
+      (github.event_name != 'pull_request' || github.event.action != 'labeled') &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -374,19 +368,11 @@ jobs:
           done
 
       - name: Run critical live vLLM smoke tests
-        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && (github.event_name != 'pull_request' || github.event.action != 'labeled')
         env:
           VLLM_TEST_BACKEND: live
         run: |
           uv run tests/integration/sdk/openai/test_openai_responses_vllm.py \
             -s -m "critical_vllm"
-
-      - name: Run complete live vLLM Responses suite
-        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) || (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'vllm-full-suite')
-        env:
-          VLLM_TEST_BACKEND: live
-        run: |
-          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 
       - name: vLLM container logs
         if: failure()
@@ -406,6 +392,210 @@ jobs:
           if [ -f /tmp/ogx.pid ]; then
             kill "$(cat /tmp/ogx.pid)" 2>/dev/null || true
           fi
+
+  # ----------------------------------------------------------------------------
+  # Complete live vLLM Responses suite on a real GPU. Runs nightly, on a
+  # `run_live_vllm` dispatch, and on a vllm-full-suite PR label. An ephemeral
+  # EC2 g4dn.xlarge runner is provisioned for the run and torn down
+  # unconditionally afterwards.
+  # ----------------------------------------------------------------------------
+
+  gpu-start-runner:
+    name: Start ephemeral EC2 GPU runner
+    if: |
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) ||
+      (
+        github.event_name == 'pull_request' &&
+        github.event.action == 'labeled' &&
+        github.event.label.name == 'vllm-full-suite'
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      label: ${{ steps.start.outputs.label }}
+      ec2-instance-id: ${{ steps.start.outputs.ec2-instance-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start EC2 GPU runner
+        id: start
+        uses: ./.github/actions/start-ec2-runner
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+          aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+          ami-id: ${{ vars.AWS_GPU_AMI_ID }}
+          subnet-id: ${{ vars.AWS_SUBNET_ID || vars.US_EAST_2A_SUBNET_ID }}
+          security-group-id: ${{ vars.AWS_SECURITY_GROUP_ID || vars.US_EAST_2_SG_ID }}
+          github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
+
+  vllm-gpu-full-suite:
+    name: Run complete live vLLM Responses suite (GPU)
+    needs: [gpu-start-runner]
+    runs-on: ${{ needs.gpu-start-runner.outputs.label }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify GPU and container runtime
+        run: |
+          nvidia-smi
+          if command -v docker >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
+            docker info >/dev/null
+          elif command -v podman >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
+            podman info >/dev/null
+          else
+            echo "Neither docker nor podman is available on this runner" >&2
+            exit 1
+          fi
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          # The GPU AMI ships Python 3.9; ogx[starter] needs >=3.12, so pin the
+          # interpreter setup-uv provisions. Cache is repo-scoped (GH cache
+          # service), so it still warms across ephemeral runners.
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: |
+            tests/integration/ogx-constraints.txt
+
+      - name: Pull vLLM CUDA image
+        run: |
+          "$CONTAINER_RUNTIME" pull "$VLLM_GPU_IMAGE"
+
+      - name: Start vLLM on GPU
+        env:
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+        run: |
+          gpu_args=()
+          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+            gpu_args=(--device nvidia.com/gpu=all)
+          else
+            gpu_args=(--gpus all)
+          fi
+
+          "$CONTAINER_RUNTIME" run -d --name vllm \
+            "${gpu_args[@]}" \
+            -p 8000:8000 \
+            -e HUGGING_FACE_HUB_TOKEN \
+            "$VLLM_GPU_IMAGE" \
+            --model "$VLLM_MODEL" \
+            --max-model-len 4096 \
+            --served-model-name "$VLLM_MODEL" \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes \
+            --reasoning-parser deepseek_r1 \
+            --gpu-memory-utilization 0.7
+
+      - name: Pre-install OGX dependencies
+        run: |
+          uv run --with-requirements "$OGX_CONSTRAINTS" ogx --help > /dev/null
+
+      - name: Start OGX
+        run: |
+          uv run --with-requirements "$OGX_CONSTRAINTS" ogx run starter --insecure > /tmp/ogx.log 2>&1 &
+          echo $! > /tmp/ogx.pid
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Wait for vLLM readiness
+        run: |
+          echo "Waiting for vLLM health and model endpoints..."
+          # Model weights download from Hugging Face on first start, so allow a
+          # generous deadline. Poll the serving endpoints directly (runtime
+          # agnostic) rather than introspecting the container.
+          timeout 1200 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
+                                       curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
+            sleep 5
+          done'
+          echo "vLLM is ready"
+          curl -sf http://127.0.0.1:8000/v1/models | head -c 500
+          echo
+
+      - name: Wait for OGX readiness
+        run: |
+          dump_ogx_log() {
+            echo "----- /tmp/ogx.log (tail -n 200) -----"
+            tail -n 200 /tmp/ogx.log 2>/dev/null || echo "No OGX log found"
+          }
+          OGX_PID="$(cat /tmp/ogx.pid)"
+          deadline=$((SECONDS + 300))
+          until curl -sf http://127.0.0.1:8321/v1/files > /dev/null 2>&1; do
+            if ! kill -0 "$OGX_PID" 2>/dev/null; then
+              echo "::error::OGX process (pid $OGX_PID) exited before binding port 8321"
+              dump_ogx_log
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::OGX did not become ready within 300s"
+              dump_ogx_log
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "OGX is ready"
+
+      - name: Run complete live vLLM Responses suite
+        env:
+          VLLM_TEST_BACKEND: live
+        run: |
+          uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
+
+      - name: vLLM container logs
+        if: failure()
+        run: |
+          "$CONTAINER_RUNTIME" logs vllm 2>&1 || echo "(no vllm container)"
+
+      - name: OGX logs
+        if: failure()
+        run: cat /tmp/ogx.log 2>/dev/null || echo "No OGX log found"
+
+      - name: Stop vLLM
+        if: always()
+        run: |
+          "$CONTAINER_RUNTIME" rm -f vllm || true
+
+      - name: Stop OGX
+        if: always()
+        run: |
+          if [ -f /tmp/ogx.pid ]; then
+            kill "$(cat /tmp/ogx.pid)" 2>/dev/null || true
+          fi
+
+  gpu-stop-runner:
+    name: Stop ephemeral EC2 GPU runner
+    needs: [gpu-start-runner, vllm-gpu-full-suite]
+    # Always tear down the instance, even on failure/cancel, but skip when the
+    # runner was never started (non-GPU triggers).
+    if: always() && needs.gpu-start-runner.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Stop EC2 GPU runner
+        uses: ./.github/actions/stop-ec2-runner
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+          aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+          github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
+          label: ${{ needs.gpu-start-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.gpu-start-runner.outputs.ec2-instance-id }}
 
   # ----------------------------------------------------------------------------
   # Fast Responses API integration tests with PostgreSQL store backend

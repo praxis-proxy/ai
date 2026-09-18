@@ -156,6 +156,31 @@ def _patch_store_backend(config: str, db_path: str) -> str:
     return config
 
 
+def _persist_config(config: str) -> str:
+    """Write a generated Praxis config to a temp file and return its path.
+
+    When the harness runs as root — as it does on the ephemeral EC2 GPU runner
+    used by the nightly/label-triggered full suite — Praxis refuses to start
+    unless ``insecure_options.allow_root`` is set. Inject it here so every config
+    writer inherits the override in one place; non-root local and CPU CI runs are
+    left byte-for-byte unchanged.
+    """
+    if os.geteuid() == 0 and "allow_root:" not in config:
+        block = "\ninsecure_options:\n"
+        override = "\ninsecure_options:\n  allow_root: true\n"
+        if block in config:
+            config = config.replace(block, override, 1)
+        elif config.startswith("insecure_options:\n"):
+            config = "insecure_options:\n  allow_root: true\n" + config[len("insecure_options:\n") :]
+        else:
+            config = config.rstrip("\n") + override
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(config)
+    return path
+
+
 def _write_config(praxis_port: int, db_path: str) -> str:
     with open(CONFIG_PATH) as f:
         config = f.read()
@@ -170,9 +195,7 @@ def _write_config(praxis_port: int, db_path: str) -> str:
     config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -253,9 +276,7 @@ def _write_irr_streaming_config(praxis_port: int) -> str:
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -270,9 +291,7 @@ def _write_chat_streaming_config(
     config = config.replace("127.0.0.1:3001", backend_endpoint)
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -298,9 +317,7 @@ def _write_compact_config(
     config = config.replace("127.0.0.1:11434", _vllm_endpoint())
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -332,9 +349,7 @@ def _write_web_search_chat_streaming_config(
         "                allow_private_base_url: true",
     )
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -743,9 +758,7 @@ def _write_witness_config(
     config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -822,9 +835,7 @@ def _write_agentic_config(
             "              - filter: router",
         )
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -4319,9 +4330,7 @@ def _write_file_search_config(
         ogx_endpoint=_ogx_endpoint(),
         vllm_endpoint=backend_endpoint,
     )
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -4556,9 +4565,7 @@ def _write_file_search_chat_config(
             "Chat backend endpoint was not patched"
         )
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -4719,9 +4726,7 @@ def _write_file_search_streaming_config(
     config = config.replace("step_timeout_ms: 60000", "step_timeout_ms: 300000")
     config = config.replace("timeout_ms: 5000", "timeout_ms: 30000")
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
