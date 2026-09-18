@@ -41,7 +41,8 @@ use tracing::warn;
 use self::{
     client::{
         CalloutTransport, FileSearchClient, FileSearchClientConfig, FileSearchError, MAX_QUERY_BYTES,
-        MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchBatch, SearchFailure, SearchSpec, request_error,
+        MAX_SEARCH_REQUEST_BYTES, MAX_VECTOR_STORE_ID_BYTES, SearchBatch, SearchFailure, SearchOptions, SearchSpec,
+        request_error,
     },
     config::{FileSearchFilterConfig, ValidatedConfig, build_config_with_client, require_inline_outbound_chain},
     model_context::{FormatLimits, FormatTemplates, MODEL_CONTEXT_TEMPLATES, format_search_results},
@@ -52,7 +53,10 @@ use crate::{
     http_hop::connection_nominates_header,
     openai::responses::{
         bounded_json_size,
-        state::{DispatchFailure, FileSearchAssignment, MAX_CITATION_FILES, ResponsesState},
+        state::{
+            DispatchFailure, FileSearchAssignment, MAX_CITATION_FILES, ResponsesState, retained_json_bytes,
+            retained_json_values_bytes,
+        },
     },
     subrequest::SubRequestClient,
 };
@@ -156,25 +160,64 @@ impl FileSearchCalloutFilter {
     /// private model-context bridges to `messages`, and extends `citation_files`.
     /// On a size overflow it records a shared [`DispatchFailure`] the loop owner
     /// converts into the terminal wire form; the dispatcher never rejects itself.
-    #[expect(clippy::too_many_lines, reason = "sequential result formatting and state commit")]
-    fn apply_batch(state: &mut ResponsesState, plan: &SearchPlan, batch: &SearchBatch) -> Result<(), DispatchFailure> {
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "sequential result formatting and one transactional state commit"
+    )]
+    fn apply_batch(
+        state: &mut ResponsesState,
+        assignments: &[FileSearchAssignment],
+        plan: &SearchPlan,
+        batch: &SearchBatch,
+        framework_bytes: usize,
+        max_state_bytes: usize,
+    ) -> Result<(), DispatchFailure> {
         let failed_calls: HashSet<usize> = batch.failures.iter().map(|failure| failure.call_index).collect();
         let expose_results = state.include.iter().any(|value| value == "file_search_call.results");
+        // Formatting creates a second owner for model context and, when
+        // requested, a public projection of every decoded result. Reserve the
+        // transient owners before allocating either projection. Checking only
+        // after `format_search_results` would let a large search response
+        // temporarily exceed the request-wide aggregate ceiling.
+        let mut remaining_model_bytes = match reserve_file_search_formatting(state, plan, batch, expose_results) {
+            Ok(bytes) => bytes,
+            Err(failure) => {
+                state.discard_payload_for_budget_error();
+                return Err(failure);
+            },
+        };
         let mut bridges = Vec::with_capacity(plan.calls.len());
-        let mut remaining_model_bytes = MAX_TOTAL_MODEL_CONTEXT_BYTES;
+        let mut updates = Vec::with_capacity(assignments.len());
         let response_identity_hash = state
             .response_object
             .get("id")
             .and_then(Value::as_str)
             .map_or(FNV_OFFSET_BASIS, |response_id| stable_call_hash(&[response_id]));
-        ensure_pending_file_search_call_ids(state, plan, response_identity_hash);
+        let mut new_citation_files = HashMap::new();
 
         for (call_index, call) in plan.calls.iter().enumerate() {
             let results = batch.results_by_call.get(call_index).map_or(&[][..], Vec::as_slice);
             let (query, query_truncated) = join_queries_bounded(&call.queries);
-            let Some(source_item) = state.accumulated_output.get(call.output_index) else {
+            let Some(source_object) = state
+                .accumulated_output
+                .get(call.output_index)
+                .and_then(Value::as_object)
+            else {
                 continue;
             };
+            let public_id = source_object
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map_or_else(
+                    || Some(format!("fs_{response_identity_hash:016x}_{}", call.output_index)),
+                    |_| None,
+                );
+            let source_id = public_id
+                .as_deref()
+                .or_else(|| source_object.get("id").and_then(Value::as_str))
+                .unwrap_or_default();
             let BudgetedSearchResults {
                 citation_files,
                 model_messages: call_model_messages,
@@ -183,9 +226,11 @@ impl FileSearchCalloutFilter {
                 truncated,
             } = BridgeBudget {
                 known_citation_files: &state.citation_files,
-                max_new_citation_files: MAX_CITATION_FILES.saturating_sub(state.citation_files.len()),
+                staged_citation_files: &new_citation_files,
+                max_new_citation_files: MAX_CITATION_FILES
+                    .saturating_sub(state.citation_files.len().saturating_add(new_citation_files.len())),
                 remaining_model_bytes,
-                source_item,
+                source_id,
                 output_index: call.output_index,
                 query: &query,
                 response_identity_hash,
@@ -203,29 +248,55 @@ impl FileSearchCalloutFilter {
                 && !truncated
                 && call_model_messages.is_some();
             let status = if complete { "completed" } else { "incomplete" };
-
-            let mut applied = false;
-            if let Some(item) = state.accumulated_output.get_mut(call.output_index)
-                && let Some(object) = item.as_object_mut()
-            {
-                object.insert("status".to_owned(), Value::String(status.to_owned()));
-                if expose_results {
-                    object.insert("results".to_owned(), Value::Array(public_results));
-                } else {
-                    object.remove("results");
-                }
-
-                if let Some(messages) = call_model_messages {
-                    bridges.push(messages);
-                }
-                applied = true;
+            updates.push(OutputUpdate::new(
+                call.output_index,
+                source_object,
+                public_id,
+                status,
+                expose_results.then_some(public_results),
+            )?);
+            if let Some(messages) = call_model_messages {
+                bridges.push(messages);
             }
-            if applied {
-                state.citation_files.extend(citation_files);
+            for (file_id, filename) in citation_files {
+                new_citation_files.insert(file_id, filename);
             }
         }
 
-        if !accumulated_output_fits(state, MAX_JSON_BODY_BYTES) {
+        // Calls dropped by the per-continuation cap still receive a valid public
+        // identity and terminal status, but participate in the same transaction.
+        for assignment in assignments {
+            let output_index = assignment.output_index;
+            if plan.calls.iter().any(|call| call.output_index == output_index) {
+                continue;
+            }
+            let Some(object) = state.accumulated_output.get(output_index).and_then(Value::as_object) else {
+                continue;
+            };
+            let public_id = object
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .is_none()
+                .then(|| format!("fs_{response_identity_hash:016x}_{output_index}"));
+            updates.push(OutputUpdate::new(output_index, object, public_id, "incomplete", None)?);
+        }
+
+        let removed_output_bytes = updates
+            .iter()
+            .try_fold(0_usize, |total, update| total.checked_add(update.previous_bytes))
+            .ok_or_else(file_search_state_accounting_failure)?;
+        let added_output_bytes = updates
+            .iter()
+            .try_fold(0_usize, |total, update| total.checked_add(update.updated_bytes))
+            .ok_or_else(file_search_state_accounting_failure)?;
+        let current_output_bytes =
+            retained_json_bytes(&state.accumulated_output).ok_or_else(file_search_state_accounting_failure)?;
+        let projected_output_bytes = current_output_bytes
+            .checked_sub(removed_output_bytes)
+            .and_then(|bytes| bytes.checked_add(added_output_bytes))
+            .ok_or_else(file_search_state_accounting_failure)?;
+        if projected_output_bytes > MAX_JSON_BODY_BYTES {
             return Err(DispatchFailure {
                 status: 502,
                 code: "server_error",
@@ -233,6 +304,70 @@ impl FileSearchCalloutFilter {
                     .to_owned(),
             });
         }
+
+        let bridge_bytes = bridges.iter().try_fold(0_usize, |total, bridge| {
+            retained_json_values_bytes(bridge).and_then(|bytes| total.checked_add(bytes))
+        });
+        let citation_bytes = new_citation_files
+            .iter()
+            .try_fold(0_usize, |total, (file_id, filename)| {
+                total.checked_add(file_id.len().saturating_add(filename.len()))
+            });
+        let added_bytes = bridge_bytes
+            .and_then(|bytes| citation_bytes.and_then(|citations| bytes.checked_add(citations)))
+            .and_then(|bytes| bytes.checked_add(added_output_bytes))
+            .ok_or_else(file_search_state_accounting_failure)?;
+
+        // The decoded batch and every staged replacement remain live until the
+        // transactional commit below. Charge those owners separately from the
+        // final state owners represented by `added_bytes`.
+        let staged_update_bytes = updates.iter().try_fold(0_usize, |total, update| {
+            let id_bytes = update.public_id.as_ref().map_or(0, String::len);
+            let result_bytes = update.public_results.as_ref().map_or(Some(0), retained_json_bytes);
+            total
+                .checked_add(id_bytes)
+                .and_then(|total| result_bytes.and_then(|bytes| total.checked_add(bytes)))
+        });
+        let staged_citation_bytes = new_citation_files
+            .iter()
+            .try_fold(0_usize, |total, (file_id, filename)| {
+                total.checked_add(file_id.len().saturating_add(filename.len()))
+            });
+        let staging_bytes = batch
+            .staging_bytes()
+            .and_then(|bytes| {
+                bridges.iter().try_fold(bytes, |total, bridge| {
+                    retained_json_values_bytes(bridge).and_then(|bytes| total.checked_add(bytes))
+                })
+            })
+            .and_then(|bytes| staged_update_bytes.and_then(|updates| bytes.checked_add(updates)))
+            .and_then(|bytes| staged_citation_bytes.and_then(|citations| bytes.checked_add(citations)))
+            .ok_or_else(file_search_state_accounting_failure)?;
+
+        if !state.can_replace_retained_payload(removed_output_bytes, added_bytes, staging_bytes) {
+            state.discard_payload_for_budget_error();
+            return Err(DispatchFailure {
+                status: 502,
+                code: "server_error",
+                message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes while appending file-search results"
+                    .to_owned(),
+            });
+        }
+        if !continuation_state_replacement_fits(
+            framework_bytes,
+            state,
+            max_state_bytes,
+            removed_output_bytes,
+            added_bytes,
+            staging_bytes,
+        ) {
+            return Err(continuation_state_dispatch_failure());
+        }
+
+        for update in updates {
+            update.commit(&mut state.accumulated_output);
+        }
+        state.citation_files.extend(new_citation_files);
         // Append only the private model-context bridges (function_call +
         // function_call_output pairs) to `messages`. The loop owner already routed
         // this round's reasoning items into `messages`; a hosted file_search_call
@@ -254,6 +389,7 @@ impl FileSearchCalloutFilter {
         &self,
         plan: &SearchPlan,
         request_headers: &HeaderMap,
+        max_decoded_bytes: usize,
         transport: &CalloutTransport<'_>,
     ) -> SearchBatch {
         if let Some(message) = plan.planning_error {
@@ -283,9 +419,21 @@ impl FileSearchCalloutFilter {
         let specs = build_search_specs(plan);
         let mut batch = if specs.is_empty() {
             SearchBatch::new(plan.calls.len())
-        } else {
+        } else if max_decoded_bytes == usize::MAX {
             self.client
                 .search(&specs, plan.calls.len(), request_headers, transport)
+                .await
+        } else {
+            self.client
+                .search_with_retained_limit(
+                    &specs,
+                    SearchOptions {
+                        call_count: plan.calls.len(),
+                        request_headers,
+                        max_decoded_bytes,
+                        transport,
+                    },
+                )
                 .await
         };
         batch.failures.extend(planning_failures);
@@ -347,8 +495,29 @@ impl FileSearchCalloutFilter {
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
+        if !file_search_plan_projection_fits(state, &assignments) {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.discard_payload_for_budget_error();
+                state.dispatch_failure = Some(file_search_budget_failure());
+            }
+            return Ok(FilterAction::Continue);
+        }
         let plan = build_search_plan(state, &assignments);
+        let Some(plan_bytes) = plan.retained_payload_bytes() else {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.discard_payload_for_budget_error();
+                state.dispatch_failure = Some(file_search_budget_failure());
+            }
+            return Ok(FilterAction::Continue);
+        };
         let hdrs = callout_request_headers(ctx);
+        let Some(max_decoded_bytes) = retained_payload_available(state, plan_bytes) else {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.discard_payload_for_budget_error();
+                state.dispatch_failure = Some(file_search_budget_failure());
+            }
+            return Ok(FilterAction::Continue);
+        };
         // Capture the downstream client attributes forwarded into every filtered
         // sub-request, then bind the request-scoped transport to the prebuilt
         // outbound chain. `run` takes `&self`, so one transport drives the whole
@@ -363,7 +532,14 @@ impl FileSearchCalloutFilter {
             outbound: &self.outbound,
             downstream,
         };
-        let batch = self.execute_plan(&plan, &hdrs, &transport).await;
+        let batch = self.execute_plan(&plan, &hdrs, max_decoded_bytes, &transport).await;
+        if batch.retained_payload_overflow() {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.discard_payload_for_budget_error();
+                state.dispatch_failure = Some(file_search_budget_failure());
+            }
+            return Ok(FilterAction::Continue);
+        }
         if let Some(failure) = self.dispatch_failure(&batch) {
             if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
                 state.dispatch_failure = Some(failure);
@@ -374,15 +550,18 @@ impl FileSearchCalloutFilter {
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
-        // Terminalize any assignments the per-continuation server cap dropped
-        // from the plan, then reconcile the executed calls in place.
-        terminalize_unplanned_pending_calls(state, &assignments, &plan);
-        if let Err(failure) = Self::apply_batch(state, &plan, &batch) {
+        let apply_result = Self::apply_batch(
+            state,
+            &assignments,
+            &plan,
+            &batch,
+            framework_bytes,
+            self.max_state_bytes,
+        );
+        drop(batch);
+        if let Err(failure) = apply_result {
             state.dispatch_failure = Some(failure);
             return Ok(FilterAction::Continue);
-        }
-        if !continuation_state_fits(framework_bytes, state, self.max_state_bytes, 0) {
-            state.dispatch_failure = Some(continuation_state_dispatch_failure());
         }
         Ok(FilterAction::Continue)
     }
@@ -489,111 +668,43 @@ fn retained_iteration_bytes(ctx: &HttpFilterContext<'_>) -> usize {
 }
 
 /// Check framework-retained and filter-owned continuation payloads together.
-#[expect(
-    clippy::too_many_lines,
-    reason = "accounts each retained state field without allocation"
-)]
+#[cfg(test)]
 fn continuation_state_fits(
     framework_bytes: usize,
     state: &ResponsesState,
     max_bytes: usize,
     incoming_bytes: usize,
 ) -> bool {
-    let mut used = framework_bytes.saturating_add(incoming_bytes);
-    for value in [
-        &state.request_body,
-        &state.response_object,
-        &state.local_completion_response_template,
-        &state.tool_choice,
-        &state.usage,
-    ] {
-        let Some(size) = bounded_json_size(value, max_bytes.saturating_sub(used)).ok().flatten() else {
-            return false;
-        };
-        used = used.saturating_add(size);
-    }
-    for values in [
-        &state.accumulated_output,
-        &state.input,
-        &state.messages,
-        &state.persisted_messages,
-        &state.previous_tools,
-        &state.tool_calls,
-        &state.tools,
-        &state.web_search_calls,
-    ] {
-        let Some(size) = bounded_json_size(values, max_bytes.saturating_sub(used)).ok().flatten() else {
-            return false;
-        };
-        used = used.saturating_add(size);
-    }
-    for value in [
-        state.context_management.as_ref(),
-        state.conversation.as_ref(),
-        state.original_tool_choice.as_ref(),
-        state.previous_usage.as_ref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let Some(size) = bounded_json_size(value, max_bytes.saturating_sub(used)).ok().flatten() else {
-            return false;
-        };
-        used = used.saturating_add(size);
-    }
-    let string_bytes = state
-        .citation_files
-        .iter()
-        .map(|(key, value)| key.len().saturating_add(value.len()))
-        .chain(state.include.iter().map(String::len))
-        .chain(state.previous_response_id.iter().map(String::len))
-        .chain(state.response_id.iter().map(String::len))
-        .chain(
-            state
-                .mcp_tool_map
-                .iter()
-                .map(|((server, tool), _)| server.len().saturating_add(tool.len())),
-        )
-        // #313 P1: charge the per-round provider-streamed observation set against the same
-        // ceiling as every other request-scoped field, so one round streaming many distinct
-        // native ids cannot bypass max_state_bytes (finalize clears it between rounds).
-        .chain(state.provider_streamed_terminal_ids.iter().map(String::len))
-        // #1131: charge the client-tool lowering reverse map (private name -> original name,
-        // plus the optional restored namespace) against the same ceiling; `ClientToolRestore`
-        // is a 1-byte `Copy` tag with no owned payload, so only the strings need accounting.
-        .chain(state.client_tool_lowering.iter().map(|(name, lowered)| {
-            name.len()
-                .saturating_add(lowered.original_name.len())
-                .saturating_add(lowered.namespace.as_ref().map_or(0, String::len))
-        }))
-        .fold(0_usize, usize::saturating_add);
-    used = used.saturating_add(string_bytes);
-    for value in state.mcp_tool_map.values() {
-        let Some(size) = bounded_json_size(value, max_bytes.saturating_sub(used)).ok().flatten() else {
-            return false;
-        };
-        used = used.saturating_add(size);
-    }
-    // #1131: charge the pre-lowering echo snapshot (the client's original `tools`
-    // array and `tool_choice`, restored onto the echoed response) against the same
-    // ceiling as every other request-scoped field.
-    if let Some(echo) = state.client_tool_echo.as_ref() {
-        let Some(size) = bounded_json_size(&echo.tools, max_bytes.saturating_sub(used))
-            .ok()
-            .flatten()
-        else {
-            return false;
-        };
-        used = used.saturating_add(size);
-        let Some(size) = bounded_json_size(&echo.tool_choice, max_bytes.saturating_sub(used))
-            .ok()
-            .flatten()
-        else {
-            return false;
-        };
-        used = used.saturating_add(size);
-    }
-    used <= max_bytes
+    let framework_and_incoming = framework_bytes.saturating_add(incoming_bytes);
+    let remaining = max_bytes.saturating_sub(framework_and_incoming);
+    framework_and_incoming <= max_bytes
+        && state
+            .retained_payload_bytes_bounded_without_external(remaining)
+            .is_some()
+}
+
+/// Check a prospective payload replacement against file-search's independent
+/// compatibility ceiling without committing it to shared state.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "exact replacement accounting across two independent budgets"
+)]
+fn continuation_state_replacement_fits(
+    framework_bytes: usize,
+    state: &ResponsesState,
+    max_bytes: usize,
+    removed_bytes: usize,
+    added_bytes: usize,
+    incoming_bytes: usize,
+) -> bool {
+    let framework_and_incoming = framework_bytes.saturating_add(incoming_bytes);
+    let remaining = max_bytes.saturating_sub(framework_and_incoming);
+    let Some(current) = state.retained_payload_bytes_bounded_without_external(remaining.saturating_add(removed_bytes))
+    else {
+        return false;
+    };
+    framework_and_incoming <= max_bytes
+        && current.saturating_sub(removed_bytes).saturating_add(added_bytes) <= remaining
 }
 
 /// Build the shared terminal outcome for continuation state exceeding its ceiling.
@@ -633,6 +744,26 @@ struct SearchPlan {
     vector_store_ids: Vec<String>,
 }
 
+impl SearchPlan {
+    /// Payload retained by the owned callout plan while responses are decoded
+    /// and formatted. Fixed-size coordinates and counters carry no charge.
+    fn retained_payload_bytes(&self) -> Option<usize> {
+        let mut used = self
+            .calls
+            .iter()
+            .flat_map(|call| &call.queries)
+            .chain(&self.vector_store_ids)
+            .try_fold(0_usize, |used, value| used.checked_add(value.len()))?;
+        for value in [self.filters.as_ref(), self.ranking_options.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            used = used.checked_add(retained_json_bytes(value)?)?;
+        }
+        Some(used)
+    }
+}
+
 /// One pending output item and its fan-out accounting.
 struct PendingCall {
     /// Number of searches implied before the global cap.
@@ -656,14 +787,17 @@ struct BridgeBudget<'a> {
     /// Citation mappings already retained by earlier calls.
     known_citation_files: &'a HashMap<String, String>,
 
+    /// Citation mappings staged by earlier calls in this batch.
+    staged_citation_files: &'a HashMap<String, String>,
+
     /// Maximum new mappings this call may retain.
     max_new_citation_files: usize,
 
     /// Remaining compact JSON bytes for immediate model messages.
     remaining_model_bytes: usize,
 
-    /// Response item used to derive a deterministic bridge identity.
-    source_item: &'a Value,
+    /// Final public call identity used to derive a deterministic bridge identity.
+    source_id: &'a str,
 
     /// Per-call response output index.
     output_index: usize,
@@ -696,12 +830,244 @@ struct BudgetedSearchResults {
     truncated: bool,
 }
 
+/// One output-item mutation staged until every applicable byte budget admits
+/// the full file-search batch.
+struct OutputUpdate {
+    /// Generated identity, absent when the provider identity remains valid.
+    public_id: Option<String>,
+
+    /// Replacement public results, absent when the field must be removed.
+    public_results: Option<Vec<Value>>,
+
+    /// Absolute canonical output position.
+    output_index: usize,
+
+    /// Compact JSON bytes of the current independently owned item.
+    previous_bytes: usize,
+
+    /// Terminal status committed with this update.
+    status: &'static str,
+
+    /// Compact JSON bytes of the prospective independently owned item.
+    updated_bytes: usize,
+}
+
+impl OutputUpdate {
+    /// Stage one exact-size object mutation without copying the source payload.
+    #[expect(clippy::too_many_lines, reason = "exact JSON object member replacement accounting")]
+    fn new(
+        output_index: usize,
+        object: &serde_json::Map<String, Value>,
+        public_id: Option<String>,
+        status: &'static str,
+        public_results: Option<Vec<Value>>,
+    ) -> Result<Self, DispatchFailure> {
+        let previous_bytes = retained_json_bytes(object).ok_or_else(file_search_state_accounting_failure)?;
+        let previous_commas = object.len().saturating_sub(1);
+        let mut content_bytes = previous_bytes
+            .checked_sub(2_usize.saturating_add(previous_commas))
+            .ok_or_else(file_search_state_accounting_failure)?;
+        let mut field_count = object.len();
+
+        for key in [public_id.as_ref().map(|_| "id"), Some("status"), Some("results")]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(value) = object.get(key) {
+                content_bytes = content_bytes
+                    .checked_sub(json_member_bytes(key, value).ok_or_else(file_search_state_accounting_failure)?)
+                    .ok_or_else(file_search_state_accounting_failure)?;
+                field_count = field_count.saturating_sub(1);
+            }
+        }
+
+        let mut added_content = json_member_bytes("status", status).ok_or_else(file_search_state_accounting_failure)?;
+        let mut added_fields = 1_usize;
+        if let Some(public_id) = &public_id {
+            added_content = added_content
+                .checked_add(json_member_bytes("id", public_id).ok_or_else(file_search_state_accounting_failure)?)
+                .ok_or_else(file_search_state_accounting_failure)?;
+            added_fields = added_fields.saturating_add(1);
+        }
+        if let Some(public_results) = &public_results {
+            added_content = added_content
+                .checked_add(
+                    json_member_bytes("results", public_results).ok_or_else(file_search_state_accounting_failure)?,
+                )
+                .ok_or_else(file_search_state_accounting_failure)?;
+            added_fields = added_fields.saturating_add(1);
+        }
+        field_count = field_count.saturating_add(added_fields);
+        let updated_bytes = content_bytes
+            .checked_add(added_content)
+            .and_then(|bytes| bytes.checked_add(2_usize.saturating_add(field_count.saturating_sub(1))))
+            .ok_or_else(file_search_state_accounting_failure)?;
+
+        Ok(Self {
+            public_id,
+            public_results,
+            output_index,
+            previous_bytes,
+            status,
+            updated_bytes,
+        })
+    }
+
+    /// Commit the already-admitted update to the canonical response item.
+    fn commit(self, output: &mut [Value]) {
+        let Some(object) = output.get_mut(self.output_index).and_then(Value::as_object_mut) else {
+            return;
+        };
+        if let Some(public_id) = self.public_id {
+            object.insert("id".to_owned(), Value::String(public_id));
+        }
+        object.insert("status".to_owned(), Value::String(self.status.to_owned()));
+        if let Some(public_results) = self.public_results {
+            object.insert("results".to_owned(), Value::Array(public_results));
+        } else {
+            object.remove("results");
+        }
+    }
+}
+
+/// Return the compact bytes occupied by one JSON object member, excluding its
+/// separator comma.
+fn json_member_bytes<T: serde::Serialize + ?Sized>(key: &str, value: &T) -> Option<usize> {
+    retained_json_bytes(key)?
+        .checked_add(1)
+        .and_then(|bytes| retained_json_bytes(value).and_then(|value_bytes| bytes.checked_add(value_bytes)))
+}
+
+/// Build a bounded server error for impossible serialization/accounting state.
+fn file_search_state_accounting_failure() -> DispatchFailure {
+    DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "openai_file_search_callout: failed to account continuation state".to_owned(),
+    }
+}
+
+/// Admit the decoded search batch and transient formatting projections before
+/// constructing those projections.
+///
+/// The public projection is conservatively charged at four times the decoded
+/// result bytes: one bound for its serialized representation and one for the
+/// staged/final owners, with room for the canonical result wrapper. Model
+/// bridges have three simultaneous owners while formatting (the rendered
+/// string, the bridge value, and its staged/final state owner), so the model
+/// budget is capped to one third of the remaining aggregate allowance.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preflight accounts each transient owner before formatting"
+)]
+fn reserve_file_search_formatting(
+    state: &ResponsesState,
+    plan: &SearchPlan,
+    batch: &SearchBatch,
+    expose_results: bool,
+) -> Result<usize, DispatchFailure> {
+    let batch_bytes = batch.staging_bytes().ok_or_else(file_search_state_accounting_failure)?;
+    let result_bytes = batch
+        .results_by_call
+        .iter()
+        .try_fold(0_usize, |total, results| {
+            results.iter().try_fold(total, |total, result| {
+                retained_json_bytes(result).and_then(|bytes| total.checked_add(bytes))
+            })
+        })
+        .ok_or_else(file_search_state_accounting_failure)?;
+    let plan_bytes = plan
+        .retained_payload_bytes()
+        .ok_or_else(file_search_state_accounting_failure)?;
+    let public_bytes = expose_results
+        .then_some(result_bytes.checked_mul(4))
+        .flatten()
+        .unwrap_or(0);
+    let non_model_bytes = batch_bytes
+        .checked_add(public_bytes)
+        .and_then(|bytes| bytes.checked_add(plan_bytes))
+        .ok_or_else(file_search_state_accounting_failure)?;
+
+    let model_bytes = match state.retained_payload_limit() {
+        Some(limit) => {
+            let current = state
+                .retained_payload_bytes_bounded(limit)
+                .ok_or_else(file_search_budget_failure)?;
+            let available = limit
+                .checked_sub(current)
+                .and_then(|bytes| bytes.checked_sub(non_model_bytes))
+                .ok_or_else(file_search_budget_failure)?;
+            let model_bytes = MAX_TOTAL_MODEL_CONTEXT_BYTES.min(available / 3);
+            let staging = non_model_bytes
+                .checked_add(
+                    model_bytes
+                        .checked_mul(3)
+                        .ok_or_else(file_search_state_accounting_failure)?,
+                )
+                .ok_or_else(file_search_state_accounting_failure)?;
+            if !state.can_replace_retained_payload(0, 0, staging) {
+                return Err(file_search_budget_failure());
+            }
+            model_bytes
+        },
+        None => MAX_TOTAL_MODEL_CONTEXT_BYTES,
+    };
+    Ok(model_bytes)
+}
+
+/// Build the shared aggregate-budget failure before any large file-search
+/// formatting allocation is made.
+fn file_search_budget_failure() -> DispatchFailure {
+    DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes while formatting file-search results"
+            .to_owned(),
+    }
+}
+
+/// Return payload capacity available for decoded dispatcher results before the
+/// callout begins. An unarmed aggregate budget leaves the independent
+/// file-search limits authoritative.
+fn retained_payload_available(state: &ResponsesState, external_bytes: usize) -> Option<usize> {
+    let Some(limit) = state.retained_payload_limit() else {
+        return Some(usize::MAX);
+    };
+    let used = state.retained_payload_bytes_bounded(limit)?;
+    limit.checked_sub(used)?.checked_sub(external_bytes)
+}
+
+/// Admit the bounded owned execution plan before cloning its query/tool fields
+/// out of request state.
+fn file_search_plan_projection_fits(state: &ResponsesState, assignments: &[FileSearchAssignment]) -> bool {
+    let tool_bytes = state
+        .tools
+        .iter()
+        .find(|tool| tool.get("type").and_then(Value::as_str) == Some("file_search"))
+        .map_or(Some(0), retained_json_bytes);
+    let call_bytes = assignments
+        .iter()
+        .take(MAX_PENDING_CALLS)
+        .try_fold(0_usize, |used, assignment| {
+            state
+                .accumulated_output
+                .get(assignment.output_index)
+                .map_or(Some(used), |item| {
+                    retained_json_bytes(item).and_then(|bytes| used.checked_add(bytes))
+                })
+        });
+    tool_bytes
+        .zip(call_bytes)
+        .and_then(|(tool, calls)| tool.checked_add(calls))
+        .is_some_and(|bytes| state.can_retain_payload(bytes))
+}
+
 impl BridgeBudget<'_> {
     /// Reserve exact structural and metadata bytes, then render chunks once.
     #[expect(clippy::too_many_lines, reason = "one ordered format and exact-budget transaction")]
     fn format(self, results: &[client::SearchResult], include_public_results: bool) -> BudgetedSearchResults {
         let empty_model_messages = model_context_messages(
-            self.source_item,
+            self.source_id,
             self.output_index,
             self.response_identity_hash,
             self.query,
@@ -721,11 +1087,12 @@ impl BridgeBudget<'_> {
                 max_model_context_bytes: max_context_bytes,
                 max_new_citation_files: self.max_new_citation_files,
                 known_citation_files: self.known_citation_files,
+                staged_citation_files: self.staged_citation_files,
                 include_public_results,
             },
         );
         let model_messages = model_context_messages(
-            self.source_item,
+            self.source_id,
             self.output_index,
             self.response_identity_hash,
             self.query,
@@ -1109,65 +1476,16 @@ fn rewrite_function_call_as_file_search(object: &mut serde_json::Map<String, Val
     object.remove("call_id");
 }
 
-/// Mark assigned pending calls the per-continuation server cap dropped as incomplete.
-///
-/// The loop owner recorded one [`FileSearchAssignment`] per pending call; the
-/// dispatcher only planned the first `MAX_PENDING_CALLS` of them.
-/// Any assignment whose absolute [`FileSearchAssignment::output_index`] did not
-/// enter `plan.calls` is terminalized in place inside `accumulated_output`.
-fn terminalize_unplanned_pending_calls(
-    state: &mut ResponsesState,
-    assignments: &[FileSearchAssignment],
-    plan: &SearchPlan,
-) {
-    let response_identity_hash = state
-        .response_object
-        .get("id")
-        .and_then(Value::as_str)
-        .map_or(FNV_OFFSET_BASIS, |response_id| stable_call_hash(&[response_id]));
-    for assignment in assignments {
-        let output_index = assignment.output_index;
-        if plan.calls.iter().any(|call| call.output_index == output_index) {
-            continue;
-        }
-        if let Some(object) = state
-            .accumulated_output
-            .get_mut(output_index)
-            .and_then(Value::as_object_mut)
-        {
-            // A terminalized call still reaches the public output, so it needs a
-            // valid id exactly like the planned calls (`ensure_pending_file_search_call_ids`).
-            ensure_public_file_search_call_id(object, output_index, response_identity_hash);
-            object.insert("status".to_owned(), Value::String("incomplete".to_owned()));
-            object.remove("results");
-        }
-    }
-}
-
-/// Give every planned pending call its final public identity before budgeting.
-fn ensure_pending_file_search_call_ids(state: &mut ResponsesState, plan: &SearchPlan, response_identity_hash: u64) {
-    for call in &plan.calls {
-        let output_index = call.output_index;
-        if let Some(object) = state
-            .accumulated_output
-            .get_mut(output_index)
-            .and_then(Value::as_object_mut)
-        {
-            ensure_public_file_search_call_id(object, output_index, response_identity_hash);
-        }
-    }
-}
-
 /// Build the standard Responses bridge carrying private model context.
 fn model_context_messages(
-    item: &Value,
+    source_id: &str,
     output_index: usize,
     response_identity_hash: u64,
     query: &str,
     output: &str,
 ) -> [Value; 2] {
     let fallback_id = output_index.to_string();
-    let source_id = item.get("id").and_then(Value::as_str).unwrap_or(&fallback_id);
+    let source_id = if source_id.is_empty() { &fallback_id } else { source_id };
     let call_hash = stable_call_hash_with_seed(response_identity_hash, &[source_id, query]);
     let call_id = format!("file_search_{output_index}_{call_hash:016x}");
     let arguments = serde_json::json!({ "query": query }).to_string();
@@ -1206,33 +1524,6 @@ fn stable_call_hash_with_seed(mut hash: u64, parts: &[&str]) -> u64 {
         }
     }
     hash
-}
-
-/// Return whether the reconciled public output remains within its hard body ceiling.
-///
-/// The loop owner serializes [`ResponsesState::accumulated_output`] as the public
-/// `output`, so the dispatcher charges its post-reconciliation size against the
-/// same JSON response ceiling before returning control.
-fn accumulated_output_fits(state: &ResponsesState, max_bytes: usize) -> bool {
-    bounded_json_size(&state.accumulated_output, max_bytes)
-        .ok()
-        .flatten()
-        .is_some()
-}
-
-/// Normalize a malformed provider call ID without changing valid opaque IDs.
-fn ensure_public_file_search_call_id(
-    item: &mut serde_json::Map<String, Value>,
-    output_index: usize,
-    response_identity_hash: u64,
-) {
-    let valid_id = item.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty());
-    if !valid_id {
-        item.insert(
-            "id".to_owned(),
-            Value::String(format!("fs_{response_identity_hash:016x}_{output_index}")),
-        );
-    }
 }
 
 /// Assign stable synthetic IDs to every id-less public output item in

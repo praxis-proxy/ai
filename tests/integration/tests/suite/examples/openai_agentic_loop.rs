@@ -21,8 +21,8 @@ use std::{
 
 use praxis_test_utils::{
     McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, build_pipeline, example_config_path,
-    free_port, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
-    start_proxy,
+    free_port, http_send, json_post, load_example_config, parse_body, parse_status, patch_yaml,
+    start_mcp_mock_server_with_config, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -32,6 +32,16 @@ use praxis_test_utils::{
 #[test]
 fn example_config_builds_pipeline() {
     let config = load_agentic_config(free_port(), 19901);
+    let _pipeline = build_pipeline(&config);
+}
+
+#[test]
+fn retained_overflow_fixture_config_builds_pipeline() {
+    let config = load_example_config(
+        "openai/responses/agentic-loop-overflow-fixture.yaml",
+        free_port(),
+        HashMap::from([("127.0.0.1:3001", 19901)]),
+    );
     let _pipeline = build_pipeline(&config);
 }
 

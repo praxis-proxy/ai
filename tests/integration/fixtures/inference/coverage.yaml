@@ -220,6 +220,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.agentic.retained_overflow
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/agentic-retained-overflow-stream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.agentic.deferred_mcp_connectors
     scopes:
       - responses_agentic_loop

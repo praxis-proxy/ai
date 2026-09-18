@@ -950,7 +950,7 @@ fn build_tool_result_turn(tool_use_id: &str, outcome: &SearchOutcome) -> Value {
                 "type":"tool_result","tool_use_id":tool_use_id,"content":content
             }]})
         },
-        SearchOutcome::Failed => json!({"role":"user","content":[{
+        SearchOutcome::Failed | SearchOutcome::RetainedLimitExceeded => json!({"role":"user","content":[{
             "type":"tool_result","tool_use_id":tool_use_id,"content":SEARCH_UNAVAILABLE,"is_error":true
         }]}),
     }

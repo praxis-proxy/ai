@@ -3497,6 +3497,15 @@ impl ResponseStore for MockStore {
         Ok(Vec::new())
     }
 
+    async fn pending_approval_payload_bytes(
+        &self,
+        _tenant_id: &str,
+        _response_id: &str,
+        _approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        Ok(0)
+    }
+
     async fn get_conversation(
         &self,
         tenant_id: &StateOwner,

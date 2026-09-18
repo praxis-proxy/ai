@@ -32,8 +32,6 @@
 )]
 mod tests;
 
-use std::mem;
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -44,11 +42,13 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::state::{
-    ResponsesState, consumed_builtin_tool_calls_before_current_round, current_round_tool_call_admissions,
+    DispatchFailure, ResponsesState, consumed_builtin_tool_calls_before_current_round,
+    current_round_web_search_admissions, retained_json_bytes, retained_json_values_bytes,
 };
 use crate::web_search::{
     OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, SearchResult,
     build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
+    provider::MAX_SEARCH_RESPONSE_BYTES,
 };
 
 // -----------------------------------------------------------------------------
@@ -80,13 +80,26 @@ const TOOL_LIMIT_OUTPUT: &str = "Web search was not executed because max_tool_ca
 /// Borrowed inputs for one request-side web-search dispatch batch.
 struct PendingSearchBatch<'a> {
     /// Calls retained from the current model round.
-    calls: &'a [Value],
+    calls: &'a [PendingSearchCall],
     /// Ordered response-wide budget decisions, when the client set a limit.
     admissions: Option<&'a [bool]>,
     /// Remaining provider requests allowed by the cumulative budget.
     provider_budget: usize,
     /// Search result size requested for this response.
     context_size: SearchContextSize,
+}
+
+/// Lightweight execution staging for one canonical web-search output item.
+/// Only fields needed across the provider await are copied.
+struct PendingSearchCall {
+    /// Absolute canonical output index replaced by the result.
+    output_index: usize,
+    /// Position among web-search calls in this model round.
+    ordinal: usize,
+    /// Public call id.
+    id: String,
+    /// Search query, absent for malformed calls.
+    query: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -203,28 +216,39 @@ impl WebSearchFilter {
     /// `Failed` outcome, both charged against the call budget — and `false`
     /// when the call was surfaced as incomplete without issuing a request
     /// (a missing query).
+    #[expect(clippy::too_many_lines, reason = "budgeted provider dispatch and outcome handling")]
     async fn execute_single_search(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        call: &Value,
-        index: usize,
+        call: &PendingSearchCall,
         context_size: SearchContextSize,
     ) -> bool {
-        let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
-        let query = call.get("action").and_then(|a| a.get("query")).and_then(Value::as_str);
+        let call_id = call.id.as_str();
+        let query = call.query.as_deref();
 
         let Some(query) = query else {
             warn!(call_id, "web_search_call missing action.query, skipping");
-            let bridge = bridge_call_id(call_id, "", index);
-            let ids = SearchCallIds::new(call_id, &bridge, index);
+            let bridge = bridge_call_id(call_id, "", call.ordinal);
+            let ids = SearchCallIds::new(call_id, &bridge, call.output_index);
             append_incomplete(ctx, &ids);
             return false;
         };
 
-        let bridge = bridge_call_id(call_id, query, index);
-        let ids = SearchCallIds::new(call_id, &bridge, index);
-        match self.search_client.search(query, Some(context_size)).await {
+        let bridge = bridge_call_id(call_id, query, call.ordinal);
+        let ids = SearchCallIds::new(call_id, &bridge, call.output_index);
+        let Some(max_response_bytes) = web_search_response_limit(ctx, query) else {
+            record_web_search_budget_failure(ctx);
+            return false;
+        };
+        match self
+            .search_client
+            .search_with_response_limit(query, Some(context_size), max_response_bytes)
+            .await
+        {
             SearchOutcome::Results(results) => append_result(ctx, &ids, "completed", query, &results),
+            SearchOutcome::RetainedLimitExceeded => {
+                record_web_search_budget_failure(ctx);
+            },
             SearchOutcome::Failed => {
                 warn!(
                     call_id,
@@ -246,24 +270,32 @@ impl WebSearchFilter {
     /// calls (a `Results` or `Failed` outcome) are added to the cumulative
     /// provider counter; a missing-query call consumes its model-call admission
     /// but does not issue a provider request.
+    #[expect(clippy::too_many_lines, reason = "ordered batch dispatch with terminal budget stop")]
     async fn execute_pending_searches(&self, ctx: &mut HttpFilterContext<'_>, batch: PendingSearchBatch<'_>) -> bool {
         let mut dispatched = 0_usize;
         let mut tool_limit_exceeded = false;
         for (index, call) in batch.calls.iter().enumerate() {
+            if ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| state.retained_payload_failed)
+            {
+                break;
+            }
             if batch
                 .admissions
                 .and_then(|values| values.get(index))
                 .is_some_and(|admitted| !admitted)
             {
-                append_tool_limit_exceeded(ctx, call, index);
+                append_tool_limit_exceeded(ctx, call);
                 tool_limit_exceeded = true;
                 continue;
             }
             if dispatched >= batch.provider_budget {
-                append_excess_incomplete(ctx, call, index);
+                append_excess_incomplete(ctx, call);
                 continue;
             }
-            if self.execute_single_search(ctx, call, index, batch.context_size).await {
+            if self.execute_single_search(ctx, call, batch.context_size).await {
                 dispatched = dispatched.saturating_add(1);
             }
         }
@@ -334,7 +366,7 @@ impl HttpFilter for WebSearchFilter {
 
         let admissions = state
             .max_tool_calls
-            .map(|_| current_round_tool_call_admissions(state, &state.web_search_calls));
+            .map(|_| current_round_web_search_admissions(state, &state.web_search_calls));
         let context_size = ctx
             .get_metadata("tool_parse.search_context_size")
             .or_else(|| web_search_context_size_from_state(state))
@@ -344,11 +376,14 @@ impl HttpFilter for WebSearchFilter {
         // still live, then move the web search calls out instead of cloning
         // and then removing them from state.
         let budget = remaining_web_search_budget(state);
-        let calls: Vec<Value> = ctx
+        let Some((calls, calls_bytes)) = ctx
             .extensions
             .get_mut::<ResponsesState>()
-            .map(|state| mem::take(&mut state.web_search_calls))
-            .unwrap_or_default();
+            .and_then(take_pending_search_calls)
+        else {
+            record_web_search_budget_failure(ctx);
+            return Ok(FilterAction::Continue);
+        };
 
         let execute_count = admissions.as_ref().map_or(calls.len(), |values| {
             values.iter().filter(|admitted| **admitted).count()
@@ -374,8 +409,65 @@ impl HttpFilter for WebSearchFilter {
         if tool_limit_exceeded && let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
             state.deferred_tool_limit_completion = true;
         }
+        drop(calls);
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.release_external_payload_bytes(calls_bytes);
+        }
         Ok(FilterAction::Continue)
     }
+}
+
+/// Move the pending dispatcher queue to a filter-local owner without making
+/// its payload disappear from aggregate accounting.
+#[expect(
+    clippy::too_many_lines,
+    reason = "preflights and stages the minimal indexed search execution plan"
+)]
+fn take_pending_search_calls(state: &mut ResponsesState) -> Option<(Vec<PendingSearchCall>, usize)> {
+    let bytes = state.web_search_calls.iter().try_fold(0_usize, |used, assignment| {
+        let item = state.accumulated_output.get(assignment.output_index)?;
+        used.checked_add(
+            item.get("id")
+                .and_then(Value::as_str)
+                .map_or("ws_unknown".len(), str::len),
+        )?
+        .checked_add(
+            item.get("action")
+                .and_then(|action| action.get("query"))
+                .and_then(Value::as_str)
+                .map_or(0, str::len),
+        )
+    })?;
+    if !state.can_retain_payload(bytes) || !state.retain_external_payload_bytes(bytes) {
+        return None;
+    }
+    let calls = state
+        .web_search_calls
+        .iter()
+        .map(|assignment| {
+            let item = state.accumulated_output.get(assignment.output_index)?;
+            Some(PendingSearchCall {
+                output_index: assignment.output_index,
+                ordinal: assignment.ordinal,
+                id: item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("ws_unknown")
+                    .to_owned(),
+                query: item
+                    .get("action")
+                    .and_then(|action| action.get("query"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(calls) = calls else {
+        state.release_external_payload_bytes(bytes);
+        return None;
+    };
+    state.web_search_calls.clear();
+    Some((calls, bytes))
 }
 
 /// Return the response fan-out cap this dispatcher published for the owner.
@@ -407,14 +499,18 @@ struct SearchCallIds<'a> {
     public: &'a str,
     /// Bounded, backend-valid id for the synthetic bridge pair.
     bridge: &'a str,
-    /// Position within the current model round.
-    index: usize,
+    /// Absolute canonical output index replaced by the result.
+    output_index: usize,
 }
 
 impl<'a> SearchCallIds<'a> {
     /// Pair one provider-facing ID with its bounded bridge ID and round position.
-    fn new(public: &'a str, bridge: &'a str, index: usize) -> Self {
-        Self { public, bridge, index }
+    fn new(public: &'a str, bridge: &'a str, output_index: usize) -> Self {
+        Self {
+            public,
+            bridge,
+            output_index,
+        }
     }
 }
 
@@ -447,15 +543,10 @@ fn remaining_web_search_budget(state: &ResponsesState) -> usize {
 /// search was declined, matching the missing-query incomplete shape. No
 /// provider request is issued, so no budget is charged. `index` keeps the
 /// bridge `call_id` unique, mirroring [`WebSearchFilter::execute_single_search`].
-fn append_excess_incomplete(ctx: &mut HttpFilterContext<'_>, call: &Value, index: usize) {
-    let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
-    let query = call
-        .get("action")
-        .and_then(|a| a.get("query"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let bridge = bridge_call_id(call_id, query, index);
-    let ids = SearchCallIds::new(call_id, &bridge, index);
+fn append_excess_incomplete(ctx: &mut HttpFilterContext<'_>, call: &PendingSearchCall) {
+    let query = call.query.as_deref().unwrap_or_default();
+    let bridge = bridge_call_id(&call.id, query, call.ordinal);
+    let ids = SearchCallIds::new(&call.id, &bridge, call.output_index);
     append_result(ctx, &ids, "incomplete", query, &[]);
 }
 
@@ -476,9 +567,17 @@ fn append_result(
     results: &[SearchResult],
 ) {
     let include_sources = include_action_sources(ctx);
+    let Some(source_bytes) = web_search_results_bytes(results) else {
+        record_web_search_budget_failure(ctx);
+        return;
+    };
+    if !web_search_construction_fits(ctx, ids, status, query, results, include_sources, source_bytes) {
+        record_web_search_budget_failure(ctx);
+        return;
+    }
     let output_item = build_output_item(ids.public, status, query, results, include_sources);
     let bridge = build_tool_result_messages(ids.bridge, status, query, results);
-    push_search_turn(ctx, output_item, bridge, ids.index);
+    push_search_turn(ctx, output_item, bridge, ids.output_index, source_bytes);
 }
 
 /// Append a malformed search turn to [`ResponsesState`].
@@ -489,9 +588,13 @@ fn append_result(
 /// as a successful search with zero results.
 fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
     let include_sources = include_action_sources(ctx);
+    if !web_search_construction_fits(ctx, ids, "incomplete", "", &[], include_sources, 0) {
+        record_web_search_budget_failure(ctx);
+        return;
+    }
     let output_item = build_output_item(ids.public, "incomplete", "", &[], include_sources);
     let bridge = build_incomplete_tool_result_messages(ids.bridge);
-    push_search_turn(ctx, output_item, bridge, ids.index);
+    push_search_turn(ctx, output_item, bridge, ids.output_index, 0);
 }
 
 /// Append a failed search turn to [`ResponsesState`].
@@ -503,24 +606,29 @@ fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
 /// so the agentic loop continues without exposing provider details to the client.
 fn append_failed(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>, query: &str) {
     let include_sources = include_action_sources(ctx);
+    if !web_search_construction_fits(ctx, ids, "failed", query, &[], include_sources, 0) {
+        record_web_search_budget_failure(ctx);
+        return;
+    }
     let output_item = build_output_item(ids.public, "failed", query, &[], include_sources);
     let bridge = build_failed_tool_result_messages(ids.bridge, query);
-    push_search_turn(ctx, output_item, bridge, ids.index);
+    push_search_turn(ctx, output_item, bridge, ids.output_index, 0);
 }
 
 /// Append a bounded failure for a call rejected by `max_tool_calls`.
-fn append_tool_limit_exceeded(ctx: &mut HttpFilterContext<'_>, call: &Value, index: usize) {
-    let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
-    let query = call
-        .get("action")
-        .and_then(|action| action.get("query"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let bridge_id = bridge_call_id(call_id, query, index);
+fn append_tool_limit_exceeded(ctx: &mut HttpFilterContext<'_>, call: &PendingSearchCall) {
+    let call_id = call.id.as_str();
+    let query = call.query.as_deref().unwrap_or_default();
+    let bridge_id = bridge_call_id(call_id, query, call.ordinal);
     let include_sources = include_action_sources(ctx);
+    let ids = SearchCallIds::new(call_id, &bridge_id, call.output_index);
+    if !web_search_construction_fits(ctx, &ids, "failed", query, &[], include_sources, 0) {
+        record_web_search_budget_failure(ctx);
+        return;
+    }
     let output_item = build_output_item(call_id, "failed", query, &[], include_sources);
     let bridge = build_failed_tool_result_messages_with_output(&bridge_id, query, TOOL_LIMIT_OUTPUT);
-    push_search_turn(ctx, output_item, bridge, index);
+    push_search_turn(ctx, output_item, bridge, call.output_index, 0);
 }
 
 /// Whether `action.sources` should be included in output items, per the
@@ -539,8 +647,44 @@ fn include_action_sources(ctx: &HttpFilterContext<'_>) -> bool {
 /// distinct owners of the bridge messages. The public `output_item` is upserted
 /// so the placeholder accumulated during the response phase is replaced in
 /// place, never duplicated.
-fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge: [Value; 2], index: usize) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "transactional output, history, and provenance commit"
+)]
+fn push_search_turn(
+    ctx: &mut HttpFilterContext<'_>,
+    output_item: Value,
+    bridge: [Value; 2],
+    index: usize,
+    source_bytes: usize,
+) {
     if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        if state.retained_payload_failed {
+            return;
+        }
+        let replaced = state.accumulated_output.get(index);
+        let removed = replaced.and_then(retained_json_bytes).unwrap_or(0);
+        let bridge_bytes = retained_json_values_bytes(&bridge).unwrap_or(usize::MAX);
+        let output_bytes = retained_json_bytes(&output_item);
+        let added = output_bytes
+            .and_then(|output_bytes| output_bytes.checked_add(bridge_bytes.checked_mul(2)?))
+            .and_then(|bytes| bytes.checked_add(output_item.get("id").and_then(Value::as_str).map_or(0, str::len)));
+        let staging = output_bytes
+            .and_then(|output_bytes| output_bytes.checked_add(bridge_bytes))
+            .and_then(|bytes| bytes.checked_add(source_bytes));
+        if !added
+            .zip(staging)
+            .is_some_and(|(added, staging)| state.can_replace_retained_payload(removed, added, staging))
+        {
+            state.discard_payload_for_budget_error();
+            state.dispatch_failure = Some(DispatchFailure {
+                status: 502,
+                code: "server_error",
+                message: "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes while appending web-search results"
+                    .to_owned(),
+            });
+            return;
+        }
         state.messages.extend(bridge.iter().cloned());
         state.persisted_messages.extend(bridge);
         // Record execution provenance keyed on the item id `stream_events` reads:
@@ -550,10 +694,94 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
         if let Some(id) = output_item.get("id").and_then(Value::as_str) {
             state.locally_executed_output_items.insert(id.to_owned());
         }
-        let round_start = state
-            .current_round_output_start
-            .unwrap_or(state.accumulated_output.len());
-        upsert_output_item(&mut state.accumulated_output, round_start, index, output_item);
+        upsert_output_item(&mut state.accumulated_output, index, output_item);
+    }
+}
+
+/// Bound provider parsing, decoded results, and result construction before a
+/// paid search is dispatched. Thirty-two response-body owners conservatively
+/// cover the raw body, parsed provider JSON, decoded strings, worst-case JSON
+/// escaping, public item, formatted bridge, and the two final history owners.
+fn web_search_response_limit(ctx: &HttpFilterContext<'_>, query: &str) -> Option<usize> {
+    let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+        return Some(MAX_SEARCH_RESPONSE_BYTES);
+    };
+    let Some(limit) = state.retained_payload_limit() else {
+        return Some(MAX_SEARCH_RESPONSE_BYTES);
+    };
+    let current = state.retained_payload_bytes_bounded(limit)?;
+    let request_staging = query.len().checked_mul(8)?.checked_add(4_096)?;
+    let available = limit.checked_sub(current)?.checked_sub(request_staging)?;
+    let response_limit = available / 32;
+    (response_limit > 0).then_some(response_limit.min(MAX_SEARCH_RESPONSE_BYTES))
+}
+
+/// Raw decoded payload retained by a provider result vector.
+fn web_search_results_bytes(results: &[SearchResult]) -> Option<usize> {
+    results.iter().try_fold(0_usize, |used, result| {
+        used.checked_add(result.title.len())?
+            .checked_add(result.url.len())?
+            .checked_add(result.snippet.len())
+    })
+}
+
+/// Admit every result-sized construction owner before formatting or cloning
+/// provider strings into JSON values.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "wire identity, result projection, and source ownership are independent inputs"
+)]
+fn web_search_construction_fits(
+    ctx: &HttpFilterContext<'_>,
+    ids: &SearchCallIds<'_>,
+    status: &str,
+    query: &str,
+    results: &[SearchResult],
+    include_sources: bool,
+    source_bytes: usize,
+) -> bool {
+    let formatting_overhead = results.len().saturating_mul(64);
+    let source_projection = if include_sources {
+        results.iter().try_fold(0_usize, |used, result| {
+            used.checked_add(result.url.len().checked_mul(6)?)?.checked_add(128)
+        })
+    } else {
+        Some(0)
+    };
+    let output_bound = source_projection.and_then(|sources| {
+        sources
+            .checked_add(query.len().checked_mul(6)?)?
+            .checked_add(ids.public.len().checked_mul(6)?)?
+            .checked_add(status.len().checked_mul(6)?)?
+            .checked_add(512)
+    });
+    let bridge_bound = source_bytes
+        .checked_add(formatting_overhead)
+        .and_then(|bytes| bytes.checked_add(query.len()))
+        .and_then(|bytes| bytes.checked_add(ids.bridge.len().saturating_mul(2)))
+        .and_then(|bytes| bytes.checked_mul(6))
+        .and_then(|bytes| bytes.checked_add(2_048));
+    output_bound
+        .zip(bridge_bound)
+        .and_then(|(output, bridge)| source_bytes.checked_add(output)?.checked_add(bridge.checked_mul(3)?))
+        .is_some_and(|additional| {
+            ctx.extensions
+                .get::<ResponsesState>()
+                .is_none_or(|state| state.can_retain_payload(additional))
+        })
+}
+
+/// Stop dispatch and hand one aggregate failure to the loop owner.
+fn record_web_search_budget_failure(ctx: &mut HttpFilterContext<'_>) {
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.discard_payload_for_budget_error();
+        state.dispatch_failure = Some(DispatchFailure {
+            status: 502,
+            code: "server_error",
+            message:
+                "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes while executing web search"
+                    .to_owned(),
+        });
     }
 }
 
@@ -563,13 +791,8 @@ fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge:
 /// accumulated each model placeholder in output order. Updating the indexed
 /// placeholder keeps duplicate and absent provider IDs distinct. When no
 /// current-round placeholder exists (isolated unit contexts), append instead.
-fn upsert_output_item(accumulated: &mut Vec<Value>, round_start: usize, index: usize, output_item: Value) {
-    if let Some(slot) = accumulated.get_mut(round_start..).and_then(|items| {
-        items
-            .iter_mut()
-            .filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
-            .nth(index)
-    }) {
+fn upsert_output_item(accumulated: &mut Vec<Value>, index: usize, output_item: Value) {
+    if let Some(slot) = accumulated.get_mut(index) {
         *slot = output_item;
         return;
     }

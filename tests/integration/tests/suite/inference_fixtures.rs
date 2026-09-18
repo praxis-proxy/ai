@@ -38,6 +38,8 @@ const AGENTIC_PARALLEL_TOOL_CALLS_SCENARIO: &str = "responses/agentic-parallel-t
 const AGENTIC_PARALLEL_TOOL_CALLS_PROVIDER: &str = "synthetic";
 const AGENTIC_STATUS_LESS_FUNCTION_CALL_SCENARIO: &str = "responses/agentic-status-less-function-call";
 const AGENTIC_STATUS_LESS_FUNCTION_CALL_PROVIDER: &str = "synthetic";
+const AGENTIC_RETAINED_OVERFLOW_SCENARIO: &str = "responses/agentic-retained-overflow-stream";
+const AGENTIC_RETAINED_OVERFLOW_PROVIDER: &str = "synthetic";
 
 #[tokio::test]
 async fn all_inference_fixtures_replay() {
@@ -60,6 +62,7 @@ async fn all_inference_fixtures_replay() {
     let mut saw_malformed_compaction = false;
     let mut saw_agentic_parallel_tool_calls = false;
     let mut saw_agentic_status_less_function_call = false;
+    let mut saw_agentic_retained_overflow = false;
 
     for recording in recordings {
         let scenario_id = recording.scenario_id.as_str();
@@ -121,6 +124,10 @@ async fn all_inference_fixtures_replay() {
             assert_agentic_status_less_function_call(&report.actual, scenario_id, provider);
             saw_agentic_status_less_function_call = true;
         }
+        if scenario_id == AGENTIC_RETAINED_OVERFLOW_SCENARIO && provider == AGENTIC_RETAINED_OVERFLOW_PROVIDER {
+            assert_agentic_retained_overflow(&report.actual, scenario_id, provider);
+            saw_agentic_retained_overflow = true;
+        }
         if NATIVE_RESPONSES_PROVIDERS.contains(&provider) && NATIVE_RESPONSES_SCENARIOS.contains(&scenario_id) {
             native_responses_recordings.insert((scenario_id.to_owned(), provider.to_owned()));
             assert_native_responses_passthrough(&report.actual, scenario_id, provider);
@@ -167,6 +174,10 @@ async fn all_inference_fixtures_replay() {
     assert!(
         saw_agentic_status_less_function_call,
         "missing representative recording for scenario `{AGENTIC_STATUS_LESS_FUNCTION_CALL_SCENARIO}` and provider `{AGENTIC_STATUS_LESS_FUNCTION_CALL_PROVIDER}`"
+    );
+    assert!(
+        saw_agentic_retained_overflow,
+        "missing representative recording for scenario `{AGENTIC_RETAINED_OVERFLOW_SCENARIO}` and provider `{AGENTIC_RETAINED_OVERFLOW_PROVIDER}`"
     );
     for scenario_id in NATIVE_ANTHROPIC_SCENARIOS {
         assert!(
@@ -482,5 +493,67 @@ fn assert_agentic_status_less_function_call(actual: &WireFixture, scenario_id: &
     assert!(
         function_call.get("status").is_none(),
         "function_call item must be status-less for scenario `{scenario_id}` and provider `{provider}`"
+    );
+}
+
+fn assert_agentic_retained_overflow(actual: &WireFixture, scenario_id: &str, provider: &str) {
+    assert_eq!(
+        actual.turns.len(),
+        2,
+        "retained overflow scenario must include the retrieval-miss check for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    let turn = actual.turns.first().unwrap_or_else(|| {
+        panic!("scenario `{scenario_id}` and provider `{provider}` replayed without a turn");
+    });
+    assert_eq!(
+        turn.client.response.status, 200,
+        "committed retained overflow must preserve HTTP 200 for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    let RecordedBody::Json { value } = &turn.client.request.body else {
+        panic!("retained overflow request must be JSON for scenario `{scenario_id}` and provider `{provider}`");
+    };
+    assert_eq!(
+        value["store"], true,
+        "retained overflow must request persistence for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    let RecordedBody::Sse { frames, done } = &turn.client.response.body else {
+        panic!("scenario `{scenario_id}` and provider `{provider}` must replay a client SSE body");
+    };
+    assert!(!done, "retained overflow must suppress `[DONE]`");
+    assert_eq!(
+        frames
+            .iter()
+            .filter_map(|frame| frame.event.as_deref())
+            .collect::<Vec<_>>(),
+        ["response.created", "error"],
+        "retained overflow must emit one terminal error and no completion"
+    );
+    let error = frames
+        .last()
+        .and_then(|frame| serde_json::from_str::<serde_json::Value>(&frame.data).ok());
+    assert_eq!(
+        error,
+        Some(json!({
+            "type": "error",
+            "sequence_number": 1,
+            "code": "server_error",
+            "message": "agentic retained payload exceeded openai_agentic_loop.max_retained_bytes",
+            "param": null,
+        })),
+        "retained overflow terminal changed for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    let retrieval = &actual.turns[1];
+    assert_eq!(
+        retrieval.client.response.status, 404,
+        "retained overflow response must not be retrievable for scenario `{scenario_id}` and provider `{provider}`"
+    );
+    let RecordedBody::Json { value } = &retrieval.client.response.body else {
+        panic!(
+            "retained overflow retrieval miss must return a JSON body for scenario `{scenario_id}` and provider `{provider}`"
+        );
+    };
+    assert_eq!(
+        value["error"]["type"], "invalid_request_error",
+        "retained overflow retrieval miss must use the Responses API error envelope for scenario `{scenario_id}` and provider `{provider}`"
     );
 }

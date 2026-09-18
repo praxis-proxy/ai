@@ -4,6 +4,7 @@
 //! Unit tests for the `openai_mcp_tool_resolve` filter.
 
 use super::*;
+use crate::openai::responses::state::OutputAssignment;
 
 // =========================================================================
 // Config Parsing
@@ -3454,7 +3455,8 @@ async fn discover_deferred_connectors_loads_filtered_tools_without_leaking_endpo
             Some(serde_json::json!(["get_weather"])),
             Some("Bearer secret".to_owned()),
         )],
-        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
+        accumulated_output: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
+        tool_search_calls: vec![OutputAssignment { output_index: 0 }],
         ..ResponsesState::default()
     };
 
@@ -3715,7 +3717,8 @@ fn has_pending_deferred_discovery_requires_tool_search_and_connectors() {
     assert!(!has_pending_deferred_discovery(&state));
     state.deferred_mcp = vec![deferred_connector("https://a.example.com/mcp", None, None)];
     assert!(!has_pending_deferred_discovery(&state));
-    state.tool_search_calls = vec![serde_json::json!({"type": "tool_search_call"})];
+    state.accumulated_output = vec![serde_json::json!({"type": "tool_search_call"})];
+    state.tool_search_calls = vec![OutputAssignment { output_index: 0 }];
     assert!(has_pending_deferred_discovery(&state));
 }
 
@@ -3724,7 +3727,9 @@ fn has_pending_deferred_discovery_respects_exhausted_max_tool_calls() {
     let search = serde_json::json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
     let mut state = ResponsesState {
         deferred_mcp: vec![deferred_connector("https://a.example.com/mcp", None, None)],
-        tool_search_calls: vec![search.clone()],
+        current_round_output_start: Some(0),
+        accumulated_output: vec![search.clone()],
+        tool_search_calls: vec![OutputAssignment { output_index: 0 }],
         max_tool_calls: Some(0),
         ..ResponsesState::default()
     };
@@ -3742,6 +3747,7 @@ fn has_pending_deferred_discovery_respects_exhausted_max_tool_calls() {
     let web = serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "completed"});
     state.accumulated_output = vec![web.clone(), search.clone()];
     state.response_object = serde_json::json!({"output": [web, search]});
+    state.tool_search_calls[0].output_index = 1;
     assert!(
         !has_pending_deferred_discovery(&state),
         "an earlier current-round built-in call consumes the shared cap first"
@@ -3756,7 +3762,8 @@ async fn discover_deferred_connectors_skips_tools_list_when_budget_exhausted() {
 
     let mut state = ResponsesState {
         deferred_mcp: vec![deferred_connector(&server_url, None, None)],
-        tool_search_calls: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
+        accumulated_output: vec![serde_json::json!({"type": "tool_search_call", "id": "tsc_1"})],
+        tool_search_calls: vec![OutputAssignment { output_index: 0 }],
         max_tool_calls: Some(0),
         ..ResponsesState::default()
     };

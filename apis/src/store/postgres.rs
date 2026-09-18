@@ -754,6 +754,40 @@ impl ResponseStore for PostgresResponseStore {
         rows.iter().map(row_to_pending_approval_record).collect()
     }
 
+    async fn pending_approval_payload_bytes(
+        &self,
+        tenant_id: &str,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        if approval_ids.is_empty() {
+            return Ok(0);
+        }
+        let table = pending_approvals_table(&self.tables.responses);
+        let placeholders = (0..approval_ids.len())
+            .map(|i| format!("${}", i + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT COALESCE(SUM(octet_length(approval_id) + octet_length(server_label) + \
+             octet_length(tool_name) + octet_length(arguments) + octet_length(target_fingerprint)), 0) \
+             FROM {table} WHERE tenant_id = $1 AND response_id = $2 \
+             AND approval_id IN ({placeholders})"
+        );
+        let mut query = sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql.as_str()))
+            .bind(tenant_id)
+            .bind(response_id);
+        for approval_id in approval_ids {
+            query = query.bind(*approval_id);
+        }
+        let bytes = query
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        usize::try_from(bytes)
+            .map_err(|error| StoreError::Database(format!("pending approval payload size overflow: {error}")))
+    }
+
     async fn consume_approvals(
         &self,
         owner: &StateOwner,

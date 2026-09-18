@@ -257,6 +257,11 @@ filter_chains:
                   - authorization
               - filter: openai_agentic_loop
                 max_infer_iters: 10
+                # Aggregate payload retained across response state, history,
+                # dispatch queues, SSE parser scratch, and output staging.
+                # Valid range: 4096..=268435456; the smallest value wins when
+                # multiple loop instances touch one request.
+                max_retained_bytes: 67108864
               # Selects typed streaming automatically when the effective
               # outbound body carries `"stream": true`; otherwise buffers.
               - filter: openai_responses_proxy

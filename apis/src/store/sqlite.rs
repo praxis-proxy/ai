@@ -709,6 +709,39 @@ impl ResponseStore for SqliteResponseStore {
         rows.iter().map(row_to_pending_approval_record).collect()
     }
 
+    async fn pending_approval_payload_bytes(
+        &self,
+        tenant_id: &str,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        if approval_ids.is_empty() {
+            return Ok(0);
+        }
+        let table = pending_approvals_table(&self.tables.responses);
+        let placeholders = std::iter::repeat_n("?", approval_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT COALESCE(SUM(length(CAST(approval_id AS BLOB)) + length(CAST(server_label AS BLOB)) + \
+             length(CAST(tool_name AS BLOB)) + length(CAST(arguments AS BLOB)) + \
+             length(CAST(target_fingerprint AS BLOB))), 0) FROM {table} \
+             WHERE tenant_id = ? AND response_id = ? AND approval_id IN ({placeholders})"
+        );
+        let mut query = sqlx::query_scalar::<_, i64>(AssertSqlSafe(sql.as_str()))
+            .bind(tenant_id)
+            .bind(response_id);
+        for approval_id in approval_ids {
+            query = query.bind(*approval_id);
+        }
+        let bytes = query
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))?;
+        usize::try_from(bytes)
+            .map_err(|error| StoreError::Database(format!("pending approval payload size overflow: {error}")))
+    }
+
     async fn consume_approvals(
         &self,
         owner: &StateOwner,

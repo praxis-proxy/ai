@@ -28,7 +28,7 @@ use crate::{
 
 /// Response body cap for search callouts (1 MiB). Distinct from
 /// `max_body_bytes` which governs inbound request buffering.
-const MAX_SEARCH_RESPONSE_BYTES: usize = 1_048_576;
+pub(crate) const MAX_SEARCH_RESPONSE_BYTES: usize = 1_048_576;
 
 // -----------------------------------------------------------------------------
 // SearchResult
@@ -54,6 +54,9 @@ pub(crate) struct SearchResult {
 pub(crate) enum SearchOutcome {
     /// Search succeeded. An empty vector is a successful zero-result search.
     Results(Vec<SearchResult>),
+    /// The agentic request's aggregate retained-payload allowance, rather than
+    /// the provider's ordinary response cap, stopped the response body.
+    RetainedLimitExceeded,
     /// Search failed — timeout, transport error, non-2xx status, oversized
     /// response, or unparseable body. Callers continue with a truthful failed
     /// tool result rather than exposing provider details to the client.
@@ -125,6 +128,17 @@ impl SearchClient {
 
     /// Execute a web search query.
     pub(crate) async fn search(&self, query: &str, context_size: Option<SearchContextSize>) -> SearchOutcome {
+        self.search_with_response_limit(query, context_size, MAX_SEARCH_RESPONSE_BYTES)
+            .await
+    }
+
+    /// Execute a web search with a caller-selected response-body ceiling.
+    pub(crate) async fn search_with_response_limit(
+        &self,
+        query: &str,
+        context_size: Option<SearchContextSize>,
+        max_response_bytes: usize,
+    ) -> SearchOutcome {
         let size = context_size.unwrap_or(self.default_context_size);
         let count = size.result_count();
         debug!(
@@ -138,22 +152,23 @@ impl SearchClient {
             SearchProvider::Tavily => self.build_tavily_request(query, size),
             SearchProvider::You => self.build_you_request(query, count),
         };
-        self.execute_search(&url, request).await
+        self.execute_search(&url, request, max_response_bytes).await
     }
 
     /// Execute a search request and map the result to a
     /// [`SearchOutcome`].
-    async fn execute_search(&self, url: &str, request: SubRequest) -> SearchOutcome {
+    async fn execute_search(&self, url: &str, request: SubRequest, max_response_bytes: usize) -> SearchOutcome {
+        let max_response_bytes = max_response_bytes.min(MAX_SEARCH_RESPONSE_BYTES);
         let result = subrequest::execute_url(
             &self.client,
             url,
             request,
-            MAX_SEARCH_RESPONSE_BYTES,
+            max_response_bytes,
             self.timeout,
             self.address_policy,
         )
         .await;
-        self.map_search_result(result)
+        self.map_search_result(result, max_response_bytes < MAX_SEARCH_RESPONSE_BYTES)
     }
 
     /// Map a sub-request result to a [`SearchOutcome`].
@@ -161,7 +176,11 @@ impl SearchClient {
     /// Non-2xx statuses and transport errors (including timeouts and
     /// oversized responses) map to [`SearchOutcome::Failed`]. Detailed
     /// diagnostics are logged; provider specifics never reach the client.
-    fn map_search_result(&self, result: Result<SubResponse, SubRequestError>) -> SearchOutcome {
+    fn map_search_result(
+        &self,
+        result: Result<SubResponse, SubRequestError>,
+        aggregate_constrained: bool,
+    ) -> SearchOutcome {
         match result {
             Ok(response) if (200..300).contains(&(response.status as usize)) => self.parse_response(&response.body),
             Ok(response) => {
@@ -171,6 +190,13 @@ impl SearchClient {
                     "search callout returned non-2xx"
                 );
                 SearchOutcome::Failed
+            },
+            Err(SubRequestError::ResponseTooLarge { .. }) if aggregate_constrained => {
+                warn!(
+                    provider = self.provider.as_str(),
+                    "search response exceeded retained-payload allowance"
+                );
+                SearchOutcome::RetainedLimitExceeded
             },
             Err(e) => {
                 warn!(provider = self.provider.as_str(), error = %e, "search callout failed");
@@ -740,7 +766,7 @@ mod tests {
             body: Bytes::new(),
         };
 
-        let outcome = client.execute_search(&url, request).await;
+        let outcome = client.execute_search(&url, request, MAX_SEARCH_RESPONSE_BYTES).await;
         assert!(
             matches!(&outcome, SearchOutcome::Results(r) if r.len() == 1),
             "2xx with valid JSON should return results: {outcome:?}"
@@ -762,7 +788,7 @@ mod tests {
             body: Bytes::new(),
         };
 
-        let outcome = client.execute_search(&url, request).await;
+        let outcome = client.execute_search(&url, request, MAX_SEARCH_RESPONSE_BYTES).await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
             "a non-2xx status should map to Failed: {outcome:?}"
@@ -787,7 +813,7 @@ mod tests {
             body: Bytes::new(),
         };
 
-        let outcome = client.execute_search(&url, request).await;
+        let outcome = client.execute_search(&url, request, MAX_SEARCH_RESPONSE_BYTES).await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
             "a transport failure should map to Failed: {outcome:?}"
@@ -813,7 +839,7 @@ mod tests {
             body: Bytes::new(),
         };
 
-        let outcome = client.execute_search(&url, request).await;
+        let outcome = client.execute_search(&url, request, MAX_SEARCH_RESPONSE_BYTES).await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
             "a timeout should map to Failed: {outcome:?}"
@@ -846,10 +872,24 @@ mod tests {
             body: Bytes::new(),
         };
 
-        let outcome = client.execute_search(&url, request).await;
+        let outcome = client.execute_search(&url, request, MAX_SEARCH_RESPONSE_BYTES).await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
             "an oversized response should map to Failed: {outcome:?}"
         );
+    }
+
+    #[test]
+    fn aggregate_constrained_response_limit_is_distinct() {
+        let client = test_search_client();
+        let outcome = client.map_search_result(
+            Err(SubRequestError::ResponseTooLarge {
+                actual: 4_097,
+                limit: 4_096,
+            }),
+            true,
+        );
+
+        assert!(matches!(outcome, SearchOutcome::RetainedLimitExceeded));
     }
 }

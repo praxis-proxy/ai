@@ -5,6 +5,7 @@
 
 use std::{collections::HashMap, fmt};
 
+use serde::Serialize;
 use serde_json::Value;
 
 use super::model_context::{MAX_FILE_ID_BYTES, MAX_FILENAME_BYTES, is_valid_file_id};
@@ -240,6 +241,117 @@ pub(crate) fn annotate_output_items(
         return Ok(false);
     }
     annotate_output_items_with_budget(output, citation_files, &mut CitationBudget::default())
+}
+
+/// Return an allocation-free upper bound for payload temporarily owned while
+/// citation rewriting builds cleaned text and generated annotations.
+///
+/// The finalizer uses this before moving output into the canonical response, so
+/// marker-heavy text cannot allocate past the aggregate retained-payload limit.
+#[expect(clippy::too_many_lines, reason = "allocation-free mirror of the citation scanner")]
+pub(crate) fn annotation_staging_bytes(
+    output: &[Value],
+    citation_files: &HashMap<String, String>,
+) -> Result<usize, CitationRewriteError> {
+    if citation_files.is_empty() {
+        return Ok(0);
+    }
+    let mut markers_remaining = MAX_CITATION_MARKERS;
+    let mut annotations_remaining = MAX_CITATION_ANNOTATIONS;
+    let mut staging = 0_usize;
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("message")
+            || item.get("role").and_then(Value::as_str) != Some("assistant")
+        {
+            continue;
+        }
+        let Some(content) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in content {
+            let Some(text) = part
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| text.contains("<|file-"))
+            else {
+                continue;
+            };
+            // `extract_citations_bounded` allocates a cleaned string with this
+            // capacity before the original text owner is replaced.
+            staging = staging.checked_add(text.len()).ok_or(CitationRewriteError {
+                budget: "payload byte",
+                limit: usize::MAX,
+            })?;
+            let mut remaining = text;
+            let mut modifies_text = false;
+            while let Some(marker_start) = remaining.find("<|file-") {
+                markers_remaining = markers_remaining.checked_sub(1).ok_or(CitationRewriteError {
+                    budget: "marker",
+                    limit: MAX_CITATION_MARKERS,
+                })?;
+                let candidate = remaining.get(marker_start..).unwrap_or_default();
+                let Some((file_id, after_marker)) = split_marker(candidate) else {
+                    remaining = candidate.get("<|file-".len()..).unwrap_or_default();
+                    continue;
+                };
+                if !is_valid_file_id(file_id) {
+                    remaining = candidate.get("<|file-".len()..).unwrap_or_default();
+                    continue;
+                }
+                modifies_text = true;
+                if let Some(filename) = citation_files.get(file_id)
+                    && filename.len() <= MAX_FILENAME_BYTES
+                {
+                    annotations_remaining = annotations_remaining.checked_sub(1).ok_or(CitationRewriteError {
+                        budget: "annotation",
+                        limit: MAX_CITATION_ANNOTATIONS,
+                    })?;
+                    staging = staging
+                        .checked_add(
+                            crate::openai::responses::state::retained_json_bytes(&CitationProjection {
+                                item_type: "file_citation",
+                                file_id,
+                                filename,
+                                index: usize::MAX,
+                            })
+                            .ok_or(CitationRewriteError {
+                                budget: "payload byte",
+                                limit: usize::MAX,
+                            })?,
+                        )
+                        .ok_or(CitationRewriteError {
+                            budget: "payload byte",
+                            limit: usize::MAX,
+                        })?;
+                }
+                remaining = after_marker;
+            }
+            if modifies_text {
+                let existing = part.get("annotations").and_then(Value::as_array).map_or(0, Vec::len);
+                annotations_remaining = annotations_remaining
+                    .checked_sub(existing)
+                    .ok_or(CitationRewriteError {
+                        budget: "annotation",
+                        limit: MAX_CITATION_ANNOTATIONS,
+                    })?;
+            }
+        }
+    }
+    Ok(staging)
+}
+
+/// Borrowed generated annotation used only for compact-size projection.
+#[derive(Serialize)]
+struct CitationProjection<'a> {
+    #[serde(rename = "type")]
+    /// Annotation discriminator.
+    item_type: &'static str,
+    /// Referenced file identifier.
+    file_id: &'a str,
+    /// Client-visible filename.
+    filename: &'a str,
+    /// Conservative upper-bound index.
+    index: usize,
 }
 
 /// Replace markers while sharing one response-wide allocation budget.

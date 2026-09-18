@@ -177,6 +177,24 @@ pub trait ResponseStore: Send + Sync {
         approval_ids: &[&str],
     ) -> Result<Vec<PendingApprovalRecord>, StoreError>;
 
+    /// Return the raw payload bytes of matching pending approvals without
+    /// materializing their string columns.
+    ///
+    /// Callers use this before [`Self::get_pending_approvals`] so a request-wide
+    /// retained-payload budget can reject a large stored invocation before the
+    /// database driver allocates it.
+    async fn pending_approval_payload_bytes(
+        &self,
+        _tenant_id: &str,
+        _response_id: &str,
+        _approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        // Unknown backends fail aggregate admission closed without fetching
+        // payload columns. Implementations can opt in safely with a size-only
+        // query, as the built-in SQLite and PostgreSQL stores do.
+        Ok(usize::MAX)
+    }
+
     /// Atomically claim single-use consumption of a batch of pending approvals
     /// issued by `response_id`.
     ///

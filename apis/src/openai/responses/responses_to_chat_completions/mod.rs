@@ -325,6 +325,20 @@ impl ResponsesToChatCompletionsFilter {
     }
 }
 
+/// Complete request preparation deferred until every loop budget is admitted.
+async fn finish_deferred_request_preparation(ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    if super::mcp_dispatch::initial_dispatch_is_deferred(ctx) {
+        let action = super::mcp_dispatch::dispatch_after_budget_admission(ctx).await?;
+        if !matches!(action, FilterAction::Continue) {
+            return Ok(action);
+        }
+    }
+    if super::agentic_loop::request_finish_is_deferred(ctx) {
+        return super::agentic_loop::finish_request_after_deferred_dispatch(ctx);
+    }
+    Ok(FilterAction::Continue)
+}
+
 #[async_trait]
 impl HttpFilter for ResponsesToChatCompletionsFilter {
     fn name(&self) -> &'static str {
@@ -435,6 +449,11 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     ) -> Result<FilterAction, FilterError> {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
+        }
+
+        let action = finish_deferred_request_preparation(ctx).await?;
+        if !matches!(action, FilterAction::Continue) {
+            return Ok(action);
         }
 
         if let Some(action) = request_disposition(ctx) {

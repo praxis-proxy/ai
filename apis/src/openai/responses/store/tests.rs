@@ -949,6 +949,81 @@ async fn on_response_body_releases_when_skip_persist_is_true() {
     );
 }
 
+#[test]
+fn retained_request_payload_counts_store_input_snapshot() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let input = json!([{"role": "user", "content": "retained by store"}]);
+    ctx.set_metadata(
+        "responses.store_request_payload_bytes",
+        crate::openai::responses::state::retained_json_bytes(&input)
+            .unwrap()
+            .to_string(),
+    );
+
+    assert_eq!(
+        super::filter::retained_request_payload_bytes(&ctx),
+        crate::openai::responses::state::retained_json_bytes(&input)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_input_does_not_exhaust_agentic_payload_budget() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::default());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from_static(b"{}"));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        super::filter::retained_request_payload_bytes(&ctx),
+        Some(0),
+        "an owner-only store snapshot retains no request input payload"
+    );
+
+    let loop_filter = super::super::agentic_loop::AgenticLoopFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let action = loop_filter.on_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an absent input must reach normal request validation instead of producing a payload-budget 413"
+    );
+}
+
+#[test]
+fn persistence_construction_is_rejected_before_payload_clones() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let input = json!([{"role": "user", "content": "request input"}]);
+    let input_bytes = crate::openai::responses::state::retained_json_bytes(&input).unwrap();
+    ctx.set_metadata("responses.store_request_payload_bytes", input_bytes.to_string());
+    let mut state = ResponsesState {
+        response_object: json!({
+            "id": "resp_budget",
+            "created_at": 1,
+            "model": "test",
+            "output": [{"type": "message", "content": "x".repeat(1_024)}],
+        }),
+        persisted_messages: vec![json!({"role": "assistant", "content": "x".repeat(1_024)})],
+        ..ResponsesState::default()
+    };
+    state.set_retained_external_payload_bytes(input_bytes);
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current);
+    let response_bytes = crate::openai::responses::state::retained_json_bytes(&state.response_object).unwrap();
+    ctx.extensions.insert(state);
+
+    assert!(!super::filter::persistence_construction_fits(&ctx, response_bytes));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        !state.retained_payload_failed,
+        "preflight must not mutate canonical state"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_releases_streaming_request_before_eos() {
     let filter = make_filter();

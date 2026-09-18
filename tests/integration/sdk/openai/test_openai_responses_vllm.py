@@ -2872,6 +2872,31 @@ class TestClientToolCompatVLLM:
 class TestAgenticLoopVLLM:
     """Agentic-loop integration tests against the selected backend."""
 
+    def test_explicit_retained_budget_buffered_happy_path(self, agentic_client):
+        """The example's explicit 64 MiB aggregate budget admits an ordinary response."""
+        response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input="Reply with exactly BUDGET-OK. /no_think",
+            store=False,
+            max_output_tokens=64,
+        )
+
+        assert response.status in ("completed", "incomplete")
+        assert response.output
+
+    def test_explicit_retained_budget_streaming_happy_path(self, agentic_client):
+        """The same explicit budget preserves the normal logical SSE lifecycle."""
+        stream = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input="Reply with exactly STREAM-BUDGET-OK. /no_think",
+            store=False,
+            stream=True,
+            max_output_tokens=64,
+        )
+
+        terminal = _assert_stream_contract(_collect_stream(stream))
+        assert terminal.status in ("completed", "incomplete")
+
     def test_mcp_approval_round_trip_executes_once(
         self, agentic_client, agentic_proxy,
     ):

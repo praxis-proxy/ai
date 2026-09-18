@@ -84,6 +84,7 @@ before sending requests.
 | [prompts-routing.yaml](configs/openai/prompts/prompts-routing.yaml) | Routes OpenAI Prompts API requests to a dedicated Prompts API backend |
 | [agentic-loop-deferred-mcp-fixture.yaml](configs/openai/responses/agentic-loop-deferred-mcp-fixture.yaml) | Minimal agentic-loop pipeline that sanitizes deferred MCP connectors on the first inference round. `defer_loading: true` skips `tools/list`, so replay never opens an independent MCP callout |
 | [agentic-loop-fixture.yaml](configs/openai/responses/agentic-loop-fixture.yaml) | Minimal agentic loop pipeline for inference fixture replay |
+| [agentic-loop-overflow-fixture.yaml](configs/openai/responses/agentic-loop-overflow-fixture.yaml) | Controlled inference fixture configuration with the minimum aggregate state budget |
 | [agentic-loop.yaml](configs/openai/responses/agentic-loop.yaml) | Demonstrates the openai_agentic_loop filter with iterative_request_router for step-based model-tool-model looping in the Responses API |
 | [body-size-limits.yaml](configs/openai/responses/body-size-limits.yaml) | Demonstrates how raw request body size is enforced across a chain of OpenAI Responses filters that each buffer the request body |
 | [client-tool-compat.yaml](configs/openai/responses/client-tool-compat.yaml) | Lets a rich Codex-style Responses client talk to a function-only Responses backend (for example vLLM at POST /v1/responses) without routing through /v1/chat/completions and without executing client-owned tools in Praxis |

@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 use super::super::state::ResponsesState;
 use crate::{
     openai::responses::state::{
-        DeferredMcpConnector, DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind,
+        DeferredMcpConnector, DispatchFailure, FileSearchAssignment, McpApprovalState, OutputAssignment, SynthesisKind,
+        ToolCallAssignment, WebSearchAssignment,
     },
     test_utils::{make_filter_context, make_request},
 };
@@ -293,6 +294,94 @@ async fn on_request_allows_buffered_mode_without_logical_stream() {
     );
 }
 
+#[tokio::test]
+async fn on_request_rejects_oversized_initial_state_with_413() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "x".repeat(2_000)
+    }));
+    state.store_persist_armed = true;
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("oversized starting state must be rejected before inference");
+    };
+    assert_eq!(rejection.status, 413);
+    assert_action(&ctx, "done");
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(state.retained_payload_failed);
+    assert!(!state.store_persist_armed);
+    assert!(state.input.is_empty());
+    assert!(state.messages.is_empty());
+    assert!(state.persisted_messages.is_empty());
+    assert!(state.response_object.is_null());
+}
+
+#[tokio::test]
+async fn on_request_charges_response_store_input_snapshot() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 4096").unwrap();
+    let filter = super::AgenticLoopFilter::from_config(&yaml).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("responses.store_request_payload_bytes", "4096");
+    ctx.extensions.insert(ResponsesState::default());
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("the independently retained store input must be admitted before inference");
+    };
+    assert_eq!(rejection.status, 413);
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.retained_external_payload_bytes, 0);
+    assert_eq!(
+        super::super::store::retained_request_payload_bytes(&ctx),
+        Some(0),
+        "the rejected store snapshot must be released"
+    );
+}
+
+#[tokio::test]
+async fn smallest_loop_retained_limit_wins_for_one_request() {
+    let lower: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 8192").unwrap();
+    let higher: serde_yaml::Value = serde_yaml::from_str("max_retained_bytes: 16384").unwrap();
+    let lower = super::AgenticLoopFilter::from_config(&lower).unwrap();
+    let higher = super::AgenticLoopFilter::from_config(&higher).unwrap();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::default());
+
+    assert!(matches!(
+        lower.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(matches!(
+        higher.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert_eq!(
+        ctx.extensions.get::<ResponsesState>().unwrap().retained_payload_limit(),
+        Some(8192)
+    );
+}
+
+#[test]
+fn only_one_loop_instance_claims_each_router_response() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    assert!(super::claim_response_round(&mut ctx, Some(0)));
+    assert!(!super::claim_response_round(&mut ctx, Some(0)));
+    assert!(super::claim_response_round(&mut ctx, Some(1)));
+    assert!(!super::claim_response_round(&mut ctx, Some(1)));
+}
+
 // -----------------------------------------------------------------------------
 // on_request_body Bookkeeping
 // -----------------------------------------------------------------------------
@@ -542,18 +631,6 @@ fn incomplete_stream_does_not_dispatch_accumulated_tool_call() {
         "input": "test",
         "stream": true
     }));
-    state.tool_calls.push(json!({
-        "type": "function_call",
-        "call_id": "call_partial",
-        "name": "must_not_run",
-        "arguments": "{}",
-        "status": "completed"
-    }));
-    state.tool_search_calls.push(json!({
-        "type": "tool_search_call",
-        "id": "tsc_partial",
-        "status": "completed"
-    }));
     state.response_object = json!({
         "id": "resp_incomplete",
         "object": "response",
@@ -611,13 +688,6 @@ fn failed_stream_does_not_dispatch_accumulated_tool_call() {
         "model": "gpt-4o",
         "input": "test",
         "stream": true
-    }));
-    state.tool_calls.push(json!({
-        "type": "function_call",
-        "call_id": "call_failed",
-        "name": "must_not_run",
-        "arguments": "{}",
-        "status": "completed"
     }));
     state.response_object = json!({
         "id": "resp_failed",
@@ -717,10 +787,13 @@ fn multiple_streamed_client_function_calls_end_done() {
         "input": "test",
         "stream": true
     }));
-    state.tool_calls = vec![
-        json!({"type": "function_call", "call_id": "call_1", "name": "first", "status": "completed"}),
-        json!({"type": "function_call", "call_id": "call_2", "name": "second", "status": "completed"}),
-    ];
+    assign_tool_calls(
+        &mut state,
+        vec![
+            json!({"type": "function_call", "call_id": "call_1", "name": "first", "status": "completed"}),
+            json!({"type": "function_call", "call_id": "call_2", "name": "second", "status": "completed"}),
+        ],
+    );
     state.response_object = json!({"id": "resp_multiple", "object": "response", "status": "completed", "output": []});
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
@@ -752,10 +825,13 @@ fn mixed_streamed_function_call_ownership_fails_before_dispatch() {
         "input": "test",
         "stream": true
     }));
-    state.tool_calls = vec![
-        json!({"type": "function_call", "call_id": "call_1", "name": "server__lookup", "status": "completed"}),
-        json!({"type": "function_call", "call_id": "call_2", "name": "client", "status": "completed"}),
-    ];
+    assign_tool_calls(
+        &mut state,
+        vec![
+            json!({"type": "function_call", "call_id": "call_1", "name": "server__lookup", "status": "completed"}),
+            json!({"type": "function_call", "call_id": "call_2", "name": "client", "status": "completed"}),
+        ],
+    );
     state.mcp_tool_map.insert(
         ("server".to_owned(), "lookup".to_owned()),
         json!({"server_label":"server", "server_url":"http://example.com", "require_approval":"never"}),
@@ -797,17 +873,23 @@ fn streaming_iteration_limit_ends_with_sse_error() {
         ("server".to_owned(), "lookup".to_owned()),
         json!({"server_label": "server", "server_url": "http://example.com", "require_approval": "never"}),
     );
-    state.tool_calls = vec![json!({
-        "type": "function_call",
-        "call_id": "call_limit",
-        "name": "server__lookup",
-        "status": "completed"
-    })];
-    state.tool_search_calls = vec![json!({
-        "type": "tool_search_call",
-        "id": "tsc_limit",
-        "status": "completed"
-    })];
+    assign_tool_calls(
+        &mut state,
+        vec![json!({
+            "type": "function_call",
+            "call_id": "call_limit",
+            "name": "server__lookup",
+            "status": "completed"
+        })],
+    );
+    assign_tool_search_calls(
+        &mut state,
+        vec![json!({
+            "type": "tool_search_call",
+            "id": "tsc_limit",
+            "status": "completed"
+        })],
+    );
     state.response_object = json!({"id": "resp_limit", "object": "response", "status": "completed", "output": []});
     ctx.set_metadata("responses.stream_completion", "terminal");
     ctx.extensions.insert(state);
@@ -1022,7 +1104,10 @@ fn any_dispatchable_call_type_sets_loop() {
     let mcp = make_state_with_mcp_tool_calls(vec![mcp_tool_call("call_1")]);
 
     let mut web = make_state_with_tool_calls(vec![]);
-    web.web_search_calls = vec![json!({"type": "web_search_call", "id": "ws_1", "status": "completed"})];
+    assign_web_search_calls(
+        &mut web,
+        vec![json!({"type": "web_search_call", "id": "ws_1", "status": "completed"})],
+    );
 
     // A pending hosted file_search_call is recorded by the parse owner as a
     // `FileSearchAssignment` (issue #1046), so drive it through the response
@@ -1086,7 +1171,8 @@ fn default_config_has_max_infer_iters_ten() {
 
     let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
     assert_eq!(state.iteration, 10, "iteration should have incremented to 10");
-    state.tool_calls = vec![mcp_tool_call("call_2")];
+    state.tool_calls.clear();
+    assign_tool_calls(&mut state, vec![mcp_tool_call("call_2")]);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1116,7 +1202,8 @@ fn max_infer_iters_one_allows_exactly_one_loop() {
     let mut state = ctx.extensions.remove::<ResponsesState>().unwrap();
     assert_eq!(state.iteration, 1, "should have incremented to 1");
 
-    state.tool_calls = vec![mcp_tool_call("call_2")];
+    state.tool_calls.clear();
+    assign_tool_calls(&mut state, vec![mcp_tool_call("call_2")]);
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1194,7 +1281,156 @@ fn multiple_client_function_calls_are_preserved() {
     // Both calls are client-owned (no MCP tool map), so the loop ends and
     // returns them to the client rather than looping (issue #1046 §3.4).
     assert_action(&ctx, "done");
-    assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.len(), 2);
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.tool_calls.is_empty(),
+        "terminal finalization clears dispatch assignments"
+    );
+    assert_eq!(state.output_items().len(), 2);
+}
+
+#[test]
+fn cumulative_buffered_round_overflow_is_transactional() {
+    let mut state = ResponsesState::default();
+    let response = |id: &str, fill: char| {
+        Bytes::from(
+            serde_json::to_vec(&json!({
+                "id": id,
+                "object": "response",
+                "status": "completed",
+                "output": [{
+                    "id": format!("rs_{id}"),
+                    "type": "reasoning",
+                    "summary": fill.to_string().repeat(600)
+                }]
+            }))
+            .unwrap(),
+        )
+    };
+
+    super::extract_tool_calls_from_body(&response("one", 'a'), &mut state).unwrap();
+    assert_eq!(state.accumulated_output.len(), 1);
+    let retained_after_first = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained_after_first + 1_000);
+
+    let failure = super::extract_tool_calls_from_body(&response("two", 'b'), &mut state).unwrap_err();
+    assert_eq!(failure.status, 502);
+    assert_eq!(state.accumulated_output.len(), 1, "second round committed nothing");
+    assert_eq!(state.response_object["id"], "one");
+    assert_eq!(state.retained_payload_bytes().unwrap(), retained_after_first);
+}
+
+#[test]
+fn buffered_collection_allocates_less_than_legacy_dispatch_copies() {
+    let make_call = || {
+        json!({
+            "type": "function_call",
+            "id": "fc_large",
+            "call_id": "call_large",
+            "name": "server__lookup",
+            "arguments": "x".repeat(65_536),
+            "status": "completed"
+        })
+    };
+    let legacy_call = make_call();
+    let moved_call = make_call();
+
+    let legacy = allocation_counter::measure(|| {
+        let mut accumulated = Vec::new();
+        let mut dispatch = Vec::new();
+        let mut backend = Vec::new();
+        let mut persisted = Vec::new();
+        accumulated.push(legacy_call.clone());
+        dispatch.push(legacy_call.clone());
+        backend.push(legacy_call.clone());
+        persisted.push(legacy_call.clone());
+        std::hint::black_box((accumulated, dispatch, backend, persisted));
+    });
+    let moved = allocation_counter::measure(|| {
+        let mut state = ResponsesState::default();
+        super::collect_output_items(vec![moved_call], &mut state, &[]);
+        std::hint::black_box(state);
+    });
+
+    assert!(
+        moved.bytes_total + 65_536 < legacy.bytes_total,
+        "absolute assignments must remove a payload-sized dispatch copy: legacy={} moved={}",
+        legacy.bytes_total,
+        moved.bytes_total
+    );
+}
+
+#[test]
+fn buffered_parse_peak_accepts_exact_budget_without_charging_framework_body() {
+    let response = json!({
+        "id": "resp_exact",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "id": "msg_exact",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "retained"}]
+        }]
+    });
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let baseline = ResponsesState::default().retained_payload_bytes().unwrap();
+    let response_bytes = super::super::state::retained_json_bytes(&response).unwrap();
+    let item_bytes = super::super::state::retained_json_bytes(&response["output"][0]).unwrap();
+    let exact_peak = baseline + response_bytes + item_bytes;
+
+    let mut state = ResponsesState::default();
+    state.apply_retained_payload_limit(exact_peak);
+    super::extract_tool_calls_from_body(&body, &mut state).unwrap();
+
+    assert!(state.retained_payload_bytes().unwrap() <= exact_peak);
+}
+
+#[test]
+fn buffered_parse_projection_is_rejected_before_state_mutation() {
+    let body = Bytes::from(
+        serde_json::to_vec(&json!({
+            "object": "response",
+            "output": [{"type": "message", "content": "x".repeat(8_192)}]
+        }))
+        .unwrap(),
+    );
+    let mut state = ResponsesState::default();
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained + body.len() - 1);
+
+    let failure = super::extract_tool_calls_from_body(&body, &mut state).unwrap_err();
+
+    assert_eq!(failure.status, 502);
+    assert!(state.response_object.is_null());
+    assert!(state.accumulated_output.is_empty());
+}
+
+#[test]
+fn file_search_argument_normalization_is_reserved_before_allocation() {
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "name": "file_search",
+            "call_id": "call_large",
+            "arguments": serde_json::json!({"query": "x".repeat(4096)}).to_string()
+        }]
+    });
+    let body = Bytes::from(serde_json::to_vec(&response).unwrap());
+    let mut state = ResponsesState {
+        tools: vec![json!({"type": "file_search"})],
+        ..ResponsesState::default()
+    };
+    let retained = state.retained_payload_bytes().unwrap();
+    // The parsed response fits, but its arguments parser/query copy does not.
+    state.apply_retained_payload_limit(retained + body.len());
+
+    let failure = super::extract_tool_calls_from_body(&body, &mut state).unwrap_err();
+
+    assert_eq!(failure.status, 502);
+    assert!(state.response_object.is_null());
+    assert!(state.accumulated_output.is_empty());
 }
 
 #[test]
@@ -1281,7 +1517,7 @@ fn all_client_executed_call_types_conflict_with_mcp_dispatch() {
         // the streamed round out of `response_object` before the check runs), so
         // the client-owned call must sit in `accumulated_output` from index
         // the explicit `current_round_output_start` onward.
-        state.accumulated_output = vec![client_call.clone()];
+        state.accumulated_output.push(client_call.clone());
         state.current_round_output_start = Some(0);
 
         assert!(
@@ -1320,9 +1556,12 @@ fn hosted_tool_search_conflicts_with_client_function_call() {
     let mut state = make_state_with_tool_calls(vec![json!({
         "type":"function_call", "call_id":"c1", "name":"get_weather", "status":"completed"
     })]);
-    state.tool_search_calls = vec![json!({
-        "type":"tool_search_call", "id":"tsc_1", "status":"completed"
-    })];
+    assign_tool_search_calls(
+        &mut state,
+        vec![json!({
+            "type":"tool_search_call", "id":"tsc_1", "status":"completed"
+        })],
+    );
 
     assert!(
         super::has_mixed_function_call_ownership(&state),
@@ -1333,9 +1572,12 @@ fn hosted_tool_search_conflicts_with_client_function_call() {
 #[test]
 fn hosted_tool_search_alone_is_not_mixed_ownership() {
     let mut state = make_state_with_tool_calls(vec![]);
-    state.tool_search_calls = vec![json!({
-        "type":"tool_search_call", "id":"tsc_1", "status":"completed"
-    })];
+    assign_tool_search_calls(
+        &mut state,
+        vec![json!({
+            "type":"tool_search_call", "id":"tsc_1", "status":"completed"
+        })],
+    );
 
     assert!(
         !super::has_mixed_function_call_ownership(&state),
@@ -1417,7 +1659,11 @@ fn reasoning_items_preserved_in_messages() {
     );
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.tool_calls.len(), 1, "only function_call goes to tool_calls");
+    assert!(
+        state.tool_calls.is_empty(),
+        "terminal finalization clears dispatch assignments"
+    );
+    assert_eq!(state.output_items().len(), 2);
 
     let msg_types: Vec<&str> = state
         .messages
@@ -1601,8 +1847,11 @@ fn extracts_tool_calls_from_non_streaming_body() {
     assert_action(&ctx, "done");
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.tool_calls.len(), 1);
-    assert_eq!(state.tool_calls[0]["call_id"], "call_1");
+    assert!(
+        state.tool_calls.is_empty(),
+        "terminal finalization clears dispatch assignments"
+    );
+    assert_eq!(state.output_items()[0]["call_id"], "call_1");
 }
 
 #[test]
@@ -1882,7 +2131,7 @@ fn web_search_call_extracted_to_web_search_calls_not_tool_calls() {
         1,
         "web_search_call must appear in web_search_calls"
     );
-    assert_eq!(state.web_search_calls[0]["id"], "ws_1");
+    assert_eq!(web_search_item(state, 0)["id"], "ws_1");
 }
 
 #[test]
@@ -1892,11 +2141,14 @@ fn web_search_call_triggers_loop() {
     let mut ctx = make_filter_context(&req);
 
     let mut state = make_state_with_tool_calls(vec![]);
-    state.web_search_calls = vec![json!({
-        "type": "web_search_call",
-        "id": "ws_1",
-        "action": {"type": "search", "query": "test"}
-    })];
+    assign_web_search_calls(
+        &mut state,
+        vec![json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "action": {"type": "search", "query": "test"}
+        })],
+    );
     ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
@@ -1911,11 +2163,14 @@ fn web_search_call_alone_increments_iteration() {
     let mut ctx = make_filter_context(&req);
 
     let mut state = make_state_with_tool_calls(vec![]);
-    state.web_search_calls = vec![json!({
-        "type": "web_search_call",
-        "id": "ws_1",
-        "action": {"type": "search", "query": "test"}
-    })];
+    assign_web_search_calls(
+        &mut state,
+        vec![json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "action": {"type": "search", "query": "test"}
+        })],
+    );
     ctx.extensions.insert(state);
 
     drop(filter.on_response_body(&mut ctx, &mut None, true).unwrap());
@@ -2032,11 +2287,14 @@ fn web_search_call_subject_to_iteration_limit() {
     let mut ctx = make_filter_context(&req);
 
     let mut state = make_state_with_tool_calls(vec![]);
-    state.web_search_calls = vec![json!({
-        "type": "web_search_call",
-        "id": "ws_1",
-        "action": {"type": "search", "query": "test"}
-    })];
+    assign_web_search_calls(
+        &mut state,
+        vec![json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "action": {"type": "search", "query": "test"}
+        })],
+    );
     state.iteration = 2;
     ctx.extensions.insert(state);
 
@@ -2054,11 +2312,14 @@ async fn web_search_calls_cleared_on_prepare() {
     let mut ctx = make_filter_context(&req);
 
     let mut state = make_state_with_tool_calls(vec![]);
-    state.web_search_calls = vec![json!({
-        "type": "web_search_call",
-        "id": "ws_stale",
-        "action": {"type": "search", "query": "old query"}
-    })];
+    assign_web_search_calls(
+        &mut state,
+        vec![json!({
+            "type": "web_search_call",
+            "id": "ws_stale",
+            "action": {"type": "search", "query": "old query"}
+        })],
+    );
     ctx.extensions.insert(state);
 
     drop(filter.on_request_body(&mut ctx, &mut None, true).await.unwrap());
@@ -2108,10 +2369,12 @@ fn web_search_call_excluded_from_messages_but_persisted() {
     );
 
     assert!(
-        state
-            .web_search_calls
-            .iter()
-            .any(|item| item.get("id").and_then(Value::as_str) == Some("ws_1")),
+        state.web_search_calls.iter().any(|assignment| {
+            state.accumulated_output[assignment.output_index]
+                .get("id")
+                .and_then(Value::as_str)
+                == Some("ws_1")
+        }),
         "web_search_call should be queued in web_search_calls for dispatch"
     );
 
@@ -2541,10 +2804,14 @@ fn status_less_function_call_is_collected() {
     let results = ctx.filter_results.get("openai_agentic_loop").unwrap();
     let action = results.get("action").unwrap();
 
+    assert!(
+        state.tool_calls.is_empty(),
+        "terminal finalization clears dispatch assignments"
+    );
     assert_eq!(
-        state.tool_calls.len(),
+        state.output_items().len(),
         1,
-        "Status-less function call should be extracted to tool_calls"
+        "status-less function call stays client-visible"
     );
     assert_eq!(
         action, "done",
@@ -2584,10 +2851,14 @@ fn status_null_function_call_is_collected() {
     let results = ctx.filter_results.get("openai_agentic_loop").unwrap();
     let action = results.get("action").unwrap();
 
+    assert!(
+        state.tool_calls.is_empty(),
+        "terminal finalization clears dispatch assignments"
+    );
     assert_eq!(
-        state.tool_calls.len(),
+        state.output_items().len(),
         1,
-        "Function call with null status should be extracted to tool_calls"
+        "null-status function call stays client-visible"
     );
     assert_eq!(
         action, "done",
@@ -2711,7 +2982,7 @@ fn model_output_ordering_survives_all_three_dispatchers() {
 
     // Each dispatcher's target is recorded against its absolute index.
     assert_eq!(state.web_search_calls.len(), 1, "web_search dispatcher target recorded");
-    assert_eq!(state.web_search_calls[0]["id"], "ws_1");
+    assert_eq!(web_search_item(state, 0)["id"], "ws_1");
     assert_eq!(
         state.file_search_assignments.len(),
         1,
@@ -2727,7 +2998,75 @@ fn model_output_ordering_survives_all_three_dispatchers() {
         "a normalized private call records the private synthesis origin"
     );
     assert_eq!(state.tool_calls.len(), 1, "MCP dispatcher target recorded");
-    assert_eq!(state.tool_calls[0]["name"], "server__lookup");
+    assert_eq!(tool_call_item(state, 0)["name"], "server__lookup");
+}
+
+#[test]
+fn streamed_output_uses_the_same_canonical_order_and_history_contracts() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o", "input": "test", "stream": true
+    }));
+    state.mcp_tool_map.insert(
+        ("server".to_owned(), "lookup".to_owned()),
+        json!({"server_label":"server", "server_url":"http://example.com", "require_approval":"never"}),
+    );
+    state.tools = vec![json!({"type":"file_search", "vector_store_ids":["vs_1"]})];
+    state.usage = json!({"input_tokens":11, "output_tokens":7, "total_tokens":18});
+    state.response_object = json!({
+        "id":"resp_stream_ordering", "object":"response", "status":"completed",
+        "output":[
+            {"type":"reasoning", "id":"rs_1", "summary":[]},
+            {"type":"web_search_call", "id":"ws_1", "status":"completed",
+             "action":{"type":"search", "query":"ownership"}},
+            {"type":"function_call", "id":"fc_fs", "call_id":"call_fs",
+             "name":"file_search", "arguments":"{\"query\":\"ownership\"}", "status":"completed"},
+            {"type":"function_call", "id":"fc_mcp", "call_id":"call_mcp",
+             "name":"server__lookup", "arguments":"{}", "status":"completed"}
+        ]
+    });
+    ctx.set_metadata("responses.stream_completion", "terminal");
+    ctx.extensions.insert(state);
+
+    let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_action(&ctx, "loop");
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let output_ids = state
+        .accumulated_output
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(output_ids, ["rs_1", "ws_1", "fc_fs", "fc_mcp"]);
+    assert!(
+        state.output_items().is_empty(),
+        "the streamed round moved out of the response tree"
+    );
+    assert_eq!(state.accumulated_output[2]["type"], "file_search_call");
+    assert_eq!(state.accumulated_output[2]["queries"], json!(["ownership"]));
+
+    let backend_ids = state
+        .messages
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(backend_ids, ["rs_1", "fc_mcp"]);
+    let persisted_ids = state
+        .persisted_messages
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(persisted_ids, output_ids);
+    assert_eq!(state.web_search_calls[0].output_index, 1);
+    assert_eq!(state.file_search_assignments[0].output_index, 2);
+    assert_eq!(tool_call_item(state, 0)["id"], "fc_mcp");
+    assert_eq!(
+        state.usage,
+        json!({"input_tokens":11, "output_tokens":7, "total_tokens":18})
+    );
 }
 
 #[test]
@@ -2748,7 +3087,7 @@ fn streamed_provider_conversation_marks_persisted_history() {
         ..ResponsesState::default()
     };
 
-    super::collect_streaming_output_items(&mut state);
+    super::collect_streaming_output_items(&mut state).expect("streamed provider conversation should be retained");
 
     assert_eq!(
         state.provider_history_len,
@@ -2845,8 +3184,11 @@ async fn dispatch_failure_buffered_rejects_with_json_envelope() {
 
     let mut state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "test"}));
     // Stale per-round bookkeeping the conversion must drop.
-    state.tool_calls = vec![json!({"type": "function_call", "name": "server__lookup", "status": "completed"})];
-    state.web_search_calls = vec![json!({"type": "web_search_call", "id": "ws_1"})];
+    assign_tool_calls(
+        &mut state,
+        vec![json!({"type": "function_call", "name": "server__lookup", "status": "completed"})],
+    );
+    assign_web_search_calls(&mut state, vec![json!({"type": "web_search_call", "id": "ws_1"})]);
     state.file_search_assignments = vec![FileSearchAssignment {
         output_index: 0,
         synthesis: SynthesisKind::Native,
@@ -2930,6 +3272,40 @@ async fn dispatch_failure_streaming_emits_sse_error_frame() {
     );
 }
 
+#[tokio::test]
+async fn dispatcher_failure_does_not_become_retained_budget_failure() {
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4o",
+        "input": "test",
+        "stream": true
+    }));
+    state.accumulated_output.push(json!({
+        "type": "file_search_call",
+        "id": "fs_executed",
+        "status": "completed",
+        "results": []
+    }));
+    state.pending_local_tool_synthesis = vec![(0, SynthesisKind::Private)];
+
+    let failure = DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "MCP call validation failed".to_owned(),
+    };
+    let action = super::finish_response_failure(&mut ctx, state, &failure, false).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(!state.retained_payload_failed);
+    assert_eq!(
+        state.pending_local_tool_synthesis,
+        vec![(0, SynthesisKind::Private)],
+        "unrelated dispatcher failures must preserve already-executed tool synthesis"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
@@ -2941,8 +3317,50 @@ fn make_filter() -> Box<dyn HttpFilter> {
 fn make_state_with_tool_calls(tool_calls: Vec<Value>) -> ResponsesState {
     let body = json!({"model": "gpt-4o", "input": "test"});
     let mut state = ResponsesState::from_request_body(body);
-    state.tool_calls = tool_calls;
+    assign_tool_calls(&mut state, tool_calls);
     state
+}
+
+fn assign_tool_calls(state: &mut ResponsesState, calls: Vec<Value>) {
+    for call in calls {
+        let output_index = state.accumulated_output.len();
+        state.accumulated_output.push(call);
+        state.current_round_output_start.get_or_insert(output_index);
+        state
+            .tool_calls
+            .push(ToolCallAssignment::Output(OutputAssignment { output_index }));
+    }
+}
+
+fn assign_tool_search_calls(state: &mut ResponsesState, calls: Vec<Value>) {
+    for call in calls {
+        let output_index = state.accumulated_output.len();
+        state.accumulated_output.push(call);
+        state.current_round_output_start.get_or_insert(output_index);
+        state.tool_search_calls.push(OutputAssignment { output_index });
+    }
+}
+
+fn assign_web_search_calls(state: &mut ResponsesState, calls: Vec<Value>) {
+    for (ordinal, call) in calls.into_iter().enumerate() {
+        let output_index = state.accumulated_output.len();
+        state.accumulated_output.push(call);
+        state.current_round_output_start.get_or_insert(output_index);
+        state
+            .web_search_calls
+            .push(WebSearchAssignment { output_index, ordinal });
+    }
+}
+
+fn tool_call_item(state: &ResponsesState, index: usize) -> &Value {
+    let ToolCallAssignment::Output(assignment) = &state.tool_calls[index] else {
+        panic!("expected a provider-output assignment");
+    };
+    &state.accumulated_output[assignment.output_index]
+}
+
+fn web_search_item(state: &ResponsesState, index: usize) -> &Value {
+    &state.accumulated_output[state.web_search_calls[index].output_index]
 }
 
 fn pending_deferred_connector() -> DeferredMcpConnector {

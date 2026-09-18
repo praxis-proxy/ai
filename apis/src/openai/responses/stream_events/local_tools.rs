@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 
 use praxis_filter::HttpFilterContext;
+use serde::{Serialize, ser::SerializeMap as _};
 use serde_json::Value;
 
-use super::{encode_sse_event, normalize_logical_payload};
+use super::{encode_sse_event, normalize_logical_payload, take_logical_sequence};
 use crate::openai::responses::{
     fs_end_stream_with_error_ctx,
     state::{ResponsesState, SynthesisKind},
@@ -68,6 +69,7 @@ pub(crate) fn event_local_tool_keys(payload: &Value) -> impl Iterator<Item = Str
     clippy::too_many_lines,
     reason = "linear sequence: opening + 3 progress events + done, each with its own payload construction"
 )]
+#[cfg(test)]
 pub(crate) fn synthesize_private_complete(item: &Value, output_index: u64) -> Vec<(&'static str, Value)> {
     let idx = || Value::Number(output_index.into());
 
@@ -126,6 +128,7 @@ pub(crate) fn synthesize_private_complete(item: &Value, output_index: u64) -> Ve
 
 /// Synthesize the tail of a native complete `file_search` (2 events: completed → done).
 /// Reuses the opening's `output_index`. Clone is necessary — synthesis payload.
+#[cfg(test)]
 pub(crate) fn synthesize_native_complete_tail(item: &Value, output_index: u64) -> Vec<(&'static str, Value)> {
     let idx = || Value::Number(output_index.into());
 
@@ -166,6 +169,7 @@ pub(crate) fn synthesize_native_complete_tail(item: &Value, output_index: u64) -
     clippy::too_many_lines,
     reason = "linear sequence: private branch (opening + 2 progress) + common terminal done; each with its own payload construction"
 )]
+#[cfg(test)]
 pub(crate) fn synthesize_incomplete_tail(item: &Value, output_index: u64, private: bool) -> Vec<(&'static str, Value)> {
     let idx = || Value::Number(output_index.into());
 
@@ -253,7 +257,7 @@ pub(crate) fn synthesize_incomplete_tail(item: &Value, output_index: u64, privat
     reason = "phased drain: partition ready vs deferred, then synthesize"
 )]
 pub(super) fn drain_local_tool_synthesis(ctx: &mut HttpFilterContext<'_>, out: &mut Vec<u8>) {
-    type ResolvedItem = (u64, SynthesisKind, Value);
+    type ResolvedItem = (usize, SynthesisKind);
     type DeferredItem = (usize, SynthesisKind);
     type SynthesisResolution = Result<(Vec<ResolvedItem>, Vec<DeferredItem>), &'static str>;
 
@@ -292,11 +296,7 @@ pub(super) fn drain_local_tool_synthesis(ctx: &mut HttpFilterContext<'_>, out: &
                 Some("completed" | "incomplete")
             );
             if reconciled {
-                let output_index = u64::try_from(*absolute)
-                    .map_err(|_overflow| "openai_stream_events: file_search synthesis index invariant")?;
-                // Owned copy for the freshly-built synthesis payload; the original
-                // stays in accumulated_output for the terminal frame.
-                ready.push((output_index, *kind, item.clone()));
+                ready.push((*absolute, *kind));
             } else {
                 deferred.push((*absolute, *kind));
             }
@@ -320,15 +320,192 @@ pub(super) fn drain_local_tool_synthesis(ctx: &mut HttpFilterContext<'_>, out: &
     }
     // Clean path — build, then normalize with a zero offset (indices are already
     // absolute) + encode. The state borrow is dropped; only &mut ctx is held here.
-    for (output_index, kind, item) in ready {
-        for (event_type, mut payload) in select_builder(&item, output_index, kind) {
-            normalize_logical_payload(ctx, &mut payload, 0);
-            encode_sse_event(event_type, &payload, out);
+    for (output_index, kind) in ready {
+        emit_borrowed_file_search_lifecycle(ctx, out, output_index, kind);
+    }
+}
+
+/// Emit file-search lifecycle events from the canonical accumulator item.
+/// Only fixed-size sequencing and a small item-id string are staged; item
+/// envelopes borrow the complete output tree during serialization.
+#[expect(
+    clippy::too_many_lines,
+    reason = "emits the ordered private and native file-search lifecycles"
+)]
+fn emit_borrowed_file_search_lifecycle(
+    ctx: &mut HttpFilterContext<'_>,
+    out: &mut Vec<u8>,
+    item_index: usize,
+    kind: SynthesisKind,
+) {
+    let (completed, item_id) = match ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.accumulated_output.get(item_index))
+    {
+        Some(item) => (
+            item.get("status").and_then(Value::as_str) == Some("completed"),
+            item.get("id").and_then(Value::as_str).unwrap_or_default().to_owned(),
+        ),
+        None => return,
+    };
+    let output_index = u64::try_from(item_index).unwrap_or(u64::MAX);
+
+    if kind == SynthesisKind::Private {
+        encode_file_search_item_event(
+            ctx,
+            out,
+            "response.output_item.added",
+            output_index,
+            item_index,
+            Some("searching"),
+            true,
+        );
+        for phase in [
+            "response.file_search_call.in_progress",
+            "response.file_search_call.searching",
+        ] {
+            encode_file_search_phase(ctx, out, phase, output_index, &item_id);
         }
+    }
+
+    if completed {
+        encode_file_search_phase(ctx, out, "response.file_search_call.completed", output_index, &item_id);
+    }
+
+    encode_file_search_item_event(
+        ctx,
+        out,
+        "response.output_item.done",
+        output_index,
+        item_index,
+        (!completed).then_some("incomplete"),
+        !completed,
+    );
+}
+
+/// Encode one lightweight file-search progress phase.
+fn encode_file_search_phase(
+    ctx: &mut HttpFilterContext<'_>,
+    out: &mut Vec<u8>,
+    event_type: &str,
+    output_index: u64,
+    item_id: &str,
+) {
+    let mut payload = serde_json::json!({
+        "type": event_type,
+        "output_index": output_index,
+        "item_id": item_id,
+        "sequence_number": 0,
+    });
+    normalize_logical_payload(ctx, &mut payload, 0);
+    encode_sse_event(event_type, &payload, out);
+}
+
+/// Encode one output-item envelope by borrowing the canonical item.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "wire envelope fields remain explicit at the two call sites"
+)]
+fn encode_file_search_item_event(
+    ctx: &mut HttpFilterContext<'_>,
+    out: &mut Vec<u8>,
+    event_type: &str,
+    output_index: u64,
+    item_index: usize,
+    status: Option<&str>,
+    omit_results: bool,
+) {
+    let sequence_number = take_logical_sequence(ctx);
+    let state = ctx.extensions.get::<ResponsesState>();
+    let Some(item) = state.and_then(|state| state.accumulated_output.get(item_index)) else {
+        return;
+    };
+    let payload = BorrowedFileSearchEnvelope {
+        event_type,
+        response_id: state.and_then(|state| state.logical_stream_response_id.as_deref()),
+        output_index,
+        item: FileSearchItemView {
+            item,
+            status,
+            omit_results,
+        },
+        sequence_number,
+    };
+    encode_sse_event(event_type, &payload, out);
+}
+
+/// Borrowed output-item event envelope for synthesized file-search lifecycle.
+#[derive(Serialize)]
+struct BorrowedFileSearchEnvelope<'a> {
+    #[serde(rename = "type")]
+    /// SSE payload discriminator.
+    event_type: &'a str,
+    /// Logical response identifier, when known.
+    response_id: Option<&'a str>,
+    /// Absolute canonical output index.
+    output_index: u64,
+    /// Borrowed item view with lifecycle overrides.
+    item: FileSearchItemView<'a>,
+    /// Monotonic logical-stream sequence number.
+    sequence_number: u64,
+}
+
+/// Serializer view that overrides status and optionally omits search results.
+struct FileSearchItemView<'a> {
+    /// Canonical file-search output item.
+    item: &'a Value,
+    /// Status substituted into the emitted view.
+    status: Option<&'a str>,
+    /// Whether the borrowed view suppresses the `results` field.
+    omit_results: bool,
+}
+
+impl Serialize for FileSearchItemView<'_> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "map serializer conditionally substitutes and omits fields"
+    )]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Some(object) = self.item.as_object() else {
+            return self.item.serialize(serializer);
+        };
+        let mut len = object.len();
+        if self.omit_results && object.contains_key("results") {
+            len = len.saturating_sub(1);
+        }
+        if self.status.is_some() && !object.contains_key("status") {
+            len = len.saturating_add(1);
+        }
+        let mut map = serializer.serialize_map(Some(len))?;
+        for (key, value) in object {
+            if self.omit_results && key == "results" {
+                continue;
+            }
+            if key == "status" {
+                if let Some(status) = self.status {
+                    map.serialize_entry(key, status)?;
+                } else {
+                    map.serialize_entry(key, value)?;
+                }
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        if let Some(status) = self.status
+            && !object.contains_key("status")
+        {
+            map.serialize_entry("status", status)?;
+        }
+        map.end()
     }
 }
 
 /// Dispatch to the Task 17 builders by origin `kind` + item `status`.
+#[cfg(test)]
 fn select_builder(item: &Value, output_index: u64, kind: SynthesisKind) -> Vec<(&'static str, Value)> {
     let completed = item.get("status").and_then(Value::as_str) == Some("completed");
     match (kind, completed) {
@@ -433,5 +610,51 @@ mod tests {
             "private incomplete emits opening"
         );
         assert!(!private.iter().any(|(t, _)| *t == "response.file_search_call.completed"));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "allocation comparison constructs and measures both implementations"
+    )]
+    fn borrowed_synthesis_allocates_less_than_legacy_item_clones() {
+        let make_item = || {
+            json!({
+                "type": "file_search_call",
+                "id": "fs_large",
+                "status": "completed",
+                "results": [{"file_id": "f1", "text": "x".repeat(65_536)}]
+            })
+        };
+        let legacy_item = make_item();
+        let current_item = make_item();
+
+        let legacy = allocation_counter::measure(|| {
+            let events = select_builder(&legacy_item, 0, SynthesisKind::Private);
+            let mut output = Vec::new();
+            for (event_type, payload) in events {
+                encode_sse_event(event_type, &payload, &mut output);
+            }
+            std::hint::black_box(output);
+        });
+
+        let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context(Box::leak(Box::new(request)));
+        ctx.extensions.insert(ResponsesState {
+            accumulated_output: vec![current_item],
+            ..ResponsesState::default()
+        });
+        let borrowed = allocation_counter::measure(|| {
+            let mut output = Vec::new();
+            emit_borrowed_file_search_lifecycle(&mut ctx, &mut output, 0, SynthesisKind::Private);
+            std::hint::black_box(output);
+        });
+
+        assert!(
+            borrowed.bytes_total + 65_536 < legacy.bytes_total,
+            "borrowed synthesis must remove payload-sized item clones: legacy={} borrowed={}",
+            legacy.bytes_total,
+            borrowed.bytes_total
+        );
     }
 }

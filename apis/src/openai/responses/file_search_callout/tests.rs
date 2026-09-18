@@ -302,9 +302,9 @@ fn plan_bounds_owned_inputs_but_accounts_for_every_store() {
 
 #[test]
 fn synthetic_bridge_call_ids_are_bounded_and_response_specific() {
-    let item = json!({"id":"x".repeat(100_000)});
-    let first = model_context_messages(&item, usize::MAX, stable_call_hash(&["resp-a"]), "query", "output");
-    let second = model_context_messages(&item, usize::MAX, stable_call_hash(&["resp-b"]), "query", "output");
+    let source_id = "x".repeat(100_000);
+    let first = model_context_messages(&source_id, usize::MAX, stable_call_hash(&["resp-a"]), "query", "output");
+    let second = model_context_messages(&source_id, usize::MAX, stable_call_hash(&["resp-b"]), "query", "output");
     let first_id = first[0]["call_id"].as_str().unwrap();
     let second_id = second[0]["call_id"].as_str().unwrap();
 
@@ -312,6 +312,97 @@ fn synthetic_bridge_call_ids_are_bounded_and_response_specific() {
     assert!(first_id.len() <= 64);
     assert_eq!(first[1]["call_id"], first_id);
     assert_ne!(first_id, second_id);
+}
+
+#[test]
+fn output_update_accounts_exact_prospective_json_bytes() {
+    let source = json!({
+        "type": "file_search_call",
+        "id": "",
+        "status": "searching",
+        "queries": ["revenue"],
+        "results": [{"old": true}],
+    });
+    let object = source.as_object().unwrap();
+    let update = OutputUpdate::new(
+        0,
+        object,
+        Some("fs-generated".to_owned()),
+        "completed",
+        Some(vec![json!({"file_id":"file-a","text":"Revenue grew."})]),
+    )
+    .unwrap();
+    let expected_bytes = update.updated_bytes;
+    let mut output = vec![source];
+
+    update.commit(&mut output);
+
+    assert_eq!(retained_json_bytes(&output[0]), Some(expected_bytes));
+}
+
+#[test]
+fn file_search_state_limit_rejects_batch_before_canonical_mutation() {
+    let mut state = one_pending_state(&[]);
+    let assignments = state.drain_file_search_assignments();
+    let plan = build_search_plan(&state, &assignments);
+    let batch = SearchBatch::new(plan.calls.len());
+    let state_limit = state.retained_payload_bytes().unwrap();
+    let original_output = state.accumulated_output[0].clone();
+
+    let failure =
+        FileSearchCalloutFilter::apply_batch(&mut state, &assignments, &plan, &batch, 0, state_limit).unwrap_err();
+
+    assert_eq!(failure.status, 413);
+    assert_eq!(state.accumulated_output[0], original_output);
+    assert!(state.messages.is_empty());
+    assert!(state.citation_files.is_empty());
+}
+
+#[test]
+fn aggregate_limit_clears_file_search_dispatch_without_committing_batch() {
+    let mut state = one_pending_state(&[]);
+    let assignments = state.drain_file_search_assignments();
+    let plan = build_search_plan(&state, &assignments);
+    let batch = SearchBatch::new(plan.calls.len());
+    let retained = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(retained);
+
+    let failure =
+        FileSearchCalloutFilter::apply_batch(&mut state, &assignments, &plan, &batch, 0, usize::MAX).unwrap_err();
+
+    assert_eq!(failure.status, 502);
+    assert!(state.retained_payload_failed);
+    assert!(state.accumulated_output.is_empty());
+    assert!(state.messages.is_empty());
+    assert!(!state.store_persist_armed);
+}
+
+#[test]
+fn aggregate_limit_rejects_before_file_search_formatting() {
+    let mut state = one_pending_state(&[]);
+    let assignments = state.drain_file_search_assignments();
+    let plan = build_search_plan(&state, &assignments);
+    let mut batch = SearchBatch::new(plan.calls.len());
+    batch.results_by_call[0].push(SearchResult {
+        attributes: None,
+        content: vec![ContentChunk {
+            _chunk_type: ContentChunkType::Text,
+            text: "x".repeat(16_384),
+        }],
+        file_id: "file-a".to_owned(),
+        filename: "a.txt".to_owned(),
+        score: 0.9,
+    });
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current + batch.staging_bytes().unwrap());
+
+    let failure =
+        FileSearchCalloutFilter::apply_batch(&mut state, &assignments, &plan, &batch, 0, usize::MAX).unwrap_err();
+
+    assert_eq!(failure.status, 502);
+    assert!(state.retained_payload_failed);
+    assert!(state.accumulated_output.is_empty());
+    assert!(state.messages.is_empty());
 }
 
 #[test]
@@ -1669,12 +1760,6 @@ fn format_test_bridge(
     context_template: &str,
     remaining_model_bytes: usize,
 ) -> BudgetedSearchResults {
-    let source_item = json!({
-        "type": "file_search_call",
-        "id": "fs-test",
-        "status": "searching",
-        "queries": [query],
-    });
     let known_citation_files = HashMap::new();
     let templates = FormatTemplates {
         annotation: annotation_template,
@@ -1682,9 +1767,10 @@ fn format_test_bridge(
     };
     BridgeBudget {
         known_citation_files: &known_citation_files,
+        staged_citation_files: &HashMap::new(),
         max_new_citation_files: MAX_CITATION_FILES,
         remaining_model_bytes,
-        source_item: &source_item,
+        source_id: "fs-test",
         output_index: 0,
         query,
         response_identity_hash: FNV_OFFSET_BASIS,
@@ -1968,6 +2054,24 @@ fn continuation_state_charges_provider_streamed_terminal_ids() {
     assert!(
         !continuation_state_fits(0, &state, 64, 0),
         "a large observation set is charged and overflows the ceiling (P1 DoS bound)"
+    );
+}
+
+#[test]
+fn continuation_state_excludes_aggregate_only_external_payload() {
+    let mut state = ResponsesState::default();
+    let state_bytes = state
+        .retained_payload_bytes_bounded_without_external(usize::MAX)
+        .unwrap();
+    state.set_retained_external_payload_bytes(state_bytes.saturating_add(1));
+
+    assert!(
+        continuation_state_fits(0, &state, state_bytes, 0),
+        "response-store and sibling-filter payload must not consume file-search max_state_bytes"
+    );
+    assert!(
+        state.retained_payload_bytes_bounded(state_bytes).is_none(),
+        "the same external owner must still be charged by the aggregate budget"
     );
 }
 

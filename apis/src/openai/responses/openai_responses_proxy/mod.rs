@@ -174,6 +174,10 @@ impl HttpFilter for ResponsesProxyFilter {
         Ok(FilterAction::Continue)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "deferred dispatch and request serialization lifecycle"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -183,6 +187,19 @@ impl HttpFilter for ResponsesProxyFilter {
         if !end_of_stream {
             trace!("buffering request body chunk");
             return Ok(FilterAction::Continue);
+        }
+
+        if super::mcp_dispatch::initial_dispatch_is_deferred(ctx) {
+            let action = super::mcp_dispatch::dispatch_after_budget_admission(ctx).await?;
+            if !matches!(action, FilterAction::Continue) {
+                return Ok(action);
+            }
+        }
+        if super::agentic_loop::request_finish_is_deferred(ctx) {
+            let action = super::agentic_loop::finish_request_after_deferred_dispatch(ctx)?;
+            if !matches!(action, FilterAction::Continue) {
+                return Ok(action);
+            }
         }
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {

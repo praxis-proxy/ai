@@ -86,7 +86,11 @@ use std::{
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue, header::AUTHORIZATION};
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+#[cfg(not(target_os = "macos"))]
+use notify::RecommendedWatcher;
+#[cfg(target_os = "macos")]
+use notify::{Config as NotifyConfig, PollWatcher};
+use notify::{EventKind, RecursiveMode, Watcher as _};
 use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -116,6 +120,12 @@ const MAX_TOKEN_READ_BYTES: u64 = 16 * 1024 + 1;
 
 /// Default injection header for the `apikey` strategy.
 const DEFAULT_APIKEY_HEADER: &str = "x-api-key";
+
+/// Polling interval for the macOS fallback watcher. `FSEvents` can miss changes
+/// under temporary or otherwise unowned directories, while projected Secret
+/// files must still converge without a filter rebuild.
+#[cfg(target_os = "macos")]
+const CREDENTIAL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 // -----------------------------------------------------------------------------
 // Config
@@ -266,6 +276,32 @@ struct CredentialReloadHandle {
     shutdown: mpsc::Sender<WatcherMessage>,
     /// Watcher thread joined during filter destruction.
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Watcher implementation used on macOS, where polling avoids missed `FSEvents`.
+#[cfg(target_os = "macos")]
+type CredentialWatcher = PollWatcher;
+/// Native watcher implementation used on non-macOS platforms.
+#[cfg(not(target_os = "macos"))]
+type CredentialWatcher = RecommendedWatcher;
+
+/// Build the platform watcher used for projected credential files.
+fn create_credential_watcher(
+    callback: impl FnMut(notify::Result<notify::Event>) + Send + 'static,
+) -> notify::Result<CredentialWatcher> {
+    #[cfg(target_os = "macos")]
+    {
+        PollWatcher::new(
+            callback,
+            NotifyConfig::default()
+                .with_poll_interval(CREDENTIAL_POLL_INTERVAL)
+                .with_compare_contents(true),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        notify::recommended_watcher(callback)
+    }
 }
 
 impl Drop for CredentialReloadHandle {
@@ -750,17 +786,18 @@ fn spawn_credential_watcher(watched: Vec<WatchedCredential>) -> Result<Credentia
     let thread = std::thread::Builder::new()
         .name("credential-inject-watcher".to_owned())
         .spawn(move || {
-            let mut watcher: RecommendedWatcher = match notify::recommended_watcher(move |event| {
-                if let Ok(event) = event {
-                    drop(callback_tx.send(WatcherMessage::Event(event)));
-                }
-            }) {
-                Ok(watcher) => watcher,
-                Err(error) => {
-                    drop(ready_tx.send(Err(format!("failed to create credential watcher: {error}"))));
-                    return;
-                },
-            };
+            let mut watcher: CredentialWatcher =
+                match create_credential_watcher(move |event: notify::Result<notify::Event>| {
+                    if let Ok(event) = event {
+                        drop(callback_tx.send(WatcherMessage::Event(event)));
+                    }
+                }) {
+                    Ok(watcher) => watcher,
+                    Err(error) => {
+                        drop(ready_tx.send(Err(format!("failed to create credential watcher: {error}"))));
+                        return;
+                    },
+                };
 
             let mut directories = std::collections::HashSet::new();
             for item in &watched {

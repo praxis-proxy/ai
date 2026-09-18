@@ -17,74 +17,58 @@ use tracing::{debug, warn};
 
 use super::StreamEventsState;
 use crate::openai::{
-    responses::{state::ResponsesState, usage::merge_usage},
+    responses::{state::ResponsesState, usage::merge_usage_owned},
     sse::responses::ResponsesEvent,
 };
 
 /// Process a single SSE event, updating `ResponsesState` in
 /// extensions and per-filter accumulation state.
-///
-/// Returns the serialized byte size of any clone retained in `tool_calls` by this
-/// event (`0` for every event but a `function_call_arguments.done` that stores a
-/// clone). That clone is the one accumulator whose growth the driving frame does not
-/// bound, so the caller charges the returned size against the request-wide
-/// accumulation byte budget (#556); see [`finalize_function_call`].
-#[must_use = "the returned clone bytes must be charged against the accumulation byte budget"]
 pub(super) fn accumulate_event(
     ctx: &mut HttpFilterContext<'_>,
     filter_state: &mut StreamEventsState,
-    event: &ResponsesEvent,
-) -> usize {
+    event: &mut ResponsesEvent,
+) {
     match event {
-        ResponsesEvent::ResponseCompleted(payload)
-        | ResponsesEvent::ResponseIncomplete(payload)
-        | ResponsesEvent::ResponseFailed(payload) => {
-            handle_terminal_event(ctx, payload, event);
-            0
-        },
+        ResponsesEvent::ResponseCompleted(payload) => handle_terminal_event(ctx, payload, "completed"),
+        ResponsesEvent::ResponseIncomplete(payload) => handle_terminal_event(ctx, payload, "incomplete"),
+        ResponsesEvent::ResponseFailed(payload) => handle_terminal_event(ctx, payload, "failed"),
 
         ResponsesEvent::OutputItemAdded(payload) => {
             handle_output_item_added(ctx, payload);
-            0
         },
         ResponsesEvent::OutputItemDone(payload) => {
-            handle_output_item_done(ctx, payload);
-            0
+            handle_output_item_done(ctx, payload, filter_state.output_index_offset);
         },
 
         ResponsesEvent::FunctionCallArgumentsDelta(payload) => {
             handle_function_call_delta(filter_state, payload);
-            0
         },
-        ResponsesEvent::FunctionCallArgumentsDone(payload) => handle_function_call_done(ctx, filter_state, payload),
+        ResponsesEvent::FunctionCallArgumentsDone(payload) => {
+            handle_function_call_done(ctx, filter_state, payload);
+        },
 
         ResponsesEvent::Error(payload) => {
             warn!(error = %payload, "streaming error event received");
-            0
         },
 
         ResponsesEvent::Unknown { event_type, .. } => {
             debug!(event_type, "unknown SSE event type (forward-compat)");
-            0
         },
 
-        _ => 0,
+        _ => {},
     }
 }
 
 /// Overwrite `ResponsesState` from a terminal event's authoritative payload.
-fn handle_terminal_event(ctx: &mut HttpFilterContext<'_>, payload: &Value, event: &ResponsesEvent) {
-    let response = payload.get("response").unwrap_or(payload);
-
-    let status = match event {
-        ResponsesEvent::ResponseCompleted(_) => "completed",
-        ResponsesEvent::ResponseIncomplete(_) => "incomplete",
-        ResponsesEvent::ResponseFailed(_) => "failed",
-        _ => "unknown",
-    };
-    // SSE payloads are borrowed from the frame parser, so terminal accumulation
-    // is the one path that must clone a complete response object.
-    let _ = accumulate_response_object(ctx, response.clone(), Some(status));
+fn handle_terminal_event(ctx: &mut HttpFilterContext<'_>, payload: &mut Value, status: &str) {
+    // Move the authoritative response into shared state. The deferred terminal
+    // keeps only its now-lightweight envelope metadata and borrows this canonical
+    // tree when it is eventually serialized.
+    let response = payload
+        .as_object_mut()
+        .and_then(|object| object.remove("response"))
+        .unwrap_or_else(|| payload.take());
+    let _ = accumulate_response_object(ctx, response, Some(status));
 }
 
 /// Overwrite response fields from an authoritative complete response object.
@@ -103,16 +87,12 @@ pub(super) fn accumulate_response_object(
     let had_prior_usage = {
         let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
         let had_prior_usage = !state.usage.is_null();
-        if let Some(usage) = response.get("usage").filter(|usage| !usage.is_null()) {
-            merge_usage(&mut state.usage, usage);
-        }
-        if !state.usage.is_null()
-            && let Some(object) = response.as_object_mut()
-        {
-            object.insert("usage".to_owned(), state.usage.clone());
-        }
-        if let Some(Value::Array(output)) = response.get("output") {
-            replace_completed_tool_calls(state, output);
+        let usage = response
+            .as_object_mut()
+            .and_then(|object| object.remove("usage"))
+            .unwrap_or(Value::Null);
+        if !usage.is_null() {
+            merge_usage_owned(&mut state.usage, usage);
         }
         state.response_object = response;
         state.local_completion_response_template = Value::Null;
@@ -124,44 +104,31 @@ pub(super) fn accumulate_response_object(
     had_prior_usage
 }
 
-/// Replace incremental function calls from the authoritative terminal output.
-fn replace_completed_tool_calls(state: &mut ResponsesState, output: &[Value]) {
-    state.tool_calls.clear();
-    state.tool_calls.extend(
-        output
-            .iter()
-            .filter(|item| {
-                item.get("type").and_then(Value::as_str) == Some("function_call")
-                    && item.get("status").and_then(Value::as_str) == Some("completed")
-            })
-            .cloned(),
-    );
-}
-
 /// Push a new output item to the incremental accumulator.
-fn handle_output_item_added(ctx: &mut HttpFilterContext<'_>, payload: &Value) {
+fn handle_output_item_added(ctx: &mut HttpFilterContext<'_>, payload: &mut Value) {
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
 
-    if let Some(item) = payload.get("item") {
-        state.output_items_mut().push(item.clone());
+    if let Some(item) = payload.get_mut("item") {
+        state.output_items_mut().push(item.take());
     }
 }
 
 /// Replace an existing output item by index or id, or append if new.
-fn handle_output_item_done(ctx: &mut HttpFilterContext<'_>, payload: &Value) {
+fn handle_output_item_done(ctx: &mut HttpFilterContext<'_>, payload: &mut Value, output_index_offset: u64) {
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
 
-    let Some(item) = payload.get("item") else {
+    let output_index = payload
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .map(|index| index.saturating_sub(output_index_offset));
+    let Some(item) = payload.get_mut("item") else {
         return;
     };
 
-    if let Some(idx) = payload
-        .get("output_index")
-        .and_then(Value::as_u64)
-        .and_then(|v| usize::try_from(v).ok())
+    if let Some(idx) = output_index.and_then(|v| usize::try_from(v).ok())
         && let Some(slot) = state.output_items_mut().get_mut(idx)
     {
-        item.clone_into(slot);
+        *slot = item.take();
         return;
     }
 
@@ -171,19 +138,30 @@ fn handle_output_item_done(ctx: &mut HttpFilterContext<'_>, payload: &Value) {
             .iter_mut()
             .find(|i| i.get("id").and_then(Value::as_str) == Some(id))
     {
-        item.clone_into(existing);
+        *existing = item.take();
         return;
     }
 
-    state.output_items_mut().push(item.clone());
+    state.output_items_mut().push(item.take());
 }
 
 /// Append a function-call argument delta to the running buffer.
-fn handle_function_call_delta(filter_state: &mut StreamEventsState, payload: &Value) {
+#[expect(
+    clippy::too_many_lines,
+    reason = "entry handling keeps overflow rejection transactional"
+)]
+fn handle_function_call_delta(filter_state: &mut StreamEventsState, payload: &mut Value) {
     let Some(key) = tool_call_key(payload) else {
         return;
     };
-    let Some(delta) = payload.get("delta").and_then(Value::as_str) else {
+    let Some(delta) = payload
+        .as_object_mut()
+        .and_then(|object| object.remove("delta"))
+        .and_then(|value| match value {
+            Value::String(delta) => Some(delta),
+            _ => None,
+        })
+    else {
         return;
     };
     if filter_state.rejected_tool_call_args.contains(&key) {
@@ -198,7 +176,7 @@ fn handle_function_call_delta(filter_state: &mut StreamEventsState, payload: &Va
                 reject_overflowing_tool_call(filter_state, key);
                 return;
             }
-            occupied.get_mut().push_str(delta);
+            occupied.get_mut().push_str(&delta);
         },
         Entry::Vacant(vacant) => {
             if delta.len() > limit {
@@ -206,7 +184,7 @@ fn handle_function_call_delta(filter_state: &mut StreamEventsState, payload: &Va
                 reject_overflowing_tool_call(filter_state, key);
                 return;
             }
-            vacant.insert(delta.to_owned());
+            vacant.insert(delta);
         },
     }
 }
@@ -221,34 +199,34 @@ fn reject_overflowing_tool_call(filter_state: &mut StreamEventsState, key: Strin
     filter_state.rejected_tool_call_args.insert(key);
 }
 
-/// Finalize a function call from the done event's payload and push to `tool_calls`.
-///
-/// Returns the serialized byte size of the clone retained in `tool_calls`, or `0`
-/// when the call is rejected or no clone is stored.
+/// Finalize a function call from the done event's payload.
 fn handle_function_call_done(
     ctx: &mut HttpFilterContext<'_>,
     filter_state: &mut StreamEventsState,
-    payload: &Value,
-) -> usize {
+    payload: &mut Value,
+) {
     let Some(key) = tool_call_key(payload) else {
-        return 0;
+        return;
     };
     if filter_state.rejected_tool_call_args.contains(&key) {
-        return 0;
+        return;
     }
     if reject_oversized_done(filter_state, &key, payload) {
-        return 0;
+        return;
     }
 
     let accumulated = filter_state.tool_call_args.remove(&key);
     let arguments = payload
-        .get("arguments")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+        .as_object_mut()
+        .and_then(|object| object.remove("arguments"))
+        .and_then(|value| match value {
+            Value::String(arguments) => Some(arguments),
+            _ => None,
+        })
         .or(accumulated)
         .unwrap_or_default();
 
-    finalize_function_call(ctx, &key, payload, &arguments)
+    finalize_function_call(ctx, &key, payload, arguments, filter_state.output_index_offset);
 }
 
 /// Reject a completed function call whose `arguments` already exceed the cap.
@@ -272,47 +250,29 @@ fn reject_oversized_done(filter_state: &mut StreamEventsState, key: &str, payloa
     true
 }
 
-/// Apply finalized arguments to the matching output item and store the tool call.
-///
-/// Returns the serialized byte size of the clone retained in `tool_calls`, or `0`
-/// when no clone is stored (no matching item, or a non-function item).
-///
-/// A `function_call_arguments.done` clones the *whole* retained output item — whose
-/// payload arrived in an earlier frame — into `tool_calls`, so this clone is the one
-/// accumulator whose growth the small driving `done` frame does not bound. Sizing
-/// the clone here, where it is actually made, lets the caller charge the exact
-/// retained bytes against the request-wide accumulation byte budget (#556): a
-/// backend that re-clones a large id-less item with hundreds of tiny `done` frames
-/// then fails closed instead of retaining megabytes uncharged. On the replace path
-/// the full new clone is charged (the counter is monotonic and cannot credit the
-/// dropped old value); that over-charges a re-`done` of the same call slightly,
-/// which only fails the stream closed marginally earlier.
-fn finalize_function_call(ctx: &mut HttpFilterContext<'_>, key: &str, payload: &Value, arguments: &str) -> usize {
+/// Apply finalized arguments to the matching canonical output item.
+fn finalize_function_call(
+    ctx: &mut HttpFilterContext<'_>,
+    key: &str,
+    payload: &Value,
+    arguments: String,
+    output_index_offset: u64,
+) {
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
-    let tool_call = {
-        let Some(item) = find_output_item_mut(state.output_items_mut(), payload) else {
-            warn!(
-                key,
-                "dropping function-call arguments.done without matching output item"
-            );
-            return 0;
-        };
-
-        let Some(tool_call) = complete_function_call_item(item, arguments) else {
-            warn!(
-                key,
-                "dropping function-call arguments.done for non-function output item"
-            );
-            return 0;
-        };
-        tool_call
+    let Some(item) = find_output_item_mut(state.output_items_mut(), payload, output_index_offset) else {
+        warn!(
+            key,
+            "dropping function-call arguments.done without matching output item"
+        );
+        return;
     };
 
-    // Size the clone before it is moved into `tool_calls`; this is the retained
-    // growth the byte budget must charge.
-    let retained_bytes = crate::json_body::serialized_len(&tool_call).unwrap_or(0);
-    upsert_tool_call(&mut state.tool_calls, tool_call);
-    retained_bytes
+    if !complete_function_call_item(item, arguments) {
+        warn!(
+            key,
+            "dropping function-call arguments.done for non-function output item"
+        );
+    }
 }
 
 /// Build the stable key used by argument delta/done events.
@@ -330,7 +290,11 @@ fn tool_call_key(payload: &Value) -> Option<String> {
 }
 
 /// Find the output item targeted by a function-call arguments event.
-fn find_output_item_mut<'a>(output_items: &'a mut [Value], payload: &Value) -> Option<&'a mut Value> {
+fn find_output_item_mut<'a>(
+    output_items: &'a mut [Value],
+    payload: &Value,
+    output_index_offset: u64,
+) -> Option<&'a mut Value> {
     if let Some(item_id) = payload.get("item_id").and_then(Value::as_str)
         && let Some(index) = output_items
             .iter()
@@ -342,18 +306,21 @@ fn find_output_item_mut<'a>(output_items: &'a mut [Value], payload: &Value) -> O
     let output_index = payload
         .get("output_index")
         .and_then(Value::as_u64)
+        .map(|index| index.saturating_sub(output_index_offset))
         .and_then(|v| usize::try_from(v).ok())?;
     output_items.get_mut(output_index)
 }
 
 /// Apply finalized arguments to an existing function-call item.
-fn complete_function_call_item(item: &mut Value, arguments: &str) -> Option<Value> {
-    let obj = item.as_object_mut()?;
+fn complete_function_call_item(item: &mut Value, arguments: String) -> bool {
+    let Some(obj) = item.as_object_mut() else {
+        return false;
+    };
     if obj.get("type").and_then(Value::as_str) != Some("function_call") {
-        return None;
+        return false;
     }
 
-    obj.insert("arguments".to_owned(), Value::String(arguments.to_owned()));
+    obj.insert("arguments".to_owned(), Value::String(arguments));
     if !matches!(
         obj.get("status").and_then(Value::as_str),
         Some("completed" | "incomplete")
@@ -361,22 +328,5 @@ fn complete_function_call_item(item: &mut Value, arguments: &str) -> Option<Valu
         obj.insert("status".to_owned(), Value::String("completed".to_owned()));
     }
 
-    Some(item.clone())
-}
-
-/// Insert or replace a completed function-call item.
-fn upsert_tool_call(tool_calls: &mut Vec<Value>, tool_call: Value) {
-    let id = tool_call.get("id").and_then(Value::as_str);
-    let call_id = tool_call.get("call_id").and_then(Value::as_str);
-
-    if let Some(existing) = tool_calls.iter_mut().find(|existing| {
-        let existing_id = existing.get("id").and_then(Value::as_str);
-        let existing_call_id = existing.get("call_id").and_then(Value::as_str);
-        id.is_some_and(|id| existing_id == Some(id)) || call_id.is_some_and(|call_id| existing_call_id == Some(call_id))
-    }) {
-        *existing = tool_call;
-        return;
-    }
-
-    tool_calls.push(tool_call);
+    true
 }

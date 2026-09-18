@@ -1,0 +1,46 @@
+version: 1
+id: responses/agentic-retained-overflow-stream
+description: An aggregate retained-payload overflow terminates an already-committed Responses stream with one error event without persisting the requested response.
+protocol: openai_responses
+example_config: openai/responses/agentic-loop-overflow-fixture.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.agentic.retained_overflow
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Trigger the controlled retained-state overflow.
+          store: true
+          stream: true
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events:
+        - response.created
+        - error
+      upstream_sse_events: []
+  - name: retrieval_miss
+    request:
+      method: GET
+      path: /v1/responses/resp_recorded_0001
+      headers: {}
+      body:
+        kind: empty
+    expect:
+      client_status: 404
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []

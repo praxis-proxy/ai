@@ -9,8 +9,7 @@
 //! label, tool name, and arguments) resolved against the current tool map, and
 //! shapes the decision into either a tool call to execute or a denial fed back
 //! to the model: [`parse_approval_response`], [`resolve_approval`],
-//! [`ResolvedApproval`], [`ApprovalError`], [`build_approved_tool_call`],
-//! [`build_denial_message`].
+//! [`ResolvedApproval`], [`ApprovalError`], [`build_denial_message`].
 //!
 //! The *policy* decision — whether a resolved MCP call must pause for human
 //! approval at all — is owned by [`super::super::mcp_classify`]
@@ -365,6 +364,7 @@ fn scalar_bytes(value: Option<&serde_json::Value>) -> Cow<'_, [u8]> {
 /// function call so the existing dispatch execution path runs it unchanged.
 /// `approval_request_id` is threaded so the resulting `mcp_call` output item
 /// references the approval that authorized it.
+#[cfg(all(test, feature = "store-sqlite"))]
 pub(crate) fn build_approved_tool_call(resolved: &ResolvedApproval) -> serde_json::Value {
     serde_json::json!({
         "type": "function_call",

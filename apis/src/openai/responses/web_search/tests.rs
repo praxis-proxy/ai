@@ -4,6 +4,40 @@
 //! Tests for the `openai_web_search` filter.
 
 use super::*;
+use crate::openai::responses::state::WebSearchAssignment;
+
+fn assign_web_search_calls(state: &mut ResponsesState, calls: Vec<Value>) {
+    for (ordinal, call) in calls.into_iter().enumerate() {
+        let call_id = call.get("id").and_then(Value::as_str);
+        let round_index = state
+            .current_round_output_start
+            .and_then(|start| start.checked_add(ordinal))
+            .filter(|index| {
+                state
+                    .accumulated_output
+                    .get(*index)
+                    .and_then(|item| item.get("id"))
+                    .and_then(Value::as_str)
+                    == call_id
+            });
+        let output_index = round_index
+            .or_else(|| {
+                state
+                    .accumulated_output
+                    .iter()
+                    .position(|item| item.get("id").and_then(Value::as_str) == call_id)
+            })
+            .unwrap_or_else(|| {
+                let output_index = state.accumulated_output.len();
+                state.accumulated_output.push(call);
+                output_index
+            });
+        state.current_round_output_start.get_or_insert(output_index);
+        state
+            .web_search_calls
+            .push(WebSearchAssignment { output_index, ordinal });
+    }
+}
 
 // -----------------------------------------------------------------------------
 // Helper: build filter from YAML
@@ -179,6 +213,70 @@ fn emit_status_uses_valid_key() {
         "status should be stored with underscore-separated key"
     );
 }
+
+#[test]
+fn web_search_construction_reserves_provider_result_owners() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
+    let current = state.retained_payload_bytes().unwrap();
+    let results = vec![SearchResult {
+        title: "title".repeat(128),
+        url: "https://example.test/result".to_owned(),
+        snippet: "snippet".repeat(512),
+    }];
+    let source_bytes = web_search_results_bytes(&results).unwrap();
+    state.apply_retained_payload_limit(current + source_bytes - 1);
+    ctx.extensions.insert(state);
+    let ids = SearchCallIds::new("ws_1", "ws_bridge", 0);
+
+    assert!(!web_search_construction_fits(
+        &ctx,
+        &ids,
+        "completed",
+        "query",
+        &results,
+        true,
+        source_bytes,
+    ));
+}
+
+#[test]
+fn web_search_response_limit_is_derived_before_dispatch() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
+    let current = state.retained_payload_bytes().unwrap();
+    state.apply_retained_payload_limit(current + 32_768);
+    ctx.extensions.insert(state);
+
+    let limit = web_search_response_limit(&ctx, "query").unwrap();
+    assert!(limit < MAX_SEARCH_RESPONSE_BYTES);
+    assert!(limit <= (32_768 - 4_096 - "query".len() * 8) / 32);
+}
+
+#[test]
+fn moving_pending_search_calls_keeps_their_payload_charged() {
+    let call = serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_1",
+        "action": {"type": "search", "query": "x".repeat(4_096)}
+    });
+    let mut state = ResponsesState::default();
+    assign_web_search_calls(&mut state, vec![call]);
+    let before = state.retained_payload_bytes().unwrap();
+
+    let (calls, bytes) = take_pending_search_calls(&mut state).unwrap();
+
+    assert_eq!(state.retained_payload_bytes().unwrap(), before + bytes);
+    drop(calls);
+    state.release_external_payload_bytes(bytes);
+    assert_eq!(
+        state.retained_payload_bytes().unwrap(),
+        before,
+        "the charge is released only after the local owner is dropped"
+    );
+}
 // -----------------------------------------------------------------------------
 // Response ownership
 // -----------------------------------------------------------------------------
@@ -189,14 +287,16 @@ fn response_hook_is_execution_only_noop() {
     let filter = WebSearchFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.extensions.insert(ResponsesState {
-        web_search_calls: vec![serde_json::json!({
+    let mut state = ResponsesState::default();
+    assign_web_search_calls(
+        &mut state,
+        vec![serde_json::json!({
             "type": "web_search_call",
             "id": "ws_1",
             "action": {"type": "search", "query": "test query"}
         })],
-        ..ResponsesState::default()
-    });
+    );
+    ctx.extensions.insert(state);
 
     let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
 
@@ -268,11 +368,14 @@ async fn on_request_body_passthrough_on_non_end_of_stream() {
 
     let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
     let mut state = ResponsesState::from_request_body(body);
-    state.web_search_calls = vec![serde_json::json!({
-        "type": "web_search_call",
-        "id": "ws_1",
-        "action": {"type": "search", "query": "test"}
-    })];
+    assign_web_search_calls(
+        &mut state,
+        vec![serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "action": {"type": "search", "query": "test"}
+        })],
+    );
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, false).await.unwrap();
@@ -371,11 +474,14 @@ async fn on_request_body_executes_search_and_populates_state() {
         "include": ["web_search_call.action.sources"],
     });
     let mut state = ResponsesState::from_request_body(body);
-    state.web_search_calls = vec![serde_json::json!({
-        "type": "web_search_call",
-        "id": "ws_exec_1",
-        "action": {"type": "search", "query": "rust language"}
-    })];
+    assign_web_search_calls(
+        &mut state,
+        vec![serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_exec_1",
+            "action": {"type": "search", "query": "rust language"}
+        })],
+    );
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -422,11 +528,14 @@ async fn on_request_body_omits_sources_without_include() {
 
     let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
     let mut state = ResponsesState::from_request_body(body);
-    state.web_search_calls = vec![serde_json::json!({
-        "type": "web_search_call",
-        "id": "ws_exec_2",
-        "action": {"type": "search", "query": "rust language"}
-    })];
+    assign_web_search_calls(
+        &mut state,
+        vec![serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_exec_2",
+            "action": {"type": "search", "query": "rust language"}
+        })],
+    );
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -451,11 +560,14 @@ async fn on_request_body_missing_query_produces_incomplete_status() {
 
     let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
     let mut state = ResponsesState::from_request_body(body);
-    state.web_search_calls = vec![serde_json::json!({
-        "type": "web_search_call",
-        "id": "ws_no_query",
-        "action": {"type": "search"}
-    })];
+    assign_web_search_calls(
+        &mut state,
+        vec![serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_no_query",
+            "action": {"type": "search"}
+        })],
+    );
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -512,11 +624,14 @@ async fn on_request_body_provider_failure_produces_failed_item_and_truthful_inpu
         "action": {"type": "search", "query": "rust language"}
     })];
     state.current_round_output_start = Some(0);
-    state.web_search_calls = vec![serde_json::json!({
-        "type": "web_search_call",
-        "id": "ws_fail_1",
-        "action": {"type": "search", "query": "rust language"}
-    })];
+    assign_web_search_calls(
+        &mut state,
+        vec![serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_fail_1",
+            "action": {"type": "search", "query": "rust language"}
+        })],
+    );
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -578,11 +693,14 @@ async fn on_request_body_empty_results_remain_completed() {
 
     let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
     let mut state = ResponsesState::from_request_body(body);
-    state.web_search_calls = vec![serde_json::json!({
-        "type": "web_search_call",
-        "id": "ws_empty_1",
-        "action": {"type": "search", "query": "rust language"}
-    })];
+    assign_web_search_calls(
+        &mut state,
+        vec![serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_empty_1",
+            "action": {"type": "search", "query": "rust language"}
+        })],
+    );
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -629,18 +747,21 @@ async fn on_request_body_mixed_batch_preserves_completed_and_failed() {
         }),
     ];
     state.current_round_output_start = Some(0);
-    state.web_search_calls = vec![
-        serde_json::json!({
-            "type": "web_search_call",
-            "id": "ws_ok",
-            "action": {"type": "search", "query": "rust language"}
-        }),
-        serde_json::json!({
-            "type": "web_search_call",
-            "id": "ws_fail",
-            "action": {"type": "search", "query": "rust crates"}
-        }),
-    ];
+    assign_web_search_calls(
+        &mut state,
+        vec![
+            serde_json::json!({
+                "type": "web_search_call",
+                "id": "ws_ok",
+                "action": {"type": "search", "query": "rust language"}
+            }),
+            serde_json::json!({
+                "type": "web_search_call",
+                "id": "ws_fail",
+                "action": {"type": "search", "query": "rust crates"}
+            }),
+        ],
+    );
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -706,7 +827,7 @@ async fn on_request_body_enforces_shared_max_tool_calls_across_web_search_batch(
     state.response_object = serde_json::json!({"object":"response", "output":calls.clone()});
     state.accumulated_output = calls.clone();
     state.current_round_output_start = Some(0);
-    state.web_search_calls = calls;
+    assign_web_search_calls(&mut state, calls);
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -743,11 +864,14 @@ async fn on_request_body_appends_backend_valid_continuation() {
 
     let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
     let mut state = ResponsesState::from_request_body(body);
-    state.web_search_calls = vec![serde_json::json!({
-        "type": "web_search_call",
-        "id": "ws_bridge_1",
-        "action": {"type": "search", "query": "rust language"}
-    })];
+    assign_web_search_calls(
+        &mut state,
+        vec![serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_bridge_1",
+            "action": {"type": "search", "query": "rust language"}
+        })],
+    );
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -1047,8 +1171,7 @@ fn upsert_output_item_replaces_current_round_position() {
     ];
     upsert_output_item(
         &mut accumulated,
-        1,
-        1,
+        2,
         serde_json::json!({"type": "web_search_call", "id": "duplicate", "status": "failed"}),
     );
     assert_eq!(accumulated.len(), 3, "the indexed placeholder is replaced");
@@ -1061,7 +1184,6 @@ fn upsert_output_item_appends_when_no_match() {
     let mut accumulated = vec![serde_json::json!({"type": "web_search_call", "id": "ws_1"})];
     upsert_output_item(
         &mut accumulated,
-        0,
         1,
         serde_json::json!({"type": "web_search_call", "id": "ws_2", "status": "failed"}),
     );
@@ -1083,12 +1205,10 @@ fn upsert_output_item_replaces_missing_id_placeholders_independently() {
     upsert_output_item(
         &mut accumulated,
         0,
-        0,
         serde_json::json!({"type": "web_search_call", "id": "ws_unknown", "status": "completed"}),
     );
     upsert_output_item(
         &mut accumulated,
-        0,
         1,
         serde_json::json!({"type": "web_search_call", "id": "ws_unknown", "status": "failed"}),
     );
@@ -1337,7 +1457,10 @@ async fn on_request_body_honors_client_max_tool_calls() {
 
     let body = serde_json::json!({"model": "gpt-4o", "input": "test", "max_tool_calls": 1});
     let mut state = ResponsesState::from_request_body(body);
-    state.web_search_calls = vec![web_search_call("ws_a", "first"), web_search_call("ws_b", "second")];
+    assign_web_search_calls(
+        &mut state,
+        vec![web_search_call("ws_a", "first"), web_search_call("ws_b", "second")],
+    );
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -1360,26 +1483,29 @@ async fn on_request_body_honors_client_max_tool_calls() {
     assert_eq!(state.accumulated_output[0]["status"], "completed");
     assert_eq!(state.accumulated_output[1]["id"], "ws_b");
     assert_eq!(
-        state.accumulated_output[1]["status"], "incomplete",
-        "the over-budget call is surfaced as incomplete, not executed"
+        state.accumulated_output[1]["status"], "failed",
+        "ordered max_tool_calls rejection is surfaced without execution"
     );
     assert_eq!(
         state.accumulated_output[1]["action"]["query"], "second",
         "the declined query is preserved in the incomplete item"
     );
 
-    // The model-facing bridge (state.messages) and the durable rehydration
-    // history (persisted_messages) must tell the model the truth about the
-    // over-budget call: it was not performed, not a completed empty search.
+    // The model-facing bridge and durable history must carry the bounded tool
+    // limit result used by the loop owner's deferred terminal path.
     let bridge = find_bridge_output(&state.messages, "second").expect("ws_b bridge present");
     assert_eq!(
-        bridge["output"], "Web search not performed.",
-        "the over-budget bridge must not fabricate a no-results outcome"
+        bridge["output"], TOOL_LIMIT_OUTPUT,
+        "the over-budget bridge must report the shared tool limit"
     );
     let persisted = find_bridge_output(&state.persisted_messages, "second").expect("ws_b persisted");
     assert_eq!(
-        persisted["output"], "Web search not performed.",
-        "durable history must not persist a false completed outcome"
+        persisted["output"], TOOL_LIMIT_OUTPUT,
+        "durable history must retain the shared tool-limit result"
+    );
+    assert!(
+        state.deferred_tool_limit_completion,
+        "the owner must terminalize after sibling dispatchers finish"
     );
     // The dispatched call remains a truthful bridge carrying real results.
     let dispatched = find_bridge_output(&state.messages, "first").expect("ws_a bridge present");
@@ -1417,7 +1543,8 @@ async fn on_request_body_budget_spans_iterations() {
         current[1].clone(),
     ];
     state.response_object = serde_json::json!({"output": current});
-    state.web_search_calls = state.output_items().to_vec();
+    let pending = state.output_items().to_vec();
+    assign_web_search_calls(&mut state, pending);
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -1459,7 +1586,7 @@ async fn incomplete_prior_call_still_exhausts_later_round_budget() {
         next.clone(),
     ];
     state.response_object = serde_json::json!({"output": [next.clone()]});
-    state.web_search_calls = vec![next];
+    assign_web_search_calls(&mut state, vec![next]);
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -1494,7 +1621,7 @@ async fn on_request_body_exhausted_budget_dispatches_nothing() {
         current.clone(),
     ];
     state.response_object = serde_json::json!({"output":[current.clone()]});
-    state.web_search_calls = vec![current];
+    assign_web_search_calls(&mut state, vec![current]);
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
@@ -1522,7 +1649,10 @@ async fn on_request_body_without_max_tool_calls_dispatches_all_under_cap() {
 
     let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
     let mut state = ResponsesState::from_request_body(body);
-    state.web_search_calls = vec![web_search_call("ws_f", "a"), web_search_call("ws_g", "b")];
+    assign_web_search_calls(
+        &mut state,
+        vec![web_search_call("ws_f", "a"), web_search_call("ws_g", "b")],
+    );
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();

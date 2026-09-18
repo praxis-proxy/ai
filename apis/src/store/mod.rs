@@ -137,6 +137,21 @@ impl OwnerScopedResponseStore {
             .await
     }
 
+    /// Return the raw payload size of pending approvals visible to this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn pending_approval_payload_bytes(
+        &self,
+        response_id: &str,
+        approval_ids: &[&str],
+    ) -> Result<usize, StoreError> {
+        self.store
+            .pending_approval_payload_bytes(self.owner.tenant_id(), response_id, approval_ids)
+            .await
+    }
+
     /// Atomically consume approvals issued to this owner.
     ///
     /// # Errors
