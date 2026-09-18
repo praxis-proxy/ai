@@ -42,16 +42,16 @@ const MAX_REQUEST_BODY_BYTES: usize = 16_777_216; // 16 MiB
 /// A captured HTTP request from a test client.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapturedHttpRequest {
+    /// Full request body.
+    pub body: Bytes,
+    /// Request headers observed by the backend.
+    pub headers: HeaderMap,
     /// HTTP method used by the client (e.g. `"POST"`).
     pub method: String,
     /// Path component of the request target (without query string).
     pub path: String,
     /// Query string portion of the request target, if any.
     pub query: Option<String>,
-    /// Request headers observed by the backend.
-    pub headers: HeaderMap,
-    /// Full request body.
-    pub body: Bytes,
 }
 
 /// An observation emitted by the scripted HTTP backend.
@@ -94,19 +94,19 @@ pub enum HttpBackendEvent {
 /// A deterministic response action performed after each request turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HttpServerAction {
+    /// Respond with a non-streaming JSON body.
+    Json {
+        /// JSON body to return.
+        body: String,
+        /// HTTP status code (e.g. `200`).
+        status: u16,
+    },
     /// Respond with a chunked transfer-encoded body (SSE-style frames).
     StreamSse {
         /// Pre-rendered SSE event payload lines, each terminated with `\n\n`.
         events: Vec<String>,
         /// Delay after each non-final event; zero keeps the fast fixture path.
         inter_event_delay: Duration,
-    },
-    /// Respond with a non-streaming JSON body.
-    Json {
-        /// HTTP status code (e.g. `200`).
-        status: u16,
-        /// JSON body to return.
-        body: String,
     },
 }
 
@@ -720,11 +720,11 @@ async fn read_full_request(stream: &mut tokio::net::TcpStream, peek: PeekedHttpR
     let headers = peek.headers;
     let body = Bytes::copy_from_slice(buffer.get(peek.head_bytes..)?);
     Some(CapturedHttpRequest {
+        body,
+        headers,
         method,
         path,
         query,
-        headers,
-        body,
     })
 }
 
