@@ -702,29 +702,6 @@ async fn sse_partial_then_oversized_terminal_event_sets_overflow_status() {
     );
 }
 
-/// Builds a Responses-API stream whose terminal `response.completed` event
-/// embeds an output object padded to `pad_bytes`, mirroring how agentic
-/// clients (reasoning summaries, tool items) inflate that event in
-/// production while the smaller events stay tiny.
-fn responses_stream_with_padded_completed_event(pad_bytes: usize) -> Vec<u8> {
-    let mut events =
-        b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_pad\"}}\n\n"
-            .to_vec();
-    events.extend_from_slice(
-        b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
-    );
-    events.extend_from_slice(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_pad\",\"output\":[{\"type\":\"output_text\",\"text\":\"");
-    events.extend(std::iter::repeat_n(b'x', pad_bytes));
-    events.extend_from_slice(
-        b"\"}],\"usage\":{\"input_tokens\":62000,\"output_tokens\":13000,\"total_tokens\":75000}}}\n\n",
-    );
-    events
-}
-
-/// The `response.completed` event embeds the full response object and
-/// routinely exceeds the pre-fix 64 KiB scratch default. At the default
-/// the usage must still be captured; when it was skipped, gateways that
-/// forward counts to billing booked real spend as zero.
 #[tokio::test]
 async fn sse_responses_completed_event_larger_than_64kib_captured_at_default_scratch() {
     let filter = make_filter(ProviderKind::OpenAi);
@@ -748,10 +725,6 @@ async fn sse_responses_completed_event_larger_than_64kib_captured_at_default_scr
     );
 }
 
-/// Pinning the documented skip semantics: a chain's `max_scratch_bytes`
-/// deliberately set (back) to 64 KiB still drops the oversized terminal
-/// event, yields no usage, and flags the row `overflow` rather than
-/// leaving consumers to guess between zero usage and lost usage.
 #[tokio::test]
 async fn sse_responses_completed_event_beyond_scratch_marks_overflow() {
     let mut filter = make_filter(ProviderKind::OpenAi);
@@ -1585,6 +1558,25 @@ async fn json_bedrock_anthropic_fallback_records_thinking_tokens() {
 // -----------------------------------------------------------------------------
 
 use std::fmt::Write as _;
+
+/// Builds a Responses-API stream whose terminal `response.completed` event
+/// embeds an output object padded to `pad_bytes`, mirroring how agentic
+/// clients (reasoning summaries, tool items) inflate that event in
+/// production while the smaller events stay tiny.
+fn responses_stream_with_padded_completed_event(pad_bytes: usize) -> Vec<u8> {
+    let mut events =
+        b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_pad\"}}\n\n"
+            .to_vec();
+    events.extend_from_slice(
+        b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+    );
+    events.extend_from_slice(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_pad\",\"output\":[{\"type\":\"output_text\",\"text\":\"");
+    events.extend(std::iter::repeat_n(b'x', pad_bytes));
+    events.extend_from_slice(
+        b"\"}],\"usage\":{\"input_tokens\":62000,\"output_tokens\":13000,\"total_tokens\":75000}}}\n\n",
+    );
+    events
+}
 
 fn make_filter(provider: ProviderKind) -> TokenCountFilter {
     TokenCountFilter {
