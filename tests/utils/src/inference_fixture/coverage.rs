@@ -1232,6 +1232,7 @@ mod tests {
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
                 vec!["messages_native_passthrough"],
@@ -1264,6 +1265,7 @@ mod tests {
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
@@ -1298,6 +1300,7 @@ mod tests {
             vec![
                 "messages/basic-nonstream",
                 "messages/basic-stream",
+                "messages/invalid-tool-id",
                 "messages/malformed-success",
                 "messages/malformed-tool-arguments",
                 "messages/native-basic-nonstream",
@@ -1355,6 +1358,10 @@ mod tests {
                 (
                     &"messages.response.malformed_tool_arguments".to_owned(),
                     &vec!["messages/malformed-tool-arguments".to_owned()]
+                ),
+                (
+                    &"messages.response.invalid_tool_id".to_owned(),
+                    &vec!["messages/invalid-tool-id".to_owned()]
                 ),
                 (
                     &"messages.streaming.usage".to_owned(),
@@ -1506,7 +1513,7 @@ mod tests {
                 ("vllm", CoverageStatus::LiveCovered),
             ]
         );
-        for feature in &manifest.features[3..4] {
+        for feature in &manifest.features[3..5] {
             assert_eq!(
                 feature
                     .providers
@@ -1517,7 +1524,7 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[4]
+            manifest.features[5]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
@@ -1527,7 +1534,7 @@ mod tests {
                 ("vllm", CoverageStatus::LiveCovered),
             ]
         );
-        for feature in &manifest.features[5..7] {
+        for feature in &manifest.features[6..8] {
             assert_eq!(
                 feature
                     .providers
@@ -1537,7 +1544,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[7..10] {
+        for feature in &manifest.features[8..11] {
             assert_eq!(
                 feature
                     .providers
@@ -1547,7 +1554,7 @@ mod tests {
                 vec![("anthropic", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[10..13] {
+        for feature in &manifest.features[11..14] {
             assert_eq!(
                 feature
                     .providers
@@ -1560,7 +1567,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[13..] {
+        for feature in &manifest.features[14..] {
             assert_eq!(
                 feature
                     .providers

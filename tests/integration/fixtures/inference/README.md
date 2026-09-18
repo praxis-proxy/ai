@@ -27,6 +27,7 @@ The manifest declares **27 features** across **6 scopes**, linked to **27 scenar
 | `messages_to_chat_completions` | `messages.request.client_tool_ownership` | `synthetic_only` | `messages/typed-server-tools` | `synthetic`: `synthetic_only` |
 | `messages_to_chat_completions` | `messages.response.text` | `live_covered` | `messages/basic-nonstream`<br>`messages/basic-stream` | `openai`: `covered`<br>`vllm`: `live_covered` |
 | `messages_to_chat_completions` | `messages.response.malformed_tool_arguments` | `synthetic_only` | `messages/malformed-tool-arguments` | `synthetic`: `synthetic_only` |
+| `messages_to_chat_completions` | `messages.response.invalid_tool_id` | `synthetic_only` | `messages/invalid-tool-id` | `synthetic`: `synthetic_only` |
 | `messages_to_chat_completions` | `messages.streaming.usage` | `live_covered` | `messages/basic-stream` | `openai`: `live_covered`<br>`vllm`: `live_covered` |
 | `messages_to_chat_completions` | `messages.error.upstream` | `synthetic_only` | `messages/upstream-error` | `synthetic`: `synthetic_only` |
 | `messages_to_chat_completions` | `messages.error.malformed_success` | `synthetic_only` | `messages/malformed-success` | `synthetic`: `synthetic_only` |
