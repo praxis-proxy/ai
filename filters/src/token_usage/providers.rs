@@ -288,17 +288,27 @@ struct BedrockConverseResponse {
 }
 
 /// `Bedrock` Converse API usage object.
+///
+/// When prompt caching is enabled, `input_tokens` is the uncached remainder;
+/// cached tokens are reported separately as `cache_read_input_tokens` /
+/// `cache_write_input_tokens` and already counted in `total_tokens`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BedrockConverseUsage {
-    /// Tokens in the input.
+    /// Uncached tokens in the input.
     input_tokens: u64,
 
     /// Tokens in the output.
     output_tokens: u64,
 
-    /// Total tokens (optional).
+    /// Total tokens (optional). Includes cache read/write when caching is on.
     total_tokens: Option<u64>,
+
+    /// Tokens read from the prompt cache. Not included in `input_tokens`.
+    cache_read_input_tokens: Option<u64>,
+
+    /// Tokens written to the prompt cache. Not included in `input_tokens`.
+    cache_write_input_tokens: Option<u64>,
 }
 
 /// Parses AWS `Bedrock` response format.
@@ -323,25 +333,36 @@ struct BedrockConverseUsage {
 ///
 /// # Prompt Caching
 ///
-/// The Converse API reports cache counts under a different shape than the one
-/// parsed here, so no cache breakdown is recorded for it. It also has no
-/// documented reasoning-token field. Claude via `InvokeModel` gets both the
+/// The Converse API reports cache counts as `cacheReadInputTokens` /
+/// `cacheWriteInputTokens`, which are **not** included in `inputTokens`.
+/// Those fields are folded into [`TokenUsage::input_tokens`] the same way
+/// [`parse_anthropic`] folds `cache_read_input_tokens` /
+/// `cache_creation_input_tokens`, and kept as a cache breakdown so M4
+/// weights can discount them. Claude via `InvokeModel` gets both the
 /// cache and thinking breakdowns through the Anthropic fallback below.
 pub(super) fn parse_bedrock(body: &[u8]) -> Option<TokenUsage> {
     // Try Converse API format first (AWS recommended, works with all models)
     if let Ok(response) = serde_json::from_slice::<BedrockConverseResponse>(body)
         && let Some(usage) = response.usage
     {
-        return Some(TokenUsage::new(
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.total_tokens,
-        ));
+        return Some(bedrock_converse_usage(&usage));
     }
 
     // Fall back to Claude/Anthropic format (Claude via InvokeModel)
     // Claude via Bedrock InvokeModel uses the same format as direct Anthropic API
     parse_anthropic(body)
+}
+
+/// Converts a Converse API usage object, folding cache tokens into input
+/// the same way [`parse_anthropic`] does.
+fn bedrock_converse_usage(usage: &BedrockConverseUsage) -> TokenUsage {
+    let cache_read = usage.cache_read_input_tokens;
+    let cache_write = usage.cache_write_input_tokens;
+    let actual_input = usage
+        .input_tokens
+        .saturating_add(cache_read.unwrap_or(0))
+        .saturating_add(cache_write.unwrap_or(0));
+    TokenUsage::new(actual_input, usage.output_tokens, usage.total_tokens).with_cache(cache_read, cache_write)
 }
 
 #[cfg(test)]
@@ -833,25 +854,63 @@ mod tests {
     }
 
     #[test]
-    fn bedrock_converse_reports_no_cache() {
+    fn bedrock_converse_reports_no_cache_when_fields_omitted() {
         let json = br#"{"usage": {"inputTokens": 10, "outputTokens": 20}}"#;
         let usage = parse_bedrock(json).unwrap();
 
         assert_eq!(
             usage.cache_read_tokens(),
             None,
-            "the Converse cache shape is not parsed, so no cache read is claimed"
+            "omitted Converse cache fields mean no cache information"
         );
         assert_eq!(
             usage.cache_write_tokens(),
             None,
-            "the Converse cache shape is not parsed, so no cache write is claimed"
+            "omitted Converse cache fields mean no cache write is claimed"
         );
         assert_eq!(
             usage.reasoning_tokens(),
             None,
             "the Converse usage shape has no reasoning field"
         );
+    }
+
+    #[test]
+    fn bedrock_converse_cache_tokens_are_folded_into_input() {
+        let json = br#"{"usage": {
+            "inputTokens": 9,
+            "outputTokens": 214,
+            "cacheReadInputTokens": 1066,
+            "totalTokens": 1289
+        }}"#;
+        let usage = parse_bedrock(json).unwrap();
+
+        assert_eq!(
+            usage.input_tokens(),
+            1075,
+            "uncached 9 + cache read 1066, matching Anthropic normalization"
+        );
+        assert_eq!(usage.output_tokens(), 214);
+        assert_eq!(usage.total_tokens(), 1289);
+        assert_eq!(usage.cache_read_tokens(), Some(1066));
+        assert_eq!(usage.cache_write_tokens(), None);
+    }
+
+    #[test]
+    fn bedrock_converse_cache_write_is_folded_into_input() {
+        let json = br#"{"usage": {
+            "inputTokens": 10,
+            "outputTokens": 20,
+            "cacheReadInputTokens": 200,
+            "cacheWriteInputTokens": 100,
+            "totalTokens": 330
+        }}"#;
+        let usage = parse_bedrock(json).unwrap();
+
+        assert_eq!(usage.input_tokens(), 310, "10 + 200 read + 100 write");
+        assert_eq!(usage.cache_read_tokens(), Some(200));
+        assert_eq!(usage.cache_write_tokens(), Some(100));
+        assert_eq!(usage.total_tokens(), 330);
     }
 
     #[test]

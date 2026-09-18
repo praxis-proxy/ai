@@ -1,4 +1,5 @@
 # Compact Filter Example
+# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
 #
 # Demonstrates compaction after rehydrate, file resolve, and document
 # extract so rewritten current-turn content survives history

@@ -10,6 +10,12 @@ repository.workspace = true
 readme = "../README.md"
 publish = false
 
+[features]
+default = ["store-postgres"]
+store-postgres = ["praxis-ai/store-postgres", "praxis-ai-apis/store-postgres", "praxis-test-utils/store-postgres"]
+store-sqlite = ["praxis-ai/store-sqlite", "praxis-ai-apis/store-sqlite", "praxis-test-utils/store-sqlite"]
+store-all = ["store-postgres", "store-sqlite"]
+
 [lints]
 workspace = true
 
@@ -17,7 +23,7 @@ workspace = true
 clap = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
-praxis-ai = { path = "../server", package = "praxis-ai-proxy" }
+praxis-ai = { path = "../server", package = "praxis-ai-proxy", default-features = false }
 praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }
 praxis-test-utils = { workspace = true }

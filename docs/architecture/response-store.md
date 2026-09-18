@@ -25,6 +25,27 @@ The filter layer lives in the OpenAI responses module
 and handles HTTP lifecycle concerns. The storage layer
 is a generic async trait shared across providers.
 
+## Backend Features
+
+PostgreSQL is the default production backend. The same feature selection
+applies to both the Responses store and the Conversations store:
+
+| Feature | Backends |
+|---------|----------|
+| `store-postgres` | PostgreSQL through SQLx native TLS (default) |
+| `store-sqlite` | SQLite only |
+| `store-all` | PostgreSQL and SQLite |
+
+SQLite examples require an explicit build:
+
+```console
+cargo run -p praxis-ai-proxy --no-default-features --features store-sqlite -- \
+  -c examples/configs/openai/responses/response-store.yaml
+```
+
+A configuration that selects a backend absent from the binary is rejected
+while the filter pipeline is constructed, before the proxy serves traffic.
+
 ## Request Phases
 
 The filter spans three Pingora phases, each refining

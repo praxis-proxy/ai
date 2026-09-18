@@ -983,6 +983,7 @@ fn parse_compact_request_body_with_previous_response_id() {
 }
 
 #[tokio::test]
+#[cfg(feature = "store-sqlite")]
 async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
     let backend: std::sync::Arc<dyn crate::store::ResponseStore> = std::sync::Arc::new(
         crate::store::SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", None, None)

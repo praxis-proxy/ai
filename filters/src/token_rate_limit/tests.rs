@@ -6,7 +6,10 @@
 use praxis_filter::{FilterAction, HttpFilter};
 
 use super::TokenRateLimitFilter;
-use crate::token_usage::META_TOKEN_TOTAL;
+use crate::token_usage::{
+    META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
+    META_TOKEN_STATUS, META_TOKEN_TOTAL, TOKEN_STATUS_OVERFLOW,
+};
 
 /// Wrap one rule body (already-valid YAML lines, unindented) into a
 /// full one-rule `rules:` config, named `"default"`. Most scenarios
@@ -714,7 +717,7 @@ fn debug_format_lists_configured_rule_names() {
     let rules = cfg
         .rules
         .into_iter()
-        .map(|rule| super::compile_rule(rule, &backend))
+        .map(|rule| super::compile_rule(rule, &backend, super::TokenWeights::UNITY))
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let needs_body = rules.iter().any(|r| r.estimation.needs_body());
@@ -935,6 +938,23 @@ fn from_config_rejects_non_finite_refill_rate_from_yaml() {
         assert!(
             err.to_string().contains("refill_rate"),
             "got: {err} for refill_rate: {literal}"
+        );
+    }
+}
+
+#[test]
+fn from_config_rejects_non_finite_or_negative_default_weights_from_yaml() {
+    for literal in [".nan", ".inf", "-.inf", "-0.1"] {
+        let yaml = single_rule_yaml_with(
+            &format!("default_weights:\n  cached_input: {literal}"),
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+        );
+        let err = TokenRateLimitFilter::from_config(&yaml)
+            .err()
+            .unwrap_or_else(|| panic!("cached_input: {literal} must be rejected"));
+        assert!(
+            err.to_string().contains("cached_input"),
+            "got: {err} for cached_input: {literal}"
         );
     }
 }
@@ -1946,5 +1966,351 @@ async fn model_scaled_outer_multiplier_composes_with_per_model_multiplier() {
         ctx.get_metadata("token_rate_limit.estimate").unwrap(),
         "300",
         "gpt-4 with outer multiplier 1.5 × model multiplier 2.0 = 3.0 × 100 = 300"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// M4 token-type weights
+// -----------------------------------------------------------------------------
+
+fn set_typed_usage(ctx: &mut praxis_filter::HttpFilterContext<'_>, input: u64, output: u64, total: u64) {
+    ctx.set_metadata(META_TOKEN_INPUT, input.to_string());
+    ctx.set_metadata(META_TOKEN_OUTPUT, output.to_string());
+    ctx.set_metadata(META_TOKEN_TOTAL, total.to_string());
+}
+
+#[tokio::test]
+async fn weighted_cache_hit_refunds_more_than_token_total() {
+    // input 100 (90 cached) + output 10, total 110.
+    // weighted with cached_input 0.1: 10 + 9 + 10 = 29.
+    // Reserve 50 → refund 21 → 71 remain → next 50 fits.
+    let yaml = single_rule_yaml_with(
+        "default_weights:\n  cached_input: 0.1",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    set_typed_usage(&mut ctx, 100, 10, 110);
+    ctx.set_metadata(META_TOKEN_CACHE_READ, "90");
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Continue),
+        "weighted cost 29 of 100 should leave room for another 50-token reservation"
+    );
+}
+
+#[tokio::test]
+async fn unweighted_total_of_the_same_cached_request_would_starve_the_window() {
+    // Control: same counts as weighted_cache_hit_refunds_more_than_token_total
+    // but no default_weights, and only token.total=110 is published (the
+    // fallback path). 50 reserved, 110 actual → window holds 110 of 100,
+    // next 50 is denied.
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    ctx.set_metadata(META_TOKEN_TOTAL, "110");
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Reject(_)),
+        "charging token.total=110 against capacity 100 must starve the next 50-token request"
+    );
+}
+
+#[tokio::test]
+async fn per_rule_weight_overlay_is_isolated_from_filter_defaults() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "default_weights:\n\
+         \x20 cached_input: 0.1\n\
+         rules:\n\
+         \x20 - name: cheap-cache\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: cheap\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   reserved_tokens: 50\n\
+         \x20   weights:\n\
+         \x20     cached_input: 0.0\n\
+         \x20 - name: default-cache\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: full\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 75\n\
+         \x20   reserved_tokens: 50\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    // cheap-cache: uncached 10 + cache 90*0 + output 10 = 20. Refund 30.
+    let cheap_req = make_request_with_header("x-app-id", "cheap");
+    let mut cheap_ctx = crate::test_utils::make_filter_context(&cheap_req);
+    drop(filter.on_request(&mut cheap_ctx).await.unwrap());
+    set_typed_usage(&mut cheap_ctx, 100, 10, 110);
+    cheap_ctx.set_metadata(META_TOKEN_CACHE_READ, "90");
+    let mut body = None;
+    drop(filter.on_response_body(&mut cheap_ctx, &mut body, true).unwrap());
+
+    let mut cheap_next = crate::test_utils::make_filter_context(&cheap_req);
+    assert!(
+        matches!(
+            filter.on_request(&mut cheap_next).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "cached_input 0.0 should charge only 20, leaving room for another 50"
+    );
+
+    // default-cache uses filter cached_input 0.1 on the same typed counts:
+    // cost 29. capacity 75 → remaining 46, so the next 50-token reserve
+    // is denied. If the 0.0 overlay leaked onto this rule, cost would be
+    // 20, remaining 55, and the next reserve would be admitted.
+    let full_req = make_request_with_header("x-app-id", "full");
+    let mut full_ctx = crate::test_utils::make_filter_context(&full_req);
+    drop(filter.on_request(&mut full_ctx).await.unwrap());
+    set_typed_usage(&mut full_ctx, 100, 10, 110);
+    full_ctx.set_metadata(META_TOKEN_CACHE_READ, "90");
+    drop(filter.on_response_body(&mut full_ctx, &mut body, true).unwrap());
+    let mut full_next = crate::test_utils::make_filter_context(&full_req);
+    assert!(
+        matches!(
+            filter.on_request(&mut full_next).await.unwrap(),
+            FilterAction::Reject(_)
+        ),
+        "filter-wide cached_input 0.1 must still apply (cost 29 of 75); a leaked 0.0 overlay would admit"
+    );
+}
+
+#[tokio::test]
+async fn google_additive_reasoning_does_not_drop_visible_output() {
+    // input 50 + output 80 + reasoning 200, total 330, reasoning weight 0.9
+    // additive cost 50+80+180 = 310. Nested subtract would charge ~50+180.
+    let yaml = single_rule_yaml_with(
+        "default_weights:\n  reasoning: 0.9",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 400\nreserved_tokens: 50",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    set_typed_usage(&mut ctx, 50, 80, 330);
+    ctx.set_metadata(META_TOKEN_REASONING, "200");
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    // 400 - 310 = 90 remaining. A 50-token reserve fits; a third does not.
+    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Continue),
+        "310 of 400 used should admit another 50"
+    );
+    let mut third_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(
+            filter.on_request(&mut third_ctx).await.unwrap(),
+            FilterAction::Reject(_)
+        ),
+        "90 remaining after the second 50-token reserve should deny a third"
+    );
+}
+
+#[tokio::test]
+async fn openai_nested_reasoning_is_not_double_counted() {
+    // input 120, output 800 (640 reasoning nested), total 920, reasoning 0.9
+    // nested cost = 120 + 160 + 576 = 856. Additive would be 120+800+576 = 1496.
+    // capacity 1000: nested leaves 144 (next 50 admits); additive overshoots (denies).
+    let yaml = single_rule_yaml_with(
+        "default_weights:\n  reasoning: 0.9",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 50",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    set_typed_usage(&mut ctx, 120, 800, 920);
+    ctx.set_metadata(META_TOKEN_REASONING, "640");
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Continue),
+        "nested reasoning cost 856 of 1000 must leave room for another 50; additive 1496 would not"
+    );
+}
+
+#[tokio::test]
+async fn overflow_status_keeps_the_reservation_estimate() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    set_typed_usage(&mut ctx, 10, 10, 20);
+    ctx.set_metadata(META_TOKEN_STATUS, TOKEN_STATUS_OVERFLOW);
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    // Settled at the 50-token estimate, not the 20 typed cost: 50 of 100 used,
+    // a second 50 fits exactly, a third does not.
+    let mut second = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut second).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut third = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut third).await.unwrap(),
+        FilterAction::Reject(_)
+    ));
+}
+
+#[tokio::test]
+async fn large_finite_weight_does_not_settle_at_zero() {
+    // 1e308 is finite (config accepts it) but 2 × 1e308 overflows to +inf.
+    // Saturating to COST_U64_CAP starves capacity 100. Settling at 0 would
+    // refund the 50-token reservation and admit the next request.
+    let yaml = single_rule_yaml_with(
+        "default_weights:\n  input: 1.0e308",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    set_typed_usage(&mut ctx, 2, 0, 2);
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Reject(_)),
+        "overflowed weighted cost must saturate, not settle at zero and refund the reservation"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_cache_write_weight_is_applied() {
+    // token.input = 6050 = 50 uncached + 5000 read + 1000 write, output 100.
+    // cached_input 0.1, cache_write 1.25 → 50 + 500 + 1250 + 100 = 1900.
+    let yaml = single_rule_yaml_with(
+        "default_weights:\n  cached_input: 0.1\n  cache_write: 1.25",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 2000\nreserved_tokens: 50",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    set_typed_usage(&mut ctx, 6050, 100, 6150);
+    ctx.set_metadata(META_TOKEN_CACHE_READ, "5000");
+    ctx.set_metadata(META_TOKEN_CACHE_WRITE, "1000");
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    // 2000 - 1900 = 100 left. 50 fits, second 50 after that would also fit
+    // (100 >= 50, then 50 left), third would fail. Two more 50s then deny.
+    let mut a = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut a).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut b = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut b).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut c = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut c).await.unwrap(),
+        FilterAction::Reject(_)
+    ));
+}
+
+#[tokio::test]
+async fn bedrock_cache_hidden_in_total_is_not_dropped() {
+    // Pre-normalization Converse metadata: inputTokens is uncached-only,
+    // cache lives only in token.total. Residual must charge 1289, not 223.
+    // capacity 1300, reserved 50 → remaining 11, so the next 50 is denied.
+    // Without the residual the next reserve would fit.
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1300\nreserved_tokens: 50");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    set_typed_usage(&mut ctx, 9, 214, 1289);
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Reject(_)),
+        "uncovered Bedrock cache in token.total must be charged; cost 223 would admit the next 50"
+    );
+}
+
+#[tokio::test]
+async fn bedrock_normalized_cache_breakdown_applies_cached_input_weight() {
+    // After parse_bedrock folds cache into input: 9+1066=1075, cache_read 1066.
+    // cached_input 0.1 → cost 330. capacity 380, reserved 50 → remaining 50,
+    // so the next 50 admits and a third is denied. Residual-at-input-weight
+    // would charge 1289 and deny the second request.
+    let yaml = single_rule_yaml_with(
+        "default_weights:\n  cached_input: 0.1",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 380\nreserved_tokens: 50",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    set_typed_usage(&mut ctx, 1075, 214, 1289);
+    ctx.set_metadata(META_TOKEN_CACHE_READ, "1066");
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let mut second = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut second).await.unwrap(), FilterAction::Continue),
+        "normalized Bedrock cache must take cached_input 0.1 (cost 330 of 380)"
+    );
+    let mut third = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut third).await.unwrap(), FilterAction::Reject(_)),
+        "50 remaining after the second 50-token reserve should deny a third"
+    );
+}
+
+#[tokio::test]
+async fn token_bucket_applies_the_same_weighted_cost() {
+    let yaml = single_rule_yaml_with(
+        "default_weights:\n  cached_input: 0.1",
+        "algorithm: token_bucket\ncapacity: 100\nrefill_rate: 0.0001\nreserved_tokens: 50",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    set_typed_usage(&mut ctx, 100, 10, 110);
+    ctx.set_metadata(META_TOKEN_CACHE_READ, "90");
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    // Bucket started at 100, reserved 50, credited back 21 (50-29) → 71.
+    // Next 50 fits.
+    let mut next_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut next_ctx).await.unwrap(), FilterAction::Continue),
+        "token_bucket must apply the same partitioned weighted cost as sliding_window"
     );
 }

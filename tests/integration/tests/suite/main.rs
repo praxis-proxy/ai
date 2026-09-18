@@ -41,7 +41,9 @@ mod a2a;
 mod agentic_mocks;
 mod anthropic_messages;
 mod claude_code;
+#[cfg(feature = "store-sqlite")]
 mod codex_websocket;
+#[cfg(feature = "store-sqlite")]
 mod conversations_rehydrate;
 mod error_response_formatter;
 mod examples;
@@ -51,6 +53,7 @@ mod harness;
 mod inference_fixtures;
 mod mcp;
 mod mcp_broker;
+#[cfg(feature = "store-sqlite")]
 mod openai_mcp_tool_resolve;
 mod openai_responses_format;
 mod openai_responses_model_rewrite;

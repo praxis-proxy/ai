@@ -9,7 +9,7 @@ Token-denominated rate limiter: reserves an estimated cost at admission, reconci
 
 Experimental: requires the `token-rate-limit-filter` cargo feature, which is off by default and activates the `experimental` marker. This filter delivers the agreed M1/M2/M6 milestone scope, but its parent proposal is not yet `accepted` and open questions remain (HA/clustered-Valkey failure modes, and the relationship to Kuadrant's `TokenRateLimitPolicy` -- see `ai#127`). The configuration surface may change between releases.
 
-Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting` proposal in `praxis-proxy/enhancements`, scoped to this milestone's static header-value matchers and per-rule algorithm choice. CEL matchers, soft-limit tiers, and weighted per-type accounting are still out of scope (see the module doc comment) -- upstream itself defers the first two; per-type accounting is deferred to a separate follow-up by design, not by upstream mandate. Configurable estimation strategies (M3) are now supported via the `estimation:` block (see [`EstimationConfig`]).
+Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting` proposal in `praxis-proxy/enhancements`, scoped to this milestone's static header-value matchers, per-rule algorithm choice, configurable estimation strategies (M3, see [`EstimationConfig`]), and M4 token-type weights (`default_weights` / per-rule `weights`). CEL matchers and soft-limit tiers are still out of scope (see the module doc comment) -- upstream itself defers those.
 
 Assumes request identity has already been resolved upstream (this filter doesn't authenticate callers) -- a catch-all rule (no `match:`) reserves quota for every request that reaches it, including probes and health checks. Scope rules with explicit `match:` conditions, or place an identity/auth filter earlier in the pipeline. Tracked as follow-on integration work in `grid#101`.
 
@@ -35,11 +35,23 @@ Assumes request identity has already been resolved upstream (this filter doesn't
 | `rules[].estimation.default_multiplier` | number | no | Default multiplier for models not listed in `model_multipliers`. |
 | `rules[].estimation.bytes_per_token` | number | no | Approximate bytes-per-token ratio for `input_plus_max_tokens`. Defaults to 4.0. |
 | `rules[].reservation_timeout` | string | no | How long an admitted-but-never-reconciled reservation (lost request: timeout, connection reset, upstream crash) is tracked as active before that already-reserved-at-admission charge against its estimate becomes irreversibly locked in (sliding-window: folded into the settled total so it survives the window's normal aging-out; token-bucket: the tokens were already decremented at reserve time regardless, this only bounds how long the reservation is tracked as pending). This does **not** defer when the charge first applies -- it applies immediately at admission, same as any other reservation. Answers the proposal's still-open "lost request handling" question for this milestone. Defaults to [`DEFAULT_RESERVATION_TIMEOUT`] when unset. |
+| `rules[].weights` | TokenTypeWeightsConfig | no | Optional per-rule overlay on [`TokenRateLimitConfig::default_weights`]. Omitted types inherit the filter defaults (then `1.0`). |
+| `rules[].weights.input` | number | no | Weight for uncached input tokens (the residual of `token.input` after subtracting cache read/write). Defaults to `1.0` when omitted. |
+| `rules[].weights.output` | number | no | Weight for visible output tokens (the residual of `token.output` after subtracting nested reasoning). Defaults to `1.0` when omitted. |
+| `rules[].weights.cached_input` | number | no | Weight for prompt-cache hits (`token.cache_read`). A value below `1.0` cheapens cached input; the proposal's example is `0.1`. |
+| `rules[].weights.cache_write` | number | no | Weight for prompt-cache writes (`token.cache_write`). Anthropic cache creation is typically priced *above* uncached input; omit to keep `1.0`. |
+| `rules[].weights.reasoning` | number | no | Weight for reasoning / thinking tokens (`token.reasoning`). |
 | `key` | `global` \| `authenticated_subject` | no | Trusted request identity used to partition each rule's budget. The default preserves the historical single global bucket. |
 | `backend` | BackendConfig | no | Where every rule's admission state lives: in-process (default, one budget per gateway instance) or a shared Valkey backend (one budget shared across every gateway instance/replica). One backend for the whole filter, not per rule -- rules already share Valkey key-space isolation via `namespace`/rule-name hashing, so per-rule backend selection bought no isolation benefit, only a separate Valkey connection per rule pointed at the same URL. Revisit if a real deployment ever needs to mix in-process and Valkey rules in one filter instance. |
 | `backend.kind` | `memory` \| `valkey` | no | Which backend implementation to use. |
 | `backend.url` | string | no | Backend connection URL. Supports one `${ENV_VAR}` reference, so credentials/hostnames don't need to be committed to config. Required when `kind: valkey`, ignored otherwise. |
 | `backend.namespace` | string | no | Key namespace prefix, so multiple filter rules or deployments can share one Valkey instance without colliding. Ignored for `kind: memory`. Defaults to `"praxis:token_rate_limit"` when unset. |
+| `default_weights` | TokenTypeWeightsConfig | no | Filter-wide default per-type weights applied at reconciliation (proposal M4). Omitted types default to `1.0`. Rules may overlay individual types via [`RuleConfig::weights`]. Admission still reserves the estimation/`reserved_tokens` cost unweighted. |
+| `default_weights.input` | number | no | Weight for uncached input tokens (the residual of `token.input` after subtracting cache read/write). Defaults to `1.0` when omitted. |
+| `default_weights.output` | number | no | Weight for visible output tokens (the residual of `token.output` after subtracting nested reasoning). Defaults to `1.0` when omitted. |
+| `default_weights.cached_input` | number | no | Weight for prompt-cache hits (`token.cache_read`). A value below `1.0` cheapens cached input; the proposal's example is `0.1`. |
+| `default_weights.cache_write` | number | no | Weight for prompt-cache writes (`token.cache_write`). Anthropic cache creation is typically priced *above* uncached input; omit to keep `1.0`. |
+| `default_weights.reasoning` | number | no | Weight for reasoning / thinking tokens (`token.reasoning`). |
 
 ## Example
 
@@ -49,6 +61,12 @@ backend:                           # optional: defaults to in-process state, sha
   kind: valkey                      # memory (default) | valkey
   url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
   namespace: praxis:token_rate_limit
+default_weights:                   # optional: omitted types default to 1.0
+  input: 1.0
+  output: 1.0
+  cached_input: 0.1                # prompt-cache hits (token.cache_read)
+  cache_write: 1.25                # prompt-cache writes (token.cache_write)
+  reasoning: 0.9                   # thinking tokens (token.reasoning)
 rules:
   - name: team-alpha                 # human-readable, unique per filter instance
     match:                           # optional: omit for a catch-all rule
@@ -61,6 +79,8 @@ rules:
       strategy: max_tokens           # fixed | max_tokens | input_plus_max_tokens | model_scaled
       multiplier: 1.2                # optional safety margin (default: 1.0)
       fallback_estimate: 500         # used when max_tokens absent from request
+    weights:                         # optional per-rule overlay on default_weights
+      cached_input: 0.05
   - name: team-beta
     match:
       headers:

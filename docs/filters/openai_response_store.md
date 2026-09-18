@@ -22,8 +22,9 @@ Persists Responses API responses to the configured response store backend.
 
 ```yaml
 filter: openai_response_store
-backend: sqlite
-database_url: sqlite://responses.db?mode=rwc
+backend: postgres
+database_url: postgres://praxis:password@db.example.com/praxis
 responses_table: openai_responses
 conversations_table: openai_conversation_messages
+allow_private_database_url: true
 ```
