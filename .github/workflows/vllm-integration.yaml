@@ -508,7 +508,7 @@ jobs:
               -e HUGGING_FACE_HUB_TOKEN \
               "$image" \
               --model "$model" \
-              --max-model-len 4096 \
+              --max-model-len 16384 \
               --served-model-name "$model" \
               --enable-auto-tool-choice \
               --tool-call-parser hermes \
