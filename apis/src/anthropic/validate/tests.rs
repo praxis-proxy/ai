@@ -61,6 +61,34 @@ fn malformed_nested_json_and_trailing_data_are_rejected() {
 }
 
 #[test]
+fn deeply_nested_json_is_fully_validated() {
+    let mut body = String::from(r#"{"deep":"#);
+    for depth in 0..256 {
+        if depth % 2 == 0 {
+            body.push_str(r#"{"deep":"#);
+        } else {
+            body.push('[');
+        }
+    }
+    body.push_str("null");
+    for depth in (0..256).rev() {
+        body.push(if depth % 2 == 0 { '}' } else { ']' });
+    }
+    body.push('}');
+
+    assert!(
+        validate_request(body.as_bytes()).is_none(),
+        "a valid object with 256 nested arrays and objects should pass"
+    );
+
+    body.pop();
+    assert!(
+        validate_request(body.as_bytes()).is_some(),
+        "the same deeply nested object with a missing delimiter should fail"
+    );
+}
+
+#[test]
 fn non_object_json_rejected() {
     let body = br#"[]"#;
     let rejection = validate_request(body);
