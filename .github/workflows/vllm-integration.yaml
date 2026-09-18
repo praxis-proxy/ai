@@ -59,6 +59,13 @@ env:
   # The model is downloaded from Hugging Face at container start (not baked in),
   # unlike the CPU image above.
   VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
+  # Model served on the GPU runner. A capable model is required for reliable
+  # tool-calling (file_search, MCP) — the 0.6B CPU model above is not. Qwen3-8B
+  # fits the A10G (24GB) used by the g5.xlarge GPU runner with FlashAttention-2.
+  VLLM_GPU_MODEL: "Qwen/Qwen3-8B"
+  # Instance type for the ephemeral GPU runner. g5.xlarge = A10G (24GB, compute
+  # capability 8.6, so FlashAttention-2 is available).
+  GPU_INSTANCE_TYPE: "g5.xlarge"
   # llm-d-inference-sim v0.11.2 multi-architecture image index.
   INFERENCE_SIM_IMAGE: "ghcr.io/llm-d/llm-d-inference-sim@sha256:32144df791330a0006b747edfdf2b114a0fe728e023a9d1b3463eeb48d32abb9"
   INFERENCE_SIM_MODEL: "praxis-test-model"
@@ -430,6 +437,7 @@ jobs:
           ami-id: ${{ vars.AWS_GPU_AMI_ID }}
           subnet-id: ${{ vars.AWS_SUBNET_ID || vars.US_EAST_2A_SUBNET_ID }}
           security-group-id: ${{ vars.AWS_SECURITY_GROUP_ID || vars.US_EAST_2_SG_ID }}
+          instance-type: ${{ env.GPU_INSTANCE_TYPE }}
           github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
 
   vllm-gpu-full-suite:
@@ -490,13 +498,13 @@ jobs:
             -p 8000:8000 \
             -e HUGGING_FACE_HUB_TOKEN \
             "$VLLM_GPU_IMAGE" \
-            --model "$VLLM_MODEL" \
+            --model "$VLLM_GPU_MODEL" \
             --max-model-len 4096 \
-            --served-model-name "$VLLM_MODEL" \
+            --served-model-name "$VLLM_GPU_MODEL" \
             --enable-auto-tool-choice \
             --tool-call-parser hermes \
             --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization 0.7
+            --gpu-memory-utilization 0.9
 
       - name: Pre-install OGX dependencies
         run: |
@@ -550,6 +558,7 @@ jobs:
       - name: Run complete live vLLM Responses suite
         env:
           VLLM_TEST_BACKEND: live
+          VLLM_MODEL: ${{ env.VLLM_GPU_MODEL }}
         run: |
           uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 
