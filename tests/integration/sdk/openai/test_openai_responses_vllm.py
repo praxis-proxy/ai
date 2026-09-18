@@ -351,8 +351,13 @@ def _write_web_search_chat_streaming_config(
         "- filter: openai_web_search\n"
         "                provider: brave\n"
         "                api_key: test-key\n"
-        f"                base_url: http://127.0.0.1:{search_port}\n"
-        "                allow_private_base_url: true",
+        f"                base_url: http://127.0.0.1:{search_port}",
+    )
+    # The provider callout targets a loopback mock, so the executor's SSRF check
+    # requires the operator opt-in on the outbound pipeline.
+    config = config.replace(
+        "allow_private_endpoints: true",
+        "allow_private_endpoints: true\n  allow_private_upstreams: true",
     )
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -828,9 +833,11 @@ def _write_agentic_config(
         "- filter: openai_web_search\n"
         "                provider: brave\n"
         "                api_key: test-key\n"
-        f"                base_url: http://127.0.0.1:{search_port}\n"
-        "                allow_private_base_url: true",
+        f"                base_url: http://127.0.0.1:{search_port}",
     )
+    # agentic-loop.yaml already declares ``allow_private_upstreams: true`` in its
+    # ``insecure_options``, which is the operator opt-in the executor's SSRF check
+    # requires for the loopback provider callout — no test-time injection needed.
     if translate_to_chat:
         config = config.replace(
             "              - filter: openai_responses_proxy\n"
