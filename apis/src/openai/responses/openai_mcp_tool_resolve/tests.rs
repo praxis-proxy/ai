@@ -491,7 +491,7 @@ async fn cache_hit_populates_mcp_tool_map_on_existing_state() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://10.0.0.5/mcp";
+    let server_url = "http://203.0.113.5/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -527,7 +527,7 @@ async fn rewritten_body_over_limit_rejected_with_413() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://10.0.0.5/mcp";
+    let server_url = "http://203.0.113.5/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -554,7 +554,7 @@ async fn rewritten_body_under_limit_committed() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://10.0.0.5/mcp";
+    let server_url = "http://203.0.113.5/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -2752,7 +2752,7 @@ async fn expanded_body_exceeding_limit_returns_413() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://10.0.0.5/mcp";
+    let server_url = "http://203.0.113.5/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -2789,7 +2789,7 @@ async fn expanded_body_within_limit_continues() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://10.0.0.5/mcp";
+    let server_url = "http://203.0.113.5/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -2830,7 +2830,7 @@ async fn measure_expanded_body_len(server_url: &str, cached: &[serde_json::Value
 /// accepted (the guard rejects strictly *over* the limit).
 #[tokio::test]
 async fn expanded_body_at_exact_limit_continues() {
-    let server_url = "http://10.0.0.5/mcp";
+    let server_url = "http://203.0.113.5/mcp";
     let cached = vec![serde_json::json!({
         "name": "get_weather", "description": "Get weather",
         "inputSchema": {"type": "object"},
@@ -2877,6 +2877,58 @@ fn body_too_large_maps_to_413() {
         "error type should be invalid_request_error: {body_str}"
     );
     assert!(body_str.contains("1000000"), "should include actual size: {body_str}");
+}
+
+/// A transport `ResponseTooLarge` classification (an MCP server response that
+/// crossed the per-exchange wire ceiling, surfaced by the filtered callout's
+/// `CalloutOutcome::ResponseTooLarge`) maps to HTTP 413, distinct from the 502 a
+/// generic upstream client failure produces. Non-streaming: rejected inline.
+#[test]
+fn mcp_response_too_large_maps_to_413() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let err = ResolveError::Client {
+        server_label: "weather".to_owned(),
+        source: mcp_client::McpClientError::ResponseTooLarge {
+            url: mcp_client::parse_display_url("https://mcp.example/mcp"),
+            limit: 1_048_576,
+        },
+    };
+    let action = resolve_error_action(&mut ctx, &err, false, b"{}");
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(
+        rejection.status, 413,
+        "an oversized MCP response should map to HTTP 413"
+    );
+    let body_str = String::from_utf8_lossy(rejection.body.as_deref().unwrap_or_default());
+    assert!(
+        body_str.contains("invalid_request_error"),
+        "413 error type should be invalid_request_error: {body_str}"
+    );
+}
+
+/// A generic (non-overflow) MCP client failure keeps its 502 upstream status, so
+/// the 413 arm is not over-broad.
+#[test]
+fn mcp_generic_client_failure_maps_to_502() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let err = ResolveError::Client {
+        server_label: "weather".to_owned(),
+        source: mcp_client::McpClientError::ListTools {
+            url: mcp_client::parse_display_url("https://mcp.example/mcp"),
+        },
+    };
+    // Non-streaming so the runtime-failure deferral does not apply.
+    let action = resolve_error_action(&mut ctx, &err, false, b"{}");
+    let rejection = match action {
+        FilterAction::Reject(r) => r,
+        other => panic!("expected Reject, got {other:?}"),
+    };
+    assert_eq!(rejection.status, 502, "a generic MCP client failure stays a 502");
 }
 
 // =========================================================================
@@ -3416,7 +3468,6 @@ fn deferred_connector(
     authorization: Option<String>,
 ) -> DeferredMcpConnector {
     DeferredMcpConnector {
-        allow_loopback: true,
         authorization,
         allowed_tools,
         connector_id: "c1".to_owned(),
@@ -3556,8 +3607,7 @@ async fn discover_deferred_connectors_applies_allowed_tools() {
 #[tokio::test]
 async fn discover_deferred_connectors_redacts_endpoint_on_error() {
     let secret_url = "http://127.0.0.1:1/internal-mcp-secret";
-    let mut connector = deferred_connector(secret_url, None, Some("Bearer secret".to_owned()));
-    connector.allow_loopback = false;
+    let connector = deferred_connector(secret_url, None, Some("Bearer secret".to_owned()));
     let mut state = ResponsesState {
         deferred_mcp: vec![connector],
         ..ResponsesState::default()
@@ -3586,7 +3636,6 @@ async fn discover_deferred_connectors_is_transactional_across_connectors() {
     let mut bad = deferred_connector("http://127.0.0.1:1/internal-mcp-secret", None, None);
     bad.connector_id = "c2".to_owned();
     bad.server_label = "other".to_owned();
-    bad.allow_loopback = false;
     let mut state = ResponsesState {
         tools: vec![
             serde_json::json!({"type": "mcp", "server_label": "weather", "defer_loading": true}),
@@ -4051,7 +4100,7 @@ async fn start_single_tool_mcp_server() -> (String, tokio_util::sync::Cancellati
         .with_sse_keep_alive(None)
         .with_cancellation_token(ct.child_token());
     let service: StreamableHttpService<SingleToolMcpServer, LocalSessionManager> =
-        StreamableHttpService::new(|| Ok(SingleToolMcpServer::new()), std::sync::Arc::default(), config);
+        StreamableHttpService::new(|| Ok(SingleToolMcpServer::new()), Arc::default(), config);
     let router = axum::Router::new().nest_service("/mcp", service);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -4078,8 +4127,8 @@ async fn start_single_tool_mcp_server() -> (String, tokio_util::sync::Cancellati
 async fn zero_permitted_tools_does_not_leak_credentials_to_backend() {
     let (server_url, ct) = start_single_tool_mcp_server().await;
 
-    let yaml: serde_yaml::Value = serde_yaml::from_str("allow_loopback: true").unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+    let filter = McpToolResolveFilter::from_config_allow_private(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
@@ -4128,8 +4177,8 @@ async fn streaming_list_failure_emits_conformant_mcp_failure_lifecycle() {
     let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
     drop(listener);
 
-    let yaml: serde_yaml::Value = serde_yaml::from_str("allow_loopback: true\ntimeout_ms: 1000").unwrap();
-    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_ms: 1000").unwrap();
+    let filter = McpToolResolveFilter::from_config_allow_private(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     // Per-filter state (the deferred-failure stash) is keyed by the filter's
@@ -4294,17 +4343,29 @@ async fn streaming_list_failure_emits_conformant_mcp_failure_lifecycle() {
 
 #[test]
 fn streaming_failure_classification_includes_runtime_tools_list_failures() {
-    let uri: http::Uri = "https://mcp.example/tools".parse().unwrap();
-    let url = || mcp_client::McpDisplayUrl::from_uri(&uri);
-    let client = |source: mcp_client::McpClientError| ResolveError::Client {
-        server_label: "drive".to_owned(),
-        source,
-    };
-
     // Every runtime/transport failure of `tools/list` discovery must defer to the
     // 200 SSE lifecycle. Pinning each arm guards the core feature: a refactor that
     // drops one would silently return a hard HTTP error for that failure mode.
-    for source in [
+    for source in runtime_tools_list_failure_sources() {
+        let err = ResolveError::Client {
+            server_label: "drive".to_owned(),
+            source,
+        };
+        assert!(
+            is_mcp_listing_runtime_failure(&err),
+            "runtime tools/list failure must defer to the SSE lifecycle"
+        );
+    }
+}
+
+/// The `tools/list` runtime/transport failures that must defer to the streaming
+/// SSE lifecycle. `ResponseTooLarge` (the callout-transport / executor
+/// body-limit overflow) and `ListingTooLarge` are both size-driven runtime
+/// failures and belong here alongside connection/timeout errors.
+fn runtime_tools_list_failure_sources() -> Vec<mcp_client::McpClientError> {
+    let uri: http::Uri = "https://mcp.example/tools".parse().unwrap();
+    let url = || mcp_client::McpDisplayUrl::from_uri(&uri);
+    vec![
         mcp_client::McpClientError::Connection { url: url() },
         mcp_client::McpClientError::ListTools { url: url() },
         mcp_client::McpClientError::Timeout {
@@ -4316,13 +4377,17 @@ fn streaming_failure_classification_includes_runtime_tools_list_failures() {
             count: 11,
             max: 10,
         },
+        mcp_client::McpClientError::ListingTooLarge {
+            url: url(),
+            bytes: 5_000_000,
+            max: 4_194_304,
+        },
+        mcp_client::McpClientError::ResponseTooLarge {
+            url: url(),
+            limit: 1_048_576,
+        },
         mcp_client::McpClientError::Serialization(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
-    ] {
-        assert!(
-            is_mcp_listing_runtime_failure(&client(source)),
-            "runtime tools/list failure must defer to the SSE lifecycle"
-        );
-    }
+    ]
 }
 
 #[test]
@@ -4336,14 +4401,18 @@ fn streaming_failure_classification_excludes_local_request_policy() {
 
     // Local request-policy failures retain their HTTP error. SSRF blocking is the
     // headline exclusion documented on the filter: it must never be downgraded to
-    // the 200 SSE lifecycle. `CallTool` is a non-listing operation and cannot
-    // arise from the tools/list path.
+    // the 200 SSE lifecycle. `InvalidTarget` (a structurally invalid or disallowed
+    // URL, including an SSRF-evasion host literal rejected at parse time before the
+    // address hook runs) is the same permanent class and must not degrade either.
+    // `CallTool` is a non-listing operation and cannot arise from the tools/list
+    // path.
     for source in [
         mcp_client::McpClientError::InvalidAuthorization,
         mcp_client::McpClientError::SsrfBlocked {
             url: url(),
             reason: "resolves to a private address",
         },
+        mcp_client::McpClientError::InvalidTarget { url: url() },
         mcp_client::McpClientError::CallTool {
             url: url(),
             tool_name: "x".to_owned(),
@@ -4414,6 +4483,49 @@ fn streaming_ssrf_failure_retains_http_error() {
     assert!(
         !raw.contains("response.mcp_list_tools.failed") && !raw.contains("response.failed"),
         "SSRF must not emit the discovery lifecycle: {raw}"
+    );
+}
+
+/// A streaming `InvalidTarget` failure is a pre-commitment rejection on the same
+/// footing as SSRF: a structurally invalid or disallowed URL (here an SSRF-evasion
+/// host literal rejected at parse time, before the address hook can run) must
+/// retain its hard HTTP error and the JSON `{"error":{...}}` envelope, never the
+/// 200 discovery lifecycle. This guards the regression where such a literal, being
+/// rejected at parse time rather than by the SSRF address hook, could slip through
+/// as a transient connection failure and degrade to a soft in-band SSE-200.
+#[test]
+fn streaming_invalid_target_failure_retains_http_error() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let err = ResolveError::Client {
+        server_label: "internal".to_owned(),
+        source: mcp_client::McpClientError::InvalidTarget {
+            url: mcp_client::parse_display_url("http://[::ffff:127.0.0.1]/mcp"),
+        },
+    };
+
+    let FilterAction::Reject(rejection) = resolve_error_action(&mut ctx, &err, true, b"{}") else {
+        panic!("expected a hard Reject, not a deferred streaming lifecycle");
+    };
+
+    assert_eq!(
+        rejection.status, 502,
+        "an invalid target keeps its upstream error status"
+    );
+    assert!(
+        !rejection.preserve_keepalive,
+        "a genuine HTTP error closes the connection, unlike the 200 discovery-failure transport"
+    );
+    let ct = rejection.headers.iter().find(|(k, _)| k == "content-type");
+    assert_eq!(
+        ct.map(|(_, v)| v.as_str()),
+        Some("application/json"),
+        "a pre-commitment invalid-target rejection uses the JSON error envelope, not an SSE event"
+    );
+    let raw = std::str::from_utf8(rejection.body.as_deref().expect("error body")).unwrap();
+    assert!(
+        !raw.contains("response.mcp_list_tools.failed") && !raw.contains("response.failed"),
+        "invalid target must not emit the discovery lifecycle: {raw}"
     );
 }
 
@@ -4929,7 +5041,7 @@ async fn cache_hit_seeds_mcp_list_tools_output_item() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://10.0.0.5/mcp";
+    let server_url = "http://203.0.113.5/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![cached_weather_listing(server_url)];

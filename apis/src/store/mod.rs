@@ -11,6 +11,8 @@ mod pool;
 #[cfg(feature = "store-postgres")]
 mod postgres;
 #[cfg(feature = "store-postgres")]
+mod postgres_tls;
+#[cfg(feature = "store-postgres")]
 pub(crate) mod postgres_url;
 mod schemas;
 #[cfg(feature = "store-sqlite")]
@@ -42,6 +44,8 @@ pub(crate) use schemas::{validate_postgres_table_identifiers, validate_postgres_
 
 #[cfg(feature = "store-postgres")]
 pub use self::postgres::PostgresResponseStore;
+#[cfg(feature = "store-postgres")]
+pub use self::postgres_tls::PgTlsConfig;
 #[cfg(feature = "store-sqlite")]
 pub use self::sqlite::SqliteResponseStore;
 pub use self::{

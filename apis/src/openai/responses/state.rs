@@ -698,11 +698,12 @@ pub(crate) struct EmittedItem {
 }
 
 /// Internally resolved MCP connector waiting for deferred discovery.
+///
+/// The deferred `tools/list` callout is issued later by `openai_mcp_dispatch`,
+/// so its private/loopback posture is governed by that filter's bound outbound
+/// pipeline (via the per-request `McpCallout`) rather than a field captured here.
 #[derive(Clone)]
 pub(crate) struct DeferredMcpConnector {
-    /// Allow loopback MCP endpoints for this listing.
-    pub allow_loopback: bool,
-
     /// Request `authorization` forwarded to the MCP endpoint.
     pub authorization: Option<String>,
 
@@ -738,7 +739,6 @@ pub(crate) struct DeferredMcpConnector {
 impl fmt::Debug for DeferredMcpConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeferredMcpConnector")
-            .field("allow_loopback", &self.allow_loopback)
             .field("authorization", &self.authorization.as_ref().map(|_| "<redacted>"))
             .field("allowed_tools", &self.allowed_tools)
             .field("connector_id", &self.connector_id)

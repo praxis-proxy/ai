@@ -2947,7 +2947,6 @@ fn make_state_with_tool_calls(tool_calls: Vec<Value>) -> ResponsesState {
 
 fn pending_deferred_connector() -> DeferredMcpConnector {
     DeferredMcpConnector {
-        allow_loopback: true,
         authorization: None,
         allowed_tools: None,
         connector_id: "corp_drive".to_owned(),

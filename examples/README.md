@@ -78,6 +78,7 @@ before sending requests.
 
 | File | Description |
 | ------ | ------------- |
+| [conversations-postgres-mtls.yaml](configs/openai/conversations/conversations-postgres-mtls.yaml) | Local /v1/conversations endpoints backed by PostgreSQL over a TLS-verified connection that authenticates with a client certificate instead of a password |
 | [conversations.yaml](configs/openai/conversations/conversations.yaml) | Local /v1/conversations endpoints for conversation lifecycle, backed by the ConversationItemStore |
 | [embeddings-routing.yaml](configs/openai/embeddings/embeddings-routing.yaml) | Routes OpenAI Embeddings API requests to a dedicated Embeddings API backend |
 | [operation-classifier.yaml](configs/openai/operation-classifier.yaml) | Identifies supported OpenAI operations from the request head — method, normalized path, and protocol headers — and publishes the result so a pipeline can branch on a proxy-owned fact instead of a path prefix |
@@ -98,11 +99,13 @@ before sending requests.
 | [full-flow-agentic.yaml](configs/openai/responses/full-flow-agentic.yaml) | Runs the complete Responses API pipeline through an agentic iterative_request_router that executes hosted file_search, web_search, and MCP tool calls in a model-tool-model loop, persisting both buffered and streaming (`stream: true`) responses |
 | [irr-terminal-streaming.yaml](configs/openai/responses/irr-terminal-streaming.yaml) | Demonstrates a single-step iterative_request_router pipeline that exposes a native OpenAI Responses SSE body incrementally. `openai_responses_proxy` always advertises the streaming capability and selects Praxis's typed streaming transport automatically for an effective `"stream": true` request; there is no operator opt-in |
 | [mcp-dispatch.yaml](configs/openai/responses/mcp-dispatch.yaml) | Demonstrates the `openai_mcp_dispatch` filter configuration |
+| [mcp-outbound-chain.yaml](configs/openai/responses/mcp-outbound-chain.yaml) | Demonstrates binding an operator `outbound_chain` onto the outbound MCP callout made by `openai_mcp_tool_resolve` (the `tools/list` discovery request) |
 | [mcp-tool-resolve.yaml](configs/openai/responses/mcp-tool-resolve.yaml) | Demonstrates the `openai_mcp_tool_resolve` filter, which resolves MCP tool entries in the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server |
 | [model-rewrite.yaml](configs/openai/responses/model-rewrite.yaml) | Rewrites or injects the top-level `model` field in Responses API request bodies before forwarding to the inference backend |
 | [rehydrate-fixture.yaml](configs/openai/responses/rehydrate-fixture.yaml) | Minimal native OpenAI Responses pipeline that stores a first turn, rehydrates a stored `previous_response_id` into the outbound `input` history, and proxies to a native /v1/responses backend |
 | [rehydrate.yaml](configs/openai/responses/rehydrate.yaml) | Validates `previous_response_id` by fetching the stored response, confirming its status is completed, and promoting the ID to filter metadata |
 | [request-validate.yaml](configs/openai/responses/request-validate.yaml) | Validates Responses API JSON and enriches request metadata |
+| [response-store-postgres-mtls.yaml](configs/openai/responses/response-store-postgres-mtls.yaml) | Persists non-streaming Responses API responses to PostgreSQL over a TLS-verified connection that authenticates with a client certificate instead of a password |
 | [response-store.yaml](configs/openai/responses/response-store.yaml) | Persists non-streaming Responses API responses to a database and serves stored data via GET endpoints and handles DELETE /v1/responses/{id} locally |
 | [responses-proxy.yaml](configs/openai/responses/responses-proxy.yaml) | Proxies OpenAI Responses API requests to a native /v1/responses backend |
 | [responses-routing.yaml](configs/openai/responses/responses-routing.yaml) | Routes Responses API traffic by detected mode |
