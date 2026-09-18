@@ -159,6 +159,31 @@ def _patch_store_backend(config: str, db_path: str) -> str:
     return config
 
 
+def _persist_config(config: str) -> str:
+    """Write a generated Praxis config to a temp file and return its path.
+
+    When the harness runs as root — as it does on the ephemeral EC2 GPU runner
+    used by the nightly/label-triggered full suite — Praxis refuses to start
+    unless ``insecure_options.allow_root`` is set. Inject it here so every config
+    writer inherits the override in one place; non-root local and CPU CI runs are
+    left byte-for-byte unchanged.
+    """
+    if os.geteuid() == 0 and "allow_root:" not in config:
+        block = "\ninsecure_options:\n"
+        override = "\ninsecure_options:\n  allow_root: true\n"
+        if block in config:
+            config = config.replace(block, override, 1)
+        elif config.startswith("insecure_options:\n"):
+            config = "insecure_options:\n  allow_root: true\n" + config[len("insecure_options:\n") :]
+        else:
+            config = config.rstrip("\n") + override
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(config)
+    return path
+
+
 def _write_config(praxis_port: int, db_path: str) -> str:
     with open(CONFIG_PATH) as f:
         config = f.read()
@@ -173,9 +198,7 @@ def _write_config(praxis_port: int, db_path: str) -> str:
     config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -256,9 +279,7 @@ def _write_irr_streaming_config(praxis_port: int) -> str:
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -273,9 +294,7 @@ def _write_chat_streaming_config(
     config = config.replace("127.0.0.1:3001", backend_endpoint)
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -321,9 +340,7 @@ def _write_compact_config(
     config = config.replace("127.0.0.1:11434", _vllm_endpoint())
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -355,9 +372,7 @@ def _write_web_search_chat_streaming_config(
         "                allow_private_base_url: true",
     )
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -766,9 +781,7 @@ def _write_witness_config(
     config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -838,9 +851,7 @@ def _write_agentic_config(
             "              - filter: router",
         )
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -1693,7 +1704,12 @@ class TestOpenAIResponsesVLLM:
                 conversation={"id": conversation.id},
                 store=True,
                 temperature=0,
-                max_output_tokens=128,
+                # Qwen3 is a hybrid thinking model and its /no_think soft switch
+                # is not honored through this backend, so it emits a reasoning
+                # block before answering. Budget enough output tokens for the
+                # reasoning plus the short answer so the turn completes instead
+                # of truncating to status "incomplete".
+                max_output_tokens=2048,
             )
             # Ask the model to echo the earlier color rather than recall it in
             # free form: the small CI model reliably repeats an exact token from
@@ -1706,7 +1722,7 @@ class TestOpenAIResponsesVLLM:
                 conversation=conversation.id,
                 store=True,
                 temperature=0,
-                max_output_tokens=128,
+                max_output_tokens=2048,
             )
 
             assert first.status == "completed"
@@ -2175,7 +2191,12 @@ class TestResponsesCompactionVLLM:
             input="Remember the marker BELOW-THRESHOLD-2468. /no_think",
             temperature=0,
             store=True,
-            max_output_tokens=64,
+            # Qwen3 emits a reasoning block (its /no_think soft switch is not
+            # honored through this backend), so budget enough tokens for the
+            # reasoning plus the short ack; otherwise the turn truncates to
+            # "incomplete" and the continuation rejects the incomplete
+            # predecessor.
+            max_output_tokens=2048,
         )
         request_count = len(CompactionHandler.requests)
 
@@ -2187,11 +2208,13 @@ class TestResponsesCompactionVLLM:
             context_management=[
                 {
                     "type": "compaction",
-                    "compact_threshold": 1000,
+                    # Comfortably above the reasoning-inflated first-turn history
+                    # so this "below threshold" case reliably skips compaction.
+                    "compact_threshold": 8000,
                 }
             ],
             store=False,
-            max_output_tokens=128,
+            max_output_tokens=2048,
         )
 
         assert second.status == "completed"
@@ -3312,8 +3335,15 @@ class TestAgenticLoopVLLM:
                     "search_context_size": "low",
                 }
             ],
+            # Force the hosted call so the proxy's translate/execute path is
+            # exercised deterministically rather than relying on a small model
+            # electing to call the tool; the agentic loop resets tool_choice to
+            # "auto" on continuation, so the follow-up round answers freely.
+            tool_choice={"type": "web_search"},
             store=False,
-            max_output_tokens=512,
+            # Room for the continuation round's reasoning plus the final message
+            # (Qwen3 emits a reasoning block that /no_think does not suppress).
+            max_output_tokens=2048,
         )
 
         web_search_calls = [
@@ -4534,9 +4564,7 @@ def _write_file_search_config(
         ogx_endpoint=ogx_endpoint or _ogx_endpoint(),
         vllm_endpoint=backend_endpoint,
     )
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -4699,9 +4727,15 @@ class TestFileSearchVLLM:
                     "vector_store_ids": [store_id],
                 }
             ],
+            # Force the hosted file_search call so the translate/execute path is
+            # exercised deterministically instead of depending on the small
+            # model to elect the tool.
+            tool_choice={"type": "file_search"},
             include=["file_search_call.results"],
             store=False,
-            max_output_tokens=512,
+            # Room for the continuation round's reasoning plus the final message
+            # (Qwen3 emits a reasoning block that /no_think does not suppress).
+            max_output_tokens=2048,
         )
 
         assert response.status in ("completed", "incomplete"), (
@@ -4801,9 +4835,7 @@ def _write_file_search_chat_config(
             "Chat backend endpoint was not patched"
         )
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -4964,9 +4996,7 @@ def _write_file_search_streaming_config(
     config = config.replace("step_timeout_ms: 60000", "step_timeout_ms: 300000")
     config = config.replace("timeout_ms: 5000", "timeout_ms: 30000")
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -5072,10 +5102,16 @@ class TestFileSearchStreamingVLLM:
             model=VLLM_MODEL,
             input=self._INPUT,
             tools=[{"type": "file_search", "vector_store_ids": [store_id]}],
+            # Force the hosted file_search call so the synthesized lifecycle is
+            # exercised deterministically instead of depending on the small
+            # model to elect the tool.
+            tool_choice={"type": "file_search"},
             include=["file_search_call.results"],
             store=False,
             stream=True,
-            max_output_tokens=512,
+            # Room for the continuation round's reasoning plus the final message
+            # (Qwen3 emits a reasoning block that /no_think does not suppress).
+            max_output_tokens=2048,
         )
 
         event_types, output_items, terminal_status = _drain_response_stream(
