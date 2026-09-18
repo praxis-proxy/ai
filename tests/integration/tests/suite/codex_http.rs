@@ -26,12 +26,13 @@ use std::{
     path::Path,
     process::Stdio,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
+use jsonschema::{Draft, Validator};
 #[cfg(unix)]
 use nix::{
     errno::Errno,
@@ -53,7 +54,7 @@ use super::harness::TempWorkspace;
 /// Maximum time allowed for process and pipe cleanup after termination.
 const CHILD_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum retained bytes from each child output pipe.
-const MAX_CHILD_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CHILD_OUTPUT_BYTES: usize = 4_194_304; // 4 MiB
 /// Required output from the pinned executable.
 const CODEX_VERSION: &str = "codex-cli 0.144.1";
 /// Synthetic credential that must reach the test backend.
@@ -147,6 +148,31 @@ async fn pinned_codex_completes_chat_backend_coding_workflow_over_http() {
     assert_translated_tool_turns(&requests);
     observer.assert_http_only();
     assert_coding_codex_jsonl(&output.stdout);
+}
+
+/// Validate the native SSE fixture's resource snapshots against the pinned OpenResponses contract.
+#[test]
+fn native_sse_response_resources_match_openresponses_schema() {
+    let turns = http_response_script();
+    let HttpServerAction::StreamSse { events, .. } = &turns[0][0] else {
+        panic!("native Responses fixture should stream SSE");
+    };
+    let mut count = 0;
+    for event in events {
+        let Some(payload) = event.lines().find_map(|line| line.strip_prefix("data: ")) else {
+            continue;
+        };
+        let payload: serde_json::Value = serde_json::from_str(payload).expect("SSE fixture data should be JSON");
+        let Some(resource) = payload.get("response") else {
+            continue;
+        };
+        assert_openresponses_response_resource(resource);
+        count += 1;
+    }
+    assert_eq!(
+        count, 2,
+        "native fixture should include created and completed resources"
+    );
 }
 
 /// Prove the translated client stream starts before the Chat stream completes.
@@ -451,11 +477,7 @@ fn http_response_script() -> Vec<Vec<HttpServerAction>> {
                 &serde_json::json!({
                     "type": "response.created",
                     "sequence_number": 0,
-                    "response": {
-                        "id": "resp_http_acceptance",
-                        "object": "response",
-                        "status": "in_progress",
-                    }
+                    "response": http_response_resource("in_progress", Vec::new(), serde_json::Value::Null)
                 }),
             ),
             sse_event(
@@ -551,33 +573,27 @@ fn http_response_script() -> Vec<Vec<HttpServerAction>> {
                 &serde_json::json!({
                     "type": "response.completed",
                     "sequence_number": 7,
-                    "response": {
-                        "id": "resp_http_acceptance",
-                        "object": "response",
-                        "status": "completed",
-                        "output": [
-                            {
-                                "id": "msg_http_acceptance",
-                                "type": "message",
-                                "role": "assistant",
-                                "status": "completed",
-                                "content": [
-                                    {
-                                        "type": "output_text",
-                                        "text": "PONG",
-                                        "annotations": []
-                                    }
-                                ]
-                            }
-                        ],
-                        "usage": {
+                    "response": http_response_resource(
+                        "completed",
+                        vec![serde_json::json!({
+                            "id": "msg_http_acceptance",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "PONG",
+                                "annotations": []
+                            }]
+                        })],
+                        serde_json::json!({
                             "input_tokens": 0,
-                            "input_tokens_details": null,
+                            "input_tokens_details": {"cached_tokens": 0},
                             "output_tokens": 0,
-                            "output_tokens_details": null,
+                            "output_tokens_details": {"reasoning_tokens": 0},
                             "total_tokens": 0
-                        }
-                    }
+                        }),
+                    )
                 }),
             ),
         ],
@@ -592,6 +608,73 @@ fn http_response_script() -> Vec<Vec<HttpServerAction>> {
         turns.push(turns[0].clone());
     }
     turns
+}
+
+/// Build a canonical OpenResponses resource snapshot for native SSE events.
+fn http_response_resource(status: &str, output: Vec<serde_json::Value>, usage: serde_json::Value) -> serde_json::Value {
+    let completed_at = if status == "completed" {
+        serde_json::json!(2)
+    } else {
+        serde_json::Value::Null
+    };
+    let mut response = serde_json::json!({
+        "id": "resp_http_acceptance",
+        "object": "response",
+        "created_at": 1,
+        "completed_at": completed_at,
+        "status": status,
+        "incomplete_details": null,
+        "model": "test-model",
+        "previous_response_id": null,
+        "instructions": null,
+        "error": null,
+        "tools": [],
+        "tool_choice": "auto",
+        "truncation": "disabled",
+        "parallel_tool_calls": true,
+        "text": {"format": {"type": "text"}},
+        "top_p": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "top_logprobs": 0,
+        "temperature": 1.0,
+        "reasoning": {"effort": null, "summary": null},
+        "user": null,
+        "max_output_tokens": null,
+        "max_tool_calls": null,
+        "store": true,
+        "background": false,
+        "service_tier": "default",
+        "metadata": {},
+        "safety_identifier": null,
+        "prompt_cache_key": null
+    });
+    response["output"] = serde_json::Value::Array(output);
+    response["usage"] = usage;
+    response
+}
+
+/// Schema projection of the required fields in OpenResponses 92c12d96.
+///
+/// The canonical schema is split across 164 files upstream. This executable
+/// projection covers the ResponseResource and Usage contract used by this
+/// fixture without vendoring unrelated response item variants.
+static OPENRESPONSES_RESPONSE_RESOURCE_VALIDATOR: LazyLock<Validator> = LazyLock::new(|| {
+    let schema = serde_json::from_str(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["id","object","created_at","completed_at","status","incomplete_details","model","previous_response_id","instructions","output","error","tools","tool_choice","truncation","parallel_tool_calls","text","top_p","presence_penalty","frequency_penalty","top_logprobs","temperature","reasoning","user","usage","max_output_tokens","max_tool_calls","store","background","service_tier","metadata","safety_identifier","prompt_cache_key"],"properties":{"id":{"type":"string"},"object":{"const":"response"},"created_at":{"type":"integer"},"completed_at":{"type":["integer","null"]},"status":{"type":"string"},"incomplete_details":{"type":["object","null"]},"model":{"type":"string"},"previous_response_id":{"type":["string","null"]},"instructions":{"type":["string","null"]},"output":{"type":"array"},"error":{"type":["object","null"]},"tools":{"type":"array"},"tool_choice":{"type":["string","object"]},"truncation":{"type":"string"},"parallel_tool_calls":{"type":"boolean"},"text":{"type":"object"},"top_p":{"type":"number"},"presence_penalty":{"type":"number"},"frequency_penalty":{"type":"number"},"top_logprobs":{"type":"integer"},"temperature":{"type":"number"},"reasoning":{"type":["object","null"]},"user":{"type":["string","null"]},"usage":{"anyOf":[{"type":"null"},{"type":"object","required":["input_tokens","output_tokens","total_tokens","input_tokens_details","output_tokens_details"],"properties":{"input_tokens":{"type":"integer"},"output_tokens":{"type":"integer"},"total_tokens":{"type":"integer"},"input_tokens_details":{"type":"object","required":["cached_tokens"],"properties":{"cached_tokens":{"type":"integer"}}},"output_tokens_details":{"type":"object","required":["reasoning_tokens"],"properties":{"reasoning_tokens":{"type":"integer"}}}}}]},"max_output_tokens":{"type":["integer","null"]},"max_tool_calls":{"type":["integer","null"]},"store":{"type":"boolean"},"background":{"type":"boolean"},"service_tier":{"type":"string"},"metadata":{"type":"object"},"safety_identifier":{"type":["string","null"]},"prompt_cache_key":{"type":["string","null"]}}}"#,
+    )
+    .expect("OpenResponses fixture schema projection should parse");
+    jsonschema::options()
+        .with_draft(Draft::Draft202012)
+        .build(&schema)
+        .expect("OpenResponses fixture schema projection should compile")
+});
+
+/// Validate a fixture resource against its pinned OpenResponses contract.
+fn assert_openresponses_response_resource(resource: &serde_json::Value) {
+    OPENRESPONSES_RESPONSE_RESOURCE_VALIDATOR
+        .validate(resource)
+        .unwrap_or_else(|error| panic!("native Responses fixture violates OpenResponses 92c12d96: {error}"));
 }
 
 /// Build two Chat Completions SSE turns: one command call and one summary.

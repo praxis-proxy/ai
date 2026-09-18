@@ -34,6 +34,8 @@ use tracing::debug;
 
 /// Maximum HTTP request-head size accepted by the scripted backend.
 const MAX_HEAD_BYTES: usize = 16_384; // 16 KiB
+/// Maximum time to wait for a complete HTTP request head.
+const REQUEST_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum HTTP request-body size captured or drained by the backend.
 const MAX_REQUEST_BODY_BYTES: usize = 16_777_216; // 16 MiB
 
@@ -106,8 +108,6 @@ pub enum HttpServerAction {
         /// JSON body to return.
         body: String,
     },
-    /// Wait before executing the next action in the current response turn.
-    Delay(Duration),
 }
 
 /// RAII guard for a scripted HTTP backend.
@@ -128,11 +128,6 @@ impl HttpBackendGuard {
     /// Wait for the next backend observation.
     pub async fn next_event(&mut self) -> Option<HttpBackendEvent> {
         self.events.recv().await
-    }
-
-    /// Try to receive the next backend observation without awaiting.
-    pub fn try_next_event(&mut self) -> Option<HttpBackendEvent> {
-        self.events.try_recv().ok()
     }
 
     /// Return the allocated port.
@@ -175,8 +170,7 @@ pub async fn start_scripted_http_backend(
 ///
 /// Each `turn` element is a list of [`HttpServerAction`] entries. The
 /// backend advances to the next turn after the previous one has been
-/// delivered. `Json` and `StreamSse` actions both consume exactly one
-/// request, while `Delay` actions postpone the next action in that turn.
+/// delivered. `Json` and `StreamSse` actions both consume exactly one request.
 ///
 /// # Panics
 ///
@@ -257,9 +251,14 @@ async fn handle_connection(
     state: Arc<ScriptState>,
     event_tx: mpsc::Sender<HttpBackendEvent>,
 ) {
-    let Some(peek) = peek_http_request(&stream).await else {
+    let Some(peek) = peek_http_request(&stream, REQUEST_HEAD_TIMEOUT).await else {
         return;
     };
+
+    if peek.malformed {
+        reject_malformed_request(&mut stream, peek.head_bytes).await;
+        return;
+    }
 
     if peek.websocket_upgrade {
         let _handled = handle_websocket_upgrade(&mut stream, &event_tx, &peek).await;
@@ -283,6 +282,17 @@ async fn handle_connection(
     }
 
     respond_to_turn(&mut stream, &state, &event_tx).await;
+}
+
+/// Reject a syntactically malformed request head.
+async fn reject_malformed_request(stream: &mut tokio::net::TcpStream, head_bytes: usize) {
+    let mut head = vec![0_u8; head_bytes];
+    if stream.read_exact(&mut head).await.is_err() {
+        return;
+    }
+    let _written = stream
+        .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .await;
 }
 
 /// Reject an oversized matching request without allocating its declared body.
@@ -369,25 +379,18 @@ async fn handle_websocket_upgrade(
         .is_ok()
 }
 
-/// Execute the actions for a single turn, returning whether a response was sent.
+/// Execute the response action for a single turn, returning whether it was sent.
 async fn execute_turn_actions(stream: &mut tokio::net::TcpStream, script: &[HttpServerAction]) -> bool {
-    for action in script {
-        match action {
-            HttpServerAction::StreamSse {
-                events,
-                inter_event_delay,
-            } => return write_sse_response(stream, events, *inter_event_delay).await,
-            HttpServerAction::Json { status, body } => return write_json_response(stream, *status, body).await,
-            HttpServerAction::Delay(duration) => {
-                if !delay_while_accepting(*duration).await {
-                    return false;
-                }
-            },
-        }
+    let Some(action) = script.first() else {
+        return false;
+    };
+    match action {
+        HttpServerAction::StreamSse {
+            events,
+            inter_event_delay,
+        } => write_sse_response(stream, events, *inter_event_delay).await,
+        HttpServerAction::Json { status, body } => write_json_response(stream, *status, body).await,
     }
-    // A turn composed entirely of delays should not advance; the
-    // caller is expected to use a Json or StreamSse action per turn.
-    false
 }
 
 /// Write a chunked transfer-encoded SSE response.
@@ -446,12 +449,6 @@ async fn write_json_response(stream: &mut tokio::net::TcpStream, status: u16, bo
         return false;
     }
     stream.flush().await.is_ok()
-}
-
-/// Wait for a scripted duration before continuing the current response.
-async fn delay_while_accepting(duration: Duration) -> bool {
-    tokio::time::sleep(duration).await;
-    true
 }
 
 /// Map an HTTP status code to a standard reason phrase.
@@ -519,23 +516,25 @@ struct PeekedHttpRequest {
     body_bytes: usize,
     /// Number of bytes through the terminating blank header line.
     head_bytes: usize,
+    /// Parsed request headers.
+    headers: HeaderMap,
+    /// Whether the request head contains a malformed header or content length.
+    malformed: bool,
     /// Request method.
     method: String,
     /// Request path component.
     path: String,
     /// Optional query string from the request target.
     query: Option<String>,
-    /// Whether the request declares a `WebSocket` upgrade.
-    websocket_upgrade: bool,
     /// Observed `Upgrade` header value.
     upgrade_value: String,
-    /// Parsed request headers.
-    headers: HeaderMap,
+    /// Whether the request declares a `WebSocket` upgrade.
+    websocket_upgrade: bool,
 }
 
 /// Inspect an HTTP head without consuming bytes from the TCP stream.
-async fn peek_http_request(stream: &tokio::net::TcpStream) -> Option<PeekedHttpRequest> {
-    let head_bytes = peek_head_bytes(stream).await?;
+async fn peek_http_request(stream: &tokio::net::TcpStream, timeout: Duration) -> Option<PeekedHttpRequest> {
+    let head_bytes = peek_head_bytes(stream, timeout).await?;
     let head = std::str::from_utf8(&head_bytes).ok()?;
     let mut lines = head.split("\r\n");
     let (method, path, query) = parse_request_line(lines.next()?)?;
@@ -546,19 +545,20 @@ async fn peek_http_request(stream: &tokio::net::TcpStream) -> Option<PeekedHttpR
     Some(PeekedHttpRequest {
         body_bytes: parsed_headers.body_bytes,
         head_bytes: head_bytes.len(),
+        headers: parsed_headers.headers,
+        malformed: parsed_headers.malformed,
         method,
         path,
         query,
-        websocket_upgrade,
         upgrade_value: parsed_headers.upgrade_value,
-        headers: parsed_headers.headers,
+        websocket_upgrade,
     })
 }
 
 /// Wait until the HTTP head terminator is available in the stream's peek buffer.
-async fn peek_head_bytes(stream: &tokio::net::TcpStream) -> Option<Vec<u8>> {
+async fn peek_head_bytes(stream: &tokio::net::TcpStream, timeout: Duration) -> Option<Vec<u8>> {
     let mut buffer = vec![0_u8; MAX_HEAD_BYTES];
-    let head_bytes = tokio::time::timeout(Duration::from_secs(5), async {
+    let head_bytes = tokio::time::timeout(timeout, async {
         loop {
             let count = stream.peek(&mut buffer).await.ok()?;
             if count == 0 {
@@ -583,6 +583,10 @@ fn parse_request_line(line: &str) -> Option<(String, String, Option<String>)> {
     let mut parts = line.split_whitespace();
     let method = parts.next()?.to_owned();
     let target = parts.next()?.to_owned();
+    let version = parts.next()?;
+    if !version.starts_with("HTTP/") || parts.next().is_some() {
+        return None;
+    }
     let (path, query) = match target.split_once('?') {
         Some((path, query)) => (path.to_owned(), Some(query.to_owned())),
         None => (target, None),
@@ -591,17 +595,23 @@ fn parse_request_line(line: &str) -> Option<(String, String, Option<String>)> {
 }
 
 /// Aggregated facts extracted from a request head's header lines.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the independent header facts make request validation explicit"
+)]
 struct ParsedHeaders {
-    /// Whether any `Connection` header listed the `upgrade` token.
-    connection_upgrade: bool,
-    /// Whether any `Upgrade` header carried the `websocket` token.
-    websocket_upgrade: bool,
-    /// Observed `Upgrade` header value (preserved verbatim).
-    upgrade_value: String,
     /// Declared request body length.
     body_bytes: usize,
+    /// Whether any `Connection` header listed the `upgrade` token.
+    connection_upgrade: bool,
     /// Parsed header map.
     headers: HeaderMap,
+    /// Whether the request head contains a malformed header or content length.
+    malformed: bool,
+    /// Observed `Upgrade` header value (preserved verbatim).
+    upgrade_value: String,
+    /// Whether any `Upgrade` header carried the `websocket` token.
+    websocket_upgrade: bool,
 }
 
 /// Parse all header lines and aggregate the connection, upgrade, body length, and header map.
@@ -611,41 +621,53 @@ fn parse_request_headers(lines: &[&str]) -> ParsedHeaders {
         apply_header_line(&mut state, line);
     }
     ParsedHeaders {
-        connection_upgrade: state.connection_upgrade,
-        websocket_upgrade: state.websocket_upgrade,
-        upgrade_value: state.upgrade_value,
         body_bytes: state.body_bytes,
+        connection_upgrade: state.connection_upgrade,
         headers: state.headers,
+        malformed: state.malformed,
+        upgrade_value: state.upgrade_value,
+        websocket_upgrade: state.websocket_upgrade,
     }
 }
 
 /// Mutable accumulator shared across [`apply_header_line`] calls.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the independent header facts make request validation explicit"
+)]
 struct HeaderParseState {
-    /// Whether any `Connection` header listed the `upgrade` token.
-    connection_upgrade: bool,
-    /// Whether any `Upgrade` header carried the `websocket` token.
-    websocket_upgrade: bool,
-    /// Observed `Upgrade` header value (preserved verbatim).
-    upgrade_value: String,
     /// Declared request body length.
     body_bytes: usize,
+    /// Whether any `Connection` header listed the `upgrade` token.
+    connection_upgrade: bool,
     /// Parsed header map.
     headers: HeaderMap,
+    /// Whether the request head contains a malformed header or content length.
+    malformed: bool,
+    /// Observed `Upgrade` header value (preserved verbatim).
+    upgrade_value: String,
+    /// Whether any `Upgrade` header carried the `websocket` token.
+    websocket_upgrade: bool,
 }
 
 /// Apply one header line to the parse state.
 fn apply_header_line(state: &mut HeaderParseState, line: &str) {
     let Some((name, value)) = line.split_once(':') else {
+        state.malformed = true;
         return;
     };
     let trimmed_name = name.trim();
     let trimmed_value = value.trim();
-    if let Ok(header_name) = http::header::HeaderName::from_bytes(trimmed_name.as_bytes())
-        && let Ok(header_value) = http::header::HeaderValue::from_str(trimmed_value)
-    {
-        state.headers.append(header_name, header_value);
-    }
+    let Ok(header_name) = http::header::HeaderName::from_bytes(trimmed_name.as_bytes()) else {
+        state.malformed = true;
+        return;
+    };
+    let Ok(header_value) = http::header::HeaderValue::from_str(trimmed_value) else {
+        state.malformed = true;
+        return;
+    };
+    state.headers.append(header_name, header_value);
     if name.eq_ignore_ascii_case("connection") {
         state.connection_upgrade |= value
             .split(',')
@@ -654,7 +676,10 @@ fn apply_header_line(state: &mut HeaderParseState, line: &str) {
         trimmed_value.clone_into(&mut state.upgrade_value);
         state.websocket_upgrade |= state.upgrade_value.eq_ignore_ascii_case("websocket");
     } else if name.eq_ignore_ascii_case("content-length") {
-        state.body_bytes = trimmed_value.parse().unwrap_or(0);
+        match trimmed_value.parse() {
+            Ok(body_bytes) => state.body_bytes = body_bytes,
+            Err(_) => state.malformed = true,
+        }
     }
 }
 
@@ -758,6 +783,7 @@ mod tests {
 
     /// Advance response turns globally when each request uses a new connection.
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "complete two-connection response-turn test")]
     async fn scripted_http_backend_advances_turns_across_connections() {
         let mut backend = start_scripted_http_backend_turns(
             "POST",
@@ -786,12 +812,19 @@ mod tests {
             second.ends_with(r#"{"turn":2}"#),
             "second connection should receive turn two: {second}"
         );
-        assert!(matches!(next_event(&mut backend).await, HttpBackendEvent::Request(_)));
-        assert!(matches!(next_event(&mut backend).await, HttpBackendEvent::Request(_)));
+        assert!(
+            matches!(next_event(&mut backend).await, HttpBackendEvent::Request(_)),
+            "first connection should emit a captured request"
+        );
+        assert!(
+            matches!(next_event(&mut backend).await, HttpBackendEvent::Request(_)),
+            "second connection should emit a captured request"
+        );
     }
 
     /// Reject an unexpected path without consuming a scripted turn.
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "complete rejection and turn-preservation test")]
     async fn scripted_http_backend_rejects_unexpected_request() {
         let mut backend = start_scripted_http_backend(
             "POST",
@@ -822,11 +855,15 @@ mod tests {
             ),
             "wrong path should emit a test-visible event"
         );
-        assert!(matches!(next_event(&mut backend).await, HttpBackendEvent::Request(_)));
+        assert!(
+            matches!(next_event(&mut backend).await, HttpBackendEvent::Request(_)),
+            "accepted request should emit a captured event"
+        );
     }
 
     /// Report script exhaustion instead of silently reusing or dropping a turn.
     #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "complete script-exhaustion response-boundary test")]
     async fn scripted_http_backend_reports_script_exhaustion() {
         let mut backend = start_scripted_http_backend(
             "POST",
@@ -849,8 +886,14 @@ mod tests {
             exhausted.contains("500 Internal Server Error"),
             "exhaustion should fail: {exhausted}"
         );
-        assert!(matches!(next_event(&mut backend).await, HttpBackendEvent::Request(_)));
-        assert!(matches!(next_event(&mut backend).await, HttpBackendEvent::Request(_)));
+        assert!(
+            matches!(next_event(&mut backend).await, HttpBackendEvent::Request(_)),
+            "first request should emit a captured event"
+        );
+        assert!(
+            matches!(next_event(&mut backend).await, HttpBackendEvent::Request(_)),
+            "exhausted request should still emit a captured event"
+        );
         assert!(
             matches!(
                 next_event(&mut backend).await,
@@ -901,6 +944,90 @@ mod tests {
         );
     }
 
+    /// Reject a non-numeric `Content-Length` instead of accepting an empty body.
+    #[tokio::test]
+    async fn scripted_http_backend_rejects_invalid_content_length() {
+        let backend = start_scripted_http_backend(
+            "POST",
+            "/v1/responses",
+            vec![HttpServerAction::Json {
+                status: 200,
+                body: r#"{"ok":true}"#.to_owned(),
+            }],
+        )
+        .await;
+        let response = send_raw_request(
+            &backend,
+            "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: nope\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "invalid Content-Length should receive 400: {response}"
+        );
+    }
+
+    /// Reject a malformed header instead of silently accepting it.
+    #[tokio::test]
+    async fn scripted_http_backend_rejects_malformed_headers() {
+        let backend = start_scripted_http_backend("POST", "/v1/responses", vec![]).await;
+        let response = send_raw_request(
+            &backend,
+            "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nnot-a-header\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "malformed header should receive 400: {response}"
+        );
+    }
+
+    /// Reject malformed request lines before the backend claims a scripted turn.
+    #[test]
+    fn scripted_http_backend_rejects_malformed_request_lines() {
+        assert!(
+            parse_request_line("POST").is_none(),
+            "request line without a target should be rejected"
+        );
+        assert!(
+            parse_request_line("POST /v1/responses HTTP/1.1 extra").is_none(),
+            "request line with trailing fields should be rejected"
+        );
+    }
+
+    /// Time out an incomplete request head without reading unbounded client data.
+    #[tokio::test]
+    async fn scripted_http_backend_times_out_incomplete_request_head() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test listener should bind");
+        let client = tokio::net::TcpStream::connect(listener.local_addr().expect("listener address"))
+            .await
+            .expect("test client should connect");
+        let (server, _) = listener.accept().await.expect("listener should accept test client");
+
+        assert!(
+            peek_head_bytes(&server, Duration::from_millis(10)).await.is_none(),
+            "incomplete request head should time out"
+        );
+        drop(client);
+    }
+
+    /// Map configured status codes to the reason phrases emitted on the wire.
+    #[test]
+    fn scripted_http_backend_uses_expected_status_reasons() {
+        assert_eq!(status_reason(201), "Created", "201 should use Created");
+        assert_eq!(status_reason(408), "Request Timeout", "408 should use Request Timeout");
+        assert_eq!(
+            status_reason(503),
+            "Service Unavailable",
+            "503 should use Service Unavailable"
+        );
+        assert_eq!(status_reason(418), "OK", "unmapped statuses use the fallback reason");
+    }
+
     /// Reject `WebSocket` upgrade attempts so the HTTP-only test boundary holds.
     #[tokio::test]
     async fn scripted_http_backend_rejects_websocket_upgrades() {
@@ -942,6 +1069,23 @@ mod tests {
             .await
             .expect("backend event should arrive within five seconds")
             .expect("backend event channel should remain open")
+    }
+
+    /// Send raw bytes over a fresh connection and collect the response.
+    async fn send_raw_request(backend: &HttpBackendGuard, request: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, backend.port()))
+            .await
+            .expect("test client should connect");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("raw test request should be written");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("test response should complete within five seconds")
+            .expect("test response should be readable");
+        String::from_utf8(response).expect("test response should be UTF-8")
     }
 
     /// Send one complete HTTP request over a fresh connection and collect the response.
