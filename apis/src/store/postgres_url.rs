@@ -119,6 +119,51 @@ pub(crate) fn has_postgres_url_ssl_root_cert(database_url: &str) -> bool {
     postgres_query_params(database_url).any(|(key, _)| is_postgres_ssl_root_cert_param(&key))
 }
 
+/// Return whether a `PostgreSQL` URL carries a password in any position.
+///
+/// A password can reach `SQLx` from the URL userinfo (`user:pass@host`) or
+/// from an explicit `password=` query parameter. The certificate-authentication
+/// compliance profile forbids both so no secret is embedded where it could be
+/// logged or drive application-side password cryptography. The check matches the
+/// `password` key exactly and therefore does not false-match `sslpassword`
+/// (the encrypted-client-key passphrase).
+pub(crate) fn postgres_url_has_password(database_url: &str) -> bool {
+    if postgres_url_userinfo_has_password(database_url) {
+        return true;
+    }
+    postgres_query_params(database_url).any(|(key, _)| key == "password")
+}
+
+/// Return whether a `PostgreSQL` URL embeds any TLS parameter.
+///
+/// The compliance profile requires TLS to be configured through the filter
+/// fields (not the URL) so the configuration is the single authoritative source
+/// and the connection options can be rebuilt deterministically.
+pub(crate) fn postgres_url_has_tls_params(database_url: &str) -> bool {
+    postgres_query_params(database_url)
+        .any(|(key, _)| is_postgres_sslmode_param(&key) || is_postgres_tls_file_param(&key) || key == "sslpassword")
+}
+
+/// Return the first connection parameter that the certificate-authentication
+/// rebuild would silently drop, if any.
+///
+/// Under the compliance profile the connection is rebuilt from a
+/// password-file-free base that carries only addressing fields (host, port,
+/// socket, user, database). `SQLx` also parses `application_name`,
+/// `options`/`options[...]`, and `statement-cache-capacity` from the URL, but
+/// none can be faithfully carried onto the rebuilt options through the crate's
+/// public API: there is no `statement_cache_capacity` getter, and `get_options`
+/// returns a pre-formatted string the key/value-only `options` setter cannot
+/// round-trip. Silently dropping `options[search_path]` in particular could
+/// route store DDL and queries to the wrong schema, so the profile fails closed
+/// on any of these rather than discard them.
+pub(crate) fn postgres_url_dropped_connection_param(database_url: &str) -> Option<String> {
+    postgres_query_params(database_url)
+        .map(|(key, _)| key)
+        .find(|key| is_postgres_rebuild_dropped_param(key))
+        .map(Cow::into_owned)
+}
+
 /// Return whether an `sslmode` value enables certificate verification.
 pub(crate) fn is_verified_postgres_sslmode(value: &str) -> bool {
     value.eq_ignore_ascii_case("verify-ca") || value.eq_ignore_ascii_case("verify-full")
@@ -133,6 +178,21 @@ fn postgres_url_after_scheme(database_url: &str) -> Option<&str> {
     database_url
         .strip_prefix("postgres://")
         .or_else(|| database_url.strip_prefix("postgresql://"))
+}
+
+/// Return whether the URL authority carries userinfo with a password component.
+///
+/// The userinfo is the portion before the last `@` in the authority. A `:`
+/// inside it denotes a `user:password` split, mirroring how the `url` crate (and
+/// thus `SQLx`) reports `Url::password`.
+fn postgres_url_userinfo_has_password(database_url: &str) -> bool {
+    let Some(after_scheme) = postgres_url_after_scheme(database_url) else {
+        return false;
+    };
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or_default();
+    authority
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _host)| userinfo.contains(':'))
 }
 
 /// Extract the authority host from a `PostgreSQL` URL.
@@ -343,6 +403,18 @@ fn is_postgres_ssl_root_cert_param(key: &str) -> bool {
 /// Return whether a query key configures any `PostgreSQL` TLS file path.
 fn is_postgres_tls_file_param(key: &str) -> bool {
     is_postgres_ssl_root_cert_param(key) || key == "sslcert" || key == "ssl-cert" || key == "sslkey" || key == "ssl-key"
+}
+
+/// Return whether a query key sets a connection option that the
+/// certificate-authentication rebuild does not carry over.
+///
+/// These are the non-addressing parameters `SQLx` recognizes in a URL —
+/// `application_name`, `options`/`options[...]`, and `statement-cache-capacity` —
+/// that the password-file-free rebuild drops. Addressing parameters (`host`,
+/// `hostaddr`, `port`, `dbname`, `user`) and TLS/password parameters are handled
+/// elsewhere and are not reported here.
+fn is_postgres_rebuild_dropped_param(key: &str) -> bool {
+    key == "application_name" || key == "options" || key.starts_with("options[") || key == "statement-cache-capacity"
 }
 
 // -----------------------------------------------------------------------------
@@ -765,5 +837,111 @@ mod tests {
             "postgres://1.2.3.4/db?sslrootcert=/etc/ca.pem&sslkey=/etc/key.pem",
         )
         .unwrap();
+    }
+
+    // -- password detection ----------------------------------------------------
+
+    #[test]
+    fn detects_password_in_userinfo() {
+        assert!(postgres_url_has_password("postgres://user:secret@1.2.3.4:5432/db"));
+    }
+
+    #[test]
+    fn detects_password_in_query_param() {
+        assert!(postgres_url_has_password("postgres://1.2.3.4:5432/db?password=secret"));
+    }
+
+    #[test]
+    fn detects_empty_userinfo_password() {
+        // `user:@host` yields `Url::password() == Some("")` in SQLx; treat as present.
+        assert!(postgres_url_has_password("postgres://user:@1.2.3.4:5432/db"));
+    }
+
+    #[test]
+    fn no_password_when_userinfo_is_user_only() {
+        assert!(!postgres_url_has_password("postgres://user@1.2.3.4:5432/db"));
+    }
+
+    #[test]
+    fn no_password_without_userinfo() {
+        assert!(!postgres_url_has_password("postgres://1.2.3.4:5432/db"));
+    }
+
+    #[test]
+    fn sslpassword_query_is_not_a_password() {
+        // The encrypted-key passphrase must not be mistaken for a login password.
+        assert!(!postgres_url_has_password(
+            "postgres://user@1.2.3.4:5432/db?sslpassword=keypass"
+        ));
+    }
+
+    // -- TLS parameter detection -----------------------------------------------
+
+    #[test]
+    fn detects_url_tls_params() {
+        for url in [
+            "postgres://1.2.3.4/db?sslmode=verify-full",
+            "postgres://1.2.3.4/db?ssl-mode=require",
+            "postgres://1.2.3.4/db?sslcert=/etc/c.pem",
+            "postgres://1.2.3.4/db?sslkey=/etc/k.pem",
+            "postgres://1.2.3.4/db?sslrootcert=/etc/ca.pem",
+            "postgres://1.2.3.4/db?sslpassword=keypass",
+        ] {
+            assert!(postgres_url_has_tls_params(url), "should detect TLS param in {url}");
+        }
+    }
+
+    #[test]
+    fn no_url_tls_params_when_absent() {
+        assert!(!postgres_url_has_tls_params(
+            "postgres://user@1.2.3.4:5432/db?application_name=x"
+        ));
+    }
+
+    // -- rebuild-dropped connection parameter detection ------------------------
+
+    #[test]
+    fn detects_dropped_connection_params() {
+        for (url, param) in [
+            (
+                "postgres://user@1.2.3.4:5432/db?application_name=svc",
+                "application_name",
+            ),
+            (
+                "postgres://user@1.2.3.4:5432/db?options=-csearch_path%3Dmyschema",
+                "options",
+            ),
+            (
+                "postgres://user@1.2.3.4:5432/db?options[search_path]=myschema",
+                "options[search_path]",
+            ),
+            (
+                "postgres://user@1.2.3.4:5432/db?statement-cache-capacity=0",
+                "statement-cache-capacity",
+            ),
+        ] {
+            assert_eq!(
+                postgres_url_dropped_connection_param(url).as_deref(),
+                Some(param),
+                "should flag dropped connection param in {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_dropped_connection_param_for_addressing_only_url() {
+        // Addressing, TLS, and password parameters are handled elsewhere and
+        // must not be reported as rebuild-dropped.
+        for url in [
+            "postgres://user@1.2.3.4:5432/db",
+            "postgres://user@1.2.3.4:5432/db?host=1.2.3.4&port=5432&dbname=db&user=svc",
+            "postgres://user@1.2.3.4:5432/db?sslmode=verify-full&sslrootcert=/etc/ca.pem",
+        ] {
+            assert_eq!(
+                postgres_url_dropped_connection_param(url),
+                None,
+                "addressing/TLS-only URL should not flag a dropped param: {url}"
+            );
+        }
     }
 }

@@ -804,6 +804,134 @@ fn url_sslmode_verify_ca_with_sslrootcert_is_valid() {
     validate_config(&cfg).unwrap();
 }
 
+#[test]
+fn accept_client_cert_and_key() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://cert-user@1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_mode: verify-full
+        ssl_root_cert: "/etc/pki/ca.pem"
+        ssl_client_cert: "/etc/pki/client.pem"
+        ssl_client_key: "/etc/pki/client.key"
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+}
+
+#[test]
+fn reject_client_cert_without_key() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://cert-user@1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_mode: verify-full
+        ssl_client_cert: "/etc/pki/client.pem"
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let err = validate_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("configured together"),
+        "client cert without key should be rejected: {err}"
+    );
+}
+
+#[test]
+fn accept_compliance_profile() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://cert-user@1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_mode: verify-full
+        ssl_root_cert: "/etc/pki/ca.pem"
+        ssl_client_cert: "/etc/pki/client.pem"
+        ssl_client_key: "/etc/pki/client.key"
+        require_certificate_authentication: true
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    validate_config(&cfg).unwrap();
+}
+
+#[test]
+fn compliance_rejects_password_in_url() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://cert-user:secret@1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_mode: verify-full
+        ssl_client_cert: "/etc/pki/client.pem"
+        ssl_client_key: "/etc/pki/client.key"
+        require_certificate_authentication: true
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let err = validate_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("forbids a password"),
+        "compliance profile must reject a password in database_url: {err}"
+    );
+}
+
+#[test]
+fn compliance_requires_verify_full() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://cert-user@1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_mode: verify-ca
+        ssl_root_cert: "/etc/pki/ca.pem"
+        ssl_client_cert: "/etc/pki/client.pem"
+        ssl_client_key: "/etc/pki/client.key"
+        require_certificate_authentication: true
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let err = validate_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("verify-full"),
+        "compliance profile must require ssl_mode verify-full: {err}"
+    );
+}
+
+#[test]
+fn compliance_requires_client_cert() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: postgres
+        database_url: "postgres://cert-user@1.2.3.4:5432/db"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_mode: verify-full
+        require_certificate_authentication: true
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let err = validate_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("requires both"),
+        "compliance profile must require a client certificate and key: {err}"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Config Tests — SQLite Extras
 // -----------------------------------------------------------------------------
@@ -825,6 +953,47 @@ fn reject_ssl_root_cert_on_sqlite() {
     assert!(
         err.to_string().contains("only valid with the 'postgres' backend"),
         "ssl_root_cert on sqlite should be rejected: {err}"
+    );
+}
+
+#[test]
+fn reject_ssl_client_cert_on_sqlite() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: conversations
+        items_table: conversation_items
+        ssl_client_cert: "/path/to/client.pem"
+        ssl_client_key: "/path/to/client.key"
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let err = validate_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("only valid with the 'postgres' backend"),
+        "ssl_client_cert on sqlite should be rejected: {err}"
+    );
+}
+
+#[test]
+fn reject_require_certificate_authentication_on_sqlite() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: conversations
+        items_table: conversation_items
+        require_certificate_authentication: true
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let err = validate_config(&cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("only valid with the 'postgres' backend"),
+        "require_certificate_authentication on sqlite should be rejected: {err}"
     );
 }
 

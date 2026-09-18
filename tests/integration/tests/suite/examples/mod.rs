@@ -46,6 +46,7 @@ mod openai_agentic_loop;
 mod openai_client_tool_compat;
 #[cfg(feature = "store-sqlite")]
 mod openai_conversations;
+mod openai_conversations_postgres_mtls;
 mod openai_doc_extract;
 mod openai_embeddings_routing;
 mod openai_file_resolve;
@@ -56,6 +57,7 @@ mod openai_prompts_routing;
 mod openai_response_store;
 #[cfg(feature = "store-postgres")]
 mod openai_response_store_postgres;
+mod openai_response_store_postgres_mtls;
 mod openai_responses_body_size_limits;
 mod openai_responses_format;
 mod openai_responses_model_rewrite;

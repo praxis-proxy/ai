@@ -2931,6 +2931,42 @@ ssl_root_cert: /path/to/ca.pem
 }
 
 #[test]
+fn sqlite_config_rejects_ssl_client_cert() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+ssl_client_cert: /path/to/client.pem
+ssl_client_key: /path/to/client.key
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_err(), "ssl_client_cert should be rejected for sqlite backend");
+}
+
+#[test]
+fn sqlite_config_rejects_require_certificate_authentication() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+require_certificate_authentication: true
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "require_certificate_authentication should be rejected for sqlite backend"
+    );
+}
+
+#[test]
 fn sqlite_config_rejects_allow_private_database_url() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
@@ -2946,6 +2982,145 @@ allow_private_database_url: true
     assert!(
         result.is_err(),
         "allow_private_database_url should be rejected for sqlite backend"
+    );
+}
+
+#[test]
+fn postgres_config_accepts_client_cert_and_key() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: verify-full
+ssl_root_cert: /etc/pki/ca.pem
+ssl_client_cert: /etc/pki/client.pem
+ssl_client_key: /etc/pki/client.key
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_ok(), "client cert + key with verify-full should parse");
+}
+
+#[test]
+fn postgres_config_rejects_client_cert_without_key() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: verify-full
+ssl_client_cert: /etc/pki/client.pem
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_err(), "client cert without key should be rejected");
+}
+
+#[test]
+fn postgres_config_rejects_client_cert_with_unverified_mode() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: require
+ssl_client_cert: /etc/pki/client.pem
+ssl_client_key: /etc/pki/client.key
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "client cert with unverified ssl_mode should be rejected"
+    );
+}
+
+#[test]
+fn postgres_config_accepts_compliance_profile() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: verify-full
+ssl_root_cert: /etc/pki/ca.pem
+ssl_client_cert: /etc/pki/client.pem
+ssl_client_key: /etc/pki/client.key
+require_certificate_authentication: true
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_ok(), "well-formed compliance profile should parse");
+}
+
+#[test]
+fn postgres_config_compliance_rejects_password_in_url() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user:secret@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: verify-full
+ssl_client_cert: /etc/pki/client.pem
+ssl_client_key: /etc/pki/client.key
+require_certificate_authentication: true
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "compliance profile must reject a password in database_url"
+    );
+}
+
+#[test]
+fn postgres_config_compliance_requires_verify_full() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: verify-ca
+ssl_root_cert: /etc/pki/ca.pem
+ssl_client_cert: /etc/pki/client.pem
+ssl_client_key: /etc/pki/client.key
+require_certificate_authentication: true
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_err(), "compliance profile must require ssl_mode verify-full");
+}
+
+#[test]
+fn postgres_config_compliance_requires_client_cert() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: verify-full
+require_certificate_authentication: true
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "compliance profile must require a client certificate and key"
     );
 }
 
