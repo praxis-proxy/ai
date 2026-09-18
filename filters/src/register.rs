@@ -51,6 +51,7 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     register_anthropic_filters(registry, subrequest_client);
     register_openai_filters(registry, subrequest_client);
     register_routing_filters(registry);
+    register_vertex_filters(registry);
 }
 
 /// Build a [`FilterRegistry`] with core builtins and in-tree AI filters.
@@ -233,6 +234,14 @@ fn register_anthropic_filters(registry: &mut FilterRegistry, subrequest_client: 
         http "anthropic_validate" => praxis_ai_apis::anthropic::AnthropicValidateFilter::from_config
     );
     register_anthropic_web_search(registry, subrequest_client);
+}
+
+/// Register Vertex AI translation filters.
+fn register_vertex_filters(registry: &mut FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_chat_completions_to_vertexai_gemini" => praxis_ai_apis::vertex::OpenaiChatCompletionsToVertexaiGeminiFilter::from_config
+    );
 }
 
 /// Register OpenAI Responses API request-path filters.
@@ -576,6 +585,7 @@ mod tests {
             "request_id",
             "aws_sigv4_sign",
             "openai_chat_completions_to_azureai_chat_completions",
+            "openai_chat_completions_to_vertexai_gemini",
         ];
         for name in expected {
             assert!(names.contains(&name), "expected {name} in registry");

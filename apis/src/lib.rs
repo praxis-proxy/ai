@@ -27,6 +27,7 @@ mod state_owner_headers;
 pub mod store;
 pub mod subrequest;
 pub mod token_cache;
+pub mod vertex;
 pub(crate) mod web_search;
 
 pub use state_owner::{StateOwner, StateOwnerError, StateOwnerFilter, project_state_owner};
