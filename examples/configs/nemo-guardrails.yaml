@@ -44,6 +44,8 @@ filter_chains:
           # headers are forwarded to this endpoint.
           endpoint: "http://127.0.0.1:3001/v1/checks"
           allow_private_endpoint: true
+          guardrails:
+            config_ids: ["your-config"] # replace with a configuration deployed in NeMo
           timeout_ms: 5000
         phase:
           request: true

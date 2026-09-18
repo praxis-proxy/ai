@@ -9,6 +9,8 @@ Calls an external AI guardrail provider to evaluate request and response bodies.
 
 **Wire format:** Chat Completions only (`messages` on requests, `choices[].message` on responses). Responses API, Anthropic Messages, and MCP are not supported yet (see ai#1043).
 
+For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail configurations. When `provider.guardrails` is omitted, the request omits `config_ids` so the service can use its default configuration. Omit `provider.model` to leave the selected configuration's models unchanged; a non-empty value replaces or adds its main model.
+
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -27,6 +29,8 @@ provider:
   type: nemo
   endpoint: "http://nemo:8000/v1/checks"
   allow_private_endpoint: true
+  guardrails:
+    config_ids: ["your-config"]
   timeout_ms: 5000
 phase:
   request: true

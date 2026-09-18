@@ -163,6 +163,26 @@ phase:
 }
 
 #[test]
+fn empty_nemo_config_ids_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://nemo:8000/v1/checks"
+  guardrails:
+    config_ids: []
+"#,
+    )
+    .unwrap();
+
+    let error = AiGuardrailsFilter::from_config(&yaml).err().unwrap();
+    assert_eq!(
+        error.to_string(),
+        "ai_guardrails (nemo): 'guardrails.config_ids' must not be empty; omit 'guardrails' to use the service default"
+    );
+}
+
+#[test]
 fn nemo_private_endpoint_requires_explicit_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"

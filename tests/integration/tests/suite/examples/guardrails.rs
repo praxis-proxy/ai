@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 
-use praxis_test_utils::{Backend, BackendGuard, free_port, http_post, start_backend_with_shutdown, start_proxy};
+use praxis_test_utils::{
+    Backend, BackendGuard, free_port, http_post, start_backend_with_shutdown, start_capturing_backend, start_proxy,
+};
 
 use super::load_example_config;
 
@@ -27,7 +29,7 @@ fn nemo_guardrails_config_parses_correctly() {
 #[test]
 fn nemo_guardrails_forwards_to_backend() {
     let backend = start_backend_with_shutdown("ok");
-    let nemo = nemo_mock(r#"{"status":"passed","content":"Hello, how are you?"}"#);
+    let nemo = start_capturing_backend(r#"{"status":"passed"}"#);
     let proxy_port = free_port();
     let config = load_example_config(
         "nemo-guardrails.yaml",
@@ -44,6 +46,16 @@ fn nemo_guardrails_forwards_to_backend() {
 
     assert_eq!(status, 200, "NeMo 'passed' should forward to upstream");
     assert_eq!(body, "ok", "upstream response should reach the client");
+    let payload: serde_json::Value = serde_json::from_str(&nemo.body()).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "model": "",
+            "messages": [{"role": "user", "content": "Hello, how are you?"}],
+            "guardrails": {"rail_types": ["input"], "config_ids": ["your-config"]}
+        }),
+        "example must select guardrails without overriding the configured NeMo model"
+    );
 }
 
 /// `NeMo` returns `"blocked"` → proxy rejects with 403 and the triggered

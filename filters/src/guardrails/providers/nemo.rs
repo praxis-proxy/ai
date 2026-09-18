@@ -39,6 +39,10 @@ struct NemoConfig {
     #[serde(default)]
     model: String,
 
+    /// Optional guardrail configuration selection sent to `NeMo`.
+    #[serde(default)]
+    guardrails: Option<NemoGuardrails>,
+
     /// Per-request timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
@@ -58,22 +62,33 @@ fn default_max_message_checks() -> u32 {
     DEFAULT_MAX_MESSAGE_CHECKS
 }
 
+/// Guardrail configurations selected for evaluation.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NemoGuardrails {
+    /// Configuration IDs understood by the configured `NeMo` service.
+    config_ids: Vec<String>,
+}
+
 /// Phase-specific rail selection sent under `guardrails.rail_types`.
 #[derive(Serialize)]
-struct NemoGuardrailsRequest {
+struct NemoGuardrailsRequest<'a> {
+    /// Omitted when the service should select its default configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_ids: Option<&'a [String]>,
     /// Rail types `NeMo` should run for this check (`input` or `output`).
     rail_types: Vec<&'static str>,
 }
 
 /// Outgoing request payload for `NeMo`
 #[derive(Serialize)]
-struct NemoRequest {
+struct NemoRequest<'a> {
     /// Model name
-    model: String,
+    model: &'a str,
     /// List of messages to evaluate.
     messages: Vec<serde_json::Value>,
     /// `NeMo` guardrails options for `/v1/checks`.
-    guardrails: NemoGuardrailsRequest,
+    guardrails: NemoGuardrailsRequest<'a>,
 }
 
 /// Incoming response payload for `/v1/checks`.
@@ -101,6 +116,9 @@ pub(in crate::guardrails) struct NemoProvider {
     /// Model name included in every request. Empty string when not configured.
     model: String,
 
+    /// Optional guardrail configuration selection.
+    guardrails: Option<NemoGuardrails>,
+
     /// Per-request deadline covering admission, connect, and I/O.
     timeout: Duration,
 
@@ -125,6 +143,7 @@ impl NemoProvider {
     pub fn from_config(config: &serde_yaml::Value, client: SubRequestClient) -> Result<Self, FilterError> {
         let cfg: NemoConfig = serde_yaml::from_value(config.clone())
             .map_err(|e| -> FilterError { format!("ai_guardrails (nemo): {e}").into() })?;
+        validate_guardrails_config(&cfg)?;
         if cfg.endpoint.is_empty() {
             return Err("ai_guardrails (nemo): 'endpoint' must not be empty".into());
         }
@@ -146,6 +165,7 @@ impl NemoProvider {
             client,
             endpoint: cfg.endpoint,
             model: cfg.model,
+            guardrails: cfg.guardrails,
             timeout: Duration::from_millis(cfg.timeout_ms),
             address_policy,
             max_message_checks: cfg.max_message_checks,
@@ -159,7 +179,7 @@ impl NemoProvider {
         phase: GuardPhase,
         remaining: Duration,
     ) -> Result<GuardResult, FilterError> {
-        let request = build_request(&self.model, messages, phase)?;
+        let request = build_request(&self.model, messages, phase, self.guardrails.as_ref())?;
         let response = subrequest::execute_url(
             &self.client,
             &self.endpoint,
@@ -219,6 +239,17 @@ impl GuardProvider for NemoProvider {
 // Private Utilities
 // -----------------------------------------------------------------------------
 
+/// Reject an explicitly empty configuration selection.
+fn validate_guardrails_config(config: &NemoConfig) -> Result<(), FilterError> {
+    if config.guardrails.as_ref().is_some_and(|g| g.config_ids.is_empty()) {
+        return Err(
+            "ai_guardrails (nemo): 'guardrails.config_ids' must not be empty; omit 'guardrails' to use the service default"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Combine a per-slice verdict into the running evaluation state.
 ///
 /// `blocked` fails fast. `modified` is retained but later slices are still
@@ -270,12 +301,18 @@ fn rail_types_for_phase(phase: GuardPhase) -> Vec<&'static str> {
 }
 
 /// Build the outbound `NeMo` JSON callout.
-fn build_request(model: &str, messages: Vec<serde_json::Value>, phase: GuardPhase) -> Result<SubRequest, FilterError> {
+fn build_request(
+    model: &str,
+    messages: Vec<serde_json::Value>,
+    phase: GuardPhase,
+    guardrails: Option<&NemoGuardrails>,
+) -> Result<SubRequest, FilterError> {
     let payload = NemoRequest {
-        model: model.to_owned(),
+        model,
         messages,
         guardrails: NemoGuardrailsRequest {
             rail_types: rail_types_for_phase(phase),
+            config_ids: guardrails.map(|settings| settings.config_ids.as_slice()),
         },
     };
     let body =
@@ -349,6 +386,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_serializes_configured_guardrails() {
+        let config: NemoConfig = serde_yaml::from_str(
+            r#"
+endpoint: "http://localhost:8000/v1/checks"
+model: check-model
+guardrails:
+  config_ids: [your-config, another-config]
+"#,
+        )
+        .unwrap();
+        let request = build_request(
+            &config.model,
+            vec![serde_json::json!({"role": "user", "content": "Hello"})],
+            GuardPhase::Request,
+            config.guardrails.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(request.method, Method::POST);
+        assert_eq!(request.headers[http::header::CONTENT_TYPE], "application/json");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+            serde_json::json!({
+                "model": "check-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "guardrails": {"rail_types": ["input"], "config_ids": ["your-config", "another-config"]}
+            })
+        );
+    }
+
+    #[test]
+    fn request_omits_unconfigured_config_ids() {
+        let config: NemoConfig = serde_yaml::from_str("endpoint: http://localhost:8000").unwrap();
+        let request = build_request(&config.model, vec![], GuardPhase::Response, config.guardrails.as_ref()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+            serde_json::json!({
+                "model": "", "messages": [], "guardrails": {"rail_types": ["output"]}
+            })
+        );
+    }
+
+    #[test]
     fn target_message_indices_request_collects_user_turns() {
         let messages = vec![
             serde_json::json!({"role": "system", "content": "sys"}),
@@ -394,6 +473,7 @@ mod tests {
             "test",
             vec![serde_json::json!({"role": "user", "content": "hello"})],
             GuardPhase::Request,
+            None,
         )
         .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&request.body).unwrap();

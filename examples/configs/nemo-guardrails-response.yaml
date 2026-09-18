@@ -28,6 +28,8 @@ filter_chains:
           type: nemo
           endpoint: "http://127.0.0.1:3001/v1/checks"
           allow_private_endpoint: true
+          guardrails:
+            config_ids: ["your-config"] # replace with a configuration deployed in NeMo
           timeout_ms: 5000
         phase:
           request: false
