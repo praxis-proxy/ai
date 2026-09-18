@@ -478,14 +478,16 @@ jobs:
           cache-dependency-glob: |
             tests/integration/ogx-constraints.txt
 
-      - name: Pull vLLM CUDA image
-        run: |
-          "$CONTAINER_RUNTIME" pull "$VLLM_GPU_IMAGE"
-
-      - name: Start vLLM on GPU
+      - name: Start vLLM on GPU (background)
         env:
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
         run: |
+          # Background the image pull + container launch so the multi-GB CUDA
+          # image download and model weight load overlap `cargo build` below.
+          # `run -d` needs the image present, so pull and run are chained in one
+          # detached subshell; the readiness wait then joins on the serving port.
+          # Runtime, image, model and GPU flags are passed positionally so they
+          # expand in the inner shell without leaking outer-shell quoting.
           gpu_args=()
           if [ "$CONTAINER_RUNTIME" = "podman" ]; then
             gpu_args=(--device nvidia.com/gpu=all)
@@ -493,18 +495,29 @@ jobs:
             gpu_args=(--gpus all)
           fi
 
-          "$CONTAINER_RUNTIME" run -d --name vllm \
-            "${gpu_args[@]}" \
-            -p 8000:8000 \
-            -e HUGGING_FACE_HUB_TOKEN \
-            "$VLLM_GPU_IMAGE" \
-            --model "$VLLM_GPU_MODEL" \
-            --max-model-len 4096 \
-            --served-model-name "$VLLM_GPU_MODEL" \
-            --enable-auto-tool-choice \
-            --tool-call-parser hermes \
-            --reasoning-parser deepseek_r1 \
-            --gpu-memory-utilization 0.9
+          # The single-quoted body is the inner script; $1/$runtime/... expand
+          # there, not in this outer shell, which is the whole point.
+          # shellcheck disable=SC2016
+          nohup bash -c '
+            set -euo pipefail
+            runtime="$1"; image="$2"; model="$3"; shift 3
+            "$runtime" pull "$image"
+            "$runtime" run -d --name vllm \
+              "$@" \
+              -p 8000:8000 \
+              -e HUGGING_FACE_HUB_TOKEN \
+              "$image" \
+              --model "$model" \
+              --max-model-len 4096 \
+              --served-model-name "$model" \
+              --enable-auto-tool-choice \
+              --tool-call-parser hermes \
+              --reasoning-parser deepseek_r1 \
+              --gpu-memory-utilization 0.9
+          ' bash "$CONTAINER_RUNTIME" "$VLLM_GPU_IMAGE" "$VLLM_GPU_MODEL" "${gpu_args[@]}" \
+            > /tmp/vllm-launch.log 2>&1 &
+          echo $! > /tmp/vllm-launch.pid
+          echo "vLLM launch (pull + run) started in background, pid $(cat /tmp/vllm-launch.pid)"
 
       - name: Pre-install OGX dependencies
         run: |
@@ -520,14 +533,37 @@ jobs:
 
       - name: Wait for vLLM readiness
         run: |
+          # The image pull + container launch run in the background so they can
+          # overlap `cargo build`; join on them here. Model weights download from
+          # Hugging Face on first start, so allow a generous deadline. Poll the
+          # serving endpoints directly (runtime agnostic), but fail fast if the
+          # background launcher exited before the port ever came up (bad pull,
+          # OOM on load) rather than waiting out the whole deadline.
+          dump_launch_log() {
+            echo "----- /tmp/vllm-launch.log -----"
+            cat /tmp/vllm-launch.log 2>/dev/null || echo "No vLLM launch log found"
+          }
           echo "Waiting for vLLM health and model endpoints..."
-          # Model weights download from Hugging Face on first start, so allow a
-          # generous deadline. Poll the serving endpoints directly (runtime
-          # agnostic) rather than introspecting the container.
-          timeout 1200 bash -c 'until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
-                                       curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
+          launch_pid="$(cat /tmp/vllm-launch.pid)"
+          deadline=$((SECONDS + 1200))
+          until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
+                curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
+            if ! kill -0 "$launch_pid" 2>/dev/null; then
+              # Launcher finished; if the endpoint still is not up, the container
+              # failed to start or crashed during weight load.
+              if ! curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
+                echo "::error::vLLM launcher (pid $launch_pid) exited before the serving port came up"
+                dump_launch_log
+                exit 1
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::vLLM did not become ready within 1200s"
+              dump_launch_log
+              exit 1
+            fi
             sleep 5
-          done'
+          done
           echo "vLLM is ready"
           curl -sf http://127.0.0.1:8000/v1/models | head -c 500
           echo
