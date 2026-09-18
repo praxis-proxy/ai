@@ -4824,6 +4824,105 @@ fn web_search_caps_multiple_calls_within_one_round_without_reentry() {
 }
 
 #[test]
+fn web_search_multi_query_call_costs_one_tool_call() {
+    // The model asks for three queries inside a *single* web_search_call while
+    // the client caps built-in tool calls at one. `max_tool_calls` counts
+    // logical tool calls, so the call is admitted in full: three provider
+    // requests are dispatched, the call completes, and no call is rejected.
+    let first_response = serde_json::json!({
+        "id": "resp_ws_multi_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_multi_a",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "queries": ["Rust 2025 edition", "Rust async runtime", "Rust release notes"]
+            }
+        }]
+    });
+    let final_response = serde_json::json!({
+        "id": "resp_ws_multi_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "id": "msg_ws_multi",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "Rust 2025 edition shipped.", "annotations": []}]
+        }]
+    });
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&final_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let search_count = spawn_counting_search_mock(search_listener);
+
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model.port(), search_port);
+    let proxy = start_proxy(&config);
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for Rust news",
+        "max_tool_calls": 1,
+        "tools": [{"type": "web_search_preview"}]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "multi-query round-trip should return 200");
+
+    assert_eq!(
+        search_count.load(Ordering::SeqCst),
+        3,
+        "every query of the single admitted call reaches the provider"
+    );
+
+    let body = parse_body(&raw);
+    let response: serde_json::Value = serde_json::from_str(&body).expect("response should be JSON");
+    let output = response["output"]
+        .as_array()
+        .expect("response output should be an array");
+    let executed = output
+        .iter()
+        .find(|item| item["type"] == "web_search_call")
+        .expect("the web_search_call must be retained in the final output");
+    assert_eq!(
+        executed["status"], "completed",
+        "a fully dispatched multi-query call is completed"
+    );
+    assert_eq!(
+        executed["action"]["queries"],
+        serde_json::json!(["Rust 2025 edition", "Rust async runtime", "Rust release notes"]),
+        "the client-visible action preserves every requested query"
+    );
+    assert!(
+        !output
+            .iter()
+            .any(|item| item["type"] == "web_search_call" && item["status"] == "failed"),
+        "one multi-query call must not exhaust max_tool_calls: 1"
+    );
+
+    // The single call cost one unit, so the loop continued into a normal
+    // post-search model round rather than terminating on budget exhaustion.
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "the admitted call must re-enter the model with its results"
+    );
+}
+
+#[test]
 fn web_search_budget_persists_across_loop_iterations() {
     // The client caps built-in tool calls at one, but the model requests a
     // *new* web search in a *later* loop iteration. The executed count lives
