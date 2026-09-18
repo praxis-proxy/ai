@@ -56,8 +56,8 @@ use bytes::Bytes;
 use futures::{FutureExt as _, future::join_all};
 use praxis_core::config::InsecureOptions;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, FilterPipeline, HttpFilter, HttpFilterContext, Rejection,
-    body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
+    HttpFilterContext, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::{debug, warn};
 
@@ -67,7 +67,7 @@ use self::{
         extract_approval_responses, is_approval_response, parse_approval_response, resolve_approval,
         target_fingerprint,
     },
-    config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config},
+    config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config, require_inline_outbound_chain},
 };
 use super::{
     DEFAULT_STORE_NAME,
@@ -149,9 +149,11 @@ pub struct McpDispatchFilter {
     ///
     /// Carries only operator-configured cross-cutting filters (if any); the dial
     /// target is staged by the transport, so no upstream-selecting filter is
-    /// prepended. This filter runs inside an `iterative_request_router` step and
-    /// so supports only an inline `outbound_chain` (or none): a named reference
-    /// cannot be resolved without a chain-binding context (see [`Self::from_config`]).
+    /// prepended. This filter runs inside an `iterative_request_router` step, which
+    /// praxis core builds with a live [`ChainBindingContext`], so an inline
+    /// `outbound_chain` (or none) is bound at step-build time via
+    /// [`Self::from_config_with_binding`]; a named reference is rejected because IRR
+    /// supplies each step an empty top-level named-chain map.
     outbound_pipeline: Arc<FilterPipeline>,
     /// Trusted request headers explicitly allowed across the MCP boundary.
     forward_headers: Vec<http::HeaderName>,
@@ -168,32 +170,70 @@ pub struct McpDispatchFilter {
 }
 
 impl McpDispatchFilter {
-    /// Build from parsed YAML config.
+    /// Build from parsed YAML config as a plain builtin (no chain binding).
     ///
-    /// `openai_mcp_dispatch` is registered as a plain builtin (not chain-binding)
-    /// because it runs inside an `iterative_request_router` step, whose filters
-    /// praxis core builds without a [`ChainBindingContext`]. It therefore builds
-    /// its outbound pipeline directly from an inline `outbound_chain` (or an empty
-    /// one when none is configured) and rejects a named reference, which cannot be
-    /// resolved here. The transport stages the SSRF-validated dial target, so the
-    /// built pipeline carries only cross-cutting outbound filters.
+    /// This path cannot bind an operator `outbound_chain` (it has no
+    /// [`ChainBindingContext`]), so it builds an empty outbound pipeline and
+    /// rejects a configured `outbound_chain`. Production registers this filter as
+    /// chain-binding via [`Self::from_config_with_binding`]; this method exists for
+    /// the no-chain default and unit tests, and keeps the `name()` +
+    /// `from_config()` pair the filter-docs generator anchors on.
     ///
     /// [`ChainBindingContext`]: praxis_filter::ChainBindingContext
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the config is invalid, carries a named
-    /// `outbound_chain` (unsupported without chain binding), or the inline
-    /// outbound pipeline cannot be built.
+    /// Returns [`FilterError`] if the config is invalid, carries an
+    /// `outbound_chain` (unsupported without chain binding), or the empty outbound
+    /// pipeline cannot be built.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let cfg: McpDispatchConfig = parse_filter_config("openai_mcp_dispatch", config)?;
+        let validated = build_config(cfg)?;
+        if validated.outbound_chain.is_some() {
+            return Err(FilterError::from(
+                "openai_mcp_dispatch: outbound_chain requires chain-binding registration; register this \
+                 filter with register_chain_binding, not as a plain builtin",
+            ));
+        }
+        // Empty outbound pipeline; posture stays at its safe default until pipeline
+        // finalization propagates the operator's global insecure options.
+        let outbound_pipeline = mcp_client::build_bare_outbound_pipeline(false)
+            .map_err(|error| FilterError::from(format!("openai_mcp_dispatch: {error}")))?;
+        Ok(Self::assemble(&validated, outbound_pipeline))
+    }
+
+    /// Build from parsed YAML config, binding the operator `outbound_chain`
+    /// against the active registry.
+    ///
+    /// Registered via [`FilterRegistry::register_chain_binding`]. Although this
+    /// filter runs nested inside an `iterative_request_router` step, praxis core
+    /// builds each IRR step with a live [`ChainBindingContext`], so an inline
+    /// `outbound_chain` is bound at step-build time and its filters run as
+    /// cross-cutting outbound filters on every `tools/call` and deferred
+    /// `tools/list` callout. A named reference is rejected up front (via
+    /// `require_inline_outbound_chain`): IRR supplies each step an empty
+    /// top-level named-chain map, so a `Named` reference can never resolve inside a
+    /// step. The dial target is staged by the transport, so the bound chain carries
+    /// no upstream-selecting filter.
+    ///
+    /// [`FilterRegistry::register_chain_binding`]: praxis_filter::FilterRegistry::register_chain_binding
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the config is invalid, carries a named
+    /// `outbound_chain` (unsupported inside an IRR step), or the inline outbound
+    /// chain cannot be bound (a cycle, excessive nesting, a terminal filter, or an
+    /// ordering violation).
+    pub fn from_config_with_binding(
+        config: &serde_yaml::Value,
+        ctx: &ChainBindingContext<'_>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: McpDispatchConfig = parse_filter_config("openai_mcp_dispatch", config)?;
         let mut validated = build_config(cfg)?;
         let outbound_chain = validated.outbound_chain.take();
-        // Inline (or empty) pipeline; a named reference cannot be resolved without
-        // a chain-binding context. Posture stays at its safe default until pipeline
-        // finalization propagates the operator's global insecure options.
-        let outbound_pipeline = mcp_client::build_inline_outbound_pipeline(outbound_chain, false)
-            .map_err(|error| FilterError::from(format!("openai_mcp_dispatch: {error}")))?;
+        require_inline_outbound_chain(outbound_chain.as_ref())?;
+        let outbound_pipeline =
+            mcp_client::bind_mcp_outbound_chain(outbound_chain, ctx, "openai_mcp_dispatch_outbound")?;
         Ok(Self::assemble(&validated, outbound_pipeline))
     }
 

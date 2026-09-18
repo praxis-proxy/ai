@@ -1092,33 +1092,64 @@ fn from_config_rejects_zero_timeout() {
 }
 
 #[test]
-fn from_config_accepts_inline_outbound_chain() {
-    // openai_mcp_dispatch runs inside an iterative_request_router step, which
-    // praxis core builds without a chain-binding context. An *inline* chain
-    // carries its own filters and builds directly (no top-level resolution
-    // needed), so it is accepted and runs on the `tools/call` callout.
+fn from_config_rejects_inline_outbound_chain() {
+    // The plain-builtin `from_config` path has no chain-binding context, so it
+    // cannot bind *any* configured `outbound_chain` (inline or named). Production
+    // registers this filter as chain-binding via `from_config_with_binding`; the
+    // plain path must reject a configured chain rather than silently drop it.
     let config = serde_yaml::from_str::<serde_yaml::Value>(
         "outbound_chain:\n  name: mcp-outbound\n  filters:\n    - filter: headers\n      request_set:\n        - name: x-probe\n          value: v\n",
     )
     .unwrap();
+    let Err(error) = McpDispatchFilter::from_config(&config) else {
+        panic!("a configured outbound_chain must be rejected by the plain builtin path");
+    };
     assert!(
-        McpDispatchFilter::from_config(&config).is_ok(),
-        "an inline outbound_chain must build without a chain-binding context"
+        error.to_string().contains("chain-binding registration"),
+        "error should point at chain-binding registration: {error}"
     );
 }
 
 #[test]
 fn from_config_rejects_named_outbound_chain() {
-    // A named reference resolves against the top-level `filter_chains`, which are
-    // unreachable inside the IRR step (no chain-binding context), so it is
-    // rejected up front rather than silently ignored.
+    // The plain-builtin path rejects a named chain for the same reason as an
+    // inline one: it has no chain-binding context to resolve it.
     let config = serde_yaml::from_str::<serde_yaml::Value>("outbound_chain: mcp-outbound\n").unwrap();
     let Err(error) = McpDispatchFilter::from_config(&config) else {
         panic!("a named outbound_chain must be rejected");
     };
     assert!(
-        error.to_string().contains("named reference cannot be resolved"),
-        "error should explain the rejection: {error}"
+        error.to_string().contains("chain-binding registration"),
+        "error should point at chain-binding registration: {error}"
+    );
+}
+
+#[test]
+fn require_inline_outbound_chain_accepts_none_and_inline() {
+    // The chain-binding path (`from_config_with_binding`) accepts an inline chain
+    // (bound at IRR step-build time) and the omitted case (empty chain).
+    use praxis_core::config::ChainRef;
+    super::config::require_inline_outbound_chain(None).expect("None must be accepted");
+    let inline = ChainRef::Inline {
+        name: "mcp-outbound".to_owned(),
+        filters: Vec::new(),
+    };
+    super::config::require_inline_outbound_chain(Some(&inline)).expect("an inline chain must be accepted");
+}
+
+#[test]
+fn require_inline_outbound_chain_rejects_named() {
+    // A named reference cannot resolve inside the IRR step (empty step-level
+    // named-chain map), so the chain-binding path rejects it up front with a
+    // clear inline-required error.
+    use praxis_core::config::ChainRef;
+    let named = ChainRef::Named("mcp-outbound".to_owned());
+    let Err(error) = super::config::require_inline_outbound_chain(Some(&named)) else {
+        panic!("a named outbound_chain must be rejected");
+    };
+    assert!(
+        error.to_string().contains("must be defined inline"),
+        "error should require an inline chain: {error}"
     );
 }
 

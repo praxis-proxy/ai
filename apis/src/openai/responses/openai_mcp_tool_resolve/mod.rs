@@ -464,16 +464,20 @@ impl McpToolResolveFilter {
         };
         let label = server_label(entry);
         let is_connector = entry.get("connector_id").is_some();
-        mcp_client::validate_mcp_url(server_url, self.timeout, callout.allow_private())
-            .await
-            .map_err(|source| ResolveError::Client {
-                server_label: label.to_owned(),
-                source,
-            })?;
         if can_reuse_cached_listing(entry, is_connector)
             && let Some(cached) =
                 find_cached_listing(previous_tools, label, server_url, cache_allowed_names, is_connector)
         {
+            // Cache hit: no dial is made, so validate the target here to preserve
+            // the SSRF-rejection invariant. A cache miss instead validates during
+            // the actual callout inside the subrequest transport, so exactly one
+            // DNS resolution happens per path.
+            mcp_client::validate_mcp_target(server_url, self.timeout, callout.allow_private())
+                .await
+                .map_err(|source| ResolveError::Client {
+                    server_label: label.to_owned(),
+                    source,
+                })?;
             debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
             return Ok(Some(cached));
         }
@@ -997,8 +1001,10 @@ fn failure_server_label(err: &ResolveError) -> &str {
 }
 
 /// Return whether an MCP client error represents a discovery attempt that
-/// reached runtime I/O or response processing. Local request-policy failures
-/// such as SSRF blocking and malformed authorization retain their HTTP error.
+/// reached runtime I/O or response processing. Local request-policy failures --
+/// SSRF blocking, an invalid or disallowed target URL, and malformed
+/// authorization -- are permanent rejections that retain their HTTP error rather
+/// than degrading to an in-band streaming lifecycle.
 fn is_mcp_listing_runtime_failure(err: &ResolveError) -> bool {
     let (ResolveError::Client { source, .. } | ResolveError::ConnectorClient { source, .. }) = err else {
         return false;
@@ -2432,9 +2438,10 @@ async fn list_deferred_connector(
     callout: &mcp_client::McpCallout,
 ) -> Result<Vec<serde_json::Value>, ResolveError> {
     let entry = deferred_entry_view(connector);
-    mcp_client::validate_mcp_url(&connector.server_url, connector.timeout, callout.allow_private())
-        .await
-        .map_err(|source| deferred_connector_client_error(connector, source))?;
+    // No upfront SSRF classifier: `fetch_tools` always dials, and the subrequest
+    // transport validates the target during the callout, so the SSRF rejection is
+    // reconstructed from the transport signal below without a second DNS
+    // resolution.
     let options = FetchToolsOptions {
         forwarded_header_names,
         forwarded_headers: Some(forwarded_headers),

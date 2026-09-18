@@ -350,15 +350,15 @@ fn register_openai_response_filters(registry: &mut FilterRegistry, subrequest_cl
 /// `filter_chains`) are supported.
 ///
 /// `openai_mcp_dispatch` runs **inside** the `iterative_request_router` step
-/// pipeline (the per-round `tools/call` executor). praxis core resolves IRR
-/// step filters via the plain [`FilterPipeline::build`], which has no
-/// [`ChainBindingContext`], so a named reference cannot be resolved there. It is
-/// therefore registered as a plain builtin that builds its outbound pipeline
-/// directly from an inline `outbound_chain` (or an empty one) and rejects a
-/// named reference at build time. SSRF posture is propagated from the operator's
-/// global insecure options at pipeline finalization.
+/// pipeline (the per-round `tools/call` executor) and is likewise registered as
+/// **chain-binding**. praxis core builds each IRR step with a live
+/// [`ChainBindingContext`], so its inline `outbound_chain` is bound at
+/// step-build time. Outer *named* references remain unavailable inside a step —
+/// IRR supplies each step an empty top-level named-chain map — so a named
+/// reference is rejected and an inline chain (or none) is the supported shape
+/// here. SSRF posture is propagated from the operator's global insecure options
+/// at pipeline finalization.
 ///
-/// [`FilterPipeline::build`]: praxis_filter::FilterPipeline::build
 /// [`ChainBindingContext`]: praxis_filter::ChainBindingContext
 /// [`StagedUpstream`]: praxis_filter::StagedUpstream
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
@@ -371,10 +371,14 @@ fn register_mcp_callout_filters(registry: &mut FilterRegistry) {
             }),
         )
         .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_mcp_tool_resolve'"));
-    praxis_filter::register_filters!(
-        @register registry,
-        http "openai_mcp_dispatch" => praxis_ai_apis::openai::McpDispatchFilter::from_config
-    );
+    registry
+        .register_chain_binding(
+            "openai_mcp_dispatch",
+            ::std::sync::Arc::new(|config: &serde_yaml::Value, ctx: &ChainBindingContext<'_>| {
+                praxis_ai_apis::openai::McpDispatchFilter::from_config_with_binding(config, ctx)
+            }),
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_mcp_dispatch'"));
 }
 
 /// Register OpenAI agentic loop filters.

@@ -16,9 +16,10 @@
 # On `openai_mcp_tool_resolve` (a top-level filter), `outbound_chain` may be an
 # **inline** chain (as shown here) or a **named** reference to a top-level
 # `filter_chains` entry. `openai_mcp_dispatch` (the per-round `tools/call`
-# executor) runs inside `iterative_request_router`, whose step filters praxis
-# core builds without a chain-binding context, so it accepts only an **inline**
-# `outbound_chain` (a named reference cannot be resolved there).
+# executor) runs inside `iterative_request_router`. praxis core builds each IRR
+# step with a live chain-binding context, so `openai_mcp_dispatch` also binds an
+# **inline** `outbound_chain`; a **named** reference cannot resolve there because
+# IRR supplies each step an empty top-level named-chain map.
 #
 # SSRF posture: the outbound MCP callout is validated against the pipeline's
 # `insecure_options.allow_private_upstreams`. This example enables it so the

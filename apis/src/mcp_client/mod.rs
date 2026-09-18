@@ -25,7 +25,7 @@ mod tests;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr},
     time::Duration,
 };
 
@@ -37,8 +37,7 @@ use rmcp::{
 
 use self::subrequest_transport::MAX_CONTROL_RESPONSE_BYTES;
 pub(crate) use self::subrequest_transport::{
-    McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, build_inline_outbound_pipeline,
-    overflow_client_error,
+    McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
 };
 
 // -----------------------------------------------------------------------------
@@ -249,6 +248,21 @@ pub(crate) enum McpClientError {
         reason: &'static str,
     },
 
+    /// The MCP server URL is structurally invalid or disallowed before any dial:
+    /// an unsupported scheme, embedded userinfo, a fragment, or a
+    /// malformed/disallowed host literal (for example a bracketed IPv4 or an
+    /// IPv4-mapped IPv6 address rejected at parse time).
+    ///
+    /// A permanent request-shaping failure — the target is never contacted. Like
+    /// [`SsrfBlocked`](Self::SsrfBlocked), it is a policy/validation rejection
+    /// rather than a transient upstream failure, so a streaming `tools/list`
+    /// retains its HTTP error instead of degrading to an in-band lifecycle event.
+    #[error("mcp server URL is invalid or not allowed: {url}")]
+    InvalidTarget {
+        /// The rejected URL, reduced to a credential-safe display form.
+        url: McpDisplayUrl,
+    },
+
     /// Authorization token contains invalid header characters.
     #[error("authorization token contains invalid HTTP header characters")]
     InvalidAuthorization,
@@ -332,18 +346,20 @@ pub(crate) async fn list_tools_with_forwarded_headers(
     let display_url = parse_display_url(server_url);
 
     let work = async {
-        resolve_and_validate(server_url, timeout, callout.allow_private()).await?;
-        // `initialize` and `tools/list` are control-plane exchanges: the
-        // subrequest transport bounds each response body to the control ceiling
-        // before deserialization, so an untrusted server cannot exhaust proxy
-        // memory before `max_tools` (a count-only limit) is ever evaluated.
-        // Across pagination the decoded listing is additionally bounded by
-        // `MAX_LISTING_RESPONSE_BYTES` (see `paginate_tools`).
+        // No upfront SSRF classifier: the subrequest transport validates the
+        // dial target during the callout via `prepare_url_target`, so this path
+        // resolves DNS exactly once. `initialize` and `tools/list` are
+        // control-plane exchanges: the transport bounds each response body to the
+        // control ceiling before deserialization, so an untrusted server cannot
+        // exhaust proxy memory before `max_tools` (a count-only limit) is ever
+        // evaluated. Across pagination the decoded listing is additionally
+        // bounded by `MAX_LISTING_RESPONSE_BYTES` (see `paginate_tools`).
         let mcp_client = subrequest_transport::McpSubrequestClient::control(callout.clone(), timeout);
-        // Take the overflow handle before the client is moved into the rmcp
-        // transport, so a `ResponseTooLarge` classification recorded during the
-        // exchange (which rmcp otherwise discards) can be read back below.
-        let overflow = mcp_client.overflow_handle();
+        // Take the signal handle before the client is moved into the rmcp
+        // transport, so a `ResponseTooLarge` or `SsrfBlocked` classification
+        // recorded during the exchange (which rmcp otherwise discards) can be
+        // read back below.
+        let signal = mcp_client.signal_handle();
         let transport = StreamableHttpClientTransport::with_client(
             mcp_client,
             build_transport_config_with_forwarded_headers(
@@ -356,13 +372,13 @@ pub(crate) async fn list_tools_with_forwarded_headers(
         );
         let display_url = parse_display_url(server_url);
         let client = Box::pin(().serve(transport)).await.map_err(|_source| {
-            overflow_client_error(&overflow, &display_url).unwrap_or_else(|| McpClientError::Connection {
+            transport_signal_error(&signal, &display_url).unwrap_or_else(|| McpClientError::Connection {
                 url: display_url.clone(),
             })
         })?;
         let tools = Box::pin(paginate_tools(&client, max_tools, &display_url))
             .await
-            .map_err(|err| overflow_client_error(&overflow, &display_url).unwrap_or(err))?;
+            .map_err(|err| transport_signal_error(&signal, &display_url).unwrap_or(err))?;
         tools_to_json(tools)
     };
 
@@ -437,16 +453,18 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     let display_url = parse_display_url(server_url);
 
     let work = async {
-        resolve_and_validate(server_url, timeout, callout.allow_private()).await?;
-        // `initialize` uses the control ceiling; the `tools/call` result is
-        // bounded to the configured `max_result_bytes` cap (expanded for
-        // worst-case JSON string escaping) before deserialization.
+        // No upfront SSRF classifier: the subrequest transport validates the
+        // dial target during the callout via `prepare_url_target`, so this path
+        // resolves DNS exactly once. `initialize` uses the control ceiling; the
+        // `tools/call` result is bounded to the configured `max_result_bytes` cap
+        // (expanded for worst-case JSON string escaping) before deserialization.
         let mcp_client =
             subrequest_transport::McpSubrequestClient::for_tool(callout.clone(), timeout, max_result_bytes);
-        // Take the overflow handle before the client is moved into the rmcp
-        // transport, so a `ResponseTooLarge` classification recorded during the
-        // exchange (which rmcp otherwise discards) can be read back below.
-        let overflow = mcp_client.overflow_handle();
+        // Take the signal handle before the client is moved into the rmcp
+        // transport, so a `ResponseTooLarge` or `SsrfBlocked` classification
+        // recorded during the exchange (which rmcp otherwise discards) can be
+        // read back below.
+        let signal = mcp_client.signal_handle();
         let transport = StreamableHttpClientTransport::with_client(
             mcp_client,
             build_transport_config_with_forwarded_headers(
@@ -460,7 +478,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
         let display_url = parse_display_url(server_url);
 
         let client = Box::pin(().serve(transport)).await.map_err(|_source| {
-            overflow_client_error(&overflow, &display_url).unwrap_or_else(|| McpClientError::Connection {
+            transport_signal_error(&signal, &display_url).unwrap_or_else(|| McpClientError::Connection {
                 url: display_url.clone(),
             })
         })?;
@@ -476,7 +494,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
         }
 
         Box::pin(client.call_tool(params)).await.map_err(|_source| {
-            overflow_client_error(&overflow, &display_url).unwrap_or_else(|| McpClientError::CallTool {
+            transport_signal_error(&signal, &display_url).unwrap_or_else(|| McpClientError::CallTool {
                 url: display_url.clone(),
                 tool_name: tool_name.to_owned(),
             })
@@ -634,96 +652,14 @@ fn inject_authorization(
     Ok(())
 }
 
-/// Reject MCP server URLs that point at SSRF-sensitive addresses.
-///
-/// Lightweight validation for use on the cache-hit path where no
-/// connection is made. On the connect path the resolved addresses are
-/// re-validated inside the filtered-subrequest transport, so this pass is
-/// an early, cheap rejection rather than the sole gate.
-///
-/// # Errors
-///
-/// Returns [`McpClientError::SsrfBlocked`] if the URL resolves to a
-/// private, loopback, link-local, unique-local, unspecified, or cloud
-/// metadata address (private and loopback only when `allow_private` is
-/// `false`).
-pub(crate) async fn validate_mcp_url(url: &str, timeout: Duration, allow_private: bool) -> Result<(), McpClientError> {
-    resolve_and_validate(url, timeout, allow_private).await
-}
-
-/// Validate an MCP server URL and resolve its addresses.
-///
-/// The actual dial now runs through the filtered-subrequest transport, which
-/// re-validates the resolved addresses via [`prepare_url_target`]; this upfront
-/// pass keeps the lightweight cache-hit SSRF check and rejects obviously unsafe
-/// URLs before any transport is built.
-///
-/// [`prepare_url_target`]: praxis_core::connectivity::prepare_url_target
-async fn resolve_and_validate(url: &str, timeout: Duration, allow_private: bool) -> Result<(), McpClientError> {
-    let uri: http::Uri = url
-        .parse()
-        .map_err(|_parse_err| ssrf_blocked(McpDisplayUrl::invalid(), "invalid URL"))?;
-    let scheme = uri.scheme_str().unwrap_or_default();
-    if scheme != "http" && scheme != "https" {
-        return Err(ssrf_blocked(McpDisplayUrl::invalid(), "scheme must be http or https"));
-    }
-    let display_url = McpDisplayUrl::from_uri(&uri);
-    if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
-        return Err(ssrf_blocked(display_url, "embedded credentials are not allowed"));
-    }
-    let Some(host) = uri.host() else {
-        return Err(ssrf_blocked(display_url, "URL must include a host"));
-    };
-    let host = host.trim_matches(|c| c == '[' || c == ']');
-    if !allow_private && is_blocked_hostname(host) {
-        return Err(ssrf_blocked(display_url, "localhost hostnames are not allowed"));
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return check_ip(ip, &display_url, allow_private);
-    }
-    let port = uri.port_u16().unwrap_or(if scheme == "https" { 443 } else { 80 });
-    resolve_hostname_ssrf(host, port, display_url, timeout, allow_private).await
-}
-
 /// Credential-safe reason attached to every SSRF rejection.
+///
+/// The subrequest transport's [`ssrf_validate`](subrequest_transport) hook and
+/// the cache-hit [`validate_mcp_target`] check both surface this string on an
+/// SSRF rejection, so a blocked literal and a blocked DNS-resolved address read
+/// identically to the client without echoing which address matched.
 const SSRF_BLOCK_REASON: &str =
     "address is a private, loopback, link-local, unique-local, unspecified, or cloud-metadata range";
-
-/// Check a literal IP address against the SSRF block list.
-fn check_ip(ip: IpAddr, url: &McpDisplayUrl, allow_private: bool) -> Result<(), McpClientError> {
-    if is_ssrf_blocked_ip(&ip, allow_private) {
-        return Err(ssrf_blocked(url.clone(), SSRF_BLOCK_REASON));
-    }
-    Ok(())
-}
-
-/// Resolve a hostname and check all resolved addresses. Fails
-/// closed: DNS resolution failure or timeout blocks the request.
-async fn resolve_hostname_ssrf(
-    host: &str,
-    port: u16,
-    url: McpDisplayUrl,
-    timeout: Duration,
-    allow_private: bool,
-) -> Result<(), McpClientError> {
-    let addrs: Vec<SocketAddr> = tokio::time::timeout(timeout, tokio::net::lookup_host((host, port)))
-        .await
-        .map_err(|_elapsed| McpClientError::Timeout {
-            url: url.clone(),
-            timeout,
-        })?
-        .map_err(|_dns_err| ssrf_blocked(url.clone(), "DNS resolution failed"))?
-        .collect();
-    check_resolved_addrs(&addrs, &url, allow_private)
-}
-
-/// Check DNS-resolved addresses against the SSRF block list.
-fn check_resolved_addrs(addrs: &[SocketAddr], url: &McpDisplayUrl, allow_private: bool) -> Result<(), McpClientError> {
-    for addr in addrs {
-        check_ip(addr.ip(), url, allow_private)?;
-    }
-    Ok(())
-}
 
 /// Field names listed by any `Connection` value in MCP tool-config headers.
 fn connection_nominated_from_json(
@@ -768,12 +704,6 @@ pub(crate) fn is_blocked_mcp_header(name: &http::HeaderName) -> bool {
     }
     let s = name.as_str();
     s.starts_with("x-forwarded-") || s.starts_with("x-praxis-") || s.starts_with("x-mcp-") || s.starts_with("x-a2a-")
-}
-
-/// Hostnames that resolve to loopback.
-fn is_blocked_hostname(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    lower == "localhost" || lower.ends_with(".localhost")
 }
 
 /// Whether `v4` matches a known cloud instance-metadata endpoint that the

@@ -111,6 +111,11 @@ pub(crate) enum McpTransportError {
     Target,
 
     /// The MCP target resolved to an address the SSRF policy rejected.
+    ///
+    /// [`McpSubrequestClient::execute`] records the typed classification
+    /// out-of-band (see [`TransportSignal`]) before returning this variant, so
+    /// the free-standing caller can reconstruct the SSRF rejection after `rmcp`
+    /// discards the typed error.
     #[error("mcp target blocked by address policy")]
     SsrfBlocked,
 
@@ -131,30 +136,40 @@ pub(crate) enum McpTransportError {
     ///
     /// The filtered callout classifies the oversized response as
     /// [`CalloutOutcome::ResponseTooLarge`]; the transport records the typed
-    /// overflow out-of-band (see [`ResponseOverflow`]) and returns this variant so
+    /// overflow out-of-band (see [`TransportSignal`]) and returns this variant so
     /// the caller can map it to HTTP 413.
     #[error("mcp server returned a response exceeding the size limit")]
     ResponseTooLarge,
 }
 
 // -----------------------------------------------------------------------------
-// ResponseOverflow
+// TransportSignal
 // -----------------------------------------------------------------------------
 
-/// A response-size overflow observed on an MCP callout, carried out-of-band past
-/// `rmcp`'s opaque transport-error mapping.
+/// A typed transport classification observed on an MCP callout, carried
+/// out-of-band past `rmcp`'s opaque transport-error mapping.
 ///
 /// `rmcp`'s `StreamableHttpClient` funnels every transport failure through an
 /// opaque `.map_err(|_source| …)` that discards the typed [`McpTransportError`],
-/// so a [`CalloutOutcome::ResponseTooLarge`] classification cannot ride out on
-/// the returned `StreamableHttpError`. [`McpSubrequestClient::execute`] records
-/// it here instead (first overflow wins), and the free-standing caller in
-/// `mod.rs` reads it back via [`overflow_client_error`] after the rmcp
-/// `serve`/pagination call fails.
+/// so neither a [`CalloutOutcome::ResponseTooLarge`] classification nor an SSRF
+/// address rejection can ride out on the returned `StreamableHttpError`.
+/// [`McpSubrequestClient::execute`] records the classification here instead
+/// (first signal wins), and the free-standing caller in `mod.rs` reads it back
+/// via [`transport_signal_error`] after the rmcp `serve`/pagination call fails.
 #[derive(Clone, Copy)]
-pub(crate) struct ResponseOverflow {
-    /// The effective response-size limit that was exceeded.
-    limit: usize,
+pub(crate) enum TransportSignal {
+    /// The server's response exceeded the effective size limit; maps to HTTP 413.
+    ResponseTooLarge {
+        /// The effective response-size limit that was exceeded.
+        limit: usize,
+    },
+    /// The MCP target resolved to an address the SSRF policy rejected.
+    SsrfBlocked,
+    /// The MCP target URL was structurally invalid or disallowed at parse time
+    /// (bad scheme, embedded userinfo, a fragment, or a malformed/disallowed host
+    /// literal) — rejected before any dial. Distinct from [`Self::SsrfBlocked`]
+    /// only in the surfaced error text; both are permanent, hard rejections.
+    TargetRejected,
 }
 
 // -----------------------------------------------------------------------------
@@ -197,46 +212,6 @@ pub(crate) fn bind_mcp_outbound_chain(
         Some(chain_ref) => chain_ref,
     };
     let pipeline = ctx.bind_chain(&chain_ref)?;
-    Ok(Arc::new(pipeline))
-}
-
-/// Build an inline (or empty) MCP outbound pipeline without a chain-binding
-/// context, for a filter that cannot resolve named chains.
-///
-/// `openai_mcp_dispatch` runs inside an `iterative_request_router` step, whose
-/// filters praxis core builds via the plain [`FilterPipeline::build`] with no
-/// [`ChainBindingContext`]. A named reference resolves against the top-level
-/// `filter_chains`, which are unreachable here, so a [`ChainRef::Named`] is
-/// rejected; an inline chain carries its own filters and is built directly, and
-/// [`None`] yields an empty pipeline. In every case the executor seeds the dial
-/// target from the staged upstream, so the built filters run purely as
-/// cross-cutting outbound filters.
-///
-/// `allow_private` seeds the private-upstream posture; pipeline finalization
-/// later propagates the operator's global insecure options onto the stored
-/// pipeline (see the filter's `apply_insecure_options`).
-///
-/// # Errors
-///
-/// Returns [`FilterError`] if the reference is a named chain, or if the inline
-/// filters cannot be built into a pipeline.
-pub(crate) fn build_inline_outbound_pipeline(
-    outbound_chain: Option<ChainRef>,
-    allow_private: bool,
-) -> Result<Arc<FilterPipeline>, FilterError> {
-    let mut entries = match outbound_chain {
-        None => Vec::new(),
-        Some(ChainRef::Inline { filters, .. }) => filters,
-        Some(ChainRef::Named(_)) => {
-            return Err(FilterError::from(
-                "mcp outbound_chain must be an inline chain here; a named reference cannot be \
-                 resolved without a chain-binding context",
-            ));
-        },
-    };
-    let registry = FilterRegistry::with_builtins();
-    let mut pipeline = FilterPipeline::build(&mut entries, &registry)?;
-    pipeline.set_allow_private_upstreams(allow_private);
     Ok(Arc::new(pipeline))
 }
 
@@ -413,15 +388,16 @@ pub(crate) struct McpSubrequestClient {
     tool_result_bytes: usize,
     /// Per-exchange duration ceiling.
     step_timeout: Duration,
-    /// Out-of-band record of a response-size overflow observed on a callout.
+    /// Out-of-band record of a typed classification observed on a callout.
     ///
     /// `rmcp` discards the typed [`McpTransportError`] on failure, so a
-    /// [`CalloutOutcome::ResponseTooLarge`] classification is recorded here (first
-    /// overflow wins) and read back by the caller via [`overflow_client_error`]
-    /// after the rmcp `serve`/pagination call fails. Shared through the [`Clone`]
-    /// the transport requires, so the handle taken before the client is moved into
-    /// the rmcp transport observes writes made during the exchange.
-    overflow: Arc<OnceLock<ResponseOverflow>>,
+    /// [`CalloutOutcome::ResponseTooLarge`] classification or an SSRF address
+    /// rejection is recorded here (first signal wins) and read back by the caller
+    /// via [`transport_signal_error`] after the rmcp `serve`/pagination call
+    /// fails. Shared through the [`Clone`] the transport requires, so the handle
+    /// taken before the client is moved into the rmcp transport observes writes
+    /// made during the exchange.
+    signal: Arc<OnceLock<TransportSignal>>,
 }
 
 impl McpSubrequestClient {
@@ -455,19 +431,20 @@ impl McpSubrequestClient {
             callout,
             tool_result_bytes,
             step_timeout,
-            overflow: Arc::new(OnceLock::new()),
+            signal: Arc::new(OnceLock::new()),
         }
     }
 
-    /// Take a handle to this client's overflow record before the client is moved
-    /// into the rmcp transport.
+    /// Take a handle to this client's transport-signal record before the client
+    /// is moved into the rmcp transport.
     ///
     /// The returned [`Arc`] aliases the same [`OnceLock`] the transport writes to
     /// during an exchange, so the caller can read back a
-    /// [`CalloutOutcome::ResponseTooLarge`] classification after the rmcp
-    /// `serve`/pagination call fails (see [`overflow_client_error`]).
-    pub(crate) fn overflow_handle(&self) -> Arc<OnceLock<ResponseOverflow>> {
-        Arc::clone(&self.overflow)
+    /// [`CalloutOutcome::ResponseTooLarge`] classification or an SSRF address
+    /// rejection after the rmcp `serve`/pagination call fails (see
+    /// [`transport_signal_error`]).
+    pub(crate) fn signal_handle(&self) -> Arc<OnceLock<TransportSignal>> {
+        Arc::clone(&self.signal)
     }
 
     /// Select the wire byte ceiling for one outbound message.
@@ -510,9 +487,20 @@ impl McpSubrequestClient {
             .checked_add(self.step_timeout)
             .ok_or(StreamableHttpError::Client(McpTransportError::Setup))?;
         let allow_private = self.callout.allow_private;
-        let target = prepare_url_target(uri, deadline, move |addrs| ssrf_validate(addrs, allow_private))
-            .await
-            .map_err(|error| map_prepare_error(&error))?;
+        let target = match prepare_url_target(uri, deadline, move |addrs| ssrf_validate(addrs, allow_private)).await {
+            Ok(target) => target,
+            Err(error) => {
+                if let Some(signal) = prepare_error_signal(&error) {
+                    // First signal wins; the free-standing caller reconstructs the
+                    // typed hard rejection (SSRF or invalid target) after rmcp
+                    // discards the transport error (see `transport_signal_error`).
+                    // Transient failures (DNS, deadline) record nothing and fall
+                    // back to the caller's generic connection error.
+                    self.signal.get_or_init(|| signal);
+                }
+                return Err(map_prepare_error(&error));
+            },
+        };
         let staged = StagedUpstream::from_prepared_target(&target)
             .map_err(|_error| StreamableHttpError::Client(McpTransportError::Setup))?;
         let fallback = StagedUpstreamFallback::from_prepared_target(&target);
@@ -545,9 +533,9 @@ impl McpSubrequestClient {
             CalloutOutcome::Response(CalloutResponse::Buffered(response)) => Ok(response),
             CalloutOutcome::ResponseTooLarge { actual, limit } => {
                 tracing::debug!(actual = ?actual, limit, "mcp callout response exceeded size limit");
-                // First overflow wins; the caller reads this back after rmcp
-                // discards the typed error (see `overflow_client_error`).
-                self.overflow.get_or_init(|| ResponseOverflow { limit });
+                // First signal wins; the caller reads this back after rmcp
+                // discards the typed error (see `transport_signal_error`).
+                self.signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
                 Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
             },
             // A single request/response MCP exchange never selects streaming, and
@@ -780,25 +768,104 @@ fn origin_form(url: &str) -> Result<http::Uri, McpTransportError> {
     path_and_query.parse().map_err(|_error| McpTransportError::Target)
 }
 
-/// Read back a recorded response-size overflow as a caller-facing
-/// [`McpClientError`], if one was observed on the callout.
+/// Read back a recorded transport signal as a caller-facing [`McpClientError`],
+/// if one was observed on the callout.
 ///
 /// `rmcp` discards the typed [`McpTransportError`] the transport returns, so a
-/// [`CalloutOutcome::ResponseTooLarge`] classification is recorded out-of-band in
-/// the client's overflow [`OnceLock`] (see
-/// [`McpSubrequestClient::overflow_handle`]) and read back here after the rmcp
-/// `serve`/pagination call fails. Returns [`None`] when no overflow was recorded,
+/// [`CalloutOutcome::ResponseTooLarge`] classification or an SSRF address
+/// rejection is recorded out-of-band in the client's signal [`OnceLock`] (see
+/// [`McpSubrequestClient::signal_handle`]) and read back here after the rmcp
+/// `serve`/pagination call fails. Returns [`None`] when no signal was recorded,
 /// so the caller can fall back to its generic connection error. `url` carries the
 /// credential-safe display URL for the surfaced error.
-pub(crate) fn overflow_client_error(
-    overflow: &OnceLock<ResponseOverflow>,
+pub(crate) fn transport_signal_error(
+    signal: &OnceLock<TransportSignal>,
     url: &McpDisplayUrl,
 ) -> Option<McpClientError> {
-    let recorded = overflow.get()?;
-    Some(McpClientError::ResponseTooLarge {
-        url: url.clone(),
-        limit: recorded.limit,
-    })
+    match signal.get()? {
+        TransportSignal::ResponseTooLarge { limit } => Some(McpClientError::ResponseTooLarge {
+            url: url.clone(),
+            limit: *limit,
+        }),
+        TransportSignal::SsrfBlocked => Some(super::ssrf_blocked(url.clone(), super::SSRF_BLOCK_REASON)),
+        TransportSignal::TargetRejected => Some(McpClientError::InvalidTarget { url: url.clone() }),
+    }
+}
+
+/// Validate an MCP target URL against scheme, credential, and SSRF policy on the
+/// cache-hit path, where no dial is made.
+///
+/// On a cache miss the resolved addresses are validated during the actual
+/// callout by [`McpSubrequestClient::execute`] (which runs the same
+/// [`prepare_url_target`] + [`ssrf_validate`] pair), so this is the *only* extra
+/// DNS resolution the resolver performs — and only when a cached listing lets it
+/// skip the dial entirely. Reusing [`prepare_url_target`] makes a cache hit
+/// enforce exactly the policy a live callout would: scheme/userinfo/fragment
+/// rejection, DNS resolution, and the [`ssrf_validate`] address hook.
+///
+/// # Errors
+///
+/// Classifies the preparation failure exactly as the live callout would (see
+/// [`classify_prepare_error`]): [`McpClientError::SsrfBlocked`] when the target
+/// resolves to an address the SSRF policy refuses, [`McpClientError::InvalidTarget`]
+/// for a structurally invalid or disallowed URL (bad scheme, embedded userinfo,
+/// a fragment, or a malformed/disallowed host literal), or
+/// [`McpClientError::Connection`] for a transient failure (DNS resolution or a
+/// deadline). The URL is reduced to a credential-safe display form first.
+pub(crate) async fn validate_mcp_target(
+    url: &str,
+    timeout: Duration,
+    allow_private: bool,
+) -> Result<(), McpClientError> {
+    let display_url = super::parse_display_url(url);
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return Err(McpClientError::Connection { url: display_url });
+    };
+    match prepare_url_target(url, deadline, move |addrs| ssrf_validate(addrs, allow_private)).await {
+        Ok(_target) => Ok(()),
+        Err(error) => Err(classify_prepare_error(&error, display_url)),
+    }
+}
+
+/// Classify a [`prepare_url_target`] failure into the caller-facing
+/// [`McpClientError`], distinguishing permanent target rejections that must fail
+/// hard from transient dial-time failures.
+///
+/// Permanent rejections — an SSRF policy block ([`UrlTargetError::PolicyRejected`])
+/// and a structurally invalid or disallowed URL ([`UrlTargetError::InvalidTarget`],
+/// which also covers host literals rejected at parse time such as a bracketed IPv4
+/// or an IPv4-mapped IPv6 address) — map to [`McpClientError::SsrfBlocked`] and
+/// [`McpClientError::InvalidTarget`] respectively, so a streaming `tools/list`
+/// retains its HTTP error. Transient failures (DNS resolution, a deadline, or any
+/// future [`UrlTargetError`] variant) map to [`McpClientError::Connection`], which
+/// a streaming listing may surface as a soft in-band lifecycle event.
+///
+/// This is the single source of truth shared by the cache-hit validator
+/// ([`validate_mcp_target`]) and the live callout path ([`prepare_error_signal`]
+/// plus [`transport_signal_error`]), guaranteeing identical failure shapes across
+/// both.
+fn classify_prepare_error(error: &UrlTargetError, url: McpDisplayUrl) -> McpClientError {
+    match error {
+        UrlTargetError::PolicyRejected(_) => super::ssrf_blocked(url, super::SSRF_BLOCK_REASON),
+        UrlTargetError::InvalidTarget(_) => McpClientError::InvalidTarget { url },
+        _ => McpClientError::Connection { url },
+    }
+}
+
+/// Record the out-of-band [`TransportSignal`] for a [`prepare_url_target`]
+/// failure, if the failure is a permanent hard rejection.
+///
+/// Mirrors the permanent/transient split in [`classify_prepare_error`]: an SSRF
+/// policy block and a structurally invalid target are recorded so the caller can
+/// reconstruct the typed hard rejection after rmcp discards the transport error;
+/// transient failures (DNS, deadline) record nothing and fall back to the caller's
+/// generic [`McpClientError::Connection`].
+fn prepare_error_signal(error: &UrlTargetError) -> Option<TransportSignal> {
+    match error {
+        UrlTargetError::PolicyRejected(_) => Some(TransportSignal::SsrfBlocked),
+        UrlTargetError::InvalidTarget(_) => Some(TransportSignal::TargetRejected),
+        _ => None,
+    }
 }
 
 /// SSRF policy hook applied to the resolved MCP addresses.

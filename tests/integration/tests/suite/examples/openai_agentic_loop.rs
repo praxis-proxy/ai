@@ -345,6 +345,17 @@ fn round_trip_captures_tool_and_model_requests() {
             .all(|(name, _)| !name.eq_ignore_ascii_case("x-tenant-id")),
         "ambient identity must not cross the request-selected MCP URL boundary"
     );
+    // The example's openai_mcp_dispatch binds an inline outbound_chain whose
+    // `headers` filter stamps X-MCP-Client. tools/call is issued only by dispatch
+    // (tool_resolve issues initialize/tools/list), so its presence here proves the
+    // dispatch outbound_chain is bound and runs on the callout inside the IRR step.
+    assert!(
+        call.headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-mcp-client") && value == "praxis-ai-gateway"),
+        "the dispatch outbound_chain must stamp X-MCP-Client on the tools/call callout: {:?}",
+        call.headers
+    );
     let call_body: serde_json::Value = serde_json::from_str(&call.body).expect("tools/call body should be JSON");
     assert_eq!(call_body["params"]["arguments"]["location"], "SF");
 

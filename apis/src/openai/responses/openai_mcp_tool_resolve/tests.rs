@@ -4401,14 +4401,18 @@ fn streaming_failure_classification_excludes_local_request_policy() {
 
     // Local request-policy failures retain their HTTP error. SSRF blocking is the
     // headline exclusion documented on the filter: it must never be downgraded to
-    // the 200 SSE lifecycle. `CallTool` is a non-listing operation and cannot
-    // arise from the tools/list path.
+    // the 200 SSE lifecycle. `InvalidTarget` (a structurally invalid or disallowed
+    // URL, including an SSRF-evasion host literal rejected at parse time before the
+    // address hook runs) is the same permanent class and must not degrade either.
+    // `CallTool` is a non-listing operation and cannot arise from the tools/list
+    // path.
     for source in [
         mcp_client::McpClientError::InvalidAuthorization,
         mcp_client::McpClientError::SsrfBlocked {
             url: url(),
             reason: "resolves to a private address",
         },
+        mcp_client::McpClientError::InvalidTarget { url: url() },
         mcp_client::McpClientError::CallTool {
             url: url(),
             tool_name: "x".to_owned(),
@@ -4479,6 +4483,49 @@ fn streaming_ssrf_failure_retains_http_error() {
     assert!(
         !raw.contains("response.mcp_list_tools.failed") && !raw.contains("response.failed"),
         "SSRF must not emit the discovery lifecycle: {raw}"
+    );
+}
+
+/// A streaming `InvalidTarget` failure is a pre-commitment rejection on the same
+/// footing as SSRF: a structurally invalid or disallowed URL (here an SSRF-evasion
+/// host literal rejected at parse time, before the address hook can run) must
+/// retain its hard HTTP error and the JSON `{"error":{...}}` envelope, never the
+/// 200 discovery lifecycle. This guards the regression where such a literal, being
+/// rejected at parse time rather than by the SSRF address hook, could slip through
+/// as a transient connection failure and degrade to a soft in-band SSE-200.
+#[test]
+fn streaming_invalid_target_failure_retains_http_error() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let err = ResolveError::Client {
+        server_label: "internal".to_owned(),
+        source: mcp_client::McpClientError::InvalidTarget {
+            url: mcp_client::parse_display_url("http://[::ffff:127.0.0.1]/mcp"),
+        },
+    };
+
+    let FilterAction::Reject(rejection) = resolve_error_action(&mut ctx, &err, true, b"{}") else {
+        panic!("expected a hard Reject, not a deferred streaming lifecycle");
+    };
+
+    assert_eq!(
+        rejection.status, 502,
+        "an invalid target keeps its upstream error status"
+    );
+    assert!(
+        !rejection.preserve_keepalive,
+        "a genuine HTTP error closes the connection, unlike the 200 discovery-failure transport"
+    );
+    let ct = rejection.headers.iter().find(|(k, _)| k == "content-type");
+    assert_eq!(
+        ct.map(|(_, v)| v.as_str()),
+        Some("application/json"),
+        "a pre-commitment invalid-target rejection uses the JSON error envelope, not an SSE event"
+    );
+    let raw = std::str::from_utf8(rejection.body.as_deref().expect("error body")).unwrap();
+    assert!(
+        !raw.contains("response.mcp_list_tools.failed") && !raw.contains("response.failed"),
+        "invalid target must not emit the discovery lifecycle: {raw}"
     );
 }
 

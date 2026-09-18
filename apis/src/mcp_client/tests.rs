@@ -10,7 +10,7 @@ use super::*;
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn validate_url(url: &str) -> Result<(), McpClientError> {
-    validate_mcp_url(url, TEST_TIMEOUT, false).await
+    validate_mcp_target(url, TEST_TIMEOUT, false).await
 }
 
 fn display_url(url: &str) -> McpDisplayUrl {
@@ -525,6 +525,11 @@ async fn alibaba_metadata_ipv4_is_blocked() {
     );
 }
 
+// IPv4-mapped IPv6 literals (`[::ffff:a.b.c.d]`) are refused during target
+// parsing: they would normalize to a bare IPv4 address while the SNI/Host kept
+// the mapped form, so `prepare_url_target` rejects the host before the SSRF hook
+// runs. The requests are still refused; the mechanism is parse-time rejection
+// rather than address classification.
 #[tokio::test]
 async fn ssrf_blocks_mapped_ipv4_loopback() {
     assert!(validate_url("http://[::ffff:127.0.0.1]/mcp").await.is_err());
@@ -541,17 +546,24 @@ async fn alibaba_metadata_ipv4_mapped_ipv6_is_blocked() {
         validate_url("http://[::ffff:100.100.100.200]/latest/meta-data/")
             .await
             .is_err(),
-        "IPv4-mapped Alibaba metadata address must be normalized then blocked"
+        "IPv4-mapped Alibaba metadata literal must be refused during target parsing"
     );
 }
 
 #[test]
 fn alibaba_metadata_via_dns_is_blocked() {
-    let resolved = ["100.100.100.200:80".parse::<SocketAddr>().unwrap()];
-    let shown = display_url("http://metadata.example/mcp");
+    // The upfront DNS classifier is gone: `prepare_url_target` normalizes every
+    // resolved address and then applies the SSRF hook. A hostname that resolves
+    // to the Alibaba metadata endpoint is refused by that hook, so assert the
+    // hook itself rejects the address regardless of the private-upstream flag.
+    let ip = "100.100.100.200".parse::<IpAddr>().unwrap();
     assert!(
-        check_resolved_addrs(&resolved, &shown, false).is_err(),
+        is_ssrf_blocked_ip(&ip, false),
         "a hostname resolving to Alibaba metadata must be blocked after DNS"
+    );
+    assert!(
+        is_ssrf_blocked_ip(&ip, true),
+        "cloud-metadata addresses stay blocked even when private upstreams are permitted"
     );
 }
 
@@ -583,10 +595,13 @@ async fn blocked_url_errors_hide_query_and_fragment() {
 
 #[tokio::test]
 async fn unshowable_urls_use_opaque_placeholder() {
+    // URLs that cannot be parsed into a scheme+host at all fall back to the
+    // opaque placeholder. (A scheme like `ftp` is parseable, so it renders as a
+    // sanitized `ftp://host/path`; that case is covered by
+    // `blocked_urls_report_actionable_reason`.)
     let malformed = [
         "http://exa mple.com/mcp?api_key=TOPSECRET#FRAGMENTSECRET",
         "//user:pass@example.com/mcp?api_key=TOPSECRET#FRAGMENTSECRET",
-        "ftp://user:pass@example.com/mcp?api_key=TOPSECRET#FRAGMENTSECRET",
     ];
 
     for raw in malformed {
@@ -603,26 +618,81 @@ async fn unshowable_urls_use_opaque_placeholder() {
 
 #[tokio::test]
 async fn blocked_urls_report_actionable_reason() {
-    let expectations = [
-        ("ftp://example.com/mcp", "scheme must be http or https"),
-        (
-            "http://user:pass@example.com/mcp",
-            "embedded credentials are not allowed",
-        ),
-        ("http://localhost/mcp", "localhost hostnames are not allowed"),
-        (
-            "http://127.0.0.1/mcp",
-            "address is a private, loopback, link-local, unique-local, unspecified, or cloud-metadata range",
-        ),
-    ];
-
-    for (raw, reason) in expectations {
+    // SSRF address rejections consolidate on the single credential-safe reason
+    // string, so a blocked literal reads identically to a blocked DNS result.
+    for raw in ["http://127.0.0.1/mcp", "http://169.254.169.254/mcp"] {
         let message = validate_url(raw).await.unwrap_err().to_string();
         assert!(
-            message.contains(reason),
-            "missing actionable reason for {raw}: {message}"
+            message.contains(SSRF_BLOCK_REASON),
+            "missing SSRF reason for {raw}: {message}"
         );
     }
+
+    // Structural target rejections (unsupported scheme, embedded credentials)
+    // fail closed as a permanent "invalid or not allowed" error whose sanitized
+    // URL never echoes the userinfo or scheme-specific guidance. Like an SSRF
+    // block, these are hard rejections rather than transient connection failures.
+    for raw in ["ftp://example.com/mcp", "http://user:pass@example.com/mcp"] {
+        let message = validate_url(raw).await.unwrap_err().to_string();
+        assert!(
+            message.contains("invalid or not allowed"),
+            "structural rejection should fail closed as an invalid-target error for {raw}: {message}"
+        );
+        assert!(
+            !message.contains("user:pass"),
+            "userinfo must never leak from {raw}: {message}"
+        );
+    }
+}
+
+// A parse-time target rejection (an SSRF-evasion host literal, an unsupported
+// scheme, embedded userinfo, or a fragment) must classify as the *permanent*
+// `InvalidTarget` rather than the transient `Connection`. On a streaming
+// `tools/list` the two diverge sharply: `InvalidTarget` is excluded from
+// `is_mcp_listing_runtime_failure`, so it stays a hard HTTP error, while
+// `Connection` would degrade to a soft in-band SSE lifecycle. Pin the exact
+// variant so that split cannot silently regress.
+#[tokio::test]
+async fn parse_time_rejections_classify_as_invalid_target() {
+    for raw in [
+        // IPv4-mapped IPv6 loopback: rejected during host parsing, before the
+        // SSRF address hook ever runs.
+        "http://[::ffff:127.0.0.1]/mcp",
+        // Bracketed IPv4 literal: likewise rejected at parse time.
+        "http://[127.0.0.1]/mcp",
+        // Unsupported scheme and embedded credentials: structural rejections.
+        "ftp://example.com/mcp",
+        "http://user:pass@example.com/mcp",
+    ] {
+        let error = validate_url(raw).await.unwrap_err();
+        assert!(
+            matches!(error, McpClientError::InvalidTarget { .. }),
+            "{raw} must classify as a hard InvalidTarget, got: {error:?}"
+        );
+    }
+}
+
+// A DNS resolution failure is transient, not a policy rejection: it must remain
+// a `Connection` error so a streaming listing can degrade to the soft in-band
+// lifecycle rather than a hard HTTP error.
+#[tokio::test]
+async fn dns_failure_classifies_as_connection() {
+    let error = validate_url("http://unresolvable.invalid/mcp").await.unwrap_err();
+    assert!(
+        matches!(error, McpClientError::Connection { .. }),
+        "an unresolvable host must stay a transient Connection error, got: {error:?}"
+    );
+}
+
+// A resolved SSRF block stays the dedicated `SsrfBlocked` variant carrying the
+// credential-safe reason string.
+#[tokio::test]
+async fn resolved_ssrf_block_classifies_as_ssrf_blocked() {
+    let error = validate_url("http://127.0.0.1/mcp").await.unwrap_err();
+    assert!(
+        matches!(error, McpClientError::SsrfBlocked { .. }),
+        "a loopback address must classify as SsrfBlocked, got: {error:?}"
+    );
 }
 
 #[tokio::test]
@@ -642,12 +712,12 @@ async fn ssrf_blocks_private_rfc1918_by_default() {
 #[tokio::test]
 async fn ssrf_allows_private_rfc1918_when_private_permitted() {
     assert!(
-        validate_mcp_url("http://10.0.0.5/mcp", TEST_TIMEOUT, true)
+        validate_mcp_target("http://10.0.0.5/mcp", TEST_TIMEOUT, true)
             .await
             .is_ok()
     );
     assert!(
-        validate_mcp_url("http://192.168.1.100/mcp", TEST_TIMEOUT, true)
+        validate_mcp_target("http://192.168.1.100/mcp", TEST_TIMEOUT, true)
             .await
             .is_ok()
     );
@@ -760,7 +830,7 @@ fn ipv6_unique_local_detected_by_is_always_sensitive() {
 #[tokio::test]
 async fn allow_loopback_permits_ipv4_loopback() {
     assert!(
-        validate_mcp_url("http://127.0.0.1/mcp", TEST_TIMEOUT, true)
+        validate_mcp_target("http://127.0.0.1/mcp", TEST_TIMEOUT, true)
             .await
             .is_ok()
     );
@@ -769,7 +839,7 @@ async fn allow_loopback_permits_ipv4_loopback() {
 #[tokio::test]
 async fn allow_loopback_permits_localhost_hostname() {
     assert!(
-        validate_mcp_url("http://localhost/mcp", TEST_TIMEOUT, true)
+        validate_mcp_target("http://localhost/mcp", TEST_TIMEOUT, true)
             .await
             .is_ok()
     );
@@ -778,7 +848,7 @@ async fn allow_loopback_permits_localhost_hostname() {
 #[tokio::test]
 async fn allow_loopback_still_blocks_link_local() {
     assert!(
-        validate_mcp_url("http://169.254.169.254/mcp", TEST_TIMEOUT, true)
+        validate_mcp_target("http://169.254.169.254/mcp", TEST_TIMEOUT, true)
             .await
             .is_err()
     );
@@ -787,7 +857,7 @@ async fn allow_loopback_still_blocks_link_local() {
 #[tokio::test]
 async fn allow_loopback_still_blocks_unspecified() {
     assert!(
-        validate_mcp_url("http://0.0.0.0/mcp", TEST_TIMEOUT, true)
+        validate_mcp_target("http://0.0.0.0/mcp", TEST_TIMEOUT, true)
             .await
             .is_err()
     );
