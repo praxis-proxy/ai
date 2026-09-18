@@ -81,8 +81,8 @@ filter_chains:
         #     algorithm: zstd          # none (default) or zstd
         #     level: 3                 # optional zstd level (default: 3)
         #
-        #   Upgrading an existing database: schema version 2 stores these
-        #   responses columns as binary. Databases created under version 1
+        #   Upgrading an existing database: schema version 3 stores these
+        #   responses columns as binary. Databases created under version 2
         #   (TEXT columns) must be migrated before the proxy will start — see
         #   docs/store/schema-migration.md.
         #

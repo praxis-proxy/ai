@@ -4140,6 +4140,84 @@ async fn update_conversation_metadata_store_error_returns_500() {
 }
 
 // -----------------------------------------------------------------------------
+// Generated Responses Table Schema Migration
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn generated_responses_table_gates_conversations_on_schema_version() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let db_path = dir.path().join("conversations_migrate.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        conversations_table: mig_conversations
+        items_table: mig_items
+        "#,
+    )
+    .unwrap();
+    let cfg: ConversationsConfig = parse_filter_config("openai_conversations", &yaml).unwrap();
+    let responses_table = cfg.responses_table();
+    let version_table = format!("{responses_table}_schema_version");
+
+    // Build the store the way the filter does (compression disabled). A fresh
+    // build stamps the current schema version and creates the generated,
+    // always-empty responses table alongside the conversations/items tables.
+    let build_store = || {
+        SqliteResponseStore::new(
+            &url,
+            &responses_table,
+            &cfg.conversations_table,
+            Some(&cfg.items_table),
+            None,
+            None,
+        )
+    };
+    drop(build_store().await.expect("fresh conversations store should build"));
+
+    // Simulate an older deployment by rolling the generated table's version back
+    // to the previous schema version.
+    let options = url
+        .parse::<sqlx::sqlite::SqliteConnectOptions>()
+        .expect("url should parse");
+    let pool = sqlx::SqlitePool::connect_with(options.clone())
+        .await
+        .expect("pool should connect");
+    sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {version_table} SET version = 2")))
+        .execute(&pool)
+        .await
+        .expect("downgrade should succeed");
+    pool.close().await;
+
+    // The store now refuses to start until the generated table is migrated.
+    let rejected = build_store().await;
+    assert!(
+        rejected.is_err_and(|e| e.to_string().contains("schema version mismatch")),
+        "conversations store must refuse a stale generated-table version"
+    );
+
+    // Apply the documented migration: bump the generated table's version. The
+    // table is empty, so no payload conversion is required.
+    let pool = sqlx::SqlitePool::connect_with(options)
+        .await
+        .expect("pool should connect");
+    sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {version_table} SET version = 3")))
+        .execute(&pool)
+        .await
+        .expect("version bump should succeed");
+    pool.close().await;
+
+    // After the bump the conversations store starts again.
+    drop(
+        build_store()
+            .await
+            .expect("conversations store should start after the version bump"),
+    );
+}
+
+// -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
 

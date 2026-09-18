@@ -2795,7 +2795,7 @@ async fn sqlite_stamps_schema_version_on_fresh_db() {
         .fetch_one(&pool)
         .await
         .expect("version row should exist");
-    assert_eq!(version, 2, "fresh store should stamp version 2");
+    assert_eq!(version, 3, "fresh store should stamp version 3");
 }
 
 #[tokio::test]
@@ -2854,7 +2854,7 @@ async fn sqlite_accepts_matching_schema_version() {
 }
 
 #[tokio::test]
-async fn sqlite_v1_text_schema_migrates_to_v2_preserving_rows() {
+async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
     let dir = tempfile::tempdir().expect("tempdir should succeed");
     let db_path = dir.path().join("migrate.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
@@ -2864,21 +2864,23 @@ async fn sqlite_v1_text_schema_migrates_to_v2_preserving_rows() {
         .expect("url should parse")
         .create_if_missing(true);
 
-    // Build a legacy version-1 layout: TEXT payload columns, stamped v1,
+    // Build a legacy version-2 layout: TEXT payload columns, stamped v2,
     // with a plain-JSON row written the way the pre-bytes store would.
     let pool = sqlx::SqlitePool::connect_with(options.clone())
         .await
         .expect("pool should connect");
     for stmt in [
-        "CREATE TABLE mr (tenant_id TEXT NOT NULL, id TEXT NOT NULL, created_at BIGINT NOT NULL, \
-         model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, messages TEXT NOT NULL, \
-         PRIMARY KEY (tenant_id, id))",
-        "CREATE TABLE mc (conversation_id TEXT NOT NULL, tenant_id TEXT NOT NULL, created_at BIGINT NOT NULL, \
-         metadata TEXT NOT NULL, messages TEXT NOT NULL, PRIMARY KEY (conversation_id, tenant_id))",
+        "CREATE TABLE mr (tenant_id TEXT NOT NULL, id TEXT NOT NULL, owner_issuer TEXT NOT NULL, \
+         owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, model TEXT NOT NULL, \
+         response_object TEXT NOT NULL, input TEXT NOT NULL, messages TEXT NOT NULL, \
+         PRIMARY KEY (id))",
+        "CREATE TABLE mc (conversation_id TEXT NOT NULL, tenant_id TEXT NOT NULL, owner_issuer TEXT NOT NULL, \
+         owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, metadata TEXT NOT NULL, messages TEXT NOT NULL, \
+         PRIMARY KEY (conversation_id))",
         "CREATE TABLE mr_schema_version (version BIGINT NOT NULL PRIMARY KEY)",
-        "INSERT INTO mr_schema_version (version) VALUES (1)",
-        "INSERT INTO mr (tenant_id, id, created_at, model, response_object, input, messages) \
-         VALUES ('tenant_a', 'legacy_resp', 1000, 'gpt-4.1', \
+        "INSERT INTO mr_schema_version (version) VALUES (2)",
+        "INSERT INTO mr (tenant_id, id, owner_issuer, owner_subject, created_at, model, response_object, input, messages) \
+         VALUES ('tenant_a', 'legacy_resp', 'test-issuer', 'test-subject', 1000, 'gpt-4.1', \
          '{\"id\":\"legacy_resp\",\"model\":\"gpt-4.1\"}', '\"hi\"', '[{\"role\":\"user\"}]')",
     ] {
         sqlx::query(stmt)
@@ -2892,7 +2894,7 @@ async fn sqlite_v1_text_schema_migrates_to_v2_preserving_rows() {
     let before = SqliteResponseStore::new(&url, "mr", "mc", None, None, None).await;
     assert!(
         before.is_err_and(|e| e.to_string().contains("schema version mismatch")),
-        "store must refuse a version-1 database"
+        "store must refuse a version-2 database"
     );
 
     // Apply the documented operator migration: CAST the responses payload
@@ -2903,7 +2905,7 @@ async fn sqlite_v1_text_schema_migrates_to_v2_preserving_rows() {
     for stmt in [
         "UPDATE mr SET response_object = CAST(response_object AS BLOB), \
          input = CAST(input AS BLOB), messages = CAST(messages AS BLOB)",
-        "UPDATE mr_schema_version SET version = 2",
+        "UPDATE mr_schema_version SET version = 3",
     ] {
         sqlx::query(stmt)
             .execute(&pool)
@@ -2915,10 +2917,11 @@ async fn sqlite_v1_text_schema_migrates_to_v2_preserving_rows() {
     // After migration the store starts and the legacy row reads back intact.
     let store = SqliteResponseStore::new(&url, "mr", "mc", None, None, None)
         .await
-        .expect("store should start on a migrated version-2 database");
+        .expect("store should start on a migrated version-3 database");
 
+    let owner = crate::test_utils::test_owner("tenant_a");
     let fetched = store
-        .get_response("tenant_a", "legacy_resp")
+        .get_response(&owner, "legacy_resp")
         .await
         .expect("get should succeed")
         .expect("legacy row should be readable after migration");
@@ -2929,7 +2932,7 @@ async fn sqlite_v1_text_schema_migrates_to_v2_preserving_rows() {
     let record = make_response_record("post_mig", "tenant_a", 2000);
     store.upsert_response(&record).await.expect("upsert should succeed");
     let round = store
-        .get_response("tenant_a", "post_mig")
+        .get_response(&owner, "post_mig")
         .await
         .expect("get should succeed")
         .expect("new row should exist");
@@ -3612,37 +3615,39 @@ async fn pg_rejects_schema_version_mismatch() {
 
 #[tokio::test]
 #[ignore]
-async fn pg_v1_text_schema_migrates_to_v2_bytea_preserving_rows() {
+async fn pg_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
     let fx = PgSchemaFixture::new("mig");
 
-    let legacy_v1 = [
+    let legacy_v2 = [
         format!(
             "CREATE TABLE {} (\
-             tenant_id TEXT NOT NULL, id TEXT NOT NULL, created_at BIGINT NOT NULL, \
-             model TEXT NOT NULL, response_object TEXT NOT NULL, input TEXT NOT NULL, \
-             messages TEXT NOT NULL, PRIMARY KEY (tenant_id, id))",
+             tenant_id TEXT NOT NULL, id TEXT NOT NULL, owner_issuer TEXT NOT NULL, \
+             owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, model TEXT NOT NULL, \
+             response_object TEXT NOT NULL, input TEXT NOT NULL, \
+             messages TEXT NOT NULL, PRIMARY KEY (id))",
             fx.responses
         ),
         format!(
             "CREATE TABLE {} (\
-             conversation_id TEXT NOT NULL, tenant_id TEXT NOT NULL, created_at BIGINT NOT NULL, \
-             metadata TEXT NOT NULL, messages TEXT NOT NULL, PRIMARY KEY (conversation_id, tenant_id))",
+             conversation_id TEXT NOT NULL, tenant_id TEXT NOT NULL, owner_issuer TEXT NOT NULL, \
+             owner_subject TEXT NOT NULL, created_at BIGINT NOT NULL, metadata TEXT NOT NULL, \
+             messages TEXT NOT NULL, PRIMARY KEY (conversation_id))",
             fx.conversations
         ),
         format!("CREATE TABLE {} (version BIGINT NOT NULL PRIMARY KEY)", fx.version),
-        format!("INSERT INTO {} (version) VALUES (1)", fx.version),
+        format!("INSERT INTO {} (version) VALUES (2)", fx.version),
         format!(
-            "INSERT INTO {} (tenant_id, id, created_at, model, response_object, input, messages) \
-             VALUES ('tenant_a', 'legacy_resp', 1000, 'gpt-4.1', \
+            "INSERT INTO {} (tenant_id, id, owner_issuer, owner_subject, created_at, model, response_object, input, messages) \
+             VALUES ('tenant_a', 'legacy_resp', 'test-issuer', 'test-subject', 1000, 'gpt-4.1', \
              '{{\"id\":\"legacy_resp\",\"model\":\"gpt-4.1\"}}', '\"hi\"', '[{{\"role\":\"user\"}}]')",
             fx.responses
         ),
     ];
 
-    let msg = fx.expect_rejected(&legacy_v1, &[]).await;
+    let msg = fx.expect_rejected(&legacy_v2, &[]).await;
     assert!(
         msg.contains("schema version mismatch"),
-        "store must refuse a version-1 database: {msg}"
+        "store must refuse a version-2 database: {msg}"
     );
 
     let migrate = [
@@ -3653,14 +3658,14 @@ async fn pg_v1_text_schema_migrates_to_v2_bytea_preserving_rows() {
              ALTER COLUMN messages TYPE BYTEA USING convert_to(messages, 'UTF8')",
             fx.responses
         ),
-        format!("UPDATE {} SET version = 2", fx.version),
+        format!("UPDATE {} SET version = 3", fx.version),
     ];
-    let migrated_v2: Vec<String> = legacy_v1.into_iter().chain(migrate).collect();
+    let migrated_v3: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
 
-    let result = fx.init(&migrated_v2, &[]).await;
+    let result = fx.init(&migrated_v3, &[]).await;
     assert!(
         result.is_ok(),
-        "store should start on a migrated version-2 database: {:?}",
+        "store should start on a migrated version-3 database: {:?}",
         result.err()
     );
 }
@@ -3710,7 +3715,7 @@ async fn pg_compressed_store_roundtrips_response() {
     store.upsert_response(&record).await.expect("upsert should succeed");
 
     let fetched = store
-        .get_response("tenant_a", "resp_zstd")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_zstd")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -3761,7 +3766,7 @@ async fn pg_compression_is_backward_compatible_with_plain_rows() {
     .expect("compressed postgres store creation should succeed");
 
     let fetched = compressed
-        .get_response("tenant_a", "resp_plain")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_plain")
         .await
         .expect("get should succeed")
         .expect("plain record should remain readable");
@@ -4818,7 +4823,7 @@ async fn compressed_store_roundtrips_response() {
     store.upsert_response(&record).await.expect("upsert should succeed");
 
     let fetched = store
-        .get_response("tenant_a", "resp_zstd")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_zstd")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -4856,7 +4861,7 @@ async fn compression_is_backward_compatible_with_plain_rows() {
     .expect("compressed store creation should succeed");
 
     let fetched = compressed
-        .get_response("tenant_a", "resp_plain")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_plain")
         .await
         .expect("get should succeed")
         .expect("plain record should remain readable");
@@ -4896,7 +4901,7 @@ async fn plain_store_reads_zstd_rows_after_disabling_compression() {
         .expect("plain store creation should succeed");
 
     let fetched = plain
-        .get_response("tenant_a", "resp_zstd")
+        .get_response(&crate::test_utils::test_owner("tenant_a"), "resp_zstd")
         .await
         .expect("get should succeed")
         .expect("compressed record should remain readable after compression is disabled");

@@ -103,6 +103,9 @@ impl PostgresResponseStore {
         pool_config: Option<&PoolConfig>,
         compression: Option<&StoreCompressionConfig>,
     ) -> Result<Self, StoreError> {
+        if let Some(compression) = compression {
+            compression.validate().map_err(StoreError::InvalidInput)?;
+        }
         let tables = TableNames {
             responses: responses_table.to_owned(),
             conversations: conversations_table.to_owned(),

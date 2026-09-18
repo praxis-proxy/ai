@@ -94,8 +94,17 @@ impl StoreCompressionConfig {
         let json = serde_json::to_vec(value).map_err(|e| StoreError::Serialization(e.to_string()))?;
         match self.algorithm {
             CompressionAlgorithm::None => Ok(json),
-            CompressionAlgorithm::Zstd => zstd::bulk::compress(&json, self.zstd_level())
-                .map_err(|e| StoreError::Serialization(format!("zstd compress: {e}"))),
+            CompressionAlgorithm::Zstd => {
+                // Refuse to compress a payload larger than decode will accept, so a
+                // successful write can always be read back.
+                if json.len() as u64 > MAX_DECOMPRESSED_SIZE {
+                    return Err(StoreError::Serialization(
+                        "zstd compress: payload exceeds size limit".to_owned(),
+                    ));
+                }
+                zstd::bulk::compress(&json, self.zstd_level())
+                    .map_err(|e| StoreError::Serialization(format!("zstd compress: {e}")))
+            },
         }
     }
 }
