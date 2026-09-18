@@ -2181,10 +2181,7 @@ fn commit_deferred_listings(
         {
             generated_names.insert(name.to_owned());
         }
-        function_tools_by_label.insert(
-            item.server_label.as_str(),
-            item.functions.as_slice(),
-        );
+        function_tools_by_label.insert(item.server_label.as_str(), item.functions.as_slice());
     }
 
     let expanded_tools = expand_deferred_tools_array(state.tools.clone(), &function_tools_by_label);
