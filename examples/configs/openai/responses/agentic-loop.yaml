@@ -224,6 +224,27 @@ filter_chains:
               # Request-phase dispatcher: runs second on re-entry to execute
               # MCP calls prepared and classified by the loop owner.
               - filter: openai_mcp_dispatch
+                # Every MCP tools/call and deferred tools/list sub-request runs
+                # through this chain. It must be inline ({ name, filters }): this
+                # filter runs inside an iterative_request_router step, whose
+                # pipeline is built with an empty named-chain map, so a top-level
+                # filter_chains reference cannot resolve here. The SSRF-validated
+                # destination is staged by the transport, so the chain never
+                # selects an upstream; it only observes and stamps the outbound
+                # MCP request.
+                #
+                # Do NOT put static credentials in this chain: MCP destinations
+                # are client-selected (server_url), so a blanket credential header
+                # would leak to attacker-chosen hosts. Destination-bound auth is
+                # tracked in #880; per-target credentials use the MCP tool entry's
+                # dedicated `authorization` field.
+                outbound_chain:
+                  name: mcp-dispatch-outbound
+                  filters:
+                    - filter: headers
+                      request_set:
+                        - name: X-MCP-Client
+                          value: praxis-ai-gateway
                 max_calls_per_round: 32
                 max_parallel_calls: 8
                 max_result_bytes: 1048576

@@ -127,7 +127,10 @@ use crate::{
 ///           value: file-resolve
 /// ```
 ///
-/// `outbound_chain` may be defined inline or reference a top-level named chain.
+/// `outbound_chain` is optional and may be defined inline or reference a
+/// top-level named chain. When omitted it defaults to an empty inline chain
+/// (pure passthrough); configured `file_id` callouts still run through the
+/// bound outbound pipeline.
 ///
 /// # Full YAML
 ///
@@ -249,14 +252,16 @@ impl FileResolveFilter {
     /// The chain-binding registration path calls this to resolve and bind
     /// the chain (via [`ChainBindingContext::bind_chain`]) before
     /// constructing the filter, keeping the private config type inside this
-    /// module. Returns `None` when no `outbound_chain` is configured.
+    /// module. `outbound_chain` is optional; when omitted the config layer
+    /// substitutes an empty inline chain (pure passthrough), so this always
+    /// yields a bindable reference and never signals "missing".
     ///
     /// # Errors
     ///
     /// Returns [`FilterError`] if the YAML config cannot be parsed.
     ///
     /// [`ChainBindingContext::bind_chain`]: praxis_filter::ChainBindingContext::bind_chain
-    pub fn outbound_chain_ref(config: &serde_yaml::Value) -> Result<Option<ChainRef>, FilterError> {
+    pub fn outbound_chain_ref(config: &serde_yaml::Value) -> Result<ChainRef, FilterError> {
         let cfg: FileResolveConfig = parse_filter_config("openai_file_resolve", config)?;
         Ok(cfg.outbound_chain)
     }

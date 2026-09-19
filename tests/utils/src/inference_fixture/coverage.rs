@@ -1239,6 +1239,7 @@ mod tests {
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
                 vec!["responses_native_passthrough"],
+                vec!["responses_native_passthrough"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
@@ -1288,11 +1289,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 27);
-        assert_eq!(report.scenarios_total, 27);
-        assert_eq!(report.recordings_total, 32);
+        assert_eq!(report.features_total, 28);
+        assert_eq!(report.scenarios_total, 28);
+        assert_eq!(report.recordings_total, 33);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1308,6 +1310,7 @@ mod tests {
                 "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-status-less-function-call",
+                "responses/background-unsupported",
                 "responses/chat-basic-nonstream",
                 "responses/chat-basic-stream",
                 "responses/chat-file-search",
@@ -1325,7 +1328,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 27);
+        assert_eq!(manifest.features.len(), 28);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1405,6 +1408,10 @@ mod tests {
                 (
                     &"responses.native.tool_call".to_owned(),
                     &vec!["responses/native-tool-call".to_owned()]
+                ),
+                (
+                    &"responses.request.background_unsupported".to_owned(),
+                    &vec!["responses/background-unsupported".to_owned()]
                 ),
                 (
                     &"responses.native.continuation".to_owned(),

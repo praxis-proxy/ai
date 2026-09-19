@@ -14,9 +14,9 @@
 # generates response and conversation IDs, and writes responses.*
 # metadata for downstream pipeline filters.
 #
-# Valid JSON requests are forwarded to the upstream backend with the
-# original body unchanged. Invalid JSON requests receive a 400 error
-# response. Provider-supported parameter combinations are not rejected.
+# Valid supported JSON requests are forwarded to the upstream backend with
+# the original body unchanged. Invalid JSON and unsupported background-mode
+# requests receive a 400 error response.
 #
 # Example valid request:
 #
@@ -24,18 +24,12 @@
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"Hello, world!"}'
 #
-# Example background streaming request (forwarded to a capable backend):
+# Example unsupported background request (rejected before the backend):
 #
 #   curl -X POST http://localhost:8080/v1/responses \
 #     -H "Content-Type: application/json" \
 #     -d '{"model":"gpt-4.1","input":"test","stream":true,"background":true}'
 #
-# Example background request without durable storage:
-#
-#   curl -X POST http://localhost:8080/v1/responses \
-#     -H "Content-Type: application/json" \
-#     -d '{"model":"gpt-4.1","input":"test","background":true,"store":false}'
-
 listeners:
   - name: responses-gateway
     address: "127.0.0.1:8080"

@@ -14,6 +14,8 @@
 //! discriminator is a Responses request rather than unknown JSON. A
 //! `GET /v1/responses` `WebSocket` upgrade is classified from the method,
 //! path, and upgrade headers without inferring body-derived facts.
+//! Create requests with `background=true` are rejected because Praxis does not
+//! implement the asynchronous Responses lifecycle.
 //! Promotes classification facts to configurable headers, durable
 //! metadata, and filter results for routing. Does not mutate the
 //! request body.
@@ -186,9 +188,12 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 /// and mode facts remain absent. An ordinary bodyless `GET /v1/responses`
 /// remains unclassified.
 ///
-/// Routing mode for Responses API: `stateful` when the request contains
-/// `previous_response_id`, non-empty `tools`, `store=true` (default when
-/// omitted), `background=true`, `conversation`, or `prompt.id`;
+/// Requests with `background=true` are rejected because Praxis does not
+/// implement the asynchronous Responses lifecycle.
+///
+/// Routing mode for supported Responses API requests: `stateful` when the
+/// request contains `previous_response_id`, non-empty `tools`, `store=true`
+/// (default when omitted), `conversation`, or `prompt.id`;
 /// `stateless` when `store=false` with no other stateful markers.
 ///
 /// Use with branch chains to route stateful and stateless requests to
@@ -277,6 +282,10 @@ impl HttpFilter for ResponsesFormatFilter {
         );
 
         if let Some(action) = handle_invalid_format(classified.format, &self.config) {
+            return Ok(action);
+        }
+
+        if let Some(action) = handle_unsupported_background(&classified) {
             return Ok(action);
         }
 
@@ -373,10 +382,26 @@ fn handle_invalid_format(format: AiRequestFormat, config: &ResponsesFormatConfig
     }
 }
 
+/// Reject Responses create requests that request background execution.
+///
+/// Praxis does not implement the asynchronous Responses lifecycle
+/// (schedule, poll, cancel), so `background=true` is rejected uniformly
+/// before routing or upstream contact with an OpenAI-shaped 400.
+fn handle_unsupported_background(classified: &ClassifiedRequest) -> Option<FilterAction> {
+    if classified.format == AiRequestFormat::Responses && classified.background == Some(true) {
+        return Some(FilterAction::Reject(error::responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "background mode is not supported",
+        )));
+    }
+    None
+}
+
 /// Determine the routing mode for a Responses API request.
 ///
 /// Returns `Some("stateful")` when the request needs orchestration
-/// (conversation history, tools, persistence, or background processing)
+/// (conversation history, tools, or persistence)
 /// and `Some("stateless")` when it can be forwarded directly to a
 /// native Responses backend. Returns `None` for non-Responses formats.
 fn compute_mode(classified: &ClassifiedRequest) -> Option<&'static str> {
@@ -387,7 +412,6 @@ fn compute_mode(classified: &ClassifiedRequest) -> Option<&'static str> {
     let stateful = classified.has_previous_response_id
         || classified.has_tools
         || classified.store.unwrap_or(true)
-        || classified.background == Some(true)
         || classified.has_conversation
         || classified.has_prompt_id;
     Some(if stateful { "stateful" } else { "stateless" })

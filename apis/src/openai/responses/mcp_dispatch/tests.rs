@@ -93,7 +93,6 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         max_result_bytes: TEST_MAX_RESULT_BYTES,
         max_total_result_bytes: TEST_MAX_TOTAL_RESULT_BYTES,
         timeout,
-        allow_loopback: true,
         forwarded_header_names: &[],
         forwarded_headers: None,
     }
@@ -1079,7 +1078,7 @@ fn from_config_minimal() {
 #[test]
 fn from_config_with_all_fields() {
     let config = serde_yaml::from_str::<serde_yaml::Value>(
-        "timeout_ms: 5000\nallow_loopback: true\nmax_calls_per_round: 16\nmax_parallel_calls: 4\nmax_result_bytes: 2048\nmax_total_result_bytes: 16384",
+        "timeout_ms: 5000\nmax_calls_per_round: 16\nmax_parallel_calls: 4\nmax_result_bytes: 2048\nmax_total_result_bytes: 16384",
     )
     .unwrap();
     let filter = McpDispatchFilter::from_config(&config).unwrap();
@@ -1090,6 +1089,68 @@ fn from_config_with_all_fields() {
 fn from_config_rejects_zero_timeout() {
     let config = serde_yaml::from_str::<serde_yaml::Value>("timeout_ms: 0").unwrap();
     assert!(McpDispatchFilter::from_config(&config).is_err());
+}
+
+#[test]
+fn from_config_rejects_inline_outbound_chain() {
+    // The plain-builtin `from_config` path has no chain-binding context, so it
+    // cannot bind *any* configured `outbound_chain` (inline or named). Production
+    // registers this filter as chain-binding via `from_config_with_binding`; the
+    // plain path must reject a configured chain rather than silently drop it.
+    let config = serde_yaml::from_str::<serde_yaml::Value>(
+        "outbound_chain:\n  name: mcp-outbound\n  filters:\n    - filter: headers\n      request_set:\n        - name: x-probe\n          value: v\n",
+    )
+    .unwrap();
+    let Err(error) = McpDispatchFilter::from_config(&config) else {
+        panic!("a configured outbound_chain must be rejected by the plain builtin path");
+    };
+    assert!(
+        error.to_string().contains("chain-binding registration"),
+        "error should point at chain-binding registration: {error}"
+    );
+}
+
+#[test]
+fn from_config_rejects_named_outbound_chain() {
+    // The plain-builtin path rejects a named chain for the same reason as an
+    // inline one: it has no chain-binding context to resolve it.
+    let config = serde_yaml::from_str::<serde_yaml::Value>("outbound_chain: mcp-outbound\n").unwrap();
+    let Err(error) = McpDispatchFilter::from_config(&config) else {
+        panic!("a named outbound_chain must be rejected");
+    };
+    assert!(
+        error.to_string().contains("chain-binding registration"),
+        "error should point at chain-binding registration: {error}"
+    );
+}
+
+#[test]
+fn require_inline_outbound_chain_accepts_none_and_inline() {
+    // The chain-binding path (`from_config_with_binding`) accepts an inline chain
+    // (bound at IRR step-build time) and the omitted case (empty chain).
+    use praxis_core::config::ChainRef;
+    super::config::require_inline_outbound_chain(None).expect("None must be accepted");
+    let inline = ChainRef::Inline {
+        name: "mcp-outbound".to_owned(),
+        filters: Vec::new(),
+    };
+    super::config::require_inline_outbound_chain(Some(&inline)).expect("an inline chain must be accepted");
+}
+
+#[test]
+fn require_inline_outbound_chain_rejects_named() {
+    // A named reference cannot resolve inside the IRR step (empty step-level
+    // named-chain map), so the chain-binding path rejects it up front with a
+    // clear inline-required error.
+    use praxis_core::config::ChainRef;
+    let named = ChainRef::Named("mcp-outbound".to_owned());
+    let Err(error) = super::config::require_inline_outbound_chain(Some(&named)) else {
+        panic!("a named outbound_chain must be rejected");
+    };
+    assert!(
+        error.to_string().contains("must be defined inline"),
+        "error should require an inline chain: {error}"
+    );
 }
 
 // =========================================================================
@@ -1103,9 +1164,14 @@ async fn execute_single_call_missing_name_returns_none() {
     let timeout = std::time::Duration::from_millis(100);
     let options = execution_options(false, timeout);
     assert!(
-        execute_single_call(&tc, &McpToolIndex::new(&map), &options)
-            .await
-            .is_none()
+        execute_single_call(
+            &tc,
+            &McpToolIndex::new(&map),
+            &options,
+            &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+        )
+        .await
+        .is_none()
     );
 }
 
@@ -1116,9 +1182,14 @@ async fn execute_single_call_unknown_tool_returns_none() {
     let timeout = std::time::Duration::from_millis(100);
     let options = execution_options(false, timeout);
     assert!(
-        execute_single_call(&tc, &McpToolIndex::new(&map), &options)
-            .await
-            .is_none()
+        execute_single_call(
+            &tc,
+            &McpToolIndex::new(&map),
+            &options,
+            &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+        )
+        .await
+        .is_none()
     );
 }
 
@@ -1128,9 +1199,14 @@ async fn execute_single_call_ambiguous_returns_error() {
     let tc = json!({"name": "my_server__get", "call_id": "c1"});
     let timeout = std::time::Duration::from_millis(100);
     let options = execution_options(false, timeout);
-    let result = execute_single_call(&tc, &McpToolIndex::new(&map), &options)
-        .await
-        .unwrap();
+    let result = execute_single_call(
+        &tc,
+        &McpToolIndex::new(&map),
+        &options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     assert!(result.output_item["error"].as_str().unwrap().contains("ambiguous"));
 }
 
@@ -1140,9 +1216,14 @@ async fn execute_single_call_malformed_args_returns_error() {
     let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": "not-json"});
     let timeout = std::time::Duration::from_millis(100);
     let options = execution_options(false, timeout);
-    let result = execute_single_call(&tc, &McpToolIndex::new(&map), &options)
-        .await
-        .unwrap();
+    let result = execute_single_call(
+        &tc,
+        &McpToolIndex::new(&map),
+        &options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     assert!(result.output_item["error"].as_str().unwrap().contains("malformed"));
 }
 
@@ -1152,9 +1233,14 @@ async fn execute_single_call_connection_error() {
     let tc = json!({"name": "weather__get_weather", "call_id": "c1", "arguments": {"city": "Paris"}});
     let timeout = std::time::Duration::from_millis(200);
     let options = execution_options(false, timeout);
-    let result = execute_single_call(&tc, &McpToolIndex::new(&map), &options)
-        .await
-        .unwrap();
+    let result = execute_single_call(
+        &tc,
+        &McpToolIndex::new(&map),
+        &options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     assert!(
         result.message["output"].as_str().unwrap().starts_with("Error:"),
         "should report connection/timeout error"
@@ -1169,9 +1255,14 @@ async fn execute_single_call_connection_error() {
 async fn execute_mcp_calls_empty_input() {
     let map = sample_tool_map();
     let timeout = std::time::Duration::from_millis(100);
-    let results = execute_mcp_calls(&[], &McpToolIndex::new(&map), execution_options(false, timeout))
-        .await
-        .unwrap();
+    let results = execute_mcp_calls(
+        &[],
+        &McpToolIndex::new(&map),
+        execution_options(false, timeout),
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
     assert!(results.is_empty());
 }
 
@@ -1184,6 +1275,7 @@ async fn execute_mcp_calls_sequential() {
         &call_refs(&calls),
         &McpToolIndex::new(&map),
         execution_options(false, timeout),
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1200,6 +1292,7 @@ async fn execute_mcp_calls_parallel() {
         &call_refs(&calls),
         &McpToolIndex::new(&map),
         execution_options(true, timeout),
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1219,9 +1312,14 @@ async fn execute_mcp_calls_parallel_preserves_order_across_bounded_chunks() {
 
     let mut options = execution_options(true, timeout);
     options.max_parallel_calls = 2;
-    let results = execute_mcp_calls(&call_refs(&calls), &McpToolIndex::new(&map), options)
-        .await
-        .unwrap();
+    let results = execute_mcp_calls(
+        &call_refs(&calls),
+        &McpToolIndex::new(&map),
+        options,
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
 
     let ids: Vec<&str> = results
         .iter()
@@ -1239,6 +1337,7 @@ async fn execute_mcp_calls_emits_error_for_unknown_tools() {
         &call_refs(&calls),
         &McpToolIndex::new(&map),
         execution_options(false, timeout),
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1255,6 +1354,7 @@ async fn execute_mcp_calls_emits_error_for_unknown_tool_without_call_id() {
         &call_refs(&calls),
         &McpToolIndex::new(&map),
         execution_options(false, timeout),
+        &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
     )
     .await
     .unwrap();
@@ -1272,9 +1372,14 @@ async fn execute_mcp_calls_rejects_an_aggregate_result_overflow() {
     options.max_total_result_bytes = 1;
 
     assert!(
-        execute_mcp_calls(&call_refs(&calls), &McpToolIndex::new(&map), options)
-            .await
-            .is_err()
+        execute_mcp_calls(
+            &call_refs(&calls),
+            &McpToolIndex::new(&map),
+            options,
+            &crate::mcp_client::McpCallout::fabricated(true).unwrap(),
+        )
+        .await
+        .is_err()
     );
 }
 
@@ -1333,6 +1438,21 @@ fn process_call_result_image_content_is_preserved() {
 fn make_dispatch_filter() -> Box<dyn praxis_filter::HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
     McpDispatchFilter::from_config(&yaml).unwrap()
+}
+
+/// A dispatch filter whose bound outbound pipeline permits private/loopback
+/// upstreams, mirroring a deployment with `insecure_options.allow_private_upstreams`.
+///
+/// Tests that need a genuine *runtime* dial failure (connection refused,
+/// timeout) against a loopback address use this so the SSRF guard admits the
+/// dial instead of rejecting it up front as a local policy failure. Mirrors the
+/// finalization walk Praxis performs, which flips the pipeline's SSRF posture
+/// via `set_allow_private_upstreams` while the outbound pipeline is still
+/// uniquely owned.
+fn make_dispatch_filter_allow_private() -> Box<dyn praxis_filter::HttpFilter> {
+    let mut filter = make_dispatch_filter();
+    filter.visit_nested_pipelines(&mut |pipeline| pipeline.set_allow_private_upstreams(true));
+    filter
 }
 
 fn auto_approval_tool_map() -> HashMap<(String, String), serde_json::Value> {
@@ -1614,7 +1734,6 @@ async fn on_request_body_skips_deferred_discovery_when_max_tool_calls_exhausted(
     let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
     ctx.extensions.insert(ResponsesState {
         deferred_mcp: vec![DeferredMcpConnector {
-            allow_loopback: true,
             authorization: None,
             allowed_tools: None,
             connector_id: "corp_drive".to_owned(),
@@ -1658,7 +1777,10 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
     let server_url = format!("http://{}/mcp", listener.local_addr().unwrap());
     drop(listener);
 
-    let filter = make_dispatch_filter();
+    // Permit the loopback dial so it fails at *connect* (a runtime failure that
+    // defers to the header phase) rather than being rejected up front by the
+    // SSRF guard as a local policy failure.
+    let filter = make_dispatch_filter_allow_private();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.current_filter_id = Some(0);
@@ -1673,7 +1795,6 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.response_id = Some("resp_deferred_listing_failure".to_owned());
     state.deferred_mcp = vec![DeferredMcpConnector {
-        allow_loopback: true,
         authorization: None,
         allowed_tools: None,
         connector_id: "corp_drive".to_owned(),
@@ -1949,7 +2070,7 @@ async fn resolve_to_dispatch_execute_with_original_name() {
 /// The resolved tool-map entry for the `weather` server shared by the approval
 /// tests.
 ///
-/// A loopback URL under the default `allow_loopback=false` policy makes any
+/// A loopback URL under the default `allow_private=false` policy makes any
 /// executed approved call fail closed instantly via the SSRF guard — no
 /// network round trip, no timeout wait. The resume/consume/inject logic is
 /// what these tests exercise; `build_error_result` still preserves the

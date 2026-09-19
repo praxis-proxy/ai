@@ -8,8 +8,8 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::{
-    ConversationItemRecord, ConversationRecord, PendingApprovalRecord, PostgresResponseStore, ResponseRecord,
-    ResponseStoreRegistry, SqliteResponseStore, SslMode, StoreError,
+    ConversationItemRecord, ConversationRecord, PendingApprovalRecord, PgTlsConfig, PostgresResponseStore,
+    ResponseRecord, ResponseStoreRegistry, SqliteResponseStore, SslMode, StoreError,
     trait_def::{ConversationItemStore, ResponseStore},
 };
 use crate::openai::{
@@ -3162,13 +3162,16 @@ impl PgSchemaFixture {
         }
         pool.close().await;
 
+        let tls = PgTlsConfig {
+            ssl_mode: Some(SslMode::Disable),
+            ..PgTlsConfig::default()
+        };
         let result = Box::pin(PostgresResponseStore::new(
             &self.url,
             &self.responses,
             &self.conversations,
             None,
-            Some(SslMode::Disable),
-            None,
+            &tls,
             None,
         ))
         .await;
@@ -3239,13 +3242,17 @@ fn pg_ssl_mode_converts_to_pg_ssl_mode() {
 async fn pg_nonexistent_ssl_root_cert_fails() {
     let url = pg_database_url();
     let suffix = pg_unique_suffix();
+    let tls = PgTlsConfig {
+        ssl_mode: Some(SslMode::VerifyCa),
+        ssl_root_cert: Some("/nonexistent/ca.pem"),
+        ..PgTlsConfig::default()
+    };
     let result = Box::pin(PostgresResponseStore::new(
         &url,
         &format!("test_responses_{suffix}"),
         &format!("test_conversations_{suffix}"),
         None,
-        Some(SslMode::VerifyCa),
-        Some("/nonexistent/ca.pem"),
+        &tls,
         None,
     ))
     .await;
@@ -3506,13 +3513,16 @@ async fn pg_rejects_schema_version_mismatch() {
 async fn make_pg_store() -> PostgresResponseStore {
     let url = pg_database_url();
     let suffix = pg_unique_suffix();
+    let tls = PgTlsConfig {
+        ssl_mode: Some(SslMode::Disable),
+        ..PgTlsConfig::default()
+    };
     Box::pin(PostgresResponseStore::new(
         &url,
         &format!("test_responses_{suffix}"),
         &format!("test_conversations_{suffix}"),
         None,
-        Some(SslMode::Disable),
-        None,
+        &tls,
         None,
     ))
     .await
@@ -4602,13 +4612,16 @@ async fn make_pg_store_with_items() -> PostgresResponseStore {
     let responses_table = format!("test_responses_{suffix}");
     let conversations_table = format!("test_conversations_{suffix}");
     let items_table = format!("test_conversation_items_{suffix}");
+    let tls = PgTlsConfig {
+        ssl_mode: Some(SslMode::Disable),
+        ..PgTlsConfig::default()
+    };
     PostgresResponseStore::new(
         &url,
         &responses_table,
         &conversations_table,
         Some(&items_table),
-        Some(SslMode::Disable),
-        None,
+        &tls,
         None,
     )
     .await
