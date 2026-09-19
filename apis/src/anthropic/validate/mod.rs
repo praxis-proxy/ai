@@ -24,6 +24,7 @@ use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };
+use serde::de::IgnoredAny;
 use tracing::debug;
 
 use self::config::{AnthropicValidateConfig, build_config};
@@ -108,16 +109,33 @@ impl HttpFilter for AnthropicValidateFilter {
 
 /// Validate the JSON envelope in the request body.
 fn validate_request(body: &[u8]) -> Option<Rejection> {
-    let value: serde_json::Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return Some(reject("request body is not valid JSON")),
-    };
+    if serde_json::from_slice::<IgnoredAny>(body).is_err() {
+        return Some(reject("request body is not valid JSON"));
+    }
 
-    if !value.is_object() {
+    if !is_json_object(body) {
         return Some(reject("request body is not a JSON object"));
     }
 
     None
+}
+
+/// Return whether `byte` is insignificant whitespace in the JSON grammar.
+///
+/// RFC 8259 permits exactly space, horizontal tab, line feed, and carriage
+/// return outside JSON strings.
+fn is_json_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Return whether a validated JSON document is an object.
+///
+/// This check is valid only after the complete body has been successfully
+/// parsed as JSON. Under that invariant, the first non-whitespace byte exists,
+/// and `{` uniquely identifies a top-level JSON object.
+fn is_json_object(body: &[u8]) -> bool {
+    let root = body.iter().find(|&&byte| !is_json_whitespace(byte));
+    root == Some(&b'{')
 }
 
 // -----------------------------------------------------------------------------

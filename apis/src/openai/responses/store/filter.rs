@@ -396,9 +396,8 @@ impl ResponseCapture {
         let input = request_input
             .or_else(|| json.get("input").cloned())
             .unwrap_or(Value::Null);
-        let output = json.get("output").cloned().unwrap_or(Value::Null);
         let history_input = state_messages.map_or_else(|| input.clone(), Value::Array);
-        let messages = assemble_stored_messages(&history_input, &output);
+        let messages = assemble_stored_messages(history_input, json.get("output"));
 
         Self { input, messages }
     }
@@ -408,28 +407,26 @@ impl ResponseCapture {
 /// create request body.
 fn extract_request_input(body: &Option<Bytes>) -> Option<Value> {
     let bytes = body.as_ref().filter(|b| !b.is_empty())?;
-    let json: Value = match serde_json::from_slice(bytes) {
+    let mut json: Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(e) => {
             trace!(error = %e, "response store: invalid request JSON");
             return None;
         },
     };
-    json.get("input").cloned()
+    json.as_object_mut()?.remove("input")
 }
 
 /// Build the stored conversation history from response input and output.
-fn assemble_stored_messages(input: &Value, output: &Value) -> Value {
+fn assemble_stored_messages(input: Value, output: Option<&Value>) -> Value {
     let mut messages = Vec::new();
 
-    append_stored_input_items(&mut messages, input.clone());
+    append_stored_input_items(&mut messages, input);
 
-    if !output.is_null() {
-        if let Some(items) = output.as_array() {
-            messages.extend(items.iter().cloned());
-        } else {
-            messages.push(output.clone());
-        }
+    match output {
+        Some(Value::Array(items)) => messages.extend(items.iter().cloned()),
+        Some(output) if !output.is_null() => messages.push(output.clone()),
+        Some(_) | None => {},
     }
 
     Value::Array(messages)

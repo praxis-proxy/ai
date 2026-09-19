@@ -16,6 +16,14 @@ fn valid_request_passes() {
 }
 
 #[test]
+fn whitespace_prefixed_object_passes() {
+    assert!(
+        validate_request(b" \t\r\n {\"nested\":{\"items\":[1,true,null]}}").is_none(),
+        "JSON whitespace before an object should be ignored"
+    );
+}
+
+#[test]
 fn backend_owned_semantics_pass() {
     let body = br#"{"model":"","max_tokens":0,"messages":[]}"#;
     assert!(
@@ -46,10 +54,65 @@ fn invalid_json_rejected() {
 }
 
 #[test]
+fn malformed_nested_json_and_trailing_data_are_rejected() {
+    for body in [br#"{"outer":[{"broken":}]}"#.as_slice(), br#"{} []"#.as_slice()] {
+        assert!(validate_request(body).is_some(), "malformed JSON should be rejected");
+    }
+}
+
+#[test]
+fn deeply_nested_json_is_fully_validated() {
+    let mut body = String::from(r#"{"deep":"#);
+    for depth in 0..256 {
+        if depth % 2 == 0 {
+            body.push_str(r#"{"deep":"#);
+        } else {
+            body.push('[');
+        }
+    }
+    body.push_str("null");
+    for depth in (0..256).rev() {
+        body.push(if depth % 2 == 0 { '}' } else { ']' });
+    }
+    body.push('}');
+
+    assert!(
+        validate_request(body.as_bytes()).is_none(),
+        "a valid object with 256 nested arrays and objects should pass"
+    );
+
+    body.pop();
+    assert!(
+        validate_request(body.as_bytes()).is_some(),
+        "the same deeply nested object with a missing delimiter should fail"
+    );
+}
+
+#[test]
 fn non_object_json_rejected() {
     let body = br#"[]"#;
     let rejection = validate_request(body);
     assert!(rejection.is_some(), "non-object JSON should be rejected");
+}
+
+#[test]
+fn scalar_and_null_json_rejected() {
+    for body in [
+        br#""text""#.as_slice(),
+        br#"42"#.as_slice(),
+        br#"true"#.as_slice(),
+        br#"null"#.as_slice(),
+    ] {
+        assert!(validate_request(body).is_some(), "non-object JSON should be rejected");
+    }
+}
+
+#[test]
+fn json_object_requires_validated_object_root() {
+    assert!(is_json_object(b" \t\r\n{}"));
+    assert!(!is_json_object(b"[]"));
+    assert!(!is_json_object(b"null"));
+    assert!(!is_json_object(b""));
 }
 
 #[tokio::test]
