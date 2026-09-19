@@ -162,15 +162,15 @@ pub async fn start_scripted_http_backend(
     expected_path: &str,
     script: Vec<HttpServerAction>,
 ) -> HttpBackendGuard {
-    start_scripted_http_backend_turns(expected_method, expected_path, vec![script]).await
+    start_scripted_http_backend_turns(expected_method, expected_path, script).await
 }
 
 /// Start an HTTP backend that replays one action sequence for each
 /// sequential request.
 ///
-/// Each `turn` element is a list of [`HttpServerAction`] entries. The
-/// backend advances to the next turn after the previous one has been
-/// delivered. `Json` and `StreamSse` actions both consume exactly one request.
+/// Each [`HttpServerAction`] is one response turn. The backend advances to
+/// the next action after the previous one has been delivered. `Json` and
+/// `StreamSse` actions both consume exactly one request.
 ///
 /// # Panics
 ///
@@ -178,7 +178,7 @@ pub async fn start_scripted_http_backend(
 pub async fn start_scripted_http_backend_turns(
     expected_method: &str,
     expected_path: &str,
-    turns: Vec<Vec<HttpServerAction>>,
+    turns: Vec<HttpServerAction>,
 ) -> HttpBackendGuard {
     let listener = bind_listener().await;
     let port = listener
@@ -280,12 +280,12 @@ struct ScriptState {
     /// Next response turn claimed by a valid request.
     turn_index: AtomicUsize,
     /// Ordered response actions, shared across every connection.
-    turns: Box<[Vec<HttpServerAction>]>,
+    turns: Box<[HttpServerAction]>,
 }
 
 impl ScriptState {
     /// Build listener-owned state for one backend instance.
-    fn new(expected_method: &str, expected_path: &str, turns: Vec<Vec<HttpServerAction>>) -> Self {
+    fn new(expected_method: &str, expected_path: &str, turns: Vec<HttpServerAction>) -> Self {
         Self {
             expectation: RequestExpectation {
                 method: expected_method.to_owned(),
@@ -452,7 +452,7 @@ async fn respond_to_turn(
             .await;
         return;
     };
-    if !execute_turn_actions(stream, script).await {
+    if !execute_turn_action(stream, script).await {
         debug!(turn = index, "scripted HTTP backend did not complete response");
     }
 }
@@ -486,11 +486,8 @@ async fn handle_websocket_upgrade(
         .is_ok()
 }
 
-/// Execute the response action for a single turn, returning whether it was sent.
-async fn execute_turn_actions(stream: &mut tokio::net::TcpStream, script: &[HttpServerAction]) -> bool {
-    let Some(action) = script.first() else {
-        return false;
-    };
+/// Execute one response action, returning whether it was sent.
+async fn execute_turn_action(stream: &mut tokio::net::TcpStream, action: &HttpServerAction) -> bool {
     match action {
         HttpServerAction::StreamSse {
             events,
@@ -793,14 +790,14 @@ mod tests {
             "POST",
             "/v1/chat/completions",
             vec![
-                vec![HttpServerAction::Json {
+                HttpServerAction::Json {
                     status: 200,
                     body: r#"{"turn":1}"#.to_owned(),
-                }],
-                vec![HttpServerAction::Json {
+                },
+                HttpServerAction::Json {
                     status: 200,
                     body: r#"{"turn":2}"#.to_owned(),
-                }],
+                },
             ],
         )
         .await;
