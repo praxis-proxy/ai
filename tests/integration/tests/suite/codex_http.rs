@@ -154,7 +154,7 @@ async fn pinned_codex_completes_chat_backend_coding_workflow_over_http() {
 #[test]
 fn native_sse_response_resources_match_openresponses_schema() {
     let turns = http_response_script();
-    let HttpServerAction::StreamSse { events, .. } = &turns[0][0] else {
+    let HttpServerAction::StreamSse { events, .. } = &turns[0] else {
         panic!("native Responses fixture should stream SSE");
     };
     let mut count = 0;
@@ -233,14 +233,14 @@ async fn translated_chat_sse_reaches_client_before_upstream_finishes() {
     let mut backend = start_scripted_http_backend_turns(
         "POST",
         "/v1/chat/completions",
-        vec![vec![HttpServerAction::StreamSse {
+        vec![HttpServerAction::StreamSse {
             events: vec![
                 chat_sse_data(&first_chunk),
                 chat_sse_data(&terminal_chunk),
                 "data: [DONE]\n".to_owned(),
             ],
             inter_event_delay: Duration::from_secs(5),
-        }]],
+        }],
     )
     .await;
     let proxy_port = free_port();
@@ -503,8 +503,8 @@ async fn read_first_translated_delta(proxy_port: u16) {
 /// for every turn so the assertion is deterministic regardless of how
 /// many times Codex polls the endpoint.
 #[expect(clippy::large_stack_frames, reason = "scripted turns are test fixtures")]
-fn http_response_script() -> Vec<Vec<HttpServerAction>> {
-    let turn = vec![HttpServerAction::StreamSse {
+fn http_response_script() -> Vec<HttpServerAction> {
+    let turn = HttpServerAction::StreamSse {
         events: vec![
             sse_event(
                 "response.created",
@@ -632,7 +632,7 @@ fn http_response_script() -> Vec<Vec<HttpServerAction>> {
             ),
         ],
         inter_event_delay: Duration::ZERO,
-    }];
+    };
     // A handful of follow-up turns is enough to let Codex finish the
     // multi-step task. The test asserts at least one request so any
     // additional follow-up turns simply keep the script running until
@@ -716,7 +716,7 @@ fn assert_openresponses_response_resource(resource: &serde_json::Value) {
     clippy::large_stack_frames,
     reason = "Chat SSE JSON values are bounded test fixtures"
 )]
-fn chat_coding_response_script() -> Vec<Vec<HttpServerAction>> {
+fn chat_coding_response_script() -> Vec<HttpServerAction> {
     let command = r#"expected=$(sed -n 's/.*"expected_content": "\(.*\)".*/\1/p' input.json); test -n "$expected"; printf '%s\n' "$expected" > result.txt; ./verify.sh"#;
     let arguments = serde_json::json!({
         "cmd": command,
@@ -774,22 +774,22 @@ fn chat_coding_response_script() -> Vec<Vec<HttpServerAction>> {
     });
 
     vec![
-        vec![HttpServerAction::StreamSse {
+        HttpServerAction::StreamSse {
             events: vec![
                 chat_sse_data(&tool_chunk),
                 chat_sse_data(&tool_done),
                 "data: [DONE]\n".to_owned(),
             ],
             inter_event_delay: Duration::ZERO,
-        }],
-        vec![HttpServerAction::StreamSse {
+        },
+        HttpServerAction::StreamSse {
             events: vec![
                 chat_sse_data(&summary_chunk),
                 chat_sse_data(&summary_done),
                 "data: [DONE]\n".to_owned(),
             ],
             inter_event_delay: Duration::ZERO,
-        }],
+        },
     ]
 }
 
