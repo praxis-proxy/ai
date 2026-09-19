@@ -17,7 +17,8 @@ use crate::TokenRateLimitFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
     IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    ProviderRouteFilter, Sigv4SignFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    ProviderRouteFilter, Sigv4SignFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter, TokenCountFilter,
+    TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -143,6 +144,10 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
 
 /// Register token counting/usage/rate-limiting filters.
 fn register_token_filters(registry: &mut FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
+        http "stream_usage_inject" => StreamUsageInjectFilter::from_config
+    );
     praxis_filter::register_filters!(
         @register registry,
         http "token_count" => TokenCountFilter::from_config

@@ -48,7 +48,7 @@ pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteF
 pub use time_to_first_token::TimeToFirstTokenFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 pub use token_rate_limit::TokenRateLimitFilter;
-pub use token_usage::{TokenCountFilter, TokenUsageHeadersFilter};
+pub use token_usage::{StreamUsageInjectFilter, TokenCountFilter, TokenUsageHeadersFilter};
 
 // -----------------------------------------------------------------------------
 // Test Utilities
