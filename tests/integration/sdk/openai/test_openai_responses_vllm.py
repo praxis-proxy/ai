@@ -781,7 +781,7 @@ def _write_agentic_config(
     translate_to_chat: bool = False,
     backend_endpoint: str | None = None,
 ) -> str:
-    """Patch agentic-loop.yaml with test ports and allow_loopback."""
+    """Patch agentic-loop.yaml with test ports and loopback callout posture."""
     with open(AGENTIC_CONFIG_PATH) as f:
         config = f.read()
 
@@ -802,18 +802,9 @@ def _write_agentic_config(
     # too; it stays inert for web/mcp-only tests that emit no file_search_call.
     config = config.replace("http://127.0.0.1:8001", f"http://{_ogx_endpoint()}")
     config = _patch_store_backend(config, db_path)
-    config = config.replace(
-        "- filter: openai_mcp_tool_resolve\n",
-        "- filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-    )
-    config = config.replace(
-        "- filter: openai_mcp_dispatch\n"
-        "                max_calls_per_round: 32\n",
-        "- filter: openai_mcp_dispatch\n"
-        "                allow_loopback: true\n"
-        "                max_calls_per_round: 32\n",
-        1,
-    )
+    # The loopback MCP callout's SSRF posture is governed by
+    # ``insecure_options.allow_private_upstreams`` (no per-filter opt-in), which
+    # agentic-loop.yaml already enables -- so no injection is needed here.
     config = config.replace(
         "max_iterations: 11\n",
         # agentic-loop.yaml already sets the IRR's overall ``timeout_ms``;
@@ -1874,6 +1865,23 @@ class TestOpenAIResponsesVLLM:
                 "Mutually exclusive parameters. Ensure you are only providing "
                 "one of: 'previous_response_id' or 'conversation'."
             ),
+            "param": None,
+            "type": "invalid_request_error",
+        }
+
+    def test_background_mode_is_rejected_before_inference(self, openai_client):
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Run this later.",
+                background=True,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400
+        assert error.body == {
+            "code": "invalid_request_error",
+            "message": "background mode is not supported",
             "param": None,
             "type": "invalid_request_error",
         }
@@ -4303,8 +4311,9 @@ class TestStreamingMcpDiscoveryFailureVLLM:
     retrievable via the SDK.
 
     The failure is triggered with an MCP ``server_url`` pointing at a dead
-    loopback port. The agentic config sets ``allow_loopback: true`` on
-    ``openai_mcp_tool_resolve``, so the refused connection is classified as a
+    loopback port. The agentic config enables
+    ``insecure_options.allow_private_upstreams``, so the loopback MCP callout
+    passes SSRF validation and the refused connection is classified as a
     genuine *runtime* discovery failure (-> 200 SSE lifecycle) rather than a
     local SSRF policy rejection (-> HTTP error). Discovery failures
     short-circuit in the request phase, so vLLM is never contacted -- this

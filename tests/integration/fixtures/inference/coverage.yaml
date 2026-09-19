@@ -144,6 +144,15 @@ features:
         status: live_covered
       vllm:
         status: live_covered
+  - id: responses.request.background_unsupported
+    scopes:
+      - responses_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - responses/background-unsupported
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.native.continuation
     scopes:
       - responses_native_passthrough

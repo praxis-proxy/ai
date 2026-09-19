@@ -23,5 +23,7 @@ Supports both streaming (SSE) and non-streaming (JSON) responses across five pro
 filter: token_count
 provider: openai   # openai | anthropic | google | bedrock | bedrock_invoke_model | azure
 max_body_bytes: 1048576    # optional, JSON capture limit
-max_scratch_bytes: 65536   # optional, SSE per-event capture limit
+max_scratch_bytes: 1048576 # optional, SSE per-event capture limit; must fit
+                           # the largest usage event (Responses-API
+                           # response.completed embeds the full response)
 ```

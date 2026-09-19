@@ -119,8 +119,18 @@ test-inference-fixtures:
 test-postgres-unit:
 	cargo test -p praxis-ai-apis --no-default-features --features store-all store::tests::pg_ -- --ignored $(_NOCAPTURE)
 
+# Every PostgreSQL integration test is #[ignore]d (each spawns its own
+# container), so it runs only when named here. Enumerate every module explicitly:
+# a bare substring filter such as `openai_response_store_postgres` incidentally
+# matches the response-store mTLS variant (a prefix) but cannot select the
+# Conversations certificate-auth module, silently dropping it from CI. Filters
+# must follow `--` so libtest treats each as an OR filter. Add every new
+# PostgreSQL integration module to this list.
 test-postgres-integration:
-	cargo test -p praxis-tests-integration --test suite openai_response_store_postgres -- --ignored $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --test suite -- --ignored \
+		openai_response_store_postgres \
+		openai_response_store_postgres_mtls \
+		openai_conversations_postgres_mtls $(if $(V),--nocapture)
 
 test-token-rate-limit-valkey-unit:
 	cargo test -p praxis-ai-filters --features token-rate-limit-filter valkey $(_NOCAPTURE)
