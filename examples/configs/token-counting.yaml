@@ -12,8 +12,9 @@
 # Each cache key is set only when the provider reported that count. An
 # absent key means the response carried no cache information; a zero
 # means the provider reported a cache miss. Providers whose API has no
-# cache write concept, such as OpenAI and Google, never set
-# token.cache_write.
+# cache write concept, such as Google, never set token.cache_write;
+# OpenAI reports cache writes as cache_write_tokens on both Chat
+# Completions and Responses API usage.
 #
 # Reasoning / thinking tokens are reported as token.reasoning when the
 # provider sends them:
