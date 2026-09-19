@@ -7,7 +7,7 @@
 //!
 //! ```console
 //! PRAXIS_TEST_CODEX_BIN=/absolute/path/to/codex \
-//!   cargo test -p praxis-tests-integration --test suite \
+//!   cargo test -p praxis-tests-integration --features store-sqlite --test suite \
 //!   codex_websocket::pinned_codex_uses_responses_websocket_through_full_flow -- --exact
 //! ```
 //!
