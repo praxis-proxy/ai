@@ -1,0 +1,96 @@
+# MCP Outbound Chain
+#
+# Demonstrates binding an operator `outbound_chain` onto the outbound MCP
+# callout made by `openai_mcp_tool_resolve` (the `tools/list` discovery
+# request). The callout is dialed through the pipeline's sub-request executor;
+# the MCP transport stages the SSRF-validated dial target onto the request, so
+# the operator's `outbound_chain` filters observe and may transform the outbound
+# MCP request while the transport still controls where it is dialed.
+#
+# Here the outbound chain is a single `headers` filter that stamps an
+# `x-mcp-outbound-probe` header on every outbound MCP request (`initialize`,
+# `tools/list`, ...). A real deployment might instead inject an egress
+# credential, add tracing headers, or enforce an allow-list before the request
+# leaves the proxy.
+#
+# On `openai_mcp_tool_resolve` (a top-level filter), `outbound_chain` may be an
+# **inline** chain (as shown here) or a **named** reference to a top-level
+# `filter_chains` entry. `openai_mcp_dispatch` (the per-round `tools/call`
+# executor) runs inside `iterative_request_router`. praxis core builds each IRR
+# step with a live chain-binding context, so `openai_mcp_dispatch` also binds an
+# **inline** `outbound_chain`; a **named** reference cannot resolve there because
+# IRR supplies each step an empty top-level named-chain map.
+#
+# SSRF posture: the outbound MCP callout is validated against the pipeline's
+# `insecure_options.allow_private_upstreams`. This example enables it so the
+# demo can talk to a loopback MCP server; leave it at its default (false) in
+# production so private/reserved MCP destinations are refused.
+#
+# Example request (server_url points at your MCP server):
+#
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "What is the weather?",
+#       "tools": [{
+#         "type": "mcp",
+#         "server_label": "weather",
+#         "server_url": "http://127.0.0.1:8001/mcp",
+#         "allowed_tools": ["get_weather"]
+#       }]
+#     }'
+#
+# Build:
+#   cargo build -p praxis-ai-proxy
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-pipeline]
+
+filter_chains:
+  - name: responses-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+          mode: x-praxis-responses-mode
+
+      - filter: openai_tool_parse
+
+      - filter: openai_mcp_tool_resolve
+        timeout_ms: 5000
+        # Inline outbound chain bound onto the MCP callout. The transport stages
+        # the dial target itself, so these filters run purely on the request
+        # dialed to the MCP server.
+        outbound_chain:
+          name: mcp-outbound
+          filters:
+            - filter: headers
+              request_set:
+                - name: x-mcp-outbound-probe
+                  value: praxis-outbound
+
+      - filter: openai_responses_proxy
+        name: inference
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            headers:
+              x-praxis-ai-format: "openai_responses"
+            cluster: "inference-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a loopback inference backend
+  allow_private_upstreams: true # example dials a loopback MCP server

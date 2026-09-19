@@ -1,0 +1,68 @@
+# Conversations — PostgreSQL with certificate authentication
+#
+# Local /v1/conversations endpoints backed by PostgreSQL over a
+# TLS-verified connection that authenticates with a client certificate
+# instead of a password. This is the compliance-oriented profile: it
+# keeps application-side password cryptography (SCRAM-SHA-256 / MD5) off
+# the connection path entirely.
+#
+# Cryptographic boundary:
+#   TLS transport and client-certificate authentication run inside the
+#   platform TLS library that sqlx links through the `tls-native-tls`
+#   feature (OpenSSL on Linux, Security.framework on macOS).
+#   `require_certificate_authentication` fails closed before serving
+#   traffic if any client-visible password path (a password in
+#   `database_url`, TLS parameters in `database_url`, or the `PGPASSWORD`
+#   environment variable) remains open.
+#
+# Server-side requirement (NOT enforceable by the proxy):
+#   PostgreSQL must use a `cert` rule in `pg_hba.conf` so it never issues
+#   a password challenge, and the client certificate's Common Name must
+#   map to the database role:
+#
+#     # TYPE  DATABASE  USER  ADDRESS      METHOD
+#     hostssl all       all   0.0.0.0/0    cert
+#     hostssl all       all   ::/0         cert
+#
+#   Operators must verify this out of band; see the cryptographic
+#   boundary architecture doc for a complete sample.
+
+listeners:
+  - name: conversations-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [conversations-pipeline]
+
+filter_chains:
+  - name: conversations-pipeline
+    filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
+      - filter: openai_conversations
+        backend: postgres
+        # No password: the client authenticates with a certificate.
+        database_url: "postgres://praxis@db.internal:5432/praxis"
+        # conversations_table defaults to "openai_conversations"
+        # items_table defaults to "openai_conversation_items"
+        allow_private_database_url: true # required for DNS / private DB targets
+        # Certificate-authentication compliance profile.
+        ssl_mode: verify-full
+        ssl_root_cert: /etc/praxis/pki/ca.crt
+        ssl_client_cert: /etc/praxis/pki/client.crt
+        ssl_client_key: /etc/praxis/pki/client.key # unencrypted PKCS#8 (not SEC1), mode 0600
+        require_certificate_authentication: true
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "fallback-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "fallback-backend"
+            endpoints:
+              - "127.0.0.1:8000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

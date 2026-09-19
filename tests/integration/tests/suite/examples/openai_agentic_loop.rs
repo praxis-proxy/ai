@@ -345,6 +345,17 @@ fn round_trip_captures_tool_and_model_requests() {
             .all(|(name, _)| !name.eq_ignore_ascii_case("x-tenant-id")),
         "ambient identity must not cross the request-selected MCP URL boundary"
     );
+    // The example's openai_mcp_dispatch binds an inline outbound_chain whose
+    // `headers` filter stamps X-MCP-Client. tools/call is issued only by dispatch
+    // (tool_resolve issues initialize/tools/list), so its presence here proves the
+    // dispatch outbound_chain is bound and runs on the callout inside the IRR step.
+    assert!(
+        call.headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-mcp-client") && value == "praxis-ai-gateway"),
+        "the dispatch outbound_chain must stamp X-MCP-Client on the tools/call callout: {:?}",
+        call.headers
+    );
     let call_body: serde_json::Value = serde_json::from_str(&call.body).expect("tools/call body should be JSON");
     assert_eq!(call_body["params"]["arguments"]["location"], "SF");
 
@@ -5422,17 +5433,21 @@ fn load_unified_dispatch_config(
         "      - filter: state_owner\n        mode: trusted_headers\n        tenant: {header: x-tenant-id}\n        issuer: {static: urn:test}\n        subject: {static: test-user}\n      - filter: state_owner_headers\n        tenant_header: x-tenant-id\n        subject_header: x-user-id\n",
         1,
     );
-    // Allow loopback MCP resolution and dispatch against the in-test MCP server.
+    // Retarget MCP resolution and dispatch at the in-test loopback MCP server.
+    // Loopback is permitted through the example config's
+    // `insecure_options.allow_private_upstreams` (propagated to each callout's
+    // outbound pipeline), not a per-filter opt-in, so no `allow_loopback` field
+    // is injected.
     let yaml = yaml.replacen(
         "      - filter: openai_mcp_tool_resolve\n        connectors:\n          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
         &format!(
-            "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n        forward_headers: [x-tenant-id]\n        connectors:\n          - id: trusted-mcp\n            server_url: http://127.0.0.1:{mcp_port}/mcp\n"
+            "      - filter: openai_mcp_tool_resolve\n        forward_headers: [x-tenant-id]\n        connectors:\n          - id: trusted-mcp\n            server_url: http://127.0.0.1:{mcp_port}/mcp\n"
         ),
         1,
     );
     let yaml = yaml.replacen(
         "              - filter: openai_mcp_dispatch\n",
-        "              - filter: state_owner_headers\n                tenant_header: x-tenant-id\n                subject_header: x-user-id\n              - filter: openai_mcp_dispatch\n                allow_loopback: true\n                forward_headers: [x-tenant-id]\n",
+        "              - filter: state_owner_headers\n                tenant_header: x-tenant-id\n                subject_header: x-user-id\n              - filter: openai_mcp_dispatch\n                forward_headers: [x-tenant-id]\n",
         1,
     );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse unified dispatch config")
@@ -6815,25 +6830,15 @@ fn load_loopback_mcp_config_inner(
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-        1,
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
-    );
     let yaml = if forward_headers {
         yaml.replacen(
-            "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-            "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n        forward_headers: [x-tenant-id]\n",
+            "      - filter: openai_mcp_tool_resolve\n",
+            "      - filter: openai_mcp_tool_resolve\n        forward_headers: [x-tenant-id]\n",
             1,
         )
         .replacen(
-            "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-            "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n                forward_headers: [x-tenant-id]\n",
+            "              - filter: openai_mcp_dispatch\n",
+            "              - filter: openai_mcp_dispatch\n                forward_headers: [x-tenant-id]\n",
             1,
         )
     } else {
@@ -6866,17 +6871,12 @@ fn load_loopback_mcp_config_with_connectors(
         .collect();
     let yaml = yaml.replacen(
         "      - filter: openai_mcp_tool_resolve\n        connectors:\n          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
-        &format!("      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n        connectors:\n{connector_yaml}"),
+        &format!("      - filter: openai_mcp_tool_resolve\n        connectors:\n{connector_yaml}"),
         1,
     );
     assert!(
         connectors.iter().all(|(id, _)| yaml.contains(&format!("id: {id}"))),
         "expected to rewrite example connector config for {connectors:?}"
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
     );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse loopback MCP connector config")
 }
@@ -6891,16 +6891,6 @@ fn load_loopback_mcp_config_without_rehydrate(proxy_port: u16, model_port: u16) 
         !yaml.contains("      - filter: openai_responses_rehydrate\n"),
         "expected to remove rehydration from the agentic-loop config"
     );
-    let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-        1,
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
-    );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse loopback MCP config without rehydration")
 }
 
@@ -6912,16 +6902,6 @@ fn load_approval_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxi
     let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-        1,
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
-    );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse approval round-trip config")
 }
 
@@ -6934,16 +6914,6 @@ fn load_approval_config_without_store(proxy_port: u16, model_port: u16) -> praxi
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-        1,
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
-    );
     let store_block = "      - filter: openai_response_store\n        backend: sqlite\n        database_url: \"sqlite://responses.db?mode=rwc\"\n        responses_table: openai_responses\n        conversations_table: openai_conversations\n\n";
     let without_store = yaml.replacen(store_block, "", 1);
     assert_ne!(

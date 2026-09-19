@@ -970,6 +970,308 @@ async fn on_response_body_releases_streaming_request_before_eos() {
     );
 }
 
+// -----------------------------------------------------------------------------
+// #937: persist the streaming terminal frame before it is released downstream
+// -----------------------------------------------------------------------------
+
+/// A `ResponseStore` fake that counts `upsert_response` calls and can be armed to
+/// fail every write.
+///
+/// #937 tests use it to prove the store persists the streaming terminal frame
+/// exactly once (before the frame is released) and fails closed when that
+/// persistence errors. The real `SqliteResponseStore` cannot force an upsert
+/// failure or observe call counts.
+struct RecordingResponseStore {
+    upserts: std::sync::atomic::AtomicUsize,
+    fail: bool,
+    records: std::sync::Mutex<std::collections::HashMap<String, ResponseRecord>>,
+}
+
+impl RecordingResponseStore {
+    fn new(fail: bool) -> Self {
+        Self {
+            upserts: std::sync::atomic::AtomicUsize::new(0),
+            fail,
+            records: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn upsert_count(&self) -> usize {
+        self.upserts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::store::ResponseStore for RecordingResponseStore {
+    async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), crate::store::StoreError> {
+        self.upserts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail {
+            return Err(crate::store::StoreError::Unavailable(
+                "recording store: forced failure".to_owned(),
+            ));
+        }
+        self.records
+            .lock()
+            .expect("records mutex should not be poisoned")
+            .insert(record.id.clone(), record.clone());
+        Ok(())
+    }
+
+    async fn get_response(
+        &self,
+        owner: &crate::StateOwner,
+        id: &str,
+    ) -> Result<Option<ResponseRecord>, crate::store::StoreError> {
+        Ok(self
+            .records
+            .lock()
+            .expect("records mutex should not be poisoned")
+            .get(id)
+            .filter(|record| record.owner == *owner)
+            .cloned())
+    }
+
+    async fn delete_response(&self, _owner: &crate::StateOwner, _id: &str) -> Result<bool, crate::store::StoreError> {
+        Ok(false)
+    }
+
+    async fn get_conversation(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<Option<crate::store::ConversationRecord>, crate::store::StoreError> {
+        Ok(None)
+    }
+
+    async fn record_pending_approvals(
+        &self,
+        _owner: &crate::StateOwner,
+        _response_id: &str,
+        _records: &[crate::store::PendingApprovalRecord],
+        _created_at: i64,
+    ) -> Result<(), crate::store::StoreError> {
+        Ok(())
+    }
+
+    async fn get_pending_approvals(
+        &self,
+        _owner: &crate::StateOwner,
+        _response_id: &str,
+        _approval_ids: &[&str],
+    ) -> Result<Vec<crate::store::PendingApprovalRecord>, crate::store::StoreError> {
+        Ok(Vec::new())
+    }
+
+    async fn consume_approvals(
+        &self,
+        _owner: &crate::StateOwner,
+        _response_id: &str,
+        _approval_ids: &[&str],
+        _consumed_at: i64,
+    ) -> Result<Option<usize>, crate::store::StoreError> {
+        Ok(None)
+    }
+}
+
+/// Install a [`RecordingResponseStore`] before the request phase so
+/// `get_or_init_store` keeps it instead of building a real backend.
+fn install_recording_store(filter: &ResponseStoreFilter, store: std::sync::Arc<RecordingResponseStore>) {
+    let dyn_store: std::sync::Arc<dyn crate::store::ResponseStore> = store;
+    assert!(
+        filter.store.set(Some(dyn_store)).is_ok(),
+        "store OnceCell should be empty before the request phase"
+    );
+}
+
+/// Build a streaming request context whose accumulated state carries a canonical
+/// `response_object`, optionally already marked as having emitted its terminal
+/// `response.completed` frame (`terminal_emitted`).
+///
+/// Uses [`make_owned_filter_context`], which installs the default
+/// [`test_owner`] before the request phase so `capture_persistence_owner`
+/// records the immutable owner (#1197); without it streaming persistence would
+/// fail closed with a `Reject` instead of writing the record.
+///
+/// [`make_owned_filter_context`]: crate::test_utils::make_owned_filter_context
+/// [`test_owner`]: crate::test_utils::test_owner
+async fn armed_streaming_ctx<'a>(
+    filter: &ResponseStoreFilter,
+    req: &'a praxis_filter::Request,
+    response_id: &str,
+    terminal_emitted: bool,
+) -> HttpFilterContext<'a> {
+    let mut ctx = crate::test_utils::make_owned_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    run_request_phase(filter, &mut ctx).await;
+
+    ctx.extensions.insert(ResponsesState {
+        response_object: json!({
+            "id": response_id,
+            "created_at": 1_719_900_100_i64,
+            "model": "gpt-4.1",
+            "status": "completed",
+            "output": [{"type": "message", "role": "assistant", "content": "Done"}]
+        }),
+        persisted_messages: vec![json!({"role": "user", "content": "Hi"})],
+        logical_stream_terminal_emitted: terminal_emitted,
+        ..Default::default()
+    });
+    ctx
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_terminal_frame_persists_before_eos_release() {
+    let filter = make_filter();
+    let store = std::sync::Arc::new(RecordingResponseStore::new(false));
+    install_recording_store(&filter, std::sync::Arc::clone(&store));
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, "resp_937_terminal", true).await;
+
+    // The deferred terminal `response.completed` frame arrives as a
+    // non-end-of-stream chunk. It must be persisted BEFORE it is released.
+    let mut terminal = Some(Bytes::from_static(
+        b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+    ));
+    let action = filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "the terminal frame chunk is still released, only after persistence"
+    );
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "the streaming response must be persisted at the terminal frame, before release"
+    );
+    assert!(
+        store
+            .get_response(&crate::test_utils::test_owner("default"), "resp_937_terminal")
+            .await
+            .unwrap()
+            .is_some(),
+        "the record must be durable before the client can observe response.completed"
+    );
+
+    // The subsequent empty end-of-stream callback must not persist again.
+    let mut eos_body: Option<Bytes> = None;
+    let eos_action = filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap();
+    assert!(
+        matches!(eos_action, FilterAction::Continue),
+        "end-of-stream after a persisted terminal frame should continue"
+    );
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "end-of-stream must not trigger a redundant second persist"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_terminal_frame_persist_failure_fails_closed() {
+    let filter = make_filter();
+    let store = std::sync::Arc::new(RecordingResponseStore::new(true));
+    install_recording_store(&filter, std::sync::Arc::clone(&store));
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, "resp_937_failclosed", true).await;
+
+    let mut terminal = Some(Bytes::from_static(
+        b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+    ));
+    let result = filter.on_response_body(&mut ctx, &mut terminal, false);
+    assert!(
+        result.is_err(),
+        "a persistence failure on the terminal frame must fail closed so the client never observes response.completed"
+    );
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "the failing upsert must have been attempted for the terminal frame"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_terminal_frame_propagates_persist_rejection() {
+    // #937 (latest-main integration): `persist_from_streaming_state` returns
+    // `Ok(FilterAction::Reject(_))` when the immutable owner/request state was
+    // never captured (#1197). The deferred-terminal branch must propagate that
+    // rejection instead of unconditionally releasing `response.completed`, so a
+    // client never observes completion for a record that was refused persistence.
+    let filter = make_filter();
+    let store = std::sync::Arc::new(RecordingResponseStore::new(false));
+    install_recording_store(&filter, std::sync::Arc::clone(&store));
+
+    // Deliberately skip the request phase so no `ResponseStoreRequestState`
+    // (owner + input) is captured; streaming persistence then fails closed.
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.extensions.insert(ResponsesState {
+        response_object: json!({
+            "id": "resp_937_reject",
+            "created_at": 1_719_900_100_i64,
+            "model": "gpt-4.1",
+            "status": "completed",
+            "output": [{"type": "message", "role": "assistant", "content": "Done"}]
+        }),
+        logical_stream_terminal_emitted: true,
+        ..Default::default()
+    });
+
+    let mut terminal = Some(Bytes::from_static(
+        b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+    ));
+    let rejection = expect_reject(filter.on_response_body(&mut ctx, &mut terminal, false).unwrap());
+    assert_eq!(
+        rejection.status, 500,
+        "a fail-closed persist rejection must propagate, not release response.completed"
+    );
+    assert_has_json_content_type(&rejection);
+    assert_eq!(
+        store.upsert_count(),
+        0,
+        "the missing-owner guard rejects before any upsert is attempted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_without_terminal_signal_persists_only_at_eos() {
+    let filter = make_filter();
+    let store = std::sync::Arc::new(RecordingResponseStore::new(false));
+    install_recording_store(&filter, std::sync::Arc::clone(&store));
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    // No terminal frame observed through this filter (e.g. a plain single-round
+    // stream): the signal stays unset and the EOS fallback still persists.
+    let mut ctx = armed_streaming_ctx(&filter, &req, "resp_937_fallback", false).await;
+
+    let mut chunk = Some(Bytes::from_static(b"event: response.output_text.delta\n\n"));
+    let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+    assert!(
+        matches!(action, FilterAction::Release),
+        "content chunks without a terminal signal release without persisting"
+    );
+    assert_eq!(
+        store.upsert_count(),
+        0,
+        "no persistence should occur before EOS without a terminal signal"
+    );
+
+    let mut eos_body: Option<Bytes> = None;
+    let eos_action = filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap();
+    assert!(
+        matches!(eos_action, FilterAction::Continue),
+        "end-of-stream should persist from accumulated state and continue"
+    );
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "the EOS fallback persists exactly once for non-deferred streams"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_buffers_persistable_non_end_of_stream() {
     let filter = make_filter();
@@ -2931,6 +3233,42 @@ ssl_root_cert: /path/to/ca.pem
 }
 
 #[test]
+fn sqlite_config_rejects_ssl_client_cert() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+ssl_client_cert: /path/to/client.pem
+ssl_client_key: /path/to/client.key
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_err(), "ssl_client_cert should be rejected for sqlite backend");
+}
+
+#[test]
+fn sqlite_config_rejects_require_certificate_authentication() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: responses
+conversations_table: conversations
+require_certificate_authentication: true
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "require_certificate_authentication should be rejected for sqlite backend"
+    );
+}
+
+#[test]
 fn sqlite_config_rejects_allow_private_database_url() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
@@ -2946,6 +3284,145 @@ allow_private_database_url: true
     assert!(
         result.is_err(),
         "allow_private_database_url should be rejected for sqlite backend"
+    );
+}
+
+#[test]
+fn postgres_config_accepts_client_cert_and_key() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: verify-full
+ssl_root_cert: /etc/pki/ca.pem
+ssl_client_cert: /etc/pki/client.pem
+ssl_client_key: /etc/pki/client.key
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_ok(), "client cert + key with verify-full should parse");
+}
+
+#[test]
+fn postgres_config_rejects_client_cert_without_key() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: verify-full
+ssl_client_cert: /etc/pki/client.pem
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_err(), "client cert without key should be rejected");
+}
+
+#[test]
+fn postgres_config_rejects_client_cert_with_unverified_mode() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: require
+ssl_client_cert: /etc/pki/client.pem
+ssl_client_key: /etc/pki/client.key
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "client cert with unverified ssl_mode should be rejected"
+    );
+}
+
+#[test]
+fn postgres_config_accepts_compliance_profile() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: verify-full
+ssl_root_cert: /etc/pki/ca.pem
+ssl_client_cert: /etc/pki/client.pem
+ssl_client_key: /etc/pki/client.key
+require_certificate_authentication: true
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_ok(), "well-formed compliance profile should parse");
+}
+
+#[test]
+fn postgres_config_compliance_rejects_password_in_url() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user:secret@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: verify-full
+ssl_client_cert: /etc/pki/client.pem
+ssl_client_key: /etc/pki/client.key
+require_certificate_authentication: true
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "compliance profile must reject a password in database_url"
+    );
+}
+
+#[test]
+fn postgres_config_compliance_requires_verify_full() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: verify-ca
+ssl_root_cert: /etc/pki/ca.pem
+ssl_client_cert: /etc/pki/client.pem
+ssl_client_key: /etc/pki/client.key
+require_certificate_authentication: true
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(result.is_err(), "compliance profile must require ssl_mode verify-full");
+}
+
+#[test]
+fn postgres_config_compliance_requires_client_cert() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+backend: postgres
+database_url: "postgres://cert-user@1.2.3.4:5432/praxis"
+responses_table: responses
+conversations_table: conversations
+ssl_mode: verify-full
+require_certificate_authentication: true
+"#,
+    )
+    .unwrap();
+    let result = ResponseStoreFilter::from_config(&yaml);
+    assert!(
+        result.is_err(),
+        "compliance profile must require a client certificate and key"
     );
 }
 

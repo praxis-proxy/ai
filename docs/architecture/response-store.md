@@ -133,8 +133,12 @@ Connection-pooled via `sqlx::PgPool`. Upsert uses
 `ON CONFLICT (tenant_id, id) DO UPDATE SET ...` for
 idempotent persistence. Supports configurable
 `SslMode` (`disable`, `prefer`, `require`,
-`verify-ca`, `verify-full`) and custom root CA
-certificates.
+`verify-ca`, `verify-full`), custom root CA
+certificates, and client-certificate (mutual TLS)
+authentication. See the [PostgreSQL cryptographic
+boundary](postgres-cryptographic-boundary.md) for the
+certificate-authentication compliance profile that
+keeps password cryptography off the connection path.
 
 SSRF protections reject DNS hostnames, localhost,
 loopback, private, link-local, and unspecified
@@ -180,4 +184,5 @@ pass-through traffic is not held.
 ## Related
 
 - [AI Inference](ai-inference.md)
+- [PostgreSQL cryptographic boundary](postgres-cryptographic-boundary.md)
 - [Features](../features.md)

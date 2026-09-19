@@ -1661,6 +1661,12 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     let sequence_number = state.logical_stream_sequence;
     state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
 
+    // #937: deliberately do NOT set `logical_stream_terminal_emitted` here.
+    // Unlike `emit_deferred_terminal`, this local completion is returned to the
+    // store as a buffered `TerminalResponse` at end-of-stream (see
+    // `finish_deferred_local_response`), where the store already persists before
+    // the body is written. Marking the flag would make the store skip that
+    // end-of-stream persist and lose the record (#937 review regression).
     output.extend_from_slice(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":");
     serde_json::to_writer(&mut output, &state.response_object).ok()?;
     output.extend_from_slice(b",\"sequence_number\":");
@@ -1798,6 +1804,13 @@ fn emit_deferred_terminal(
     // the persisted store source cannot disagree with the streamed frame (#1150).
     let restore_previous_response_id = state.previous_response_id_stream_restore_armed;
     let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id);
+    // #937: `response_object` is now canonical and the client-visible terminal
+    // frame is appended below as a deferred, non-end-of-stream chunk. Signal the
+    // pre-IRR `openai_response_store` to persist BEFORE it releases that chunk so
+    // completion is never observed before the record is durable. Only this
+    // deferred path sets the flag; a buffered local completion
+    // (`encode_local_completion`) persists at end-of-stream and must not.
+    state.logical_stream_terminal_emitted = true;
     if let Some(response) = terminal.payload.get_mut("response").and_then(Value::as_object_mut) {
         response.insert("output".to_owned(), Value::Array(accumulated_output));
         if !usage.is_null() {

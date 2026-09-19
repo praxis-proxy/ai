@@ -9,12 +9,7 @@ use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
 #[cfg(feature = "store-postgres")]
-use crate::store::postgres_url::{
-    self, has_postgres_url_ssl_root_cert, is_verified_postgres_sslmode, postgres_url_sslmode,
-    validate_postgres_url_tls_file_params,
-};
-#[cfg(feature = "store-postgres")]
-use crate::store::validate_postgres_table_set_identifiers;
+use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_set_identifiers};
 use crate::store::{PoolConfig, SslMode, validate_table_identifier};
 
 /// Filter name used in SSRF validation error messages.
@@ -75,6 +70,46 @@ pub(crate) struct ConversationsConfig {
     #[serde(default)]
     pub ssl_root_cert: Option<SecretString>,
 
+    /// Path to a PEM-encoded client certificate for mutual TLS with
+    /// `PostgreSQL`.
+    ///
+    /// Only valid when `backend` is `postgres` and the effective SSL
+    /// mode is `verify-ca` or `verify-full`. Must be configured together
+    /// with `ssl_client_key`. Enables certificate authentication so the
+    /// server does not challenge for a password.
+    #[serde(default)]
+    pub ssl_client_cert: Option<SecretString>,
+
+    /// Path to the PEM-encoded private key for `ssl_client_cert`.
+    ///
+    /// Only valid when `backend` is `postgres`. Must be an unencrypted
+    /// PKCS#8 key (mode `0600`) and configured together with
+    /// `ssl_client_cert`. The native-tls backend (`OpenSSL` on Linux,
+    /// Security.framework on macOS) accepts PKCS#8 only; convert a
+    /// SEC1/PKCS#1 key with `openssl pkcs8 -topk8 -nocrypt`.
+    #[serde(default)]
+    pub ssl_client_key: Option<SecretString>,
+
+    /// Enforce the certificate-authentication compliance profile for
+    /// `PostgreSQL`.
+    ///
+    /// When enabled, the filter fails to start unless `ssl_mode` is
+    /// `verify-full`, both `ssl_client_cert` and `ssl_client_key` are
+    /// set, and no password reaches the connection (rejecting a password
+    /// in `database_url`, TLS parameters in `database_url`, and the
+    /// `PGPASSWORD` environment variable). It also rejects non-addressing
+    /// connection parameters in `database_url` (`application_name`,
+    /// `options`/`options[...]`, `statement-cache-capacity`), which the
+    /// certificate-authentication rebuild would silently drop; set such
+    /// defaults on the database role instead (`ALTER ROLE ... SET ...`).
+    /// The `ssl_client_key` file must also be owner-only (mode `0600`,
+    /// enforced on Unix). This keeps application-side password
+    /// cryptography off the connection path. The `PostgreSQL` server must
+    /// independently use a `cert` rule in `pg_hba.conf`; the proxy cannot
+    /// enforce that server-side requirement.
+    #[serde(default)]
+    pub require_certificate_authentication: bool,
+
     /// Allow `PostgreSQL` URLs that target local-sensitive addresses.
     ///
     /// By default, DNS names, localhost, loopback, private,
@@ -111,6 +146,18 @@ impl ConversationsConfig {
     /// exists but remains empty.
     pub fn responses_table(&self) -> String {
         format!("{}_unused_responses", self.conversations_table)
+    }
+
+    /// Borrow the `PostgreSQL` TLS settings as a [`PgTlsConfig`].
+    #[cfg(feature = "store-postgres")]
+    pub(crate) fn tls_config(&self) -> PgTlsConfig<'_> {
+        PgTlsConfig {
+            ssl_mode: self.ssl_mode,
+            ssl_root_cert: self.ssl_root_cert.as_ref().map(secrecy::ExposeSecret::expose_secret),
+            ssl_client_cert: self.ssl_client_cert.as_ref().map(secrecy::ExposeSecret::expose_secret),
+            ssl_client_key: self.ssl_client_key.as_ref().map(secrecy::ExposeSecret::expose_secret),
+            require_certificate_authentication: self.require_certificate_authentication,
+        }
     }
 }
 
@@ -219,41 +266,7 @@ pub(crate) fn revalidate_postgres_host(cfg: &ConversationsConfig) -> Result<(), 
 /// Validate `PostgreSQL` TLS options.
 #[cfg(feature = "store-postgres")]
 fn validate_postgres_ssl_config(cfg: &ConversationsConfig, database_url: &str) -> Result<(), FilterError> {
-    validate_postgres_url_tls_file_params(FILTER_NAME, database_url)?;
-
-    if let Some(root_cert) = &cfg.ssl_root_cert {
-        let root_cert = root_cert.expose_secret();
-        if has_dot_dot_traversal(root_cert) {
-            return Err(format!("{FILTER_NAME}: ssl_root_cert must not contain '..' path traversal").into());
-        }
-    }
-
-    if has_postgres_ssl_root_cert(cfg, database_url) && !has_verified_postgres_ssl_mode(cfg, database_url) {
-        return Err(format!("{FILTER_NAME}: 'ssl_root_cert' requires ssl_mode 'verify-ca' or 'verify-full'").into());
-    }
-    Ok(())
-}
-
-/// Return whether any configured `PostgreSQL` root CA path is present.
-#[cfg(feature = "store-postgres")]
-fn has_postgres_ssl_root_cert(cfg: &ConversationsConfig, database_url: &str) -> bool {
-    cfg.ssl_root_cert.is_some() || has_postgres_url_ssl_root_cert(database_url)
-}
-
-/// Return whether the effective `PostgreSQL` SSL mode verifies certificates.
-///
-/// When no explicit `ssl_mode` is set, the runtime default is
-/// [`SslMode::VerifyFull`], so the `None` case is considered verified
-/// unless the URL carries a non-verifying `sslmode`.
-#[cfg(feature = "store-postgres")]
-fn has_verified_postgres_ssl_mode(cfg: &ConversationsConfig, database_url: &str) -> bool {
-    match cfg.ssl_mode {
-        Some(SslMode::VerifyCa | SslMode::VerifyFull) => true,
-        Some(SslMode::Disable | SslMode::Prefer | SslMode::Require) => false,
-        None => postgres_url_sslmode(database_url)
-            .as_deref()
-            .is_none_or(is_verified_postgres_sslmode),
-    }
+    cfg.tls_config().validate(FILTER_NAME, database_url)
 }
 
 /// Reject `PostgreSQL`-specific fields when backend is SQLite.
@@ -263,6 +276,18 @@ fn reject_postgres_fields(cfg: &ConversationsConfig) -> Result<(), FilterError> 
     }
     if cfg.ssl_root_cert.is_some() {
         return Err(format!("{FILTER_NAME}: 'ssl_root_cert' is only valid with the 'postgres' backend").into());
+    }
+    if cfg.ssl_client_cert.is_some() {
+        return Err(format!("{FILTER_NAME}: 'ssl_client_cert' is only valid with the 'postgres' backend").into());
+    }
+    if cfg.ssl_client_key.is_some() {
+        return Err(format!("{FILTER_NAME}: 'ssl_client_key' is only valid with the 'postgres' backend").into());
+    }
+    if cfg.require_certificate_authentication {
+        return Err(format!(
+            "{FILTER_NAME}: 'require_certificate_authentication' is only valid with the 'postgres' backend"
+        )
+        .into());
     }
     if cfg.allow_private_database_url {
         return Err(

@@ -55,13 +55,21 @@ pub(crate) struct FileResolveConfig {
     /// Client-controlled `file_url` downloads never traverse this
     /// chain; they stay on the credential-free hardened resolver.
     ///
-    /// May be an inline chain (`name` + `filters`) or a reference to a
-    /// top-level named chain. The field is optional at the struct level
-    /// so programmatic constructors can omit it, but the filter
-    /// registration fails the build when the chain is missing or cannot
-    /// be bound.
-    #[serde(default)]
-    pub outbound_chain: Option<ChainRef>,
+    /// Optional. Configured `file_id` callouts always run through the
+    /// bound outbound pipeline; this chain only adds filters along the
+    /// way. When omitted it defaults to an empty inline chain (pure
+    /// passthrough) via `default_outbound_chain`, so registration never
+    /// fails for a missing chain — matching `openai_file_search_callout`.
+    /// Provide it only to attach cross-cutting concerns such as
+    /// credential injection, tracing, or request tagging.
+    ///
+    /// May be defined inline (`name` + `filters`) or reference a
+    /// top-level named chain; a named reference resolves because this
+    /// filter runs at the top pipeline level, not nested inside an
+    /// `iterative_request_router` step. Registration still fails the
+    /// build when a provided chain cannot be bound.
+    #[serde(default = "default_outbound_chain")]
+    pub outbound_chain: ChainRef,
 
     /// Allow Files API callouts from the `StreamBuffer` pre-read
     /// phase, before header-phase security filters execute.
@@ -133,6 +141,20 @@ pub(crate) struct FileResolveConfig {
     /// Cloud metadata, unspecified, and multicast remain blocked.
     #[serde(default)]
     pub allowed_file_url_origins: Vec<String>,
+}
+
+/// Default `outbound_chain` when the field is omitted: an empty inline chain.
+///
+/// Configured `file_id` callouts always run through the bound outbound
+/// pipeline; an empty chain simply applies no extra filters (pure passthrough).
+/// Operators supply a chain only to attach cross-cutting concerns such as
+/// credential injection, tracing, or request tagging. The name is a label only
+/// — inline chains are not looked up, so it never needs to be globally unique.
+fn default_outbound_chain() -> ChainRef {
+    ChainRef::Inline {
+        name: "openai_file_resolve_outbound".to_owned(),
+        filters: Vec::new(),
+    }
 }
 
 /// Default max rewritten body bytes (64 MiB).
@@ -270,6 +292,19 @@ mod tests {
 files_api_url: "http://files-api:8321"
 allow_pre_security_callout: true
 "#;
+
+    #[test]
+    fn config_defaults_omitted_outbound_chain_to_empty_inline() {
+        // `outbound_chain` is optional: omitting it yields an empty inline chain
+        // (pure passthrough) rather than a config error, matching
+        // `openai_file_search_callout`. Registration binds this empty chain, so a
+        // missing `outbound_chain` never fails the build.
+        let cfg: FileResolveConfig = serde_yaml::from_str(MINIMAL_YAML).unwrap();
+        assert!(
+            matches!(&cfg.outbound_chain, ChainRef::Inline { filters, .. } if filters.is_empty()),
+            "omitted outbound_chain should default to an empty inline chain"
+        );
+    }
 
     #[test]
     fn minimal_config_parses() {
@@ -440,7 +475,7 @@ timeout_ms: 300001"#;
     #[test]
     fn valid_config_passes() {
         let cfg = FileResolveConfig {
-            outbound_chain: None,
+            outbound_chain: default_outbound_chain(),
             allow_pre_security_callout: true,
             files_api_url: "http://files-api:8321".to_owned(),
             forward_headers: Vec::new(),

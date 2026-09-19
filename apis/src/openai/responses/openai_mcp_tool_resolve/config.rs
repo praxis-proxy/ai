@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use praxis_core::config::ChainRef;
 use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 use url::Url;
@@ -83,12 +84,21 @@ pub(crate) struct McpToolResolveConfig {
     #[serde(default = "default_max_tools")]
     pub max_tools: usize,
 
-    /// Allow connections to loopback addresses (`127.0.0.0/8`,
-    /// `::1`, `localhost`). Disabled by default for SSRF
-    /// protection; enable for development environments where MCP
-    /// servers run locally.
+    /// Outbound filter chain the MCP `tools/list` callout runs through.
+    ///
+    /// The chain is bound at build time and carries only operator-configured
+    /// cross-cutting filters, which observe and can act on the outbound MCP
+    /// request. The SSRF-validated dial target is staged by the transport, so no
+    /// upstream-selecting filter is prepended. Both an inline chain and a named
+    /// reference (resolved against the top-level `filter_chains`) are accepted,
+    /// because this filter binds at top level. When omitted, the callout runs
+    /// through an empty chain and dials the staged target directly.
+    ///
+    /// Whether loopback/private MCP destinations are permitted is governed by
+    /// the operator's global insecure posture (which pipeline finalization
+    /// applies to this bound chain), not a per-filter flag.
     #[serde(default)]
-    pub allow_loopback: bool,
+    pub outbound_chain: Option<ChainRef>,
 
     /// Named connectors mapping connector IDs to server URLs.
     #[serde(default)]

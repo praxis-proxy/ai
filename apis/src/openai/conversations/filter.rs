@@ -171,17 +171,13 @@ impl OpenaiConversationsFilter {
     async fn build_postgres_store(&self, responses_table: &str) -> Result<Arc<dyn ConversationItemStore>, StoreError> {
         revalidate_postgres_host(&self.config)
             .map_err(|e| StoreError::Unavailable(format!("postgres host validation failed before connect: {e}")))?;
-        let ssl_root_cert = self.config.ssl_root_cert.as_ref().map(|s| {
-            let secret: &str = s.expose_secret();
-            secret
-        });
+        let tls = self.config.tls_config();
         PostgresResponseStore::new(
             self.config.database_url.expose_secret(),
             responses_table,
             &self.config.conversations_table,
             Some(&self.config.items_table),
-            self.config.ssl_mode,
-            ssl_root_cert,
+            &tls,
             self.config.pool.as_ref(),
         )
         .await

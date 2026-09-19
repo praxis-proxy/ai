@@ -14,10 +14,19 @@
 
 use std::ops::Deref;
 
-use crate::openai::operation::{
-    OpenAiApiFamily, OpenAiHandlingMode, OpenAiHttpMethod, OpenAiOperationSpec, OpenAiRequestBody, OpenAiTransport,
-    OperationEntry, match_operation,
+use crate::{
+    openai::operation::OpenAiOperationSpec,
+    operation::{
+        ApplicationProtocol, HandlingMode, HttpMethod, OperationEntry, OperationSpec, RequestBody, Transport,
+        match_operation,
+    },
 };
+
+/// Application protocol these operations belong to.
+///
+/// Declared beside the registry that owns it, so registering a protocol
+/// never edits a shared list.
+const APPLICATION_PROTOCOL: ApplicationProtocol = ApplicationProtocol::new("openai_chat_completions");
 
 /// Static metadata for one Chat Completions operation.
 #[derive(Clone, Copy)]
@@ -37,18 +46,18 @@ impl Deref for ChatCompletionsOperationSpec {
 }
 
 impl OperationEntry for ChatCompletionsOperationSpec {
-    fn spec(&self) -> &OpenAiOperationSpec {
-        &self.definition
+    fn spec(&self) -> &OperationSpec {
+        &self.definition.runtime
     }
 }
 
 /// Convert a registry body declaration into a runtime request-body shape.
 macro_rules! request_body_shape {
     ([none]) => {
-        OpenAiRequestBody::None
+        RequestBody::None
     };
     ([required json]) => {
-        OpenAiRequestBody::Json { required: true }
+        RequestBody::Json { required: true }
     };
 }
 
@@ -81,14 +90,16 @@ macro_rules! chat_completions_operations {
                 ChatCompletionsOperationSpec {
                     operation: ChatCompletionsOperation::$operation,
                     definition: OpenAiOperationSpec {
-                        family: OpenAiApiFamily::ChatCompletions,
-                        operation_id: $operation_id,
-                        method: OpenAiHttpMethod::$method,
-                        transport: OpenAiTransport::$transport,
+                        runtime: OperationSpec {
+                            application_protocol: APPLICATION_PROTOCOL,
+                            operation_id: $operation_id,
+                            method: HttpMethod::$method,
+                            transport: Transport::$transport,
+                            runtime_path: concat!("/v1", $path),
+                            mode: HandlingMode::$mode,
+                            request_body: request_body_shape!($body),
+                        },
                         spec_path: $path,
-                        runtime_path: concat!("/v1", $path),
-                        mode: OpenAiHandlingMode::$mode,
-                        request_body: request_body_shape!($body),
                         owned_contract: None,
                     },
                 },
@@ -165,7 +176,7 @@ pub const fn operation_specs() -> &'static [ChatCompletionsOperationSpec] {
 ///
 /// Chat Completions is reached over plain HTTP only.
 pub(crate) fn match_route(method: &str, path: &str) -> Option<MatchedChatCompletionsRoute> {
-    match_operation(OPERATION_SPECS, method, path, OpenAiTransport::Http)
+    match_operation(OPERATION_SPECS, method, path, Transport::Http)
         .map(|matched| MatchedChatCompletionsRoute { spec: matched.spec })
 }
 
@@ -181,13 +192,13 @@ mod tests {
     fn registry_keys_and_operation_ids_are_unique() {
         let keys = OPERATION_SPECS
             .iter()
-            .map(|spec| (spec.method, spec.transport.as_str(), spec.spec_path))
+            .map(|spec| (spec.method(), spec.transport().as_str(), spec.spec_path))
             .collect::<BTreeSet<_>>();
         assert_eq!(keys.len(), OPERATION_SPECS.len(), "duplicate method/transport/path key");
 
         let ids = OPERATION_SPECS
             .iter()
-            .map(|spec| spec.operation_id)
+            .map(|spec| spec.operation_id())
             .collect::<BTreeSet<_>>();
         assert_eq!(ids.len(), OPERATION_SPECS.len(), "duplicate operation ID");
     }
@@ -195,13 +206,13 @@ mod tests {
     #[test]
     fn every_registered_operation_resolves_from_its_own_template() {
         for spec in OPERATION_SPECS {
-            let path = spec.runtime_path.replace("{completion_id}", "chatcmpl_test");
-            let matched = match_route(spec.method.as_str(), &path).unwrap();
+            let path = spec.runtime_path().replace("{completion_id}", "chatcmpl_test");
+            let matched = match_route(spec.method().as_str(), &path).unwrap();
             assert_eq!(
                 matched.spec.operation,
                 spec.operation,
                 "{} {path} resolved to the wrong operation",
-                spec.method.as_str()
+                spec.method().as_str()
             );
         }
     }
@@ -212,7 +223,7 @@ mod tests {
             OPERATION_SPECS,
             "GET",
             "/v1/chat/completions/chatcmpl_abc123",
-            OpenAiTransport::Http,
+            Transport::Http,
         )
         .unwrap();
         assert_eq!(matched.spec.operation, ChatCompletionsOperation::GetChatCompletion);
@@ -222,7 +233,7 @@ mod tests {
             OPERATION_SPECS,
             "GET",
             "/v1/chat/completions/chatcmpl_abc123/messages",
-            OpenAiTransport::Http,
+            Transport::Http,
         )
         .unwrap();
         assert_eq!(
@@ -279,12 +290,13 @@ mod tests {
         for spec in OPERATION_SPECS {
             let expected = match spec.operation {
                 ChatCompletionsOperation::CreateChatCompletion | ChatCompletionsOperation::UpdateChatCompletion => {
-                    OpenAiRequestBody::Json { required: true }
+                    RequestBody::Json { required: true }
                 },
-                _ => OpenAiRequestBody::None,
+                _ => RequestBody::None,
             };
             assert_eq!(
-                spec.request_body, expected,
+                spec.request_body(),
+                expected,
                 "{:?} reported the wrong body shape",
                 spec.operation
             );
@@ -296,7 +308,7 @@ mod tests {
         assert!(
             OPERATION_SPECS
                 .iter()
-                .all(|spec| spec.mode == OpenAiHandlingMode::Passthrough && spec.owned_contract().is_none()),
+                .all(|spec| spec.mode() == HandlingMode::Passthrough && spec.owned_contract().is_none()),
             "Praxis proxies Chat Completions without inspecting or owning the contract"
         );
     }

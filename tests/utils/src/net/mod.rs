@@ -30,7 +30,7 @@ pub use http_client::{
     parse_status,
 };
 pub use port::{PortGuard, bind_unique_port, free_port, free_port_guard, free_port_v6, ipv6_available};
-pub use postgres::{PostgresGuard, start_postgres};
+pub use postgres::{PostgresCertAuthGuard, PostgresGuard, start_postgres, start_postgres_cert_auth};
 pub use simulator::{SimulatorGuard, start_simulator, start_simulator_with_model};
 pub use tls::{
     ClientCert, TestCertificates, https_get, https_send, start_mtls_backend, start_tcp_echo_backend,
