@@ -1869,6 +1869,23 @@ class TestOpenAIResponsesVLLM:
             "type": "invalid_request_error",
         }
 
+    def test_background_mode_is_rejected_before_inference(self, openai_client):
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Run this later.",
+                background=True,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400
+        assert error.body == {
+            "code": "invalid_request_error",
+            "message": "background mode is not supported",
+            "param": None,
+            "type": "invalid_request_error",
+        }
+
     @pytest.mark.critical_vllm
     @requires_real_inference
     def test_doc_extract_inline_file_to(self, openai_client):

@@ -290,8 +290,9 @@ pub(crate) enum McpApprovalState {
     clippy::struct_excessive_bools,
     reason = "request-scoped state bag; the request, transport, and deferred \
               lifecycle bool flags (history_rehydrated, parallel_tool_calls, \
-              store_persist_armed, previous_response_id_stream_restore_armed) are \
-              independent request facts, not a state machine or refactorable enum"
+              store_persist_armed, previous_response_id_stream_restore_armed, \
+              logical_stream_terminal_emitted) are independent request facts, \
+              not a state machine or refactorable enum"
 )]
 pub(crate) struct ResponsesState {
     /// Maps file IDs to filenames for citation annotation extraction.
@@ -322,6 +323,29 @@ pub(crate) struct ResponsesState {
 
     /// Next downstream sequence number for a logical Responses stream.
     pub logical_stream_sequence: u64,
+
+    /// Whether the client-visible terminal `response.completed` event has been
+    /// emitted as a *deferred, non-end-of-stream* chunk for this logical stream.
+    ///
+    /// #937: `openai_stream_events` defers the terminal frame until the inner
+    /// IRR stream ends, then surfaces it to the pre-IRR `openai_response_store`
+    /// as an ordinary non-end-of-stream chunk — ahead of the empty
+    /// end-of-stream callback where streaming persistence historically ran. Left
+    /// uncoordinated, a client could observe `response.completed` for a record a
+    /// later GET, DELETE, or `previous_response_id` continuation cannot find.
+    ///
+    /// [`emit_deferred_terminal`] sets this the moment it canonicalizes
+    /// [`Self::response_object`] and appends that non-end-of-stream terminal
+    /// frame, so the store persists synchronously BEFORE releasing the chunk
+    /// (failing closed on error) and then skips the redundant end-of-stream
+    /// persist. It is deliberately **not** set for a request-phase local
+    /// completion (`encode_local_completion`): that terminal is delivered as a
+    /// buffered `TerminalResponse` at end-of-stream, where the store already
+    /// persists before the body is written, so marking it here would suppress
+    /// that end-of-stream persist and lose the record.
+    ///
+    /// [`emit_deferred_terminal`]: crate::openai::responses::stream_events
+    pub logical_stream_terminal_emitted: bool,
 
     /// Index where the current model round begins in `accumulated_output`.
     ///
@@ -774,6 +798,7 @@ impl Default for ResponsesState {
             include: Vec::new(),
             logical_stream_response_id: None,
             logical_stream_sequence: 0,
+            logical_stream_terminal_emitted: false,
             current_round_output_start: None,
             history_rehydrated: false,
             input: Vec::new(),
@@ -1604,6 +1629,10 @@ mod tests {
         assert_eq!(state.iteration, 0);
         assert!(state.max_tool_calls.is_none());
         assert!(state.client_tool_lowering.is_empty());
+        assert!(
+            !state.logical_stream_terminal_emitted,
+            "logical stream terminal must start unemitted"
+        );
         assert!(state.parallel_tool_calls);
         assert!(state.persisted_messages.is_empty());
         assert!(!state.store_persist_armed);

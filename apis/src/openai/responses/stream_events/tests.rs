@@ -187,6 +187,37 @@ fn local_completion_preserves_deferred_done_sentinel() {
 }
 
 #[test]
+fn local_completion_does_not_arm_deferred_store_persistence() {
+    // #937 review regression: a request-phase local completion is returned to the
+    // store as a buffered `TerminalResponse` at end-of-stream, where the store
+    // already persists before the body is written. It must NOT set
+    // `logical_stream_terminal_emitted` — that flag means the terminal is a
+    // deferred non-end-of-stream chunk, and setting it here would make the store
+    // skip its end-of-stream persist and lose the record.
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        response_object: json!({"id":"resp_1", "object":"response", "status":"completed", "output":[]}),
+        ..ResponsesState::default()
+    });
+
+    let encoded = encode_local_completion(&mut ctx).expect("response object should encode");
+    assert!(
+        std::str::from_utf8(&encoded)
+            .unwrap()
+            .contains("event: response.completed"),
+        "local completion must emit a terminal response.completed frame"
+    );
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .logical_stream_terminal_emitted,
+        "a buffered local completion must not arm the deferred non-EOS persist path"
+    );
+}
+
+#[test]
 fn local_completion_flushes_file_search_lifecycle_before_terminal() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -3582,6 +3613,51 @@ async fn logical_terminal_only_output_survives_canonicalization() {
         state.output_items()[0],
         message,
         "the store source output must equal the terminal event output"
+    );
+}
+
+#[tokio::test]
+async fn deferred_terminal_arms_store_persistence_at_terminal_frame() {
+    // #937: the deferred terminal frame reaches the pre-IRR store as a
+    // non-end-of-stream chunk. `emit_deferred_terminal` must mark
+    // `logical_stream_terminal_emitted` exactly when it appends that frame so the
+    // store persists before releasing it. The flag must stay unset while the
+    // terminal is still deferred (held, not yet emitted).
+    let (filter, mut ctx) = make_armed_context();
+
+    let completed = json!({
+        "response": {
+            "id": "resp_937_defer",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-4o",
+            "created_at": 1_700_000_000,
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hi"}]}]
+        },
+        "sequence_number": 0
+    });
+
+    let mut terminal = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(terminal.is_none(), "the terminal event must be deferred until finalize");
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .logical_stream_terminal_emitted,
+        "persistence must not be armed while the terminal is still deferred"
+    );
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    assert!(eos.is_some(), "finalize must emit the deferred terminal frame");
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .logical_stream_terminal_emitted,
+        "emit_deferred_terminal must arm store persistence when it appends the terminal frame"
     );
 }
 
