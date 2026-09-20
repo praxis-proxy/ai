@@ -192,7 +192,11 @@ The `anthropic_messages_to_chat_completions` filter:
   other `output_config` key is rejected with a 400
 - Rejects `service_tier`, `container`, `inference_geo`
   and `mcp_servers` with a 400, because the translated
-  response cannot report their effect truthfully
+  response cannot report their effect truthfully; the
+  same applies to Chat Completions fields whose output
+  the translated response would discard (`n`,
+  `logprobs`, `top_logprobs`, `audio`, `modalities`,
+  `functions`, `function_call`, `web_search_options`)
 - Drops `thinking` and `context_management` with a log
   warning; Claude Code sends both on every request and
   Chat Completions has no equivalent

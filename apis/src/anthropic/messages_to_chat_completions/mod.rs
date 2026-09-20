@@ -50,8 +50,9 @@ const RESPONSE_REQUEST_ID_KEY: &str = "anthropic_messages_to_chat_completions.re
 /// Request fields the translation does not map are forwarded untouched for
 /// the backend to validate. Fields whose effect the translated response could
 /// not report truthfully (`service_tier`, `container`, `inference_geo`,
-/// `mcp_servers`) are rejected with a 400. `thinking` and `context_management`
-/// are dropped with a warning.
+/// `mcp_servers`, and Chat Completions fields such as `n` or `logprobs` whose
+/// output the translated response would discard) are rejected with a 400.
+/// `thinking` and `context_management` are dropped with a warning.
 ///
 /// # YAML
 ///

@@ -11,15 +11,35 @@ use tracing::warn;
 // Request Transformation
 // -----------------------------------------------------------------------------
 
-/// Anthropic Messages fields the Chat Completions translation cannot honor.
+/// Request fields whose effect the translated response could not report.
 ///
-/// Each one changes behavior that the translated response would then
-/// misreport: `wire.rs` hardcodes `service_tier`, `container` and
-/// `inference_geo` to null, and `mcp_servers` is a beta server-side feature
-/// (`mcp-client-2025-04-04`). Forwarding them would let the backend ignore
-/// the field while the client is told it took effect, so the request is
-/// rejected instead.
-const UNREPRESENTABLE_FIELDS: [&str; 4] = ["service_tier", "container", "inference_geo", "mcp_servers"];
+/// The Anthropic fields change behavior that the response would misreport:
+/// `wire.rs` hardcodes `service_tier`, `container` and `inference_geo` to
+/// null, and `mcp_servers` is a beta server-side feature
+/// (`mcp-client-2025-04-04`).
+///
+/// The Chat Completions fields have no Anthropic counterpart, so no
+/// conforming client sends them, but forwarding would let them reach the
+/// backend, which then produces output the response translators discard:
+/// only the first of `n` choices is translated, `logprobs` and
+/// `top_logprobs` are dropped, `audio` and `modalities` output parts are
+/// dropped, the deprecated `functions`/`function_call` shape is never read,
+/// and `web_search_options` annotations are dropped. Rejecting is honest;
+/// forwarding would bill the client for output it never sees.
+const UNREPRESENTABLE_FIELDS: [&str; 12] = [
+    "service_tier",
+    "container",
+    "inference_geo",
+    "mcp_servers",
+    "n",
+    "logprobs",
+    "top_logprobs",
+    "audio",
+    "modalities",
+    "functions",
+    "function_call",
+    "web_search_options",
+];
 
 /// Anthropic Messages fields dropped with a warning instead of forwarded.
 ///
@@ -1442,6 +1462,32 @@ mod tests {
             "Anthropic structured outputs guarantee conformance, so the Chat schema must be strict"
         );
         assert!(parsed.get("output_config").is_none(), "output_config must not travel");
+    }
+
+    #[test]
+    fn chat_fields_whose_effect_the_response_cannot_carry_are_rejected() {
+        for field in [
+            "n",
+            "logprobs",
+            "top_logprobs",
+            "audio",
+            "modalities",
+            "functions",
+            "function_call",
+            "web_search_options",
+        ] {
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hi"}],
+                field: 2,
+            });
+            let error = transform_request(body).unwrap_err();
+            assert!(
+                error.contains(field),
+                "rejection for `{field}` must name the field: {error}"
+            );
+        }
     }
 
     #[test]
