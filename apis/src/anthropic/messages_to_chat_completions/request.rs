@@ -727,11 +727,9 @@ fn map_output_config(
         Some(Value::Object(config)) => config,
         _ => Map::new(),
     };
-    insert_if_some(
-        chat,
-        "reasoning_effort",
-        config.remove("effort").filter(|effort| !effort.is_null()),
-    );
+    // Every `output_config` key is nullable in the schema; null means unset.
+    config.retain(|_, value| !value.is_null());
+    insert_if_some(chat, "reasoning_effort", config.remove("effort"));
     if let Some(format) = config
         .remove("format")
         .or(output_format)
@@ -1486,6 +1484,20 @@ mod tests {
             assert!(
                 error.contains(field),
                 "rejection for `{field}` must name the field: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_config_null_values_are_treated_as_absent() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"output_config":{"effort":null,"format":null,"task_budget":null},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let result = transform_bytes(body).unwrap();
+        let parsed: Value = serde_json::from_slice(&result).unwrap();
+
+        for field in ["reasoning_effort", "response_format", "output_config"] {
+            assert!(
+                parsed.get(field).is_none(),
+                "a null `{field}` source must produce nothing"
             );
         }
     }
