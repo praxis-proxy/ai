@@ -68,7 +68,7 @@ pub use self::postgres_tls::PgTlsConfig;
 #[cfg(feature = "store-sqlite")]
 pub use self::sqlite::SqliteResponseStore;
 pub use self::{
-    compression::{CompressionAlgorithm, StoreCompressionConfig},
+    compression::{CompressionAlgorithm, StoreCompressionConfig, decode},
     pool::PoolConfig,
     ssl_mode::SslMode,
     trait_def::{ConversationItemStore, ResponseStore},

@@ -49,7 +49,7 @@ COPY integrations/llmd/ext-proc/build.rs ./integrations/llmd/ext-proc/build.rs
 COPY integrations/llmd/ext-proc/proto ./integrations/llmd/ext-proc/proto
 
 # Strip workspace members not needed for the binary.
-RUN sed -i '/xtask/d; /tests\//d' Cargo.toml
+RUN sed -i '/xtask/d; /tests\//d; /benchmarks/d' Cargo.toml
 
 # Create stub source files for the crates whose real source isn't
 # needed until after dependencies are cached.

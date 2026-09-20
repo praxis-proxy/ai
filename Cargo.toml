@@ -5,6 +5,7 @@ members = [
     "server/build_support",
     "filters",
     "apis",
+    "benchmarks",
     "integrations/llmd/ext-proc",
     "xtask",
     "tests/environment",
@@ -75,6 +76,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 utoipa = "5.5.0"
 wiremock = "0.6.5"
 allocation-counter = "0.8.1"
+criterion = { version = "0.7.0", default-features = false, features = ["cargo_bench_support"] }
 prost = "0.14.4"
 prost-build = "0.14.4"
 prost-types = "0.14.4"

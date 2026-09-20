@@ -90,7 +90,12 @@ impl StoreCompressionConfig {
     ///
     /// With `algorithm: none` this is the raw UTF-8 JSON bytes. With
     /// `algorithm: zstd` the JSON is compressed into a raw zstd frame.
-    pub(crate) fn encode(&self, value: &serde_json::Value) -> Result<Vec<u8>, StoreError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Serialization`] if the value cannot be serialized,
+    /// exceeds the size limit, or zstd compression fails.
+    pub fn encode(&self, value: &serde_json::Value) -> Result<Vec<u8>, StoreError> {
         let json = serde_json::to_vec(value).map_err(|e| StoreError::Serialization(e.to_string()))?;
         match self.algorithm {
             CompressionAlgorithm::None => Ok(json),
@@ -116,7 +121,13 @@ impl StoreCompressionConfig {
 /// bytes. Reads are therefore independent of the store's configured
 /// compression, which is what keeps existing uncompressed records
 /// readable after compression is enabled.
-pub(crate) fn decode(stored: &[u8]) -> Result<serde_json::Value, StoreError> {
+///
+/// # Errors
+///
+/// Returns [`StoreError::Serialization`] if a zstd frame is corrupt, the
+/// decompressed payload exceeds the size limit, or the bytes are not valid
+/// JSON.
+pub fn decode(stored: &[u8]) -> Result<serde_json::Value, StoreError> {
     if stored.starts_with(&ZSTD_MAGIC) {
         use std::io::Read as _;
 
