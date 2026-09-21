@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    McpMockConfig, McpToolFixture, StatefulCapturingBackend, free_port, http_send, json_post,
-    load_example_config, parse_body, parse_status, start_mcp_mock_server_with_config, start_proxy,
+    McpMockConfig, McpToolFixture, StatefulCapturingBackend, free_port, http_send, json_post, load_example_config,
+    parse_body, parse_status, start_mcp_mock_server_with_config, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -179,11 +179,7 @@ fn buffered_json_tool_result_still_works() {
         &json_post("/v1/responses", &serde_json::to_string(&body).unwrap()),
     );
 
-    assert_eq!(
-        parse_status(&raw),
-        200,
-        "buffered JSON tool result should return 200"
-    );
+    assert_eq!(parse_status(&raw), 200, "buffered JSON tool result should return 200");
     assert_eq!(
         mcp.tool_call_count("get_weather"),
         1,
@@ -217,11 +213,8 @@ fn oversized_sse_tool_result_returns_413() {
         }]
     });
 
-    let model = StatefulCapturingBackend::new(vec![(
-        200,
-        serde_json::to_string(&first_response).unwrap(),
-    )])
-    .start_with_shutdown();
+    let model = StatefulCapturingBackend::new(vec![(200, serde_json::to_string(&first_response).unwrap())])
+        .start_with_shutdown();
 
     // max_result_bytes is 1048576 in the config, so use 2 MiB
     let mcp = start_mcp_mock_server_with_config(McpMockConfig {
@@ -512,8 +505,8 @@ insecure_options:
         backend_port = model.port()
     );
 
-    let config = praxis_core::config::Config::from_yaml(&yaml)
-        .expect("config with selector-first named chain should parse");
+    let config =
+        praxis_core::config::Config::from_yaml(&yaml).expect("config with selector-first named chain should parse");
     let proxy = start_proxy(&config);
 
     let mcp = start_mcp_mock_server_with_config(McpMockConfig {
