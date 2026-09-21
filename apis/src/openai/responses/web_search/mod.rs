@@ -77,6 +77,9 @@ const MISSING_QUERY_OUTPUT: &str = "Web search could not run because the query w
 /// Model-facing result when the response-wide tool budget is exhausted.
 const TOOL_LIMIT_OUTPUT: &str = "Web search was not executed because max_tool_calls was exhausted.";
 
+/// Model-facing result for a call a budget left undispatched.
+const NOT_PERFORMED_OUTPUT: &str = "Web search not performed.";
+
 /// Borrowed inputs for one request-side web-search dispatch batch.
 struct PendingSearchBatch<'a> {
     /// Calls retained from the current model round, parsed once.
@@ -127,6 +130,55 @@ fn prepare_calls(calls: &[Value]) -> Vec<PreparedCall<'_>> {
             parse_search_request(call, call_id, index).unwrap_or_else(|| PreparedCall::malformed(call_id, index))
         })
         .collect()
+}
+
+/// Whether the response-wide ordered admission pass refused the call at
+/// `index`. Absent admissions mean the client set no `max_tool_calls`.
+fn rejected(admissions: Option<&[bool]>, index: usize) -> bool {
+    admissions
+        .and_then(|values| values.get(index))
+        .is_some_and(|admitted| !admitted)
+}
+
+/// Decide whether one pending call may reach the provider, appending its
+/// terminal turn when it may not.
+///
+/// A call without a usable query is surfaced as incomplete on every path, since
+/// neither rejection nor a budget has anything to dispatch. A call `rejected` by
+/// the response-wide ordered admission pass fails locally and forces completion
+/// without another model round. An `over_budget` call — one that can spend
+/// neither a tool-call unit nor a single provider request — is surfaced as
+/// incomplete without reaching the provider.
+fn admit_call<'a>(
+    ctx: &mut HttpFilterContext<'_>,
+    prepared: PreparedCall<'a>,
+    rejected: bool,
+    over_budget: bool,
+) -> Option<PreparedCall<'a>> {
+    if prepared.queries.is_empty() {
+        warn!(
+            call_id = prepared.ids.public,
+            "web_search_call missing valid action.queries or action.query, skipping"
+        );
+        append_incomplete(ctx, &prepared.ids);
+        return None;
+    }
+    if rejected {
+        append_search_turn(ctx, &prepared.ids, "failed", prepared.action, &[], TOOL_LIMIT_OUTPUT);
+        return None;
+    }
+    if over_budget {
+        append_search_turn(
+            ctx,
+            &prepared.ids,
+            "incomplete",
+            prepared.action,
+            &[],
+            NOT_PERFORMED_OUTPUT,
+        );
+        return None;
+    }
+    Some(prepared)
 }
 
 // -----------------------------------------------------------------------------
@@ -348,56 +400,31 @@ impl WebSearchFilter {
         }
         let is_completed = dispatched == queries.len();
         let status = if is_completed { "completed" } else { "incomplete" };
-        append_search_turn(ctx, &ids, status, action, &results, "Web search not performed.");
+        append_search_turn(ctx, &ids, status, action, &results, NOT_PERFORMED_OUTPUT);
         dispatched
     }
 
     /// Execute admitted web search `calls` within the batch budgets, then
     /// update the cumulative execution count and clear the pending queue.
     ///
-    /// Calls rejected by the response-wide ordered admission pass receive a
-    /// failed result and force local completion without another model round.
-    /// A call that can spend neither a tool-call unit nor a single provider
-    /// request is surfaced as incomplete without reaching the provider; a call
-    /// that gets only part of its queries is dispatched and reported incomplete
-    /// with the results it obtained. A call whose action carries no usable
-    /// query is surfaced as incomplete on every path, since neither rejection
-    /// nor a budget has anything to dispatch.
+    /// [`admit_call`] resolves every call the batch budgets exclude, so only
+    /// admitted calls reach the provider here. A call that gets only part of
+    /// its queries is dispatched and reported incomplete with the results it
+    /// obtained. Returns whether any call was rejected by the response-wide
+    /// ordered admission pass, which forces local completion without another
+    /// model round.
     async fn execute_pending_searches(&self, ctx: &mut HttpFilterContext<'_>, batch: PendingSearchBatch<'_>) -> bool {
         let mut calls_dispatched = 0_usize;
         let mut queries_dispatched = 0_usize;
         let mut tool_limit_exceeded = false;
         for prepared in batch.calls {
-            let rejected = batch
-                .admissions
-                .and_then(|values| values.get(prepared.ids.index))
-                .is_some_and(|admitted| !admitted);
-            if prepared.queries.is_empty() {
-                warn!(
-                    call_id = prepared.ids.public,
-                    "web_search_call missing valid action.queries or action.query, skipping"
-                );
-                append_incomplete(ctx, &prepared.ids);
-                tool_limit_exceeded |= rejected;
-                continue;
-            }
-            if rejected {
-                append_search_turn(ctx, &prepared.ids, "failed", prepared.action, &[], TOOL_LIMIT_OUTPUT);
-                tool_limit_exceeded = true;
-                continue;
-            }
+            let rejected = rejected(batch.admissions, prepared.ids.index);
+            tool_limit_exceeded |= rejected;
             let query_allowance = batch.query_budget.saturating_sub(queries_dispatched);
-            if calls_dispatched >= batch.call_budget || query_allowance == 0 {
-                append_search_turn(
-                    ctx,
-                    &prepared.ids,
-                    "incomplete",
-                    prepared.action,
-                    &[],
-                    "Web search not performed.",
-                );
+            let over_budget = calls_dispatched >= batch.call_budget || query_allowance == 0;
+            let Some(prepared) = admit_call(ctx, prepared, rejected, over_budget) else {
                 continue;
-            }
+            };
             let dispatched = self
                 .execute_single_search(ctx, prepared, batch.context_size, query_allowance)
                 .await;
@@ -646,6 +673,10 @@ fn remaining_web_search_budget(state: &ResponsesState) -> usize {
 /// contradicts the client-visible output item or pollutes durable rehydration
 /// history. A partially dispatched call bridges the results it did gather. A
 /// missing-query call uses the more specific [`append_incomplete`] instead.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one search turn's identities, status, action, results, and failure text"
+)]
 fn append_search_turn(
     ctx: &mut HttpFilterContext<'_>,
     ids: &SearchCallIds<'_>,
