@@ -22,6 +22,7 @@ pub(crate) mod mcp_client;
 pub mod openai;
 pub mod operation;
 pub mod promotion;
+mod callout_credentials;
 mod state_owner;
 mod state_owner_headers;
 #[cfg(feature = "store")]
@@ -30,6 +31,7 @@ pub mod subrequest;
 pub mod token_cache;
 pub(crate) mod web_search;
 
+pub use callout_credentials::CalloutCredentials;
 pub use state_owner::{StateOwner, StateOwnerError, StateOwnerFilter, project_state_owner};
 pub use state_owner_headers::StateOwnerHeadersFilter;
 
