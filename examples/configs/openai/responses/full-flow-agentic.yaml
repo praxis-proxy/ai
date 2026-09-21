@@ -122,11 +122,16 @@
 #      selected cluster is forwarded upstream directly.
 #
 #   11. The iterative_request_router owns the agentic loop for classified
-#      openai_responses create requests. openai_responses_proxy rebuilds
-#      the outbound body from ResponsesState and automatically selects the
-#      typed streaming transport for an effective `stream: true` request,
-#      so each backend SSE chunk reaches openai_stream_events
-#      incrementally. openai_agentic_loop is the sole loop owner, sole
+#      openai_responses create requests. For a native Responses upstream,
+#      openai_responses_proxy rebuilds the outbound body from ResponsesState
+#      and automatically selects the typed streaming transport for an
+#      effective `stream: true` request, so each backend SSE chunk reaches
+#      openai_stream_events incrementally; for a Chat Completions upstream,
+#      responses_to_chat_completions does the equivalent build and translates
+#      Chat responses back to Responses. Both now run AFTER the step load
+#      balancer, each gated on the selected upstream's protocol (see the
+#      "Protocol-adaptive translation" note below).
+#      openai_agentic_loop is the sole loop owner, sole
 #      response parser, and sole transition authority: it extracts
 #      completed function_call, web_search_call, file_search_call, and MCP
 #      items, records the assignment each request-phase dispatcher must
@@ -139,19 +144,27 @@
 #      happens PRE-IRR at the bypass carrier (step 10); only a classified
 #      openai_responses create request reaches this step.
 #
-# IRR inference filter chain (canonical #1046 order):
+# IRR inference filter chain (canonical #1046 order, extended for
+# praxis#1241 protocol-adaptive translation):
 #   Request phase (forward):
 #     openai_stream_events → openai_web_search → openai_mcp_dispatch
 #       → openai_file_search_callout → openai_agentic_loop
-#       → headers → router → load_balancer → openai_responses_proxy
+#       → headers → router → load_balancer
+#       → openai_responses_proxy         (when selected upstream = Responses)
+#       → responses_to_chat_completions  (when selected upstream = Chat)
+#       → path_rewrite                   (when selected upstream = Chat)
 #   Response phase (reverse):
-#     openai_responses_proxy → load_balancer → router → headers
-#       → openai_agentic_loop → (dispatchers have no response phase)
-#       → openai_stream_events
-#   The proxy's request-body hook still participates in the pipeline body
-#   pre-read. Its request-header hook runs after load_balancer selection, so it
-#   can fail closed unless the selected cluster explicitly declares both
-#   application_protocol: openai_responses and application_provider: openai.
+#     path_rewrite → responses_to_chat_completions → openai_responses_proxy
+#       → load_balancer → router → headers → openai_agentic_loop
+#       → (dispatchers have no response phase) → openai_stream_events
+#   The protocol-adaptive body builders run AFTER the load balancer because
+#   they carry selected_upstream conditions (praxis#1241), which are rejected
+#   at build time unless an unconditional load balancer is guaranteed to run
+#   before them. On the response path they therefore run FIRST, converting a
+#   Chat Completions response into Responses before openai_agentic_loop and
+#   openai_stream_events observe it. Exactly one body builder fires per
+#   request, keyed to the selected cluster's declared application_protocol;
+#   the match fails closed when the cluster declares none.
 #   The three dispatchers (openai_web_search, openai_mcp_dispatch,
 #   openai_file_search_callout) have no response phase: each executes the
 #   loop owner's assigned calls at request-body EOS on the next iteration,
@@ -186,6 +199,26 @@
 #   INSIDE the IRR step so both buffered and streaming responses are
 #   persisted and retrievable via GET /v1/responses/{id} (served pre-IRR
 #   by openai_response_store).
+#
+# Protocol-adaptive translation (requires praxis#1241):
+#   This config serves ONE Responses gateway pipeline regardless of whether
+#   the inference backend speaks the Responses API natively or only Chat
+#   Completions. The IRR step's load balancer publishes the selected
+#   cluster's typed application metadata (http.application_protocol /
+#   http.application_provider), and three filters carry selected_upstream
+#   conditions that read it:
+#     - openai_responses_proxy         when application_protocol=openai_responses
+#     - responses_to_chat_completions  when application_protocol=openai_chat_completions
+#     - path_rewrite                   when application_protocol=openai_chat_completions
+#   Flip the cluster's http block (native openai_responses/openai vs
+#   openai_chat_completions/vllm) to switch protocols without editing the
+#   pipeline. selected_upstream fails closed: declare application_protocol on
+#   the cluster, or neither branch fires and no outbound body is built. The
+#   gated filters must sit AFTER the unconditional load balancer, so build-time
+#   validation can prove a load balancer always runs before them.
+#   NOTE (WIP): praxis#1241 is not yet merged. Until the pinned praxis-core rev
+#   in the workspace Cargo.toml includes it, the selected_upstream condition is
+#   unknown to the config parser and this example will fail to validate/CI.
 #
 # Security: StreamBuffer body callouts run before this listener's
 # header-phase filters. Deploy this example behind an outer authentication
@@ -266,12 +299,11 @@
 # Direct OpenAI upstream variant:
 #   - Replace the local inference-backend endpoint with api.openai.com:443
 #     and configure tls.sni: api.openai.com (in BOTH the bypass branch's
-#     load_balancer and the IRR step's load_balancer).
-#   - Uncomment the `http.application_protocol: openai_responses` and
-#     `http.application_provider: openai` declarations on BOTH
-#     inference-backend clusters below. The canonical IRR ordering already
-#     permits `prompt.id` once both capabilities are declared; endpoint
-#     identity does not participate in the trust decision.
+#     load_balancer and the IRR step's load_balancer). Keep the IRR step
+#     cluster's http.application_protocol: openai_responses (the default) so
+#     openai_responses_proxy runs and no translation is applied — api.openai.com
+#     speaks the Responses API natively. Point at a Chat Completions backend
+#     instead by switching that block to openai_chat_completions/vllm.
 #   - Add this headers filter inside the IRR step after the router to
 #     replace the downstream Host:
 #
@@ -544,7 +576,19 @@ filter_chains:
               # "Streaming persistence" note above); openai_agentic_loop
               # fails closed with a 500 on an effective stream:true request
               # when it is absent.
+              #
+              # Its limits are set at or above responses_to_chat_completions'
+              # converter bounds below so no frame the client receives is ever
+              # rejected here and dropped from the store (the accumulator must
+              # never be tighter than the converter): max_events (200000) >=
+              # converter max_stream_events (100000); max_buffer_bytes (64 MiB)
+              # > converter max_emitted_sse_frame_bytes (48 MiB); timeout_secs
+              # (600) >= converter stream_timeout_secs (300). These apply on the
+              # native path too and stay within the IRR's byte/time caps above.
               - filter: openai_stream_events
+                max_buffer_bytes: 67108864
+                max_events: 200000
+                timeout_secs: 600
 
               # Request-phase dispatcher: runs first on re-entry to execute
               # web_search_call assignments prepared by the loop owner. Inert
@@ -602,6 +646,12 @@ filter_chains:
               # must stay below the IRR max_iterations safety cap (7 + 1 = 8).
               - filter: openai_agentic_loop
                 max_infer_iters: 7
+              # openai_responses_proxy MOVED below the load balancer: it now
+              # carries a selected_upstream condition (praxis#1241), and a
+              # selected_upstream-gated filter is rejected at build time unless
+              # an unconditional load balancer is guaranteed to run before it on
+              # every reachable path. The load balancer publishes the selected
+              # cluster's typed application metadata that the conditions match.
               - filter: headers
                 request_set:
                   - name: Content-Type
@@ -616,24 +666,85 @@ filter_chains:
                 routes:
                   - path: "/v1/responses"
                     cluster: "inference-backend"
+              # Unconditional load balancer: selects the upstream endpoint AND
+              # publishes the selected cluster's typed application metadata
+              # (http.application_protocol / http.application_provider). Every
+              # selected_upstream condition below reads that published
+              # selection, so all three protocol-adaptive filters run AFTER
+              # this filter.
               - filter: load_balancer
                 clusters:
                   - name: "inference-backend"
-                    # Optional provider capability. Uncomment only when this
-                    # backend can resolve OpenAI-managed prompt IDs.
-                    # Endpoint hostname, port, TLS, and SNI are not the trust
-                    # boundary.
-                    # http:
-                    #   application_protocol: openai_responses
-                    #   application_provider: openai
+                    # Declares the backend wire protocol. Flip this block to
+                    # switch the whole gateway between a native Responses
+                    # upstream and a Chat Completions upstream WITHOUT editing
+                    # the filter pipeline: the selected_upstream conditions
+                    # below fire the matching body-build path. Default: native
+                    # Responses (preserves this example's original behavior).
+                    http:
+                      application_protocol: openai_responses
+                      application_provider: openai
+                    # Chat Completions backend (e.g. vLLM) variant — comment the
+                    # block above and uncomment this one:
+                    #   http:
+                    #     application_protocol: openai_chat_completions
+                    #     application_provider: vllm
                     endpoints:
                       - "127.0.0.1:3001"
-              # Selects typed streaming automatically when the effective
-              # outbound body carries `"stream": true`; otherwise buffers.
-              # Its request hook runs after load-balancer selection. Prompt
-              # templates fail closed unless the selected cluster enables both
-              # optional application declarations above.
+
+              # ---- Protocol-adaptive body builders (run AFTER selection) ----
+              # Exactly ONE branch fires, chosen by the selected upstream's
+              # declared application_protocol. selected_upstream FAILS CLOSED:
+              # if the selected cluster declares no application_protocol,
+              # NEITHER branch runs and no outbound body is built — always
+              # declare http.application_protocol on the cluster above.
+
+              # Native Responses upstream: rebuild the outbound Responses body
+              # from ResponsesState and select the typed streaming transport
+              # for an effective `stream: true` request (otherwise buffer), so
+              # each backend SSE chunk reaches openai_stream_events
+              # incrementally. Skipped for Chat Completions upstreams.
               - filter: openai_responses_proxy
+                conditions:
+                  - when:
+                      selected_upstream:
+                        application_protocol: openai_responses
+
+              # Chat Completions upstream: translate the canonical Responses
+              # request into Chat Completions on the request path, and
+              # translate the Chat Completions response (finite JSON or streamed
+              # SSE) back into a Responses resource / Responses SSE on the
+              # response path. Because response filters run in reverse, this
+              # converts the raw Chat response into Responses BEFORE
+              # openai_agentic_loop and openai_stream_events observe it (both
+              # require Responses). It fully owns outbound body build for Chat
+              # backends, which is why openai_responses_proxy is gated off for
+              # this path. Stream bounds stay at/under openai_stream_events'
+              # limits so no frame the client receives is dropped from the store
+              # (cf. responses-to-chat-completions.yaml).
+              - filter: responses_to_chat_completions
+                max_rewritten_body_bytes: 33554432
+                max_emitted_sse_frame_bytes: 50331648
+                max_stream_events: 100000
+                stream_timeout_secs: 300
+                conditions:
+                  - when:
+                      selected_upstream:
+                        application_protocol: openai_chat_completions
+
+              # Chat Completions upstream: rewrite the upstream path from
+              # /v1/responses to /v1/chat/completions. Gated identically (and on
+              # the create verb/path) so it only fires for a translated request.
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      selected_upstream:
+                        application_protocol: openai_chat_completions
+                      path_prefix: "/v1/responses"
+                      methods: [POST]
             on_result:
               # openai_agentic_loop is the sole loop authority (issue #1046):
               # it parses each model response, records assignments for the
