@@ -24,9 +24,10 @@ use tracing::warn;
 /// only the first of `n` choices is translated, `logprobs` and
 /// `top_logprobs` are dropped, `audio` and `modalities` output parts are
 /// dropped, the deprecated `functions`/`function_call` shape is never read,
-/// and `web_search_options` annotations are dropped. Rejecting is honest;
-/// forwarding would bill the client for output it never sees.
-const UNREPRESENTABLE_FIELDS: [&str; 12] = [
+/// `web_search_options` annotations are dropped, and the top-level
+/// `moderation` results are dropped. Rejecting is honest; forwarding would
+/// bill the client for output it never sees.
+const UNREPRESENTABLE_FIELDS: [&str; 13] = [
     "service_tier",
     "container",
     "inference_geo",
@@ -39,6 +40,7 @@ const UNREPRESENTABLE_FIELDS: [&str; 12] = [
     "functions",
     "function_call",
     "web_search_options",
+    "moderation",
 ];
 
 /// Anthropic Messages fields dropped with a warning instead of forwarded.
@@ -1484,6 +1486,7 @@ mod tests {
             "functions",
             "function_call",
             "web_search_options",
+            "moderation",
         ] {
             let body = json!({
                 "model": "claude-opus-4-8",

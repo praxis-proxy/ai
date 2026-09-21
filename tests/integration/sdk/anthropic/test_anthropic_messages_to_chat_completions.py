@@ -188,6 +188,22 @@ class TestRequestFieldHandling:
         assert "`service_tier` is not supported" in str(excinfo.value)
         assert RecordingBackend.bodies == []
 
+    def test_chat_completions_field_whose_output_is_discarded_is_rejected(
+        self, anthropic_client
+    ):
+        RecordingBackend.bodies.clear()
+
+        with pytest.raises(BadRequestError) as excinfo:
+            anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                extra_body={"moderation": {"input": True, "output": True}},
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            )
+
+        assert "`moderation` is not supported" in str(excinfo.value)
+        assert RecordingBackend.bodies == []
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))
