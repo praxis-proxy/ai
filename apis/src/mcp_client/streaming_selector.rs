@@ -90,7 +90,7 @@ impl HttpFilter for McpStreamingSelectorFilter {
 #[allow(clippy::unwrap_used, reason = "tests use unwrap for brevity")]
 mod tests {
     use http::Method;
-    use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter, SubRequestResponseMode};
+    use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter as _, SubRequestResponseMode};
 
     use super::{McpStreamingRequested, McpStreamingSelectorFilter};
     use crate::test_utils::{make_filter_context, make_request};
