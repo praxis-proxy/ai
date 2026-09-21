@@ -198,6 +198,7 @@ impl std::fmt::Debug for CalloutCredentials {
 mod config_tests {
     use super::*;
 
+    #[expect(clippy::unwrap_used, reason = "tests")]
     fn cfg(yaml: &str) -> Result<Box<dyn HttpFilter>, FilterError> {
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
         CalloutCredentialsFilter::from_config(&value)
@@ -256,9 +257,10 @@ mod config_tests {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
 mod tests {
     use super::*;
-    use secrecy::ExposeSecret;
+    use secrecy::ExposeSecret as _;
 
     #[test]
     fn get_returns_inserted_secret() {
