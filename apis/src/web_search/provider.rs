@@ -785,6 +785,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            user_credential: None,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -822,6 +823,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            user_credential: None,
             terminal_streaming: false,
         };
         SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
@@ -897,6 +899,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            user_credential: None,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client());
@@ -912,6 +915,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            user_credential: None,
             terminal_streaming: false,
         };
 
@@ -934,6 +938,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: Some("http://localhost:9999".into()),
+            user_credential: None,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -953,6 +958,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: Some("http://localhost:9999".into()),
+            user_credential: None,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -972,6 +978,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: Some("http://localhost:9999".into()),
+            user_credential: None,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -991,6 +998,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            user_credential: None,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -1010,6 +1018,7 @@ mod tests {
             timeout_ms: 5000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            user_credential: None,
             terminal_streaming: false,
         };
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
@@ -1028,6 +1037,7 @@ mod tests {
             timeout_ms: 1000,
             max_body_bytes: 64 * 1024 * 1024,
             base_url: None,
+            user_credential: None,
             terminal_streaming: false,
         };
         SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
