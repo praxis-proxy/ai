@@ -987,10 +987,17 @@ impl StreamableHttpClient for McpSubrequestClient {
         custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<McpTransportError>> {
-        let headers = self.build_get_stream_headers(auth_header, custom_headers, session_id.as_ref(), last_event_id.as_deref())?;
-        let (response, body) =
-            self.execute_streaming(Method::GET, &uri, Bytes::new(), headers, self.stream_cumulative_cap()).await?;
-        self.classify_get_stream_response(response, body, max_sse_event_size).await
+        let headers = self.build_get_stream_headers(
+            auth_header,
+            custom_headers,
+            session_id.as_ref(),
+            last_event_id.as_deref(),
+        )?;
+        let (response, body) = self
+            .execute_streaming(Method::GET, &uri, Bytes::new(), headers, self.stream_cumulative_cap())
+            .await?;
+        self.classify_get_stream_response(response, body, max_sse_event_size)
+            .await
     }
 
     async fn post_message_with_max_sse_event_size(
@@ -1918,26 +1925,24 @@ mod tests {
     #[tokio::test]
     async fn get_stream_405_is_no_sse_support() {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let body: Box<dyn StreamingResponseBody> =
-            Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks(
-                [],
-                Arc::clone(&cancelled),
-            ));
+        let body: Box<dyn StreamingResponseBody> = Box::new(
+            crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks([], Arc::clone(&cancelled)),
+        );
         let response = sub_response(405, None, b"");
         let result = client()
             .classify_get_stream_response(response, Some(body), 16 * 1024 * 1024)
             .await;
         assert!(matches!(result, Err(StreamableHttpError::ServerDoesNotSupportSse)));
-        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst), "non-forward branch cancels the body");
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "non-forward branch cancels the body"
+        );
     }
 
     #[test]
     fn get_stream_headers_reject_caller_last_event_id() {
         let mut custom = HashMap::new();
-        custom.insert(
-            HeaderName::from_static("last-event-id"),
-            HeaderValue::from_static("42"),
-        );
+        custom.insert(HeaderName::from_static("last-event-id"), HeaderValue::from_static("42"));
         let err = client().build_get_stream_headers(None, custom, None, None).unwrap_err();
         assert!(matches!(err, StreamableHttpError::ReservedHeaderConflict(_)));
     }
