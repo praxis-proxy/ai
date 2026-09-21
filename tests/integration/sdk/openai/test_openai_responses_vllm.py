@@ -2388,6 +2388,62 @@ class TestResponsesToChatCompletionsVLLM:
             "marker": "CHAT-JSON-1357",
         }
 
+    @pytest.mark.critical_vllm
+    @requires_vllm_compat
+    def test_structured_output_preserved_with_tools_round_trip(
+        self,
+        chat_streaming_client,
+    ):
+        # Regression for issue #1248: the Responses-to-Chat translator used to
+        # drop `response_format` whenever tools were translated, silently
+        # weakening the structured-output contract. Chat Completions supports
+        # both together, so a request pairing `text.format` with a declared tool
+        # must still return schema-valid JSON. The tool flows through the
+        # translator's tool builder (the exact path that previously deleted the
+        # constraint); `tool_choice="none"` keeps the answer direct and
+        # deterministic while still exercising that path.
+        tool = {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+        response = chat_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input="Return the marker CHAT-JSON-TOOLS-2468. /no_think",
+            temperature=0,
+            tools=[tool],
+            tool_choice="none",
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "marker_result",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "marker": {"type": "string"},
+                        },
+                        "required": ["marker"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            store=False,
+            max_output_tokens=128,
+        )
+
+        assert response.status == "completed"
+        assert json.loads(response.output_text) == {
+            "marker": "CHAT-JSON-TOOLS-2468",
+        }
+
     def test_function_call_and_output_round_trip(
         self,
         chat_streaming_client,
