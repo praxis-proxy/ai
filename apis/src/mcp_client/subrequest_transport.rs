@@ -562,27 +562,25 @@ impl McpSubrequestClient {
         }
     }
 
-    /// Prepare, validate, and dial `uri`, returning the buffered response.
-    ///
-    /// SSRF/DNS validation, TLS/SNI, Host binding, and the response-size ceiling
-    /// are enforced by [`prepare_url_target`] and the executor.
+    /// Prepare and validate the dial for `uri` — SSRF/DNS validation, upstream
+    /// staging, and executor construction — returning the staged executor,
+    /// request, extensions, and deadline for the caller to run.
     #[expect(
         clippy::too_many_lines,
         reason = "linear prepare/validate/dial sequence reads clearest inline"
     )]
-    #[expect(clippy::large_stack_frames, reason = "rmcp/executor futures are inherently large")]
     #[expect(
         clippy::too_many_arguments,
         reason = "method/uri/body/headers/limit describe one dial call"
     )]
-    async fn execute(
+    async fn prepare_staged_request(
         &self,
         method: Method,
         uri: &str,
         body: Bytes,
         headers: HeaderMap,
         max_response_bytes: usize,
-    ) -> Result<SubResponse, StreamableHttpError<McpTransportError>> {
+    ) -> Result<(FilteredSubrequestExecutor, SubRequest, RequestExtensions, Instant), StreamableHttpError<McpTransportError>> {
         let deadline = Instant::now()
             .checked_add(self.step_timeout)
             .ok_or(StreamableHttpError::Client(McpTransportError::Setup))?;
@@ -626,6 +624,28 @@ impl McpSubrequestClient {
             max_response_bytes,
             self.step_timeout,
         );
+        Ok((executor, request, extensions, deadline))
+    }
+
+    /// Prepare, validate, and dial `uri`, returning the buffered response.
+    ///
+    /// SSRF/DNS validation, TLS/SNI, Host binding, and the response-size ceiling
+    /// are enforced by [`prepare_url_target`] and the executor.
+    #[expect(clippy::large_stack_frames, reason = "rmcp/executor futures are inherently large")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "method/uri/body/headers/limit describe one dial call"
+    )]
+    async fn execute(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Bytes,
+        headers: HeaderMap,
+        max_response_bytes: usize,
+    ) -> Result<SubResponse, StreamableHttpError<McpTransportError>> {
+        let (executor, request, extensions, deadline) =
+            self.prepare_staged_request(method, uri, body, headers, max_response_bytes).await?;
         let outcome = Box::pin(executor.run_classified(&self.callout.pipeline, &request, extensions, deadline))
             .await
             .map_err(|_error| StreamableHttpError::Client(McpTransportError::Transport))?;
