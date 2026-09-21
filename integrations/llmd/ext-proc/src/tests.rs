@@ -2494,6 +2494,7 @@ fn make_ctx(req: &praxis_filter::Request) -> HttpFilterContext<'_> {
         buffered_request_body: None,
         body_done_indices: Vec::new(),
         branch_iterations: HashMap::new(),
+        grpc_completion: None,
         client_addr: None,
         cluster: None,
         current_filter_id: None,

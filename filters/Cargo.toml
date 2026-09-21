@@ -62,7 +62,9 @@ notify = { workspace = true }
 percent-encoding = { workspace = true }
 praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }
-praxis-filter = { workspace = true }
+# chain-binding: ChainBindingContext for register.rs outbound-chain wiring.
+# Off-by-default experimental feature in praxis 0.6.0 (no extra dependencies).
+praxis-filter = { workspace = true, features = ["chain-binding"] }
 redis = { workspace = true, optional = true }
 rand = { workspace = true }
 reqwest.workspace = true

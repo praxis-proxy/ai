@@ -88,12 +88,11 @@ tokio-stream = "0.1.19"
 zeroize = "1.9.0"
 
 # Praxis core dependencies
-# Pin to git until cap_stream_deadline ships on crates.io (praxis-proxy/praxis#1179).
-praxis-core = { git = "https://github.com/praxis-proxy/praxis", rev = "500de65d1c3f38ce900297805f70298c8af20a56", package = "praxis-proxy-core" }
-praxis-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "500de65d1c3f38ce900297805f70298c8af20a56", package = "praxis-proxy-filter", features = ["basic-auth-filter"] }
-praxis-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "500de65d1c3f38ce900297805f70298c8af20a56", package = "praxis-proxy-protocol" }
-praxis-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "500de65d1c3f38ce900297805f70298c8af20a56", package = "praxis-proxy-tls" }
-praxis = { git = "https://github.com/praxis-proxy/praxis", rev = "500de65d1c3f38ce900297805f70298c8af20a56", package = "praxis-proxy" }
+praxis-core = { version = "0.6.0", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.6.0", package = "praxis-proxy-filter", features = ["basic-auth-filter"] }
+praxis-protocol = { version = "0.6.0", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.6.0", package = "praxis-proxy-tls" }
+praxis = { version = "0.6.0", package = "praxis-proxy" }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer
