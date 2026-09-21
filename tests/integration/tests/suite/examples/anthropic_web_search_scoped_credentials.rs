@@ -192,3 +192,161 @@ fn missing_credential_fails_closed_with_401_authentication_error() {
     );
     assert_eq!(search.request_count(), 0, "no provider callout on a missing credential");
 }
+
+#[test]
+fn per_user_credential_arrives_at_the_anthropic_provider_and_ingress_header_is_stripped() {
+    // Mirror of the OpenAI positive test for the Anthropic Messages family: the
+    // per-user credential captured in the outer chain is staged into the in-IRR
+    // web-search callout (proving outer callout_credentials runs before the
+    // in-step anthropic_web_search reads the slot), and the ingress header is
+    // stripped from both the provider callout and the model backend.
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../fixtures/anthropic/messages/web_search_nonstreaming.json"
+    ))
+    .expect("parse web-search fixture");
+    let model = StatefulCapturingBackend::new(vec![
+        (200, fixture["first_model_response"].to_string()),
+        (200, fixture["final_model_response"].to_string()),
+    ])
+    .start_with_shutdown();
+    let brave_body = json!({
+        "web": {"results": [{
+            "title": "Potato - Wikipedia",
+            "url": "https://en.wikipedia.org/wiki/Potato",
+            "description": "Potato is a starchy underground tuber native to the Americas."
+        }]}
+    });
+    let search = StatefulCapturingBackend::new(vec![(200, brave_body.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_config(proxy_port, model.port(), search.port());
+    let proxy = start_proxy(&config);
+    let request = json!({
+        "model": "openai/gpt-oss-20b",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "Use web search to look up potato."}],
+        "tools": [{
+            "name": "WebSearch",
+            "description": "Search the web",
+            "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+        }]
+    });
+    let headers = [
+        ("x-auth-tenant", "acme"),
+        ("x-auth-user", "alice"),
+        ("x-user-brave-key", "alice-brave-secret"),
+    ];
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/messages", &request.to_string(), &headers),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "round trip should succeed: {raw}");
+    let sreqs = search.requests();
+    assert_eq!(sreqs.len(), 1, "one search callout");
+    let h = sreqs[0].headers.to_ascii_lowercase();
+    assert!(
+        h.contains("x-subscription-token: alice-brave-secret"),
+        "the provider callout carries the per-user secret, not the shared key: {}",
+        sreqs[0].headers
+    );
+    assert!(
+        !h.contains("test-key"),
+        "the shared api_key does not appear on the callout: {}",
+        sreqs[0].headers
+    );
+    assert!(
+        !h.contains("x-user-brave-key"),
+        "the ingress credential header is stripped before the provider callout: {}",
+        sreqs[0].headers
+    );
+    let mreqs = model.requests();
+    assert!(
+        !mreqs[0].headers.to_ascii_lowercase().contains("x-user-brave-key"),
+        "the ingress credential header is stripped before the model backend too: {}",
+        mreqs[0].headers
+    );
+}
+
+#[test]
+fn per_user_credentials_are_isolated_across_requests() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../fixtures/anthropic/messages/web_search_nonstreaming.json"
+    ))
+    .expect("parse web-search fixture");
+    let model = StatefulCapturingBackend::new(vec![
+        (200, fixture["first_model_response"].to_string()),
+        (200, fixture["final_model_response"].to_string()),
+        (200, fixture["first_model_response"].to_string()),
+        (200, fixture["final_model_response"].to_string()),
+    ])
+    .start_with_shutdown();
+    let brave_body = json!({
+        "web": {"results": [{
+            "title": "Potato - Wikipedia",
+            "url": "https://en.wikipedia.org/wiki/Potato",
+            "description": "Potato is a starchy underground tuber native to the Americas."
+        }]}
+    });
+    let search = StatefulCapturingBackend::new(vec![(200, brave_body.to_string()), (200, brave_body.to_string())])
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_config(proxy_port, model.port(), search.port());
+    let proxy = start_proxy(&config);
+    let request = json!({
+        "model": "openai/gpt-oss-20b",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "Use web search to look up potato."}],
+        "tools": [{
+            "name": "WebSearch",
+            "description": "Search the web",
+            "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+        }]
+    });
+
+    let headers_alice = [
+        ("x-auth-tenant", "acme"),
+        ("x-auth-user", "alice"),
+        ("x-user-brave-key", "alice-brave-secret"),
+    ];
+    let raw1 = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/messages", &request.to_string(), &headers_alice),
+    );
+    assert_eq!(parse_status(&raw1), 200, "alice request should succeed: {raw1}");
+
+    let headers_bob = [
+        ("x-auth-tenant", "acme"),
+        ("x-auth-user", "bob"),
+        ("x-user-brave-key", "bob-brave-secret"),
+    ];
+    let raw2 = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/messages", &request.to_string(), &headers_bob),
+    );
+    assert_eq!(parse_status(&raw2), 200, "bob request should succeed: {raw2}");
+
+    let sreqs = search.requests();
+    assert_eq!(sreqs.len(), 2, "two search callouts, one per request");
+    assert!(
+        sreqs[0]
+            .headers
+            .to_ascii_lowercase()
+            .contains("x-subscription-token: alice-brave-secret"),
+        "alice's credential arrives on her callout: {}",
+        sreqs[0].headers
+    );
+    assert!(
+        !sreqs[0].headers.to_ascii_lowercase().contains("bob-brave-secret"),
+        "bob's credential does not leak into alice's callout: {}",
+        sreqs[0].headers
+    );
+    assert!(
+        sreqs[1]
+            .headers
+            .to_ascii_lowercase()
+            .contains("x-subscription-token: bob-brave-secret"),
+        "bob's credential arrives on his callout: {}",
+        sreqs[1].headers
+    );
+}

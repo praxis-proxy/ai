@@ -374,6 +374,10 @@ impl WebSearchFilter {
     /// provider counter; a missing-query call consumes its model-call admission
     /// but does not issue a provider request.
     async fn execute_pending_searches(&self, ctx: &mut HttpFilterContext<'_>, batch: PendingSearchBatch<'_>) -> bool {
+        // A missing per-user credential recorded a write-once security failure in
+        // `resolve_batch_identity`. The agentic loop consults `security_failure.take()`
+        // before any pending-queue logic, so it 401s before this queue is read again;
+        // leaving `web_search_calls` un-cleared here is intentional, not a leak.
         let Some(identity) = self.resolve_batch_identity(ctx) else {
             return false;
         };
