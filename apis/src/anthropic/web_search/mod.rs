@@ -18,7 +18,7 @@ use praxis_filter::{
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
-use crate::callout_identity::{CalloutIdentity, stage_callout_identity};
+use crate::callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity};
 use crate::web_search::{
     CalloutContext, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, WebSearchFilterConfig,
     build_config, format_search_results,
@@ -199,6 +199,9 @@ pub struct AnthropicWebSearchFilter {
     search_client: SearchClient,
     /// Prebuilt outbound filter chain each provider request executes through.
     outbound: Arc<FilterPipeline>,
+    /// Callout-credential slot id whose per-user secret is required for the
+    /// provider callout. `None` uses the shared configured `api_key`.
+    user_credential_slot: Option<String>,
 }
 
 impl AnthropicWebSearchFilter {
@@ -265,6 +268,7 @@ impl AnthropicWebSearchFilter {
             terminal_streaming: validated.terminal_streaming,
             search_client,
             outbound,
+            user_credential_slot: validated.user_credential,
         }))
     }
 
@@ -320,6 +324,27 @@ impl AnthropicWebSearchFilter {
             SubRequestResponseMode::Buffered
         };
         ctx.set_subrequest_response_mode(mode);
+    }
+
+    /// Resolve the caller's trusted owner and the operator-required per-user
+    /// credential for the web-search callout.
+    ///
+    /// Projects the caller's [`StateOwner`](crate::state_owner::StateOwner) into
+    /// the callout and, when a `user_credential` slot is configured, selects the
+    /// matching per-user secret. A configured-but-missing slot fails closed: it
+    /// maps to a 401 `authentication_error` [`Rejection`]. Anthropic's error
+    /// envelope carries a `type` but no `code`; only the non-secret slot id is
+    /// surfaced in the message.
+    fn resolve_callout_identity(&self, ctx: &HttpFilterContext<'_>) -> Result<CalloutIdentity, Rejection> {
+        stage_callout_identity(ctx, self.user_credential_slot.as_deref()).map_err(
+            |CalloutContextMissing::Credential { slot }| {
+                anthropic_rejection(
+                    401,
+                    "authentication_error",
+                    &format!("web search requires the '{slot}' per-user credential, which was not provided"),
+                )
+            },
+        )
     }
 
     /// Execute one pending call, returning the provider outcome.
@@ -404,14 +429,14 @@ impl AnthropicWebSearchFilter {
         // before mutating the context so the callout's outbound chain sees the
         // real client and the executor continues this request's depth accounting.
         let callout = CalloutContext::from_filter_context(ctx);
-        // PR1 (issue #880) Task 9: project the caller's trusted owner into the
-        // web-search callout. The per-user credential slot and its fail-closed 401
-        // `authentication_error` terminal are wired on the Anthropic path in Task 10;
-        // passing `None` here requests owner attribution only, which never fails.
-        let identity = stage_callout_identity(ctx, None).unwrap_or_else(|_| CalloutIdentity {
-            owner: None,
-            user_credential: None,
-        });
+        // PR1 (issue #880) Task 10: project the caller's trusted owner into the
+        // web-search callout and select the operator-required per-user credential.
+        // A configured-but-missing slot fails closed with a 401
+        // `authentication_error` terminal before any provider callout runs.
+        let identity = match self.resolve_callout_identity(ctx) {
+            Ok(identity) => identity,
+            Err(rejection) => return Ok(FilterAction::Reject(rejection)),
+        };
         let outcome = self.execute_pending_search(callout, &pending, &identity).await;
         if let Err(rejection) = append_search_turns(&mut request, assistant_content, pending, &outcome) {
             return Ok(FilterAction::Reject(rejection));

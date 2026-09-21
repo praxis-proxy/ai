@@ -17,7 +17,9 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::callout_identity::CalloutIdentity;
+use crate::CalloutCredentials;
 use crate::test_utils::{make_filter_context, make_request, make_response};
+use secrecy::{ExposeSecret as _, SecretString};
 
 /// A callout identity with no owner and no per-user credential (shared-key path).
 fn shared_key_identity() -> CalloutIdentity {
@@ -74,7 +76,15 @@ outbound_chain: web_search_outbound
         terminal_streaming: validated.terminal_streaming,
         search_client,
         outbound: Arc::new(outbound),
+        user_credential_slot: validated.user_credential,
     }
+}
+
+/// A filter that requires the given per-user credential slot for its callout.
+fn filter_requiring_slot(slot: &str) -> AnthropicWebSearchFilter {
+    let mut filter = test_filter_impl_with_base_url("http://127.0.0.1:1");
+    filter.user_credential_slot = Some(slot.to_owned());
+    filter
 }
 
 struct SearchStub {
@@ -1439,5 +1449,64 @@ fn reentry_from_state_prefers_iteration_ceiling_over_deadline() {
         reentry_from_state(4, 5, now, now),
         Reentry::IterationCeiling,
         "the iteration ceiling takes precedence over an elapsed deadline"
+    );
+}
+
+#[test]
+fn missing_required_credential_rejects_with_authentication_error() {
+    let filter = filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let ctx = make_filter_context(&request);
+
+    let rejection = filter
+        .resolve_callout_identity(&ctx)
+        .expect_err("a configured-but-missing slot must fail closed");
+
+    assert_eq!(rejection.status, 401);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert!(
+        body["error"].get("code").is_none(),
+        "the Anthropic error envelope carries no code field"
+    );
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("brave"),
+        "the message names the missing slot id"
+    );
+}
+
+#[test]
+fn present_required_credential_resolves_to_per_user_secret() {
+    let filter = filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut creds = CalloutCredentials::new();
+    creds.insert("brave".to_owned(), SecretString::from("user-secret"));
+    ctx.extensions.insert(creds);
+
+    let identity = filter
+        .resolve_callout_identity(&ctx)
+        .expect("a populated required slot resolves");
+
+    assert_eq!(
+        identity.user_credential.expect("per-user secret present").expose_secret(),
+        "user-secret"
+    );
+}
+
+#[test]
+fn absent_slot_resolves_without_a_credential() {
+    let filter = test_filter_impl_with_base_url("http://127.0.0.1:1");
+    let request = make_request(Method::POST, "/v1/messages");
+    let ctx = make_filter_context(&request);
+
+    let identity = filter
+        .resolve_callout_identity(&ctx)
+        .expect("no configured slot resolves without a credential");
+
+    assert!(
+        identity.user_credential.is_none(),
+        "no slot configured means no per-user credential is selected"
     );
 }
