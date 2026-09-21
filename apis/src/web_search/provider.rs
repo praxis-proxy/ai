@@ -201,6 +201,7 @@ impl SearchClient {
     /// carries cross-cutting concerns (observability, security, credential
     /// injection); destination authority, DNS/SSRF, TLS/SNI, and `Host` are
     /// enforced centrally by the executor at transport time.
+    #[expect(clippy::too_many_arguments, reason = "threads the caller's per-callout identity through the fixed staging chain")]
     pub(crate) async fn search(
         &self,
         outbound: &Arc<FilterPipeline>,
@@ -240,6 +241,7 @@ impl SearchClient {
     /// authority and its target to the origin-form path+query.
     ///
     /// [`PreparedTarget::bind`]: praxis_core::connectivity::PreparedTarget::bind
+    #[expect(clippy::too_many_arguments, reason = "threads the caller's per-callout identity through the fixed staging chain")]
     async fn execute_search(
         &self,
         outbound: &Arc<FilterPipeline>,
@@ -856,6 +858,19 @@ mod tests {
         CalloutIdentity { owner: None, user_credential: None }
     }
 
+    fn brave_config_with_shared_key(shared: &str) -> ValidatedConfig {
+        ValidatedConfig {
+            provider: SearchProvider::Brave,
+            api_key: SecretString::from(shared.to_owned()),
+            default_context_size: SearchContextSize::Medium,
+            timeout_ms: 5000,
+            max_body_bytes: 64 * 1024 * 1024,
+            base_url: None,
+            user_credential: None,
+            terminal_streaming: false,
+        }
+    }
+
     #[test]
     fn brave_defers_credential_off_the_in_chain_request() {
         let brave = test_client_for(SearchProvider::Brave);
@@ -1468,16 +1483,7 @@ mod tests {
                 .to_string(),
         );
         // Brave client whose SHARED key is "shared-secret".
-        let config = ValidatedConfig {
-            provider: SearchProvider::Brave,
-            api_key: SecretString::from("shared-secret".to_owned()),
-            default_context_size: SearchContextSize::Medium,
-            timeout_ms: 5000,
-            max_body_bytes: 64 * 1024 * 1024,
-            base_url: None,
-            user_credential: None,
-            terminal_streaming: false,
-        };
+        let config = brave_config_with_shared_key("shared-secret");
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let identity = CalloutIdentity {
             owner: None,

@@ -285,6 +285,7 @@ impl WebSearchFilter {
     /// `Failed` outcome, both charged against the call budget — and `false`
     /// when the call was surfaced as incomplete without issuing a request
     /// (a missing query).
+    #[expect(clippy::too_many_arguments, reason = "threads the batch-resolved caller identity into the provider search")]
     async fn execute_single_search(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -327,6 +328,36 @@ impl WebSearchFilter {
         true
     }
 
+    /// Resolve the caller's identity once for the whole batch, recording a fail-closed
+    /// 401 security failure and returning `None` when a required per-user credential is absent.
+    fn resolve_batch_identity(&self, ctx: &mut HttpFilterContext<'_>) -> Option<CalloutIdentity> {
+        match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
+            Ok(identity) => Some(identity),
+            Err(CalloutContextMissing::Credential { slot }) => {
+                if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                    state.record_security_failure(DispatchFailure {
+                        status: 401,
+                        code: MISSING_CALLOUT_CONTEXT,
+                        message: format!(
+                            "web search requires the '{slot}' per-user credential, which was not provided"
+                        ),
+                    });
+                }
+                None
+            },
+        }
+    }
+
+    /// Update cumulative execution count and clear the pending queue after dispatch.
+    fn finalize_pending_searches(ctx: &mut HttpFilterContext<'_>, dispatched: usize) {
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.web_search_calls_executed = state
+                .web_search_calls_executed
+                .saturating_add(u32::try_from(dispatched).unwrap_or(u32::MAX));
+            state.web_search_calls.clear();
+        }
+    }
+
     /// Execute admitted web search `calls` up to the provider-request `budget`,
     /// then update the cumulative execution count and clear the pending queue.
     ///
@@ -338,26 +369,8 @@ impl WebSearchFilter {
     /// provider counter; a missing-query call consumes its model-call admission
     /// but does not issue a provider request.
     async fn execute_pending_searches(&self, ctx: &mut HttpFilterContext<'_>, batch: PendingSearchBatch<'_>) -> bool {
-        // Resolve the caller's identity once for the whole batch (slot is filter
-        // config; owner + credential come from ctx.extensions — nothing varies per
-        // call). A missing required per-user credential fails the response closed:
-        // record the shared security failure and return. The sole loop owner
-        // (`openai_agentic_loop`) converts `security_failure` into a 401 before the
-        // next round — no provider request is dispatched.
-        let identity = match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
-            Ok(identity) => identity,
-            Err(CalloutContextMissing::Credential { slot }) => {
-                if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-                    state.record_security_failure(DispatchFailure {
-                        status: 401,
-                        code: MISSING_CALLOUT_CONTEXT,
-                        message: format!(
-                            "web search requires the '{slot}' per-user credential, which was not provided"
-                        ),
-                    });
-                }
-                return false;
-            },
+        let Some(identity) = self.resolve_batch_identity(ctx) else {
+            return false;
         };
         let mut dispatched = 0_usize;
         let mut tool_limit_exceeded = false;
@@ -380,12 +393,7 @@ impl WebSearchFilter {
             }
         }
 
-        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-            state.web_search_calls_executed = state
-                .web_search_calls_executed
-                .saturating_add(u32::try_from(dispatched).unwrap_or(u32::MAX));
-            state.web_search_calls.clear();
-        }
+        Self::finalize_pending_searches(ctx, dispatched);
         tool_limit_exceeded
     }
 }
