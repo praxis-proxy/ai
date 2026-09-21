@@ -5,6 +5,15 @@
 //! config-static slot id, and strips the ingress headers so they never reach an upstream.
 //! Callout adapters read a slot through `stage_callout_identity`
 //! and stage a per-user credential into the nested subrequest instead of a shared provider key.
+//!
+//! # YAML
+//!
+//! ```yaml
+//! - filter: callout_credentials
+//!   credentials:
+//!     - slot: brave_search
+//!       source_header: x-user-brave-key
+//! ```
 
 use std::{borrow::Cow, collections::{BTreeMap, BTreeSet}};
 

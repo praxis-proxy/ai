@@ -13,6 +13,7 @@ mod anthropic_full_flow_agentic;
 mod anthropic_messages;
 mod anthropic_messages_native_vllm;
 mod anthropic_messages_to_openai_vllm;
+mod anthropic_web_search_scoped_credentials;
 mod aws_sigv4;
 #[cfg(feature = "azure-ad-filter")]
 mod azure_ad;
@@ -98,3 +99,4 @@ mod vector_stores_routing;
 mod vllm_agentic_api;
 mod web_search;
 mod web_search_chat_completions;
+mod web_search_scoped_credentials;
