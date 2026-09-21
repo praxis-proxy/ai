@@ -23,39 +23,54 @@ const MAX_SLOT_ID_BYTES: usize = 128;
 /// Routing/trust namespaces that must never be sourced from a client-supplied header.
 const RESERVED_SOURCE_PREFIXES: &[&str] = &["x-praxis-", "x-mcp-", "x-ext-", "x-a2a-"];
 
+/// YAML slot configuration before validation.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSlot {
+    /// Config-static slot identifier.
     id: String,
+    /// Ingress header name to read the per-user secret from.
     header: String,
+    /// Whether this slot's presence in the request is required.
     #[serde(default)]
     required: bool,
 }
 
+/// Top-level YAML configuration before validation.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    /// List of credential slots to read and validate.
     slots: Vec<RawSlot>,
 }
 
 /// A validated per-user credential slot: config-static id + the ingress header it is read from.
 #[derive(Debug, Clone)]
-#[allow(dead_code, reason = "used in Task 3 runtime behavior")]
+#[expect(dead_code, reason = "used in Task 3 runtime behavior")]
 struct CredentialSlot {
+    /// Config-static slot identifier.
     id: String,
+    /// Validated ingress header name.
     header: HeaderName,
+    /// Whether this slot's presence in the request is required.
     required: bool,
 }
 
 /// Establishing filter that captures per-user callout credentials from ingress headers.
 #[derive(Debug)]
 pub struct CalloutCredentialsFilter {
-    #[allow(dead_code, reason = "used in Task 3 runtime behavior")]
+    /// Validated credential slots.
+    #[expect(dead_code, reason = "used in Task 3 runtime behavior")]
     slots: Vec<CredentialSlot>,
 }
 
 impl CalloutCredentialsFilter {
     /// Parse and validate configuration, returning a boxed filter.
+    ///
+    /// # Errors
+    /// Returns [`FilterError`] when the config has unknown fields, no slots, more than
+    /// `MAX_SLOTS` slots, a duplicate slot id or source header, an oversized slot id, or a
+    /// source header that is reserved, hop-by-hop, framing, or uses an internal-trust prefix.
     pub fn from_config(value: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let raw: RawConfig = parse_filter_config("callout_credentials", value)?;
 
@@ -66,36 +81,7 @@ impl CalloutCredentialsFilter {
             return Err(format!("callout_credentials: too many slots (max {MAX_SLOTS})").into());
         }
 
-        let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
-        let mut seen_headers: BTreeSet<String> = BTreeSet::new();
-        let mut slots = Vec::with_capacity(raw.slots.len());
-
-        for slot in &raw.slots {
-            if slot.id.is_empty() || slot.id.len() > MAX_SLOT_ID_BYTES {
-                return Err(
-                    format!("callout_credentials: slot id must be 1..={MAX_SLOT_ID_BYTES} bytes")
-                        .into(),
-                );
-            }
-            if !seen_ids.insert(slot.id.as_str()) {
-                return Err(
-                    format!("callout_credentials: duplicate slot id `{}`", slot.id).into(),
-                );
-            }
-            let header = parse_source_header(&slot.header)?;
-            if !seen_headers.insert(header.as_str().to_owned()) {
-                return Err(
-                    format!("callout_credentials: duplicate source header `{}`", header.as_str())
-                        .into(),
-                );
-            }
-            slots.push(CredentialSlot {
-                id: slot.id.clone(),
-                header,
-                required: slot.required,
-            });
-        }
-
+        let slots = validate_slots(&raw.slots)?;
         Ok(Box::new(Self { slots }))
     }
 }
@@ -122,6 +108,41 @@ impl HttpFilter for CalloutCredentialsFilter {
     ) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
+}
+
+/// Validate raw slots into `CredentialSlot`s, rejecting duplicates and unsafe headers.
+fn validate_slots(raw: &[RawSlot]) -> Result<Vec<CredentialSlot>, FilterError> {
+    let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
+    let mut seen_headers: BTreeSet<String> = BTreeSet::new();
+    let mut slots = Vec::with_capacity(raw.len());
+
+    for slot in raw {
+        if slot.id.is_empty() || slot.id.len() > MAX_SLOT_ID_BYTES {
+            return Err(
+                format!("callout_credentials: slot id must be 1..={MAX_SLOT_ID_BYTES} bytes")
+                    .into(),
+            );
+        }
+        if !seen_ids.insert(slot.id.as_str()) {
+            return Err(
+                format!("callout_credentials: duplicate slot id `{}`", slot.id).into(),
+            );
+        }
+        let header = parse_source_header(&slot.header)?;
+        if !seen_headers.insert(header.as_str().to_owned()) {
+            return Err(
+                format!("callout_credentials: duplicate source header `{}`", header.as_str())
+                    .into(),
+            );
+        }
+        slots.push(CredentialSlot {
+            id: slot.id.clone(),
+            header,
+            required: slot.required,
+        });
+    }
+
+    Ok(slots)
 }
 
 /// Validate a configured source header: parseable, not reserved/framing/hop-by-hop, not
@@ -155,6 +176,7 @@ fn parse_source_header(raw: &str) -> Result<HeaderName, FilterError> {
 /// log (they come from static config); slot values are secret and never rendered.
 #[derive(Default, Clone)]
 pub struct CalloutCredentials {
+    /// Secret values keyed by config-static slot id.
     slots: BTreeMap<String, SecretString>,
 }
 
