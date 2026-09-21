@@ -12,13 +12,11 @@
 //! validation, TLS/SNI handling, Host binding, deadline, and response-size
 //! guardrails rather than reimplementing them per call.
 //!
-//! The adapter buffers each exchange: JSON responses are parsed directly, and
-//! `text/event-stream` responses are buffered and reparsed to their terminal
-//! JSON-RPC message. Server-initiated GET streams are not supported
-//! ([`get_stream`](StreamableHttpClient::get_stream) returns
-//! [`StreamableHttpError::ServerDoesNotSupportSse`]); this prototype covers the
-//! request/response MCP surface (initialize, notifications, `tools/list` +
-//! pagination, `tools/call`, session cleanup).
+//! Both POST→SSE (client-initiated request/response that may stream) and
+//! server-initiated GET SSE streams are supported through the filtered subrequest
+//! path. Buffered exchanges (JSON responses) are parsed directly, and streaming
+//! `text/event-stream` responses are forwarded incrementally via the SSE byte
+//! adapter.
 
 use std::{
     collections::HashMap,
@@ -74,6 +72,9 @@ const MAX_TOOL_RESULT_ENVELOPE_BYTES: usize = 65_536;
 /// escaping), applied to the configured `tools/call` result cap so the wire
 /// ceiling admits any result that fits within the decoded cap.
 const MAX_JSON_STRING_EXPANSION: usize = 6;
+
+/// Default per-event SSE payload cap used when rmcp does not supply an explicit maximum.
+const DEFAULT_MAX_SSE_EVENT_SIZE: usize = 16 * 1024 * 1024;
 
 /// Translate a configured *decoded* `tools/call` result cap into the *wire* byte
 /// ceiling to enforce before deserialization (worst-case JSON expansion plus the
@@ -541,13 +542,11 @@ impl McpSubrequestClient {
     }
 
     /// Per-event wire ceiling for a GET SSE stream (the tool-result wire cap).
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by the GET-stream path in Task 7"))]
     fn wire_cap(&self) -> usize {
         self.tool_result_bytes
     }
 
     /// Cumulative wire ceiling for a GET SSE stream.
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by the GET-stream path in Task 7"))]
     fn stream_cumulative_cap(&self) -> usize {
         self.stream_cumulative_cap
     }
@@ -698,6 +697,80 @@ impl McpSubrequestClient {
             headers.insert(session_id_header(), value);
         }
         Ok(headers)
+    }
+
+    /// Build the header map for a GET stream, injecting Accept, session-id, and
+    /// optional Last-Event-ID for resumption.
+    #[expect(
+        clippy::unused_self,
+        reason = "method form matches the get_stream_with_max_sse_event_size call site"
+    )]
+    fn build_get_stream_headers(
+        &self,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        session_id: Option<&Arc<str>>,
+        last_event_id: Option<&str>,
+    ) -> Result<HeaderMap, StreamableHttpError<McpTransportError>> {
+        let mut headers = build_request_headers(auth_header, custom_headers)?;
+        // GET SSE streams accept only text/event-stream.
+        headers.insert(http::header::ACCEPT, HeaderValue::from_static("text/event-stream"));
+        if let Some(session) = session_id {
+            let value = HeaderValue::from_str(session)
+                .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
+            headers.insert(session_id_header(), value);
+        }
+        if let Some(id) = last_event_id {
+            // Set from the rmcp-owned resumption cursor; a caller-supplied
+            // Last-Event-ID was already rejected by build_request_headers.
+            let value = HeaderValue::from_str(id)
+                .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
+            headers.insert(HEADER_LAST_EVENT_ID, value);
+        }
+        Ok(headers)
+    }
+
+    /// Classify a GET stream response into an rmcp SSE stream or a hard rejection.
+    ///
+    /// For the `200 text/event-stream` forward path, the body is moved into the
+    /// SSE adapter and ownership transfers to the returned stream. For every other
+    /// classification (405, 404, any non-SSE success), the body is cancelled
+    /// before the error is returned.
+    async fn classify_get_stream_response(
+        &self,
+        response: SubResponse,
+        body: Option<Box<dyn StreamingResponseBody>>,
+        max_sse_event_size: usize,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<McpTransportError>> {
+        let status = StatusCode::from_u16(response.status)
+            .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
+        let content_type = response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+
+        let is_sse = status.is_success() && content_type.is_some_and(is_event_stream_content_type);
+        if !is_sse {
+            // 405 / 404 / any non-SSE success: this server has no GET stream.
+            if let Some(mut body) = body {
+                // best-effort cancel; body may be None if praxis buffered.
+                body.cancel().await;
+            }
+            return Err(StreamableHttpError::ServerDoesNotSupportSse);
+        }
+
+        let Some(body) = body else {
+            // Success + SSE content type but praxis buffered: no stream to forward.
+            return Err(StreamableHttpError::ServerDoesNotSupportSse);
+        };
+
+        Ok(crate::mcp_client::sse_adapter::sse_stream_from_body(
+            body,
+            self.wire_cap(),
+            self.stream_cumulative_cap(),
+            max_sse_event_size,
+            self.signal_handle(),
+        ))
     }
 
     /// Streaming twin of [`execute`]: arms the callout for streaming and returns
@@ -888,15 +961,36 @@ impl StreamableHttpClient for McpSubrequestClient {
 
     async fn get_stream(
         &self,
-        _uri: Arc<str>,
-        _session_id: Option<Arc<str>>,
-        _last_event_id: Option<String>,
-        _auth_header: Option<String>,
-        _custom_headers: HashMap<HeaderName, HeaderValue>,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<McpTransportError>> {
-        // Server-initiated GET streams are out of scope for the buffered
-        // request/response prototype.
-        Err(StreamableHttpError::ServerDoesNotSupportSse)
+        self.get_stream_with_max_sse_event_size(
+            uri,
+            session_id,
+            last_event_id,
+            auth_header,
+            custom_headers,
+            DEFAULT_MAX_SSE_EVENT_SIZE,
+        )
+        .await
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<McpTransportError>> {
+        let headers = self.build_get_stream_headers(auth_header, custom_headers, session_id.as_ref(), last_event_id.as_deref())?;
+        let (response, body) =
+            self.execute_streaming(Method::GET, &uri, Bytes::new(), headers, self.stream_cumulative_cap()).await?;
+        self.classify_get_stream_response(response, body, max_sse_event_size).await
     }
 
     async fn post_message_with_max_sse_event_size(
@@ -1799,5 +1893,61 @@ mod tests {
         );
         let out = classify_buffered_post_response(response, &message, false).unwrap();
         assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+    }
+
+    // -- GET SSE stream path (Task 7) --
+
+    #[tokio::test]
+    async fn get_stream_forwards_event_stream() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body: Box<dyn StreamingResponseBody> =
+            Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks(
+                [Bytes::from_static(b"data: {\"jsonrpc\":\"2.0\"}\n\n")],
+                cancelled,
+            ));
+        let response = sub_response(200, Some("text/event-stream"), b"");
+        let stream = client()
+            .classify_get_stream_response(response, Some(body), 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        let mut stream = stream;
+        let first = futures::StreamExt::next(&mut stream).await.expect("event").expect("ok");
+        assert_eq!(first.data.as_deref(), Some("{\"jsonrpc\":\"2.0\"}"));
+    }
+
+    #[tokio::test]
+    async fn get_stream_405_is_no_sse_support() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body: Box<dyn StreamingResponseBody> =
+            Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks(
+                [],
+                Arc::clone(&cancelled),
+            ));
+        let response = sub_response(405, None, b"");
+        let result = client()
+            .classify_get_stream_response(response, Some(body), 16 * 1024 * 1024)
+            .await;
+        assert!(matches!(result, Err(StreamableHttpError::ServerDoesNotSupportSse)));
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst), "non-forward branch cancels the body");
+    }
+
+    #[test]
+    fn get_stream_headers_reject_caller_last_event_id() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            HeaderName::from_static("last-event-id"),
+            HeaderValue::from_static("42"),
+        );
+        let err = client().build_get_stream_headers(None, custom, None, None).unwrap_err();
+        assert!(matches!(err, StreamableHttpError::ReservedHeaderConflict(_)));
+    }
+
+    #[test]
+    fn get_stream_headers_set_internal_last_event_id() {
+        let headers = client()
+            .build_get_stream_headers(None, HashMap::new(), None, Some("99"))
+            .unwrap();
+        assert_eq!(headers.get(HEADER_LAST_EVENT_ID).unwrap(), "99");
+        assert_eq!(headers.get(http::header::ACCEPT).unwrap(), "text/event-stream");
     }
 }
