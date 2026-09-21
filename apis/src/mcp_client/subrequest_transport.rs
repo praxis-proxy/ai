@@ -795,8 +795,10 @@ impl McpSubrequestClient {
             .map(str::to_owned);
 
         if !status.is_success() {
-            // F5: drain (and discard) the streaming body so the transport is not
-            // left holding an open connection, then surface a status error.
+            // Streaming path: drain and fail without parsing a JSON-RPC error. The
+            // buffered path extracts a structured error from response.body, but here
+            // that would require buffering the entire response just to classify the
+            // failure — fail fast on the HTTP status instead.
             drain_body(&mut body).await;
             return Err(StreamableHttpError::UnexpectedServerResponse(
                 format!("HTTP {status}").into(),
@@ -1044,6 +1046,7 @@ async fn collect_body(body: &mut Box<dyn StreamingResponseBody>) -> Bytes {
     while let Ok(Some(chunk)) = body.next_chunk().await {
         buf.extend_from_slice(&chunk);
     }
+    body.cancel().await;
     buf.freeze()
 }
 
@@ -1759,6 +1762,25 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, StreamableHttpError::AuthRequired(_)));
         assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn streaming_post_buffers_and_cancels_json_body() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body = Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks(
+            [Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#)],
+            Arc::clone(&cancelled),
+        ));
+        let response = sub_response(200, Some("application/json"), b"");
+        let out = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "collect_body must cancel after buffering"
+        );
     }
 
     #[test]
