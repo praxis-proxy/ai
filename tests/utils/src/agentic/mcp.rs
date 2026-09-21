@@ -11,6 +11,7 @@
 //! [mcp]: https://spec.modelcontextprotocol.io/
 
 use std::{
+    io::Write as _,
     net::TcpStream,
     sync::{
         Arc, Mutex,
@@ -69,6 +70,14 @@ pub struct McpMockConfig {
     /// filter surfaces a failed `mcp_call`. Tools not listed
     /// here succeed as usual.
     pub failing_tools: Vec<String>,
+
+    /// Emit `tools/call` responses as `text/event-stream` (a single terminal
+    /// `data:` frame) instead of `application/json`.
+    pub sse_tool_results: bool,
+
+    /// When `Some(n)`, pad the SSE `tools/call` result body to at least `n`
+    /// bytes so the transport's wire ceiling rejects it (413 scenario).
+    pub oversized_sse_bytes: Option<usize>,
 }
 
 impl Default for McpMockConfig {
@@ -80,6 +89,8 @@ impl Default for McpMockConfig {
             stateful_sessions: true,
             tools: vec![McpToolFixture::new("echo")],
             failing_tools: Vec::new(),
+            sse_tool_results: false,
+            oversized_sse_bytes: None,
         }
     }
 }
@@ -480,6 +491,8 @@ fn handle_tools_call(stream: &mut TcpStream, config: &McpMockConfig, id: &Option
         write_unknown_tool_error(stream, id);
     } else if config.failing_tools.iter().any(|t| t == &name) {
         write_failing_tool_result(stream, id, &name);
+    } else if config.sse_tool_results {
+        write_known_tool_result_sse(stream, id, &name, config.oversized_sse_bytes);
     } else {
         write_known_tool_result(stream, id, &name);
     }
@@ -606,6 +619,40 @@ fn write_known_tool_result(stream: &mut TcpStream, id: &Option<Value>, name: &st
         &[("Content-Type", "application/json".to_owned())],
         &body,
     );
+}
+
+/// Successful `tools/call` content result emitted as SSE.
+fn write_known_tool_result_sse(stream: &mut TcpStream, id: &Option<Value>, name: &str, oversized_bytes: Option<usize>) {
+    let mut result = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{"type": "text", "text": format!("mock result for {name}")}],
+            "isError": false,
+        }
+    });
+
+    // Pad the result if oversized_bytes is set to trigger transport's wire ceiling
+    if let Some(n) = oversized_bytes {
+        let current_len = result.to_string().len();
+        if current_len < n {
+            result["result"]["_padding"] = json!("x".repeat(n - current_len));
+        }
+    }
+
+    let sse_body = format!("data: {result}\n\n");
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/event-stream\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: close\r\n\
+         Content-Length: {}\r\n\
+         \r\n\
+         {sse_body}",
+        sse_body.len()
+    );
+
+    let _sent = stream.write_all(resp.as_bytes());
 }
 
 /// `tools/call` content result flagged `isError: true`, so the dispatch filter
