@@ -1,4 +1,5 @@
 # Responses API to Chat Completions with reasoning translation
+# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
 #
 # Same pipeline as responses-to-chat-completions.yaml, but targets a vLLM
 # backend that returns raw reasoning in choices[].message.reasoning. The reasoning
@@ -44,6 +45,10 @@ filter_chains:
           stream: x-praxis-ai-stream
 
       - filter: openai_responses_validate
+
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
 
       - filter: openai_response_store
         backend: sqlite
