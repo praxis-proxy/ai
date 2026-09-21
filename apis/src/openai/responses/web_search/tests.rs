@@ -185,7 +185,7 @@ fn parse_search_request_prefers_current_field_and_rejects_invalid_current_field(
     let both = serde_json::json!({
         "action": {"query": "legacy", "queries": ["current one", "current two"]}
     });
-    let current = parse_search_request(&both, "ws_both").unwrap();
+    let current = parse_search_request(&both, "ws_both", 0).unwrap();
     assert_eq!(current.queries, ["current one", "current two"]);
     assert_eq!(
         current.action,
@@ -193,13 +193,13 @@ fn parse_search_request_prefers_current_field_and_rejects_invalid_current_field(
     );
 
     let legacy = serde_json::json!({"action": {"query": "legacy"}});
-    let legacy = parse_search_request(&legacy, "ws_legacy").unwrap();
+    let legacy = parse_search_request(&legacy, "ws_legacy", 0).unwrap();
     assert_eq!(legacy.queries, ["legacy"]);
     assert_eq!(legacy.action, serde_json::json!({"type": "search", "query": "legacy"}));
 
     let invalid_current = serde_json::json!({"action": {"query": "legacy", "queries": []}});
     assert!(
-        parse_search_request(&invalid_current, "ws_invalid").is_none(),
+        parse_search_request(&invalid_current, "ws_invalid", 0).is_none(),
         "a present but invalid queries field must not fall back to query"
     );
 }

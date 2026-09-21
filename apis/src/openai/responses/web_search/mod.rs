@@ -79,8 +79,8 @@ const TOOL_LIMIT_OUTPUT: &str = "Web search was not executed because max_tool_ca
 
 /// Borrowed inputs for one request-side web-search dispatch batch.
 struct PendingSearchBatch<'a> {
-    /// Calls retained from the current model round.
-    calls: &'a [Value],
+    /// Calls retained from the current model round, parsed once.
+    calls: Vec<PreparedCall<'a>>,
     /// Ordered response-wide budget decisions, when the client set a limit.
     admissions: Option<&'a [bool]>,
     /// Remaining built-in tool calls allowed by the client's `max_tool_calls`.
@@ -91,15 +91,51 @@ struct PendingSearchBatch<'a> {
     context_size: SearchContextSize,
 }
 
-/// A normalized hosted search action ready for dispatch.
+/// One pending call, with its hosted action parsed a single time for the whole
+/// batch.
 ///
-/// The owned action is moved into the public output item after the bridge has
-/// serialized its arguments; no query data is cloned between those paths.
-struct SearchRequest<'a> {
-    /// Queries in provider-supplied order.
+/// Every dispatch outcome — executed, rejected, over-budget, or malformed —
+/// reads this one parse, so a call is never re-parsed per branch. The owned
+/// action is moved into the public output item after the bridge has serialized
+/// its arguments; no query data is cloned between those paths.
+///
+/// An empty `queries` marks a malformed call: a parsed action always yields at
+/// least one query, so the vector doubles as the validity signal.
+struct PreparedCall<'a> {
+    /// Identities derived from this call's id, queries, and round position.
+    ids: SearchCallIds<'a>,
+    /// Queries in provider-supplied order; empty when the call is malformed.
     queries: Vec<&'a str>,
-    /// Canonical client-visible search action.
+    /// Canonical client-visible search action; `Null` when the call is malformed.
     action: Value,
+}
+
+impl<'a> PreparedCall<'a> {
+    /// Pair a parsed action with the identities its queries and position derive.
+    fn new(call_id: &'a str, index: usize, queries: Vec<&'a str>, action: Value) -> Self {
+        Self {
+            ids: SearchCallIds::new(call_id, &queries, index),
+            queries,
+            action,
+        }
+    }
+
+    /// Placeholder for a call carrying no usable `action.queries` or `action.query`.
+    fn malformed(call_id: &'a str, index: usize) -> Self {
+        Self::new(call_id, index, Vec::new(), Value::Null)
+    }
+}
+
+/// Parse each pending call once, preserving pending-queue order.
+fn prepare_calls(calls: &[Value]) -> Vec<PreparedCall<'_>> {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
+            parse_search_request(call, call_id, index).unwrap_or_else(|| PreparedCall::malformed(call_id, index))
+        })
+        .collect()
 }
 
 // -----------------------------------------------------------------------------
@@ -208,56 +244,42 @@ impl WebSearchFilter {
     /// message — bridged as a backend-valid `function_call`/`function_call_output`
     /// pair — so the agentic loop can continue.
     ///
-    /// `index` is the call's position within the pending queue. It keeps the
-    /// synthetic bridge `call_id` unique even when the hosted source ids
-    /// collide or are absent (issue #808).
+    /// The call's identities carry its position within the pending queue, which
+    /// keeps the synthetic bridge `call_id` unique even when the hosted source
+    /// ids collide or are absent (issue #808).
     ///
     /// Returns how many queries were dispatched.
     async fn execute_single_search(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        call: &Value,
-        index: usize,
+        prepared: PreparedCall<'_>,
         context_size: SearchContextSize,
         query_allowance: usize,
     ) -> usize {
-        let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
-        let Some(request) = parse_search_request(call, call_id) else {
-            warn!(
-                call_id,
-                "web_search_call missing valid action.queries or action.query, skipping"
-            );
-            let bridge = bridge_call_id(call_id, &[], index);
-            let ids = SearchCallIds::new(call_id, &bridge, index);
-            append_incomplete(ctx, &ids);
-            return 0;
-        };
-
-        let bridge = bridge_call_id(call_id, &request.queries, index);
-        let ids = SearchCallIds::new(call_id, &bridge, index);
+        let PreparedCall { ids, queries, action } = prepared;
         let mut results = Vec::new();
         let mut dispatched = 0_usize;
-        for query in request.queries.iter().take(query_allowance) {
+        for query in queries.iter().take(query_allowance) {
             dispatched = dispatched.saturating_add(1);
             match self.search_client.search(query, Some(context_size)).await {
                 SearchOutcome::Results(mut query_results) => results.append(&mut query_results),
                 SearchOutcome::Failed => {
                     warn!(
-                        call_id,
+                        call_id = ids.public,
                         "web search provider failed; continuing with a failed tool result"
                     );
                     let status = if results.is_empty() { "failed" } else { "incomplete" };
-                    append_search_turn(ctx, &ids, status, request, &results, SEARCH_UNAVAILABLE);
+                    append_search_turn(ctx, &ids, status, action, &results, SEARCH_UNAVAILABLE);
                     return dispatched;
                 },
             }
         }
-        let status = if dispatched == request.queries.len() {
+        let status = if dispatched == queries.len() {
             "completed"
         } else {
             "incomplete"
         };
-        append_search_turn(ctx, &ids, status, request, &results, "Web search not performed.");
+        append_search_turn(ctx, &ids, status, action, &results, "Web search not performed.");
         dispatched
     }
 
@@ -269,28 +291,46 @@ impl WebSearchFilter {
     /// A call that can spend neither a tool-call unit nor a single provider
     /// request is surfaced as incomplete without reaching the provider; a call
     /// that gets only part of its queries is dispatched and reported incomplete
-    /// with the results it obtained.
+    /// with the results it obtained. A call whose action carries no usable
+    /// query is surfaced as incomplete on every path, since neither rejection
+    /// nor a budget has anything to dispatch.
     async fn execute_pending_searches(&self, ctx: &mut HttpFilterContext<'_>, batch: PendingSearchBatch<'_>) -> bool {
         let mut calls_dispatched = 0_usize;
         let mut queries_dispatched = 0_usize;
         let mut tool_limit_exceeded = false;
-        for (index, call) in batch.calls.iter().enumerate() {
-            if batch
+        for prepared in batch.calls {
+            let rejected = batch
                 .admissions
-                .and_then(|values| values.get(index))
-                .is_some_and(|admitted| !admitted)
-            {
-                append_tool_limit_exceeded(ctx, call, index);
+                .and_then(|values| values.get(prepared.ids.index))
+                .is_some_and(|admitted| !admitted);
+            if prepared.queries.is_empty() {
+                warn!(
+                    call_id = prepared.ids.public,
+                    "web_search_call missing valid action.queries or action.query, skipping"
+                );
+                append_incomplete(ctx, &prepared.ids);
+                tool_limit_exceeded |= rejected;
+                continue;
+            }
+            if rejected {
+                append_search_turn(ctx, &prepared.ids, "failed", prepared.action, &[], TOOL_LIMIT_OUTPUT);
                 tool_limit_exceeded = true;
                 continue;
             }
             let query_allowance = batch.query_budget.saturating_sub(queries_dispatched);
             if calls_dispatched >= batch.call_budget || query_allowance == 0 {
-                append_excess_incomplete(ctx, call, index);
+                append_search_turn(
+                    ctx,
+                    &prepared.ids,
+                    "incomplete",
+                    prepared.action,
+                    &[],
+                    "Web search not performed.",
+                );
                 continue;
             }
             let dispatched = self
-                .execute_single_search(ctx, call, index, batch.context_size, query_allowance)
+                .execute_single_search(ctx, prepared, batch.context_size, query_allowance)
                 .await;
             if dispatched > 0 {
                 calls_dispatched = calls_dispatched.saturating_add(1);
@@ -380,10 +420,14 @@ impl HttpFilter for WebSearchFilter {
             .map(|state| mem::take(&mut state.web_search_calls))
             .unwrap_or_default();
 
-        let execute_count = admissions.as_ref().map_or(calls.len(), |values| {
+        // Parse each pending action once here; every dispatch branch below
+        // reuses the same parse instead of re-reading the raw call.
+        let prepared = prepare_calls(&calls);
+
+        let execute_count = admissions.as_ref().map_or(prepared.len(), |values| {
             values.iter().filter(|admitted| **admitted).count()
         });
-        let rejected_count = calls.len().saturating_sub(execute_count);
+        let rejected_count = prepared.len().saturating_sub(execute_count);
         debug!(
             count = execute_count,
             rejected = rejected_count,
@@ -394,7 +438,7 @@ impl HttpFilter for WebSearchFilter {
             .execute_pending_searches(
                 ctx,
                 PendingSearchBatch {
-                    calls: &calls,
+                    calls: prepared,
                     admissions: admissions.as_deref(),
                     call_budget,
                     query_budget: MAX_WEB_SEARCH_QUERIES_PER_CONTINUATION,
@@ -433,7 +477,7 @@ fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
 /// than the one the provider supplied. When both forms are valid, `query` is
 /// intentionally not appended to the current array, preventing duplicate
 /// dispatch of the same search.
-fn parse_search_request<'a>(call: &'a Value, call_id: &str) -> Option<SearchRequest<'a>> {
+fn parse_search_request<'a>(call: &'a Value, call_id: &'a str, index: usize) -> Option<PreparedCall<'a>> {
     let action = call.get("action")?;
     let legacy_query = action.get("query").and_then(Value::as_str);
     match action.get("queries") {
@@ -445,15 +489,13 @@ fn parse_search_request<'a>(call: &'a Value, call_id: &str) -> Option<SearchRequ
                     "web_search_call contains deprecated action.query and action.queries; using action.queries"
                 );
             }
-            Some(SearchRequest {
-                action: serde_json::json!({"type": "search", "queries": queries}),
-                queries,
-            })
+            let action = serde_json::json!({"type": "search", "queries": queries});
+            Some(PreparedCall::new(call_id, index, queries, action))
         },
         Some(_) => None,
-        None => legacy_query.map(|query| SearchRequest {
-            queries: vec![query],
-            action: serde_json::json!({"type": "search", "query": query}),
+        None => legacy_query.map(|query| {
+            let action = serde_json::json!({"type": "search", "query": query});
+            PreparedCall::new(call_id, index, vec![query], action)
         }),
     }
 }
@@ -465,19 +507,25 @@ fn parse_search_request<'a>(call: &'a Value, call_id: &str) -> Option<SearchRequ
 /// backend-valid `function_call`/`function_call_output` pair, since the raw
 /// hosted id can exceed the `OpenResponses` 64-character `call_id` limit (issue
 /// #808).
+///
+/// Owned by the [`PreparedCall`] it identifies, so both derive from one parse.
 struct SearchCallIds<'a> {
     /// Client-facing `web_search_call.id` for the public output item.
     public: &'a str,
     /// Bounded, backend-valid id for the synthetic bridge pair.
-    bridge: &'a str,
+    bridge: String,
     /// Position within the current model round.
     index: usize,
 }
 
 impl<'a> SearchCallIds<'a> {
-    /// Pair one provider-facing ID with its bounded bridge ID and round position.
-    fn new(public: &'a str, bridge: &'a str, index: usize) -> Self {
-        Self { public, bridge, index }
+    /// Derive the bounded bridge ID for one provider-facing ID and round position.
+    fn new(public: &'a str, queries: &[&str], index: usize) -> Self {
+        Self {
+            public,
+            bridge: bridge_call_id(public, queries, index),
+            index,
+        }
     }
 }
 
@@ -505,25 +553,6 @@ fn remaining_web_search_budget(state: &ResponsesState) -> usize {
     })
 }
 
-/// Surface an over-budget web search call as incomplete without dispatching.
-///
-/// Preserves the requested query in the output item so the model can see which
-/// search was declined, matching the missing-query incomplete shape. No
-/// provider request is issued, so no budget is charged. `index` keeps the
-/// bridge `call_id` unique, mirroring [`WebSearchFilter::execute_single_search`].
-fn append_excess_incomplete(ctx: &mut HttpFilterContext<'_>, call: &Value, index: usize) {
-    let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
-    let Some(request) = parse_search_request(call, call_id) else {
-        let bridge = bridge_call_id(call_id, &[], index);
-        let ids = SearchCallIds::new(call_id, &bridge, index);
-        append_incomplete(ctx, &ids);
-        return;
-    };
-    let bridge = bridge_call_id(call_id, &request.queries, index);
-    let ids = SearchCallIds::new(call_id, &bridge, index);
-    append_search_turn(ctx, &ids, "incomplete", request, &[], "Web search not performed.");
-}
-
 /// Append a completed search turn to [`ResponsesState`].
 ///
 /// An empty `results` slice is a successful zero-result search: the model
@@ -538,13 +567,13 @@ fn append_search_turn(
     ctx: &mut HttpFilterContext<'_>,
     ids: &SearchCallIds<'_>,
     status: &str,
-    request: SearchRequest<'_>,
+    action: Value,
     results: &[SearchResult],
     failure_output: &'static str,
 ) {
     let include_sources = include_action_sources(ctx);
-    let bridge = build_tool_result_messages(ids.bridge, status, &request.action, results, failure_output);
-    let output_item = build_output_item(ids.public, status, request.action, results, include_sources);
+    let bridge = build_tool_result_messages(&ids.bridge, status, &action, results, failure_output);
+    let output_item = build_output_item(ids.public, status, action, results, include_sources);
     push_search_turn(ctx, output_item, bridge, ids.index);
 }
 
@@ -563,22 +592,8 @@ fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
         &[],
         include_sources,
     );
-    let bridge = build_incomplete_tool_result_messages(ids.bridge);
+    let bridge = build_incomplete_tool_result_messages(&ids.bridge);
     push_search_turn(ctx, output_item, bridge, ids.index);
-}
-
-/// Append a bounded failure for a call rejected by `max_tool_calls`.
-fn append_tool_limit_exceeded(ctx: &mut HttpFilterContext<'_>, call: &Value, index: usize) {
-    let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
-    let Some(request) = parse_search_request(call, call_id) else {
-        let bridge = bridge_call_id(call_id, &[], index);
-        let ids = SearchCallIds::new(call_id, &bridge, index);
-        append_incomplete(ctx, &ids);
-        return;
-    };
-    let bridge = bridge_call_id(call_id, &request.queries, index);
-    let ids = SearchCallIds::new(call_id, &bridge, index);
-    append_search_turn(ctx, &ids, "failed", request, &[], TOOL_LIMIT_OUTPUT);
 }
 
 /// Whether `action.sources` should be included in output items, per the
