@@ -1,0 +1,31 @@
+version: 1
+id: responses/background-unsupported
+description: Praxis rejects unsupported Responses background mode before contacting a native backend.
+protocol: openai_responses
+example_config: openai/responses/request-validate.yaml
+upstream_authority: 127.0.0.1:8000
+features:
+  - responses.request.background_unsupported
+turns:
+  - name: background
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Run this later.
+          background: true
+          store: false
+          stream: true
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []

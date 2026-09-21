@@ -340,7 +340,7 @@ async fn promotes_metadata_for_full_responses_request() {
         ctx.filter_metadata
             .get("openai_responses_format.background")
             .map(String::as_str),
-        Some("true")
+        Some("false")
     );
     assert_eq!(
         ctx.filter_metadata
@@ -383,7 +383,7 @@ async fn promotes_filter_results_for_full_responses_request() {
     assert_eq!(results.get("model"), Some("gpt-4.1"));
     assert_eq!(results.get("stream"), Some("true"));
     assert_eq!(results.get("store"), Some("false"));
-    assert_eq!(results.get("background"), Some("true"));
+    assert_eq!(results.get("background"), Some("false"));
     assert_eq!(results.get("has_previous_response_id"), Some("true"));
     assert_eq!(results.get("has_conversation"), Some("true"));
     assert_eq!(results.get("has_tools"), Some("true"));
@@ -937,11 +937,20 @@ async fn mode_stateful_when_tools_present() {
 }
 
 #[tokio::test]
-async fn mode_stateful_when_background_true() {
-    let ctx = run_filter("{}", r#"{"input":"test","store":false,"background":true}"#).await;
-    let results = ctx.filter_results.get("openai_responses_format").unwrap();
-
-    assert_eq!(results.get("mode"), Some("stateful"));
+async fn background_true_is_rejected_even_when_invalid_formats_continue() {
+    let action = run_filter_raw(
+        "on_invalid: continue",
+        r#"{"input":"test","store":false,"background":true}"#,
+    )
+    .await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("background=true should be rejected before routing");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["code"], "invalid_request_error");
+    assert_eq!(body["error"]["message"], "background mode is not supported");
 }
 
 #[tokio::test]
@@ -1034,7 +1043,7 @@ async fn mode_header_suppressed_when_null() {
 // -----------------------------------------------------------------------------
 
 /// Full Responses body with all optional fields for promotion tests.
-const FULL_RESPONSES_BODY: &str = r#"{"model":"gpt-4.1","input":"test","stream":true,"store":false,"background":true,"previous_response_id":"resp_abc","conversation":{"id":"conv_1"},"tools":[{"type":"function"}],"prompt":{"id":"pmpt_123"}}"#;
+const FULL_RESPONSES_BODY: &str = r#"{"model":"gpt-4.1","input":"test","stream":true,"store":false,"background":false,"previous_response_id":"resp_abc","conversation":{"id":"conv_1"},"tools":[{"type":"function"}],"prompt":{"id":"pmpt_123"}}"#;
 
 /// Run the filter's `on_request_body` and return the resulting context.
 async fn run_filter(config_yaml: &str, body_str: &str) -> HttpFilterContext<'static> {

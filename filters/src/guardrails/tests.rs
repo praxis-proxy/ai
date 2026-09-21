@@ -42,6 +42,16 @@ phase:
     AiGuardrailsFilter::from_config(&yaml).unwrap()
 }
 
+/// Mount a `POST /v1/checks` mock response on the given server.
+async fn mount_nemo_checks_response(mock_server: &wiremock::MockServer, response: serde_json::Value) {
+    use wiremock::{Mock, ResponseTemplate, matchers::method};
+
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .mount(mock_server)
+        .await;
+}
+
 /// A valid OpenAI Chat Completion response body for testing.
 fn chat_completion_response(content: &str) -> bytes::Bytes {
     bytes::Bytes::from(
@@ -110,6 +120,10 @@ fn as_rejection(action: praxis_filter::FilterAction) -> praxis_filter::Rejection
     .unwrap()
 }
 
+fn guardrails_status<'a>(ctx: &'a praxis_filter::HttpFilterContext<'a>) -> Option<&'a str> {
+    ctx.filter_results.get("ai_guardrails")?.get("status")
+}
+
 // =============================================================================
 // General config
 // =============================================================================
@@ -120,7 +134,7 @@ fn valid_config_creates_filter() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
 "#,
     )
     .unwrap();
@@ -135,7 +149,7 @@ fn valid_config_with_all_fields() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
   timeout_ms: 3000
 phase:
   request: true
@@ -149,12 +163,32 @@ phase:
 }
 
 #[test]
+fn empty_nemo_config_ids_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://nemo:8000/v1/checks"
+  guardrails:
+    config_ids: []
+"#,
+    )
+    .unwrap();
+
+    let error = AiGuardrailsFilter::from_config(&yaml).err().unwrap();
+    assert_eq!(
+        error.to_string(),
+        "ai_guardrails (nemo): 'guardrails.config_ids' must not be empty; omit 'guardrails' to use the service default"
+    );
+}
+
+#[test]
 fn nemo_private_endpoint_requires_explicit_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 provider:
   type: nemo
-  endpoint: "http://127.0.0.1:8000/v1/guardrail/checks"
+  endpoint: "http://127.0.0.1:8000/v1/checks"
 "#,
     )
     .unwrap();
@@ -171,7 +205,7 @@ fn phase_response_true_accepted() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
 phase:
   response: true
 "#,
@@ -217,7 +251,7 @@ fn unknown_field_rejected() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
 unexpected_field: true
 "#,
     )
@@ -242,7 +276,7 @@ fn registry_creates_filter_by_name() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
 "#,
     )
     .unwrap();
@@ -290,7 +324,7 @@ fn nemo_zero_timeout_rejected() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
   timeout_ms: 0
 "#,
     )
@@ -298,6 +332,22 @@ provider:
 
     let result = AiGuardrailsFilter::from_config(&yaml);
     assert!(result.is_err(), "zero timeout should fail");
+}
+
+#[test]
+fn nemo_zero_max_message_checks_rejected() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://nemo:8000/v1/checks"
+  max_message_checks: 0
+"#,
+    )
+    .unwrap();
+
+    let result = AiGuardrailsFilter::from_config(&yaml);
+    assert!(result.is_err(), "zero max_message_checks should fail");
 }
 
 // =============================================================================
@@ -310,7 +360,7 @@ fn body_access_is_read_write() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
 "#,
     )
     .unwrap();
@@ -325,7 +375,7 @@ fn body_mode_is_stream_buffer() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
 "#,
     )
     .unwrap();
@@ -346,7 +396,7 @@ async fn on_request_continues() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
 "#,
     )
     .unwrap();
@@ -368,11 +418,14 @@ async fn on_request_body_passes_through() {
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "success"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "passed",
+            "content": "hello"
+        })))
         .mount(&mock_server)
         .await;
 
-    let endpoint = format!("{}/v1/guardrail/checks", mock_server.uri());
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
     let filter = nemo_filter(&endpoint);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -383,7 +436,7 @@ async fn on_request_body_passes_through() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(
         matches!(action, praxis_filter::FilterAction::Continue),
-        "nemo provider should pass through when status is 'success'"
+        "nemo provider should pass through when status is 'passed'"
     );
     assert_eq!(
         ctx.filter_results.get("ai_guardrails").unwrap().get("status"),
@@ -393,60 +446,131 @@ async fn on_request_body_passes_through() {
 }
 
 #[tokio::test]
-async fn on_request_body_blocked_writes_filter_results() {
+async fn on_request_body_checks_each_user_message() {
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "status": "blocked",
-            "rails_status": {"toxicity": {"status": "blocked"}}
+            "status": "passed",
+            "content": "ok"
+        })))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
+    let filter = nemo_filter(&endpoint);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"messages":[
+            {"role":"user","content":"first"},
+            {"role":"assistant","content":"reply"},
+            {"role":"user","content":"second"}
+        ]}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    mock_server.verify().await;
+}
+
+#[tokio::test]
+async fn on_request_body_exceeding_max_message_checks_fails_closed() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+provider:
+  type: nemo
+  endpoint: "http://nemo:8000/v1/checks"
+  allow_private_endpoint: true
+  max_message_checks: 1
+"#,
+    )
+    .unwrap();
+    let filter = AiGuardrailsFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"messages":[
+            {"role":"user","content":"first"},
+            {"role":"user","content":"second"}
+        ]}"#,
+    ));
+
+    let err_msg = format!(
+        "{}",
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap_err()
+    );
+    assert!(
+        err_msg.contains("max_message_checks"),
+        "expected max_message_checks failure, got: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_modified_records_redacted_and_forwards_unchanged() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "modified",
+            "content": "masked text"
         })))
         .mount(&mock_server)
         .await;
 
-    let endpoint = format!("{}/v1/guardrail/checks", mock_server.uri());
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
     let filter = nemo_filter(&endpoint);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let original = br#"{"messages":[{"role":"user","content":"my email is secret@example.com"}]}"#;
+    let mut body = Some(bytes::Bytes::from_static(original));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    assert_eq!(
+        ctx.filter_results.get("ai_guardrails").unwrap().get("status"),
+        Some("redacted")
+    );
+    assert_eq!(body.as_deref(), Some(bytes::Bytes::from_static(original).as_ref()));
+}
+
+#[tokio::test]
+async fn on_request_body_blocked_writes_filter_results() {
+    use wiremock::MockServer;
+
+    let mock_server = MockServer::start().await;
+    mount_nemo_checks_response(
+        &mock_server,
+        serde_json::json!({"status": "blocked", "content": "blocked", "rail": "toxicity"}),
+    )
+    .await;
+
+    let filter = nemo_filter(&format!("{}/v1/checks", mock_server.uri()));
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(bytes::Bytes::from_static(
         br#"{"messages":[{"role":"user","content":"hello"}]}"#,
     ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    let rejection = as_rejection(action);
-    assert_eq!(rejection.status, 403, "blocked verdict should reject with HTTP 403");
-    let rejection_body = rejection.body.unwrap();
-    let body_text = String::from_utf8_lossy(&rejection_body);
-    assert!(
-        body_text.contains("toxicity"),
-        "rejection body should include the blocked rail name, got: {body_text}"
-    );
-    assert_eq!(
-        ctx.filter_results.get("ai_guardrails").unwrap().get("status"),
-        Some("blocked"),
-        "verdict should be written to filter_results even when the request is rejected"
-    );
+    let rejection = as_rejection(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert_eq!(rejection.status, 403);
+    assert!(String::from_utf8_lossy(&rejection.body.unwrap()).contains("toxicity"));
+    assert_eq!(guardrails_status(&ctx), Some("blocked"));
 }
 
 #[tokio::test]
-async fn on_request_body_error_status_fails_closed() {
+async fn on_request_body_provider_http_error_fails_closed() {
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "status": "error",
-            "rails_status": {},
-            "guardrails_data": {
-                "error": "Could not load guardrails configuration.",
-                "details": "Invalid config path."
-            }
-        })))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
         .mount(&mock_server)
         .await;
 
-    let endpoint = format!("{}/v1/guardrail/checks", mock_server.uri());
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
     let filter = nemo_filter(&endpoint);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -457,7 +581,7 @@ async fn on_request_body_error_status_fails_closed() {
     let result = filter.on_request_body(&mut ctx, &mut body, true).await;
     assert!(
         result.is_err(),
-        "NeMo error status should fail closed rather than pass through"
+        "a non-2xx response from the provider should fail closed rather than pass through"
     );
 }
 
@@ -466,7 +590,7 @@ async fn on_request_body_not_end_of_stream_continues_without_evaluating() {
     // The endpoint is unreachable in this test environment, so
     // the call to the provider would fail and return a `FilterError`.
     //  A `Continue` here proves evaluation was skipped entirely.
-    let filter = nemo_filter("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(bytes::Bytes::from_static(
@@ -486,7 +610,7 @@ async fn on_request_body_phase_request_disabled_skips_evaluation() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
 phase:
   request: false
 "#,
@@ -512,7 +636,7 @@ phase:
 
 #[tokio::test]
 async fn on_request_body_none_continues_without_evaluating() {
-    let filter = nemo_filter("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = None;
@@ -526,7 +650,7 @@ async fn on_request_body_none_continues_without_evaluating() {
 
 #[tokio::test]
 async fn on_request_body_empty_continues_without_evaluating() {
-    let filter = nemo_filter("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(bytes::Bytes::new());
@@ -544,7 +668,7 @@ async fn on_request_body_empty_continues_without_evaluating() {
 
 #[tokio::test]
 async fn on_request_body_invalid_json_rejected() {
-    let filter = nemo_filter("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(bytes::Bytes::from_static(b"not json"));
@@ -558,7 +682,7 @@ async fn on_request_body_invalid_json_rejected() {
 
 #[tokio::test]
 async fn on_request_body_missing_messages_key_rejected() {
-    let filter = nemo_filter("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(bytes::Bytes::from_static(br#"{"model":"test"}"#));
@@ -572,7 +696,7 @@ async fn on_request_body_missing_messages_key_rejected() {
 
 #[tokio::test]
 async fn on_request_body_messages_not_array_rejected() {
-    let filter = nemo_filter("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(bytes::Bytes::from_static(br#"{"messages":"hello"}"#));
@@ -585,16 +709,19 @@ async fn on_request_body_messages_not_array_rejected() {
 }
 
 #[tokio::test]
-async fn on_request_body_empty_messages_array_still_evaluated() {
+async fn on_request_body_empty_messages_array_passes_without_provider_call() {
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "success"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "passed",
+            "content": ""
+        })))
         .mount(&mock_server)
         .await;
 
-    let endpoint = format!("{}/v1/guardrail/checks", mock_server.uri());
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
     let filter = nemo_filter(&endpoint);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -603,7 +730,11 @@ async fn on_request_body_empty_messages_array_still_evaluated() {
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(
         matches!(action, praxis_filter::FilterAction::Continue),
-        "an empty (but well-formed) messages array is a recognized body shape and should still be sent to the provider, not treated as fail-closed"
+        "an empty messages array has no user turns to evaluate and should pass without calling the provider"
+    );
+    assert!(
+        mock_server.received_requests().await.unwrap().is_empty(),
+        "provider should not be called when there are no user messages to evaluate"
     );
 }
 
@@ -621,7 +752,7 @@ async fn on_request_body_nemo_non_2xx_rejected() {
         .mount(&mock_server)
         .await;
 
-    let endpoint = format!("{}/v1/guardrail/checks", mock_server.uri());
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
     let filter = nemo_filter(&endpoint);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -646,7 +777,7 @@ async fn on_request_body_nemo_invalid_json_response_rejected() {
         .mount(&mock_server)
         .await;
 
-    let endpoint = format!("{}/v1/guardrail/checks", mock_server.uri());
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
     let filter = nemo_filter(&endpoint);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -729,7 +860,7 @@ fn guardrails_config_minimal_valid() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
 "#,
     )
     .unwrap();
@@ -749,7 +880,7 @@ fn guardrails_config_unknown_field_rejected() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
 bogus: true
 "#,
     );
@@ -762,7 +893,7 @@ fn guardrails_config_with_phase_overrides() {
         r#"
 provider:
   type: nemo
-  endpoint: "http://nemo:8000/v1/guardrail/checks"
+  endpoint: "http://nemo:8000/v1/checks"
 phase:
   request: false
   response: true
@@ -847,7 +978,7 @@ fn fit_to_committed_length_none_body_returns_empty() {
 
 #[test]
 fn response_body_access_none_when_phase_disabled() {
-    let filter = nemo_filter("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter("http://nemo:8000/v1/checks");
     assert_eq!(
         filter.response_body_access(),
         praxis_filter::body::BodyAccess::None,
@@ -857,7 +988,7 @@ fn response_body_access_none_when_phase_disabled() {
 
 #[test]
 fn response_body_access_read_write_when_phase_enabled() {
-    let filter = nemo_filter_response("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     assert_eq!(
         filter.response_body_access(),
         praxis_filter::body::BodyAccess::ReadWrite,
@@ -871,7 +1002,7 @@ fn response_body_access_read_write_when_phase_enabled() {
 
 #[test]
 fn on_response_body_not_end_of_stream_continues() {
-    let filter = nemo_filter_response("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(chat_completion_response("hello"));
@@ -885,7 +1016,7 @@ fn on_response_body_not_end_of_stream_continues() {
 
 #[test]
 fn on_response_body_phase_disabled_skips_evaluation() {
-    let filter = nemo_filter("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(chat_completion_response("hello"));
@@ -903,7 +1034,7 @@ fn on_response_body_phase_disabled_skips_evaluation() {
 
 #[test]
 fn on_response_body_none_continues() {
-    let filter = nemo_filter_response("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = None;
@@ -917,7 +1048,7 @@ fn on_response_body_none_continues() {
 
 #[test]
 fn on_response_body_empty_continues() {
-    let filter = nemo_filter_response("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(bytes::Bytes::new());
@@ -931,7 +1062,7 @@ fn on_response_body_empty_continues() {
 
 #[tokio::test]
 async fn on_response_sse_does_not_upgrade_to_stream_buffer() {
-    let filter = nemo_filter_response("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -951,7 +1082,7 @@ async fn on_response_sse_does_not_upgrade_to_stream_buffer() {
 
 #[tokio::test]
 async fn on_response_json_upgrades_to_stream_buffer() {
-    let filter = nemo_filter_response("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
 
@@ -970,7 +1101,7 @@ async fn on_response_json_upgrades_to_stream_buffer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_stream_mode_skips_evaluation() {
-    let filter = nemo_filter_response("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     // Default mode is Stream - evaluation should be skipped even with valid body
@@ -990,7 +1121,7 @@ async fn on_response_body_stream_mode_skips_evaluation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_invalid_json_replaces_body() {
-    let filter = nemo_filter_response("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
@@ -1005,7 +1136,7 @@ async fn on_response_body_invalid_json_replaces_body() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_missing_choices_replaces_body() {
-    let filter = nemo_filter_response("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
@@ -1018,7 +1149,7 @@ async fn on_response_body_missing_choices_replaces_body() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_empty_choices_replaces_body() {
-    let filter = nemo_filter_response("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
@@ -1031,7 +1162,7 @@ async fn on_response_body_empty_choices_replaces_body() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_mixed_choices_replaces_body() {
-    let filter = nemo_filter_response("http://nemo:8000/v1/guardrail/checks");
+    let filter = nemo_filter_response("http://nemo:8000/v1/checks");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
@@ -1055,23 +1186,16 @@ async fn on_response_body_mixed_choices_replaces_body() {
 // =============================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_error_status_fails_closed() {
+async fn on_response_body_provider_http_error_fails_closed() {
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "status": "error",
-            "rails_status": {},
-            "guardrails_data": {
-                "error": "Could not load guardrails configuration.",
-                "details": "Invalid config path."
-            }
-        })))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
         .mount(&mock_server)
         .await;
 
-    let endpoint = format!("{}/v1/guardrail/checks", mock_server.uri());
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
     let filter = nemo_filter_response(&endpoint);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1089,11 +1213,14 @@ async fn on_response_body_passes_through() {
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status": "success"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "passed",
+            "content": "hello"
+        })))
         .mount(&mock_server)
         .await;
 
-    let endpoint = format!("{}/v1/guardrail/checks", mock_server.uri());
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
     let filter = nemo_filter_response(&endpoint);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -1119,12 +1246,13 @@ async fn on_response_body_blocked_replaces_body() {
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "status": "blocked",
-            "rails_status": {"toxicity": {"status": "blocked"}}
+            "content": "blocked",
+            "rail": "toxicity"
         })))
         .mount(&mock_server)
         .await;
 
-    let endpoint = format!("{}/v1/guardrail/checks", mock_server.uri());
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
     let filter = nemo_filter_response(&endpoint);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);

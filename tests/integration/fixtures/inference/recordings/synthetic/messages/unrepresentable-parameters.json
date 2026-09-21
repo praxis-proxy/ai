@@ -1,0 +1,147 @@
+{
+  "version": 1,
+  "scenario_id": "messages/unrepresentable-parameters",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-unrepresentable-parameters-model",
+    "source_id": "controlled-anthropic-unrepresentable-parameters"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {}
+  },
+  "turns": [
+    {
+      "name": "inference_geo",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "inference_geo": "us",
+              "max_tokens": 64,
+              "messages": [
+                {
+                  "content": "What is 2+2? Reply with just the number.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-unrepresentable-parameters-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "`inference_geo` is not supported when translating Anthropic Messages to Chat Completions",
+                "type": "invalid_request_error"
+              },
+              "request_id": null,
+              "type": "error"
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
+      "name": "n",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 64,
+              "messages": [
+                {
+                  "content": "What is 2+2? Reply with just the number.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-unrepresentable-parameters-model",
+              "n": 2,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "message": "`n` is not supported when translating Anthropic Messages to Chat Completions",
+                "type": "invalid_request_error"
+              },
+              "request_id": null,
+              "type": "error"
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    }
+  ]
+}

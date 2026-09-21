@@ -21,6 +21,7 @@ pub use openapi::implementation_openapi_json;
 pub use routes::{ConversationOperation, ConversationOperationSpec, operation_specs};
 
 #[cfg(test)]
+#[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,

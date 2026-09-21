@@ -19,11 +19,12 @@ On successful discovery, one `mcp_list_tools` output item per resolved server (i
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
+| `forward_headers` | string[] | no | Trusted request headers forwarded to connector-backed MCP `initialize` and `tools/list` requests. No request headers are forwarded by default. Credential headers such as `authorization` are rejected because MCP destinations are client-selected; use the MCP tool entry's dedicated `authorization` field instead. Direct, client-selected `server_url` targets never receive ambient request headers. |
 | `max_rewritten_body_bytes` | integer | no | Maximum size in bytes of the request body this filter *produces* after expanding `mcp` tool entries into `function` entries. Raw request body size is governed by the pipeline's `body_limits`, not this field. This bounds only the post-expansion body, which can grow larger than the raw input. |
 | `timeout_ms` | integer | no | Per-server timeout in milliseconds for `tools/list` calls. |
 | `max_servers` | integer | no | Maximum number of distinct MCP servers per request. |
 | `max_tools` | integer | no | Maximum number of tools returned by a single MCP server. |
-| `allow_loopback` | bool | no | Allow connections to loopback addresses (`127.0.0.0/8`, `::1`, `localhost`). Disabled by default for SSRF protection; enable for development environments where MCP servers run locally. |
+| `outbound_chain` | string \| object | no | Outbound filter chain the MCP `tools/list` callout runs through. The chain is bound at build time and carries only operator-configured cross-cutting filters, which observe and can act on the outbound MCP request. The SSRF-validated dial target is staged by the transport, so no upstream-selecting filter is prepended. Both an inline chain and a named reference (resolved against the top-level `filter_chains`) are accepted, because this filter binds at top level. When omitted, the callout runs through an empty chain and dials the staged target directly. Whether loopback/private MCP destinations are permitted is governed by the operator's global insecure posture (which pipeline finalization applies to this bound chain), not a per-filter flag. |
 | `connectors` | ConnectorConfig[] | no | Named connectors mapping connector IDs to server URLs. |
 | `connectors[].id` | string | yes | Connector identifier referenced in requests. |
 | `connectors[].server_url` | string | yes | MCP server URL for this connector. |
@@ -40,6 +41,9 @@ filter: openai_mcp_tool_resolve
 
 ```yaml
 filter: openai_mcp_tool_resolve
+forward_headers:
+  - x-tenant-id
+  - x-user-id
 timeout_ms: 5000
 max_rewritten_body_bytes: 67108864
 max_tools: 128

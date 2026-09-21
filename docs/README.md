@@ -15,6 +15,7 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 - [AI inference](architecture/ai-inference.md)
 - [Agentic protocols](architecture/agentic-protocols.md)
 - [Response store](architecture/response-store.md)
+- [PostgreSQL cryptographic boundary](architecture/postgres-cryptographic-boundary.md)
 - [Outbound callout security](architecture/outbound-callouts.md)
 
 ## Provider guides

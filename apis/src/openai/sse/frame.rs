@@ -294,6 +294,25 @@ pub(crate) enum SseParseError {
         /// The configured limit for that dimension.
         limit: usize,
     },
+
+    /// A lowered client tool could not be restored to its canonical typed item
+    /// on the streaming Responses path (#1159): malformed arguments envelope,
+    /// missing completion artifact, out-of-order lifecycle, or a lossy retype.
+    /// Fails the whole logical stream closed so a private lowered shape never
+    /// reaches the client.
+    ClientToolRestore {
+        /// Stable key identifying the offending call (or `"terminal"` /
+        /// `"response-snapshot"` for whole-snapshot failures). Never a private name.
+        key: String,
+        /// Client-safe description of why the restore failed. Never a private name.
+        reason: String,
+    },
+
+    /// A prior chunk already failed the logical stream (#1159 C1). Every
+    /// remaining chunk is dropped closed so a post-failure terminal or lowered
+    /// event cannot emit on a poisoned stream. Carries no per-event detail: the
+    /// original failure already recorded the diagnostic error.
+    StreamPoisoned,
 }
 
 impl fmt::Display for SseParseError {
@@ -338,6 +357,12 @@ impl fmt::Display for SseParseError {
                 f,
                 "SSE accumulation limit exceeded: {dimension} {value} exceeds {limit} limit"
             ),
+            Self::ClientToolRestore { key, reason } => {
+                write!(f, "client tool restoration failed for {key}: {reason}")
+            },
+            Self::StreamPoisoned => {
+                write!(f, "SSE stream already failed; dropping remaining chunks closed")
+            },
         }
     }
 }
@@ -349,6 +374,18 @@ mod tests {
     use super::*;
 
     const MAX_BUF: usize = 65_536;
+
+    #[test]
+    fn client_tool_restore_display_names_key_and_reason() {
+        let err = SseParseError::ClientToolRestore {
+            key: "item:fc_1".to_owned(),
+            reason: "malformed input envelope".to_owned(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "client tool restoration failed for item:fc_1: malformed input envelope"
+        );
+    }
 
     #[test]
     fn single_frame_yields_one_result() {

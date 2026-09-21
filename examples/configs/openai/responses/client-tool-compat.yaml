@@ -1,0 +1,83 @@
+# Client Tool Compatibility
+#
+# Lets a rich Codex-style Responses client talk to a function-only Responses
+# backend (for example vLLM at POST /v1/responses) without routing through
+# /v1/chat/completions and without executing client-owned tools in Praxis.
+#
+# The openai_client_tool_compat filter runs between openai_agentic_loop and
+# openai_responses_proxy. On the request it lowers client-owned custom,
+# namespace, local shell, and client-executed tool_search declarations to
+# private function tools the backend understands; on a buffered response it
+# restores the returned function_call items to their canonical typed items
+# (custom_tool_call, namespaced function_call, shell_call, tool_search_call).
+# When the request declares no rich client tools the filter is a transparent
+# passthrough, so native traffic is unchanged.
+#
+# openai_stream_events leads the inference step so it arms streaming restoration
+# (a request-phase marker) before this filter lowers tools. On a streaming
+# response (stream: true) the openai_stream_events owner restores the lowered
+# calls live in the SSE lifecycle; if this filter lowers client tools for a
+# streaming request without that owner ahead of it, it fails closed with HTTP
+# 500 so private lowered names never reach an un-restored stream.
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [client-tool-compat]
+
+filter_chains:
+  - name: client-tool-compat
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_validate
+
+      # Persisted Responses/Conversations state is scoped to an immutable owner.
+      # This single-tenant demo installs a fixed owner directly (no auth gateway
+      # in front); a multi-tenant deployment would use mode: trusted_headers so
+      # an upstream gateway asserts the tenant/subject instead.
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_responses_rehydrate
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 4
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_stream_events
+              - filter: openai_agentic_loop
+                max_infer_iters: 4
+              - filter: openai_client_tool_compat
+                max_rewritten_body_bytes: 67108864
+                max_client_tools: 512
+              - filter: openai_responses_proxy
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "inference-backend"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

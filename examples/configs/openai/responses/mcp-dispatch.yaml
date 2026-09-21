@@ -21,8 +21,21 @@
 #
 # Configuration:
 #   timeout_ms:      Per-call timeout for tools/call (default: 30000)
-#   allow_loopback:  Allow MCP servers on 127.0.0.1/localhost
-#                    (default: false)
+#
+# The `tools/call` callout is dialed through the pipeline's sub-request
+# executor; the MCP transport stages the SSRF-validated dial target itself. This
+# filter is meant to run inside the `iterative_request_router` step pipeline (the
+# per-round executor). praxis core builds each IRR step with a live chain-binding
+# context, so `openai_mcp_dispatch` binds an **inline** `outbound_chain`; it
+# rejects a **named** reference, because IRR supplies each step an empty
+# top-level named-chain map and a named reference cannot resolve there.
+# `openai_mcp_tool_resolve`, a top-level filter, additionally accepts a named
+# reference — see mcp-outbound-chain.yaml.
+#
+# SSRF posture: the outbound MCP callout is validated against the pipeline's
+# `insecure_options.allow_private_upstreams` (default: false). There is no
+# per-filter loopback opt-in; a loopback MCP server requires
+# `allow_private_upstreams: true` globally.
 
 listeners:
   - name: ai-gateway
@@ -37,7 +50,6 @@ filter_chains:
         timeout_ms: 5000
       - filter: openai_mcp_dispatch
         timeout_ms: 30000
-        allow_loopback: false
       - filter: router
         routes:
           - path_prefix: "/"

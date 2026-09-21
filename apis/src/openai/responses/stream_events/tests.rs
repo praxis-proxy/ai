@@ -23,8 +23,8 @@ use super::{
 };
 use crate::{
     openai::{
-        responses::state::{ResponsesState, SynthesisKind},
-        sse::SseFrameParser,
+        responses::state::{ClientToolEcho, ClientToolRestore, LoweredClientTool, ResponsesState, SynthesisKind},
+        sse::{SseFrameParser, SseParseError},
     },
     test_utils::{make_filter_context, make_request},
 };
@@ -183,6 +183,37 @@ fn local_completion_preserves_deferred_done_sentinel() {
     assert!(
         encoded.ends_with(b"data: [DONE]\n\n"),
         "request-side completion must preserve the upstream sentinel"
+    );
+}
+
+#[test]
+fn local_completion_does_not_arm_deferred_store_persistence() {
+    // #937 review regression: a request-phase local completion is returned to the
+    // store as a buffered `TerminalResponse` at end-of-stream, where the store
+    // already persists before the body is written. It must NOT set
+    // `logical_stream_terminal_emitted` — that flag means the terminal is a
+    // deferred non-end-of-stream chunk, and setting it here would make the store
+    // skip its end-of-stream persist and lose the record.
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        response_object: json!({"id":"resp_1", "object":"response", "status":"completed", "output":[]}),
+        ..ResponsesState::default()
+    });
+
+    let encoded = encode_local_completion(&mut ctx).expect("response object should encode");
+    assert!(
+        std::str::from_utf8(&encoded)
+            .unwrap()
+            .contains("event: response.completed"),
+        "local completion must emit a terminal response.completed frame"
+    );
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .logical_stream_terminal_emitted,
+        "a buffered local completion must not arm the deferred non-EOS persist path"
     );
 }
 
@@ -363,7 +394,7 @@ fn canonicalize_skips_previous_response_id_when_wire_rewrite_declined() {
         ..ResponsesState::default()
     };
 
-    canonicalize_logical_response(&mut state, false);
+    canonicalize_logical_response(&mut state, false).expect("canonicalize");
 
     assert_eq!(
         state.response_object["previous_response_id"],
@@ -391,12 +422,109 @@ fn canonicalize_restores_previous_response_id_when_wire_rewrite_armed() {
         ..ResponsesState::default()
     };
 
-    canonicalize_logical_response(&mut state, true);
+    canonicalize_logical_response(&mut state, true).expect("canonicalize");
 
     assert_eq!(
         state.response_object["previous_response_id"], "resp_prev",
         "an armed wire rewrite must restore the caller's previous_response_id into \
          the persisted store source"
+    );
+}
+
+#[test]
+fn canonicalize_restores_lowered_client_tool_terminal_snapshot() {
+    // #1159: the terminal response.completed carries the lowered private
+    // function_call plus the backend-echoed LOWERED tools/tool_choice.
+    // canonicalize is the last-chance restore: re-type the call to a
+    // custom_tool_call and restore the client's own tools declaration, leaking
+    // no private lowered name.
+    let mut state = ResponsesState {
+        client_tool_lowering: std::collections::HashMap::from([(
+            "run_python".to_owned(),
+            LoweredClientTool {
+                original_name: "run_python".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        )]),
+        client_tool_echo: Some(ClientToolEcho {
+            tools: vec![json!({"type": "custom", "name": "run_python"})],
+            tool_choice: serde_json::Value::Null,
+        }),
+        response_object: json!({
+            "id": "resp_upstream",
+            "object": "response",
+            "status": "completed",
+            "tools": [{"type": "function", "name": "run_python"}],
+            "tool_choice": "auto",
+            "output": [{
+                "type": "function_call",
+                "name": "run_python",
+                "call_id": "call_1",
+                "arguments": r#"{"input":"print(1)"}"#
+            }]
+        }),
+        ..ResponsesState::default()
+    };
+
+    let (output, _usage) = canonicalize_logical_response(&mut state, false).expect("terminal restore");
+
+    assert_eq!(output[0]["type"], "custom_tool_call", "lowered function_call retyped");
+    assert_eq!(
+        output[0]["input"], "print(1)",
+        "single string parameter unwrapped to plain input"
+    );
+    assert_eq!(
+        state.response_object["tools"],
+        json!([{"type": "custom", "name": "run_python"}]),
+        "tools restored to the client's custom declaration"
+    );
+    assert!(
+        state.response_object.get("tool_choice").is_none(),
+        "a Null tool_choice echo removes the field"
+    );
+    assert!(
+        !state.response_object.to_string().contains("agentic_ns__"),
+        "no private lowered name leaks into the terminal response object"
+    );
+}
+
+#[test]
+fn canonicalize_fails_closed_on_lossy_terminal_client_tool_restore() {
+    // #1159: a lossy terminal restore (here a lowered custom call missing its
+    // call_id) fails the whole logical stream closed rather than emitting a
+    // private lowered shape. The error must not echo the offending tool name.
+    let mut state = ResponsesState {
+        client_tool_lowering: std::collections::HashMap::from([(
+            "run_python".to_owned(),
+            LoweredClientTool {
+                original_name: "run_python".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        )]),
+        response_object: json!({
+            "id": "resp_upstream",
+            "object": "response",
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "name": "run_python",
+                "arguments": r#"{"input":"print(1)"}"#
+            }]
+        }),
+        ..ResponsesState::default()
+    };
+
+    let err =
+        canonicalize_logical_response(&mut state, false).expect_err("a lossy client-tool restore must fail closed");
+    assert!(
+        matches!(err, SseParseError::ClientToolRestore { .. }),
+        "fail-closed uses the dedicated client-tool restore variant: {err:?}"
+    );
+    assert!(
+        !err.to_string().contains("run_python"),
+        "the error must not echo the lowered tool name: {err}"
     );
 }
 
@@ -3586,6 +3714,51 @@ async fn logical_terminal_only_output_survives_canonicalization() {
 }
 
 #[tokio::test]
+async fn deferred_terminal_arms_store_persistence_at_terminal_frame() {
+    // #937: the deferred terminal frame reaches the pre-IRR store as a
+    // non-end-of-stream chunk. `emit_deferred_terminal` must mark
+    // `logical_stream_terminal_emitted` exactly when it appends that frame so the
+    // store persists before releasing it. The flag must stay unset while the
+    // terminal is still deferred (held, not yet emitted).
+    let (filter, mut ctx) = make_armed_context();
+
+    let completed = json!({
+        "response": {
+            "id": "resp_937_defer",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-4o",
+            "created_at": 1_700_000_000,
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hi"}]}]
+        },
+        "sequence_number": 0
+    });
+
+    let mut terminal = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(terminal.is_none(), "the terminal event must be deferred until finalize");
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .logical_stream_terminal_emitted,
+        "persistence must not be armed while the terminal is still deferred"
+    );
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    assert!(eos.is_some(), "finalize must emit the deferred terminal frame");
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .logical_stream_terminal_emitted,
+        "emit_deferred_terminal must arm store persistence when it appends the terminal frame"
+    );
+}
+
+#[tokio::test]
 async fn terminal_event_authoritatively_populates_completed_function_calls() {
     let (filter, mut ctx) = make_armed_context();
     ctx.extensions.insert(ResponsesState::default());
@@ -4110,6 +4283,8 @@ fn parse_error_sets_metadata() {
         deferred_done: false,
         local_items_flushed: false,
         local_tool_items: std::collections::HashMap::new(),
+        client_tool_items: Vec::new(),
+        stream_failed: false,
     });
 
     let large_chunk =
@@ -4121,6 +4296,71 @@ fn parse_error_sets_metadata() {
         ctx.get_metadata("responses.stream_parse_error"),
         Some("true"),
         "parse error should set metadata flag"
+    );
+}
+
+#[test]
+fn incomplete_client_tool_lifecycle_fails_closed() {
+    use super::{
+        CompletionState, StreamEventsState,
+        client_tools::{ClientToolPhase, ClientToolStreamItem},
+        validate_stream_end,
+    };
+    use crate::openai::responses::state::ClientToolRestore;
+
+    let (_filter, mut ctx) = make_armed_context();
+    ctx.insert_filter_state(StreamEventsState {
+        frame_parser: SseFrameParser::new(10),
+        event_count: 0,
+        max_events: 100_000,
+        timeout: std::time::Duration::from_secs(300),
+        started_at: None,
+        completed_at: None,
+        // Terminal so the ONLY incomplete trigger is the stuck client-tool item.
+        completion_state: CompletionState::TerminalLifecycle,
+        tool_call_args: std::collections::HashMap::new(),
+        rejected_tool_call_args: std::collections::HashSet::new(),
+        max_tool_call_argument_bytes: 1024 * 1024,
+        max_accumulated_bytes: 64 * 1024 * 1024,
+        max_output_items: 100_000,
+        iteration: 0,
+        output_index_offset: 0,
+        deferred_terminal: None,
+        deferred_done: false,
+        local_items_flushed: false,
+        local_tool_items: std::collections::HashMap::new(),
+        client_tool_items: vec![ClientToolStreamItem {
+            key: "item:call_1".to_owned(),
+            private_name: "custom_run_python".to_owned(),
+            restore: ClientToolRestore::Custom,
+            phase: ClientToolPhase::Opened, // never reached Done
+            output_index: 0,
+            item_id: Some("call_1".to_owned()),
+        }],
+        stream_failed: false,
+    });
+
+    validate_stream_end(&mut ctx);
+
+    assert_eq!(
+        ctx.get_metadata("responses.stream_incomplete"),
+        Some("true"),
+        "incomplete client-tool lifecycle must flag the stream incomplete"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "incomplete client-tool lifecycle must fail closed"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_message"),
+        Some("upstream Responses stream did not terminate cleanly"),
+        "fail-closed metadata must carry the unclean-termination message"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "must skip persisting a truncated client-tool restore"
     );
 }
 
@@ -4835,6 +5075,326 @@ async fn on_response_preserves_content_length_when_not_armed() {
     );
 }
 
+#[tokio::test]
+async fn apply_arm_does_not_cap_timeout_before_first_chunk() {
+    use std::sync::Arc;
+
+    use praxis_core::connectivity::{ConnectionOptions, Upstream};
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 1").unwrap();
+    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+    ctx.upstream = Some(Upstream {
+        address: Arc::from("127.0.0.1:9"),
+        authority: None,
+        tls: None,
+        connection: Arc::new(ConnectionOptions::default()),
+    });
+
+    filter.apply_arm_decision(&mut ctx, ArmDecision::Arm);
+
+    assert!(
+        ctx.upstream.as_ref().and_then(|u| u.connection.read_timeout).is_none(),
+        "timeout_secs must not cap upstream reads before the first SSE chunk"
+    );
+}
+
+#[tokio::test]
+async fn apply_arm_does_not_cap_before_load_balancing() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 1").unwrap();
+    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+    ctx.upstream = None;
+
+    filter.apply_arm_decision(&mut ctx, ArmDecision::Arm);
+
+    assert!(
+        OpenaiStreamEventsFilter::is_armed(&ctx),
+        "arming must still install parser state when ctx.upstream is unset"
+    );
+    assert!(
+        ctx.upstream.is_none(),
+        "timeout_secs cannot invent a peer before load balancing"
+    );
+}
+
+#[tokio::test]
+async fn apply_arm_keeps_a_tighter_cluster_read_timeout() {
+    use std::{sync::Arc, time::Duration};
+
+    use praxis_core::connectivity::{ConnectionOptions, Upstream};
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 300").unwrap();
+    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+    ctx.upstream = Some(Upstream {
+        address: Arc::from("127.0.0.1:9"),
+        authority: None,
+        tls: None,
+        connection: Arc::new(ConnectionOptions {
+            read_timeout: Some(Duration::from_millis(250)),
+            ..ConnectionOptions::default()
+        }),
+    });
+
+    filter.apply_arm_decision(&mut ctx, ArmDecision::Arm);
+
+    assert_eq!(
+        ctx.upstream.as_ref().and_then(|u| u.connection.read_timeout),
+        Some(Duration::from_millis(250)),
+        "arming must not relax a tighter cluster read timeout before the first chunk"
+    );
+}
+
+#[test]
+fn stream_deadline_is_none_before_first_chunk() {
+    let (_filter, ctx) = make_armed_context();
+    let state = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    assert!(
+        super::stream_deadline_at(state).is_none(),
+        "timeout_secs must not start before the first SSE chunk"
+    );
+}
+
+#[test]
+fn stream_deadline_is_absolute_from_first_chunk() {
+    use std::time::Duration;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let state = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    let started = state.started_at.expect("first chunk must start the deadline");
+    assert_eq!(
+        super::stream_deadline_at(state),
+        Some(started + state.timeout),
+        "the cutoff must stay anchored at first-chunk + timeout_secs, not restart on each poll"
+    );
+    assert_eq!(state.timeout, Duration::from_secs(300));
+}
+
+#[test]
+fn first_chunk_recaps_absolute_deadline_onto_live_body() {
+    use std::time::Duration;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let state = ctx
+        .get_filter_state::<StreamEventsState>()
+        .expect("parser state must remain installed");
+    let applied = ctx
+        .stream_read_timeout_cap()
+        .expect("the first chunk must publish a read timeout cap");
+    assert!(applied > Duration::from_secs(299) && applied <= state.timeout);
+    assert!(
+        state.timeout <= Duration::from_secs(300),
+        "unexpected test timeout budget: {:?}",
+        state.timeout
+    );
+}
+
+#[test]
+fn stream_deadline_cap_shrinks_after_first_chunk() {
+    use std::time::Duration;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    state.started_at.expect("first chunk must start the deadline");
+    state.timeout = Duration::from_secs(1);
+    let adjusted_started = std::time::Instant::now() - Duration::from_millis(750);
+    state.started_at = Some(adjusted_started);
+    let expected = adjusted_started + state.timeout;
+    let now = std::time::Instant::now();
+    ctx.insert_filter_state(state);
+
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "again"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let applied = ctx
+        .stream_read_timeout_cap()
+        .expect("each chunk must republish a read timeout cap");
+    assert!(
+        applied <= expected.saturating_duration_since(now),
+        "each chunk must republish the remaining absolute budget, not a fresh relative timer at now={now:?}"
+    );
+}
+
+#[test]
+fn stream_deadline_caps_live_body_after_first_chunk() {
+    use std::time::Duration;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let started = state.started_at.expect("first chunk must start the deadline");
+    state.timeout = Duration::from_secs(1);
+    let expected = started + state.timeout;
+    ctx.insert_filter_state(state);
+    super::recap_stream_deadline(&mut ctx, expected);
+
+    assert!(
+        ctx.stream_read_timeout_cap().is_some(),
+        "absolute cutoff must be published on the live body"
+    );
+}
+
+#[tokio::test]
+async fn stream_deadline_recaps_live_body_on_irr_body_context() {
+    use std::{sync::Arc, time::Duration};
+
+    use praxis_core::connectivity::{ConnectionOptions, Upstream};
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 1").unwrap();
+    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+    ctx.upstream = Some(Upstream {
+        address: Arc::from("127.0.0.1:9"),
+        authority: None,
+        tls: None,
+        connection: Arc::new(ConnectionOptions {
+            read_timeout: Some(Duration::from_secs(30)),
+            ..ConnectionOptions::default()
+        }),
+    });
+
+    filter.apply_arm_decision(&mut ctx, ArmDecision::Arm);
+
+    // IRR reconstructs response-body contexts with upstream: None.
+    ctx.upstream = None;
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let started = state.started_at.expect("first chunk must start the deadline");
+    state.timeout = Duration::from_secs(1);
+    state.started_at = Some(started.checked_sub(Duration::from_millis(750)).unwrap_or(started));
+    ctx.insert_filter_state(state);
+
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    assert!(
+        ctx.stream_read_timeout_cap().is_some(),
+        "absolute cutoff must be published for the live body even when ctx.upstream is None"
+    );
+}
+
+#[test]
+fn io_before_first_chunk_is_not_a_stream_timeout() {
+    use std::time::Instant;
+
+    let (_filter, ctx) = make_armed_context();
+    let state = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    assert!(
+        !super::io_exceeded_stream_deadline(state, Instant::now()),
+        "a transport reset before any SSE chunk is not the stream deadline"
+    );
+}
+
+#[test]
+fn io_before_deadline_is_not_a_stream_timeout() {
+    use std::time::{Duration, Instant};
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    state.timeout = Duration::from_secs(300);
+    assert!(
+        !super::io_exceeded_stream_deadline(&state, Instant::now()),
+        "a truncated chunk must not be labelled a timeout"
+    );
+}
+
+#[test]
+fn io_after_deadline_is_a_stream_timeout() {
+    use std::time::Duration;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let started = state.started_at.expect("first chunk must start the deadline");
+    state.timeout = Duration::from_secs(1);
+    assert!(
+        super::io_exceeded_stream_deadline(&state, started + Duration::from_secs(1)),
+        "an Io abort after timeout_secs from the first chunk is the stream deadline"
+    );
+}
+
+#[tokio::test]
+async fn idle_timeout_does_not_fail_a_completed_sse_stream() {
+    let (filter, mut ctx) = make_armed_context();
+
+    let completed =
+        json!({"id": "resp_1", "status": "completed", "model": "m", "created_at": 0, "output": [], "usage": {}});
+    let mut body = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    // Transport-level IdleTimeout cannot be injected here (`StreamTermination`
+    // is crate-private). The completeness guard is the same function that
+    // `record_idle_transport_timeout` calls before mark_stream_termination_handled.
+    super::publish_idle_timeout_if_incomplete(&mut ctx);
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+
+    assert_eq!(
+        ctx.get_filter_state::<StreamEventsState>()
+            .map(|state| state.completion_state),
+        Some(CompletionState::TerminalLifecycle),
+        "response.completed must leave the parser in a terminal lifecycle"
+    );
+    assert!(
+        ctx.get_metadata("responses.stream_error_code").is_none(),
+        "a terminal lifecycle event must not be rewritten as a transport timeout"
+    );
+    assert!(
+        ctx.get_metadata("responses.skip_persist").is_none(),
+        "a completed SSE stream must remain persistable when the HTTP body closes slowly"
+    );
+}
+
+#[tokio::test]
+async fn idle_timeout_fails_an_open_sse_stream() {
+    let (filter, mut ctx) = make_armed_context();
+
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    super::publish_idle_timeout_if_incomplete(&mut ctx);
+
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "an idle abort before a terminal event is a stream timeout"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "an incomplete idle abort must not be persisted"
+    );
+}
+
 // Test helpers for Task 4 file_search classification/suppression tests
 fn test_ctx_with_hosted_file_search_tool() -> praxis_filter::HttpFilterContext<'static> {
     let req = make_request(http::Method::POST, "/v1/responses");
@@ -5316,5 +5876,744 @@ fn drain_atomicity_valid_item_before_invalid_both_suppressed() {
     assert!(
         ctx.get_metadata("responses.stream_error_code").is_some(),
         "validation failure sets the five-write"
+    );
+}
+
+// #1159 Task 4: end-to-end proof that a lowered `Namespace` member is retyped in
+// place through the real commit path (`commit_chunk_events` ->
+// `restore_and_append_chunk` -> `apply_client_tool_disposition`), asserting the
+// EMITTED SSE bytes carry the restored member name + namespace and never leak the
+// private lowered name. This is the one client-visible, security-relevant behavior
+// the task ships, and it exercises the payload-mutating apply code the unit tests
+// in `client_tools.rs` cannot reach.
+#[tokio::test]
+async fn namespace_lowered_call_retyped_in_place_through_commit_never_leaks_private_name() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    // Arm a Namespace lowering on the shared `ResponsesState`, inserted the same
+    // way `restore_and_append_chunk` reads it (`ctx.extensions.get::<ResponsesState>()`).
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "agentic_ns__fs__read".to_owned(),
+            LoweredClientTool {
+                original_name: "read".to_owned(),
+                namespace: Some("fs".to_owned()),
+                restore: ClientToolRestore::Namespace,
+            },
+        );
+
+    filter.arm(&mut ctx);
+
+    // Open the logical response so the incremental item events are delivered.
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    // One chunk carrying the lowered `function_call`'s whole lifecycle: added ->
+    // arguments.done -> item.done for the same item.
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__fs__read", "call_id": "c1", "id": "fc_1"},
+            "sequence_number": 1
+        }),
+    );
+    let args_done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_1",
+            "arguments": "{\"path\":\"/etc\"}",
+            "sequence_number": 2
+        }),
+    );
+    let item_done = make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__fs__read", "call_id": "c1", "id": "fc_1",
+                     "arguments": "{\"path\":\"/etc\"}", "status": "completed"},
+            "sequence_number": 3
+        }),
+    );
+    let mut chunk = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&args_done);
+        buf.extend_from_slice(&item_done);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    let emitted = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+    assert!(
+        emitted.contains(r#""name":"read""#),
+        "the restored member name must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""namespace":"fs""#),
+        "the namespace must be re-added on the restored item: {emitted}"
+    );
+    assert!(
+        !emitted.contains("agentic_ns__fs__read"),
+        "the private lowered name must never leak to the client: {emitted}"
+    );
+}
+
+// #1159 Task 5: end-to-end proof that a lowered `custom` tool is restored to the
+// canonical `custom_tool_call` lifecycle through the real commit path
+// (`commit_chunk_events` phase-2a artifact capture -> `restore_and_append_chunk` ->
+// `apply_client_tool_disposition`). This exercises the whole synthesis the unit
+// tests in `client_tools.rs` cannot reach: the phase-2a `find_output_item` capture
+// of the completed private `function_call` item, the retyped `output_item.added`,
+// the suppressed backend args frame replaced by synthesized `custom_tool_call_input`
+// delta+done, and the restored `output_item.done`. Asserts the EMITTED SSE bytes
+// carry the public `custom_tool_call` shape and never leak the private `fc_` id.
+#[tokio::test]
+async fn custom_lowered_call_restored_to_custom_tool_call_lifecycle_through_commit() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    // Arm a Custom lowering on the shared `ResponsesState`, read the same way
+    // `restore_and_append_chunk` / phase-2a capture read it.
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "run_python".to_owned(),
+            LoweredClientTool {
+                original_name: "run_python".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        );
+
+    filter.arm(&mut ctx);
+
+    // Open the logical response so the incremental item events are delivered.
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    // One chunk carrying the lowered `function_call`'s whole lifecycle: added ->
+    // arguments.done -> item.done for the same item. The lowered arguments are the
+    // `{"input":...}` envelope `openai_client_tool_compat` produced on the way out.
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "run_python", "call_id": "c1", "id": "fc_1"},
+            "sequence_number": 1
+        }),
+    );
+    let args_done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_1",
+            "arguments": "{\"input\":\"print(1)\"}",
+            "sequence_number": 2
+        }),
+    );
+    let item_done = make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "run_python", "call_id": "c1", "id": "fc_1",
+                     "arguments": "{\"input\":\"print(1)\"}", "status": "completed"},
+            "sequence_number": 3
+        }),
+    );
+    let mut chunk = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&args_done);
+        buf.extend_from_slice(&item_done);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    let emitted = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+    // The retyped added and restored done both carry the public custom_tool_call type.
+    assert!(
+        emitted.contains(r#""type":"custom_tool_call""#),
+        "the restored item type must reach the client: {emitted}"
+    );
+    // The backend function-args frame is replaced by the synthesized input pair.
+    assert!(
+        emitted.contains("response.custom_tool_call_input.delta"),
+        "the synthesized custom input delta must be emitted: {emitted}"
+    );
+    assert!(
+        emitted.contains("response.custom_tool_call_input.done"),
+        "the synthesized custom input done must be emitted: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""input":"print(1)""#),
+        "the unwrapped plain-string input must reach the client: {emitted}"
+    );
+    // Every client-visible id is the public `ctc_` form, never the private `fc_` id.
+    assert!(
+        emitted.contains(r#""id":"ctc_1""#),
+        "the public custom item id must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""call_id":"c1""#),
+        "the client's own call id must be preserved on the restored call: {emitted}"
+    );
+    assert!(
+        !emitted.contains("fc_1"),
+        "the private lowered item id must never leak to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains("function_call_arguments"),
+        "the backend function-args frames must be replaced, not forwarded: {emitted}"
+    );
+    assert!(
+        !emitted.contains(r#""type":"function_call""#),
+        "the private lowered item type must never surface to the client: {emitted}"
+    );
+}
+
+// #1159 Task 5: end-to-end proof for the *obfuscated* `NamespaceCustom` path — the
+// case #1159 exists to protect. A namespaced custom member is lowered to the private
+// `agentic_ns__{ns}__{member}` wire name, so its restoration must recover the member
+// name AND re-add its namespace while never leaking the private lowered name or its
+// `fc_` id. Mirrors `custom_lowered_call_restored_to_custom_tool_call_lifecycle_through_commit`
+// (the plain-Custom commit-path e2e) so the whole synthesis runs through the real
+// commit path (`commit_chunk_events` phase-2a artifact capture ->
+// `restore_and_append_chunk` -> `apply_client_tool_disposition`).
+#[tokio::test]
+async fn namespace_custom_lowered_call_restored_through_commit_never_leaks_private_name() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    // Arm a NamespaceCustom lowering on the shared `ResponsesState`, read the same
+    // way `restore_and_append_chunk` / phase-2a capture read it. The wire name is the
+    // obfuscated `agentic_ns__{ns}__{member}` form; the restore must recover the bare
+    // member name and re-add the namespace.
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "agentic_ns__code__run".to_owned(),
+            LoweredClientTool {
+                original_name: "run".to_owned(),
+                namespace: Some("code".to_owned()),
+                restore: ClientToolRestore::NamespaceCustom,
+            },
+        );
+
+    filter.arm(&mut ctx);
+
+    // Open the logical response so the incremental item events are delivered.
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    // One chunk carrying the lowered `function_call`'s whole lifecycle: added ->
+    // arguments.done -> item.done for the same item, keyed by the private `fc_ns1`
+    // id. The phase-2a accumulate must store the completed `function_call` item
+    // before the done event is planned, exactly as the plain-Custom e2e relies on.
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__code__run", "call_id": "c_ns1", "id": "fc_ns1"},
+            "sequence_number": 1
+        }),
+    );
+    let args_done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_ns1",
+            "arguments": "{\"input\":\"print(1)\"}",
+            "sequence_number": 2
+        }),
+    );
+    let item_done = make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__code__run", "call_id": "c_ns1", "id": "fc_ns1",
+                     "arguments": "{\"input\":\"print(1)\"}", "status": "completed"},
+            "sequence_number": 3
+        }),
+    );
+    let mut chunk = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&args_done);
+        buf.extend_from_slice(&item_done);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    let emitted = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+    // The restored item is a namespaced custom_tool_call carrying the bare member
+    // name, its namespace, the unwrapped input, and the public `ctc_` id.
+    assert!(
+        emitted.contains(r#""type":"custom_tool_call""#),
+        "the restored item type must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""name":"run""#),
+        "the restored member name must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""namespace":"code""#),
+        "the namespace must be re-added on the restored item: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""input":"print(1)""#),
+        "the unwrapped plain-string input must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""id":"ctc_ns1""#),
+        "the public custom item id must reach the client: {emitted}"
+    );
+    // The load-bearing no-leak assertions: the obfuscated wire name, its private
+    // `fc_` id, and the raw lowered `function_call` type must never surface.
+    assert!(
+        !emitted.contains("agentic_ns__"),
+        "the private lowered namespace name must never leak to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains("fc_ns1"),
+        "the private lowered item id must never leak to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains(r#""type":"function_call""#),
+        "the private lowered item type must never surface to the client: {emitted}"
+    );
+}
+
+// #1159 Task 6: end-to-end proof for the local `shell` path through the real commit
+// path (`commit_chunk_events` phase-2a artifact capture -> `restore_and_append_chunk`
+// -> `apply_client_tool_disposition`). A lowered `shell` `function_call` has its raw
+// added/args-delta/args-done lifecycle SUPPRESSED and a schema-complete `shell_call`
+// synthesized at args.done, followed by the restored `output_item.done`. Asserts the
+// EMITTED SSE bytes carry the public `shell_call` shape (`environment.type=="local"`,
+// public `sh_` id, parsed `commands`) and never leak the private `fc_` id, the raw
+// `function_call` type, or a `function_call_arguments` frame.
+#[tokio::test]
+async fn shell_lowered_call_restored_to_shell_call_lifecycle_through_commit() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "shell".to_owned(),
+            LoweredClientTool {
+                original_name: "shell".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Shell,
+            },
+        );
+
+    filter.arm(&mut ctx);
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    // The lowered arguments are the shell action envelope openai_client_tool_compat
+    // produced on the way out: a `{"commands":[...]}` object.
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "shell", "call_id": "c1", "id": "fc_1"},
+            "sequence_number": 1
+        }),
+    );
+    let args_delta = make_sse_chunk(
+        "response.function_call_arguments.delta",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "{\"commands\":",
+            "sequence_number": 2
+        }),
+    );
+    let args_done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_1",
+            "arguments": "{\"commands\":[\"ls\"]}",
+            "sequence_number": 3
+        }),
+    );
+    let item_done = make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "shell", "call_id": "c1", "id": "fc_1",
+                     "arguments": "{\"commands\":[\"ls\"]}", "status": "completed"},
+            "sequence_number": 4
+        }),
+    );
+    let mut chunk = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&args_delta);
+        buf.extend_from_slice(&args_done);
+        buf.extend_from_slice(&item_done);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    let emitted = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+    assert!(
+        emitted.contains(r#""type":"shell_call""#),
+        "the restored shell_call type must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""environment":{"type":"local"}"#),
+        "the restored shell_call must carry a local environment: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""id":"sh_1""#),
+        "the public shell item id must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""commands":["ls"]"#),
+        "the parsed shell commands must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""call_id":"c1""#),
+        "the client's own call id must be preserved on the restored call: {emitted}"
+    );
+    assert!(
+        !emitted.contains("fc_1"),
+        "the private lowered item id must never leak to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains(r#""type":"function_call""#),
+        "the private lowered item type must never surface to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains("function_call_arguments"),
+        "the backend function-args frames must be suppressed, not forwarded: {emitted}"
+    );
+}
+
+// #1159 Task 6: end-to-end proof for the client-executed `tool_search` path through
+// the real commit path. Mirrors the `shell` e2e: the raw lowered lifecycle is
+// suppressed and a schema-complete `tool_search_call` (`execution=="client"`, public
+// `tsc_` id, parsed `arguments`) is synthesized at args.done, followed by the restored
+// `output_item.done`. The private `fc_` id, raw `function_call` type, and
+// `function_call_arguments` frame must never surface.
+#[tokio::test]
+async fn tool_search_lowered_call_restored_to_tool_search_call_lifecycle_through_commit() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "tool_search".to_owned(),
+            LoweredClientTool {
+                original_name: "tool_search".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::ToolSearch,
+            },
+        );
+
+    filter.arm(&mut ctx);
+
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "tool_search", "call_id": "c1", "id": "fc_1"},
+            "sequence_number": 1
+        }),
+    );
+    let args_delta = make_sse_chunk(
+        "response.function_call_arguments.delta",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "{\"query\":",
+            "sequence_number": 2
+        }),
+    );
+    let args_done = make_sse_chunk(
+        "response.function_call_arguments.done",
+        &json!({
+            "output_index": 0,
+            "item_id": "fc_1",
+            "arguments": "{\"query\":\"rust\"}",
+            "sequence_number": 3
+        }),
+    );
+    let item_done = make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "tool_search", "call_id": "c1", "id": "fc_1",
+                     "arguments": "{\"query\":\"rust\"}", "status": "completed"},
+            "sequence_number": 4
+        }),
+    );
+    let mut chunk = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&args_delta);
+        buf.extend_from_slice(&args_done);
+        buf.extend_from_slice(&item_done);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+
+    let emitted = String::from_utf8(chunk.unwrap().to_vec()).unwrap();
+    assert!(
+        emitted.contains(r#""type":"tool_search_call""#),
+        "the restored tool_search_call type must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""execution":"client""#),
+        "the restored tool_search_call must be client-executed: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""id":"tsc_1""#),
+        "the public tool_search item id must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""query":"rust""#),
+        "the parsed tool_search arguments must reach the client: {emitted}"
+    );
+    assert!(
+        emitted.contains(r#""call_id":"c1""#),
+        "the client's own call id must be preserved on the restored call: {emitted}"
+    );
+    assert!(
+        !emitted.contains("fc_1"),
+        "the private lowered item id must never leak to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains(r#""type":"function_call""#),
+        "the private lowered item type must never surface to the client: {emitted}"
+    );
+    assert!(
+        !emitted.contains("function_call_arguments"),
+        "the backend function-args frames must be suppressed, not forwarded: {emitted}"
+    );
+}
+
+// #1159 C1 (fail-closed security regression): a fatal mid-stream error must poison
+// the whole logical stream so a co-batched lowered item whose `output_item.added`
+// was rolled back by the failed chunk cannot later leak its raw private name on a
+// subsequent `output_item.done`. Backends batch several SSE frames per network
+// chunk, so this drives the real commit path through `on_response_body`:
+//   * Chunk N: the lowered item's `output_item.added` FOLLOWED by a lossy snapshot (a `response.in_progress` whose
+//     output holds a lowered custom `function_call` with no `call_id`). The plan pass fails closed AFTER tracking the
+//     added item, so `state.client_tool_items` is rolled back and the chunk emits nothing.
+//   * Chunk N+1: that same item's `output_item.done` carrying the private name.
+// Without the sticky poison flag + defense-in-depth, chunk N+1 would find the item
+// untracked and pass the RAW `function_call` (private `agentic_ns__...` name)
+// straight to the client. Asserts no frame ever carries the private name and the
+// stream terminates as an error, not a successful completion.
+#[tokio::test]
+async fn poisoned_stream_never_leaks_rolled_back_lowered_name_on_later_done() {
+    let filter = make_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+    ctx.current_filter_id = Some(0);
+
+    // Arm a Custom lowering keyed by a private lowered name, read the same way
+    // `restore_and_append_chunk` reads it.
+    ctx.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "test-model",
+        "input": "hello",
+        "stream": true
+    })));
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .client_tool_lowering
+        .insert(
+            "agentic_ns__demo__apply_patch".to_owned(),
+            LoweredClientTool {
+                original_name: "apply_patch".to_owned(),
+                namespace: None,
+                restore: ClientToolRestore::Custom,
+            },
+        );
+
+    filter.arm(&mut ctx);
+
+    // Open the logical response.
+    let mut created = Some(make_sse_chunk(
+        "response.created",
+        &json!({
+            "response": {"id": "resp_1", "status": "in_progress", "output": []},
+            "sequence_number": 0
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut created, false).unwrap();
+    let created_out = created.map_or_else(String::new, |b| String::from_utf8(b.to_vec()).unwrap());
+
+    // Chunk N: the lowered item's `output_item.added` (tracked) followed by a lossy
+    // snapshot that fails the plan pass closed — rolling back the just-added item.
+    let added = make_sse_chunk(
+        "response.output_item.added",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__demo__apply_patch", "call_id": "c1", "id": "fc_1"},
+            "sequence_number": 1
+        }),
+    );
+    let lossy_in_progress = make_sse_chunk(
+        "response.in_progress",
+        &json!({
+            "response": {
+                "object": "response",
+                "output": [
+                    {"type": "function_call", "name": "agentic_ns__demo__apply_patch", "id": "fc_2"}
+                ]
+            },
+            "sequence_number": 2
+        }),
+    );
+    let mut chunk_n = Some({
+        let mut buf = added.to_vec();
+        buf.extend_from_slice(&lossy_in_progress);
+        Bytes::from(buf)
+    });
+    filter.on_response_body(&mut ctx, &mut chunk_n, false).unwrap();
+    let chunk_n_out = chunk_n.map_or_else(String::new, |b| String::from_utf8(b.to_vec()).unwrap());
+    assert!(
+        chunk_n_out.is_empty(),
+        "the failed chunk must emit nothing (plan pass fails before any append): {chunk_n_out}"
+    );
+
+    // Chunk N+1: the rolled-back item's `output_item.done` carrying the private name.
+    let mut chunk_n1 = Some(make_sse_chunk(
+        "response.output_item.done",
+        &json!({
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__demo__apply_patch", "call_id": "c1", "id": "fc_1",
+                     "arguments": "{\"input\":\"x\"}", "status": "completed"},
+            "sequence_number": 3
+        }),
+    ));
+    filter.on_response_body(&mut ctx, &mut chunk_n1, false).unwrap();
+    let chunk_n1_out = chunk_n1.map_or_else(String::new, |b| String::from_utf8(b.to_vec()).unwrap());
+    assert!(
+        chunk_n1_out.is_empty(),
+        "a post-failure chunk must be dropped closed on the poisoned stream: {chunk_n1_out}"
+    );
+
+    // End of stream: the logical terminal must be an error, not a completion.
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    let eos_out = eos.map_or_else(String::new, |b| String::from_utf8(b.to_vec()).unwrap());
+
+    let combined = format!("{created_out}{chunk_n_out}{chunk_n1_out}{eos_out}");
+    assert!(
+        !combined.contains("agentic_ns__demo__apply_patch"),
+        "the private lowered name must never reach the client on a poisoned stream: {combined}"
+    );
+    assert!(
+        !combined.contains("fc_1") && !combined.contains("fc_2"),
+        "the private lowered `fc_` ids must never reach the client: {combined}"
+    );
+    assert!(
+        !combined.contains(r#""type":"function_call""#),
+        "the raw lowered function_call item must never surface to the client: {combined}"
+    );
+    assert!(
+        !combined.contains("response.completed"),
+        "a poisoned stream must not emit a successful completion terminal: {combined}"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "the poisoned stream must fail closed"
+    );
+    assert!(
+        eos_out.contains("event: error"),
+        "the logical stream must terminate with an error event: {eos_out}"
     );
 }

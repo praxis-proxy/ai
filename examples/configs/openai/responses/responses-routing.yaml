@@ -13,7 +13,6 @@
 # - previous_response_id is set
 # - tools array is non-empty
 # - store is true (the OpenAI spec default when omitted)
-# - background is true
 # - conversation is set
 # - prompt.id is set
 #

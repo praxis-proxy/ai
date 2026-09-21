@@ -30,10 +30,6 @@ fn mode_branch_routes_stateful_conditions_to_stateful_path() {
             r#"{"model":"gpt-4.1","input":"Hello","store":false,"tools":[{"type":"function","function":{"name":"get_weather"}}]}"#,
         ),
         (
-            "background=true",
-            r#"{"model":"gpt-4.1","input":"Hello","store":false,"background":true}"#,
-        ),
-        (
             "conversation present",
             r#"{"model":"gpt-4.1","input":"Hello","store":false,"conversation":{"id":"conv_123"}}"#,
         ),
@@ -46,6 +42,27 @@ fn mode_branch_routes_stateful_conditions_to_stateful_path() {
     for (label, body) in cases {
         assert_routes_to("stateful-path", label, body);
     }
+}
+
+#[test]
+fn mode_branch_rejects_background_before_upstream() {
+    let stateful_guard = start_backend_with_shutdown("unexpected-stateful-request");
+    let default_guard = start_backend_with_shutdown("unexpected-default-request");
+    let proxy_port = free_port();
+    let config = Config::from_yaml(&mode_branch_yaml(
+        proxy_port,
+        stateful_guard.port(),
+        default_guard.port(),
+    ))
+    .unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"Hello","store":false,"background":true}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(parse_status(&raw), 400);
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(response["error"]["message"], "background mode is not supported");
 }
 
 #[test]

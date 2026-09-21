@@ -284,6 +284,10 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
       - filter: openai_conversations
         backend: sqlite
         database_url: "{db_url}"

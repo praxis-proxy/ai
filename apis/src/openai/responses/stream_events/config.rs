@@ -27,8 +27,16 @@ pub(crate) struct StreamEventsConfig {
     #[serde(default)]
     pub max_events: Option<usize>,
 
-    /// Maximum seconds from first chunk to stream completion.
-    /// Default: 300 (5 minutes).
+    /// Maximum seconds from the first SSE chunk to stream completion.
+    ///
+    /// The parser enforces this absolute deadline when chunks or
+    /// end-of-stream arrive. Before the first chunk, cluster
+    /// `read_timeout_ms` applies; `timeout_secs` does not start until
+    /// the first SSE chunk. Each later chunk calls
+    /// [`praxis_filter::HttpFilterContext::cap_stream_read_timeout`] with the
+    /// remaining time so downstream backpressure cannot restart a relative
+    /// per-read timer past the deadline. A tighter cluster `read_timeout_ms`
+    /// is left in place. Default: 300 (5 minutes).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 

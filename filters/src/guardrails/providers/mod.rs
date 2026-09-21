@@ -55,10 +55,9 @@ pub enum GuardResult {
         reason: String,
     },
     /// Content contains sensitive data — forward with masked text.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used once /v1/checks migration adds redaction support")
-    )]
+    ///
+    /// `modified_text` is populated from `NeMo` but not applied to the request
+    /// or response body until redaction support lands in `#49`.
     Redact {
         /// Provider-rewritten text with sensitive data masked.
         modified_text: String,

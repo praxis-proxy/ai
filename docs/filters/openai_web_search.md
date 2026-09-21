@@ -9,6 +9,8 @@ Web search filter for model-driven `web_search_call` dispatch.
 
 Detects pending web search calls in the response phase and executes them on re-entry via the `iterative_request_router` agentic loop.
 
+Each provider request is executed through the shared filtered-subrequest executor, which enforces destination authority, DNS/SSRF, TLS/SNI, and `Host` centrally. An optional `outbound_chain` runs operator-managed cross-cutting filters (headers, credentials, logging) on the callout; when omitted it defaults to an empty inline chain (pure passthrough), so the central protections still apply.
+
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -19,7 +21,7 @@ Detects pending web search calls in the response phase and executes them on re-e
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
 | `max_calls_per_round` | integer | no | Hard cap on web-search calls processed from one model response (1..=1024; default: 32). |
 | `base_url` | string | no | Override the provider's default API base URL. |
-| `allow_private_base_url` | bool | no | Allow a `base_url` that targets local-sensitive addresses. DNS names are resolved once per request and every result is checked immediately before the transport connects. By default, any private, loopback, link-local, or otherwise non-public result rejects the callout. Enable this only for a trusted private provider endpoint. |
+| `outbound_chain` | string \| object | no | Outbound filter chain the provider callout executes through. See [`WebSearchFilterConfig::outbound_chain`]; the two configs stay in sync. Optional — when omitted it defaults to an empty inline passthrough chain via [`default_outbound_chain`]. |
 
 ## Examples
 
@@ -37,6 +39,7 @@ api_key: ${WEB_SEARCH_API_KEY}
 filter: openai_web_search
 provider: brave
 api_key: ${WEB_SEARCH_API_KEY}
+outbound_chain: web_search_outbound
 default_context_size: medium
 timeout_ms: 10000
 max_calls_per_round: 32

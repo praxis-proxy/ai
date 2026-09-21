@@ -26,12 +26,11 @@ use serde::Deserialize;
 ///
 /// Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting`
 /// proposal in `praxis-proxy/enhancements`, scoped to this milestone's
-/// static header-value matchers and per-rule algorithm choice. CEL
-/// matchers, soft-limit tiers, weighted per-type accounting, and
-/// configurable estimation strategies are still out of scope (see the
-/// module doc comment) -- upstream itself defers the first two; the
-/// latter two are deferred to a separate follow-up by design, not by
-/// upstream mandate.
+/// static header-value matchers, per-rule algorithm choice, configurable
+/// estimation strategies (M3, see [`EstimationConfig`]), and M4
+/// token-type weights (`default_weights` / per-rule `weights`). CEL
+/// matchers and soft-limit tiers are still out of scope (see the module
+/// doc comment) -- upstream itself defers those.
 ///
 /// Assumes request identity has already been resolved upstream (this
 /// filter doesn't authenticate callers) -- a catch-all rule (no
@@ -49,6 +48,11 @@ pub(super) struct TokenRateLimitConfig {
     /// a catch-all budget instead.
     pub rules: Vec<RuleConfig>,
 
+    /// Trusted request identity used to partition each rule's budget.
+    /// The default preserves the historical single global bucket.
+    #[serde(default)]
+    pub key: KeySource,
+
     /// Where every rule's admission state lives: in-process (default,
     /// one budget per gateway instance) or a shared Valkey backend (one
     /// budget shared across every gateway instance/replica). One
@@ -60,6 +64,25 @@ pub(super) struct TokenRateLimitConfig {
     /// in-process and Valkey rules in one filter instance.
     #[serde(default)]
     pub backend: BackendConfig,
+
+    /// Filter-wide default per-type weights applied at reconciliation
+    /// (proposal M4). Omitted types default to `1.0`. Rules may overlay
+    /// individual types via [`RuleConfig::weights`]. Admission still
+    /// reserves the estimation/`reserved_tokens` cost unweighted.
+    #[serde(default)]
+    pub default_weights: super::weights::TokenTypeWeightsConfig,
+}
+
+/// Trusted source used to partition a rule's token budget.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum KeySource {
+    /// Every request matching a rule shares that rule's budget.
+    #[default]
+    Global,
+
+    /// Partition the rule by Praxis's verified request subject.
+    AuthenticatedSubject,
 }
 
 /// One `rules:` entry: an optional match condition, an algorithm choice
@@ -104,11 +127,23 @@ pub(super) struct RuleConfig {
     /// Fixed token cost reserved at admission time, before actual usage
     /// is known.
     ///
-    /// Placeholder pending M3 (configurable estimation strategies).
-    /// Real deployments will want this derived from request metadata
-    /// (e.g. `max_tokens`) rather than a single fixed constant -- that's
-    /// out of scope for this milestone.
-    pub reserved_tokens: u64,
+    /// Legacy field, retained for backward compatibility: a bare
+    /// `reserved_tokens: N` is equivalent to
+    /// `estimation: { strategy: fixed, fallback_estimate: N }`.
+    /// Mutually exclusive with [`estimation`](Self::estimation) --
+    /// specifying both on the same rule is a config error.
+    #[serde(default)]
+    pub reserved_tokens: Option<u64>,
+
+    /// Configurable estimation strategy for computing the token cost
+    /// reserved at admission time. Replaces the legacy `reserved_tokens`
+    /// field with request-metadata-aware strategies.
+    ///
+    /// Mutually exclusive with [`reserved_tokens`](Self::reserved_tokens) --
+    /// specifying both on the same rule is a config error. Omitting both
+    /// is also an error.
+    #[serde(default)]
+    pub estimation: Option<EstimationConfig>,
 
     /// How long an admitted-but-never-reconciled reservation (lost
     /// request: timeout, connection reset, upstream crash) is tracked as
@@ -126,6 +161,11 @@ pub(super) struct RuleConfig {
     /// when unset.
     #[serde(default)]
     pub reservation_timeout: Option<String>,
+
+    /// Optional per-rule overlay on [`TokenRateLimitConfig::default_weights`].
+    /// Omitted types inherit the filter defaults (then `1.0`).
+    #[serde(default)]
+    pub weights: super::weights::TokenTypeWeightsConfig,
 }
 
 /// Static header-value match condition for a [`RuleConfig`].
@@ -210,6 +250,63 @@ pub(super) enum BackendKind {
     Valkey,
 }
 
+/// Configurable estimation strategy for computing the token cost
+/// reserved at admission time, per rule.
+///
+/// Replaces the fixed `reserved_tokens` field with request-metadata-aware
+/// strategies. The operator picks one strategy per rule; all budgets on
+/// that rule share the same cost model.
+///
+/// Experimental: the `strategy` tag is intentionally extensible —
+/// future variants (e.g. `cel`) can be added without changing
+/// existing configurations.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "strategy", rename_all = "snake_case")]
+pub(super) enum EstimationStrategy {
+    /// Constant per request (equivalent to the legacy `reserved_tokens`).
+    Fixed,
+    /// Extracted from the request body's `max_tokens` field.
+    MaxTokens,
+    /// Content-Length-based input estimate plus `max_tokens`.
+    InputPlusMaxTokens,
+    /// `max_tokens` scaled by a per-model multiplier.
+    ModelScaled,
+}
+
+/// Full estimation configuration block, combining a strategy tag with
+/// shared tuning knobs.
+#[derive(Debug, Deserialize)]
+pub(super) struct EstimationConfig {
+    /// Which strategy to use for this rule's cost estimation.
+    #[serde(flatten)]
+    pub strategy: EstimationStrategy,
+
+    /// Safety-margin multiplier applied to the computed estimate.
+    /// Defaults to 1.0 (no margin). Must be positive and finite.
+    #[serde(default)]
+    pub multiplier: Option<f64>,
+
+    /// Token count to use when `max_tokens` is absent from the request.
+    /// Required for `fixed`; optional for body-dependent strategies
+    /// (if unset and the strategy can't extract a value, the request is
+    /// admitted without a reservation).
+    #[serde(default)]
+    pub fallback_estimate: Option<u64>,
+
+    /// Per-model multiplier map for `model_scaled` strategy.
+    #[serde(default)]
+    pub model_multipliers: Option<BTreeMap<String, f64>>,
+
+    /// Default multiplier for models not listed in `model_multipliers`.
+    #[serde(default)]
+    pub default_multiplier: Option<f64>,
+
+    /// Approximate bytes-per-token ratio for `input_plus_max_tokens`.
+    /// Defaults to 4.0.
+    #[serde(default)]
+    pub bytes_per_token: Option<f64>,
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -242,7 +339,27 @@ mod tests {
             rule.algorithm,
             RuleAlgorithm::SlidingWindow { capacity: 1000, .. }
         ));
-        assert_eq!(rule.reserved_tokens, 50);
+        assert_eq!(rule.reserved_tokens, Some(50));
+        assert_eq!(cfg.key, KeySource::Global);
+    }
+
+    #[test]
+    fn parses_authenticated_subject_key_source() {
+        let cfg = parse(
+            "key: authenticated_subject\nrules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    reserved_tokens: 50\n",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.key, KeySource::AuthenticatedSubject);
+    }
+
+    #[test]
+    fn rejects_unknown_key_source() {
+        let result = parse(
+            "key: request_header\nrules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    reserved_tokens: 50\n",
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]
@@ -370,6 +487,56 @@ mod tests {
             }
             .capacity(),
             7
+        );
+    }
+
+    #[test]
+    fn parses_filter_wide_and_per_rule_weights() {
+        let cfg = parse(
+            "default_weights:\n\
+             \x20 cached_input: 0.1\n\
+             \x20 reasoning: 0.9\n\
+             rules:\n\
+             \x20 - name: team-alpha\n\
+             \x20   algorithm: sliding_window\n\
+             \x20   window: 1h\n\
+             \x20   capacity: 1000\n\
+             \x20   reserved_tokens: 50\n\
+             \x20   weights:\n\
+             \x20     cached_input: 0.05\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.default_weights.cached_input, Some(0.1));
+        assert_eq!(cfg.default_weights.reasoning, Some(0.9));
+        assert!(cfg.default_weights.input.is_none());
+        assert_eq!(cfg.rules[0].weights.cached_input, Some(0.05));
+        assert!(cfg.rules[0].weights.reasoning.is_none());
+    }
+
+    #[test]
+    fn rejects_an_unknown_weight_type_name() {
+        let err = parse(
+            "default_weights:\n  cached: 0.1\nrules:\n  - name: default\n    algorithm: sliding_window\n    \
+             window: 1h\n    capacity: 100\n    reserved_tokens: 5\n",
+        )
+        .expect_err("typo'd type name must fail");
+        assert!(err.to_string().contains("unknown field"), "got: {err}");
+    }
+
+    #[test]
+    fn omits_weights_when_unset_so_pre_m4_configs_still_parse() {
+        let cfg = parse(
+            "rules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    \
+             reserved_tokens: 50\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.default_weights,
+            super::super::weights::TokenTypeWeightsConfig::default()
+        );
+        assert_eq!(
+            cfg.rules[0].weights,
+            super::super::weights::TokenTypeWeightsConfig::default()
         );
     }
 }

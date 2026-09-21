@@ -75,6 +75,65 @@ pub(crate) struct DispatchFailure {
     pub message: String,
 }
 
+/// How a lowered private `function` call is restored to its canonical
+/// client-owned typed output item on a function-only Responses backend (#1131).
+///
+/// Recorded by `openai_client_tool_compat` when it lowers a rich client tool
+/// declaration (`custom`, `namespace` member, local `shell`, or
+/// client-executed `tool_search`) to a private `function` tool on the outbound
+/// request. The buffered and streaming restoration paths look up a returned
+/// `function_call` by name to rebuild the exact typed item the client expects.
+/// Praxis never executes these tools; restoration only re-types the model's call
+/// before it reaches the client.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LoweredClientTool {
+    /// The canonical tool name the client declared, restored onto the output item.
+    /// For a `namespace` member this is the bare MEMBER name (namespace stripped).
+    pub original_name: String,
+    /// The declared namespace to re-add for a `namespace` member; `None` otherwise.
+    pub namespace: Option<String>,
+    /// The typed output item the returned `function_call` must be restored to.
+    pub restore: ClientToolRestore,
+}
+
+/// The canonical output-item type a lowered `function` call restores to (#1131).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClientToolRestore {
+    /// A freeform `custom` tool: `function_call` → `custom_tool_call`, unwrapping
+    /// the single string parameter into the plain-string `input` field.
+    Custom,
+    /// A `function` member of a `namespace`: keep `function_call`, restore the
+    /// original member name and re-add the `namespace`.
+    Namespace,
+    /// A `custom` member of a `namespace`: `function_call` → `custom_tool_call`
+    /// with the original member name, the re-added `namespace`, and the single
+    /// string parameter unwrapped into the plain-string `input` field.
+    NamespaceCustom,
+    /// A local `shell` tool: `function_call` → `shell_call` with
+    /// `environment.type == "local"`.
+    Shell,
+    /// A client-executed `tool_search` tool: `function_call` → `tool_search_call`
+    /// with `execution == "client"`.
+    ToolSearch,
+}
+
+/// Verbatim snapshot of the client-declared `tools`/`tool_choice` taken before
+/// `openai_client_tool_compat` lowers rich client tools to private `function`
+/// declarations (#1131).
+///
+/// The backend echoes the lowered request shape back in `response.tools` and
+/// `response.tool_choice`. Restoring these two fields from the snapshot keeps
+/// the canonical client-owned declarations (and private lowered names such as
+/// `agentic_ns__{ns}__{member}`) out of client-visible output. Captured once on
+/// the first lowered round and reused unchanged across IRR continuations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ClientToolEcho {
+    /// The client's original `tools` array, verbatim.
+    pub tools: Vec<serde_json::Value>,
+    /// The client's original `tool_choice`, verbatim; `Null` when it was absent.
+    pub tool_choice: serde_json::Value,
+}
+
 /// Return whether an output item consumes the response-wide built-in tool-call budget.
 ///
 /// All local built-in dispatchers share this classifier so adding a provider
@@ -231,8 +290,9 @@ pub(crate) enum McpApprovalState {
     clippy::struct_excessive_bools,
     reason = "request-scoped state bag; the request, transport, and deferred \
               lifecycle bool flags (history_rehydrated, parallel_tool_calls, \
-              store_persist_armed, previous_response_id_stream_restore_armed) are \
-              independent request facts, not a state machine or refactorable enum"
+              store_persist_armed, previous_response_id_stream_restore_armed, \
+              logical_stream_terminal_emitted) are independent request facts, \
+              not a state machine or refactorable enum"
 )]
 pub(crate) struct ResponsesState {
     /// Maps file IDs to filenames for citation annotation extraction.
@@ -263,6 +323,29 @@ pub(crate) struct ResponsesState {
 
     /// Next downstream sequence number for a logical Responses stream.
     pub logical_stream_sequence: u64,
+
+    /// Whether the client-visible terminal `response.completed` event has been
+    /// emitted as a *deferred, non-end-of-stream* chunk for this logical stream.
+    ///
+    /// #937: `openai_stream_events` defers the terminal frame until the inner
+    /// IRR stream ends, then surfaces it to the pre-IRR `openai_response_store`
+    /// as an ordinary non-end-of-stream chunk — ahead of the empty
+    /// end-of-stream callback where streaming persistence historically ran. Left
+    /// uncoordinated, a client could observe `response.completed` for a record a
+    /// later GET, DELETE, or `previous_response_id` continuation cannot find.
+    ///
+    /// [`emit_deferred_terminal`] sets this the moment it canonicalizes
+    /// [`Self::response_object`] and appends that non-end-of-stream terminal
+    /// frame, so the store persists synchronously BEFORE releasing the chunk
+    /// (failing closed on error) and then skips the redundant end-of-stream
+    /// persist. It is deliberately **not** set for a request-phase local
+    /// completion (`encode_local_completion`): that terminal is delivered as a
+    /// buffered `TerminalResponse` at end-of-stream, where the store already
+    /// persists before the body is written, so marking it here would suppress
+    /// that end-of-stream persist and lose the record.
+    ///
+    /// [`emit_deferred_terminal`]: crate::openai::responses::stream_events
+    pub logical_stream_terminal_emitted: bool,
 
     /// Index where the current model round begins in `accumulated_output`.
     ///
@@ -312,6 +395,23 @@ pub(crate) struct ResponsesState {
     /// Consumed by `mcp_tool` (#27) for dispatch routing.
     pub mcp_tool_map: HashMap<(String, String), serde_json::Value>,
 
+    /// Reverse map from a lowered private `function` tool name to the canonical
+    /// client-owned tool it restores to, for a function-only Responses backend.
+    ///
+    /// Populated by `openai_client_tool_compat` during request lowering (#1131)
+    /// and read by its buffered restoration and by `openai_stream_events` on the
+    /// streaming path. Empty for native passthrough. Bounded by the declared tool
+    /// count. Private lowered names never leak to client output.
+    pub client_tool_lowering: HashMap<String, LoweredClientTool>,
+
+    /// Original client-declared `tools`/`tool_choice`, snapshotted before
+    /// lowering so the echoed `response.tools`/`response.tool_choice` can be
+    /// restored to their canonical shapes without leaking private `function`
+    /// names into client-visible output (#1131). `None` for native passthrough
+    /// (nothing lowered). Set once on the first lowered round and reused across
+    /// IRR continuations.
+    pub client_tool_echo: Option<ClientToolEcho>,
+
     /// Lifecycle state for an MCP batch that must return after execution.
     pub mcp_approval_state: McpApprovalState,
 
@@ -337,6 +437,10 @@ pub(crate) struct ResponsesState {
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
     pub messages: Vec<serde_json::Value>,
+
+    /// Number of leading messages already persisted by a provider-owned
+    /// conversation. Internal continuations send only the remaining delta.
+    pub provider_history_len: usize,
 
     /// Whether tool calls may execute concurrently within an
     /// iteration. Defaults to `true` per the API spec.
@@ -618,11 +722,12 @@ pub(crate) struct EmittedItem {
 }
 
 /// Internally resolved MCP connector waiting for deferred discovery.
+///
+/// The deferred `tools/list` callout is issued later by `openai_mcp_dispatch`,
+/// so its private/loopback posture is governed by that filter's bound outbound
+/// pipeline (via the per-request `McpCallout`) rather than a field captured here.
 #[derive(Clone)]
 pub(crate) struct DeferredMcpConnector {
-    /// Allow loopback MCP endpoints for this listing.
-    pub allow_loopback: bool,
-
     /// Request `authorization` forwarded to the MCP endpoint.
     pub authorization: Option<String>,
 
@@ -658,7 +763,6 @@ pub(crate) struct DeferredMcpConnector {
 impl fmt::Debug for DeferredMcpConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeferredMcpConnector")
-            .field("allow_loopback", &self.allow_loopback)
             .field("authorization", &self.authorization.as_ref().map(|_| "<redacted>"))
             .field("allowed_tools", &self.allowed_tools)
             .field("connector_id", &self.connector_id)
@@ -694,6 +798,7 @@ impl Default for ResponsesState {
             include: Vec::new(),
             logical_stream_response_id: None,
             logical_stream_sequence: 0,
+            logical_stream_terminal_emitted: false,
             current_round_output_start: None,
             history_rehydrated: false,
             input: Vec::new(),
@@ -704,7 +809,10 @@ impl Default for ResponsesState {
             deferred_tool_limit_completion: false,
             deferred_stream_done: false,
             mcp_tool_map: HashMap::new(),
+            client_tool_lowering: HashMap::new(),
+            client_tool_echo: None,
             messages: Vec::new(),
+            provider_history_len: 0,
             parallel_tool_calls: true,
             persisted_messages: Vec::new(),
             pending_approvals: Vec::new(),
@@ -757,6 +865,7 @@ impl ResponsesState {
             input: messages.clone(),
             max_tool_calls: extract_u32(&body, "max_tool_calls"),
             messages,
+            provider_history_len: 0,
             parallel_tool_calls: extract_bool_or(&body, "parallel_tool_calls", true),
             persisted_messages,
             previous_response_id: extract_string(&body, "previous_response_id"),
@@ -1519,6 +1628,11 @@ mod tests {
         assert!(state.conversation.is_none());
         assert_eq!(state.iteration, 0);
         assert!(state.max_tool_calls.is_none());
+        assert!(state.client_tool_lowering.is_empty());
+        assert!(
+            !state.logical_stream_terminal_emitted,
+            "logical stream terminal must start unemitted"
+        );
         assert!(state.parallel_tool_calls);
         assert!(state.persisted_messages.is_empty());
         assert!(!state.store_persist_armed);

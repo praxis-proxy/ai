@@ -87,6 +87,7 @@ pub(crate) mod test_utils {
             buffered_request_body: None,
             body_done_indices: Vec::new(),
             branch_iterations: std::collections::HashMap::new(),
+            grpc_completion: None,
             client_addr: None,
             cluster: None,
             current_filter_id: None,
@@ -98,6 +99,7 @@ pub(crate) mod test_utils {
             request_headers_to_set: Vec::new(),
             filter_metadata: std::collections::HashMap::new(),
             pre_read_mutations: Vec::new(),
+            prior_pre_read_mutations: Vec::new(),
             structured_metadata: std::collections::HashMap::new(),
             filter_results: std::collections::HashMap::new(),
             filter_state: std::collections::HashMap::new(),
@@ -128,6 +130,7 @@ pub(crate) mod test_utils {
             selected_endpoint_index: None,
             time_source: &praxis_core::time::SystemTimeSource,
             upstream: None,
+            upstream_reached: false,
         }
     }
 

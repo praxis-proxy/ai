@@ -15,8 +15,8 @@
 //! filters. Configuration therefore requires an explicit
 //! `allow_pre_security_callout: true` acknowledgement and should only
 //! be used behind an outer authentication and authorization boundary.
-//! Header forwarding is disabled by default; configured headers are
-//! copied from the original downstream request.
+//! Header forwarding is disabled by default; configured headers are copied
+//! from the effective request after trusted body-phase removals and projections.
 //!
 //! When [`ResponsesState`] is present (e.g. after `rehydrate`),
 //! resolved content is synced back into `state.request_body`,
@@ -67,10 +67,13 @@ pub(crate) mod resolve_url;
 )]
 mod tests;
 
+use std::{borrow::Cow, sync::Arc};
+
 use async_trait::async_trait;
 use bytes::Bytes;
+use praxis_core::config::ChainRef;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    BodyAccess, BodyMode, FilterAction, FilterError, FilterPipeline, HttpFilter, HttpFilterContext, Rejection,
     body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
@@ -87,10 +90,11 @@ use super::{
     state::ResponsesState,
 };
 use crate::{
+    callout_headers::effective_body_callout_headers,
     callout_policy::OnMissing,
     classifier::is_responses_create,
     json_body::serialize_json_body,
-    openai::api_client::{ApiClient, ApiClientConfig},
+    openai::api_client::{ApiClient, ApiClientConfig, DownstreamRuntime, OutboundExecution},
     subrequest::SubRequestClient,
 };
 
@@ -113,17 +117,34 @@ use crate::{
 /// ```yaml
 /// filter: openai_file_resolve
 /// files_api_url: "http://files-api:8321"
-/// allow_private_files_api_url: true
 /// allow_pre_security_callout: true
+/// outbound_chain:
+///   name: files-api-outbound
+///   filters:
+///     - filter: headers
+///       request_set:
+///         - name: x-file-callout
+///           value: file-resolve
 /// ```
+///
+/// `outbound_chain` is optional and may be defined inline or reference a
+/// top-level named chain. When omitted it defaults to an empty inline chain
+/// (pure passthrough); configured `file_id` callouts still run through the
+/// bound outbound pipeline.
 ///
 /// # Full YAML
 ///
 /// ```yaml
 /// filter: openai_file_resolve
 /// files_api_url: "http://files-api:8321"
-/// allow_private_files_api_url: true
 /// allow_pre_security_callout: true
+/// outbound_chain:
+///   name: files-api-outbound
+///   filters:
+///     - filter: headers
+///       request_set:
+///         - name: x-file-callout
+///           value: file-resolve
 /// forward_headers:
 ///   - authorization
 ///   - x-tenant-id
@@ -139,8 +160,14 @@ use crate::{
 /// ```yaml
 /// filter: openai_file_resolve
 /// files_api_url: "http://ogx:8321"
-/// allow_private_files_api_url: true
 /// allow_pre_security_callout: true
+/// outbound_chain:
+///   name: ogx-outbound
+///   filters:
+///     - filter: headers
+///       request_set:
+///         - name: x-file-callout
+///           value: file-resolve
 /// file_url: resolve
 /// allowed_file_url_origins:
 ///   - "https://files.internal:8443"
@@ -152,6 +179,13 @@ pub struct FileResolveFilter {
     config: FileResolveConfig,
     /// URL resolver for `file_url` references.
     url_resolver: Option<FileUrlResolver>,
+    /// Outbound filter chain applied to configured Files API
+    /// (`file_id`) callouts. Bound at registration through
+    /// [`ChainBindingContext::bind_chain`]; `None` on the
+    /// direct-construction paths that lack a binding context.
+    ///
+    /// [`ChainBindingContext::bind_chain`]: praxis_filter::ChainBindingContext::bind_chain
+    outbound: Option<Arc<FilterPipeline>>,
 }
 
 impl FileResolveFilter {
@@ -170,7 +204,7 @@ impl FileResolveFilter {
     /// [`from_config_with_client`]: Self::from_config_with_client
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
-        Self::build(config, client)
+        Self::build(config, client, None)
     }
 
     /// Create a filter using the shared [`SubRequestClient`].
@@ -188,15 +222,56 @@ impl FileResolveFilter {
         config: &serde_yaml::Value,
         client: SubRequestClient,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        Self::build(config, client)
+        Self::build(config, client, None)
     }
 
-    /// Shared constructor body for [`from_config`](Self::from_config) and
-    /// [`from_config_with_client`](Self::from_config_with_client).
+    /// Create a filter with a pre-bound outbound filter chain.
+    ///
+    /// Used by the chain-binding registration path, which resolves the
+    /// `outbound_chain` reference through [`ChainBindingContext::bind_chain`]
+    /// (failing the build when the chain cannot be constructed) and passes
+    /// the resulting pipeline here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the YAML config is invalid or the
+    /// callout client cannot be constructed.
+    ///
+    /// [`ChainBindingContext::bind_chain`]: praxis_filter::ChainBindingContext::bind_chain
+    pub fn from_config_with_outbound(
+        config: &serde_yaml::Value,
+        client: SubRequestClient,
+        outbound: Arc<FilterPipeline>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Self::build(config, client, Some(outbound))
+    }
+
+    /// Extract the configured `outbound_chain` reference from raw filter
+    /// YAML.
+    ///
+    /// The chain-binding registration path calls this to resolve and bind
+    /// the chain (via [`ChainBindingContext::bind_chain`]) before
+    /// constructing the filter, keeping the private config type inside this
+    /// module. `outbound_chain` is optional; when omitted the config layer
+    /// substitutes an empty inline chain (pure passthrough), so this always
+    /// yields a bindable reference and never signals "missing".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the YAML config cannot be parsed.
+    ///
+    /// [`ChainBindingContext::bind_chain`]: praxis_filter::ChainBindingContext::bind_chain
+    pub fn outbound_chain_ref(config: &serde_yaml::Value) -> Result<ChainRef, FilterError> {
+        let cfg: FileResolveConfig = parse_filter_config("openai_file_resolve", config)?;
+        Ok(cfg.outbound_chain)
+    }
+
+    /// Shared constructor body for the public constructors.
     #[expect(clippy::too_many_lines, reason = "filter construction boilerplate")]
     fn build(
         config: &serde_yaml::Value,
         subrequest_client: SubRequestClient,
+        outbound: Option<Arc<FilterPipeline>>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileResolveConfig = parse_filter_config("openai_file_resolve", config)?;
         let validated = validate_config(cfg)?;
@@ -208,9 +283,12 @@ impl FileResolveFilter {
             timeout: std::time::Duration::from_millis(validated.timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names,
-            address_policy: crate::callout_target::AddressPolicy::from_allow_private(
-                validated.allow_private_files_api_url,
-            ),
+            // Configured Files API (`file_id`) callouts derive their SSRF
+            // protection from the bound outbound pipeline
+            // (`allow_private_upstreams`), not from this policy. It only
+            // governs the chain-less fallback in `from_config*`, so it stays
+            // conservative; `file_url` downloads use the hardened resolver.
+            address_policy: crate::callout_target::AddressPolicy::PublicOnly,
         });
 
         let client = FilesApiClient::new(
@@ -239,6 +317,7 @@ impl FileResolveFilter {
             client,
             config: validated,
             url_resolver,
+            outbound,
         }))
     }
 }
@@ -311,6 +390,32 @@ impl HttpFilter for FileResolveFilter {
 
         resolve_and_rewrite(self, ctx, body, parsed).await
     }
+
+    fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
+        // Reach the bound outbound pipeline so the runtime can propagate
+        // `allow_private_upstreams` and other nested-pipeline configuration
+        // into the Files API callout chain.
+        if let Some(outbound) = self.outbound.as_mut() {
+            if let Some(pipeline) = Arc::get_mut(outbound) {
+                visitor(pipeline);
+            } else {
+                debug_assert!(false, "outbound pipeline must be uniquely owned during configuration");
+            }
+        }
+    }
+
+    fn referenced_files(&self) -> Vec<std::path::PathBuf> {
+        match self.outbound.as_ref() {
+            Some(outbound) => outbound.referenced_files(),
+            None => Vec::new(),
+        }
+    }
+
+    fn apply_insecure_options(&self, options: &praxis_core::config::InsecureOptions) {
+        if let Some(outbound) = self.outbound.as_ref() {
+            outbound.apply_insecure_options(options);
+        }
+    }
 }
 
 /// Run resolution and rewrite the body if any references were resolved.
@@ -325,14 +430,18 @@ async fn resolve_and_rewrite(
     mut parsed: serde_json::Value,
 ) -> Result<FilterAction, FilterError> {
     let max_bytes = filter.config.max_rewritten_body_bytes;
-    let mut budget = filter.client.resolution_budget();
-    let count = match resolve_current_input(filter, ctx, &mut parsed, &mut budget).await {
+    let mut budget = filter.client.resolution_budget(build_outbound_execution(filter, ctx));
+    // Body pre-read mutations have not reached `ctx.request` yet. Materialize
+    // their effective view once so every Files API call observes trusted
+    // removals and projections while `ctx` is subsequently mutated.
+    let request_headers = effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers)).into_owned();
+    let count = match resolve_current_input(filter, &request_headers, &mut parsed, &mut budget).await {
         Ok(count) => count,
         Err(e) => return Ok(reject_resolve_error(&e)),
     };
     if count == 0 {
         trace!("no file_id references found");
-        if let Err(e) = update_state(filter, ctx, None, &mut budget).await {
+        if let Err(e) = update_state(filter, ctx, &request_headers, None, &mut budget).await {
             return Ok(reject_resolve_error(&e));
         }
         if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
@@ -345,7 +454,7 @@ async fn resolve_and_rewrite(
     if let Some(rejection) = rewrite_body(body, &parsed, max_bytes, filter.name())? {
         return Ok(rejection);
     }
-    if let Err(e) = update_state(filter, ctx, Some(parsed), &mut budget).await {
+    if let Err(e) = update_state(filter, ctx, &request_headers, Some(parsed), &mut budget).await {
         return Ok(reject_resolve_error(&e));
     }
     if let Some(rejection) = reject_oversized_state_body(ctx, max_bytes)? {
@@ -353,6 +462,23 @@ async fn resolve_and_rewrite(
     }
 
     Ok(FilterAction::Continue)
+}
+
+/// Snapshot the downstream request context and build the outbound
+/// execution for configured Files API (`file_id`) callouts.
+///
+/// Returns `None` when no outbound chain is bound (the chain-less
+/// `from_config*` construction paths), leaving `file_id` resolution on the
+/// direct client transport.
+fn build_outbound_execution(filter: &FileResolveFilter, ctx: &HttpFilterContext<'_>) -> Option<OutboundExecution> {
+    let pipeline = filter.outbound.clone()?;
+    let runtime = DownstreamRuntime {
+        client_addr: ctx.client_addr,
+        downstream_tls: ctx.downstream_tls,
+        peer_identity: ctx.peer_identity.clone(),
+        request_start: ctx.request_start,
+    };
+    Some(filter.client.outbound_execution(pipeline, runtime))
 }
 
 /// Enforce the resolver's body limit against the exact request shape
@@ -380,7 +506,7 @@ fn reject_oversized_state_body(
 /// Resolve references in the request body's current input.
 async fn resolve_current_input(
     filter: &FileResolveFilter,
-    ctx: &HttpFilterContext<'_>,
+    request_headers: &http::HeaderMap,
     parsed: &mut serde_json::Value,
     budget: &mut ResolutionBudget,
 ) -> Result<usize, ResolveError> {
@@ -388,7 +514,7 @@ async fn resolve_current_input(
         parsed,
         &filter.client,
         filter.config.on_missing,
-        &ctx.request.headers,
+        request_headers,
         filter.url_resolver.as_ref(),
         budget,
     ))
@@ -399,31 +525,19 @@ async fn resolve_current_input(
 async fn update_state(
     filter: &FileResolveFilter,
     ctx: &mut HttpFilterContext<'_>,
+    request_headers: &http::HeaderMap,
     resolved_body: Option<serde_json::Value>,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
+    let resolver = HistoryResolver {
+        client: &filter.client,
+        on_missing: filter.config.on_missing,
+        request_headers,
+        url_resolver: filter.url_resolver.as_ref(),
+    };
     match resolved_body {
-        Some(body) => {
-            Box::pin(sync_state_with_budget(
-                ctx,
-                body,
-                &filter.client,
-                filter.config.on_missing,
-                filter.url_resolver.as_ref(),
-                budget,
-            ))
-            .await
-        },
-        None => {
-            Box::pin(resolve_state_history(
-                ctx,
-                &filter.client,
-                filter.config.on_missing,
-                filter.url_resolver.as_ref(),
-                budget,
-            ))
-            .await
-        },
+        Some(body) => Box::pin(sync_state_with_budget(ctx, body, resolver, budget)).await,
+        None => Box::pin(resolve_state_history(ctx, resolver, budget)).await,
     }
 }
 
@@ -462,13 +576,10 @@ fn rewrite_body(
 ///
 /// Takes `resolved_body` by value and moves it into `request_body`
 /// rather than deep-cloning a tree that may carry inlined file data.
-#[expect(clippy::too_many_arguments, reason = "threading resolver through state sync")]
 async fn sync_state_with_budget(
     ctx: &mut HttpFilterContext<'_>,
     resolved_body: serde_json::Value,
-    client: &FilesApiClient,
-    on_missing: OnMissing,
-    url_resolver: Option<&FileUrlResolver>,
+    resolver: HistoryResolver<'_>,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -489,13 +600,6 @@ async fn sync_state_with_budget(
         return Ok(());
     };
 
-    let resolver = HistoryResolver {
-        client,
-        on_missing,
-        request_headers: &ctx.request.headers,
-        url_resolver,
-    };
-
     sync_message_history(messages, input_len, Some(resolved_input), resolver, budget).await?;
     sync_persisted_history(persisted_messages, input_len, Some(resolved_input), resolver, budget).await
 }
@@ -508,17 +612,22 @@ async fn sync_state(
     client: &FilesApiClient,
     on_missing: OnMissing,
 ) -> Result<(), ResolveError> {
-    let mut budget = client.resolution_budget();
-    sync_state_with_budget(ctx, resolved_body, client, on_missing, None, &mut budget).await
+    let mut budget = client.resolution_budget(None);
+    let request_headers = ctx.request.headers.clone();
+    let resolver = HistoryResolver {
+        client,
+        on_missing,
+        request_headers: &request_headers,
+        url_resolver: None,
+    };
+    sync_state_with_budget(ctx, resolved_body, resolver, &mut budget).await
 }
 
 /// Resolve file references in rehydrated history when the
 /// current input did not require a body rewrite.
 async fn resolve_state_history(
     ctx: &mut HttpFilterContext<'_>,
-    client: &FilesApiClient,
-    on_missing: OnMissing,
-    url_resolver: Option<&FileUrlResolver>,
+    resolver: HistoryResolver<'_>,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -526,13 +635,6 @@ async fn resolve_state_history(
     };
 
     let input_len = state.input.len();
-    let resolver = HistoryResolver {
-        client,
-        on_missing,
-        request_headers: &ctx.request.headers,
-        url_resolver,
-    };
-
     sync_message_history(&mut state.messages, input_len, None, resolver, budget).await?;
     sync_persisted_history(&mut state.persisted_messages, input_len, None, resolver, budget).await
 }

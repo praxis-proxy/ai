@@ -11,9 +11,9 @@
 //!
 //! When `ResponsesState` is present in `RequestExtensions`, replaces
 //! the request input with `state.messages` only after conversation
-//! history has changed it. It strips `previous_response_id` only after
-//! the rehydrate filter has resolved it locally. Every path removes the
-//! Praxis-owned `conversation` field before forwarding upstream.
+//! history has changed it. Provider-owned conversation continuations
+//! send only their new message delta. It strips `previous_response_id`
+//! and `conversation` only after local rehydration consumes them.
 
 mod config;
 
@@ -45,7 +45,7 @@ use tracing::{debug, trace};
 
 use self::config::{ResponsesProxyConfig, build_config};
 use super::{body_limits::reject_rewritten_body_too_large, state::ResponsesState};
-use crate::json_body::{SerializedJson, serialize_json_body};
+use crate::json_body::SerializedJson;
 
 // -----------------------------------------------------------------------------
 // ResponsesProxyFilter
@@ -59,8 +59,7 @@ use crate::json_body::{SerializedJson, serialize_json_body};
 /// input. Strips `previous_response_id` after Praxis resolves it
 /// locally via the rehydrate filter.
 ///
-/// When no `ResponsesState` exists, preserves the request body apart
-/// from removing the Praxis-owned `conversation` field.
+/// When no `ResponsesState` exists, preserves the request body unchanged.
 ///
 /// This filter always advertises the Praxis streaming capability. When the
 /// effective outbound body contains `"stream": true` it selects Praxis's
@@ -187,14 +186,12 @@ impl HttpFilter for ResponsesProxyFilter {
         }
 
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
-            strip_conversation_field(body, self.name());
             select_terminal_response_mode(ctx, body);
             debug!("no ResponsesState in extensions, passthrough");
             return Ok(FilterAction::Continue);
         };
 
         if !request_needs_rebuild(state) {
-            strip_conversation_field(body, self.name());
             select_terminal_response_mode(ctx, body);
             debug!("ResponsesState does not require an outbound rewrite, passthrough");
             return Ok(FilterAction::Continue);
@@ -245,26 +242,6 @@ fn select_terminal_response_mode(ctx: &mut HttpFilterContext<'_>, body: &Option<
     ctx.set_subrequest_response_mode(mode);
 }
 
-/// Defensively strip `conversation` from a passthrough body so it never
-/// leaks to the backend even when no [`ResponsesState`] was produced.
-fn strip_conversation_field(body: &mut Option<Bytes>, filter_name: &'static str) {
-    let Some(bytes) = body.as_ref() else {
-        return;
-    };
-    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-        return;
-    };
-    if parsed
-        .as_object_mut()
-        .is_some_and(|obj| obj.remove("conversation").is_some())
-    {
-        debug!("stripped conversation from passthrough body");
-        if let Ok(serialized) = serialize_json_body(&parsed) {
-            serialized.commit(body, filter_name, "conversation");
-        }
-    }
-}
-
 /// Borrowed view of the outbound request body.
 ///
 /// This keeps the original request and message history borrowed while
@@ -284,7 +261,15 @@ impl serde::Serialize for OutboundBody<'_> {
             return self.state.request_body.serialize(serializer);
         };
 
-        let backend_messages = messages_for_backend(&self.state.messages);
+        let messages = if provider_owns_conversation(self.state) && self.state.iteration > 0 {
+            self.state
+                .messages
+                .get(self.state.provider_history_len..)
+                .unwrap_or_default()
+        } else {
+            &self.state.messages
+        };
+        let backend_messages = messages_for_backend(messages);
         let mut map = serializer.serialize_map(None)?;
         let mut wrote_input = false;
         for (name, value) in object {
@@ -293,8 +278,7 @@ impl serde::Serialize for OutboundBody<'_> {
                     map.serialize_entry(name, backend_messages.as_ref())?;
                     wrote_input = true;
                 },
-                "previous_response_id" if self.state.history_rehydrated => {},
-                "conversation" => {},
+                "previous_response_id" | "conversation" if self.state.history_rehydrated => {},
                 _ => map.serialize_entry(name, value)?,
             }
         }
@@ -303,6 +287,15 @@ impl serde::Serialize for OutboundBody<'_> {
         }
         map.end()
     }
+}
+
+/// Whether the upstream provider, rather than local rehydration, owns history.
+fn provider_owns_conversation(state: &ResponsesState) -> bool {
+    !state.history_rehydrated
+        && state
+            .conversation
+            .as_ref()
+            .is_some_and(|conversation| !conversation.is_null())
 }
 
 /// Serialize the outbound body without cloning request state.

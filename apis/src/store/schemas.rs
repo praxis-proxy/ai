@@ -29,7 +29,7 @@ pub(crate) struct TableNames {
 // -----------------------------------------------------------------------------
 
 /// Current schema version. Bump this when the DDL changes.
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 /// Suffix appended to the responses table name to derive the schema
 /// version table name.
@@ -136,6 +136,7 @@ pub(crate) fn generate_ddl(tables: &TableNames) -> Result<Vec<String>, StoreErro
 ///
 /// Returns [`StoreError::Database`] when an identifier would exceed
 /// the `PostgreSQL` limit or would be case-folded.
+#[cfg(feature = "store-postgres")]
 pub(crate) fn validate_postgres_identifiers(tables: &TableNames) -> Result<(), StoreError> {
     let (r, c) = validate_table_names(tables)?;
 
@@ -159,6 +160,7 @@ pub(crate) fn validate_postgres_identifiers(tables: &TableNames) -> Result<(), S
 }
 
 /// Validate table names for a `PostgreSQL` response store.
+#[cfg(feature = "store-postgres")]
 pub(crate) fn validate_postgres_table_identifiers(
     responses_table: &str,
     conversations_table: &str,
@@ -168,6 +170,7 @@ pub(crate) fn validate_postgres_table_identifiers(
 
 /// Validate table identifiers for a store that may also configure
 /// conversation item rows.
+#[cfg(feature = "store-postgres")]
 pub(crate) fn validate_postgres_table_set_identifiers(
     responses_table: &str,
     conversations_table: &str,
@@ -185,14 +188,16 @@ pub(crate) fn validate_postgres_table_set_identifiers(
 fn responses_ddl(r: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {r} (
-            tenant_id       TEXT NOT NULL,
             id              TEXT NOT NULL,
+            tenant_id       TEXT NOT NULL,
+            owner_issuer    TEXT NOT NULL,
+            owner_subject   TEXT NOT NULL,
             created_at      BIGINT NOT NULL,
             model           TEXT NOT NULL,
             response_object TEXT NOT NULL,
             input           TEXT NOT NULL,
             messages        TEXT NOT NULL,
-            PRIMARY KEY (tenant_id, id)
+            PRIMARY KEY (id)
         )"
     )
 }
@@ -203,10 +208,12 @@ fn conversations_ddl(c: &str) -> String {
         "CREATE TABLE IF NOT EXISTS {c} (
             conversation_id TEXT NOT NULL,
             tenant_id       TEXT NOT NULL,
+            owner_issuer    TEXT NOT NULL,
+            owner_subject   TEXT NOT NULL,
             created_at      BIGINT NOT NULL,
             metadata        TEXT NOT NULL,
             messages        TEXT NOT NULL,
-            PRIMARY KEY (conversation_id, tenant_id)
+            PRIMARY KEY (conversation_id)
         )"
     )
 }
@@ -222,20 +229,22 @@ fn append_items_ddl(stmts: &mut Vec<String>, i: &str) {
         "CREATE TABLE IF NOT EXISTS {i} (
             item_id           TEXT NOT NULL,
             tenant_id         TEXT NOT NULL,
+            owner_issuer      TEXT NOT NULL,
+            owner_subject     TEXT NOT NULL,
             conversation_id   TEXT NOT NULL,
             item_data         TEXT NOT NULL,
             created_at        BIGINT NOT NULL,
             position          BIGINT NOT NULL,
-            PRIMARY KEY (item_id, tenant_id, conversation_id)
+            PRIMARY KEY (item_id)
         )"
     ));
     stmts.push(format!(
         "CREATE INDEX IF NOT EXISTS idx_{i}_conversation \
-         ON {i}(conversation_id, tenant_id, position, item_id)"
+         ON {i}(conversation_id, position, item_id)"
     ));
     stmts.push(format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_{i}_position \
-         ON {i}(tenant_id, conversation_id, position)"
+         ON {i}(conversation_id, position)"
     ));
 }
 
@@ -259,6 +268,8 @@ fn pending_approvals_ddl(a: &str) -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {a} (
             tenant_id          TEXT NOT NULL,
+            owner_issuer       TEXT NOT NULL,
+            owner_subject      TEXT NOT NULL,
             response_id        TEXT NOT NULL,
             approval_id        TEXT NOT NULL,
             server_label       TEXT NOT NULL,
@@ -267,7 +278,7 @@ fn pending_approvals_ddl(a: &str) -> String {
             target_fingerprint TEXT NOT NULL,
             created_at         BIGINT NOT NULL,
             consumed_at        BIGINT,
-            PRIMARY KEY (tenant_id, response_id, approval_id)
+            PRIMARY KEY (response_id, approval_id)
         )"
     )
 }
@@ -293,24 +304,29 @@ fn validate_table_names(tables: &TableNames) -> Result<(&str, &str), StoreError>
 const MAX_IDENTIFIER_LEN: usize = 128;
 
 /// Maximum identifier length accepted by `PostgreSQL`.
+#[cfg(feature = "store-postgres")]
 const POSTGRES_MAX_IDENTIFIER_LEN: usize = 63;
 
 /// Maximum conversation table name length that leaves room for
 /// `idx_` (4) and `_tenant_id` (10) in the generated index name.
+#[cfg(feature = "store-postgres")]
 const POSTGRES_MAX_CONVERSATION_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - 14;
 
 /// Maximum items table name length that leaves room for `idx_` (4)
 /// and `_conversation` (13) in the generated index name.
+#[cfg(feature = "store-postgres")]
 const POSTGRES_MAX_ITEMS_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - 17;
 
 /// Maximum responses table name length that leaves room for the
 /// `_schema_version` suffix in the derived version table name.
+#[cfg(feature = "store-postgres")]
 const POSTGRES_MAX_RESPONSES_TABLE_LEN: usize = POSTGRES_MAX_IDENTIFIER_LEN - SCHEMA_VERSION_SUFFIX.len();
 
 /// Maximum responses table name length that leaves room for the
 /// `_pending_approvals` suffix in the derived pending-approvals table
 /// name. This suffix is longer than `_schema_version`, so it is the
 /// binding constraint on the responses table name for `PostgreSQL`.
+#[cfg(feature = "store-postgres")]
 const POSTGRES_MAX_RESPONSES_TABLE_LEN_FOR_APPROVALS: usize =
     POSTGRES_MAX_IDENTIFIER_LEN - PENDING_APPROVALS_SUFFIX.len();
 
@@ -358,6 +374,7 @@ fn validate_items_table<'a>(items: &'a str, responses: &str, conversations: &str
 }
 
 /// Reject a `PostgreSQL` identifier that would be truncated.
+#[cfg(feature = "store-postgres")]
 fn validate_postgres_identifier_len(kind: &str, name: &str, max_len: usize) -> Result<(), StoreError> {
     if name.len() > max_len {
         return Err(StoreError::Database(format!(
@@ -381,6 +398,7 @@ fn validate_postgres_identifier_len(kind: &str, name: &str, max_len: usize) -> R
 ///
 /// This is `PostgreSQL`-only. `SQLite` compares table names case-insensitively,
 /// so a mixed-case name resolves to the same table on both paths there.
+#[cfg(feature = "store-postgres")]
 fn validate_postgres_identifier_case(kind: &str, name: &str) -> Result<(), StoreError> {
     if name.bytes().any(|b| b.is_ascii_uppercase()) {
         return Err(StoreError::Database(format!(
@@ -398,6 +416,8 @@ fn validate_postgres_identifier_case(kind: &str, name: &str) -> Result<(), Store
 const RESPONSES_COLUMNS: &[&str] = &[
     "tenant_id",
     "id",
+    "owner_issuer",
+    "owner_subject",
     "created_at",
     "model",
     "response_object",
@@ -406,11 +426,21 @@ const RESPONSES_COLUMNS: &[&str] = &[
 ];
 
 /// Expected column names for the conversations table.
-const CONVERSATIONS_COLUMNS: &[&str] = &["conversation_id", "tenant_id", "created_at", "metadata", "messages"];
+pub(crate) const CONVERSATIONS_COLUMNS: &[&str] = &[
+    "conversation_id",
+    "tenant_id",
+    "owner_issuer",
+    "owner_subject",
+    "created_at",
+    "metadata",
+    "messages",
+];
 
 /// Expected column names for the server-owned pending-approvals table.
 pub(crate) const PENDING_APPROVALS_COLUMNS: &[&str] = &[
     "tenant_id",
+    "owner_issuer",
+    "owner_subject",
     "response_id",
     "approval_id",
     "server_label",
@@ -425,6 +455,8 @@ pub(crate) const PENDING_APPROVALS_COLUMNS: &[&str] = &[
 const ITEMS_COLUMNS: &[&str] = &[
     "item_id",
     "tenant_id",
+    "owner_issuer",
+    "owner_subject",
     "conversation_id",
     "item_data",
     "created_at",
@@ -433,45 +465,37 @@ const ITEMS_COLUMNS: &[&str] = &[
 
 /// Expected ordered primary key columns for the responses table.
 ///
-/// `tenant_id` leads the composite key so upserts stay scoped per tenant.
-/// A table keyed by `id` alone would let one tenant's `INSERT OR REPLACE`
-/// (`SQLite`) or `ON CONFLICT` (`PostgreSQL`) overwrite another tenant's row.
-const RESPONSES_PRIMARY_KEY: &[&str] = &["tenant_id", "id"];
+/// Response IDs are globally owner-immutable. Store writes use this conflict
+/// target and reject an existing row whose complete owner does not match.
+const RESPONSES_PRIMARY_KEY: &[&str] = &["id"];
 
 /// Expected ordered primary key columns for the conversations table.
-const CONVERSATIONS_PRIMARY_KEY: &[&str] = &["conversation_id", "tenant_id"];
+const CONVERSATIONS_PRIMARY_KEY: &[&str] = &["conversation_id"];
 
 /// Expected ordered primary key columns for the items table.
-const ITEMS_PRIMARY_KEY: &[&str] = &["item_id", "tenant_id", "conversation_id"];
+const ITEMS_PRIMARY_KEY: &[&str] = &["item_id"];
 
 /// Columns of the one unique index the items table generates beyond its primary
 /// key (`idx_<items>_position`).
 ///
-/// This index is tenant-safe: it leads with `tenant_id`, so it enforces a unique
-/// `position` per `(tenant_id, conversation_id)` without ever letting one
-/// tenant's row collide with another's. Validation accepts exactly this unique
-/// index and rejects any other, so a pre-existing narrower unique key -- one that
-/// omits `tenant_id` and would collapse distinct tenants under
-/// `INSERT OR REPLACE` -- still fails closed.
-const ITEMS_POSITION_UNIQUE: &[&str] = &["tenant_id", "conversation_id", "position"];
+/// Conversation IDs are globally owner-immutable, so they safely scope item
+/// positions without repeating identity columns in the index.
+const ITEMS_POSITION_UNIQUE: &[&str] = &["conversation_id", "position"];
 
 /// Expected ordered primary key columns for the server-owned pending-approvals
 /// table.
 ///
-/// `tenant_id` leads the composite key so a pre-existing table keyed by
-/// `response_id`/`approval_id` alone cannot let one tenant's approval upsert
-/// overwrite another tenant's row.
-const PENDING_APPROVALS_PRIMARY_KEY: &[&str] = &["tenant_id", "response_id", "approval_id"];
+/// Approval rows inherit their issuing Response owner. Since Response IDs are
+/// globally owner-immutable, `(response_id, approval_id)` is the conflict key.
+const PENDING_APPROVALS_PRIMARY_KEY: &[&str] = &["response_id", "approval_id"];
 
 /// The schema this store generates for one table: the columns it must contain
 /// and its exact ordered primary key.
 ///
 /// Validation is fail-closed against this contract. Rather than proving a
 /// pre-existing schema is a safe superset of ours, we require it to match what
-/// we generate; any deviation -- an unknown type, a folding collation, a
-/// narrower or extra unique index, a reordered key -- is rejected. This is
-/// strictly stronger on tenant isolation than the superset proofs it replaces,
-/// and it removes the compatibility matrix entirely.
+/// we generate; any deviation -- an unknown type, a folding collation, an
+/// unexpected unique index, or a reordered key -- is rejected.
 #[derive(Clone, Copy)]
 pub(crate) struct ExpectedTable {
     /// Columns that must be present. Extra columns are tolerated.
@@ -481,9 +505,9 @@ pub(crate) struct ExpectedTable {
     /// Column sets of the unique indexes this store generates beyond the primary
     /// key. Each entry is one unique index's columns. A discovered unique index
     /// is accepted only when its column set matches one of these; any other
-    /// unique index is rejected, because a narrower one reintroduces cross-tenant
-    /// data loss under `INSERT OR REPLACE` / `ON CONFLICT`. Empty for tables that
-    /// generate no unique index beyond the primary key.
+    /// unique index is rejected because it changes the store's collision
+    /// semantics. Empty for tables that generate no unique index beyond the
+    /// primary key.
     pub unique_indexes: &'static [&'static [&'static str]],
 }
 
@@ -515,15 +539,11 @@ const PENDING_APPROVALS_TABLE: ExpectedTable = ExpectedTable {
     unique_indexes: &[],
 };
 
-/// Collect the `(table_name, expected)` contract for every tenant-scoped table.
+/// Collect the `(table_name, expected)` contract for every owner-scoped table.
 ///
-/// Only these tables carry tenant-scoped keys, so only these need key-metadata
-/// validation. The server-owned pending-approvals table is included: its derived
-/// name is internal, but it is keyed `(tenant_id, response_id, approval_id)` and
-/// upserted, so a pre-existing table with a tenant-omitting key would lose
-/// approvals across tenants just like the response tables. The single-row schema
-/// version table holds no tenant data; it is validated by value in
-/// `check_schema_version`, not structurally.
+/// The server-owned pending-approvals table is included because its rows inherit
+/// Response ownership. The single-row schema version table holds no owner data;
+/// it is validated by value in `check_schema_version`, not structurally.
 ///
 /// Table names are returned owned because the pending-approvals name is derived
 /// from the responses name rather than borrowed from `tables`.
@@ -559,8 +579,7 @@ pub(crate) struct ActualTable {
     /// Unique indexes other than the primary key, each with the columns it
     /// covers. An index is accepted only when its column set matches one the
     /// store generates (see [`ExpectedTable::unique_indexes`]); any other unique
-    /// index is rejected, because a narrower one reintroduces cross-tenant data
-    /// loss under `INSERT OR REPLACE` / `ON CONFLICT`.
+    /// index is rejected because it changes the store's collision semantics.
     pub unique_indexes: Vec<ActualUniqueIndex>,
 }
 
@@ -581,8 +600,8 @@ pub(crate) struct ActualKeyColumn {
     /// A human-readable reason the column folds distinct key values together --
     /// a wrong type or affinity, a folding collation, or an untrusted operator
     /// class -- or `None` when the column preserves distinctness. Each backend
-    /// computes this at discovery via [`pg_key_column_folding`] or
-    /// [`sqlite_key_column_folding`] so the comparison stays backend-agnostic.
+    /// computes this at discovery via its key-column folding check so the
+    /// comparison stays backend-agnostic.
     pub folding: Option<String>,
 }
 
@@ -664,10 +683,8 @@ fn check_primary_key(table: &str, expected: &[&str], actual: &ActualTable, error
 /// here is a unique index *beyond* the primary key. Each is accepted only when
 /// its columns match one of the expected sets; matching is case-insensitive and
 /// order-insensitive because uniqueness is a property of the column set, not its
-/// order. Any unmatched unique index fails closed: a narrower unique key that
-/// omits `tenant_id` would collapse distinct tenants under `INSERT OR REPLACE` /
-/// `ON CONFLICT`, and proving a different one safe is exactly the compatibility
-/// matrix this validation avoids.
+/// order. Any unmatched unique index fails closed because it changes the
+/// collision behavior of `INSERT OR REPLACE` / `ON CONFLICT`.
 fn check_unique_indexes(table: &str, expected: &[&[&str]], actual: &[ActualUniqueIndex], errors: &mut Vec<String>) {
     for index in actual {
         let matches = expected.iter().any(|columns| same_column_set(columns, &index.columns));
@@ -715,6 +732,7 @@ fn into_validation_result(errors: &[String]) -> Result<(), StoreError> {
 /// text keys distinct. `NOCASE` folds ASCII case and `RTRIM` folds trailing
 /// spaces, so either would let two distinct tenant or response ids compare
 /// equal and collapse under `INSERT OR REPLACE`.
+#[cfg(feature = "store-sqlite")]
 const SQLITE_SAFE_COLLATION: &str = "BINARY";
 
 /// Whether a `SQLite` collation folds distinct text values together.
@@ -722,12 +740,14 @@ const SQLITE_SAFE_COLLATION: &str = "BINARY";
 /// Only `BINARY` (the default) is guaranteed value-preserving. `NOCASE`,
 /// `RTRIM`, and any custom sequence may compare two different strings equal, so
 /// they are treated as folding.
+#[cfg(feature = "store-sqlite")]
 pub(crate) fn sqlite_collation_folds(collation: &str) -> bool {
     !collation.eq_ignore_ascii_case(SQLITE_SAFE_COLLATION)
 }
 
 /// A `SQLite` type affinity class, derived from a column's declared type.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(feature = "store-sqlite")]
 enum SqliteAffinity {
     /// Declared type contains `INT`; stores integers and coerces numeric text.
     Integer,
@@ -741,6 +761,7 @@ enum SqliteAffinity {
     Numeric,
 }
 
+#[cfg(feature = "store-sqlite")]
 impl SqliteAffinity {
     /// The affinity's canonical name for diagnostics.
     fn as_str(&self) -> &'static str {
@@ -760,6 +781,7 @@ impl SqliteAffinity {
 /// The rules are ordered: `INT` implies INTEGER, and `CHAR`/`CLOB`/`TEXT` imply
 /// TEXT. This is why `VARCHAR(255)` resolves to TEXT while `BIGINT` resolves to
 /// INTEGER.
+#[cfg(feature = "store-sqlite")]
 fn sqlite_type_affinity(declared_type: &str) -> SqliteAffinity {
     let upper = declared_type.to_ascii_uppercase();
     if upper.contains("INT") {
@@ -785,6 +807,7 @@ fn sqlite_type_affinity(declared_type: &str) -> SqliteAffinity {
 /// `INSERT OR REPLACE`. Affinity is derived from the declared type because it is
 /// invisible to the index pragmas; the collation is read from the primary key's
 /// backing index.
+#[cfg(feature = "store-sqlite")]
 pub(crate) fn sqlite_key_column_folding(declared_type: &str, collation: Option<&str>) -> Option<String> {
     let affinity = sqlite_type_affinity(declared_type);
     if affinity != SqliteAffinity::Text {
@@ -814,6 +837,7 @@ pub(crate) fn sqlite_key_column_folding(declared_type: &str, collation: Option<&
 /// every other type -- `citext`, an enum, a custom type, or a `DOMAIN` (whose
 /// column reports the domain's own OID, never one of these) -- is likewise
 /// rejected.
+#[cfg(feature = "store-postgres")]
 pub(crate) const PG_ALLOWED_KEY_TYPE_OIDS: &[i64] = &[25, 1043];
 
 /// Folding verdict for a `PostgreSQL` primary key column, from its catalog
@@ -830,6 +854,7 @@ pub(crate) const PG_ALLOWED_KEY_TYPE_OIDS: &[i64] = &[25, 1043];
 /// The type is checked first, so a
 /// non-collatable column -- whose `collation_deterministic` is `None` -- can only
 /// reach the later checks with an allow-listed type, which is always collatable.
+#[cfg(feature = "store-postgres")]
 pub(crate) fn pg_key_column_folding(
     type_oid: i64,
     type_name: &str,
@@ -861,6 +886,7 @@ pub(crate) fn pg_key_column_folding(
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
+#[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,
@@ -1110,7 +1136,7 @@ mod tests {
         let cases: Vec<(&str, ActualTable, &[&str])> = vec![
             (
                 "exact match",
-                actual_table(RESPONSES_COLUMNS, &[("tenant_id", None), ("id", None)], true, &[]),
+                actual_table(RESPONSES_COLUMNS, &[("id", None)], true, &[]),
                 &[],
             ),
             (
@@ -1119,6 +1145,8 @@ mod tests {
                     &[
                         "tenant_id",
                         "id",
+                        "owner_issuer",
+                        "owner_subject",
                         "created_at",
                         "model",
                         "response_object",
@@ -1126,7 +1154,7 @@ mod tests {
                         "messages",
                         "extra",
                     ],
-                    &[("tenant_id", None), ("id", None)],
+                    &[("id", None)],
                     true,
                     &[],
                 ),
@@ -1138,13 +1166,15 @@ mod tests {
                     &[
                         "TENANT_ID",
                         "ID",
+                        "OWNER_ISSUER",
+                        "OWNER_SUBJECT",
                         "CREATED_AT",
                         "MODEL",
                         "RESPONSE_OBJECT",
                         "INPUT",
                         "MESSAGES",
                     ],
-                    &[("TENANT_ID", None), ("ID", None)],
+                    &[("ID", None)],
                     true,
                     &[],
                 ),
@@ -1152,44 +1182,44 @@ mod tests {
             ),
             (
                 "missing column",
-                actual_table(&["tenant_id", "id"], &[("tenant_id", None), ("id", None)], true, &[]),
+                actual_table(&["tenant_id", "id"], &[("id", None)], true, &[]),
                 &["missing columns", "created_at"],
             ),
             (
-                "pruned primary key drops tenant scope",
-                actual_table(RESPONSES_COLUMNS, &[("id", None)], true, &[]),
-                &["primary key (id)", "tenant_id"],
+                "legacy composite primary key",
+                actual_table(RESPONSES_COLUMNS, &[("tenant_id", None), ("id", None)], true, &[]),
+                &["primary key (tenant_id, id)", "expected (id)"],
             ),
             (
-                "reordered primary key",
-                actual_table(RESPONSES_COLUMNS, &[("id", None), ("tenant_id", None)], true, &[]),
-                &["primary key (id, tenant_id)"],
+                "wrong primary key",
+                actual_table(RESPONSES_COLUMNS, &[("tenant_id", None)], true, &[]),
+                &["primary key (tenant_id)", "expected (id)"],
             ),
             (
                 "folding key column",
                 actual_table(
                     RESPONSES_COLUMNS,
-                    &[("tenant_id", Some("has type 'citext' (OID 16390)")), ("id", None)],
+                    &[("id", Some("has type 'citext' (OID 16390)"))],
                     true,
                     &[],
                 ),
-                &["tenant_id", "has type 'citext'"],
+                &["id", "has type 'citext'"],
             ),
             (
                 "deferrable primary key",
-                actual_table(RESPONSES_COLUMNS, &[("tenant_id", None), ("id", None)], false, &[]),
+                actual_table(RESPONSES_COLUMNS, &[("id", None)], false, &[]),
                 &["deferrable primary key"],
             ),
             (
                 "extra unique index",
                 actual_table(
                     RESPONSES_COLUMNS,
-                    &[("tenant_id", None), ("id", None)],
+                    &[("id", None)],
                     true,
-                    &[("uq_id", &["id"])],
+                    &[("uq_tenant", &["tenant_id"])],
                 ),
                 &[
-                    "unexpected unique index 'uq_id'",
+                    "unexpected unique index 'uq_tenant'",
                     "only the primary key and the store's own unique indexes may be unique",
                 ],
             ),
@@ -1213,7 +1243,7 @@ mod tests {
 
     #[test]
     fn check_schema_aggregates_across_tables() {
-        let responses = actual_table(RESPONSES_COLUMNS, &[("id", None)], true, &[]);
+        let responses = actual_table(RESPONSES_COLUMNS, &[("tenant_id", None), ("id", None)], true, &[]);
         let conversations = actual_table(
             CONVERSATIONS_COLUMNS,
             &[("conversation_id", None)],
@@ -1232,27 +1262,25 @@ mod tests {
 
     #[test]
     fn check_schema_accepts_the_items_position_unique_index() {
-        // The items table generates a tenant-safe unique index; column-set
-        // matching is order-insensitive, so the catalog order does not matter.
+        // Column-set matching is order-insensitive, so catalog order does not
+        // matter.
         let items = actual_table(
             ITEMS_COLUMNS,
-            &[("item_id", None), ("tenant_id", None), ("conversation_id", None)],
+            &[("item_id", None)],
             true,
-            &[("idx_i_position", &["conversation_id", "position", "tenant_id"])],
+            &[("idx_i_position", &["position", "conversation_id"])],
         );
         let input = [("i", ITEMS_TABLE, &items)];
         check_schema(&input).expect("the store's own items unique index must be accepted");
     }
 
     #[test]
-    fn check_schema_rejects_a_narrower_items_unique_index() {
-        // A unique index that omits tenant_id would collapse distinct tenants
-        // under INSERT OR REPLACE / ON CONFLICT and must fail closed.
+    fn check_schema_rejects_an_unexpected_items_unique_index() {
         let items = actual_table(
             ITEMS_COLUMNS,
-            &[("item_id", None), ("tenant_id", None), ("conversation_id", None)],
+            &[("item_id", None)],
             true,
-            &[("uq_bad", &["conversation_id", "position"])],
+            &[("uq_bad", &["tenant_id", "conversation_id", "position"])],
         );
         let input = [("i", ITEMS_TABLE, &items)];
         let msg = check_schema(&input).unwrap_err().to_string();
@@ -1421,14 +1449,16 @@ mod tests {
             approvals_ddl.contains("test_responses_pending_approvals"),
             "second-to-last DDL should create the pending-approvals table: {approvals_ddl}"
         );
-        // The issuing response_id scopes every approval, and the primary key
-        // binds each single-use token to (tenant_id, response_id, approval_id).
+        // Response IDs are globally owner-immutable, so response_id scopes the
+        // approval and the owner columns inherit the issuing response owner.
         for expected in [
+            "owner_issuer       TEXT NOT NULL",
+            "owner_subject      TEXT NOT NULL",
             "response_id        TEXT NOT NULL",
             "approval_id        TEXT NOT NULL",
             "target_fingerprint TEXT NOT NULL",
             "consumed_at        BIGINT",
-            "PRIMARY KEY (tenant_id, response_id, approval_id)",
+            "PRIMARY KEY (response_id, approval_id)",
         ] {
             assert!(
                 approvals_ddl.contains(expected),

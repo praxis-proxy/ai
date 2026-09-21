@@ -22,13 +22,19 @@ name = "praxis-ai"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["store-postgres"]
+store-postgres = ["praxis-ai-filters/store-postgres", "praxis-ai-apis/store-postgres"]
+store-sqlite = ["praxis-ai-filters/store-sqlite", "praxis-ai-apis/store-sqlite"]
+store-all = ["store-postgres", "store-sqlite"]
 # Experimental: the generic http_callout filter (see praxis-ai-filters).
 http-callout-filter = ["praxis-ai-filters/http-callout-filter", "experimental"]
 # Experimental: the azure_ad (Entra ID) auth filter (see praxis-ai-filters).
 azure-ad-filter = ["praxis-ai-filters/azure-ad-filter", "experimental"]
 # Experimental: the gcp_adc (GCP ADC) auth filter (see praxis-ai-filters).
 gcp-adc-filter = ["praxis-ai-filters/gcp-adc-filter", "experimental"]
+# Experimental: the released Praxis Basic Auth filter, which publishes
+# AuthenticatedIdentity for downstream filters.
+basic-auth-filter = ["praxis-filter/basic-auth-filter", "experimental"]
 # Experimental: the token_rate_limit filter (see praxis-ai-filters).
 token-rate-limit-filter = ["praxis-ai-filters/token-rate-limit-filter", "experimental"]
 # Marker feature activated transitively by any experimental feature.
@@ -47,7 +53,10 @@ praxis-ai-filters = { workspace = true }
 praxis-ai-apis = { workspace = true }
 praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }
-praxis-filter = { workspace = true }
+# spiffe: enables the peer_identity_trust security builtin, required as the first
+# filter of every provider_route chain (and by the shipped provider-route.yaml
+# example). Off-by-default experimental feature in praxis 0.6.0 (no extra deps).
+praxis-filter = { workspace = true, features = ["spiffe"] }
 praxis-protocol = { workspace = true, features = ["admin-api", "config-reload"] }
 praxis-tls = { workspace = true }
 serde = { workspace = true }

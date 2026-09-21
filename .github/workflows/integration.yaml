@@ -107,8 +107,12 @@ jobs:
     # The four make test-* steps each build a distinct cargo feature
     # permutation (default, EXPERIMENTAL_FEATURES, llmd-ext-proc), so this
     # job serially recompiles large parts of the tree; the llmd-ext-proc
-    # gRPC/proto build lands last. 30m was insufficient on slow runners.
-    timeout-minutes: 45
+    # gRPC/proto build lands last. Praxis 0.5.6 turns the policy filter on by
+    # default, pulling the praxis-policy-* / OPA / Cedar stack into every
+    # permutation, which pushed the serial recompile past 45m on slow runners.
+    # 75m gives headroom for cache-cold runs; warmed caches on later runs
+    # finish well inside this budget.
+    timeout-minutes: 75
     permissions:
       contents: read
     steps:
@@ -166,7 +170,7 @@ jobs:
           cache-suffix: azure-sdk-cargo
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
           cache-dependency-glob: tests/integration/sdk/openai/test_azure_chat_completions.py
@@ -176,6 +180,153 @@ jobs:
 
       - name: Run Azure OpenAI Python SDK tests
         run: uv run tests/integration/sdk/openai/test_azure_chat_completions.py -s
+
+  # Anthropic Python SDK vs Chat Completions translation (local fake backend)
+  # ----------------------------------------------------------------------------
+
+  anthropic-sdk:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        with:
+          cache-suffix: anthropic-sdk-cargo
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: tests/integration/sdk/anthropic/test_anthropic_messages_to_chat_completions.py
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Run Anthropic Python SDK tests
+        run: uv run tests/integration/sdk/anthropic/test_anthropic_messages_to_chat_completions.py -s
+
+  # ----------------------------------------------------------------------------
+  # Pinned Codex CLI HTTP acceptance
+  # ----------------------------------------------------------------------------
+
+  codex-http:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CODEX_ARCHIVE: codex-x86_64-unknown-linux-musl.tar.gz
+      CODEX_BIN: codex-x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        with:
+          cache-suffix: codex-http-cargo
+
+      - name: Cache pinned Codex CLI
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl
+          key: codex-0.144.1-x86_64-unknown-linux-musl-84091ae20c65fcc7d4120db97d1bd57d7ff8df9c7609fb781c78c2ebbd4f5a28
+
+      - name: Download pinned Codex CLI
+        run: |
+          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
+          mkdir -p "$codex_cache_dir"
+          if [ ! -f "$codex_cache_dir/$CODEX_ARCHIVE" ]; then
+            curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
+              --output "$codex_cache_dir/$CODEX_ARCHIVE" \
+              "https://github.com/openai/codex/releases/download/rust-v0.144.1/$CODEX_ARCHIVE"
+          fi
+
+      - name: Verify and extract pinned Codex CLI
+        run: |
+          codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
+          cd "$codex_cache_dir"
+          sha256sum --check \
+            "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/0.144.1-x86_64-unknown-linux-musl.sha256"
+          tar --extract --gzip --file "$CODEX_ARCHIVE"
+          chmod +x "$CODEX_BIN"
+          test -x "$CODEX_BIN"
+          test "$("./$CODEX_BIN" --version)" = "codex-cli 0.144.1"
+
+      - name: Build pinned Codex HTTP acceptance test
+        env:
+          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
+        run: |
+          test -x "$PRAXIS_TEST_CODEX_BIN"
+          cargo test -p praxis-tests-integration --test suite --no-run
+
+      - name: Run pinned Codex HTTP acceptance test without external network access
+        env:
+          PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
+        run: |
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          runner_home="$HOME"
+          runner_cargo_home="$CARGO_HOME"
+          runner_path="$PATH"
+
+          sudo unshare --net -- bash -ceu '
+            runner_uid="$1"
+            runner_gid="$2"
+            runner_home="$3"
+            runner_cargo_home="$4"
+            runner_path="$5"
+            codex_bin="$6"
+
+            ip link set lo up
+            ip -brief link show lo
+            if ip route show default | grep -q .; then
+              echo "unexpected default route in Codex test namespace" >&2
+              exit 1
+            fi
+            if ip route get 1.1.1.1 >/dev/null 2>&1; then
+              echo "external route available in Codex test namespace" >&2
+              exit 1
+            fi
+
+            setpriv \
+              --reuid="$runner_uid" \
+              --regid="$runner_gid" \
+              --clear-groups \
+              -- env \
+                HOME="$runner_home" \
+                CARGO_HOME="$runner_cargo_home" \
+                CARGO_INCREMENTAL=0 \
+                PATH="$runner_path" \
+                PRAXIS_TEST_CODEX_BIN="$codex_bin" \
+                bash -ceu "
+                  cargo test --offline -p praxis-tests-integration --test suite \
+                    codex_http::pinned_codex_completes_chat_backend_coding_workflow_over_http -- --exact
+                  cargo test --offline -p praxis-tests-integration --test suite \
+                    codex_http::pinned_codex_uses_responses_http_through_full_flow -- --exact
+                "
+          ' bash \
+            "$runner_uid" \
+            "$runner_gid" \
+            "$runner_home" \
+            "$runner_cargo_home" \
+            "$runner_path" \
+            "$PRAXIS_TEST_CODEX_BIN"
 
   # ----------------------------------------------------------------------------
   # Pinned Codex CLI WebSocket acceptance
@@ -213,10 +364,28 @@ jobs:
         run: |
           codex_cache_dir="$RUNNER_TOOL_CACHE/codex/0.144.1/x86_64-unknown-linux-musl"
           mkdir -p "$codex_cache_dir"
-          if [ ! -f "$codex_cache_dir/$CODEX_ARCHIVE" ]; then
-            curl --proto '=https' --tlsv1.2 --fail --location --retry 3 \
-              --output "$codex_cache_dir/$CODEX_ARCHIVE" \
-              "https://github.com/openai/codex/releases/download/rust-v0.144.1/$CODEX_ARCHIVE"
+          archive_path="$codex_cache_dir/$CODEX_ARCHIVE"
+          if [ ! -f "$archive_path" ]; then
+            tmp_dir="$(mktemp -d)"
+            trap 'rm -rf "$tmp_dir"' EXIT
+            tmp_archive="$tmp_dir/$CODEX_ARCHIVE"
+            if ! curl --proto '=https' --tlsv1.2 --fail --location \
+              --retry 10 --retry-all-errors --retry-delay 10 \
+              --output "$tmp_archive" \
+              "https://github.com/openai/codex/releases/download/rust-v0.144.1/$CODEX_ARCHIVE"; then
+              rm -f "$tmp_archive"
+              gh release download rust-v0.144.1 \
+                --repo openai/codex \
+                --pattern "$CODEX_ARCHIVE" \
+                --dir "$tmp_dir" \
+                --clobber
+            fi
+            (
+              cd "$tmp_dir"
+              sha256sum --check \
+                "$GITHUB_WORKSPACE/tests/integration/fixtures/codex-cli/0.144.1-x86_64-unknown-linux-musl.sha256"
+            )
+            mv "$tmp_archive" "$archive_path"
           fi
 
       - name: Verify and extract pinned Codex CLI
@@ -235,5 +404,5 @@ jobs:
           PRAXIS_TEST_CODEX_BIN: ${{ runner.tool_cache }}/codex/0.144.1/x86_64-unknown-linux-musl/${{ env.CODEX_BIN }}
         run: |
           test -x "$PRAXIS_TEST_CODEX_BIN"
-          cargo test -p praxis-tests-integration --test suite \
+          cargo test -p praxis-tests-integration --features store-sqlite --test suite \
             codex_websocket::pinned_codex_uses_responses_websocket_through_full_flow -- --exact

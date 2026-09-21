@@ -26,14 +26,26 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// response bodies. The provider determines whether content should
 /// be passed, blocked, or redacted.
 ///
+/// **Wire format:** Chat Completions only (`messages` on requests,
+/// `choices[].message` on responses). Responses API, Anthropic Messages,
+/// and MCP are not supported yet (see ai#1043).
+///
+/// For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail
+/// configurations. When `provider.guardrails` is omitted, the request omits
+/// `config_ids` so the service can use its default configuration.
+/// Omit `provider.model` to leave the selected configuration's models unchanged;
+/// a non-empty value replaces or adds its main model.
+///
 /// # YAML configuration
 ///
 /// ```yaml
 /// filter: ai_guardrails
 /// provider:
 ///   type: nemo
-///   endpoint: "http://nemo:8000/v1/guardrail/checks"
+///   endpoint: "http://nemo:8000/v1/checks"
 ///   allow_private_endpoint: true
+///   guardrails:
+///     config_ids: ["your-config"]
 ///   timeout_ms: 5000
 /// phase:
 ///   request: true
@@ -49,7 +61,7 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 ///     r#"
 /// provider:
 ///   type: nemo
-///   endpoint: "http://nemo:8000/v1/guardrail/checks"
+///   endpoint: "http://nemo:8000/v1/checks"
 ///   allow_private_endpoint: true
 /// "#,
 /// )
@@ -270,7 +282,7 @@ fn record_verdict(
         },
         GuardResult::Block { reason } => Ok(enforce_block(body, reason, phase, phase_label, verdict)),
         GuardResult::Redact { reason, .. } => {
-            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict; forwarding unchanged until #579");
+            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict; forwarding unchanged until #49");
             Ok(FilterAction::Continue)
         },
     }

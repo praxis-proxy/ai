@@ -1,4 +1,5 @@
 # Agentic Loop Fixture
+# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
 #
 # Minimal agentic loop pipeline for inference fixture replay.
 # Exercises parallel_tool_calls preservation without external
@@ -23,6 +24,10 @@ filter_chains:
           stream: x-praxis-ai-stream
 
       - filter: openai_responses_validate
+
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
 
       - filter: openai_response_store
         backend: sqlite

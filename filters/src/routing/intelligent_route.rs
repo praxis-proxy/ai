@@ -61,6 +61,12 @@ const MAX_BINDINGS: usize = 10_000;
 /// Maximum session affinity TTL in seconds (24 hours).
 const MAX_TTL_SECS: u64 = 86_400;
 
+/// Maximum number of configured management-path skip prefixes.
+const MAX_SKIP_PATHS: usize = 64;
+
+/// Maximum length of a single management-path skip prefix.
+const MAX_SKIP_PATH_LEN: usize = 256;
+
 // -----------------------------------------------------------------------------
 // Config
 // -----------------------------------------------------------------------------
@@ -107,6 +113,24 @@ struct IntelligentRouteConfig {
     /// Header name that carries the model name (default: `X-Model`).
     #[serde(default = "default_model_header")]
     model_header: String,
+
+    /// Request-path prefixes that bypass model resolution entirely.
+    ///
+    /// Management and discovery endpoints (model listing, subscriptions,
+    /// API-key management, health) carry no routable model; a matching request
+    /// returns `Continue` before any model lookup. Defaults to the well-known
+    /// OpenAI-style management paths; set an explicit list to override, or `[]`
+    /// to disable path skipping. See `path_is_management` for the match rule.
+    #[serde(default = "default_skip_paths")]
+    skip_paths: Vec<String>,
+
+    /// Cluster that serves skipped management/discovery paths.
+    ///
+    /// When set, a request whose path matches `skip_paths` has `ctx.cluster`
+    /// set to this cluster and continues straight to `load_balancer`.
+    /// When unset, skipped paths continue with the cluster untouched.
+    /// Requires a non-empty `skip_paths`.
+    management_cluster: Option<String>,
 
     /// Clusters that terminate the authenticated provider-hop protocol.
     ///
@@ -202,6 +226,18 @@ fn default_model_header() -> String {
     "X-Model".to_owned()
 }
 
+/// Default management/discovery path prefixes that bypass model resolution.
+///
+/// Mirrors the endpoints excluded from the routing chain in the reference
+/// gateway deployment (`/v1/models`, `/v1/subscriptions`, `/v1/api-keys`, and
+/// health). See praxis-proxy/ai#1039.
+fn default_skip_paths() -> Vec<String> {
+    ["/v1/models", "/v1/subscriptions", "/v1/api-keys", "/health"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Default reload enabled state.
 fn default_reload_enabled() -> bool {
     true
@@ -288,6 +324,8 @@ enum AffinityOutcome<'a> {
 ///   `routing-config.json`) and hot-reloaded via [`ArcSwap`] when the file changes.
 ///
 /// **Behavior:**
+/// - If the request path matches a configured `skip_paths` prefix (management and discovery endpoints), the filter
+///   returns `Continue` before any model lookup, setting `ctx.cluster` to `management_cluster` when one is configured.
 /// - If `ctx.cluster` is already set by an earlier filter, the selection is preserved and no metadata is written.
 /// - If no routing source is present, the filter returns `Continue` without routing.
 /// - If the model header or MCP tool name is blank, oversized, or invalid, the filter rejects with 400.
@@ -410,6 +448,10 @@ pub struct IntelligentRouteFilter {
     provider_hop_clusters: BTreeSet<String>,
     /// Header that carries the model name.
     model_header: HeaderName,
+    /// Management/discovery path prefixes that bypass model resolution.
+    skip_paths: Vec<Arc<str>>,
+    /// Cluster that serves skipped management paths (None = leave untouched).
+    management_cluster: Option<Arc<str>>,
     /// Watcher handle for overlay hot reload (None in static mode).
     _reload_handle: Option<OverlayReloadHandle>,
     /// In-memory session affinity (None when disabled).
@@ -437,38 +479,52 @@ impl IntelligentRouteFilter {
     /// - the candidate list is empty or invalid
     /// - the model header is invalid
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: IntelligentRouteConfig = parse_filter_config("intelligent_route", config)?;
+        let mut cfg: IntelligentRouteConfig = parse_filter_config("intelligent_route", config)?;
         let model_header = descriptor::validate_model_header(&cfg.model_header)?;
-
-        if cfg.overlay_file.is_some() && cfg.candidates.is_some() {
-            return Err("intelligent_route: cannot set both overlay_file and candidates".into());
-        }
-        if cfg.overlay_file.is_none() && cfg.expected_overlay_scope.is_some() {
-            return Err("intelligent_route: expected_overlay_scope requires envelope overlay_file mode".into());
-        }
-
-        let (snapshot, reload_handle) = if let Some(path) = cfg.overlay_file {
-            let reload = cfg.reload.unwrap_or_default();
-            build_overlay_snapshot(path, &reload, cfg.expected_overlay_scope)?
-        } else if let Some(candidates_raw) = cfg.candidates {
-            if cfg.reload.is_some() {
-                return Err("intelligent_route: reload block is not valid with static candidates".into());
-            }
-            build_static_snapshot(candidates_raw, cfg.local_site)?
-        } else {
-            return Err("intelligent_route: either overlay_file or candidates must be set".into());
-        };
-
+        let skip_paths = validate_skip_paths(&cfg.skip_paths)?;
+        let management_cluster = validate_management_cluster(cfg.management_cluster.as_deref(), &skip_paths)?;
+        let (snapshot, reload_handle) = build_route_snapshot(&mut cfg)?;
         let session_affinity = build_session_affinity(cfg.session_affinity)?;
         let provider_hop_clusters = validate_provider_hop_clusters(cfg.provider_hop_clusters)?;
 
         Ok(Box::new(Self {
             model_header,
+            skip_paths,
+            management_cluster,
             _reload_handle: reload_handle,
             provider_hop_clusters,
             session_affinity,
             snapshot,
         }))
+    }
+
+    /// Handle a management/discovery path that bypasses model resolution.
+    ///
+    /// Returns `Some(Continue)` when the request path matches a configured
+    /// `skip_paths` prefix, setting `ctx.cluster` to `management_cluster` when
+    /// one is configured. A cluster already chosen by an earlier filter is
+    /// preserved (never overwritten), matching the non-management path. Returns
+    /// `None` for non-management paths, which continue to model resolution.
+    fn try_management_skip(&self, ctx: &mut HttpFilterContext<'_>) -> Option<FilterAction> {
+        let path = ctx.rewritten_path.as_deref().unwrap_or_else(|| ctx.request.uri.path());
+        if !path_is_management(path, &self.skip_paths) {
+            return None;
+        }
+        if ctx.cluster.is_some() {
+            tracing::debug!(path = %path, "intelligent_route: management path but cluster already set; preserving");
+            return Some(FilterAction::Continue);
+        }
+        if let Some(cluster) = &self.management_cluster {
+            ctx.cluster = Some(Arc::clone(cluster));
+            tracing::debug!(
+                path = %path,
+                cluster = %cluster,
+                "intelligent_route: management path; routing to management_cluster"
+            );
+        } else {
+            tracing::debug!(path = %path, "intelligent_route: management path; skipping model resolution");
+        }
+        Some(FilterAction::Continue)
     }
 
     /// Core routing path: session affinity lookup, admission filtering,
@@ -524,6 +580,29 @@ impl IntelligentRouteFilter {
 
 /// Return type for snapshot builders: shared snapshot + optional watcher.
 type SnapshotResult = Result<(Arc<ArcSwap<RouteSnapshot>>, Option<OverlayReloadHandle>), FilterError>;
+
+/// Select and build the routing snapshot from the two mutually exclusive
+/// sources: an overlay file (hot-reloadable) or an inline static candidate
+/// list. Consumes the relevant fields out of `cfg`.
+fn build_route_snapshot(cfg: &mut IntelligentRouteConfig) -> SnapshotResult {
+    if cfg.overlay_file.is_some() && cfg.candidates.is_some() {
+        return Err("intelligent_route: cannot set both overlay_file and candidates".into());
+    }
+    if cfg.overlay_file.is_none() && cfg.expected_overlay_scope.is_some() {
+        return Err("intelligent_route: expected_overlay_scope requires envelope overlay_file mode".into());
+    }
+    if let Some(path) = cfg.overlay_file.take() {
+        let reload = cfg.reload.take().unwrap_or_default();
+        build_overlay_snapshot(path, &reload, cfg.expected_overlay_scope.take())
+    } else if let Some(candidates_raw) = cfg.candidates.take() {
+        if cfg.reload.is_some() {
+            return Err("intelligent_route: reload block is not valid with static candidates".into());
+        }
+        build_static_snapshot(candidates_raw, cfg.local_site.take())
+    } else {
+        Err("intelligent_route: either overlay_file or candidates must be set".into())
+    }
+}
 
 /// Build an overlay-backed snapshot with optional watcher.
 fn build_overlay_snapshot(
@@ -608,6 +687,78 @@ fn validate_provider_hop_clusters(clusters: Vec<String>) -> Result<BTreeSet<Stri
     Ok(validated)
 }
 
+/// Validate the optional management-path cluster.
+///
+/// A `management_cluster` routes skipped paths to a backend directly, so it is
+/// only meaningful alongside a non-empty `skip_paths`. The cluster name is
+/// validated like any other cluster reference.
+fn validate_management_cluster(
+    management_cluster: Option<&str>,
+    skip_paths: &[Arc<str>],
+) -> Result<Option<Arc<str>>, FilterError> {
+    let Some(cluster) = management_cluster else {
+        return Ok(None);
+    };
+    descriptor::validate_cluster_name("management_cluster", cluster)?;
+    if skip_paths.is_empty() {
+        return Err("intelligent_route: management_cluster requires a non-empty skip_paths".into());
+    }
+    Ok(Some(Arc::from(cluster)))
+}
+
+/// Validate, normalize, and deduplicate the management-path skip prefixes.
+///
+/// Each prefix must be an absolute path (leading `/`), bounded, free of
+/// whitespace/control characters, and carry no query or fragment. Trailing
+/// slashes are stripped so matching is segment-boundary consistent. An empty
+/// list is valid and disables path skipping.
+fn validate_skip_paths(raw: &[String]) -> Result<Vec<Arc<str>>, FilterError> {
+    if raw.len() > MAX_SKIP_PATHS {
+        return Err(format!("intelligent_route: skip_paths must not exceed {MAX_SKIP_PATHS} entries").into());
+    }
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::with_capacity(raw.len());
+    for path in raw {
+        if path.is_empty() || path.len() > MAX_SKIP_PATH_LEN {
+            return Err(format!("intelligent_route: skip_paths entry must be 1-{MAX_SKIP_PATH_LEN} characters").into());
+        }
+        if !path.starts_with('/') {
+            return Err(format!("intelligent_route: skip_paths entry '{path}' must start with '/'").into());
+        }
+        if path
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '?' || c == '#')
+        {
+            return Err(format!(
+                "intelligent_route: skip_paths entry '{path}' must not contain whitespace, control characters, '?', or '#'"
+            )
+            .into());
+        }
+        // Normalize a trailing slash away so "/v1/models" and "/v1/models/"
+        // are equivalent prefixes (Gateway-API semantics).
+        let normalized = path.strip_suffix('/').unwrap_or(path.as_str());
+        if seen.insert(normalized.to_owned()) {
+            out.push(Arc::from(normalized));
+        }
+    }
+    Ok(out)
+}
+
+/// Return `true` if `path` falls under any configured management-path prefix.
+///
+/// Uses Gateway-API segment-boundary semantics: a prefix matches when the
+/// request path equals it exactly or continues with a `/` separator, so
+/// `/v1/models` matches `/v1/models` and `/v1/models/x` but not
+/// `/v1/models-beta`. Prefixes are pre-normalized without a trailing slash.
+fn path_is_management(path: &str, skip_paths: &[Arc<str>]) -> bool {
+    skip_paths
+        .iter()
+        .any(|prefix| match path.strip_prefix(prefix.as_ref()) {
+            Some(rest) => rest.is_empty() || rest.starts_with('/'),
+            None => false,
+        })
+}
+
 /// Validate session affinity config constraints.
 fn validate_session_affinity_config(cfg: &SessionAffinityConfig) -> Result<(), FilterError> {
     let has_header = cfg.header.as_deref().is_some_and(|h| !h.trim().is_empty());
@@ -646,6 +797,11 @@ impl HttpFilter for IntelligentRouteFilter {
             .push(HeaderName::from_static(PROVIDER_HOP_REQUEST_ID_HEADER));
         ctx.request_headers_to_remove
             .push(HeaderName::from_static(OVERLAY_REVISION_HEADER));
+
+        // Management and discovery endpoints bypass model resolution entirely.
+        if let Some(action) = self.try_management_skip(ctx) {
+            return Ok(action);
+        }
 
         if ctx.cluster.is_some() {
             tracing::debug!("intelligent_route: cluster already set; preserving");
@@ -1126,6 +1282,218 @@ mod tests {
         );
         assert!(ctx.cluster.is_none(), "no cluster should be set");
         assert_no_route_metadata(&ctx);
+    }
+
+    // ---- Management-path skip list (praxis-proxy/ai#1039) ----
+
+    /// Build a filter from candidates plus an explicit `skip_paths` YAML block.
+    fn make_filter_with_skip(candidates: &[(&str, &str, &str, &str)], skip_paths_yaml: &str) -> Box<dyn HttpFilter> {
+        use std::fmt::Write as _;
+        let mut yaml = String::from("local_site: site-a\n");
+        yaml.push_str(skip_paths_yaml);
+        yaml.push_str("candidates:\n");
+        for (kind, name, site, cluster) in candidates {
+            writeln!(
+                yaml,
+                "  - kind: {kind}\n    name: {name}\n    site: {site}\n    cluster: {cluster}\n    fresh: true"
+            )
+            .expect("String write is infallible");
+        }
+        parse(&yaml).unwrap()
+    }
+
+    /// Drive `on_request` for `path` with `X-Model: model` and return the action.
+    async fn route_path_model(filter: &dyn HttpFilter, path: &str, model: &str) -> (FilterAction, Option<String>) {
+        let mut req = crate::test_utils::make_request(Method::POST, path);
+        req.headers.insert("X-Model", HeaderValue::from_str(model).unwrap());
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        (action, ctx.cluster.as_deref().map(str::to_owned))
+    }
+
+    #[tokio::test]
+    async fn management_path_skips_unknown_model_instead_of_failing_closed() {
+        // Default skip_paths include /v1/models. An unknown model on that path
+        // must NOT fail closed (404); it bypasses model resolution.
+        let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
+        let (action, cluster) = route_path_model(f.as_ref(), "/v1/models", "gpt-4o-not-configured").await;
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "management path must skip model resolution, got {action:?}"
+        );
+        assert!(
+            cluster.is_none(),
+            "skip must leave the cluster unset for a downstream router"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_path_skips_even_a_matching_model() {
+        // Even a model that WOULD match a candidate must not steer a management
+        // path; the skip happens before any lookup.
+        let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
+        let (action, cluster) = route_path_model(f.as_ref(), "/v1/api-keys", "llama").await;
+        assert!(matches!(action, FilterAction::Continue), "got {action:?}");
+        assert!(
+            cluster.is_none(),
+            "management path must not be routed to a matching cluster"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_prefix_matches_subpaths_on_segment_boundary() {
+        let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
+        let (action, _) = route_path_model(f.as_ref(), "/v1/models/gpt-4", "unknown").await;
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "a sub-path under a skip prefix must skip, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_prefix_does_not_match_across_a_non_boundary() {
+        // "/v1/models-beta" shares a textual prefix with "/v1/models" but is a
+        // different segment: it must still be resolved (and fail closed here).
+        let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
+        let (action, _) = route_path_model(f.as_ref(), "/v1/models-beta", "unknown").await;
+        assert!(
+            matches!(action, FilterAction::Reject(_)),
+            "non-boundary prefix overlap must not skip, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_path_still_fails_closed_on_unknown_model() {
+        // The skip is path-scoped: a real inference path with an unknown model
+        // must still fail closed.
+        let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
+        let (action, _) = route_path_model(f.as_ref(), "/v1/chat/completions", "unknown").await;
+        assert!(
+            matches!(action, FilterAction::Reject(_)),
+            "unknown model on an inference path must fail closed, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_skip_paths_disables_skipping() {
+        let f = make_filter_with_skip(&[("inference_model", "llama", "site-a", "inf")], "skip_paths: []\n");
+        let (action, _) = route_path_model(f.as_ref(), "/v1/models", "unknown").await;
+        assert!(
+            matches!(action, FilterAction::Reject(_)),
+            "with skipping disabled, /v1/models resolves and fails closed, got {action:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_skip_paths_override_defaults() {
+        let f = make_filter_with_skip(
+            &[("inference_model", "llama", "site-a", "inf")],
+            "skip_paths:\n  - /healthz\n",
+        );
+        // Default /v1/models is no longer skipped.
+        let (models, _) = route_path_model(f.as_ref(), "/v1/models", "unknown").await;
+        assert!(
+            matches!(models, FilterAction::Reject(_)),
+            "overridden defaults must not skip, got {models:?}"
+        );
+        // The configured /healthz is.
+        let (health, _) = route_path_model(f.as_ref(), "/healthz", "unknown").await;
+        assert!(
+            matches!(health, FilterAction::Continue),
+            "configured skip path must skip, got {health:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_cluster_routes_skipped_path_to_itself() {
+        // With a management_cluster set, a skipped path is pointed straight at
+        // it so load_balancer can serve it — no downstream router needed.
+        let f = parse(
+            "local_site: site-a\nmanagement_cluster: management-api\nskip_paths:\n  - /v1/models\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf\n    fresh: true\n",
+        )
+        .unwrap();
+        let (action, cluster) = route_path_model(f.as_ref(), "/v1/models", "gpt-4o-not-configured").await;
+        assert!(matches!(action, FilterAction::Continue), "got {action:?}");
+        assert_eq!(
+            cluster.as_deref(),
+            Some("management-api"),
+            "skipped path must be routed to the management cluster"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_cluster_does_not_capture_inference_paths() {
+        // The management cluster only applies to skipped paths; a real
+        // inference request still resolves to its model's cluster.
+        let f = parse(
+            "local_site: site-a\nmanagement_cluster: management-api\nskip_paths:\n  - /v1/models\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf\n    fresh: true\n",
+        )
+        .unwrap();
+        let (action, cluster) = route_path_model(f.as_ref(), "/v1/chat/completions", "llama").await;
+        assert!(matches!(action, FilterAction::Continue), "got {action:?}");
+        assert_eq!(
+            cluster.as_deref(),
+            Some("inf"),
+            "inference path must resolve to the model's cluster, not the management cluster"
+        );
+    }
+
+    #[tokio::test]
+    async fn management_cluster_preserves_cluster_set_by_earlier_filter() {
+        // A cluster chosen by a filter before intelligent_route wins even on a
+        // management path: try_management_skip must not overwrite it, matching
+        // the non-management preserve path. See praxis-proxy/ai#1180 review.
+        let f = parse(
+            "local_site: site-a\nmanagement_cluster: management-api\nskip_paths:\n  - /v1/models\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf\n    fresh: true\n",
+        )
+        .unwrap();
+        let req = crate::test_utils::make_request(Method::POST, "/v1/models");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.cluster = Some(Arc::from("pre-set-cluster"));
+
+        let action = f.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue), "got {action:?}");
+        assert_eq!(
+            ctx.cluster.as_deref(),
+            Some("pre-set-cluster"),
+            "management skip must not overwrite a cluster set by an earlier filter"
+        );
+    }
+
+    #[test]
+    fn management_cluster_requires_skip_paths() {
+        let err = parse_err(
+            "local_site: site-a\nmanagement_cluster: management-api\nskip_paths: []\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\n",
+        );
+        assert!(
+            err.to_string()
+                .contains("management_cluster requires a non-empty skip_paths"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn management_cluster_blank_name_rejected() {
+        let err = parse_err(
+            "local_site: site-a\nmanagement_cluster: \"\"\nskip_paths:\n  - /v1/models\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\n",
+        );
+        assert!(err.to_string().contains("management_cluster"), "got: {err}");
+    }
+
+    #[test]
+    fn skip_paths_without_leading_slash_rejected() {
+        let err = parse_err(
+            "local_site: site-a\nskip_paths:\n  - v1/models\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\n",
+        );
+        assert!(err.to_string().contains("must start with '/'"), "got: {err}");
+    }
+
+    #[test]
+    fn skip_paths_with_whitespace_rejected() {
+        let err = parse_err(
+            "local_site: site-a\nskip_paths:\n  - \"/v1/mo dels\"\ncandidates:\n  - kind: inference_model\n    name: m\n    site: s\n    cluster: c\n    fresh: true\n",
+        );
+        assert!(err.to_string().contains("whitespace"), "got: {err}");
     }
 
     #[tokio::test]
@@ -1630,6 +1998,8 @@ mod tests {
         let filter = IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
+            skip_paths: Vec::new(),
+            management_cluster: None,
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
@@ -1782,6 +2152,8 @@ mod tests {
         let filter = IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
+            skip_paths: Vec::new(),
+            management_cluster: None,
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
@@ -2486,6 +2858,8 @@ mod tests {
         let filter = IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
+            skip_paths: Vec::new(),
+            management_cluster: None,
             provider_hop_clusters: BTreeSet::from(["provider-gateway".to_owned()]),
             session_affinity: Some(make_test_affinity()),
             snapshot,
@@ -2532,6 +2906,8 @@ mod tests {
         let filter = IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
+            skip_paths: Vec::new(),
+            management_cluster: None,
             provider_hop_clusters: BTreeSet::from(["cluster-a".to_owned()]),
             session_affinity: None,
             snapshot: shared,
@@ -2786,6 +3162,8 @@ mod tests {
         IntelligentRouteFilter {
             model_header: HeaderName::from_static("x-model"),
             _reload_handle: None,
+            skip_paths: Vec::new(),
+            management_cluster: None,
             provider_hop_clusters: BTreeSet::new(),
             session_affinity,
             snapshot,

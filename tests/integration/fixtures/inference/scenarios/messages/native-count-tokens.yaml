@@ -1,0 +1,30 @@
+version: 1
+id: messages/native-count-tokens
+description: Native Anthropic Messages token-count request passed through to a native backend unchanged.
+protocol: anthropic_messages
+example_config: anthropic/messages-protocol.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - messages.native.count_tokens
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages/count_tokens
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: How many tokens does this sentence use?
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/messages/count_tokens
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

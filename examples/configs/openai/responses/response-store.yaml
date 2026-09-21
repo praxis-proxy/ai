@@ -1,4 +1,5 @@
 # Response Store
+# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
 #
 # Persists non-streaming Responses API responses to a database
 # and serves stored data via GET endpoints and handles
@@ -10,12 +11,17 @@
 #   GET  /v1/responses/{id}/input_items — paginated input items
 #   DELETE /v1/responses/{id}   — deleted from local store (200 or 404)
 #
-# The `openai_responses_format` filter must run first to classify
-# the request body — `openai_response_store` reads its metadata
-# to decide whether to persist POST responses.
+# The `openai_responses_format` filter must run before the store to classify
+# the request body — `openai_response_store` reads its metadata to decide
+# whether to persist POST responses.
+#
+# Persisted state always requires an explicit owner source. This standalone
+# example uses `single_tenant`, which deliberately shares one owner and
+# is not user isolation. See `state-ownership.yaml` for a trusted multi-user
+# boundary and the versioned assertion format.
 #
 # POST persistence:
-#   The `openai_responses_format` filter must run first to
+#   The `openai_responses_format` filter must run before the store to
 #   classify the request body — `openai_response_store` reads its
 #   metadata to decide whether to persist. Streaming responses
 #   (`stream: true`) are skipped; streaming persistence will be
@@ -42,6 +48,10 @@ filter_chains:
   - name: responses-pipeline
     filters:
       - filter: openai_responses_format
+
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
 
       - filter: openai_response_store
         backend: sqlite

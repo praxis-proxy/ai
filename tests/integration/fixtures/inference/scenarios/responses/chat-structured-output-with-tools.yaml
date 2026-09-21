@@ -1,0 +1,55 @@
+version: 1
+id: responses/chat-structured-output-with-tools
+description: >-
+  Responses request pairing a json_schema text.format with a function tool; the
+  translated Chat Completions request must keep response_format alongside tools
+  (issue #1248).
+protocol: openai_responses
+example_config: openai/responses/responses-to-chat-completions.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.chat.structured_output_with_tools
+turns:
+  - name: structured-output-with-tools
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: What's the weather like in San Francisco?
+          store: false
+          stream: false
+          text:
+            format:
+              type: json_schema
+              name: weather
+              description: Structured weather payload
+              strict: true
+              schema:
+                type: object
+                properties:
+                  temperature:
+                    type: number
+                required: [temperature]
+          tools:
+            - type: function
+              name: get_weather
+              description: Get the current weather for a location
+              parameters:
+                type: object
+                properties:
+                  location:
+                    type: string
+                required: [location]
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

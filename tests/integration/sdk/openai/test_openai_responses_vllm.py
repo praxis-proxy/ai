@@ -8,11 +8,13 @@
 # ]
 # ///
 """
-OpenAI Responses API integration tests against a real vLLM CPU backend.
+OpenAI Responses API integration tests against either a lightweight simulator
+or a real vLLM backend.
 
-Starts a Praxis proxy with the full responses pipeline backed by vLLM,
-then exercises stateless requests, persistence, rehydration, and streaming
-using the official OpenAI Python SDK.
+The default ``VLLM_TEST_BACKEND=live`` mode starts Praxis against real vLLM.
+``VLLM_TEST_BACKEND=simulator`` uses llm-d-inference-sim for deterministic
+gateway, persistence, tool-loop, and SDK protocol coverage. Tests marked
+``real_inference`` or ``vllm_compat`` are skipped in simulator mode.
 
 Usage:
     cargo build -p praxis-ai-proxy
@@ -31,7 +33,7 @@ import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import ClassVar
+from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 import httpx
@@ -44,6 +46,7 @@ from openai import BadRequestError, NotFoundError, OpenAI
 
 VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://127.0.0.1:8000")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "Qwen/Qwen3-0.6B")
+VLLM_TEST_BACKEND = os.environ.get("VLLM_TEST_BACKEND", "live")
 OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -62,6 +65,16 @@ COMPACT_CONFIG_PATH = "examples/configs/openai/responses/compact.yaml"
 WEB_SEARCH_CHAT_STREAMING_CONFIG_PATH = (
     "examples/configs/openai/responses/web-search-chat-completions.yaml"
 )
+# The full-flow example trusts these only after an authentication gateway has
+# overwritten them. This harness connects directly to Praxis, so it emulates
+# that boundary for clients using the full-flow configuration.
+TRUSTED_OWNER_HEADERS = {
+    "x-auth-tenant": "test-tenant",
+    "x-auth-user": "test-user",
+}
+CLIENT_TOOL_COMPAT_CONFIG_PATH = (
+    "examples/configs/openai/responses/client-tool-compat.yaml"
+)
 
 TERMINAL_RESPONSE_EVENTS = {
     "response.cancelled",
@@ -69,6 +82,30 @@ TERMINAL_RESPONSE_EVENTS = {
     "response.failed",
     "response.incomplete",
 }
+
+if VLLM_TEST_BACKEND not in {"live", "simulator"}:
+    raise RuntimeError(
+        "VLLM_TEST_BACKEND must be either 'live' or 'simulator'; "
+        f"got {VLLM_TEST_BACKEND!r}"
+    )
+
+
+def requires_real_inference(test):
+    """Mark a semantic inference test and skip it on the simulator."""
+    test = pytest.mark.real_inference(test)
+    return pytest.mark.skipif(
+        VLLM_TEST_BACKEND != "live",
+        reason="test requires real model inference",
+    )(test)
+
+
+def requires_vllm_compat(test):
+    """Mark a vLLM-specific contract test and skip it on the simulator."""
+    test = pytest.mark.vllm_compat(test)
+    return pytest.mark.skipif(
+        VLLM_TEST_BACKEND != "live",
+        reason="test requires real vLLM compatibility behavior",
+    )(test)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -228,9 +265,31 @@ def _write_irr_streaming_config(praxis_port: int) -> str:
     return path
 
 
-def _write_chat_streaming_config(praxis_port: int, db_path: str) -> str:
-    """Patch the shipped Responses-to-Chat example for live vLLM."""
+def _write_chat_streaming_config(
+    praxis_port: int, db_path: str, backend_endpoint: str
+) -> str:
+    """Patch the shipped Responses-to-Chat example for the selected backend."""
     with open(CHAT_STREAMING_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", backend_endpoint)
+    config = _patch_store_backend(config, db_path)
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+def _write_client_tool_compat_config(praxis_port: int, db_path: str) -> str:
+    """Patch the client-tool-compat example for live vLLM.
+
+    The compat config only references the proxy listener, a single
+    inference-backend cluster endpoint, and the SQLite store, so patching is
+    limited to those three (no OGX, no mock side-servers).
+    """
+    with open(CLIENT_TOOL_COMPAT_CONFIG_PATH) as f:
         config = f.read()
 
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
@@ -290,7 +349,7 @@ def _write_compact_config(
     db_path: str,
     compaction_port: int,
 ) -> str:
-    """Patch the compact example for live vLLM and a deterministic summary."""
+    """Patch the compact example for inference and a deterministic summary."""
     with open(COMPACT_CONFIG_PATH) as f:
         config = f.read()
 
@@ -314,11 +373,11 @@ def _write_compact_config(
 
 
 def _write_web_search_chat_streaming_config(
-    praxis_port: int, search_port: int,
+    praxis_port: int, search_port: int, backend_endpoint: str
 ) -> str:
-    """Patch the streaming web-search-through-Chat example for live vLLM.
+    """Patch the streaming web-search-through-Chat example for testing.
 
-    Points the loop at the live vLLM backend and swaps the Brave provider's
+    Points the loop at the selected Chat backend and swaps the Brave provider's
     ``${WEB_SEARCH_API_KEY}`` placeholder for the in-process mock search server.
     """
     with open(WEB_SEARCH_CHAT_STREAMING_CONFIG_PATH) as f:
@@ -327,7 +386,7 @@ def _write_web_search_chat_streaming_config(
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace(
         '- "127.0.0.1:3001"',
-        f'- "{_vllm_endpoint()}"\n'
+        f'- "{backend_endpoint}"\n'
         "                    read_timeout_ms: 300000",
     )
     config = config.replace(
@@ -337,8 +396,13 @@ def _write_web_search_chat_streaming_config(
         "- filter: openai_web_search\n"
         "                provider: brave\n"
         "                api_key: test-key\n"
-        f"                base_url: http://127.0.0.1:{search_port}\n"
-        "                allow_private_base_url: true",
+        f"                base_url: http://127.0.0.1:{search_port}",
+    )
+    # The provider callout targets a loopback mock, so the executor's SSRF check
+    # requires the operator opt-in on the outbound pipeline.
+    config = config.replace(
+        "allow_private_endpoints: true",
+        "allow_private_endpoints: true\n  allow_private_upstreams: true",
     )
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -641,10 +705,10 @@ class ChatCaptureHandler(BaseHTTPRequestHandler):
 
 
 class ResponsesWitnessHandler(BaseHTTPRequestHandler):
-    """Recording shim that sits between Praxis and the native vLLM backend.
+    """Recording shim that sits between Praxis and the inference backend.
 
     Captures the JSON body of every request the backend receives, then forwards
-    it transparently to real vLLM and streams the response back so the full
+    it transparently and streams the response back so the full
     native Responses pipeline still completes. Tests use the captured bodies to
     assert on what the proxy actually forwards upstream after its rewrites
     (rehydration, ``previous_response_id`` stripping, ``truncation`` passthrough).
@@ -695,6 +759,95 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
         self._forward()
 
 
+class SimulatorBackendShimHandler(BaseHTTPRequestHandler):
+    """Adapt unsupported simulator tool behavior to vLLM's frontend.
+
+    The simulator treats ``tool_choice=auto`` probabilistically and does not
+    stop choosing tools after a Chat ``role=tool`` result. Praxis agentic tests
+    need the opposite deterministic script: choose a tool on the first round,
+    then return assistant text after the locally executed result is re-entered.
+
+    Its native Responses frontend also rejects hosted ``file_search`` tools.
+    vLLM accepts those tools and emits the private ``function_call`` that the
+    Praxis file-search loop normalizes, so the shim substitutes that equivalent
+    private function at the backend boundary.
+    """
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        request_body = json.loads(body)
+
+        if self.path.rstrip("/").endswith("/v1/responses"):
+            request_body["tools"] = [
+                self._responses_tool(tool)
+                for tool in request_body.get("tools", [])
+            ]
+            body = json.dumps(request_body).encode()
+        elif (
+            request_body.get("tools")
+            and request_body.get("tool_choice", "auto") == "auto"
+        ):
+            has_tool_result = any(
+                message.get("role") == "tool"
+                for message in request_body.get("messages", [])
+                if isinstance(message, dict)
+            )
+            request_body["tool_choice"] = "none" if has_tool_result else "required"
+            body = json.dumps(request_body).encode()
+
+        headers = {
+            key: value
+            for key, value in self.headers.items()
+            if key.lower() not in ("host", "content-length")
+        }
+        url = f"{VLLM_BASE_URL.rstrip('/')}{self.path}"
+        with httpx.Client(timeout=300.0) as client:
+            with client.stream(
+                self.command, url, headers=headers, content=body
+            ) as upstream:
+                self.send_response(upstream.status_code)
+                for key, value in upstream.headers.items():
+                    if key.lower() in (
+                        "transfer-encoding",
+                        "content-length",
+                        "connection",
+                    ):
+                        continue
+                    self.send_header(key, value)
+                self.end_headers()
+                for chunk in upstream.iter_raw():
+                    if chunk:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+
+    @staticmethod
+    def _responses_tool(tool: dict) -> dict:
+        if tool.get("type") != "file_search":
+            return tool
+        return {
+            "type": "function",
+            "name": "file_search",
+            "description": "Search the configured vector stores for relevant files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 4096,
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+
+
 def _write_witness_config(
     praxis_port: int,
     db_path: str,
@@ -728,17 +881,22 @@ def _write_agentic_config(
     search_port: int,
     *,
     translate_to_chat: bool = False,
+    backend_endpoint: str | None = None,
 ) -> str:
-    """Patch agentic-loop.yaml with test ports and allow_loopback."""
+    """Patch agentic-loop.yaml with test ports and loopback callout posture."""
     with open(AGENTIC_CONFIG_PATH) as f:
         config = f.read()
 
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    vllm = _vllm_endpoint()
-    config = config.replace(
-        '- "127.0.0.1:3001"',
-        f'- "{vllm}"\n                    read_timeout_ms: 300000',
-    )
+    vllm = backend_endpoint if translate_to_chat else _vllm_endpoint()
+    if vllm is None:
+        raise ValueError("translated agentic config requires a backend endpoint")
+    config = config.replace('- "127.0.0.1:3001"', f'- "{vllm}"')
+    if config.count("read_timeout_ms:") != 1:
+        raise RuntimeError(
+            "agentic-loop.yaml must declare exactly one cluster read_timeout_ms; "
+            "the vLLM harness no longer injects a second copy"
+        )
     # agentic-loop.yaml is the canonical unified config (#1046): it wires all
     # three request-phase dispatchers (web_search, mcp_dispatch,
     # file_search_callout) under the single agentic-loop owner. Retarget the
@@ -746,18 +904,9 @@ def _write_agentic_config(
     # too; it stays inert for web/mcp-only tests that emit no file_search_call.
     config = config.replace("http://127.0.0.1:8001", f"http://{_ogx_endpoint()}")
     config = _patch_store_backend(config, db_path)
-    config = config.replace(
-        "- filter: openai_mcp_tool_resolve\n",
-        "- filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-    )
-    config = config.replace(
-        "- filter: openai_mcp_dispatch\n"
-        "                max_calls_per_round: 32\n",
-        "- filter: openai_mcp_dispatch\n"
-        "                allow_loopback: true\n"
-        "                max_calls_per_round: 32\n",
-        1,
-    )
+    # The loopback MCP callout's SSRF posture is governed by
+    # ``insecure_options.allow_private_upstreams`` (no per-filter opt-in), which
+    # agentic-loop.yaml already enables -- so no injection is needed here.
     config = config.replace(
         "max_iterations: 11\n",
         # agentic-loop.yaml already sets the IRR's overall ``timeout_ms``;
@@ -772,9 +921,11 @@ def _write_agentic_config(
         "- filter: openai_web_search\n"
         "                provider: brave\n"
         "                api_key: test-key\n"
-        f"                base_url: http://127.0.0.1:{search_port}\n"
-        "                allow_private_base_url: true",
+        f"                base_url: http://127.0.0.1:{search_port}",
     )
+    # agentic-loop.yaml already declares ``allow_private_upstreams: true`` in its
+    # ``insecure_options``, which is the operator opt-in the executor's SSRF check
+    # requires for the loopback provider callout — no test-time injection needed.
     if translate_to_chat:
         config = config.replace(
             "              - filter: openai_responses_proxy\n"
@@ -800,6 +951,24 @@ def _write_agentic_config(
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def backend_endpoint():
+    """Return the live backend or an inference-sim compatibility shim."""
+    if VLLM_TEST_BACKEND == "live":
+        yield _vllm_endpoint()
+        return
+
+    port = _free_port()
+    server = HTTPServer(("127.0.0.1", port), SimulatorBackendShimHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"127.0.0.1:{port}"
+    finally:
+        server.shutdown()
+        thread.join()
 
 
 @pytest.fixture(scope="session")
@@ -880,12 +1049,14 @@ def irr_streaming_proxy(tmp_path_factory, request):
 
 
 @pytest.fixture(scope="session")
-def chat_streaming_proxy(tmp_path_factory, request):
-    """Start the Responses-to-Chat streaming example against live vLLM."""
+def chat_streaming_proxy(tmp_path_factory, request, backend_endpoint):
+    """Start the Responses-to-Chat streaming example."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-chat-streaming")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_chat_streaming_config(port, db_path)
+    config_path = _write_chat_streaming_config(
+        port, db_path, backend_endpoint
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -958,6 +1129,56 @@ def reasoning_proxy(tmp_path_factory, request):
 
 
 @pytest.fixture(scope="session")
+def client_tool_compat_proxy(tmp_path_factory, request):
+    """Start the client-tool-compat example against live vLLM."""
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("client-tool-compat")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_client_tool_compat_config(port, db_path)
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Client tool compat Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def client_tool_compat_client(client_tool_compat_proxy):
+    """Return an SDK client using the client-tool-compat pipeline."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{client_tool_compat_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
 def compaction_server():
     """Start a deterministic summarization backend for compact callouts."""
     port = _free_port()
@@ -970,7 +1191,7 @@ def compaction_server():
 
 @pytest.fixture(scope="session")
 def compact_proxy(tmp_path_factory, request, compaction_server):
-    """Start the compact example against vLLM and the mock summarizer."""
+    """Start the compact example against inference and the mock summarizer."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-compact")
     db_path = str(db_dir / "responses.db")
@@ -1045,6 +1266,7 @@ def _witness_proxy_session(tmp_path_factory, request):
         client = OpenAI(
             base_url=f"http://127.0.0.1:{port}/v1",
             api_key="test",
+            default_headers=TRUSTED_OWNER_HEADERS,
             max_retries=0,
             timeout=300,
         )
@@ -1145,6 +1367,19 @@ def openai_client(praxis_proxy):
     return OpenAI(
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
         api_key="test",
+        default_headers=TRUSTED_OWNER_HEADERS,
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
+def other_owner_openai_client(praxis_proxy):
+    """Return a same-tenant Responses client with another subject."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
+        api_key="test",
+        default_headers={**TRUSTED_OWNER_HEADERS, "x-auth-user": "other-test-user"},
         max_retries=0,
         timeout=300,
     )
@@ -1195,11 +1430,15 @@ def compact_client(compact_proxy):
 
 
 @pytest.fixture(scope="session")
-def web_search_chat_streaming_proxy(tmp_path_factory, request, search_server):
-    """Start the streaming web-search-through-Chat example against live vLLM."""
+def web_search_chat_streaming_proxy(
+    tmp_path_factory, request, search_server, backend_endpoint
+):
+    """Start the streaming web-search-through-Chat example."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("web-search-chat-streaming")
-    config_path = _write_web_search_chat_streaming_config(port, search_server)
+    config_path = _write_web_search_chat_streaming_config(
+        port, search_server, backend_endpoint
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1250,7 +1489,7 @@ def web_search_chat_streaming_client(web_search_chat_streaming_proxy):
 
 
 class TestOpenAIResponsesVLLM:
-    """Integration tests for the Responses API against a vLLM backend."""
+    """Responses API integration tests against the selected backend."""
 
     def test_stateless_request(self, openai_client):
         response = openai_client.responses.create(
@@ -1291,6 +1530,33 @@ class TestOpenAIResponsesVLLM:
         assert retrieved.status == "completed"
         assert retrieved.output_text == response.output_text
         _assert_usage(retrieved.usage)
+
+    def test_same_tenant_other_owner_cannot_access_response(
+        self, openai_client, other_owner_openai_client
+    ):
+        response = openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: OWNER-PRIVATE /no_think",
+            temperature=0,
+            store=True,
+            max_output_tokens=128,
+        )
+
+        with pytest.raises(NotFoundError):
+            other_owner_openai_client.responses.retrieve(response.id)
+        with pytest.raises(NotFoundError):
+            other_owner_openai_client.responses.input_items.list(response.id)
+        with pytest.raises(NotFoundError):
+            other_owner_openai_client.responses.delete(response.id)
+        with pytest.raises(BadRequestError):
+            other_owner_openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="This must not use another owner's state.",
+                previous_response_id=response.id,
+                store=True,
+            )
+
+        assert openai_client.responses.retrieve(response.id).id == response.id
 
     def test_stored_input_items_pagination_and_delete(self, openai_client):
         response = openai_client.responses.create(
@@ -1411,7 +1677,7 @@ class TestOpenAIResponsesVLLM:
         # application/json error envelope, not an SSE error event.
         raw = httpx.post(
             f"{str(openai_client.base_url).rstrip('/')}/responses",
-            headers={"Authorization": "Bearer test"},
+            headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
             json={
                 "model": VLLM_MODEL,
                 "input": "This request must not reach vLLM.",
@@ -1435,7 +1701,7 @@ class TestOpenAIResponsesVLLM:
     def test_malformed_request_has_sdk_compatible_error(self, openai_client):
         response = httpx.post(
             f"{str(openai_client.base_url).rstrip('/')}/responses",
-            headers={"Authorization": "Bearer test"},
+            headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
             json={},
             timeout=10,
         )
@@ -1455,6 +1721,8 @@ class TestOpenAIResponsesVLLM:
             )
         assert exc_info.value.status_code == 400
 
+    @pytest.mark.critical_vllm
+    @requires_real_inference
     def test_rehydrated_second_turn(self, openai_client):
         first = openai_client.responses.create(
             model=VLLM_MODEL,
@@ -1484,21 +1752,21 @@ class TestOpenAIResponsesVLLM:
 
         On the rehydrated path the proxy replays prior turns via the `input`
         array and strips previous_response_id from the upstream request, so the
-        vLLM backend never sees it and echoes previous_response_id: null. The
-        rehydrate filter restores the caller's id into the response body so the
-        client always sees the id it sent, per the Responses API contract.
+        inference backend never sees it and echoes previous_response_id: null.
+        The rehydrate filter restores the caller's id into the response body so
+        the client always sees the id it sent, per the Responses API contract.
 
         This assertion is metadata-only and independent of model output, so it
-        is deterministic despite running against a real vLLM backend.
+        is deterministic with either the simulator or a real backend.
 
-        Manifest linkage: this is the live vLLM regression counterpart of the
+        Manifest linkage: this is the SDK regression counterpart of the
         committed synthetic inference fixture -- coverage feature
         ``responses.native.continuation``, scenario
         ``responses/native-continuation`` (see
         tests/integration/fixtures/inference/). No live recording is committed
         for that feature -- it stays ``synthetic_only`` because a live recording
         requires explicit authorization -- so this SDK test provides the
-        real-backend confidence instead.
+        gateway-level confidence instead.
         """
         first = openai_client.responses.create(
             model=VLLM_MODEL,
@@ -1560,7 +1828,6 @@ class TestOpenAIResponsesVLLM:
             max_output_tokens=128,
         )
         assert first.status == "completed"
-        assert first.truncation == "auto"
 
         first_seen = forwarded[before_first:]
         assert first_seen, "backend received no request on the first turn"
@@ -1578,7 +1845,6 @@ class TestOpenAIResponsesVLLM:
             max_output_tokens=128,
         )
         assert second.status == "completed"
-        assert second.truncation == "disabled"
 
         second_seen = forwarded[before_second:]
         assert second_seen, "backend received no request on the rehydrated turn"
@@ -1590,6 +1856,7 @@ class TestOpenAIResponsesVLLM:
         assert second_backend.get("previous_response_id") is None, second_backend
         assert isinstance(second_backend.get("input"), list), second_backend
 
+    @requires_real_inference
     def test_conversation_context_and_append_back(self, openai_client):
         conversation = openai_client.conversations.create(
             metadata={"suite": "responses-vllm"},
@@ -1636,6 +1903,7 @@ class TestOpenAIResponsesVLLM:
         finally:
             openai_client.conversations.delete(conversation.id)
 
+    @requires_real_inference
     def test_conversation_multi_turn_append_back(self, openai_client):
         conversation = openai_client.conversations.create()
         try:
@@ -1705,23 +1973,23 @@ class TestOpenAIResponsesVLLM:
         ``test_rehydrated_response_echoes_previous_response_id``. Same contract,
         same full-flow pipeline (store -> stream_events -> rehydrate), but
         stream=True: the proxy replays prior turns via the ``input`` array and
-        strips previous_response_id from the upstream request, so vLLM streams
-        ``previous_response_id: null`` in every response-lifecycle frame. The
-        rehydrate filter restores the caller's id into each lifecycle frame as
-        it streams -- without buffering the stream -- so the client's terminal
-        ``response.completed`` event carries the id it sent.
+        strips previous_response_id from the upstream request, so the backend
+        streams ``previous_response_id: null`` in every response-lifecycle
+        frame. The rehydrate filter restores the caller's id into each lifecycle
+        frame as it streams -- without buffering the stream -- so the client's
+        terminal ``response.completed`` event carries the id it sent.
 
         The assertions are metadata-only and independent of model output, so
-        they stay deterministic despite running against a real vLLM backend.
+        they stay deterministic with either the simulator or a real backend.
 
-        Manifest linkage: this is the live vLLM regression counterpart of the
+        Manifest linkage: this is the SDK regression counterpart of the
         committed synthetic inference fixture -- coverage feature
         ``responses.native.continuation``, scenario
         ``responses/native-continuation-stream`` (see
         tests/integration/fixtures/inference/). No live recording is committed
         for that feature -- it stays ``synthetic_only`` because a live recording
         requires explicit authorization -- so this SDK test provides the
-        real-backend confidence for the streaming path.
+        gateway-level confidence for the streaming path.
         """
         first = openai_client.responses.create(
             model=VLLM_MODEL,
@@ -1821,6 +2089,25 @@ class TestOpenAIResponsesVLLM:
             "type": "invalid_request_error",
         }
 
+    def test_background_mode_is_rejected_before_inference(self, openai_client):
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Run this later.",
+                background=True,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400
+        assert error.body == {
+            "code": "invalid_request_error",
+            "message": "background mode is not supported",
+            "param": None,
+            "type": "invalid_request_error",
+        }
+
+    @pytest.mark.critical_vllm
+    @requires_real_inference
     def test_doc_extract_inline_file_to(self, openai_client):
         """Issue #397: inline file_data is extracted to input_text and
         consumed by vLLM inference.
@@ -1871,6 +2158,8 @@ class TestOpenAIResponsesVLLM:
             f"marker '{marker}'; got: {response.output_text}"
         )
 
+    @pytest.mark.critical_vllm
+    @requires_real_inference
     def test_file_id_resolution(self, openai_client):
         """End-to-end: upload to OGX via Praxis, reference by file_id,
         verify vLLM output contains the file content.
@@ -1971,6 +2260,8 @@ class TestOpenAIResponsesVLLM:
         args = json.loads(fc.arguments)
         assert "city" in args, f"function arguments should contain city: {args}"
 
+    @pytest.mark.critical_vllm
+    @requires_real_inference
     def test_client_function_call_output_resumes_inference(
         self,
         openai_client,
@@ -2043,6 +2334,7 @@ class TestOpenAIResponsesVLLM:
         assert second.status == "completed"
         assert "72" in second.output_text or "sunny" in second.output_text.lower()
 
+    @requires_vllm_compat
     def test_generation_parameters_are_reflected(self, openai_client):
         response = openai_client.responses.create(
             model=VLLM_MODEL,
@@ -2062,6 +2354,7 @@ class TestOpenAIResponsesVLLM:
         assert response.parallel_tool_calls is False
         assert response.truncation == "disabled"
 
+    @requires_vllm_compat
     def test_max_output_tokens_reports_incomplete(self, openai_client):
         response = openai_client.responses.create(
             model=VLLM_MODEL,
@@ -2301,6 +2594,7 @@ class TestResponsesCompactionVLLM:
         assert second.output_text
         assert len(CompactionHandler.requests) == request_count
 
+    @requires_real_inference
     def test_over_threshold_compacts_rehydrated_history(
         self,
         compact_client,
@@ -2435,6 +2729,8 @@ class TestResponsesToChatCompletionsVLLM:
         assert response.prompt_cache_key == "praxis-chat-parameter-test"
         assert response.truncation == "disabled"
 
+    @pytest.mark.critical_vllm
+    @requires_vllm_compat
     def test_structured_output_round_trip(self, chat_streaming_client):
         response = chat_streaming_client.responses.create(
             model=VLLM_MODEL,
@@ -2462,6 +2758,62 @@ class TestResponsesToChatCompletionsVLLM:
         assert response.status == "completed"
         assert json.loads(response.output_text) == {
             "marker": "CHAT-JSON-1357",
+        }
+
+    @pytest.mark.critical_vllm
+    @requires_vllm_compat
+    def test_structured_output_preserved_with_tools_round_trip(
+        self,
+        chat_streaming_client,
+    ):
+        # Regression for issue #1248: the Responses-to-Chat translator used to
+        # drop `response_format` whenever tools were translated, silently
+        # weakening the structured-output contract. Chat Completions supports
+        # both together, so a request pairing `text.format` with a declared tool
+        # must still return schema-valid JSON. The tool flows through the
+        # translator's tool builder (the exact path that previously deleted the
+        # constraint); `tool_choice="none"` keeps the answer direct and
+        # deterministic while still exercising that path.
+        tool = {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+        response = chat_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input="Return the marker CHAT-JSON-TOOLS-2468. /no_think",
+            temperature=0,
+            tools=[tool],
+            tool_choice="none",
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "marker_result",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "marker": {"type": "string"},
+                        },
+                        "required": ["marker"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            store=False,
+            max_output_tokens=128,
+        )
+
+        assert response.status == "completed"
+        assert json.loads(response.output_text) == {
+            "marker": "CHAT-JSON-TOOLS-2468",
         }
 
     def test_function_call_and_output_round_trip(
@@ -2564,6 +2916,8 @@ class TestResponsesToChatCompletionsVLLM:
             f"got {retrieved.output_text!r}"
         )
 
+    @pytest.mark.critical_vllm
+    @requires_vllm_compat
     def test_streaming_incomplete_round_trip(self, chat_streaming_client):
         stream = chat_streaming_client.responses.create(
             model=VLLM_MODEL,
@@ -2579,6 +2933,7 @@ class TestResponsesToChatCompletionsVLLM:
         assert terminal.status == "incomplete"
         assert terminal.incomplete_details.reason == "max_output_tokens"
 
+    @requires_vllm_compat
     def test_backend_error_is_sdk_compatible(self, chat_streaming_client):
         with pytest.raises(NotFoundError) as exc_info:
             chat_streaming_client.responses.create(
@@ -2588,6 +2943,7 @@ class TestResponsesToChatCompletionsVLLM:
             )
         assert exc_info.value.status_code == 404
 
+    @requires_vllm_compat
     def test_web_search_streams_terminal_round_as_one_logical_response(
         self, web_search_chat_streaming_client, web_search_chat_streaming_proxy,
     ):
@@ -2750,6 +3106,7 @@ def translated_agentic_proxy(
     request,
     mcp_server,
     search_server,
+    backend_endpoint,
 ):
     """Start the agentic loop through Responses-to-Chat translation."""
     port = _free_port()
@@ -2761,6 +3118,7 @@ def translated_agentic_proxy(
         mcp_server,
         search_server,
         translate_to_chat=True,
+        backend_endpoint=backend_endpoint,
     )
     binary = _find_binary()
 
@@ -2873,8 +3231,132 @@ def _assert_multi_round_usage_and_trace(response, *, transport):
     )
 
 
+class TestClientToolCompatVLLM:
+    """Issue #1131: rich Codex client tools round-trip through a function-only
+    vLLM Responses backend via ``openai_client_tool_compat``.
+
+    The compat filter lowers ``custom``/``namespace``/``shell``/``tool_search``
+    declarations to private ``function`` tools on the request (vLLM only ever
+    sees functions) and restores the returned ``function_call`` items to their
+    canonical typed items on the buffered response — over ``POST /v1/responses``,
+    never ``/v1/chat/completions``, and without executing any client tool inside
+    Praxis.
+    """
+
+    def test_custom_tool_round_trip_lowers_and_restores(
+        self, client_tool_compat_client
+    ):
+        """A ``custom`` client tool is lowered to a private ``function`` vLLM
+        accepts; the returned ``function_call`` is restored to a
+        ``custom_tool_call`` with the original ``custom`` tool echoed back."""
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            # Force the call so the small CI model is deterministic; the compat
+            # filter lowers this custom selector to a function selector for vLLM.
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        # Response phase: the function_call is restored to a custom_tool_call.
+        custom_calls = [
+            item for item in response.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            "compat filter must restore the function_call to a custom_tool_call; "
+            f"got output types: {[i.type for i in response.output]}"
+        )
+        assert custom_calls[0].name == "apply_patch"
+        assert isinstance(custom_calls[0].input, str)
+        # No un-restored private function_call may leak to the client.
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        # Request phase echo: the client sees its original ``custom`` tool back.
+        assert any(t.type == "custom" for t in response.tools), response.tools
+
+    def test_streaming_custom_tool_restores_lifecycle(
+        self, client_tool_compat_client
+    ):
+        """Issue #1159 (streaming half): a ``custom`` client tool is lowered to a
+        private ``function`` vLLM accepts, and the streamed ``function_call``
+        lifecycle is restored LIVE to a ``custom_tool_call`` by the
+        ``openai_stream_events`` owner — over ``POST /v1/responses`` as one logical
+        SSE lifecycle, with the private lowered name never leaking un-restored."""
+        stream = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            # Force the call so the small CI model is deterministic; the compat
+            # filter lowers this custom selector to a function selector for vLLM,
+            # and openai_stream_events restores the streamed function_call live.
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=False,
+            stream=True,
+            max_output_tokens=256,
+        )
+
+        event_types = []
+        final_response = None
+        for event in stream:
+            event_types.append(event.type)
+            if event.type == "response.completed":
+                final_response = event.response
+
+        # One coherent SSE lifecycle: created first, completed last.
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] == "response.completed", event_types
+        assert final_response is not None, (
+            f"stream must terminate with a response.completed event; got: {event_types}"
+        )
+        assert final_response.status == "completed", final_response
+
+        # The streamed function_call is restored LIVE to a custom_tool_call.
+        output_types = [item.type for item in final_response.output]
+        custom_calls = [
+            item for item in final_response.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            "openai_stream_events must restore the streamed function_call to a "
+            f"custom_tool_call; got output types: {output_types}"
+        )
+        assert custom_calls[0].name == "apply_patch"
+        assert isinstance(custom_calls[0].input, str)
+        # No un-restored private function_call item may leak to the client.
+        assert "function_call" not in output_types, (
+            f"lowered function must not leak on the stream: {output_types}"
+        )
+        # Request-phase echo: the client sees its original ``custom`` tool back.
+        assert any(t.type == "custom" for t in final_response.tools), (
+            final_response.tools
+        )
+
+
 class TestAgenticLoopVLLM:
-    """Integration tests for the agentic loop against a vLLM backend."""
+    """Agentic-loop integration tests against the selected backend."""
 
     def test_mcp_approval_round_trip_executes_once(
         self, agentic_client, agentic_proxy,
@@ -2948,6 +3430,7 @@ class TestAgenticLoopVLLM:
             f"approved response should resume to model output; got: {output_types}"
         )
 
+    @requires_vllm_compat
     def test_mcp_approval_resume_streams_without_index_error(
         self, agentic_client, agentic_proxy,
     ):
@@ -3230,7 +3713,7 @@ class TestAgenticLoopVLLM:
         assert len(approvals) == 1, response.output
         assert approvals[0].name == "get_weather"
         assert approvals[0].server_label == "weather"
-        assert "Paris" in approvals[0].arguments
+        assert json.loads(approvals[0].arguments).get("city")
         assert not any(item.type == "mcp_call" for item in response.output), (
             response.output
         )
@@ -3336,6 +3819,7 @@ class TestAgenticLoopVLLM:
         assert len(BraveSearchHandler.request_paths) == request_count + 1
         assert any(item.type == "message" for item in response.output)
 
+    @requires_vllm_compat
     def test_web_search_streams_one_logical_response(
         self,
         translated_agentic_client,
@@ -3368,6 +3852,7 @@ class TestAgenticLoopVLLM:
             )
         assert len(BraveSearchHandler.request_paths) == request_count + 1
 
+    @requires_vllm_compat
     def test_batched_mcp_tools_honor_parallel_tool_calls(
         self,
         agentic_client,
@@ -3498,6 +3983,7 @@ class TestAgenticLoopVLLM:
             f"accumulated output or streamed text; got: {haystack}"
         )
 
+    @requires_vllm_compat
     def test_mcp_tool_streams_local_call_as_incremental_output_items(
         self, agentic_client, agentic_proxy,
     ):
@@ -3930,6 +4416,7 @@ class TestAgenticLoopVLLM:
             f"(id={list_id!r}, index={list_index}); got snapshot: {snapshot}"
         )
 
+    @requires_vllm_compat
     def test_web_search_streams_local_call_as_incremental_output_items(
         self, translated_agentic_client,
     ):
@@ -4302,8 +4789,9 @@ class TestStreamingMcpDiscoveryFailureVLLM:
     retrievable via the SDK.
 
     The failure is triggered with an MCP ``server_url`` pointing at a dead
-    loopback port. The agentic config sets ``allow_loopback: true`` on
-    ``openai_mcp_tool_resolve``, so the refused connection is classified as a
+    loopback port. The agentic config enables
+    ``insecure_options.allow_private_upstreams``, so the loopback MCP callout
+    passes SSRF validation and the refused connection is classified as a
     genuine *runtime* discovery failure (-> 200 SSE lifecycle) rather than a
     local SSRF policy rejection (-> HTTP error). Discovery failures
     short-circuit in the request phase, so vLLM is never contacted -- this
@@ -4424,7 +4912,13 @@ filter_chains:
               # (#1046).
               - filter: openai_file_search_callout
                 vector_store_url: http://{ogx_endpoint}
-                allow_private_url: true
+                outbound_chain:
+                  name: vector-store-outbound
+                  filters:
+                    - filter: headers
+                      request_set:
+                        - name: X-Vector-Store-Client
+                          value: praxis-ai-gateway
                 timeout_ms: 30000
                 max_response_bytes: 10485760
                 max_total_response_bytes: 67108864
@@ -4463,14 +4957,77 @@ filter_chains:
 
 insecure_options:
   allow_private_endpoints: true
+  # Central SSRF gate for the vector-store callout: permits the loopback OGX
+  # endpoint's resolved address at connect time.
+  allow_private_upstreams: true
 """
 
 
-def _write_file_search_config(praxis_port: int) -> str:
+class VectorStoreWitnessHandler(BaseHTTPRequestHandler):
+    """Recording shim between the file-search callout and OGX.
+
+    Captures the request headers of every vector-store request the callout
+    forwards, then proxies transparently to OGX so the search still runs and
+    the full pipeline completes. Tests assert the configured ``outbound_chain``
+    actually ran by checking the marker header it injects
+    (``X-Vector-Store-Client``) is present on every captured request — proving
+    the callout dispatched through the ``FilteredSubrequestExecutor`` outbound
+    chain rather than reaching OGX by some other path (or not at all).
+    """
+
+    captured_headers: ClassVar[list[dict[str, str]]] = []
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _forward(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        type(self).captured_headers.append(
+            {k.lower(): v for k, v in self.headers.items()}
+        )
+        headers = {
+            k: v
+            for k, v in self.headers.items()
+            if k.lower() not in ("host", "content-length")
+        }
+        url = f"{OGX_BASE_URL.rstrip('/')}{self.path}"
+        with httpx.Client(timeout=300.0) as client:
+            with client.stream(
+                self.command, url, headers=headers, content=body
+            ) as upstream:
+                self.send_response(upstream.status_code)
+                for key, value in upstream.headers.items():
+                    if key.lower() in (
+                        "transfer-encoding",
+                        "content-length",
+                        "connection",
+                    ):
+                        continue
+                    self.send_header(key, value)
+                self.end_headers()
+                for chunk in upstream.iter_raw():
+                    if chunk:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+
+    def do_POST(self):
+        self._forward()
+
+    def do_GET(self):
+        self._forward()
+
+    def do_DELETE(self):
+        self._forward()
+
+
+def _write_file_search_config(
+    praxis_port: int, backend_endpoint: str, ogx_endpoint: str | None = None
+) -> str:
     config = FILE_SEARCH_CONFIG_TEMPLATE.format(
         praxis_port=praxis_port,
-        ogx_endpoint=_ogx_endpoint(),
-        vllm_endpoint=_vllm_endpoint(),
+        ogx_endpoint=ogx_endpoint or _ogx_endpoint(),
+        vllm_endpoint=backend_endpoint,
     )
     fd, path = tempfile.mkstemp(suffix=".yaml")
     with os.fdopen(fd, "w") as f:
@@ -4554,10 +5111,22 @@ def vector_store():
 
 
 @pytest.fixture(scope="session")
-def file_search_proxy(tmp_path_factory, request):
-    """Start a Praxis proxy with the file-search-callout pipeline."""
+def file_search_proxy(tmp_path_factory, request, backend_endpoint):
+    """Start a Praxis proxy with the file-search-callout pipeline.
+
+    The vector-store callout is pointed at an in-process recording shim
+    (:class:`VectorStoreWitnessHandler`) that forwards transparently to OGX, so
+    a test can assert the configured ``outbound_chain`` ran by inspecting the
+    headers the shim captured.
+    """
+    VectorStoreWitnessHandler.captured_headers = []
+    shim_port = _free_port()
+    shim = HTTPServer(("127.0.0.1", shim_port), VectorStoreWitnessHandler)
+    shim_thread = threading.Thread(target=shim.serve_forever, daemon=True)
+    shim_thread.start()
+
     port = _free_port()
-    config_path = _write_file_search_config(port)
+    config_path = _write_file_search_config(port, backend_endpoint, ogx_endpoint=f"127.0.0.1:{shim_port}")
     binary = _find_binary()
 
     log_dir = tmp_path_factory.mktemp("file-search")
@@ -4582,6 +5151,7 @@ def file_search_proxy(tmp_path_factory, request):
             proc.kill()
             proc.wait()
         log_file.close()
+        shim.shutdown()
         if not started or request.session.testsfailed > 0:
             with open(log_path) as f:
                 print(
@@ -4605,6 +5175,7 @@ def file_search_client(file_search_proxy):
 class TestFileSearchVLLM:
     """File search integration tests: vLLM -> Praxis -> OGX -> vLLM."""
 
+    @pytest.mark.critical_vllm
     def test_file_search_with(self, file_search_client, vector_store):
         """vLLM emits function_call(name=file_search) which the proxy
         translates to file_search_call, executes the OGX search callout,
@@ -4661,6 +5232,23 @@ class TestFileSearchVLLM:
             for result in decoded_results
         ), "decoded file-search results should retain typed result metadata"
 
+        # Prove the callout actually dispatched the vector-store search through
+        # the configured FilteredSubrequestExecutor outbound chain — not merely
+        # that a file_search_call item surfaced. The recording shim in front of
+        # OGX captured each forwarded request; every one must carry the marker
+        # header the inline outbound_chain injects, which only the executor path
+        # can add.
+        captured = VectorStoreWitnessHandler.captured_headers
+        assert captured, (
+            "the file-search callout must forward at least one vector-store "
+            "request through the outbound chain to OGX"
+        )
+        for headers in captured:
+            assert headers.get("x-vector-store-client") == "praxis-ai-gateway", (
+                "every vector-store request must carry the outbound_chain marker "
+                f"header, proving the callout ran; got headers: {headers}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # File search via Chat Completions translation (issue #296)
@@ -4671,12 +5259,14 @@ FILE_SEARCH_CHAT_CONFIG_PATH = (
 )
 
 
-def _write_file_search_chat_config(praxis_port: int) -> str:
+def _write_file_search_chat_config(
+    praxis_port: int, backend_endpoint: str
+) -> str:
     """Patch the shipped file-search-chat-completions example for testing.
 
     Exercises the real example config (per repo test requirements) while
-    retargeting the vector-store callout at OGX and the model backend at
-    vLLM's /v1/chat/completions endpoint.
+    retargeting the vector-store callout at OGX and the model backend at the
+    selected /v1/chat/completions endpoint.
 
     IRR / callout / backend read deadlines are widened to match
     FILE_SEARCH_CONFIG_TEMPLATE: CPU-only vLLM plus OGX is slower when
@@ -4688,7 +5278,6 @@ def _write_file_search_chat_config(praxis_port: int) -> str:
 
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:8001", _ogx_endpoint())
-    vllm = _vllm_endpoint()
     config = config.replace(
         '                  - name: "chat-completions-backend"\n'
         "                    endpoints:\n"
@@ -4696,15 +5285,15 @@ def _write_file_search_chat_config(praxis_port: int) -> str:
         f'                  - name: "chat-completions-backend"\n'
         f"                    read_timeout_ms: 300000\n"
         f"                    endpoints:\n"
-        f'                      - "{vllm}"',
+        f'                      - "{backend_endpoint}"',
     )
     config = config.replace("timeout_ms: 120000", "timeout_ms: 300000")
     config = config.replace("step_timeout_ms: 60000", "step_timeout_ms: 300000")
     config = config.replace("timeout_ms: 5000", "timeout_ms: 30000")
-    if f'- "{vllm}"' not in config:
+    if f'- "{backend_endpoint}"' not in config:
         raise RuntimeError(
             "file-search-chat-completions.yaml cluster block did not match; "
-            "vLLM endpoint was not patched"
+            "Chat backend endpoint was not patched"
         )
 
     fd, path = tempfile.mkstemp(suffix=".yaml")
@@ -4714,10 +5303,12 @@ def _write_file_search_chat_config(praxis_port: int) -> str:
 
 
 @pytest.fixture(scope="session")
-def file_search_chat_proxy(tmp_path_factory, request):
+def file_search_chat_proxy(
+    tmp_path_factory, request, backend_endpoint
+):
     """Start a Praxis proxy with the file-search Chat Completions pipeline."""
     port = _free_port()
-    config_path = _write_file_search_chat_config(port)
+    config_path = _write_file_search_chat_config(port, backend_endpoint)
     binary = _find_binary()
 
     log_dir = tmp_path_factory.mktemp("file-search-chat")
@@ -4839,7 +5430,9 @@ FILE_SEARCH_STREAMING_CONFIG_PATH = (
 )
 
 
-def _write_file_search_streaming_config(praxis_port: int) -> str:
+def _write_file_search_streaming_config(
+    praxis_port: int, backend_endpoint: str
+) -> str:
     """Patch the shipped file-search-streaming example for testing.
 
     Exercises the real #313 streaming example config (per repo test
@@ -4858,7 +5451,7 @@ def _write_file_search_streaming_config(praxis_port: int) -> str:
     # _write_agentic_config. This is also the only occurrence of :3001.
     config = config.replace(
         '- "127.0.0.1:3001"',
-        f'- "{_vllm_endpoint()}"\n'
+        f'- "{backend_endpoint}"\n'
         "                    read_timeout_ms: 300000",
     )
     # Widen the IRR and callout deadlines for slow CPU inference/search.
@@ -4873,10 +5466,14 @@ def _write_file_search_streaming_config(praxis_port: int) -> str:
 
 
 @pytest.fixture(scope="session")
-def file_search_streaming_proxy(tmp_path_factory, request):
+def file_search_streaming_proxy(
+    tmp_path_factory, request, backend_endpoint
+):
     """Start a Praxis proxy with the streaming file-search-callout pipeline."""
     port = _free_port()
-    config_path = _write_file_search_streaming_config(port)
+    config_path = _write_file_search_streaming_config(
+        port, backend_endpoint
+    )
     binary = _find_binary()
 
     log_dir = tmp_path_factory.mktemp("file-search-streaming")
@@ -4960,6 +5557,7 @@ class TestFileSearchStreamingVLLM:
         "marker. Repeat the marker exactly. /no_think"
     )
 
+    @pytest.mark.critical_vllm
     def test_streaming_file_search_lifecycle_events(
         self, file_search_streaming_client, vector_store
     ):
@@ -5046,6 +5644,872 @@ class TestFileSearchStreamingVLLM:
         assert not leaked, (
             "the hosted file_search must not leak as a client function_call; "
             f"leaked: {[getattr(item, 'name', '?') for item in leaked]}"
+        )
+
+
+STRUCTURED_OUTPUT_SCHEMA_CASES = [
+    pytest.param(
+        "Generate a profile for Tom, a software engineer in Raleigh. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "maxLength": 64},
+                "occupation": {"type": "string", "maxLength": 64},
+                "city": {"type": "string", "maxLength": 64},
+            },
+            "required": ["name", "occupation", "city"],
+            "additionalProperties": False,
+        },
+        id="string-types",
+    ),
+    pytest.param(
+        "Generate a profile for Bob, who is 25 years old. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+            },
+            "required": ["name", "age"],
+            "additionalProperties": False,
+        },
+        id="integer-types",
+    ),
+    pytest.param(
+        "Generate an active user named Alice with a verified email. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "username": {"type": "string"},
+                "is_active": {"type": "boolean"},
+                "email_verified": {"type": "boolean"},
+            },
+            "required": ["username", "is_active", "email_verified"],
+            "additionalProperties": False,
+        },
+        id="boolean-types",
+    ),
+    pytest.param(
+        "Generate product information for a laptop priced at 999.99. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "product_name": {"type": "string"},
+                "price": {"type": "number"},
+            },
+            "required": ["product_name", "price"],
+            "additionalProperties": False,
+        },
+        id="number-types",
+    ),
+    pytest.param(
+        "Generate a profile for Charlie with Python, JavaScript, and Docker skills. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "skills": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 64},
+                    "minItems": 1,
+                    "maxItems": 3,
+                },
+            },
+            "required": ["name", "skills"],
+            "additionalProperties": False,
+        },
+        id="array-of-strings",
+    ),
+    pytest.param(
+        'Return exactly this JSON object: {"student_name":"Dana","scores":[85,92,78]}. /no_think',
+        {
+            "type": "object",
+            "properties": {
+                "student_name": {"type": "string", "enum": ["Dana"]},
+                "scores": {
+                    "type": "array",
+                    "items": {"type": "integer", "enum": [78, 85, 92]},
+                    "minItems": 3,
+                    "maxItems": 3,
+                },
+            },
+            "required": ["student_name", "scores"],
+            "additionalProperties": False,
+        },
+        marks=pytest.mark.xfail(
+            strict=False,
+            raises=json.JSONDecodeError,
+            reason="CPU Qwen3-0.6B can exhaust the output limit for this schema",
+        ),
+        id="array-of-integers",
+    ),
+    pytest.param(
+        "Generate an Engineering team with Alice as lead and Bob as developer. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "team_name": {"type": "string"},
+                "members": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "role": {"type": "string"},
+                        },
+                        "required": ["name", "role"],
+                        "additionalProperties": False,
+                    },
+                    "minItems": 1,
+                    "maxItems": 2,
+                },
+            },
+            "required": ["team_name", "members"],
+            "additionalProperties": False,
+        },
+        id="array-of-objects",
+    ),
+    pytest.param(
+        "Generate employee Susan, ID 1001, in Engineering managed by Frank. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "employee": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "employee_id": {"type": "integer"},
+                    },
+                    "required": ["name", "employee_id"],
+                    "additionalProperties": False,
+                },
+                "department": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "manager": {"type": "string"},
+                    },
+                    "required": ["name", "manager"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["employee", "department"],
+            "additionalProperties": False,
+        },
+        id="nested-objects",
+    ),
+    pytest.param(
+        "Generate an active profile for Grace, age 35, salary 120000, with Python and SQL skills, living at 123 Main St in Raleigh, zipcode 27601. /no_think",
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+                "salary": {"type": "number"},
+                "is_active": {"type": "boolean"},
+                "skills": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 64},
+                    "minItems": 1,
+                    "maxItems": 2,
+                },
+                "address": {
+                    "type": "object",
+                    "properties": {
+                        "street": {"type": "string"},
+                        "city": {"type": "string"},
+                        "zipcode": {"type": "integer"},
+                    },
+                    "required": ["street", "city", "zipcode"],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["name", "age", "salary", "is_active", "skills", "address"],
+            "additionalProperties": False,
+        },
+        id="mixed-types-and-structures",
+    ),
+]
+
+
+def _assert_matches_schema(value: Any, schema: dict[str, Any], path: str = "$") -> None:
+    """Assert the JSON value has the types and closed shape declared by a case."""
+    if "enum" in schema:
+        assert value in schema["enum"], f"{path} is not an allowed value: {value!r}"
+    expected_type = schema["type"]
+    if expected_type == "object":
+        assert isinstance(value, dict), f"{path} should be an object: {value!r}"
+        required = set(schema.get("required", []))
+        assert required <= value.keys(), f"{path} is missing {required - value.keys()}"
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            assert value.keys() <= properties.keys(), f"{path} has unexpected keys: {value.keys() - properties.keys()}"
+        for key, child_schema in properties.items():
+            if key in value:
+                _assert_matches_schema(value[key], child_schema, f"{path}.{key}")
+        return
+    if expected_type == "array":
+        assert isinstance(value, list), f"{path} should be an array: {value!r}"
+        assert value, f"{path} should not be empty"
+        if "minItems" in schema:
+            assert len(value) >= schema["minItems"], f"{path} has too few items"
+        if "maxItems" in schema:
+            assert len(value) <= schema["maxItems"], f"{path} has too many items"
+        for index, item in enumerate(value):
+            _assert_matches_schema(item, schema["items"], f"{path}[{index}]")
+        return
+    if expected_type == "string":
+        assert isinstance(value, str), f"{path} should be a string: {value!r}"
+        if "maxLength" in schema:
+            assert len(value) <= schema["maxLength"], f"{path} is too long"
+        return
+    if expected_type == "integer":
+        assert isinstance(value, int) and not isinstance(value, bool), f"{path} should be an integer: {value!r}"
+        return
+    if expected_type == "number":
+        assert isinstance(value, (int, float)) and not isinstance(value, bool), f"{path} should be a number: {value!r}"
+        return
+    if expected_type == "boolean":
+        assert isinstance(value, bool), f"{path} should be a boolean: {value!r}"
+        return
+    raise AssertionError(f"unsupported test schema type {expected_type!r} at {path}")
+
+
+@requires_real_inference
+@pytest.mark.parametrize("prompt,schema", STRUCTURED_OUTPUT_SCHEMA_CASES)
+def test_structured_output_schema_shapes(openai_client, prompt, schema):
+    """Exercise nine structured-output schema shapes."""
+    text_format = {
+        "type": "json_schema",
+        "name": "extended_response_shape",
+        "description": "A recording-free structured output compatibility case",
+        "schema": schema,
+        "strict": True,
+    }
+    response = openai_client.responses.create(
+        model=VLLM_MODEL,
+        input=prompt,
+        stream=False,
+        text={"format": text_format},
+        temperature=0,
+        store=False,
+        max_output_tokens=512,
+    )
+
+    assert response.text.format.model_dump(exclude_none=True, by_alias=True) == text_format
+    _assert_matches_schema(json.loads(response.output_text), schema)
+
+
+@requires_vllm_compat
+def test_include_logprobs_non_streaming(openai_client):
+    """Verify the finite include=message.output_text.logprobs scenario."""
+    response = openai_client.responses.create(
+        model=VLLM_MODEL,
+        input="Which planet do humans live on? /no_think",
+        stream=False,
+        include=["message.output_text.logprobs"],
+        store=False,
+        max_output_tokens=64,
+    )
+
+    messages = [item for item in response.output if item.type == "message"]
+    assert len(messages) == 1
+    assert messages[0].content[0].logprobs
+
+
+@requires_vllm_compat
+def test_include_logprobs_streaming(openai_client):
+    """Verify the streaming include=message.output_text.logprobs scenario."""
+    events = list(
+        openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Which planet do humans live on? /no_think",
+            stream=True,
+            include=["message.output_text.logprobs"],
+            store=False,
+            max_output_tokens=64,
+        )
+    )
+
+    deltas = [event for event in events if event.type == "response.output_text.delta"]
+    assert deltas
+    assert all(event.logprobs for event in deltas)
+
+    completed = [event for event in events if event.type == "response.completed"]
+    assert len(completed) == 1
+    messages = [item for item in completed[0].response.output if item.type == "message"]
+    assert len(messages) == 1
+    assert messages[0].content[0].logprobs
+
+
+@requires_vllm_compat
+def test_response_extra_body_guided_choice(openai_client):
+    """Verify the vLLM-specific structured_outputs.choice passthrough case."""
+    response = openai_client.responses.create(
+        model=VLLM_MODEL,
+        input="Classify this sentence: I am feeling really sad today. /no_think",
+        stream=False,
+        extra_body={"structured_outputs": {"choice": ["joy", "sadness"]}},
+        store=False,
+        max_output_tokens=16,
+    )
+
+    assert response.output_text.strip() in {"joy", "sadness"}
+
+
+def _create_short_response(openai_client, **options):
+    return openai_client.responses.create(
+        model=VLLM_MODEL,
+        input="Say exactly: RESPONSES-COVERAGE-OK /no_think",
+        temperature=0,
+        max_output_tokens=64,
+        **options,
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="native Responses does not yet echo prompt_cache_key in streamed response objects",
+)
+@requires_vllm_compat
+def test_openai_response_with_prompt_cache_key_streaming(openai_client):
+    """Verify the streaming prompt_cache_key response-shape scenario."""
+    cache_key = "responses-coverage-streaming-cache"
+    events = list(
+        _create_short_response(
+            openai_client,
+            prompt_cache_key=cache_key,
+            stream=True,
+            store=False,
+        )
+    )
+
+    terminal = _assert_stream_contract(events)
+    assert events[0].response.prompt_cache_key == cache_key
+    assert terminal.prompt_cache_key == cache_key
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="native Responses does not yet echo prompt_cache_key in finite response objects",
+)
+@requires_vllm_compat
+def test_openai_response_with_prompt_cache_key_and_previous_response(openai_client):
+    """Verify the prompt_cache_key plus previous_response_id scenario."""
+    cache_key = "responses-coverage-continuation-cache"
+    first = _create_short_response(
+        openai_client,
+        prompt_cache_key=cache_key,
+        store=True,
+    )
+    second = _create_short_response(
+        openai_client,
+        prompt_cache_key=cache_key,
+        previous_response_id=first.id,
+        store=False,
+    )
+
+    assert first.prompt_cache_key == cache_key
+    assert second.prompt_cache_key == cache_key
+    assert second.previous_response_id == first.id
+
+
+@requires_vllm_compat
+def test_openai_response_with_truncation_disabled_streaming(openai_client):
+    """Verify the streaming truncation response-shape scenario."""
+    events = list(
+        _create_short_response(
+            openai_client,
+            truncation="disabled",
+            stream=True,
+            store=False,
+        )
+    )
+
+    terminal = _assert_stream_contract(events)
+    assert events[0].response.truncation == "disabled"
+    assert terminal.truncation == "disabled"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="native Responses currently reports the default top_p instead of the requested value",
+)
+@requires_vllm_compat
+def test_openai_response_with_top_p_streaming(openai_client):
+    """Verify the streaming top_p response-shape scenario."""
+    events = list(
+        _create_short_response(
+            openai_client,
+            top_p=0.8,
+            stream=True,
+            store=False,
+        )
+    )
+
+    terminal = _assert_stream_contract(events)
+    assert events[0].response.top_p == 0.8
+    assert terminal.top_p == 0.8
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="native Responses currently reports the default top_p instead of the requested value",
+)
+@requires_vllm_compat
+def test_openai_response_with_top_p_and_previous_response(openai_client):
+    """Verify the top_p plus previous_response_id scenario."""
+    first = _create_short_response(openai_client, top_p=0.7, store=True)
+    second = _create_short_response(
+        openai_client,
+        top_p=0.7,
+        previous_response_id=first.id,
+        store=False,
+    )
+
+    assert first.top_p == 0.7
+    assert second.top_p == 0.7
+    assert second.previous_response_id == first.id
+
+
+@requires_vllm_compat
+def test_openai_response_with_parallel_tool_calls_disabled_streaming(openai_client):
+    """Verify the streaming parallel_tool_calls=false shape scenario."""
+    events = list(
+        _create_short_response(
+            openai_client,
+            parallel_tool_calls=False,
+            stream=True,
+            store=False,
+        )
+    )
+
+    terminal = _assert_stream_contract(events)
+    assert events[0].response.parallel_tool_calls is False
+    assert terminal.parallel_tool_calls is False
+
+
+@requires_vllm_compat
+def test_openai_response_with_parallel_tool_calls_and_previous_response(openai_client):
+    """Verify the parallel_tool_calls plus continuation scenario."""
+    first = _create_short_response(
+        openai_client,
+        parallel_tool_calls=False,
+        store=True,
+    )
+    second = _create_short_response(
+        openai_client,
+        parallel_tool_calls=False,
+        previous_response_id=first.id,
+        store=False,
+    )
+
+    assert first.parallel_tool_calls is False
+    assert second.parallel_tool_calls is False
+    assert second.previous_response_id == first.id
+
+
+def test_openai_response_with_stream_options_includes_usage(openai_client):
+    """Verify the streaming stream_options and usage scenario."""
+    events = list(
+        _create_short_response(
+            openai_client,
+            stream=True,
+            stream_options={"include_obfuscation": True},
+            store=False,
+        )
+    )
+
+    terminal = _assert_stream_contract(events)
+    assert terminal.usage is not None
+    assert terminal.usage.total_tokens > 0
+
+
+def test_openai_response_with_stream_options_non_streaming(openai_client):
+    """Verify the finite stream_options acceptance scenario."""
+    response = _create_short_response(
+        openai_client,
+        stream_options={"include_obfuscation": True},
+        store=False,
+    )
+
+    assert response.object == "response"
+    assert response.status == "completed"
+    messages = [item for item in response.output if item.type == "message"]
+    assert len(messages) == 1
+    assert messages[0].content
+    assert messages[0].content[0].type == "output_text"
+    _assert_usage(response.usage)
+
+
+def test_openai_response_with_stream_options_and_previous_response(openai_client):
+    """Verify the streaming stream_options plus continuation scenario."""
+    first = _create_short_response(openai_client, store=True)
+    events = list(
+        _create_short_response(
+            openai_client,
+            previous_response_id=first.id,
+            stream=True,
+            stream_options={"include_obfuscation": True},
+            store=False,
+        )
+    )
+
+    terminal = _assert_stream_contract(events)
+    assert terminal.previous_response_id == first.id
+    assert terminal.usage is not None
+
+
+@requires_vllm_compat
+def test_invalid_model_raises_not_found_error(openai_client):
+    """Verify the SDK exception contract for an unknown model."""
+    with pytest.raises(NotFoundError) as exc_info:
+        openai_client.responses.create(
+            model="nonexistent-model-responses-coverage",
+            input="Hello",
+        )
+
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="max_tool_calls=0 is not yet rejected at the Responses boundary",
+)
+def test_invalid_max_tool_calls_raises_bad_request(openai_client):
+    """Verify the max_tool_calls lower-bound error scenario."""
+    with pytest.raises(BadRequestError) as exc_info:
+        openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Search for news",
+            tools=[{"type": "web_search"}],
+            max_tool_calls=0,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "max_tool_calls" in str(exc_info.value).lower()
+
+
+@requires_vllm_compat
+def test_invalid_temperature_raises_bad_request(openai_client):
+    """Verify propagation of the backend's sampling-temperature validation."""
+    with pytest.raises(BadRequestError) as exc_info:
+        openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Hello",
+            temperature=-1.0,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "temperature" in str(exc_info.value).lower()
+
+
+@requires_vllm_compat
+def test_invalid_tool_choice_raises_bad_request(openai_client):
+    """Verify the invalid tool_choice error scenario."""
+    with pytest.raises(BadRequestError) as exc_info:
+        openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Hello",
+            tools=[
+                {
+                    "type": "function",
+                    "name": "test_tool",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_choice="invalid_choice",
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "tool_choice" in str(exc_info.value).lower()
+
+
+# ---------------------------------------------------------------------------
+# openai_file_resolve outbound-chain (fully stubbed upstreams; no vLLM/OGX)
+# ---------------------------------------------------------------------------
+
+FILE_RESOLVE_CONFIG_PATH = "examples/configs/openai/responses/file-resolve.yaml"
+_FILE_RESOLVE_CONTENT = b"Hello, world!"
+_FILE_RESOLVE_B64 = "SGVsbG8sIHdvcmxkIQ=="  # base64("Hello, world!")
+_FILE_RESOLVE_ID = "test-file-123"
+_FILE_RESOLVE_METADATA = json.dumps(
+    {
+        "id": _FILE_RESOLVE_ID,
+        "object": "file",
+        "bytes": len(_FILE_RESOLVE_CONTENT),
+        "created_at": 1750000000,
+        "filename": "test.txt",
+        "purpose": "user_data",
+    }
+).encode()
+
+# Minimal Responses object the OpenAI SDK can deserialize, so the stubbed
+# inference backend can stand in for vLLM. Shape mirrors
+# fixtures/inference/recordings/vllm/responses/native-basic-nonstream.json.
+_FILE_RESOLVE_STUB_RESPONSE = {
+    "id": "resp_file_resolve_stub",
+    "object": "response",
+    "created_at": 0,
+    "model": "gpt-4.1",
+    "status": "completed",
+    "error": None,
+    "incomplete_details": None,
+    "instructions": None,
+    "max_output_tokens": None,
+    "metadata": {},
+    "parallel_tool_calls": True,
+    "previous_response_id": None,
+    "temperature": 1.0,
+    "tool_choice": "none",
+    "tools": [],
+    "top_p": 1.0,
+    "output": [
+        {
+            "id": "msg_file_resolve_stub",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+        }
+    ],
+    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+}
+
+
+class _FilesApiStubHandler(BaseHTTPRequestHandler):
+    """Files API stub for `file_id` callouts.
+
+    Answers metadata and content only when the outbound chain stamped
+    ``x-file-callout: file-resolve`` on the callout, so a resolved file proves
+    the bound outbound pipeline executed.
+    """
+
+    callout_headers: ClassVar[list[str | None]] = []
+
+    def do_GET(self):
+        header = self.headers.get("x-file-callout")
+        type(self).callout_headers.append(header)
+        if header != "file-resolve":
+            self.send_response(403)
+            self.end_headers()
+            return
+        if self.path == f"/v1/files/{_FILE_RESOLVE_ID}/content":
+            body, ctype = _FILE_RESOLVE_CONTENT, "text/plain"
+        elif self.path == f"/v1/files/{_FILE_RESOLVE_ID}":
+            body, ctype = _FILE_RESOLVE_METADATA, "application/json"
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class _FileUrlStubHandler(BaseHTTPRequestHandler):
+    """Client-controlled `file_url` stub.
+
+    Serves content only when the outbound-chain header is ABSENT, proving the
+    credentialed outbound chain never runs for client-supplied URLs.
+    """
+
+    def do_GET(self):
+        if self.headers.get("x-file-callout") is not None:
+            self.send_response(403)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(_FILE_RESOLVE_CONTENT)))
+        self.end_headers()
+        self.wfile.write(_FILE_RESOLVE_CONTENT)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class _FileResolveBackendHandler(BaseHTTPRequestHandler):
+    """Capturing inference backend: records the forwarded Responses body."""
+
+    captured: ClassVar[list[dict]] = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        try:
+            type(self).captured.append(json.loads(body))
+        except json.JSONDecodeError:
+            pass
+        payload = json.dumps(_FILE_RESOLVE_STUB_RESPONSE).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def _write_file_resolve_config(
+    praxis_port: int,
+    files_port: int,
+    backend_port: int,
+    default_port: int,
+    file_url_port: int,
+) -> str:
+    """Patch the shipped file-resolve example for stubbed upstreams."""
+    with open(FILE_RESOLVE_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    # files_api_url and the files-api cluster endpoint both use :9999.
+    config = config.replace("127.0.0.1:9999", f"127.0.0.1:{files_port}")
+    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
+    config = config.replace("127.0.0.1:3002", f"127.0.0.1:{default_port}")
+    # Allow the loopback file_url stub so the client-URL branch resolves
+    # without traversing the credentialed outbound chain.
+    config = config.replace(
+        "        file_url: resolve",
+        "        file_url: resolve\n"
+        "        allowed_file_url_origins:\n"
+        f'          - "http://127.0.0.1:{file_url_port}"',
+    )
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+@pytest.fixture()
+def file_resolve_stub_env(tmp_path_factory, request):
+    """Function-scoped file-resolve proxy with fully stubbed upstreams.
+
+    Needs only the compiled binary — no vLLM and no OGX — so it exercises the
+    ``openai_file_resolve`` outbound-chain flow through the OpenAI SDK. Yields
+    ``(client, files_stub, backend, file_url)``.
+    """
+    _FilesApiStubHandler.callout_headers = []
+    _FileResolveBackendHandler.captured = []
+
+    files_port = _free_port()
+    backend_port = _free_port()
+    default_port = _free_port()
+    file_url_port = _free_port()
+
+    servers = [
+        HTTPServer(("127.0.0.1", files_port), _FilesApiStubHandler),
+        HTTPServer(("127.0.0.1", backend_port), _FileResolveBackendHandler),
+        HTTPServer(("127.0.0.1", file_url_port), _FileUrlStubHandler),
+    ]
+    for server in servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    port = _free_port()
+    log_dir = tmp_path_factory.mktemp("file-resolve-stub")
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    config_path = _write_file_resolve_config(
+        port, files_port, backend_port, default_port, file_url_port
+    )
+    started = False
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        client = OpenAI(
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="test",
+            max_retries=0,
+            timeout=60,
+        )
+        yield (
+            client,
+            _FilesApiStubHandler,
+            _FileResolveBackendHandler,
+            f"http://127.0.0.1:{file_url_port}/document.txt",
+        )
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        for server in servers:
+            server.shutdown()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== File-resolve Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+class TestFileResolveOutboundChain:
+    """SDK coverage for the openai_file_resolve outbound-chain callout."""
+
+    def test_file_id_resolved_via_outbound_chain_not_file_url(
+        self, file_resolve_stub_env
+    ):
+        """SDK analogue of the Rust functional test
+        ``example_config_outbound_chain_runs_for_file_id_not_file_url``.
+
+        One request carries both a ``file_id`` and a client ``file_url``. The
+        Files API stub answers only when the outbound chain stamped
+        ``x-file-callout``; the ``file_url`` stub answers only when it did not.
+        A single completed response with both parts inlined therefore proves the
+        credentialed outbound chain ran for the ``file_id`` callout but never for
+        the client-controlled ``file_url`` download.
+        """
+        client, files_stub, backend, file_url = file_resolve_stub_env
+
+        response = client.responses.create(
+            model="gpt-4.1",
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_file", "file_id": _FILE_RESOLVE_ID},
+                        {"type": "input_file", "file_url": file_url},
+                        {"type": "input_text", "text": "summarize"},
+                    ],
+                }
+            ],
+            store=False,
+        )
+
+        assert response.status == "completed"
+        assert len(backend.captured) == 1, backend.captured
+        content = backend.captured[0]["input"][0]["content"]
+
+        # file_id inlined as raw base64 file_data (the outbound chain ran).
+        assert content[0]["file_data"] == _FILE_RESOLVE_B64, content
+        assert "file_id" not in content[0], content
+
+        # file_url inlined as a data URI (the outbound chain did NOT run for it).
+        assert content[1]["file_data"] == (
+            f"data:text/plain;base64,{_FILE_RESOLVE_B64}"
+        ), content
+
+        # Every Files API callout carried the outbound-chain marker header.
+        assert files_stub.callout_headers, "Files API stub should receive callouts"
+        assert all(h == "file-resolve" for h in files_stub.callout_headers), (
+            files_stub.callout_headers
         )
 
 

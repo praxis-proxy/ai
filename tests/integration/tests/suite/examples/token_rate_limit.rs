@@ -7,7 +7,8 @@
 //! (`00121_token-rate-limiting.md` in `praxis-proxy/enhancements`, epic
 //! `ai#121`): reservation-based admission, 429 rejection with
 //! token-denominated headers, and reconciliation against actual
-//! provider-reported usage (`token_count`'s `token.total`) once the
+//! provider-reported usage (`token_count`'s typed `token.*` metadata,
+//! weighted per M4, falling back to `token.total`) once the
 //! response completes.
 //!
 //! `mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas`
@@ -19,6 +20,10 @@
 
 use std::collections::HashMap;
 
+#[cfg(feature = "basic-auth-filter")]
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+#[cfg(feature = "basic-auth-filter")]
+use praxis_test_utils::StatefulCapturingBackend;
 use praxis_test_utils::{
     Backend, example_config_path, free_port, http_send, json_post, load_example_config, parse_body, parse_header,
     parse_status, patch_yaml, start_proxy,
@@ -51,6 +56,11 @@ fn json_post_with_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> S
 /// OpenAI-shaped response reporting 10 total tokens used.
 const OPENAI_LOW_USAGE_JSON: &str =
     r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":5,"total_tokens":10}}"#;
+
+/// OpenAI-shaped response with a 90% prompt-cache hit: 1000 input (900
+/// cached) + 50 output. Unweighted `token.total` is 1050; with the
+/// example's `cached_input: 0.1` the partitioned cost is 240.
+const OPENAI_CACHED_USAGE_JSON: &str = r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050,"prompt_tokens_details":{"cached_tokens":900}}}"#;
 
 /// Plain-text response with no token usage: `token_count` extracts
 /// nothing, so `token_rate_limit`'s reservation is never reconciled.
@@ -175,6 +185,32 @@ fn reconciliation_frees_budget_for_next_request_after_low_actual_usage() {
         parse_status(&third),
         429,
         "after two admissions the bucket should be down to 10 remaining, rejecting a third 40-token request"
+    );
+}
+
+#[test]
+fn reconciliation_applies_cached_input_weight_from_the_example_config() {
+    let backend = Backend::fixed(OPENAI_CACHED_USAGE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    // capacity=1000, estimate=500. Cached usage weights to 240
+    // (100 uncached + 900*0.1 + 50 output), so each request nets 240
+    // against the window. Unweighted token.total=1050 would overshoot
+    // on the first reconcile and deny the second 500-token reserve.
+    //   first:  reserve 500, reconcile to 240 → 760 remain  [200]
+    //   second: reserve 500 (760>=500)                       [200]
+    let config = token_rate_limit_config(proxy_port, backend.port(), 1000, 500);
+    let proxy = start_proxy(&config);
+
+    let first = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(parse_status(&first), 200, "first cached request should be admitted");
+
+    let second = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&second),
+        200,
+        "weighted cache cost 240 of 1000 must leave room for a second 500-token reservation"
     );
 }
 
@@ -394,5 +430,297 @@ fn mixed_algorithm_rules_valkey_backend_isolates_budgets_across_gateway_replicas
         parse_status(&beta_second),
         429,
         "team-beta's exhausted token-bucket budget must be visible on replica two via shared Valkey state"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Basic Auth + authenticated-subject qualification (Praxis 0.5.5)
+// -----------------------------------------------------------------------------
+
+/// Build a request with Basic Auth and optional caller-controlled headers.
+/// The password is kept local to request construction and is never included
+/// in assertion messages or diagnostics.
+#[cfg(feature = "basic-auth-filter")]
+fn basic_auth_json_post(
+    path: &str,
+    body: &str,
+    username: &str,
+    password: &str,
+    extra_headers: &[(&str, &str)],
+) -> String {
+    let credentials = STANDARD.encode(format!("{username}:{password}"));
+    let mut headers = format!("Authorization: Basic {credentials}\r\n");
+    for (name, value) in extra_headers {
+        headers.push_str(&format!("{name}: {value}\r\n"));
+    }
+    format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         {headers}\
+         Connection: close\r\n\r\n\
+         {body}",
+        body.len()
+    )
+}
+
+/// Derive test-only credentials from runtime-only identifiers. The values
+/// never appear in diagnostics or source as hard-coded password literals.
+#[cfg(feature = "basic-auth-filter")]
+fn test_credential(nonce: u16) -> String {
+    format!("{:x}-{:x}", std::process::id(), nonce)
+}
+
+/// Build a pipeline in which Basic Auth publishes the verified subject before
+/// token-rate-limit admission. The optional `key` line deliberately lets the
+/// global-default regression test omit it entirely.
+#[cfg(feature = "basic-auth-filter")]
+fn authenticated_quota_config(
+    proxy_port: u16,
+    backend_port: u16,
+    key: Option<&str>,
+    backend: Option<(&str, &str)>,
+    subject_credentials: (&str, &str),
+) -> String {
+    let (subject_a_credential, subject_b_credential) = subject_credentials;
+    let key_line = key.map_or_else(String::new, |value| format!("        key: {value}\n"));
+    let backend_block = backend.map_or_else(String::new, |(url, namespace)| {
+        format!(
+            "        backend:\n\
+             \x20         kind: valkey\n\
+             \x20         url: \"{url}\"\n\
+             \x20         namespace: \"{namespace}\"\n"
+        )
+    });
+    format!(
+        "listeners:\n\
+         \x20 - name: default\n\
+         \x20   address: \"127.0.0.1:{proxy_port}\"\n\
+         \x20   filter_chains: [main]\n\
+         filter_chains:\n\
+         \x20 - name: main\n\
+         \x20   filters:\n\
+         \x20     - filter: basic_auth\n\
+         \x20       strip_authorization: true\n\
+         \x20       credentials:\n\
+         \x20         - username: subject-a\n\
+         \x20           password: {subject_a_credential}\n\
+         \x20         - username: subject-b\n\
+         \x20           password: {subject_b_credential}\n\
+         \x20     - filter: token_rate_limit\n\
+         {key_line}{backend_block}\
+         \x20       rules:\n\
+         \x20         - name: subject-budget\n\
+         \x20           algorithm: sliding_window\n\
+         \x20           window: 1h\n\
+         \x20           capacity: 30\n\
+         \x20           reserved_tokens: 20\n\
+         \x20     - filter: router\n\
+         \x20       routes:\n\
+         \x20         - path: \"/v1/chat/completions\"\n\
+         \x20           cluster: backend\n\
+         \x20     - filter: token_count\n\
+         \x20       provider: openai\n\
+         \x20     - filter: access_log\n\
+         \x20     - filter: load_balancer\n\
+         \x20       clusters:\n\
+         \x20         - name: backend\n\
+         \x20           endpoints:\n\
+         \x20             - \"127.0.0.1:{backend_port}\"\n\
+         insecure_options:\n\
+         \x20 allow_private_endpoints: true\n"
+    )
+}
+
+/// Qualifies the released Praxis Basic Auth identity producer with the
+/// authenticated-subject quota consumer across two independent gateway
+/// replicas sharing one Valkey namespace.
+///
+/// Each provider response reports 10 tokens while admission reserves 20.
+/// Subject A therefore admits on both replicas (settlement must refund 10),
+/// exhausts after the second settled request, and subject B remains
+/// independent. Rejected requests are checked against provider captures so
+/// they are proven not to route or contact the provider.
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn authenticated_subject_valkey_backend_isolates_budgets_across_gateway_replicas() {
+    let Ok(valkey_url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        eprintln!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-it-authenticated-subject-{}", std::process::id());
+
+    let backend_one =
+        StatefulCapturingBackend::new(vec![(200, OPENAI_LOW_USAGE_JSON.to_owned()); 1]).start_with_shutdown();
+    let backend_two =
+        StatefulCapturingBackend::new(vec![(200, OPENAI_LOW_USAGE_JSON.to_owned()); 2]).start_with_shutdown();
+
+    let proxy_one_port = free_port();
+    let proxy_two_port = free_port();
+    let subject_a_credential = test_credential(proxy_one_port);
+    let subject_b_credential = test_credential(proxy_two_port);
+    let config_one = praxis_core::config::Config::from_yaml(&authenticated_quota_config(
+        proxy_one_port,
+        backend_one.port(),
+        Some("authenticated_subject"),
+        Some((&valkey_url, &namespace)),
+        (&subject_a_credential, &subject_b_credential),
+    ))
+    .expect("authenticated-subject config should parse");
+    let proxy_one = start_proxy(&config_one);
+
+    let config_two = praxis_core::config::Config::from_yaml(&authenticated_quota_config(
+        proxy_two_port,
+        backend_two.port(),
+        Some("authenticated_subject"),
+        Some((&valkey_url, &namespace)),
+        (&subject_a_credential, &subject_b_credential),
+    ))
+    .expect("authenticated-subject config should parse");
+    let proxy_two = start_proxy(&config_two);
+
+    let missing = http_send(proxy_one.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(parse_status(&missing), 401, "missing Basic Auth must fail closed");
+    assert_eq!(
+        backend_one.requests().len(),
+        0,
+        "missing credentials must not contact the provider"
+    );
+
+    let invalid = http_send(
+        proxy_two.addr(),
+        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", &subject_b_credential, &[]),
+    );
+    assert_eq!(parse_status(&invalid), 401, "invalid Basic Auth must fail closed");
+    assert_eq!(
+        backend_two.requests().len(),
+        0,
+        "invalid credentials must not contact the provider"
+    );
+
+    let subject_a_first = http_send(
+        proxy_one.addr(),
+        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", &subject_a_credential, &[]),
+    );
+    assert_eq!(
+        parse_status(&subject_a_first),
+        200,
+        "valid subject A request should be admitted"
+    );
+    assert_eq!(
+        backend_one.requests().len(),
+        1,
+        "admitted subject A request should contact the provider once"
+    );
+    assert!(
+        !backend_one.requests()[0]
+            .headers
+            .to_ascii_lowercase()
+            .contains("authorization:"),
+        "Basic Auth must be stripped before provider contact"
+    );
+
+    let subject_a_second_request =
+        basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", &subject_a_credential, &[]);
+    let mut subject_a_second = String::new();
+    for _ in 0..40 {
+        subject_a_second = http_send(proxy_two.addr(), &subject_a_second_request);
+        if parse_status(&subject_a_second) == 200 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(
+        parse_status(&subject_a_second),
+        200,
+        "subject A should be admitted on replica two after the first reservation settles at 10 tokens"
+    );
+    assert_eq!(
+        backend_two.requests().len(),
+        1,
+        "second admitted request should contact the provider once"
+    );
+
+    let subject_a_exhausted = http_send(
+        proxy_one.addr(),
+        &basic_auth_json_post(
+            "/v1/chat/completions",
+            "{}",
+            "subject-a",
+            &subject_a_credential,
+            &[("x-authenticated-subject", "subject-b")],
+        ),
+    );
+    assert_eq!(
+        parse_status(&subject_a_exhausted),
+        429,
+        "exhausted subject A must be rejected before routing even when a caller supplies a subject header"
+    );
+    assert_eq!(
+        backend_one.requests().len(),
+        1,
+        "quota rejection must not contact the provider"
+    );
+
+    let subject_b_first = http_send(
+        proxy_two.addr(),
+        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-b", &subject_b_credential, &[]),
+    );
+    assert_eq!(
+        parse_status(&subject_b_first),
+        200,
+        "subject B must receive an independent quota bucket"
+    );
+    assert_eq!(
+        backend_two.requests().len(),
+        2,
+        "independent subject B admission should contact the provider once"
+    );
+}
+
+/// Confirms that omitting `key` retains the historical global bucket: two
+/// authenticated subjects still consume the same budget, while the request
+/// that is denied never reaches the provider.
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn global_key_remains_the_default_with_basic_auth() {
+    let backend = StatefulCapturingBackend::new(vec![(200, PLAIN_TEXT_BODY.to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let subject_a_credential = test_credential(proxy_port);
+    let subject_b_credential = test_credential(backend.port());
+    let config = praxis_core::config::Config::from_yaml(&authenticated_quota_config(
+        proxy_port,
+        backend.port(),
+        None,
+        None,
+        (&subject_a_credential, &subject_b_credential),
+    ))
+    .expect("global-default config should parse");
+    let proxy = start_proxy(&config);
+
+    let subject_a = http_send(
+        proxy.addr(),
+        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-a", &subject_a_credential, &[]),
+    );
+    assert_eq!(
+        parse_status(&subject_a),
+        200,
+        "first global-bucket request should be admitted"
+    );
+
+    let subject_b = http_send(
+        proxy.addr(),
+        &basic_auth_json_post("/v1/chat/completions", "{}", "subject-b", &subject_b_credential, &[]),
+    );
+    assert_eq!(
+        parse_status(&subject_b),
+        429,
+        "second subject must share the default global bucket"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        1,
+        "global quota rejection must not contact the provider"
     );
 }

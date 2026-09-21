@@ -12,8 +12,17 @@ on:
       - "apis/src/openai/responses/store/**"
       - "apis/src/openai/conversations/**"
       - "examples/configs/openai/responses/response-store.yaml"
+      - "examples/configs/openai/responses/response-store-postgres-mtls.yaml"
+      - "examples/configs/openai/conversations/conversations-postgres-mtls.yaml"
+      - "apis/Cargo.toml"
+      - "filters/Cargo.toml"
+      - "server/Cargo.toml"
+      - "tests/integration/Cargo.toml"
+      - "tests/utils/Cargo.toml"
       - "tests/utils/src/net/postgres.rs"
       - "tests/integration/tests/suite/examples/openai_response_store_postgres.rs"
+      - "tests/integration/tests/suite/examples/openai_response_store_postgres_mtls.rs"
+      - "tests/integration/tests/suite/examples/openai_conversations_postgres_mtls.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Makefile"
@@ -26,8 +35,17 @@ on:
       - "apis/src/openai/responses/store/**"
       - "apis/src/openai/conversations/**"
       - "examples/configs/openai/responses/response-store.yaml"
+      - "examples/configs/openai/responses/response-store-postgres-mtls.yaml"
+      - "examples/configs/openai/conversations/conversations-postgres-mtls.yaml"
+      - "apis/Cargo.toml"
+      - "filters/Cargo.toml"
+      - "server/Cargo.toml"
+      - "tests/integration/Cargo.toml"
+      - "tests/utils/Cargo.toml"
       - "tests/utils/src/net/postgres.rs"
       - "tests/integration/tests/suite/examples/openai_response_store_postgres.rs"
+      - "tests/integration/tests/suite/examples/openai_response_store_postgres_mtls.rs"
+      - "tests/integration/tests/suite/examples/openai_conversations_postgres_mtls.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Makefile"
@@ -79,8 +97,17 @@ jobs:
             'apis/src/openai/responses/store/' \
             'apis/src/openai/conversations/' \
             'examples/configs/openai/responses/response-store.yaml' \
+            'examples/configs/openai/responses/response-store-postgres-mtls.yaml' \
+            'examples/configs/openai/conversations/conversations-postgres-mtls.yaml' \
+            'apis/Cargo.toml' \
+            'filters/Cargo.toml' \
+            'server/Cargo.toml' \
+            'tests/integration/Cargo.toml' \
+            'tests/utils/Cargo.toml' \
             'tests/utils/src/net/postgres.rs' \
             'tests/integration/tests/suite/examples/openai_response_store_postgres.rs' \
+            'tests/integration/tests/suite/examples/openai_response_store_postgres_mtls.rs' \
+            'tests/integration/tests/suite/examples/openai_conversations_postgres_mtls.rs' \
             'Cargo.toml' \
             'Cargo.lock' \
             'Makefile' \

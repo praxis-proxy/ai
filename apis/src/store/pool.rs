@@ -8,11 +8,25 @@ use std::time::Duration;
 use serde::Deserialize;
 use sqlx::{Database, pool::PoolOptions};
 
+/// sqlx's implicit `max_connections` when the option is left unset.
+///
+/// Mirrors [`sqlx::pool::PoolOptions::new`], which starts every pool at
+/// 10. Validation reasons about this *effective* maximum so a
+/// `min_connections` above it is rejected even when `max_connections`
+/// is omitted — otherwise the runtime could never reach the requested
+/// prewarmed minimum.
+const DEFAULT_MAX_CONNECTIONS: u32 = 10;
+
 /// Connection pool tuning options for store backends.
 ///
 /// All fields are optional. When omitted, the sqlx defaults apply:
 /// `max_connections = 10`, `min_connections = 0`,
 /// `idle_timeout = 600s (10 min)`, `acquire_timeout = 30s`.
+///
+/// `min_connections` must not exceed the *effective* maximum: the
+/// explicit `max_connections` when set, otherwise the sqlx default of
+/// 10. Requesting a larger minimum without also raising
+/// `max_connections` is rejected at config load.
 ///
 /// # YAML
 ///
@@ -59,12 +73,21 @@ impl PoolConfig {
                     .into(),
             );
         }
-        if let (Some(min), Some(max)) = (self.min_connections, self.max_connections)
-            && min > max
-        {
-            return Err(format!(
-                "pool.min_connections ({min}) must not exceed pool.max_connections ({max})"
-            ));
+        if let Some(min) = self.min_connections {
+            match self.max_connections {
+                Some(max) if min > max => {
+                    return Err(format!(
+                        "pool.min_connections ({min}) must not exceed pool.max_connections ({max})"
+                    ));
+                },
+                None if min > DEFAULT_MAX_CONNECTIONS => {
+                    return Err(format!(
+                        "pool.min_connections ({min}) must not exceed the default pool.max_connections \
+                         ({DEFAULT_MAX_CONNECTIONS}); set pool.max_connections explicitly to raise the maximum"
+                    ));
+                },
+                _ => {},
+            }
         }
         Ok(())
     }
@@ -268,6 +291,77 @@ acquire_timeout_secs: 30
             ..PoolConfig::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_min_exceeds_implicit_default_max() {
+        // Regression: with no explicit max, the effective maximum stays
+        // at the sqlx default of 10, so a larger minimum is unreachable.
+        let cfg = PoolConfig {
+            min_connections: Some(20),
+            ..PoolConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("min_connections"), "{err}");
+        assert!(err.contains("default"), "{err}");
+        assert!(err.contains(&DEFAULT_MAX_CONNECTIONS.to_string()), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_min_equals_implicit_default_max() {
+        let cfg = PoolConfig {
+            min_connections: Some(DEFAULT_MAX_CONNECTIONS),
+            ..PoolConfig::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "min_connections equal to the implicit default max ({DEFAULT_MAX_CONNECTIONS}) should be accepted"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_min_below_implicit_default_max() {
+        let cfg = PoolConfig {
+            min_connections: Some(5),
+            ..PoolConfig::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "min_connections below the implicit default max ({DEFAULT_MAX_CONNECTIONS}) should be accepted"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_min_above_default_when_max_explicit() {
+        // An explicit max above the default lifts the ceiling, so a
+        // minimum that would be rejected against the default is fine.
+        let cfg = PoolConfig {
+            min_connections: Some(20),
+            max_connections: Some(30),
+            ..PoolConfig::default()
+        };
+        assert!(
+            cfg.validate().is_ok(),
+            "min_connections above the default is valid when an explicit larger max is set"
+        );
+    }
+
+    // The min-vs-implicit-max check hinges on `DEFAULT_MAX_CONNECTIONS`
+    // equaling sqlx's actual default. sqlx documents that value only as
+    // "see the source", so a future bump could change it silently and
+    // re-open the issue this validation closes — pin it here. Uses
+    // whichever driver is compiled (both share the generic default).
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[test]
+    fn default_max_connections_matches_sqlx_default() {
+        #[cfg(feature = "store-postgres")]
+        let sqlx_default = sqlx::postgres::PgPoolOptions::new().get_max_connections();
+        #[cfg(all(feature = "store-sqlite", not(feature = "store-postgres")))]
+        let sqlx_default = sqlx::sqlite::SqlitePoolOptions::new().get_max_connections();
+        assert_eq!(
+            sqlx_default, DEFAULT_MAX_CONNECTIONS,
+            "sqlx default max_connections drifted from DEFAULT_MAX_CONNECTIONS; re-verify the issue #1253 fix"
+        );
     }
 
     #[test]

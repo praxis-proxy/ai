@@ -1,0 +1,74 @@
+# Response Store — PostgreSQL with certificate authentication
+#
+# Persists non-streaming Responses API responses to PostgreSQL over a
+# TLS-verified connection that authenticates with a client certificate
+# instead of a password. This is the compliance-oriented profile: it
+# keeps application-side password cryptography (SCRAM-SHA-256 / MD5) off
+# the connection path entirely.
+#
+# Cryptographic boundary:
+#   TLS transport and client-certificate authentication run inside the
+#   platform TLS library that sqlx links through the `tls-native-tls`
+#   feature (OpenSSL on Linux, Security.framework on macOS). Password
+#   authentication would instead run application-side RustCrypto
+#   primitives; `require_certificate_authentication` fails closed before
+#   serving traffic if any client-visible password path (a password in
+#   `database_url`, TLS parameters in `database_url`, or the `PGPASSWORD`
+#   environment variable) remains open.
+#
+# Server-side requirement (NOT enforceable by the proxy):
+#   PostgreSQL selects the authentication method via `pg_hba.conf`, which
+#   it delivers after the TLS handshake. The server MUST use a `cert`
+#   rule so it never issues a password challenge, and the client
+#   certificate's Common Name must map to the database role:
+#
+#     # TYPE  DATABASE  USER  ADDRESS      METHOD
+#     hostssl all       all   0.0.0.0/0    cert
+#     hostssl all       all   ::/0         cert
+#
+#   With only `hostssl ... cert` rules for TCP, any non-TLS connection
+#   and any TLS connection lacking a valid client certificate is refused.
+#   Operators must verify this out of band; see the cryptographic
+#   boundary architecture doc for a complete sample.
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [responses-pipeline]
+
+filter_chains:
+  - name: responses-pipeline
+    filters:
+      - filter: openai_responses_format
+
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
+      - filter: openai_response_store
+        backend: postgres
+        # No password: the client authenticates with a certificate.
+        database_url: "postgres://praxis@db.internal:5432/praxis"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+        allow_private_database_url: true # required for DNS / private DB targets
+        # Certificate-authentication compliance profile.
+        ssl_mode: verify-full
+        ssl_root_cert: /etc/praxis/pki/ca.crt
+        ssl_client_cert: /etc/praxis/pki/client.crt
+        ssl_client_key: /etc/praxis/pki/client.key # unencrypted PKCS#8 (not SEC1), mode 0600
+        require_certificate_authentication: true
+
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            cluster: "inference-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:8000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

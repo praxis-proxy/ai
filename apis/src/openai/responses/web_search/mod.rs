@@ -32,13 +32,13 @@
 )]
 mod tests;
 
-use std::mem;
+use std::{mem, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES,
-    parse_filter_config,
+    BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
+    HttpFilterContext, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
@@ -47,8 +47,8 @@ use super::state::{
     ResponsesState, consumed_builtin_tool_calls_before_current_round, current_round_tool_call_admissions,
 };
 use crate::web_search::{
-    OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, SearchResult,
-    build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
+    CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
+    SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
 };
 
 // -----------------------------------------------------------------------------
@@ -99,6 +99,13 @@ struct PendingSearchBatch<'a> {
 /// executes them on re-entry via the `iterative_request_router`
 /// agentic loop.
 ///
+/// Each provider request is executed through the shared filtered-subrequest
+/// executor, which enforces destination authority, DNS/SSRF, TLS/SNI, and
+/// `Host` centrally. An optional `outbound_chain` runs operator-managed
+/// cross-cutting filters (headers, credentials, logging) on the callout; when
+/// omitted it defaults to an empty inline chain (pure passthrough), so the
+/// central protections still apply.
+///
 /// # YAML
 ///
 /// ```yaml
@@ -113,6 +120,7 @@ struct PendingSearchBatch<'a> {
 /// filter: openai_web_search
 /// provider: brave
 /// api_key: ${WEB_SEARCH_API_KEY}
+/// outbound_chain: web_search_outbound
 /// default_context_size: medium
 /// timeout_ms: 10000
 /// max_calls_per_round: 32
@@ -124,55 +132,84 @@ pub struct WebSearchFilter {
     default_context_size: SearchContextSize,
     /// Maximum calls accepted from one model response.
     max_calls_per_round: usize,
+    /// Prebuilt outbound filter chain each provider request executes through.
+    outbound: Arc<FilterPipeline>,
 }
 
 impl WebSearchFilter {
-    /// Create a filter from parsed YAML config.
+    /// Create a filter, binding its configured outbound chain through `ctx`.
     ///
-    /// Uses an isolated [`SubRequestClient`] with a default pool
-    /// size of 4. Prefer [`from_config_with_client`] when a shared
-    /// client is available.
+    /// Uses an isolated [`SubRequestClient`] with a default pool size of 4.
+    /// Prefer [`from_chain_binding_with_client`] when a shared client is
+    /// available.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the YAML config is invalid or the
-    /// search client cannot be constructed.
+    /// Returns [`FilterError`] if the YAML config is invalid, the outbound
+    /// chain cannot be bound, or the search client cannot be constructed.
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-    /// [`from_config_with_client`]: Self::from_config_with_client
-    pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+    /// [`from_chain_binding_with_client`]: Self::from_chain_binding_with_client
+    pub fn from_chain_binding(
+        config: &serde_yaml::Value,
+        ctx: &ChainBindingContext<'_>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let client =
             crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
-        Self::build(config, client)
+        Self::build(config, client, ctx)
     }
 
-    /// Create a filter using the shared [`SubRequestClient`].
+    /// Create a filter using the shared [`SubRequestClient`], binding its
+    /// configured outbound chain through `ctx`.
     ///
-    /// The shared client inherits the server-level pool size and
-    /// connection limits from the runtime configuration.
+    /// The shared client inherits the server-level pool size and connection
+    /// limits from the runtime configuration.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the YAML config is invalid or the
-    /// search client cannot be constructed.
+    /// Returns [`FilterError`] if the YAML config is invalid, the outbound
+    /// chain cannot be bound, or the search client cannot be constructed.
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-    pub fn from_config_with_client(
+    pub fn from_chain_binding_with_client(
         config: &serde_yaml::Value,
         client: crate::subrequest::SubRequestClient,
+        ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        Self::build(config, client)
+        Self::build(config, client, ctx)
     }
 
-    /// Shared constructor body for [`from_config`](Self::from_config) and
-    /// [`from_config_with_client`](Self::from_config_with_client).
+    /// Shared constructor body: parse config, bind the outbound chain, and
+    /// assemble the filter.
+    ///
+    /// The outbound chain is bound once here via
+    /// [`ChainBindingContext::bind_chain`], so a chain that cannot be resolved
+    /// or built fails the pipeline build rather than a request.
     fn build(
         config: &serde_yaml::Value,
         subrequest_client: crate::subrequest::SubRequestClient,
+        ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search", config)?;
+        // Bind the operator-configured outbound chain before `into_shared`
+        // consumes `cfg`. A `Named` reference resolves against the top-level
+        // `filter_chains` map; an `Inline` reference embeds directly. The
+        // executor seeds and re-pins `filter_ctx.upstream` from the
+        // `StagedUpstream` the search client stages, so the chain needs no
+        // upstream-selecting filter of its own.
+        let outbound = Arc::new(ctx.bind_chain(&cfg.outbound_chain)?);
+        Self::assemble(cfg, subrequest_client, outbound)
+    }
+
+    /// Validate the parsed config and assemble the filter around an
+    /// already-bound outbound pipeline.
+    fn assemble(
+        cfg: OpenAiWebSearchConfig,
+        subrequest_client: crate::subrequest::SubRequestClient,
+        outbound: Arc<FilterPipeline>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
         if cfg.max_calls_per_round == 0 || cfg.max_calls_per_round > MAX_CALLS_PER_ROUND {
             return Err(
                 format!("openai_web_search: max_calls_per_round must be between 1 and {MAX_CALLS_PER_ROUND}").into(),
@@ -185,7 +222,43 @@ impl WebSearchFilter {
             search_client,
             default_context_size: validated.default_context_size,
             max_calls_per_round,
+            outbound,
         }))
+    }
+
+    /// Test-only convenience constructor binding a minimal outbound chain.
+    ///
+    /// Production registers `openai_web_search` as a chain-binding filter and
+    /// supplies the operator-configured outbound chain (see
+    /// [`from_chain_binding`](Self::from_chain_binding)); unit tests that only
+    /// exercise dispatch logic bind a minimal builtin-only chain, since the
+    /// [`FilteredSubrequestExecutor`] seeds the upstream from the search
+    /// client's `StagedUpstream` and still enforces destination authority,
+    /// DNS/SSRF, TLS/SNI, and `Host` centrally.
+    ///
+    /// [`FilteredSubrequestExecutor`]: praxis_filter::FilteredSubrequestExecutor
+    #[cfg(test)]
+    fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client =
+            crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+        Self::from_config_with_client(config, client)
+    }
+
+    /// Test-only convenience constructor (shared client, minimal outbound chain).
+    ///
+    /// See [`from_config`](Self::from_config).
+    #[cfg(test)]
+    fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: crate::subrequest::SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        // `outbound_chain` is optional, so fixtures that omit it parse via the
+        // default. Bind a minimal builtin-only pipeline for tests (the executor
+        // still enforces SSRF/TLS/Host regardless of chain contents); private
+        // upstreams are permitted so tests can dial loopback mocks.
+        let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search", config)?;
+        let outbound = crate::web_search::test_outbound_pipeline()?;
+        Self::assemble(cfg, client, Arc::new(outbound))
     }
 
     /// Execute a single web search call and append its outcome to state.
@@ -223,7 +296,15 @@ impl WebSearchFilter {
 
         let bridge = bridge_call_id(call_id, query, index);
         let ids = SearchCallIds::new(call_id, &bridge, index);
-        match self.search_client.search(query, Some(context_size)).await {
+        // Capture the originating client's attributes and current outbound depth
+        // so the callout's outbound chain sees the real caller and the executor
+        // continues this request's depth accounting instead of resetting to zero.
+        let callout = CalloutContext::from_filter_context(ctx);
+        match self
+            .search_client
+            .search(&self.outbound, callout, query, Some(context_size))
+            .await
+        {
             SearchOutcome::Results(results) => append_result(ctx, &ids, "completed", query, &results),
             SearchOutcome::Failed => {
                 warn!(
@@ -282,6 +363,25 @@ impl WebSearchFilter {
 impl HttpFilter for WebSearchFilter {
     fn name(&self) -> &'static str {
         "openai_web_search"
+    }
+
+    fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
+        if let Some(pipeline) = Arc::get_mut(&mut self.outbound) {
+            visitor(pipeline);
+        } else {
+            debug_assert!(
+                false,
+                "openai_web_search outbound pipeline must be uniquely owned during configuration"
+            );
+        }
+    }
+
+    fn referenced_files(&self) -> Vec<std::path::PathBuf> {
+        self.outbound.referenced_files()
+    }
+
+    fn apply_insecure_options(&self, options: &praxis_core::config::InsecureOptions) {
+        self.outbound.apply_insecure_options(options);
     }
 
     fn request_body_access(&self) -> BodyAccess {

@@ -8,6 +8,15 @@ readme = "../../README.md"
 publish = false
 
 [features]
+default = ["store-postgres"]
+store-postgres = [
+    "praxis-ai-proxy/store-postgres",
+    "praxis-test-utils/store-postgres",
+    "sqlx/postgres",
+    "sqlx/tls-native-tls",
+]
+store-sqlite = ["praxis-ai-proxy/store-sqlite", "praxis-test-utils/store-sqlite", "sqlx/sqlite"]
+store-all = ["store-postgres", "store-sqlite"]
 cpex-policy-engine = []
 # Experimental: gates the lakera-guard example test, which needs the
 # http_callout filter registered in the in-process proxy registry.
@@ -18,6 +27,9 @@ azure-ad-filter = ["praxis-ai-proxy/azure-ad-filter"]
 # Experimental: gates the gcp_adc example test, which needs the gcp_adc
 # filter registered in the in-process proxy registry.
 gcp-adc-filter = ["praxis-ai-proxy/gcp-adc-filter"]
+# Experimental: gates authenticated-subject token-rate-limit tests, which need
+# Praxis's released Basic Auth filter registered in the in-process registry.
+basic-auth-filter = ["praxis-ai-proxy/basic-auth-filter"]
 # Experimental: gates the token_rate_limit example tests, which need the
 # token_rate_limit filter registered in the in-process proxy registry.
 token-rate-limit-filter = ["praxis-ai-proxy/token-rate-limit-filter"]
@@ -34,11 +46,13 @@ base64 = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
+jsonschema = { workspace = true }
 nix = { workspace = true }
 praxis-core = { workspace = true }
 praxis-ai-proxy = { workspace = true }
 praxis-filter = { workspace = true }
 praxis-test-utils = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

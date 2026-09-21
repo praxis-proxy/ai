@@ -1,0 +1,86 @@
+name: vLLM Full Suite Notifications
+
+on:
+  workflow_run:
+    workflows: [vLLM Integration]
+    types: [requested, completed]
+
+permissions: {}
+
+jobs:
+  notify-start:
+    if: |
+      github.event.action == 'requested' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.pull_requests[0].number != null &&
+      startsWith(github.event.workflow_run.display_title, 'vLLM full suite label - PR #')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Generate token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
+          private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
+
+      - name: Comment that the full suite started
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          REQUESTED_BY: ${{ github.event.workflow_run.actor.login }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          if ! gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json labels \
+            --jq '.labels[].name' | grep -Fxq 'vllm-full-suite'; then
+            echo "vllm-full-suite is not present on PR #${PR_NUMBER}; skipping notification"
+            exit 0
+          fi
+
+          gh pr comment "$PR_NUMBER" --repo "$GH_REPO" --body \
+            "<!-- praxis:vllm-full-suite:${RUN_ID} -->
+          Full live vLLM Responses suite started by @${REQUESTED_BY}: [run ${RUN_ID}](${RUN_URL})."
+
+  notify-finish:
+    if: |
+      github.event.action == 'completed' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.pull_requests[0].number != null &&
+      startsWith(github.event.workflow_run.display_title, 'vLLM full suite label - PR #')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Generate token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.PRAXIS_BOT_APP_ID }}
+          private-key: ${{ secrets.PRAXIS_BOT_APP_PRIVATE_KEY }}
+
+      - name: Comment with the full suite result
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          RESULT: ${{ github.event.workflow_run.conclusion }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          marker="<!-- praxis:vllm-full-suite:${RUN_ID} -->"
+          started=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" \
+            --paginate --jq "[.[] | select(.body | contains(\"${marker}\"))] | length")
+          if [ "$started" -eq 0 ]; then
+            echo "No start notification found for run ${RUN_ID}; skipping completion notification"
+            exit 0
+          fi
+
+          case "$RESULT" in
+            success) icon="✅" ;;
+            failure) icon="❌" ;;
+            cancelled) icon="⏹️" ;;
+            *) icon="⚪" ;;
+          esac
+          gh pr comment "$PR_NUMBER" --repo "$GH_REPO" --body \
+            "${icon} Full live vLLM Responses suite finished with **${RESULT}**: [run ${RUN_ID}](${RUN_URL})."

@@ -15,9 +15,10 @@
 #   - headers: x-praxis-ai-application-protocol, x-praxis-ai-operation
 #
 # The application protocol is provider-qualified (openai_responses,
-# openai_conversations, ...) so one identifier space can describe every AI
-# application protocol the proxy classifies. This matches the cluster-side
-# `application_protocol` vocabulary in praxis-proxy/praxis#1106.
+# openai_conversations, openai_chat_completions, ...) so one identifier
+# space can describe every AI application protocol the proxy classifies.
+# This matches the cluster-side `application_protocol` vocabulary in
+# praxis-proxy/praxis#1106.
 #
 # Consuming the classification:
 #   The classifier runs in the header phase. Its headers are pending
@@ -56,6 +57,14 @@
 #   # classified openai_conversations/getConversation -> conversations backend
 #   curl http://localhost:8080/v1/conversations/conv_123
 #
+#   # classified openai_chat_completions/createChatCompletion -> chat backend
+#   curl -X POST http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4.1","messages":[{"role":"user","content":"Hi"}]}'
+#
+#   # classified openai_chat_completions/listChatCompletions -> chat backend
+#   curl http://localhost:8080/v1/chat/completions
+#
 #   # unsupported method: no operation matches, headers stripped,
 #   # falls through to the default backend
 #   curl -X PUT http://localhost:8080/v1/responses
@@ -85,8 +94,8 @@ filter_chains:
           application_protocol: x-praxis-ai-application-protocol
           operation: x-praxis-ai-operation
         # Branch on the published filter result, not on a path prefix.
-        # The Conversations family is served by its own backend; every
-        # other classified or unclassified request falls through.
+        # Conversations and Chat Completions each have their own backend;
+        # every other classified or unclassified request falls through.
         branch_chains:
           - name: conversations
             on_result:
@@ -100,6 +109,19 @@ filter_chains:
                     routes:
                       - path_prefix: "/"
                         cluster: "conversations-backend"
+            rejoin: shared_load_balancer
+          - name: chat-completions
+            on_result:
+              filter: openai_operation
+              key: application_protocol
+              result: openai_chat_completions
+            chains:
+              - name: chat-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/"
+                        cluster: "chat-backend"
             rejoin: shared_load_balancer
 
       # Default: anything that did not branch, classified or not.
@@ -117,6 +139,9 @@ filter_chains:
           - name: "conversations-backend"
             endpoints:
               - "127.0.0.1:3002"
+          - name: "chat-backend"
+            endpoints:
+              - "127.0.0.1:3003"
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends

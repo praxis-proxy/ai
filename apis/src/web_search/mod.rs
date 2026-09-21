@@ -11,7 +11,34 @@ use std::fmt::Write as _;
 pub(crate) use config::{
     OpenAiWebSearchConfig, SearchContextSize, ValidatedConfig, WebSearchFilterConfig, build_config,
 };
-pub(crate) use provider::{SearchClient, SearchOutcome, SearchResult};
+#[cfg(test)]
+use praxis_filter::FilterError;
+pub(crate) use provider::{CalloutContext, SearchClient, SearchOutcome, SearchResult};
+
+/// Test-only: build a minimal bound outbound pipeline for a callout unit test.
+///
+/// Holds a single observable `request_id` builtin, standing in for the
+/// cross-cutting filters a real deployment binds. No seed filter is installed:
+/// the [`FilteredSubrequestExecutor`] seeds `filter_ctx.upstream` from the
+/// `StagedUpstream` the [`SearchClient`] stages (and re-pins it after the request
+/// phase), so the chain needs no upstream-selecting filter. Private upstreams are
+/// permitted so tests can dial loopback mocks; the executor still enforces
+/// SSRF/TLS/`Host` centrally.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if the pipeline cannot be built.
+///
+/// [`FilteredSubrequestExecutor`]: praxis_filter::FilteredSubrequestExecutor
+#[cfg(test)]
+pub(crate) fn test_outbound_pipeline() -> Result<praxis_filter::FilterPipeline, FilterError> {
+    let registry = praxis_filter::FilterRegistry::with_builtins();
+    let mut entries: Vec<praxis_filter::FilterEntry> =
+        serde_yaml::from_str("- filter: request_id\n").map_err(|e| FilterError::from(e.to_string()))?;
+    let mut pipeline = praxis_filter::FilterPipeline::build(&mut entries, &registry)?;
+    pipeline.set_allow_private_upstreams(true);
+    Ok(pipeline)
+}
 
 /// Bounded tool-result message fed to the model when a search provider fails,
 /// so both provider loops continue with a truthful failure instead of rejecting.

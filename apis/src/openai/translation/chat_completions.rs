@@ -306,6 +306,21 @@ pub(crate) enum TranslationError {
     /// The `reasoning` request field was present but not an object or null.
     #[error("reasoning must be an object or null, found {0}")]
     MalformedReasoningBlock(String),
+    /// A Responses request parameter describes behavior this adapter cannot provide.
+    #[error(
+        "Responses `{parameter}` has no Chat Completions representation: got {value}, \
+         this adapter supports only {supported}"
+    )]
+    UnrepresentableRequestParameter {
+        /// Responses request parameter that cannot be honored.
+        parameter: &'static str,
+        /// Bounded description of the requested value: either a recognized
+        /// literal or the JSON type. Never the value itself, which is
+        /// client-controlled and can be megabytes of JSON.
+        value: &'static str,
+        /// The only value this adapter can represent, rendered as JSON.
+        supported: &'static str,
+    },
 }
 
 /// Borrowed canonical request fields that supersede their original request values.
@@ -360,6 +375,7 @@ fn translate_responses_request(
         .as_object()
         .ok_or(TranslationError::ExpectedObject("Responses request"))?;
     validate_input_container(obj.get("input"))?;
+    validate_representable_parameters(obj)?;
 
     let mut chat = Map::new();
     map_request_parameters(obj, &mut chat);
@@ -377,8 +393,24 @@ fn translate_responses_request(
     } = tools.map(build_chat_tools).transpose()?.unwrap_or_default();
     if let Some(tools) = built_tools {
         chat.insert("tools".to_owned(), tools);
-        chat.remove("response_format");
     }
+    insert_chat_tool_choice(obj, &mut chat, overrides, has_web_search, has_file_search)?;
+
+    Ok(Value::Object(chat))
+}
+
+/// Resolve and insert the Chat Completions `tool_choice`, when one applies.
+///
+/// A synthesized canonical `auto` is omitted when the request carried no tools
+/// and no explicit choice of its own, so translation does not invent a field the
+/// caller never sent.
+fn insert_chat_tool_choice(
+    obj: &Map<String, Value>,
+    chat: &mut Map<String, Value>,
+    overrides: RequestOverrides<'_>,
+    has_web_search: bool,
+    has_file_search: bool,
+) -> Result<(), TranslationError> {
     let tool_choice = overrides.tool_choice.or_else(|| obj.get("tool_choice"));
     let omit_synthesized_default = !chat.contains_key("tools")
         && obj.get("tool_choice").is_none()
@@ -388,8 +420,7 @@ fn translate_responses_request(
     {
         chat.insert("tool_choice".to_owned(), tool_choice);
     }
-
-    Ok(Value::Object(chat))
+    Ok(())
 }
 
 /// Copy supported scalar parameters into the Chat Completions request.
@@ -411,6 +442,51 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
     if let Some(max_output_tokens) = obj.get("max_output_tokens") {
         chat.insert("max_completion_tokens".to_owned(), max_output_tokens.clone());
     }
+}
+
+/// Reject request parameters this adapter cannot represent.
+///
+/// `background` and `truncation` describe behaviors the Chat Completions
+/// translation does not implement. Accepting a non-default value would send a
+/// foreground, untruncated Chat request and then report the defaults back as
+/// though they had been honored, so the request fails closed instead. Rejecting
+/// here is what lets [`response_resource`] state those defaults truthfully.
+///
+/// Unlike parameters this translator forwards, both fields are dropped rather
+/// than sent upstream, so the backend never sees them and cannot validate them
+/// on our behalf. A malformed value is therefore rejected too: anything that is
+/// not demonstrably the default would otherwise be silently discarded and then
+/// reported back as the default.
+fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    if let Some(background) = obj.get("background").filter(|value| !value.is_null())
+        && background.as_bool() != Some(false)
+    {
+        return Err(TranslationError::UnrepresentableRequestParameter {
+            parameter: "background",
+            value: if background.as_bool() == Some(true) {
+                "true"
+            } else {
+                json_type_name(background)
+            },
+            supported: "`background` false",
+        });
+    }
+
+    if let Some(truncation) = obj.get("truncation").filter(|value| !value.is_null())
+        && truncation.as_str() != Some(DEFAULT_TRUNCATION)
+    {
+        return Err(TranslationError::UnrepresentableRequestParameter {
+            parameter: "truncation",
+            value: if truncation.as_str() == Some("auto") {
+                "\"auto\""
+            } else {
+                json_type_name(truncation)
+            },
+            supported: "`truncation` \"disabled\"",
+        });
+    }
+
+    Ok(())
 }
 
 /// Copy a field from one JSON object to another.
@@ -1503,13 +1579,13 @@ fn response_resource(
         "tool_choice": tool_choice_value(context),
         "tools": Value::Array(normalize_response_tools(context.tools)),
         "top_p": number_or_default(context.top_p, 1.0),
-        // TODO(responses): preserve request truncation when the compatibility
-        // layer supports truncation semantics instead of emitting the default.
+        // Truthful because request translation rejects any other value:
+        // see validate_representable_parameters.
         "truncation": DEFAULT_TRUNCATION,
         "usage": parts.usage,
         "metadata": metadata_value(context),
-        // TODO(responses): surface true once the background jobs filter owns
-        // queued Responses resources; this translator only builds foreground responses.
+        // Likewise truthful: a background request never reaches this translator,
+        // so every response it builds really is a foreground one.
         "background": false,
         "service_tier": parts.service_tier
     });
