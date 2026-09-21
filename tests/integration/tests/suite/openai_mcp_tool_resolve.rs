@@ -850,7 +850,12 @@ fn changed_direct_url_does_not_reuse_unbound_cached_tools() {
         r#"{{"model":"gpt-4.1","input":"first","tools":[{{"type":"mcp","server_label":"weather","server_url":"{old_url}","allowed_tools":["shared_tool"]}}]}}"#
     );
     let first = http_send(proxy.addr(), &json_post("/v1/responses", &first_body));
-    assert_eq!(parse_status(&first), 200, "first request should persist the listing");
+    assert_eq!(
+        parse_status(&first),
+        200,
+        "first request should persist the listing: {}",
+        parse_body(&first)
+    );
     assert!(
         old_mcp.method_count("tools/list") >= 1,
         "first direct URL should be resolved"
@@ -1532,6 +1537,7 @@ filter_chains:
               - "127.0.0.1:{backend_port}"
 insecure_options:
   allow_private_endpoints: true
+  allow_private_upstreams: true
 "#
     )
 }
