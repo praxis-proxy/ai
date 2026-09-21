@@ -309,11 +309,36 @@ impl ClientToolCompatFilter {
         state: &mut ResponsesState,
         discovered: &[Value],
     ) -> Result<(), FilterAction> {
-        // `lower_request` already failed closed on a present, non-null, non-array
-        // `tools`, so here `tools` is an array (the declared/rich path) or absent /
-        // `null` (a discovery-only continuation, normalized by `take_request_tools`
-        // to an empty array the discovered set is hoisted onto).
-        let original_tools = take_request_tools(state).unwrap_or_default();
+        // Defense-in-depth idempotency invariant: if a prior lowering already
+        // captured the canonical `tools`/`tool_choice` snapshot in `client_tool_echo`,
+        // rebuild this lowering from that echo rather than from the request body. The
+        // request body would by then carry the *lowered* private `function`
+        // declarations, and lowering those as if they were a fresh client declaration
+        // set would drop the rich tools' restoration recipes (a passthrough `function`
+        // records none) and let `commit_lowering` overwrite the canonical echo with
+        // the private lowered shapes, so the terminal response could no longer restore
+        // the client's canonical tool contract (#1249). Lower the echoed originals
+        // (plus the current discovered set) and keep the first echo unchanged (see
+        // `commit_lowering`). Cloning the echoed originals is required — the echo must
+        // survive as the immutable canonical snapshot.
+        //
+        // In the current runtime this branch is never reached with an echo already
+        // set: after the first lowered round the persisted `ResponsesState` carries
+        // the lowered request `tools` and its discovery-producing history is re-typed
+        // away from the `tool_search` shapes, so an IRR continuation has neither a
+        // rich tool nor a discovered tool and takes the history-only path instead. The
+        // rebuild-from-echo keeps re-lowering idempotent regardless; #1249 is a
+        // defense-in-depth guarantee, not a currently reachable failure.
+        //
+        // On the first lowered round the echo is absent, so take the tools straight
+        // from the request body. `lower_request` already failed closed on a present,
+        // non-null, non-array `tools`, so here `tools` is an array (the declared/rich
+        // path) or absent / `null` (a discovery-only continuation, normalized by
+        // `take_request_tools` to an empty array the discovered set is hoisted onto).
+        let original_tools = match state.client_tool_echo.as_ref().map(|echo| echo.tools.clone()) {
+            Some(canonical) => canonical,
+            None => take_request_tools(state).unwrap_or_default(),
+        };
         let mut lowering = Lowering::new(self.max_client_tools);
         let (mut lowered_tools, lowered_any) = match lowering.lower_tools(&original_tools) {
             Ok(result) => result,
@@ -594,12 +619,26 @@ fn commit_lowering(
         "openai_client_tool_compat lowered client tools to private functions"
     );
     state.client_tool_lowering = parts.reverse;
-    state.client_tool_echo = Some(ClientToolEcho {
-        tools: original_tools,
-        tool_choice: original_tool_choice,
-    });
+    capture_canonical_echo(state, original_tools, original_tool_choice);
     state.mark_request_body_for_rebuild();
     Ok(())
+}
+
+/// Record the canonical `tools`/`tool_choice` snapshot exactly once, on the first
+/// lowered round.
+///
+/// The capture-once guard is a defense-in-depth idempotency invariant: a repeat
+/// lowering re-lowers from this same snapshot (see `lower_declared_and_discovered`),
+/// so overwriting it with a later lowering's already-lowered `tools` and
+/// `auto`-reset `tool_choice` would corrupt the client's canonical tool contract in
+/// the terminal response (#1249). The reverse restoration map is rebuilt every round
+/// instead, so it stays complete. In the current runtime the capturing path
+/// (`commit_lowering`) runs at most once per request; the guard keeps the snapshot
+/// correct regardless.
+fn capture_canonical_echo(state: &mut ResponsesState, tools: Vec<Value>, tool_choice: Value) {
+    if state.client_tool_echo.is_none() {
+        state.client_tool_echo = Some(ClientToolEcho { tools, tool_choice });
+    }
 }
 
 /// Enforce the operator-selected rewrite cap on the fully rebuilt outbound body.

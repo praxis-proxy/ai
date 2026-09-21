@@ -2916,6 +2916,96 @@ class TestClientToolCompatVLLM:
         # Request phase echo: the client sees its original ``custom`` tool back.
         assert any(t.type == "custom" for t in response.tools), response.tools
 
+    def test_single_round_declared_and_discovered_tools_both_restore(
+        self, client_tool_compat_client
+    ):
+        """General single-request coverage: a declared rich ``custom`` tool and a
+        ``tool_search``-discovered ``custom`` tool coexist on one request, and both
+        restoration recipes plus the canonical echo stay complete.
+
+        A prior client-executed ``tool_search`` discovered ``apply_patch`` while
+        the request also declares the rich ``custom`` ``run_python``. Forcing the
+        discovered tool exercises the discovered restoration recipe, while the
+        response must still echo the *declared* ``run_python`` as ``custom`` (its
+        echo is not clobbered by the discovered set).
+
+        This exercises a single lowering only: the example pipeline transitions
+        straight to ``done``, so ``lower_request`` runs once and this test passes on
+        both pre- and post-fix code. It is deliberately NOT the #1249 IRR re-entry
+        regression guard — that failure is unreachable through the live agentic loop
+        and is pinned synthetically by the Rust unit test
+        ``relowering_with_captured_echo_preserves_canonical_restoration``.
+        """
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": (
+                        "You MUST call the apply_patch tool. Do not answer "
+                        "directly. /no_think"
+                    ),
+                },
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_ts",
+                    "execution": "client",
+                    "arguments": {"query": "patch"},
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_ts",
+                    "status": "completed",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "apply_patch",
+                            "description": "Apply a unified diff to the workspace.",
+                            "format": {"type": "text"},
+                        }
+                    ],
+                },
+            ],
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "run_python",
+                    "description": "Run python code in the workspace.",
+                }
+            ],
+            # Force the discovered custom tool so the small CI model is
+            # deterministic; the compat filter lowers this custom selector to a
+            # function selector via the discovered restoration recipe.
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        # The discovered tool's returned function_call restores to a
+        # custom_tool_call (its restoration recipe survived alongside the declared
+        # tool's).
+        custom_calls = [
+            item for item in response.output if item.type == "custom_tool_call"
+        ]
+        assert any(call.name == "apply_patch" for call in custom_calls), (
+            "the discovered custom tool must restore to a custom_tool_call; "
+            f"got output types: {[i.type for i in response.output]}"
+        )
+        # No un-restored private function_call may leak to the client.
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        # The response echoes the *declared* rich tool back as ``custom`` — the
+        # discovered set never overwrites the canonical declaration echo.
+        assert any(
+            t.type == "custom" and t.name == "run_python" for t in response.tools
+        ), response.tools
+        # The discovered tool was never declared, so it is not echoed.
+        assert all(t.name != "apply_patch" for t in response.tools), response.tools
+
     def test_streaming_custom_tool_restores_lifecycle(
         self, client_tool_compat_client
     ):
