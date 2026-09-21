@@ -1,9 +1,9 @@
 //! Per-user callout credentials captured at the trust boundary.
 //!
-//! The [`crate::callout_credentials::CalloutCredentialsFilter`] establishing filter reads
+//! The `CalloutCredentialsFilter` establishing filter reads
 //! configured ingress headers, stores their values here as [`SecretString`] slots keyed by a
 //! config-static slot id, and strips the ingress headers so they never reach an upstream.
-//! Callout adapters read a slot through [`crate::callout_identity::stage_callout_identity`]
+//! Callout adapters read a slot through `stage_callout_identity`
 //! and stage a per-user credential into the nested subrequest instead of a shared provider key.
 
 use std::collections::BTreeMap;
