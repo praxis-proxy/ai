@@ -6,14 +6,16 @@
 //! Callout adapters read a slot through `stage_callout_identity`
 //! and stage a per-user credential into the nested subrequest instead of a shared provider key.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{borrow::Cow, collections::{BTreeMap, BTreeSet}};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderName;
-use praxis_filter::{BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config};
+use praxis_filter::{BodyAccess, FilterAction, FilterError, HttpFilter, HttpFilterContext, TrustedHeaderMutation, parse_filter_config};
 use secrecy::SecretString;
 use serde::Deserialize;
+
+use crate::state_owner::reject_owner;
 
 /// Maximum number of credential slots one filter instance may declare.
 const MAX_SLOTS: usize = 32;
@@ -28,39 +30,32 @@ const RESERVED_SOURCE_PREFIXES: &[&str] = &["x-praxis-", "x-mcp-", "x-ext-", "x-
 #[serde(deny_unknown_fields)]
 struct RawSlot {
     /// Config-static slot identifier.
-    id: String,
+    slot: String,
     /// Ingress header name to read the per-user secret from.
-    header: String,
-    /// Whether this slot's presence in the request is required.
-    #[serde(default)]
-    required: bool,
+    source_header: String,
 }
 
 /// Top-level YAML configuration before validation.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    /// List of credential slots to read and validate.
-    slots: Vec<RawSlot>,
+    /// Per-user credential slots to capture from ingress headers.
+    credentials: Vec<RawSlot>,
 }
 
 /// A validated per-user credential slot: config-static id + the ingress header it is read from.
 #[derive(Debug, Clone)]
-#[expect(dead_code, reason = "used in Task 3 runtime behavior")]
 struct CredentialSlot {
     /// Config-static slot identifier.
     id: String,
     /// Validated ingress header name.
     header: HeaderName,
-    /// Whether this slot's presence in the request is required.
-    required: bool,
 }
 
 /// Establishing filter that captures per-user callout credentials from ingress headers.
 #[derive(Debug)]
 pub struct CalloutCredentialsFilter {
     /// Validated credential slots.
-    #[expect(dead_code, reason = "used in Task 3 runtime behavior")]
     slots: Vec<CredentialSlot>,
 }
 
@@ -74,15 +69,84 @@ impl CalloutCredentialsFilter {
     pub fn from_config(value: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let raw: RawConfig = parse_filter_config("callout_credentials", value)?;
 
-        if raw.slots.is_empty() {
-            return Err("callout_credentials: at least one slot is required".into());
+        if raw.credentials.is_empty() {
+            return Err("callout_credentials: at least one credential is required".into());
         }
-        if raw.slots.len() > MAX_SLOTS {
-            return Err(format!("callout_credentials: too many slots (max {MAX_SLOTS})").into());
+        if raw.credentials.len() > MAX_SLOTS {
+            return Err(format!("callout_credentials: too many credentials (max {MAX_SLOTS})").into());
         }
 
-        let slots = validate_slots(&raw.slots)?;
+        let slots = validate_slots(&raw.credentials)?;
         Ok(Box::new(Self { slots }))
+    }
+
+    /// Read all present slots from the effective header view, or reject on a duplicate.
+    fn collect_present(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        body_phase: bool,
+    ) -> Result<Vec<(String, SecretString)>, FilterAction> {
+        let view: Cow<'_, http::HeaderMap> = if body_phase {
+            crate::callout_headers::effective_body_callout_headers(
+                ctx,
+                Cow::Borrowed(&ctx.request.headers),
+            )
+        } else {
+            Cow::Borrowed(&ctx.request.headers)
+        };
+        let mut present = Vec::new();
+        for slot in &self.slots {
+            match read_singular_slot(&view, &slot.header) {
+                SlotValue::Single(value) => {
+                    present.push((slot.id.clone(), SecretString::from(value)));
+                }
+                SlotValue::Missing => {}
+                SlotValue::Duplicate => {
+                    return Err(reject_owner(
+                        400,
+                        "duplicate_callout_credential",
+                        &format!(
+                            "callout credential header `{}` must appear exactly once",
+                            slot.header.as_str()
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(present)
+    }
+
+    /// Strip every configured source header via the lifecycle-appropriate channel.
+    fn queue_header_removal(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) {
+        let ordered = body_phase && !ctx.pre_read_mutations.is_empty();
+        for slot in &self.slots {
+            ctx.request_headers_to_remove.push(slot.header.clone());
+            if ordered {
+                ctx.pre_read_mutations
+                    .push(TrustedHeaderMutation::Remove(slot.header.clone()));
+            }
+        }
+    }
+
+    /// Establish per-user callout credentials and strip the ingress headers.
+    fn resolve(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) -> FilterAction {
+        if ctx.extensions.get::<CalloutCredentials>().is_some() {
+            self.queue_header_removal(ctx, body_phase);
+            return FilterAction::Continue;
+        }
+        let present = match self.collect_present(ctx, body_phase) {
+            Ok(present) => present,
+            Err(action) => return action,
+        };
+        if !present.is_empty() {
+            let mut creds = CalloutCredentials::new();
+            for (slot, value) in present {
+                creds.insert(slot, value);
+            }
+            ctx.extensions.insert(creds);
+        }
+        self.queue_header_removal(ctx, body_phase);
+        FilterAction::Continue
     }
 }
 
@@ -96,17 +160,20 @@ impl HttpFilter for CalloutCredentialsFilter {
         BodyAccess::ReadOnly
     }
 
-    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        Ok(FilterAction::Continue)
+    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        Ok(self.resolve(ctx, false))
     }
 
     async fn on_request_body(
         &self,
-        _ctx: &mut HttpFilterContext<'_>,
+        ctx: &mut HttpFilterContext<'_>,
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        Ok(FilterAction::Continue)
+        Ok(match self.resolve(ctx, true) {
+            FilterAction::Continue => FilterAction::BodyDone,
+            action => action,
+        })
     }
 }
 
@@ -117,18 +184,18 @@ fn validate_slots(raw: &[RawSlot]) -> Result<Vec<CredentialSlot>, FilterError> {
     let mut slots = Vec::with_capacity(raw.len());
 
     for slot in raw {
-        if slot.id.is_empty() || slot.id.len() > MAX_SLOT_ID_BYTES {
+        if slot.slot.is_empty() || slot.slot.len() > MAX_SLOT_ID_BYTES {
             return Err(
-                format!("callout_credentials: slot id must be 1..={MAX_SLOT_ID_BYTES} bytes")
+                format!("callout_credentials: slot must be 1..={MAX_SLOT_ID_BYTES} bytes")
                     .into(),
             );
         }
-        if !seen_ids.insert(slot.id.as_str()) {
+        if !seen_ids.insert(slot.slot.as_str()) {
             return Err(
-                format!("callout_credentials: duplicate slot id `{}`", slot.id).into(),
+                format!("callout_credentials: duplicate slot `{}`", slot.slot).into(),
             );
         }
-        let header = parse_source_header(&slot.header)?;
+        let header = parse_source_header(&slot.source_header)?;
         if !seen_headers.insert(header.as_str().to_owned()) {
             return Err(
                 format!("callout_credentials: duplicate source header `{}`", header.as_str())
@@ -136,9 +203,8 @@ fn validate_slots(raw: &[RawSlot]) -> Result<Vec<CredentialSlot>, FilterError> {
             );
         }
         slots.push(CredentialSlot {
-            id: slot.id.clone(),
+            id: slot.slot.clone(),
             header,
-            required: slot.required,
         });
     }
 
@@ -168,6 +234,29 @@ fn parse_source_header(raw: &str) -> Result<HeaderName, FilterError> {
         return Err(format!("callout_credentials: source header `{lower}` uses an internal-trust prefix").into());
     }
     Ok(name)
+}
+
+/// Singular-value outcome for one configured slot header.
+enum SlotValue {
+    /// Exactly one non-empty UTF-8 value.
+    Single(String),
+    /// Absent, empty, or non-UTF-8 — treated as unpopulated (no reject).
+    Missing,
+    /// More than one value — a client error.
+    Duplicate,
+}
+
+/// Read one slot header with singular-value semantics from an already-effective view.
+fn read_singular_slot(headers: &http::HeaderMap, header: &HeaderName) -> SlotValue {
+    let mut it = headers.get_all(header).iter();
+    match (it.next(), it.next()) {
+        (None, _) => SlotValue::Missing,
+        (Some(_), Some(_)) => SlotValue::Duplicate,
+        (Some(v), None) => match v.to_str() {
+            Ok(s) if !s.is_empty() => SlotValue::Single(s.to_owned()),
+            _ => SlotValue::Missing,
+        },
+    }
 }
 
 /// Request-scoped map of per-user callout credentials, keyed by config-static slot id.
@@ -228,52 +317,52 @@ mod config_tests {
 
     #[test]
     fn accepts_valid_single_slot() {
-        let f = cfg("slots:\n  - id: brave_search\n    header: x-user-brave-key\n    required: true\n");
+        let f = cfg("credentials:\n  - slot: brave_search\n    source_header: x-user-brave-key\n");
         assert!(f.is_ok(), "valid config rejected: {:?}", f.err());
     }
 
     #[test]
     fn rejects_unknown_field() {
-        let f = cfg("slots:\n  - id: a\n    header: x-user-a\nbogus: 1\n");
+        let f = cfg("credentials:\n  - slot: a\n    source_header: x-user-a\nbogus: 1\n");
         assert!(f.is_err());
     }
 
     #[test]
     fn rejects_empty_slots() {
-        assert!(cfg("slots: []\n").is_err());
+        assert!(cfg("credentials: []\n").is_err());
     }
 
     #[test]
     fn rejects_duplicate_slot_id() {
-        let f = cfg("slots:\n  - id: dup\n    header: x-user-a\n  - id: dup\n    header: x-user-b\n");
+        let f = cfg("credentials:\n  - slot: dup\n    source_header: x-user-a\n  - slot: dup\n    source_header: x-user-b\n");
         assert!(f.is_err());
     }
 
     #[test]
     fn rejects_duplicate_source_header() {
-        let f = cfg("slots:\n  - id: a\n    header: x-user-shared\n  - id: b\n    header: x-user-shared\n");
+        let f = cfg("credentials:\n  - slot: a\n    source_header: x-user-shared\n  - slot: b\n    source_header: x-user-shared\n");
         assert!(f.is_err());
     }
 
     #[test]
     fn rejects_reserved_and_framing_source_headers() {
-        assert!(cfg("slots:\n  - id: a\n    header: host\n").is_err());
-        assert!(cfg("slots:\n  - id: a\n    header: content-length\n").is_err());
-        assert!(cfg("slots:\n  - id: a\n    header: connection\n").is_err()); // hop-by-hop
+        assert!(cfg("credentials:\n  - slot: a\n    source_header: host\n").is_err());
+        assert!(cfg("credentials:\n  - slot: a\n    source_header: content-length\n").is_err());
+        assert!(cfg("credentials:\n  - slot: a\n    source_header: connection\n").is_err()); // hop-by-hop
     }
 
     #[test]
     fn rejects_routing_prefixed_source_headers() {
-        assert!(cfg("slots:\n  - id: a\n    header: x-praxis-ai-model\n").is_err());
-        assert!(cfg("slots:\n  - id: a\n    header: x-mcp-authorized\n").is_err());
-        assert!(cfg("slots:\n  - id: a\n    header: x-ext-foo\n").is_err());
-        assert!(cfg("slots:\n  - id: a\n    header: x-a2a-foo\n").is_err());
+        assert!(cfg("credentials:\n  - slot: a\n    source_header: x-praxis-ai-model\n").is_err());
+        assert!(cfg("credentials:\n  - slot: a\n    source_header: x-mcp-authorized\n").is_err());
+        assert!(cfg("credentials:\n  - slot: a\n    source_header: x-ext-foo\n").is_err());
+        assert!(cfg("credentials:\n  - slot: a\n    source_header: x-a2a-foo\n").is_err());
     }
 
     #[test]
     fn rejects_oversized_slot_id() {
         let big = "x".repeat(MAX_SLOT_ID_BYTES + 1);
-        let f = cfg(&format!("slots:\n  - id: {big}\n    header: x-user-a\n"));
+        let f = cfg(&format!("credentials:\n  - slot: {big}\n    source_header: x-user-a\n"));
         assert!(f.is_err());
     }
 }
@@ -312,5 +401,137 @@ mod tests {
         let creds = CalloutCredentials::new();
         assert!(creds.is_empty());
         assert_eq!(creds.len(), 0);
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "tests")]
+mod runtime_tests {
+    use super::*;
+    use crate::test_utils::{make_filter_context, make_request};
+    use http::{HeaderValue, Method};
+    use secrecy::ExposeSecret as _;
+
+    /// Make a filter with one slot for testing.
+    fn make_filter() -> CalloutCredentialsFilter {
+        CalloutCredentialsFilter {
+            slots: vec![CredentialSlot {
+                id: "brave".to_owned(),
+                header: HeaderName::from_static("x-user-brave-key"),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn installs_slot_and_strips_ingress_header() {
+        let filter = make_filter();
+        let mut request = make_request(Method::POST, "/v1/responses");
+        request.headers.insert(
+            "x-user-brave-key",
+            HeaderValue::from_static("tok-abc"),
+        );
+        let mut ctx = make_filter_context(&request);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+
+        let creds = ctx.extensions.get::<CalloutCredentials>().unwrap();
+        assert_eq!(creds.get("brave").unwrap().expose_secret(), "tok-abc");
+        assert!(ctx
+            .request_headers_to_remove
+            .iter()
+            .any(|n| n == "x-user-brave-key"));
+    }
+
+    #[tokio::test]
+    async fn missing_optional_header_leaves_slot_unpopulated_without_reject() {
+        let filter = make_filter();
+        let request = make_request(Method::POST, "/v1/responses");
+        let mut ctx = make_filter_context(&request);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+
+        assert!(ctx
+            .extensions
+            .get::<CalloutCredentials>()
+            .is_none_or(|c| c.get("brave").is_none()));
+        assert!(ctx
+            .request_headers_to_remove
+            .iter()
+            .any(|n| n == "x-user-brave-key"));
+    }
+
+    #[tokio::test]
+    #[expect(clippy::panic, reason = "tests")]
+    async fn duplicate_header_value_rejects_400() {
+        let filter = make_filter();
+        let mut request = make_request(Method::POST, "/v1/responses");
+        request
+            .headers
+            .insert("x-user-brave-key", HeaderValue::from_static("tok-1"));
+        request
+            .headers
+            .append("x-user-brave-key", HeaderValue::from_static("tok-2"));
+        let mut ctx = make_filter_context(&request);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        let FilterAction::Reject(rejection) = action else {
+            panic!("expected rejection");
+        };
+        let body: serde_json::Value =
+            serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body.pointer("/error/type").and_then(|v| v.as_str()),
+            Some("invalid_request_error")
+        );
+        assert_eq!(
+            body.pointer("/error/code").and_then(|v| v.as_str()),
+            Some("duplicate_callout_credential")
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_when_already_installed() {
+        let filter = make_filter();
+        let mut request = make_request(Method::POST, "/v1/responses");
+        request.headers.insert(
+            "x-user-brave-key",
+            HeaderValue::from_static("new"),
+        );
+        let mut ctx = make_filter_context(&request);
+        let mut prior_creds = CalloutCredentials::new();
+        prior_creds.insert("brave".to_owned(), SecretString::from("prior"));
+        ctx.extensions.insert(prior_creds);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+
+        let creds = ctx.extensions.get::<CalloutCredentials>().unwrap();
+        assert_eq!(creds.get("brave").unwrap().expose_secret(), "prior");
+        assert!(ctx
+            .request_headers_to_remove
+            .iter()
+            .any(|n| n == "x-user-brave-key"));
+    }
+
+    #[tokio::test]
+    async fn body_phase_maps_continue_to_body_done() {
+        let filter = make_filter();
+        let mut request = make_request(Method::POST, "/v1/responses");
+        request.headers.insert(
+            "x-user-brave-key",
+            HeaderValue::from_static("tok-xyz"),
+        );
+        let mut ctx = make_filter_context(&request);
+
+        let action = filter
+            .on_request_body(&mut ctx, &mut None, true)
+            .await
+            .unwrap();
+        assert!(matches!(action, FilterAction::BodyDone));
+
+        let creds = ctx.extensions.get::<CalloutCredentials>().unwrap();
+        assert_eq!(creds.get("brave").unwrap().expose_secret(), "tok-xyz");
     }
 }
