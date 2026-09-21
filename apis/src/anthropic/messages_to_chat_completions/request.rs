@@ -51,6 +51,11 @@ const UNREPRESENTABLE_FIELDS: [&str; 12] = [
 /// and the OpenAI API rejects them.
 const DROPPED_FIELDS: [&str; 2] = ["thinking", "context_management"];
 
+/// Every `output_config` key in the Anthropic schema, including the beta
+/// `task_budget`; the schema declares no others (`additionalProperties:
+/// false`) and every one is nullable.
+const OUTPUT_CONFIG_KEYS: [&str; 3] = ["effort", "format", "task_budget"];
+
 /// Transform a parsed Anthropic Messages request body into Chat
 /// Completions-compatible format.
 ///
@@ -727,8 +732,14 @@ fn map_output_config(
         Some(Value::Object(config)) => config,
         _ => Map::new(),
     };
-    // Every `output_config` key is nullable in the schema; null means unset.
-    config.retain(|_, value| !value.is_null());
+    // Each known key is nullable in the schema, and null means unset. Nulls
+    // under unknown keys stay, so they reach the unsupported-key rejection
+    // below, as the schema's `additionalProperties: false` would reject them.
+    for key in OUTPUT_CONFIG_KEYS {
+        if config.get(key).is_some_and(Value::is_null) {
+            config.remove(key);
+        }
+    }
     insert_if_some(chat, "reasoning_effort", config.remove("effort"));
     if let Some(format) = config
         .remove("format")
@@ -1500,6 +1511,17 @@ mod tests {
                 "a null `{field}` source must produce nothing"
             );
         }
+    }
+
+    #[test]
+    fn unknown_null_output_config_key_is_rejected() {
+        let body = br#"{"model":"claude-opus-4-8","max_tokens":1024,"output_config":{"effort":"high","foo":null},"messages":[{"role":"user","content":"Hi"}]}"#;
+        let error = transform_bytes(body).unwrap_err();
+
+        assert!(
+            error.contains("output_config.foo"),
+            "a null under an unknown key must still be rejected by name: {error}"
+        );
     }
 
     #[test]
