@@ -1299,11 +1299,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 32);
-        assert_eq!(report.scenarios_total, 32);
-        assert_eq!(report.recordings_total, 37);
+        assert_eq!(report.features_total, 33);
+        assert_eq!(report.scenarios_total, 33);
+        assert_eq!(report.recordings_total, 38);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1342,7 +1343,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 32);
+        assert_eq!(manifest.features.len(), 33);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
