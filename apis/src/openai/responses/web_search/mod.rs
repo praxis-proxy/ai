@@ -47,11 +47,13 @@ use super::state::{
     DispatchFailure, ResponsesState, consumed_builtin_tool_calls_before_current_round,
     current_round_tool_call_admissions,
 };
-use crate::callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity};
-use crate::callout_policy::MISSING_CALLOUT_CONTEXT;
-use crate::web_search::{
-    CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
-    SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
+use crate::{
+    callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
+    callout_policy::MISSING_CALLOUT_CONTEXT,
+    web_search::{
+        CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
+        SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -285,7 +287,10 @@ impl WebSearchFilter {
     /// `Failed` outcome, both charged against the call budget — and `false`
     /// when the call was surfaced as incomplete without issuing a request
     /// (a missing query).
-    #[expect(clippy::too_many_arguments, reason = "threads the batch-resolved caller identity into the provider search")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "threads the batch-resolved caller identity into the provider search"
+    )]
     async fn execute_single_search(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -388,7 +393,10 @@ impl WebSearchFilter {
                 append_excess_incomplete(ctx, call, index);
                 continue;
             }
-            if self.execute_single_search(ctx, call, index, batch.context_size, &identity).await {
+            if self
+                .execute_single_search(ctx, call, index, batch.context_size, &identity)
+                .await
+            {
                 dispatched = dispatched.saturating_add(1);
             }
         }

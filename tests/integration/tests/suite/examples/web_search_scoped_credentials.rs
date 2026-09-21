@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    StatefulCapturingBackend, build_pipeline, example_config_path, free_port, http_send, parse_body,
-    parse_status, patch_yaml, start_proxy,
+    StatefulCapturingBackend, build_pipeline, example_config_path, free_port, http_send, parse_body, parse_status,
+    patch_yaml, start_proxy,
 };
 use serde_json::json;
 
@@ -342,7 +342,10 @@ fn per_user_credentials_are_isolated_across_requests() {
     let sreqs = search.requests();
     assert_eq!(sreqs.len(), 2, "two search callouts, one per request");
     assert!(
-        sreqs[0].headers.to_ascii_lowercase().contains("x-subscription-token: alice-brave-secret"),
+        sreqs[0]
+            .headers
+            .to_ascii_lowercase()
+            .contains("x-subscription-token: alice-brave-secret"),
         "alice's credential arrives on her callout: {}",
         sreqs[0].headers
     );
@@ -352,7 +355,10 @@ fn per_user_credentials_are_isolated_across_requests() {
         sreqs[0].headers
     );
     assert!(
-        sreqs[1].headers.to_ascii_lowercase().contains("x-subscription-token: bob-brave-secret"),
+        sreqs[1]
+            .headers
+            .to_ascii_lowercase()
+            .contains("x-subscription-token: bob-brave-secret"),
         "bob's credential arrives on his callout: {}",
         sreqs[1].headers
     );

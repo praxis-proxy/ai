@@ -2957,7 +2957,10 @@ async fn security_failure_preempts_dispatch_failure() {
     let FilterAction::Reject(response) = action else {
         panic!("a recorded security failure must reject before the next inference call");
     };
-    assert_eq!(response.status, 401, "security terminal preempts the 502 dispatch terminal");
+    assert_eq!(
+        response.status, 401,
+        "security terminal preempts the 502 dispatch terminal"
+    );
     let body: Value = serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "missing_callout_context");
     assert_eq!(body["error"]["message"], "no creds");

@@ -29,8 +29,10 @@ use super::{
     ValidatedConfig,
     config::{SearchContextSize, SearchProvider},
 };
-use crate::callout_identity::CalloutIdentity;
-use crate::subrequest::{SubRequest, SubRequestClient, SubResponse};
+use crate::{
+    callout_identity::CalloutIdentity,
+    subrequest::{SubRequest, SubRequestClient, SubResponse},
+};
 
 /// Response body cap for search callouts (1 MiB). Distinct from
 /// `max_body_bytes` which governs inbound request buffering.
@@ -201,7 +203,10 @@ impl SearchClient {
     /// carries cross-cutting concerns (observability, security, credential
     /// injection); destination authority, DNS/SSRF, TLS/SNI, and `Host` are
     /// enforced centrally by the executor at transport time.
-    #[expect(clippy::too_many_arguments, reason = "threads the caller's per-callout identity through the fixed staging chain")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "threads the caller's per-callout identity through the fixed staging chain"
+    )]
     pub(crate) async fn search(
         &self,
         outbound: &Arc<FilterPipeline>,
@@ -241,7 +246,10 @@ impl SearchClient {
     /// authority and its target to the origin-form path+query.
     ///
     /// [`PreparedTarget::bind`]: praxis_core::connectivity::PreparedTarget::bind
-    #[expect(clippy::too_many_arguments, reason = "threads the caller's per-callout identity through the fixed staging chain")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "threads the caller's per-callout identity through the fixed staging chain"
+    )]
     async fn execute_search(
         &self,
         outbound: &Arc<FilterPipeline>,
@@ -305,7 +313,12 @@ impl SearchClient {
     /// degraded.
     ///
     /// [`StateOwner`]: crate::StateOwner
-    fn stage_extensions(&self, target: &PreparedTarget, url: &str, identity: &CalloutIdentity) -> Option<RequestExtensions> {
+    fn stage_extensions(
+        &self,
+        target: &PreparedTarget,
+        url: &str,
+        identity: &CalloutIdentity,
+    ) -> Option<RequestExtensions> {
         // Stage the resolved upstream (pinned to the primary validated address)
         // and the full validated address set. The executor seeds
         // `filter_ctx.upstream` from the `StagedUpstream` before the request
@@ -377,7 +390,11 @@ impl SearchClient {
     ///
     /// Returns `Ok(None)` for a body-authenticated provider (Tavily) and
     /// `Err(_)` if the URL has no host or the key is not a valid header value.
-    fn staged_credentials(&self, url: &str, identity: &CalloutIdentity) -> Result<Option<PendingCredentials>, FilterError> {
+    fn staged_credentials(
+        &self,
+        url: &str,
+        identity: &CalloutIdentity,
+    ) -> Result<Option<PendingCredentials>, FilterError> {
         let Some(header) = self.auth_header() else {
             return Ok(None);
         };
@@ -855,7 +872,20 @@ mod tests {
 
     /// A callout identity with no owner and no per-user credential (shared-key path).
     fn shared_key_identity() -> CalloutIdentity {
-        CalloutIdentity { owner: None, user_credential: None }
+        CalloutIdentity {
+            owner: None,
+            user_credential: None,
+        }
+    }
+
+    /// A minimal GET `SubRequest` for the `execute_search` callout tests.
+    fn test_get_request() -> SubRequest {
+        SubRequest {
+            method: http::Method::GET,
+            uri: "/".parse().unwrap(),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        }
     }
 
     fn brave_config_with_shared_key(shared: &str) -> ValidatedConfig {
@@ -1126,15 +1156,16 @@ mod tests {
 
         let client = test_search_client();
         let url = format!("http://{addr}/res/v1/web/search?q=test&count=5");
-        let request = SubRequest {
-            method: http::Method::GET,
-            uri: "/".parse().unwrap(),
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
-        };
+        let request = test_get_request();
 
         let outcome = client
-            .execute_search(&test_outbound(), CalloutContext::for_test(), &url, request, &shared_key_identity())
+            .execute_search(
+                &test_outbound(),
+                CalloutContext::for_test(),
+                &url,
+                request,
+                &shared_key_identity(),
+            )
             .await;
         assert!(
             matches!(&outcome, SearchOutcome::Results(r) if r.len() == 1),
@@ -1150,15 +1181,16 @@ mod tests {
 
         let client = test_search_client();
         let url = format!("http://{addr}/search");
-        let request = SubRequest {
-            method: http::Method::GET,
-            uri: "/".parse().unwrap(),
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
-        };
+        let request = test_get_request();
 
         let outcome = client
-            .execute_search(&test_outbound(), CalloutContext::for_test(), &url, request, &shared_key_identity())
+            .execute_search(
+                &test_outbound(),
+                CalloutContext::for_test(),
+                &url,
+                request,
+                &shared_key_identity(),
+            )
             .await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
@@ -1177,15 +1209,16 @@ mod tests {
 
         let client = test_search_client();
         let url = format!("http://{addr}/search");
-        let request = SubRequest {
-            method: http::Method::GET,
-            uri: "/".parse().unwrap(),
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
-        };
+        let request = test_get_request();
 
         let outcome = client
-            .execute_search(&test_outbound(), CalloutContext::for_test(), &url, request, &shared_key_identity())
+            .execute_search(
+                &test_outbound(),
+                CalloutContext::for_test(),
+                &url,
+                request,
+                &shared_key_identity(),
+            )
             .await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
@@ -1205,15 +1238,16 @@ mod tests {
         let mut client = test_search_client();
         client.timeout = Duration::from_millis(50);
         let url = format!("http://{addr}/search");
-        let request = SubRequest {
-            method: http::Method::GET,
-            uri: "/".parse().unwrap(),
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
-        };
+        let request = test_get_request();
 
         let outcome = client
-            .execute_search(&test_outbound(), CalloutContext::for_test(), &url, request, &shared_key_identity())
+            .execute_search(
+                &test_outbound(),
+                CalloutContext::for_test(),
+                &url,
+                request,
+                &shared_key_identity(),
+            )
             .await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
@@ -1246,15 +1280,16 @@ mod tests {
 
         let client = test_search_client();
         let url = format!("http://{addr}/search");
-        let request = SubRequest {
-            method: http::Method::GET,
-            uri: "/".parse().unwrap(),
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
-        };
+        let request = test_get_request();
 
         let outcome = client
-            .execute_search(&test_outbound(), CalloutContext::for_test(), &url, request, &shared_key_identity())
+            .execute_search(
+                &test_outbound(),
+                CalloutContext::for_test(),
+                &url,
+                request,
+                &shared_key_identity(),
+            )
             .await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
@@ -1317,15 +1352,16 @@ mod tests {
 
         let client = test_search_client();
         let url = format!("http://{addr}/res/v1/web/search?q=test&count=5");
-        let request = SubRequest {
-            method: http::Method::GET,
-            uri: "/".parse().unwrap(),
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
-        };
+        let request = test_get_request();
 
         let outcome = client
-            .execute_search(&rejecting_outbound(), CalloutContext::for_test(), &url, request, &shared_key_identity())
+            .execute_search(
+                &rejecting_outbound(),
+                CalloutContext::for_test(),
+                &url,
+                request,
+                &shared_key_identity(),
+            )
             .await;
         assert!(
             matches!(outcome, SearchOutcome::Failed),
@@ -1439,15 +1475,16 @@ mod tests {
         // Brave client: the API key is deferred and injected by the executor only
         // at the resolved, pinned destination.
         let client = test_search_client();
-        let request = SubRequest {
-            method: http::Method::GET,
-            uri: "/".parse().unwrap(),
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
-        };
+        let request = test_get_request();
 
         let outcome = client
-            .execute_search(&outbound, CalloutContext::for_test(), &url, request, &shared_key_identity())
+            .execute_search(
+                &outbound,
+                CalloutContext::for_test(),
+                &url,
+                request,
+                &shared_key_identity(),
+            )
             .await;
 
         // The pinned provider still served the callout despite the retarget, the
@@ -1479,8 +1516,7 @@ mod tests {
         let rx = spawn_recording_server(
             listener,
             200,
-            &json!({"web": {"results": [{"title": "T", "url": "https://e.example", "description": "d"}]}})
-                .to_string(),
+            &json!({"web": {"results": [{"title": "T", "url": "https://e.example", "description": "d"}]}}).to_string(),
         );
         // Brave client whose SHARED key is "shared-secret".
         let config = brave_config_with_shared_key("shared-secret");
@@ -1490,19 +1526,22 @@ mod tests {
             user_credential: Some(SecretString::from("per-user-secret".to_owned())),
         };
         let url = format!("http://{addr}/res/v1/web/search?q=test&count=5");
-        let request = SubRequest {
-            method: http::Method::GET,
-            uri: "/".parse().unwrap(),
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
-        };
+        let request = test_get_request();
         let _unused = client
             .execute_search(&test_outbound(), CalloutContext::for_test(), &url, request, &identity)
             .await;
-        let received = rx.recv_timeout(Duration::from_secs(1)).expect("provider received callout");
+        let received = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("provider received callout");
         let received = String::from_utf8_lossy(&received).to_ascii_lowercase();
-        assert!(received.contains("per-user-secret"), "per-user secret must be injected: {received}");
-        assert!(!received.contains("shared-secret"), "shared key must NOT be injected when a per-user secret is set");
+        assert!(
+            received.contains("per-user-secret"),
+            "per-user secret must be injected: {received}"
+        );
+        assert!(
+            !received.contains("shared-secret"),
+            "shared key must NOT be injected when a per-user secret is set"
+        );
     }
 
     #[tokio::test]
@@ -1516,14 +1555,21 @@ mod tests {
             owner: Some(crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap()),
             user_credential: None,
         };
-        let ext = client.stage_extensions(&target, url, &identity).expect("staging succeeds");
-        let owner = ext.get::<crate::StateOwner>().expect("owner projected into child extensions");
+        let ext = client
+            .stage_extensions(&target, url, &identity)
+            .expect("staging succeeds");
+        let owner = ext
+            .get::<crate::StateOwner>()
+            .expect("owner projected into child extensions");
         assert_eq!(owner.tenant_id(), "tenant-a");
 
         let no_owner = client
             .stage_extensions(&target, url, &shared_key_identity())
             .expect("staging succeeds");
-        assert!(no_owner.get::<crate::StateOwner>().is_none(), "no owner ⇒ nothing projected");
+        assert!(
+            no_owner.get::<crate::StateOwner>().is_none(),
+            "no owner ⇒ nothing projected"
+        );
     }
 
     #[test]

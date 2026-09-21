@@ -9,8 +9,7 @@
 use praxis_filter::HttpFilterContext;
 use secrecy::{ExposeSecret as _, SecretString};
 
-use crate::CalloutCredentials;
-use crate::state_owner::StateOwner;
+use crate::{CalloutCredentials, state_owner::StateOwner};
 
 /// Identity + credential resolved for a single callout.
 #[derive(Debug)]
@@ -60,7 +59,7 @@ pub(crate) fn stage_callout_identity(
                 Some(secret) => Some(secret),
                 None => return Err(CalloutContextMissing::Credential { slot: name.to_owned() }),
             }
-        }
+        },
     };
 
     Ok(CalloutIdentity { owner, user_credential })
@@ -69,11 +68,14 @@ pub(crate) fn stage_callout_identity(
 #[cfg(test)]
 #[expect(clippy::expect_used, clippy::panic, reason = "tests")]
 mod tests {
-    use super::*;
-    use crate::test_utils::{make_filter_context, make_request};
-    use crate::{CalloutCredentials, StateOwner};
     use http::Method;
     use secrecy::SecretString;
+
+    use super::*;
+    use crate::{
+        CalloutCredentials, StateOwner,
+        test_utils::{make_filter_context, make_request},
+    };
 
     #[test]
     fn no_slot_configured_yields_no_owner_and_no_credential() {
@@ -89,9 +91,8 @@ mod tests {
     fn owner_is_captured_when_present() {
         let req = make_request(Method::POST, "/v1/responses");
         let mut ctx = make_filter_context(&req);
-        ctx.extensions.insert(
-            StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").expect("valid owner"),
-        );
+        ctx.extensions
+            .insert(StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").expect("valid owner"));
 
         let id = stage_callout_identity(&ctx, None).expect("ok");
         let owner = id.owner.expect("owner captured from ctx");

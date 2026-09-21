@@ -13,17 +13,22 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, HttpFilter, HttpFilterContext, Request, Response, StreamTerminationCause,
     SubRequestResponseMode,
 };
+use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Value, json};
 
 use super::*;
-use crate::callout_identity::CalloutIdentity;
-use crate::CalloutCredentials;
-use crate::test_utils::{make_filter_context, make_request, make_response};
-use secrecy::{ExposeSecret as _, SecretString};
+use crate::{
+    CalloutCredentials,
+    callout_identity::CalloutIdentity,
+    test_utils::{make_filter_context, make_request, make_response},
+};
 
 /// A callout identity with no owner and no per-user credential (shared-key path).
 fn shared_key_identity() -> CalloutIdentity {
-    CalloutIdentity { owner: None, user_credential: None }
+    CalloutIdentity {
+        owner: None,
+        user_credential: None,
+    }
 }
 
 fn test_filter() -> Box<dyn HttpFilter> {
@@ -1490,7 +1495,10 @@ fn present_required_credential_resolves_to_per_user_secret() {
         .expect("a populated required slot resolves");
 
     assert_eq!(
-        identity.user_credential.expect("per-user secret present").expose_secret(),
+        identity
+            .user_credential
+            .expect("per-user secret present")
+            .expose_secret(),
         "user-secret"
     );
 }

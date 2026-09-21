@@ -11,7 +11,9 @@
 
 pub mod anthropic;
 pub mod azure;
+mod callout_credentials;
 pub mod callout_headers;
+mod callout_identity;
 pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
@@ -22,8 +24,6 @@ pub(crate) mod mcp_client;
 pub mod openai;
 pub mod operation;
 pub mod promotion;
-mod callout_credentials;
-mod callout_identity;
 mod state_owner;
 mod state_owner_headers;
 #[cfg(feature = "store")]

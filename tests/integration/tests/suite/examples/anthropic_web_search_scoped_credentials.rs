@@ -21,8 +21,8 @@ use std::{
 };
 
 use praxis_test_utils::{
-    StatefulCapturingBackend, build_pipeline, example_config_path, free_port, http_send, parse_body,
-    parse_status, patch_yaml, start_proxy,
+    StatefulCapturingBackend, build_pipeline, example_config_path, free_port, http_send, parse_body, parse_status,
+    patch_yaml, start_proxy,
 };
 use serde_json::{Value, json};
 
@@ -31,7 +31,8 @@ const EXAMPLE: &str = "anthropic/web-search-scoped-credentials.yaml";
 /// Read the unified example and rewrite the proxy/backend ports and the search
 /// provider endpoint so the loop calls the local stubs.
 fn base_example_yaml(proxy_port: u16, model_port: u16, search_port: u16) -> String {
-    let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("read web-search-scoped-credentials example");
+    let yaml =
+        std::fs::read_to_string(example_config_path(EXAMPLE)).expect("read web-search-scoped-credentials example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8000", model_port)]));
     let yaml = yaml.replace(
         "api_key: ${WEB_SEARCH_API_KEY}",
@@ -185,16 +186,9 @@ fn missing_credential_fails_closed_with_401_authentication_error() {
         "Anthropic error envelope has no code field"
     );
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("brave_search"),
+        body["error"]["message"].as_str().unwrap().contains("brave_search"),
         "the error message names the missing slot: {}",
         body["error"]["message"]
     );
-    assert_eq!(
-        search.request_count(),
-        0,
-        "no provider callout on a missing credential"
-    );
+    assert_eq!(search.request_count(), 0, "no provider callout on a missing credential");
 }

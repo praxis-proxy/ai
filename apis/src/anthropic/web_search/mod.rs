@@ -18,10 +18,12 @@ use praxis_filter::{
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
-use crate::callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity};
-use crate::web_search::{
-    CalloutContext, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, WebSearchFilterConfig,
-    build_config, format_search_results,
+use crate::{
+    callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
+    web_search::{
+        CalloutContext, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, WebSearchFilterConfig,
+        build_config, format_search_results,
+    },
 };
 
 /// Registry name and filter-results namespace.
@@ -362,7 +364,13 @@ impl AnthropicWebSearchFilter {
         identity: &CalloutIdentity,
     ) -> SearchOutcome {
         self.search_client
-            .search(&self.outbound, callout, &pending.query, Some(self.default_context_size), identity)
+            .search(
+                &self.outbound,
+                callout,
+                &pending.query,
+                Some(self.default_context_size),
+                identity,
+            )
             .await
     }
 
