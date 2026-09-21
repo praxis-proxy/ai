@@ -8,7 +8,10 @@ publish = false
 description = "llm-d environment integration tests for Praxis AI"
 
 [features]
-default = []
+default = ["store-postgres"]
+store-postgres = ["praxis-ai-proxy/store-postgres", "praxis-test-utils/store-postgres"]
+store-sqlite = ["praxis-ai-proxy/store-sqlite", "praxis-test-utils/store-sqlite"]
+store-all = ["store-postgres", "store-sqlite"]
 llmd-ext-proc = ["praxis-ai-proxy/llmd-ext-proc", "praxis-test-utils/llmd-ext-proc"]
 
 [lints]

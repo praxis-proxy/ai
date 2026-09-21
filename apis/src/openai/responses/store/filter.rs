@@ -57,23 +57,27 @@ use serde_json::Value;
 use tokio::sync::OnceCell;
 use tracing::{debug, trace, warn};
 
+#[cfg(feature = "store-postgres")]
+use super::config::revalidate_postgres_host;
 use super::{
     super::{
-        DEFAULT_STORE_NAME, DEFAULT_TENANT_ID, TENANT_METADATA_KEY, append_stored_input_items,
-        compact::is_explicit_compact_request, error::responses_error_rejection, state::ResponsesState,
+        DEFAULT_STORE_NAME, append_stored_input_items, compact::is_explicit_compact_request,
+        error::responses_error_rejection, state::ResponsesState,
     },
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
-    config::{ResponseStoreConfig, StorageBackend, revalidate_postgres_host, validate_config},
+    config::{ResponseStoreConfig, StorageBackend, validate_config},
     list_input_items,
 };
+#[cfg(feature = "store-postgres")]
+use crate::store::PostgresResponseStore;
+#[cfg(feature = "store-sqlite")]
+use crate::store::SqliteResponseStore;
 use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
     openai::include::{IncludeFields, decode_query_component_strict, parse_include},
-    store::{
-        PendingApprovalRecord, PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry,
-        SqliteResponseStore, StoreError,
-    },
+    state_owner::{StateOwner, require_state_owner},
+    store::{PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, StoreError},
 };
 
 /// Persists Responses API responses to the configured response store backend.
@@ -82,10 +86,11 @@ use crate::{
 ///
 /// ```yaml
 /// filter: openai_response_store
-/// backend: sqlite
-/// database_url: sqlite://responses.db?mode=rwc
+/// backend: postgres
+/// database_url: postgres://praxis:password@db.example.com/praxis
 /// responses_table: openai_responses
 /// conversations_table: openai_conversation_messages
+/// allow_private_database_url: true
 /// ```
 pub struct ResponseStoreFilter {
     /// Parsed configuration.
@@ -120,6 +125,7 @@ impl ResponseStoreFilter {
     #[expect(clippy::too_many_lines, reason = "tracing macros inflate complexity")]
     pub(super) async fn build_store(&self) -> Result<Arc<dyn ResponseStore>, StoreError> {
         match self.config.backend {
+            #[cfg(feature = "store-sqlite")]
             StorageBackend::Sqlite => {
                 let store = SqliteResponseStore::new(
                     self.config.database_url.expose_secret(),
@@ -134,22 +140,22 @@ impl ResponseStoreFilter {
                     arc
                 })
             },
-
+            #[cfg(not(feature = "store-sqlite"))]
+            StorageBackend::Sqlite => Err(StoreError::Unavailable(
+                "sqlite backend was not compiled; enable the 'store-sqlite' feature".to_owned(),
+            )),
+            #[cfg(feature = "store-postgres")]
             StorageBackend::Postgres => {
                 revalidate_postgres_host(&self.config).map_err(|e| {
                     StoreError::Unavailable(format!("postgres host validation failed before connect: {e}"))
                 })?;
-                let ssl_root_cert = self.config.ssl_root_cert.as_ref().map(|s| {
-                    let secret: &str = s.expose_secret();
-                    secret
-                });
+                let tls = self.config.tls_config();
                 let store = Box::pin(PostgresResponseStore::new(
                     self.config.database_url.expose_secret(),
                     &self.config.responses_table,
                     &self.config.conversations_table,
                     None,
-                    self.config.ssl_mode,
-                    ssl_root_cert,
+                    &tls,
                     self.config.pool.as_ref(),
                 ))
                 .await;
@@ -158,6 +164,10 @@ impl ResponseStoreFilter {
                     arc
                 })
             },
+            #[cfg(not(feature = "store-postgres"))]
+            StorageBackend::Postgres => Err(StoreError::Unavailable(
+                "postgres backend was not compiled; enable the 'store-postgres' feature".to_owned(),
+            )),
         }
     }
 
@@ -228,21 +238,21 @@ impl ResponseStoreFilter {
     }
 
     /// Handle `DELETE /v1/responses/{id}` by deleting from the store.
-    async fn handle_delete(&self, tenant_id: &str, id: &str) -> Result<FilterAction, FilterError> {
+    async fn handle_delete(&self, owner: &StateOwner, id: &str) -> Result<FilterAction, FilterError> {
         let Some(store) = self.ensure_store().await else {
             return Ok(FilterAction::Reject(reject_store_error()));
         };
 
         let deleted = store
-            .delete_response(tenant_id, id)
+            .delete_response(owner, id)
             .await
             .map_err(|e| FilterError::from(format!("openai_response_store: delete failed: {e}")))?;
 
         if deleted {
-            debug!(id, tenant_id, "response deleted");
+            debug!(id, "response deleted");
             Ok(FilterAction::Reject(delete_success_rejection(id)?))
         } else {
-            debug!(id, tenant_id, "response not found for delete");
+            debug!(id, "response not found for delete");
             Ok(FilterAction::Reject(delete_not_found_rejection(id)))
         }
     }
@@ -287,20 +297,19 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let tenant_id = ctx
-            .get_metadata(TENANT_METADATA_KEY)
-            .unwrap_or(DEFAULT_TENANT_ID)
-            .to_owned();
-
-        let request_input = ctx
-            .remove_filter_state::<ResponseStoreRequestState>()
-            .map(|state| state.input);
+        let Some(capture) = ctx.extensions.remove::<ResponseStoreRequestState>() else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+        let Some(owner) = capture.owner else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+        let request_input = capture.input;
 
         // Capture the proxy-issued pending approvals before building the record;
         // the borrow is released before `build_record_from_state` re-borrows ctx.
         let pending_approvals = pending_approvals_from_ctx(ctx);
 
-        let Some(record) = build_record_from_state(ctx, &tenant_id, request_input) else {
+        let Some(record) = build_record_from_state(ctx, owner, request_input) else {
             trace!("skipping streaming persistence: no accumulated state");
             return Ok(FilterAction::Continue);
         };
@@ -318,19 +327,19 @@ impl ResponseStoreFilter {
         let Some((store, bytes)) = self.terminal_store_and_body(ctx, body) else {
             return Ok(FilterAction::Continue);
         };
-        let tenant_id = ctx
-            .get_metadata(TENANT_METADATA_KEY)
-            .unwrap_or(DEFAULT_TENANT_ID)
-            .to_owned();
-        let request_input = ctx
-            .remove_filter_state::<ResponseStoreRequestState>()
-            .map(|state| state.input);
+        let Some(capture) = ctx.extensions.remove::<ResponseStoreRequestState>() else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+        let Some(owner) = capture.owner else {
+            return Ok(FilterAction::Reject(reject_store_error()));
+        };
+        let request_input = capture.input;
         let state_messages = ctx
             .extensions
             .get::<ResponsesState>()
             .map(|state| state.persisted_messages.clone());
         let pending_approvals = pending_approvals_from_ctx(ctx);
-        let Some(record) = parse_response_record(bytes, &tenant_id, request_input, state_messages) else {
+        let Some(record) = parse_response_record(bytes, owner, request_input, state_messages) else {
             return Ok(FilterAction::Continue);
         };
 
@@ -344,9 +353,32 @@ impl ResponseStoreFilter {
 // -----------------------------------------------------------------------------
 
 /// Request-phase data needed when persisting the response.
+#[derive(Default)]
 struct ResponseStoreRequestState {
     /// Original `input` value from the Responses API create request.
-    input: Value,
+    input: Option<Value>,
+    /// Owner captured before inference begins.
+    owner: Option<StateOwner>,
+}
+
+/// Capture the immutable owner once, before inference or a body-first consumer.
+fn capture_persistence_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterAction> {
+    if !request_will_persist_response(ctx) {
+        return Ok(());
+    }
+    let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
+    if state.owner.is_none() {
+        state.owner = Some(require_state_owner(ctx)?.clone());
+    }
+    ctx.extensions.insert(state);
+    Ok(())
+}
+
+/// Retain request input alongside the already captured owner.
+fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) {
+    let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
+    state.input = Some(input);
+    ctx.extensions.insert(state);
 }
 
 /// Fields extracted from the response JSON for the store record.
@@ -364,9 +396,8 @@ impl ResponseCapture {
         let input = request_input
             .or_else(|| json.get("input").cloned())
             .unwrap_or(Value::Null);
-        let output = json.get("output").cloned().unwrap_or(Value::Null);
         let history_input = state_messages.map_or_else(|| input.clone(), Value::Array);
-        let messages = assemble_stored_messages(&history_input, &output);
+        let messages = assemble_stored_messages(history_input, json.get("output"));
 
         Self { input, messages }
     }
@@ -376,28 +407,26 @@ impl ResponseCapture {
 /// create request body.
 fn extract_request_input(body: &Option<Bytes>) -> Option<Value> {
     let bytes = body.as_ref().filter(|b| !b.is_empty())?;
-    let json: Value = match serde_json::from_slice(bytes) {
+    let mut json: Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
         Err(e) => {
             trace!(error = %e, "response store: invalid request JSON");
             return None;
         },
     };
-    json.get("input").cloned()
+    json.as_object_mut()?.remove("input")
 }
 
 /// Build the stored conversation history from response input and output.
-fn assemble_stored_messages(input: &Value, output: &Value) -> Value {
+fn assemble_stored_messages(input: Value, output: Option<&Value>) -> Value {
     let mut messages = Vec::new();
 
-    append_stored_input_items(&mut messages, input.clone());
+    append_stored_input_items(&mut messages, input);
 
-    if !output.is_null() {
-        if let Some(items) = output.as_array() {
-            messages.extend(items.iter().cloned());
-        } else {
-            messages.push(output.clone());
-        }
+    match output {
+        Some(Value::Array(items)) => messages.extend(items.iter().cloned()),
+        Some(output) if !output.is_null() => messages.push(output.clone()),
+        Some(_) | None => {},
     }
 
     Value::Array(messages)
@@ -430,7 +459,7 @@ fn register_store_in_context(ctx: &HttpFilterContext<'_>, store: &Arc<dyn Respon
     // process has one default Responses store shared by listener pipelines.
     // If multi-store-per-instance support is added later, this registry key
     // must become config- or listener-scoped instead of "default".
-    if registry.get(DEFAULT_STORE_NAME).is_some() {
+    if registry.contains(DEFAULT_STORE_NAME) {
         return;
     }
     let name: Arc<str> = Arc::from(DEFAULT_STORE_NAME);
@@ -560,6 +589,22 @@ fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.get_metadata("openai_responses_format.stream") == Some("true")
 }
 
+/// Return whether `openai_stream_events` has emitted the client-visible terminal
+/// `response.completed` frame as a *deferred, non-end-of-stream* chunk for the
+/// current logical stream (#937).
+///
+/// Set only by `emit_deferred_terminal`. When true, [`ResponsesState::response_object`]
+/// is already canonical and the terminal frame is in the non-end-of-stream chunk
+/// this filter is about to release, so the store persists before releasing it and
+/// then skips the redundant end-of-stream persist. A buffered local completion
+/// (`encode_local_completion`) leaves this unset so it still persists at
+/// end-of-stream, where its buffered body is written only after the store runs.
+fn streaming_terminal_emitted(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ResponsesState>()
+        .is_some_and(|state| state.logical_stream_terminal_emitted)
+}
+
 /// Return whether the request references a previous response.
 fn has_previous_response_id(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.get_metadata("openai_responses_format.has_previous_response_id") == Some("true")
@@ -611,7 +656,7 @@ fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
 /// `None` for invalid JSON or missing required fields.
 fn parse_response_record(
     bytes: &[u8],
-    tenant_id: &str,
+    owner: StateOwner,
     request_input: Option<Value>,
     state_messages: Option<Vec<Value>>,
 ) -> Option<ResponseRecord> {
@@ -636,7 +681,7 @@ fn parse_response_record(
 
     Some(ResponseRecord {
         id: id.to_owned(),
-        tenant_id: tenant_id.to_owned(),
+        owner,
         created_at,
         model: model.to_owned(),
         response_object: json,
@@ -652,7 +697,7 @@ fn parse_response_record(
 /// are missing.
 pub(super) fn build_record_from_state(
     ctx: &HttpFilterContext<'_>,
-    tenant_id: &str,
+    owner: StateOwner,
     request_input: Option<Value>,
 ) -> Option<ResponseRecord> {
     let state = ctx.extensions.get::<ResponsesState>()?;
@@ -677,7 +722,7 @@ pub(super) fn build_record_from_state(
 
     Some(ResponseRecord {
         id: id.to_owned(),
-        tenant_id: tenant_id.to_owned(),
+        owner,
         created_at,
         model: model.to_owned(),
         response_object: json.clone(),
@@ -772,6 +817,10 @@ impl HttpFilter for ResponseStoreFilter {
         BodyMode::Stream
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "request routing and pre-inference owner capture remain one lifecycle hook"
+    )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if is_responses_format(ctx) && !is_streaming_request(ctx) {
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
@@ -788,10 +837,17 @@ impl HttpFilter for ResponseStoreFilter {
 
         if ctx.request.method == http::Method::DELETE {
             if let Some(id) = extract_response_id(ctx.request.uri.path()) {
-                let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-                return self.handle_delete(tenant_id, id).await;
+                let owner = match require_state_owner(ctx) {
+                    Ok(owner) => owner.clone(),
+                    Err(action) => return Ok(action),
+                };
+                return self.handle_delete(&owner, id).await;
             }
             return Ok(FilterAction::Continue);
+        }
+
+        if let Err(action) = capture_persistence_owner(ctx) {
+            return Ok(action);
         }
 
         if !should_init_store_for_request(ctx) {
@@ -819,10 +875,13 @@ impl HttpFilter for ResponseStoreFilter {
         if !end_of_stream || ctx.request.method != http::Method::POST {
             return Ok(FilterAction::Continue);
         }
+        if let Err(action) = capture_persistence_owner(ctx) {
+            return Ok(action);
+        }
         if !should_skip(ctx)
             && let Some(input) = extract_request_input(body)
         {
-            ctx.insert_filter_state(ResponseStoreRequestState { input });
+            capture_request_input(ctx, input);
         }
         if should_init_store_for_request(ctx) {
             match &self.get_or_init_store().await {
@@ -870,7 +929,37 @@ impl HttpFilter for ResponseStoreFilter {
 
         if is_streaming_request(ctx) {
             if !end_of_stream {
+                // #937: the deferred terminal `response.completed` frame reaches
+                // this pre-IRR filter as a non-end-of-stream chunk, before the
+                // empty end-of-stream callback where streaming persistence
+                // historically ran. Once stream_events marks the terminal frame
+                // emitted, `response_object` is canonical: persist synchronously
+                // BEFORE releasing this chunk so a client never observes
+                // completion for a non-durable record.
+                if streaming_terminal_emitted(ctx) {
+                    // `persist_from_streaming_state` returns `Continue` once the
+                    // record is durable (or persistence is legitimately skipped,
+                    // e.g. no store configured); we still release the frame
+                    // ourselves in that case. Anything else is a fail-closed
+                    // decision — a `Reject` when the immutable owner/request
+                    // state is missing (#1197), or an `Err` on a persistence
+                    // failure — and must be propagated so the client never
+                    // observes `response.completed` for an unpersisted record.
+                    match self.persist_from_streaming_state(ctx)? {
+                        FilterAction::Continue => {},
+                        action => return Ok(action),
+                    }
+                }
                 return Ok(FilterAction::Release);
+            }
+            // A deferred terminal frame (flag set) already persisted at the
+            // non-end-of-stream chunk above, so skip the redundant persist here.
+            // Everything else — a buffered local completion (whose terminal is
+            // delivered in this end-of-stream body) and a plain single-round
+            // stream — leaves the flag unset and persists here, before the body
+            // is written downstream.
+            if streaming_terminal_emitted(ctx) {
+                return Ok(FilterAction::Continue);
             }
             return self.persist_from_streaming_state(ctx);
         }
@@ -921,6 +1010,10 @@ impl ResponseStoreFilter {
         clippy::cognitive_complexity,
         reason = "query validation adds one early-return branch"
     )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "owner-scoped lookup and OpenAI response mapping are one handler"
+    )]
     async fn handle_get_response(&self, ctx: &HttpFilterContext<'_>, id: &str) -> FilterAction {
         if let Err(msg) = validate_get_response_query_params(ctx.request.uri.query()) {
             debug!(response_id = id, error = %msg, "invalid get-response query parameter");
@@ -931,10 +1024,13 @@ impl ResponseStoreFilter {
             return FilterAction::Reject(reject_store_error());
         };
 
-        let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-        debug!(response_id = id, tenant_id, "retrieving stored response");
+        let owner = match require_state_owner(ctx) {
+            Ok(owner) => owner,
+            Err(action) => return action,
+        };
+        debug!(response_id = id, "retrieving stored response");
 
-        match store.get_response(tenant_id, id).await {
+        match store.get_response(owner, id).await {
             Ok(Some(record)) => {
                 let body = serde_json::to_vec(&record.response_object).unwrap_or_default();
                 FilterAction::Reject(
@@ -961,10 +1057,10 @@ impl ResponseStoreFilter {
             return Err(FilterAction::Reject(reject_store_error()));
         };
 
-        let tenant_id = ctx.get_metadata(TENANT_METADATA_KEY).unwrap_or(DEFAULT_TENANT_ID);
-        debug!(response_id = id, tenant_id, "retrieving input items");
+        let owner = require_state_owner(ctx)?;
+        debug!(response_id = id, "retrieving input items");
 
-        match store.get_response(tenant_id, id).await {
+        match store.get_response(owner, id).await {
             Ok(Some(r)) => Ok(r),
             Ok(None) => {
                 debug!(response_id = id, "response not found for input_items");

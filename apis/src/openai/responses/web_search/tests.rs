@@ -315,7 +315,6 @@ api_key: "{api_key}"
 default_context_size: medium
 timeout_ms: 5000
 base_url: "{base_url}"
-allow_private_base_url: true
 "#,
     ))
     .unwrap()
@@ -1288,7 +1287,7 @@ fn format_search_results_multiple() {
 // -----------------------------------------------------------------------------
 
 /// Brave mock that serves every connection and counts dispatched requests.
-fn spawn_counting_brave_mock(listener: std::net::TcpListener) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+fn spawn_counting_brave_mock(listener: std::net::TcpListener) -> Arc<std::sync::atomic::AtomicUsize> {
     use std::{
         io::{Read as _, Write as _},
         sync::{

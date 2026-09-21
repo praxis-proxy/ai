@@ -6,8 +6,7 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, example_config_path, free_port, http_send, json_post, parse_body, parse_header, parse_status, patch_yaml,
-    start_proxy,
+    Backend, example_config_path, free_port, http_send, parse_body, parse_header, parse_status, patch_yaml, start_proxy,
 };
 use sqlx::Row as _;
 
@@ -18,6 +17,8 @@ use sqlx::Row as _;
 const RESPONSE_JSON: &str = r#"{"id":"resp_stream_example","created_at":1000,"model":"gpt-4.1","object":"response","status":"completed","input":"Hello streaming","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hi from stream"}]}]}"#;
 
 const RESPONSES_TABLE: &str = "openai_responses";
+
+const OWNER_ASSERTION: &str = "v1.WyJzdHJlYW0tdGVuYW50IiwidXJuOnByYXhpczp0ZXN0IiwiYWxpY2UiXQ";
 
 const STREAMING_EXAMPLES: [(&str, u64); 5] = [
     ("openai/responses/agentic-loop.yaml", 360_000),
@@ -83,7 +84,7 @@ async fn stream_events_accumulates_state_and_persists_response_to_sqlite() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
+        &json_post_with_owner(
             "/v1/responses",
             r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
         ),
@@ -123,7 +124,7 @@ async fn stream_events_accumulates_state_and_persists_response_to_sqlite() {
     let model: String = row.get("model");
 
     assert_eq!(id, "resp_stream_example", "persisted id should match stream");
-    assert_eq!(tenant_id, "default", "default tenant should be used");
+    assert_eq!(tenant_id, "stream-tenant", "trusted owner tenant should be persisted");
     assert_eq!(created_at, 1000, "persisted created_at should match stream");
     assert_eq!(model, "gpt-4.1", "persisted model should match stream");
 
@@ -197,7 +198,7 @@ async fn stream_events_incremental_accumulation_before_terminal() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
+        &json_post_with_owner(
             "/v1/responses",
             r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
         ),
@@ -255,7 +256,7 @@ async fn stream_events_forwards_backend_error_transparently() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
+        &json_post_with_owner(
             "/v1/responses",
             r#"{"model":"nonexistent","input":"Hello","stream":true}"#,
         ),
@@ -272,6 +273,71 @@ async fn stream_events_forwards_backend_error_transparently() {
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("backend JSON should be forwarded intact");
     assert_eq!(parsed["error"]["message"], "model not found");
     assert_eq!(parsed["error"]["code"], "model_not_found");
+
+    drop(proxy);
+    cleanup_sqlite_files(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_events_idle_backend_is_cut_off_by_read_timeout() {
+    use std::time::{Duration, Instant};
+
+    let first_event = "event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n";
+    let backend_guard = Backend::chunked(vec![
+        first_event.to_owned(),
+        "event: response.completed\ndata: {}\n\n".to_owned(),
+    ])
+    .header("content-type", "text/event-stream")
+    .stall_after_first_chunk(Duration::from_secs(10))
+    .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let (db_url, db_path) = temp_sqlite_url("stream_events_idle");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
+        .expect("example config should exist");
+    // `openai_stream_events` sits after load_balancer in the example so IRR
+    // body hooks see the selected peer. Do not also shrink `read_timeout_ms`;
+    // that would hide a missing live-body recap.
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", &db_url).replace(
+        "              - filter: openai_stream_events\n",
+        "              - filter: openai_stream_events\n                timeout_secs: 1\n",
+    );
+    let patched = patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let started = Instant::now();
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_owner(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
+        ),
+    );
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "an idle backend after the first SSE event must be cut off by timeout_secs, not held until the 10s stall; elapsed={elapsed:?}"
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "headers should already be committed as SSE: {raw}"
+    );
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("response.in_progress"),
+        "the first SSE event should reach the client before the idle abort: {body}"
+    );
+    assert!(
+        !body.contains("response.completed"),
+        "the stalled backend must not be able to finish the stream after the idle deadline: {body}"
+    );
 
     drop(proxy);
     cleanup_sqlite_files(&db_path);
@@ -320,7 +386,7 @@ async fn stream_events_fails_closed_when_accumulation_budget_exceeded() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post(
+        &json_post_with_owner(
             "/v1/responses",
             r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
         ),
@@ -372,6 +438,15 @@ fn temp_sqlite_url(test_name: &str) -> (String, std::path::PathBuf) {
         .as_nanos();
     let db_path = std::env::temp_dir().join(format!("praxis_integ_{test_name}_{}_{nanos}.db", std::process::id()));
     (format!("sqlite://{}?mode=rwc", db_path.display()), db_path)
+}
+
+fn json_post_with_owner(path: &str, body: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         x-authenticated-state-owner: {OWNER_ASSERTION}\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 fn cleanup_sqlite_files(db_path: &std::path::Path) {

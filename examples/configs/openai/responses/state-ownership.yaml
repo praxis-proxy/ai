@@ -1,0 +1,68 @@
+# Trusted OpenAI State Ownership
+#
+# Provider-neutral owner isolation for persisted OpenAI Responses and Conversations.
+# A trusted authentication boundary must replace (not merely preserve) the
+# configured header before traffic reaches this listener. Direct untrusted
+# access to this listener would let a caller forge an owner assertion.
+#
+# The assertion wire format is:
+#
+#   x-authenticated-state-owner: v1.<base64url-no-padding(JSON [tenant, issuer, subject])>
+#
+# The three strings form one immutable storage owner. Subjects are not assumed
+# to be globally unique, so tenant and issuer are always part of the key. The
+# filter validates the assertion, installs request-local ownership context, and
+# strips the transport header before any upstream request is sent.
+#
+# This enforces resource ownership only. It does not evaluate authorization
+# policy. A later policy integration can decide whether the authenticated owner
+# may perform an operation, without changing the storage ownership contract.
+#
+# `single_tenant` is available for isolated development deployments with one
+# shared owner. Multi-user deployments should use `trusted_owner` as below.
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [owned-state-pipeline]
+
+filter_chains:
+  - name: owned-state-pipeline
+    filters:
+      - filter: state_owner
+        mode: trusted_owner
+        header: x-authenticated-state-owner
+
+      - filter: openai_responses_format
+        # Conversation API bodies are handled locally later in this chain.
+        on_invalid: continue
+
+      - filter: openai_responses_validate
+
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://owned-state.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_responses_rehydrate
+
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite://owned-state.db?mode=rwc"
+        conversations_table: openai_conversations
+        items_table: openai_conversation_items
+
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: "inference-backend"
+
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:8000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend

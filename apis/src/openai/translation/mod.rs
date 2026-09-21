@@ -43,6 +43,85 @@ mod tests {
     }
 
     #[test]
+    fn background_request_is_rejected_rather_than_silently_run_in_foreground() {
+        let error = map_error(&json!({"model": "m", "input": "hello", "background": true}));
+        assert_eq!(
+            error,
+            "Responses `background` has no Chat Completions representation: got true, \
+             this adapter supports only `background` false"
+        );
+    }
+
+    #[test]
+    fn truncation_auto_is_rejected_rather_than_silently_disabled() {
+        let error = map_error(&json!({"model": "m", "input": "hello", "truncation": "auto"}));
+        assert_eq!(
+            error,
+            "Responses `truncation` has no Chat Completions representation: got \"auto\", \
+             this adapter supports only `truncation` \"disabled\""
+        );
+    }
+
+    #[test]
+    fn explicit_default_background_and_truncation_translate() {
+        let chat = map(&json!({
+            "model": "m",
+            "input": "hello",
+            "background": false,
+            "truncation": "disabled"
+        }));
+
+        assert_eq!(chat["model"], "m");
+        assert!(
+            !chat.as_object().unwrap().contains_key("background"),
+            "background has no Chat Completions field to carry it"
+        );
+        assert!(
+            !chat.as_object().unwrap().contains_key("truncation"),
+            "truncation has no Chat Completions field to carry it"
+        );
+    }
+
+    #[test]
+    fn null_truncation_is_treated_as_the_default() {
+        let chat = map(&json!({"model": "m", "input": "hello", "truncation": Value::Null}));
+        assert_eq!(chat["model"], "m");
+    }
+
+    #[test]
+    fn malformed_background_and_truncation_are_also_rejected() {
+        // Neither field is forwarded, so the backend never sees it and cannot
+        // reject it for us. Anything that is not demonstrably the default would
+        // otherwise be dropped and then reported back as the default.
+        assert_eq!(
+            map_error(&json!({"model": "m", "input": "hello", "background": "yes"})),
+            "Responses `background` has no Chat Completions representation: got string, \
+             this adapter supports only `background` false"
+        );
+        assert_eq!(
+            map_error(&json!({"model": "m", "input": "hello", "truncation": 7})),
+            "Responses `truncation` has no Chat Completions representation: got number, \
+             this adapter supports only `truncation` \"disabled\""
+        );
+    }
+
+    #[test]
+    fn a_rejected_request_produces_no_chat_request_at_all() {
+        // The response resource hard-codes background:false and
+        // truncation:"disabled", which is only truthful because a request asking
+        // for anything else never reaches translation.
+        for request in [
+            json!({"model": "m", "input": "hello", "background": true}),
+            json!({"model": "m", "input": "hello", "truncation": "auto"}),
+        ] {
+            assert!(
+                super::chat_completions::responses_request_to_chat_request(&request).is_err(),
+                "{request} must fail closed"
+            );
+        }
+    }
+
+    #[test]
     fn state_overrides_supply_enriched_messages_tools_and_tool_choice() {
         let request = json!({
             "model": "gpt-4.1-mini",

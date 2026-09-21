@@ -52,9 +52,12 @@ async fn classifies_a_conversations_operation() {
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
-    assert_eq!(matched.family, OpenAiApiFamily::Conversations);
+    assert_eq!(
+        matched.application_protocol,
+        ApplicationProtocol::new("openai_conversations")
+    );
     assert_eq!(matched.operation_id, "getConversation");
-    assert_eq!(matched.transport, OpenAiTransport::Http);
+    assert_eq!(matched.transport, Transport::Http);
 
     assert_eq!(
         ctx.filter_metadata
@@ -71,6 +74,53 @@ async fn classifies_a_conversations_operation() {
 }
 
 #[tokio::test]
+async fn classifies_chat_completions_operations_from_the_request_head() {
+    for (method, path, operation_id) in [
+        ("POST", "/v1/chat/completions", "createChatCompletion"),
+        ("POST", "/v1/chat/completions/", "createChatCompletion"),
+        ("POST", "/v1/chat/completions?stream=true", "createChatCompletion"),
+        ("GET", "/v1/chat/completions", "listChatCompletions"),
+        ("GET", "/v1/chat/completions/chatcmpl_abc", "getChatCompletion"),
+        ("POST", "/v1/chat/completions/chatcmpl_abc", "updateChatCompletion"),
+        ("DELETE", "/v1/chat/completions/chatcmpl_abc", "deleteChatCompletion"),
+        (
+            "GET",
+            "/v1/chat/completions/chatcmpl_abc/messages",
+            "getChatCompletionMessages",
+        ),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied();
+        assert!(matched.is_some(), "{method} {path} must classify");
+        let matched = matched.unwrap();
+        assert_eq!(
+            matched.application_protocol,
+            ApplicationProtocol::new("openai_chat_completions"),
+            "{method} {path}"
+        );
+        assert_eq!(matched.operation_id, operation_id, "{method} {path}");
+        assert_eq!(matched.transport, Transport::Http, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn websocket_handshake_on_chat_completions_does_not_match() {
+    let filter = default_filter();
+    let mut request = req("GET", "/v1/chat/completions");
+    request.headers = websocket_headers();
+    let mut ctx = make_filter_context(&request);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    assert!(
+        ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
+        "Chat Completions is HTTP-only, so a websocket handshake must not classify"
+    );
+}
+
+#[tokio::test]
 async fn classifies_a_responses_operation() {
     let filter = default_filter();
     let request = req("POST", "/v1/responses");
@@ -78,7 +128,10 @@ async fn classifies_a_responses_operation() {
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
-    assert_eq!(matched.family, OpenAiApiFamily::Responses);
+    assert_eq!(
+        matched.application_protocol,
+        ApplicationProtocol::new("openai_responses")
+    );
     assert_eq!(matched.operation_id, "createResponse");
 }
 
@@ -157,7 +210,7 @@ async fn websocket_handshake_selects_the_websocket_operation() {
     drop(filter.on_request(&mut ctx).await.unwrap());
 
     let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
-    assert_eq!(matched.transport, OpenAiTransport::WebSocket);
+    assert_eq!(matched.transport, Transport::WebSocket);
     assert_eq!(matched.operation_id, "praxis_createResponseWebSocket");
 }
 
@@ -188,6 +241,7 @@ async fn static_endpoints_are_not_consumed_as_identifiers() {
 async fn unsupported_methods_publish_no_operation() {
     for (method, path) in [
         ("PUT", "/v1/responses"),
+        ("PUT", "/v1/chat/completions"),
         ("PATCH", "/v1/conversations/conv_1"),
         ("DELETE", "/v1/responses"),
     ] {
@@ -298,41 +352,38 @@ async fn upgrade_headers_on_a_non_get_request_still_classify() {
         .copied()
         .expect("upgrade headers must not suppress classification of a non-GET operation");
     assert_eq!(matched.operation_id, "createResponse");
-    assert_eq!(matched.transport, OpenAiTransport::Http);
+    assert_eq!(matched.transport, Transport::Http);
 }
 
 #[test]
 fn a_websocket_handshake_must_be_a_get() {
     assert_eq!(
         request_transport("POST", &websocket_headers()),
-        OpenAiTransport::Http,
+        Transport::Http,
         "only GET carries the RFC 6455 opening handshake"
     );
 }
 
 #[test]
 fn transport_detection_follows_the_opening_handshake() {
-    assert_eq!(
-        request_transport("GET", &websocket_headers()),
-        OpenAiTransport::WebSocket
-    );
-    assert_eq!(request_transport("GET", &http::HeaderMap::new()), OpenAiTransport::Http);
+    assert_eq!(request_transport("GET", &websocket_headers()), Transport::WebSocket);
+    assert_eq!(request_transport("GET", &http::HeaderMap::new()), Transport::Http);
 
     // Connection is a token list.
     let mut list = http::HeaderMap::new();
     list.insert(http::header::CONNECTION, "keep-alive, Upgrade".parse().unwrap());
     list.insert(http::header::UPGRADE, "websocket".parse().unwrap());
-    assert_eq!(request_transport("GET", &list), OpenAiTransport::WebSocket);
+    assert_eq!(request_transport("GET", &list), Transport::WebSocket);
 
     // Upgrade without Connection: upgrade is not a handshake.
     let mut partial = http::HeaderMap::new();
     partial.insert(http::header::UPGRADE, "websocket".parse().unwrap());
-    assert_eq!(request_transport("GET", &partial), OpenAiTransport::Http);
+    assert_eq!(request_transport("GET", &partial), Transport::Http);
 
     // Several nominated protocols are not treated as a websocket handshake.
     let mut multi = http::HeaderMap::new();
     multi.insert(http::header::CONNECTION, "Upgrade".parse().unwrap());
     multi.append(http::header::UPGRADE, "websocket".parse().unwrap());
     multi.append(http::header::UPGRADE, "h2c".parse().unwrap());
-    assert_eq!(request_transport("GET", &multi), OpenAiTransport::Http);
+    assert_eq!(request_transport("GET", &multi), Transport::Http);
 }

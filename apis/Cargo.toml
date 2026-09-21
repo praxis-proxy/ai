@@ -13,8 +13,11 @@ publish = false
 name = "praxis_ai_apis"
 
 [features]
-default = ["store"]
+default = ["store-postgres"]
 store = ["dep:sqlx", "dep:dashmap"]
+store-postgres = ["store", "sqlx/postgres", "sqlx/tls-native-tls"]
+store-sqlite = ["store", "sqlx/sqlite"]
+store-all = ["store-postgres", "store-sqlite"]
 praxis-main = []
 
 [lints]

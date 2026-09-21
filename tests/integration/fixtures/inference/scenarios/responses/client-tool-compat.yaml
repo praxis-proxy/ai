@@ -1,0 +1,34 @@
+version: 1
+id: responses/client-tool-compat
+description: Rich Codex custom client tool lowered to a private function on a function-only Responses backend, then restored to a custom_tool_call.
+protocol: openai_responses
+example_config: openai/responses/client-tool-compat.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.client_tool_compat.lower_restore
+turns:
+  - name: custom-tool-lower-restore
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Apply the patch.
+          store: false
+          stream: false
+          tools:
+            - type: custom
+              name: apply_patch
+              description: Apply a unified diff to the workspace.
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

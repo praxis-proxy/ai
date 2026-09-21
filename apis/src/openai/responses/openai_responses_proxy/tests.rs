@@ -535,7 +535,7 @@ async fn strips_conversation_from_outbound_body() {
 }
 
 #[tokio::test]
-async fn strips_both_previous_response_id_and_conversation() {
+async fn strips_locally_consumed_history_selectors() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -571,22 +571,24 @@ async fn strips_both_previous_response_id_and_conversation() {
 }
 
 #[tokio::test]
-async fn passthrough_strips_conversation_from_body() {
+async fn passthrough_preserves_conversation_in_body() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    let mut body = Some(Bytes::from(r#"{"model":"gpt-4.1","input":"hello","conversation":42}"#));
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"hello","conversation":{"id":"conv_native"}}"#,
+    ));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "passthrough conversation stripping should continue"
+        "passthrough conversation should continue"
     );
 
     let parsed: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
-    assert!(
-        parsed.get("conversation").is_none(),
-        "conversation should be stripped even without ResponsesState"
+    assert_eq!(
+        parsed["conversation"]["id"], "conv_native",
+        "passthrough must preserve the provider-owned conversation"
     );
     assert_eq!(parsed["model"], "gpt-4.1", "other fields should be preserved");
     assert!(
@@ -594,6 +596,79 @@ async fn passthrough_strips_conversation_from_body() {
             .iter()
             .all(|(k, _)| k.as_ref() != "content-length"),
         "filter must not set content-length (core handles framing)"
+    );
+}
+
+#[tokio::test]
+async fn rebuilt_body_preserves_conversation_without_local_rehydration() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": "hello",
+        "conversation": {"id": "conv_native"}
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4o","input":"hello","conversation":{"id":"conv_native"}}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "rebuilt request should continue to the provider"
+    );
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        rebuilt["conversation"]["id"], "conv_native",
+        "rebuilt request must preserve the provider-owned conversation"
+    );
+}
+
+#[tokio::test]
+async fn rebuilt_provider_conversation_continuation_sends_only_new_items() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let request_body = json!({
+        "model": "gpt-4o",
+        "input": "weather in SF",
+        "conversation": {"id": "conv_native"}
+    });
+    let mut state = ResponsesState::from_request_body(request_body);
+    state
+        .messages
+        .push(json!({"type": "function_call", "id": "fc_123", "call_id": "call_123"}));
+    state.provider_history_len = state.messages.len();
+    state
+        .messages
+        .push(json!({"type": "function_call_output", "call_id": "call_123", "output": "sunny"}));
+    state.iteration = 1;
+    state.mark_request_body_for_rebuild();
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4o","input":"weather in SF","conversation":{"id":"conv_native"}}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "provider-owned continuation should continue to the provider"
+    );
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        rebuilt["conversation"]["id"], "conv_native",
+        "provider-owned continuation must preserve its conversation"
+    );
+    assert_eq!(
+        rebuilt["input"],
+        json!([{"type": "function_call_output", "call_id": "call_123", "output": "sunny"}]),
+        "provider-owned continuation must send only the new tool result"
     );
 }
 

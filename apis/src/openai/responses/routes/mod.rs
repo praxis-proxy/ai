@@ -14,10 +14,19 @@
 
 use std::ops::Deref;
 
-use crate::openai::operation::{
-    OpenAiApiFamily, OpenAiHandlingMode, OpenAiHttpMethod, OpenAiOperationSpec, OpenAiRequestBody, OpenAiTransport,
-    OperationEntry, RouteParams, match_operation,
+use crate::{
+    openai::operation::OpenAiOperationSpec,
+    operation::{
+        ApplicationProtocol, HandlingMode, HttpMethod, OperationEntry, OperationSpec, RequestBody, RouteParams,
+        Transport, match_operation,
+    },
 };
+
+/// Application protocol these operations belong to.
+///
+/// Declared beside the registry that owns it, so registering a protocol
+/// never edits a shared list.
+const APPLICATION_PROTOCOL: ApplicationProtocol = ApplicationProtocol::new("openai_responses");
 
 /// Static metadata for one Responses operation.
 #[derive(Clone, Copy)]
@@ -37,21 +46,21 @@ impl Deref for ResponsesOperationSpec {
 }
 
 impl OperationEntry for ResponsesOperationSpec {
-    fn spec(&self) -> &OpenAiOperationSpec {
-        &self.definition
+    fn spec(&self) -> &OperationSpec {
+        &self.definition.runtime
     }
 }
 
 /// Convert a registry body declaration into a runtime request-body shape.
 macro_rules! request_body_shape {
     ([none]) => {
-        OpenAiRequestBody::None
+        RequestBody::None
     };
     ([required json]) => {
-        OpenAiRequestBody::Json { required: true }
+        RequestBody::Json { required: true }
     };
     ([optional json]) => {
-        OpenAiRequestBody::Json { required: false }
+        RequestBody::Json { required: false }
     };
 }
 
@@ -84,14 +93,16 @@ macro_rules! responses_operations {
                 ResponsesOperationSpec {
                     operation: ResponsesOperation::$operation,
                     definition: OpenAiOperationSpec {
-                        family: OpenAiApiFamily::Responses,
-                        operation_id: $operation_id,
-                        method: OpenAiHttpMethod::$method,
-                        transport: OpenAiTransport::$transport,
+                        runtime: OperationSpec {
+                            application_protocol: APPLICATION_PROTOCOL,
+                            operation_id: $operation_id,
+                            method: HttpMethod::$method,
+                            transport: Transport::$transport,
+                            runtime_path: concat!("/v1", $path),
+                            mode: HandlingMode::$mode,
+                            request_body: request_body_shape!($body),
+                        },
                         spec_path: $path,
-                        runtime_path: concat!("/v1", $path),
-                        mode: OpenAiHandlingMode::$mode,
-                        request_body: request_body_shape!($body),
                         owned_contract: None,
                     },
                 },
@@ -206,11 +217,7 @@ pub const fn operation_specs() -> &'static [ResponsesOperationSpec] {
 /// Matching rules, precedence, and path normalization live in the shared
 /// operation module. Transport separates `POST /v1/responses` from the
 /// `WebSocket` handshake at the same path.
-pub(crate) fn match_route<'a>(
-    method: &str,
-    path: &'a str,
-    transport: OpenAiTransport,
-) -> Option<MatchedResponsesRoute<'a>> {
+pub(crate) fn match_route<'a>(method: &str, path: &'a str, transport: Transport) -> Option<MatchedResponsesRoute<'a>> {
     match_operation(OPERATION_SPECS, method, path, transport).map(|matched| MatchedResponsesRoute {
         spec: matched.spec,
         params: matched.params,
@@ -229,13 +236,13 @@ mod tests {
     fn registry_keys_and_operation_ids_are_unique() {
         let keys = OPERATION_SPECS
             .iter()
-            .map(|spec| (spec.method, spec.transport.as_str(), spec.spec_path))
+            .map(|spec| (spec.method(), spec.transport().as_str(), spec.spec_path))
             .collect::<BTreeSet<_>>();
         assert_eq!(keys.len(), OPERATION_SPECS.len(), "duplicate method/transport/path key");
 
         let ids = OPERATION_SPECS
             .iter()
-            .map(|spec| spec.operation_id)
+            .map(|spec| spec.operation_id())
             .collect::<BTreeSet<_>>();
         assert_eq!(ids.len(), OPERATION_SPECS.len(), "duplicate operation ID");
     }
@@ -243,13 +250,13 @@ mod tests {
     #[test]
     fn every_registered_operation_resolves_from_its_own_template() {
         for spec in OPERATION_SPECS {
-            let path = spec.runtime_path.replace("{response_id}", "resp_test");
-            let matched = match_route(spec.method.as_str(), &path, spec.transport).unwrap();
+            let path = spec.runtime_path().replace("{response_id}", "resp_test");
+            let matched = match_route(spec.method().as_str(), &path, spec.transport()).unwrap();
             assert_eq!(
                 matched.spec.operation,
                 spec.operation,
                 "{} {path} resolved to the wrong operation",
-                spec.method.as_str()
+                spec.method().as_str()
             );
         }
     }
@@ -260,7 +267,7 @@ mod tests {
             ("/v1/responses/input_tokens", ResponsesOperation::CountInputTokens),
             ("/v1/responses/compact", ResponsesOperation::CompactConversation),
         ] {
-            let matched = match_route("POST", path, OpenAiTransport::Http).unwrap();
+            let matched = match_route("POST", path, Transport::Http).unwrap();
             assert_eq!(matched.spec.operation, expected, "{path}");
             assert_eq!(matched.response_id(), None, "{path} must not capture a response ID");
         }
@@ -268,33 +275,33 @@ mod tests {
 
     #[test]
     fn identifier_paths_still_capture_the_response_id() {
-        let matched = match_route("GET", "/v1/responses/resp_abc123", OpenAiTransport::Http).unwrap();
+        let matched = match_route("GET", "/v1/responses/resp_abc123", Transport::Http).unwrap();
         assert_eq!(matched.spec.operation, ResponsesOperation::GetResponse);
         assert_eq!(matched.response_id(), Some("resp_abc123"));
 
-        let matched = match_route("POST", "/v1/responses/resp_abc123/cancel", OpenAiTransport::Http).unwrap();
+        let matched = match_route("POST", "/v1/responses/resp_abc123/cancel", Transport::Http).unwrap();
         assert_eq!(matched.spec.operation, ResponsesOperation::CancelResponse);
         assert_eq!(matched.response_id(), Some("resp_abc123"));
 
-        let matched = match_route("GET", "/v1/responses/resp_abc123/input_items", OpenAiTransport::Http).unwrap();
+        let matched = match_route("GET", "/v1/responses/resp_abc123/input_items", Transport::Http).unwrap();
         assert_eq!(matched.spec.operation, ResponsesOperation::ListInputItems);
         assert_eq!(matched.response_id(), Some("resp_abc123"));
     }
 
     #[test]
     fn create_and_websocket_are_separated_without_reading_a_body() {
-        let create = match_route("POST", "/v1/responses", OpenAiTransport::Http).unwrap();
+        let create = match_route("POST", "/v1/responses", Transport::Http).unwrap();
         assert_eq!(create.spec.operation, ResponsesOperation::CreateResponse);
 
-        let socket = match_route("GET", "/v1/responses", OpenAiTransport::WebSocket).unwrap();
+        let socket = match_route("GET", "/v1/responses", Transport::WebSocket).unwrap();
         assert_eq!(socket.spec.operation, ResponsesOperation::CreateResponseWebSocket);
 
         assert!(
-            match_route("GET", "/v1/responses", OpenAiTransport::Http).is_none(),
+            match_route("GET", "/v1/responses", Transport::Http).is_none(),
             "a plain GET on the collection is not a registered operation"
         );
         assert!(
-            match_route("POST", "/v1/responses", OpenAiTransport::WebSocket).is_none(),
+            match_route("POST", "/v1/responses", Transport::WebSocket).is_none(),
             "create is not reachable over a websocket handshake"
         );
     }
@@ -310,7 +317,7 @@ mod tests {
             ("POST", "/v1/responses/resp_abc/input_items"),
         ] {
             assert!(
-                match_route(method, path, OpenAiTransport::Http).is_none(),
+                match_route(method, path, Transport::Http).is_none(),
                 "{method} {path} must not match a Responses operation"
             );
         }
@@ -321,15 +328,16 @@ mod tests {
         for spec in OPERATION_SPECS {
             let expected = match spec.operation {
                 // The only Responses operation the specification marks required.
-                ResponsesOperation::CreateResponse => OpenAiRequestBody::Json { required: true },
+                ResponsesOperation::CreateResponse => RequestBody::Json { required: true },
                 // `requestBody` present but `required` omitted, so false.
                 ResponsesOperation::CountInputTokens | ResponsesOperation::CompactConversation => {
-                    OpenAiRequestBody::Json { required: false }
+                    RequestBody::Json { required: false }
                 },
-                _ => OpenAiRequestBody::None,
+                _ => RequestBody::None,
             };
             assert_eq!(
-                spec.request_body, expected,
+                spec.request_body(),
+                expected,
                 "{:?} reported the wrong body shape",
                 spec.operation
             );
@@ -340,7 +348,7 @@ mod tests {
     fn only_the_websocket_operation_is_a_praxis_extension() {
         let extensions = OPERATION_SPECS
             .iter()
-            .filter(|spec| PROTOCOL_EXTENSION_OPERATION_IDS.contains(&spec.operation_id))
+            .filter(|spec| PROTOCOL_EXTENSION_OPERATION_IDS.contains(&spec.operation_id()))
             .map(|spec| spec.operation)
             .collect::<Vec<_>>();
         assert_eq!(extensions, vec![ResponsesOperation::CreateResponseWebSocket]);
@@ -348,8 +356,8 @@ mod tests {
         assert!(
             OPERATION_SPECS
                 .iter()
-                .filter(|spec| spec.transport == OpenAiTransport::WebSocket)
-                .all(|spec| PROTOCOL_EXTENSION_OPERATION_IDS.contains(&spec.operation_id)),
+                .filter(|spec| spec.transport() == Transport::WebSocket)
+                .all(|spec| PROTOCOL_EXTENSION_OPERATION_IDS.contains(&spec.operation_id())),
             "every websocket operation must be declared as a Praxis protocol extension"
         );
     }

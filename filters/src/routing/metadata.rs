@@ -86,6 +86,14 @@ pub(crate) const CREDENTIAL_KEY: &str = "intelligent_route.credential.key";
 /// Bearer token injection strategy identifier.
 pub(crate) const STRATEGY_BEARER_TOKEN: &str = "bearer_token";
 
+/// Raw API-key injection strategy identifier.
+pub(crate) const STRATEGY_APIKEY: &str = "apikey";
+
+/// True when `strategy` names a credential strategy the pipeline can inject.
+pub(crate) fn is_supported_strategy(strategy: &str) -> bool {
+    strategy == STRATEGY_BEARER_TOKEN || strategy == STRATEGY_APIKEY
+}
+
 /// Kubernetes Secret reference. Only locator fields are carried in routing
 /// configuration and request metadata.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
@@ -134,6 +142,15 @@ pub(crate) fn clear_credential_metadata(ctx: &mut HttpFilterContext<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_strategy_set_is_closed() {
+        assert!(is_supported_strategy(STRATEGY_BEARER_TOKEN));
+        assert!(is_supported_strategy(STRATEGY_APIKEY));
+        for strategy in ["", "oauth2", "sigv4", "basic", "Bearer_Token"] {
+            assert!(!is_supported_strategy(strategy), "{strategy} must stay unsupported");
+        }
+    }
 
     #[test]
     fn forwarded_routing_headers_are_not_praxis_reserved() {

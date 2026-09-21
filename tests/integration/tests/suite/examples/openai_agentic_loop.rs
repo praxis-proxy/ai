@@ -292,13 +292,14 @@ fn round_trip_captures_tool_and_model_requests() {
     });
 
     let proxy_port = free_port();
-    let config = load_loopback_mcp_config(proxy_port, model.port());
+    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model.port());
     let proxy = start_proxy(&config);
 
     let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
     let request_body = serde_json::json!({
         "model": "gpt-4.1",
         "input": "What is the weather in SF?",
+        "conversation": {"id": "conv_native"},
         "parallel_tool_calls": true,
         "tools": [{
             "type": "mcp",
@@ -308,10 +309,12 @@ fn round_trip_captures_tool_and_model_requests() {
             "require_approval": "never"
         }]
     });
-    let raw = http_send(
-        proxy.addr(),
-        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    let request = json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()).replacen(
+        "Content-Type: application/json",
+        "x-tenant-id: tenant-a\r\nContent-Type: application/json",
+        1,
     );
+    let raw = http_send(proxy.addr(), &request);
 
     assert_eq!(parse_status(&raw), 200, "round-trip should return 200");
     let body = parse_body(&raw);
@@ -336,6 +339,23 @@ fn round_trip_captures_tool_and_model_requests() {
         .iter()
         .find(|request| request.json_rpc_method.as_deref() == Some("tools/call"))
         .expect("MCP server should receive tools/call");
+    assert!(
+        call.headers
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("x-tenant-id")),
+        "ambient identity must not cross the request-selected MCP URL boundary"
+    );
+    // The example's openai_mcp_dispatch binds an inline outbound_chain whose
+    // `headers` filter stamps X-MCP-Client. tools/call is issued only by dispatch
+    // (tool_resolve issues initialize/tools/list), so its presence here proves the
+    // dispatch outbound_chain is bound and runs on the callout inside the IRR step.
+    assert!(
+        call.headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("x-mcp-client") && value == "praxis-ai-gateway"),
+        "the dispatch outbound_chain must stamp X-MCP-Client on the tools/call callout: {:?}",
+        call.headers
+    );
     let call_body: serde_json::Value = serde_json::from_str(&call.body).expect("tools/call body should be JSON");
     assert_eq!(call_body["params"]["arguments"]["location"], "SF");
 
@@ -365,15 +385,19 @@ fn round_trip_captures_tool_and_model_requests() {
 
     let model_body: serde_json::Value =
         serde_json::from_str(&second_model_req.body).expect("second model request body should be valid JSON");
+    assert_eq!(
+        model_body["conversation"]["id"], "conv_native",
+        "state-backed rebuild must preserve a provider-owned conversation"
+    );
     let input = model_body["input"]
         .as_array()
         .expect("second model request input should be an array");
 
-    let has_function_call = input.iter().any(|item| item["type"] == "function_call");
     let has_function_call_output = input.iter().any(|item| item["type"] == "function_call_output");
-    assert!(
-        has_function_call,
-        "second model request input should contain a function_call item"
+    assert_eq!(
+        input.len(),
+        1,
+        "provider-owned continuation should send only the new delta"
     );
     assert!(
         has_function_call_output,
@@ -1005,13 +1029,13 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
         ..McpMockConfig::default()
     });
     let proxy_port = free_port();
-    let config = load_loopback_mcp_config(proxy_port, model_port);
+    let config = load_loopback_mcp_config_without_rehydrate(proxy_port, model_port);
     let proxy = start_proxy(&config);
     let request = serde_json::json!({
         "model": "gpt-4.1",
         "input": "What is the weather in SF?",
         "stream": true,
-        "store": false,
+        "conversation": {"id": "conv_native"},
         "tools": [{
             "type": "mcp",
             "server_label": "weather",
@@ -1310,13 +1334,14 @@ fn streaming_mcp_round_trip_uses_one_logical_sse_response() {
     let input = second_request["input"]
         .as_array()
         .expect("second request input should be an array");
-    assert!(
-        input.iter().any(|item| item["type"] == "function_call"),
-        "second inference should receive the streamed function call"
+    assert_eq!(
+        input.len(),
+        1,
+        "provider-owned continuation should send only the new delta"
     );
-    assert!(
-        input.iter().any(|item| item["type"] == "function_call_output"),
-        "second inference should receive the MCP result"
+    assert_eq!(
+        input[0]["type"], "function_call_output",
+        "the only continuation item should be the local tool result"
     );
 
     // #985 (criterion 3): the call identity stays consistent across every round of
@@ -3316,6 +3341,77 @@ fn web_search_round_trip_executes_and_re_enters_inference() {
     );
 }
 
+/// #958: the web-search provider callout is dispatched through the filtered
+/// subrequest executor, so the filters configured in the web-search filter's
+/// `outbound_chain` run on the outbound request. The example's outbound chain
+/// contains a `request_id` filter, which injects an `X-Request-ID` header — its
+/// presence on the provider callout is observable proof the outbound chain
+/// executed (rather than the callout bypassing the configured chain).
+#[test]
+fn web_search_callout_executes_outbound_chain_filters() {
+    let first_response = serde_json::json!({
+        "id": "resp_ws_1",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "Rust 2025 edition"}
+        }]
+    });
+    let second_response = serde_json::json!({
+        "id": "resp_ws_2",
+        "object": "response",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Rust 2025 brings great features."}]
+        }]
+    });
+
+    let model = StatefulCapturingBackend::new(vec![
+        (200, serde_json::to_string(&first_response).unwrap()),
+        (200, serde_json::to_string(&second_response).unwrap()),
+    ])
+    .start_with_shutdown();
+
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let captured = spawn_capturing_search_mock(search_listener);
+
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model.port(), search_port);
+    let proxy = start_proxy(&config);
+
+    let request_body = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for Rust 2025 edition features",
+        "tools": [{"type": "web_search_preview"}]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    );
+    assert_eq!(parse_status(&raw), 200, "web search round-trip should return 200");
+
+    // Copy the captured requests out and release the lock before asserting.
+    let requests = captured.lock().expect("capture lock").clone();
+    assert_eq!(
+        requests.len(),
+        1,
+        "provider should be hit exactly once, got: {requests:?}"
+    );
+    let head = requests[0].to_ascii_lowercase();
+    assert!(
+        head.contains("x-request-id:"),
+        "the outbound_chain's request_id filter must inject X-Request-ID on the provider callout, \
+         proving the configured outbound chain executed: {}",
+        requests[0]
+    );
+}
+
 /// #1046 boundary test 3: a single model round emitting a `web_search_call`, a
 /// hosted `file_search_call`, and an MCP `function_call` is resolved by all three
 /// request-phase dispatchers in ONE IRR continuation — the model is called
@@ -3390,7 +3486,7 @@ fn all_three_dispatchers_execute_in_one_irr_continuation() {
     let vector_calls = spawn_vector_store_mock(vector_listener);
 
     let proxy_port = free_port();
-    let config = load_unified_dispatch_config(proxy_port, model.port(), search_port, vector_port);
+    let config = load_unified_dispatch_config(proxy_port, model.port(), search_port, vector_port, mcp.port());
     let proxy = start_proxy(&config);
 
     let request_body = serde_json::json!({
@@ -3404,16 +3500,18 @@ fn all_three_dispatchers_execute_in_one_irr_continuation() {
             {
                 "type": "mcp",
                 "server_label": "weather",
-                "server_url": format!("http://127.0.0.1:{}/mcp", mcp.port()),
+                "connector_id": "trusted-mcp",
                 "allowed_tools": ["get_weather"],
                 "require_approval": "never"
             }
         ]
     });
-    let raw = http_send(
-        proxy.addr(),
-        &json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()),
+    let request = json_post("/v1/responses", &serde_json::to_string(&request_body).unwrap()).replacen(
+        "Content-Type: application/json",
+        "x-tenant-id: tenant-a\r\nContent-Type: application/json",
+        1,
     );
+    let raw = http_send(proxy.addr(), &request);
 
     assert_eq!(parse_status(&raw), 200, "unified round-trip should return 200: {raw}");
     let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
@@ -3445,6 +3543,19 @@ fn all_three_dispatchers_execute_in_one_irr_continuation() {
         "MCP tool must be dispatched exactly once"
     );
     assert_eq!(mcp.last_tool_call_name().as_deref(), Some("get_weather"));
+    let mcp_requests = mcp.received_requests();
+    for method in ["tools/list", "tools/call"] {
+        assert!(
+            mcp_requests.iter().any(|request| {
+                request.json_rpc_method.as_deref() == Some(method)
+                    && request
+                        .headers
+                        .iter()
+                        .any(|(name, value)| name.eq_ignore_ascii_case("x-tenant-id") && value == "tenant-a")
+            }),
+            "{method} should receive the configured trusted header: {mcp_requests:#?}"
+        );
+    }
 
     // Every server-owned call is reconciled to a completed public output item.
     let output = response["output"].as_array().expect("final response output array");
@@ -4655,6 +4766,45 @@ fn spawn_search_mock(listener: TcpListener) -> Arc<AtomicUsize> {
     connections
 }
 
+/// Serve web-search results and capture the raw request line + headers of every
+/// provider callout.
+///
+/// The returned buffer lets a test prove that the filters configured in the
+/// web-search filter's `outbound_chain` actually ran on the provider callout:
+/// the `request_id` filter injects an `X-Request-ID` header, so its presence in
+/// the captured request is observable evidence the outbound chain executed.
+fn spawn_capturing_search_mock(listener: TcpListener) -> Arc<Mutex<Vec<String>>> {
+    use std::io::{Read as _, Write as _};
+    let body = serde_json::json!({
+        "web": {
+            "results": [{
+                "title": "Rust 2025 Edition",
+                "url": "https://blog.rust-lang.org/2025",
+                "description": "The Rust 2025 edition is here."
+            }]
+        }
+    })
+    .to_string();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&captured);
+    thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0_u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            // Capture the request head (request line + headers) so the test can
+            // assert the injected outbound-chain header is present.
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            sink.lock().expect("capture lock").push(request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _written = stream.write_all(response.as_bytes());
+        }
+    });
+    captured
+}
+
 /// Vector-store mock for hosted file search: serves every connection with a
 /// fixed `{"data": [...]}` result set and counts dispatched requests so a test
 /// can assert exactly how many vector-store callouts the file-search dispatcher
@@ -5454,10 +5604,11 @@ fn load_web_search_config(proxy_port: u16, model_port: u16, search_port: u16) ->
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = yaml.replace(
         "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!(
-            "api_key: test-key\n                base_url: http://127.0.0.1:{search_port}\n                allow_private_base_url: true"
-        ),
+        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
+    // agentic-loop.yaml already declares `allow_private_upstreams: true` in its
+    // `insecure_options`, which is the operator opt-in the executor's SSRF check
+    // requires for the loopback provider callout — no test-time injection needed.
     praxis_core::config::Config::from_yaml(&yaml).expect("parse web search config")
 }
 
@@ -5470,6 +5621,7 @@ fn load_unified_dispatch_config(
     model_port: u16,
     search_port: u16,
     vector_port: u16,
+    mcp_port: u16,
 ) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
@@ -5482,19 +5634,31 @@ fn load_unified_dispatch_config(
     // Point the brave web-search provider at the local search mock.
     let yaml = yaml.replace(
         "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!(
-            "api_key: test-key\n                base_url: http://127.0.0.1:{search_port}\n                allow_private_base_url: true"
-        ),
+        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
-    // Allow loopback MCP resolution and dispatch against the in-test MCP server.
+    // agentic-loop.yaml already declares `allow_private_upstreams: true` in its
+    // `insecure_options`, which is the operator opt-in the executor's SSRF check
+    // requires for the loopback provider callout — no test-time injection needed.
     let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
+        "      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n",
+        "      - filter: state_owner\n        mode: trusted_headers\n        tenant: {header: x-tenant-id}\n        issuer: {static: urn:test}\n        subject: {static: test-user}\n      - filter: state_owner_headers\n        tenant_header: x-tenant-id\n        subject_header: x-user-id\n",
+        1,
+    );
+    // Retarget MCP resolution and dispatch at the in-test loopback MCP server.
+    // Loopback is permitted through the example config's
+    // `insecure_options.allow_private_upstreams` (propagated to each callout's
+    // outbound pipeline), not a per-filter opt-in, so no `allow_loopback` field
+    // is injected.
+    let yaml = yaml.replacen(
+        "      - filter: openai_mcp_tool_resolve\n        connectors:\n          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
+        &format!(
+            "      - filter: openai_mcp_tool_resolve\n        forward_headers: [x-tenant-id]\n        connectors:\n          - id: trusted-mcp\n            server_url: http://127.0.0.1:{mcp_port}/mcp\n"
+        ),
         1,
     );
     let yaml = yaml.replacen(
         "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
+        "              - filter: state_owner_headers\n                tenant_header: x-tenant-id\n                subject_header: x-user-id\n              - filter: openai_mcp_dispatch\n                forward_headers: [x-tenant-id]\n",
         1,
     );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse unified dispatch config")
@@ -6865,20 +7029,32 @@ fn load_agentic_rejection_config(proxy_port: u16, model_port: u16) -> praxis_cor
 }
 
 fn load_loopback_mcp_config(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+    load_loopback_mcp_config_inner(proxy_port, model_port, false)
+}
+
+fn load_loopback_mcp_config_inner(
+    proxy_port: u16,
+    model_port: u16,
+    forward_headers: bool,
+) -> praxis_core::config::Config {
     let path = example_config_path("openai/responses/agentic-loop.yaml");
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-        1,
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
-    );
+    let yaml = if forward_headers {
+        yaml.replacen(
+            "      - filter: openai_mcp_tool_resolve\n",
+            "      - filter: openai_mcp_tool_resolve\n        forward_headers: [x-tenant-id]\n",
+            1,
+        )
+        .replacen(
+            "              - filter: openai_mcp_dispatch\n",
+            "              - filter: openai_mcp_dispatch\n                forward_headers: [x-tenant-id]\n",
+            1,
+        )
+    } else {
+        yaml
+    };
     praxis_core::config::Config::from_yaml(&yaml).expect("parse loopback MCP config")
 }
 
@@ -6906,19 +7082,27 @@ fn load_loopback_mcp_config_with_connectors(
         .collect();
     let yaml = yaml.replacen(
         "      - filter: openai_mcp_tool_resolve\n        connectors:\n          - id: corp_drive\n            server_url: https://drive-mcp.internal:8443/mcp\n",
-        &format!("      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n        connectors:\n{connector_yaml}"),
+        &format!("      - filter: openai_mcp_tool_resolve\n        connectors:\n{connector_yaml}"),
         1,
     );
     assert!(
         connectors.iter().all(|(id, _)| yaml.contains(&format!("id: {id}"))),
         "expected to rewrite example connector config for {connectors:?}"
     );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
-    );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse loopback MCP connector config")
+}
+
+fn load_loopback_mcp_config_without_rehydrate(proxy_port: u16, model_port: u16) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/agentic-loop.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    let yaml = patch_web_search_api_key(&yaml);
+    let yaml = yaml.replacen("      - filter: openai_responses_rehydrate\n", "", 1);
+    assert!(
+        !yaml.contains("      - filter: openai_responses_rehydrate\n"),
+        "expected to remove rehydration from the agentic-loop config"
+    );
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse loopback MCP config without rehydration")
 }
 
 /// Loopback MCP config backed by a real (file) SQLite store so the approval
@@ -6929,16 +7113,6 @@ fn load_approval_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxi
     let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-        1,
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
-    );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse approval round-trip config")
 }
 
@@ -6951,16 +7125,6 @@ fn load_approval_config_without_store(proxy_port: u16, model_port: u16) -> praxi
     let yaml = std::fs::read_to_string(path).expect("read agentic-loop example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     let yaml = patch_web_search_api_key(&yaml);
-    let yaml = yaml.replacen(
-        "      - filter: openai_mcp_tool_resolve\n",
-        "      - filter: openai_mcp_tool_resolve\n        allow_loopback: true\n",
-        1,
-    );
-    let yaml = yaml.replacen(
-        "              - filter: openai_mcp_dispatch\n",
-        "              - filter: openai_mcp_dispatch\n                allow_loopback: true\n",
-        1,
-    );
     let store_block = "      - filter: openai_response_store\n        backend: sqlite\n        database_url: \"sqlite://responses.db?mode=rwc\"\n        responses_table: openai_responses\n        conversations_table: openai_conversations\n\n";
     let without_store = yaml.replacen(store_block, "", 1);
     assert_ne!(

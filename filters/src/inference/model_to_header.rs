@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use http::HeaderName;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, builtins::JsonBodyFieldFilter,
     parse_filter_config,
@@ -69,6 +70,9 @@ pub struct ModelToHeaderFilter {
     /// Delegated body-field extraction filter (type-erased
     /// `JsonBodyFieldFilter`).
     inner: Box<dyn HttpFilter>,
+    /// The promotion-target header this filter owns; a client-supplied copy is
+    /// stripped before promotion so routing cannot be spoofed. See #1039.
+    header: HeaderName,
 }
 
 impl ModelToHeaderFilter {
@@ -92,13 +96,8 @@ impl ModelToHeaderFilter {
     /// ```
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ModelToHeaderConfig = parse_filter_config("model_to_header", config)?;
-        let header = &cfg.header;
-        praxis_ai_apis::promotion::validate_dedicated_promotion_header(
-            "model_to_header",
-            "header",
-            Some(header.as_str()),
-            &[],
-        )?;
+        let header =
+            praxis_ai_apis::promotion::parse_dedicated_promotion_header("model_to_header", "header", &cfg.header, &[])?;
 
         let mut inner_config = serde_yaml::Mapping::new();
         inner_config.insert(
@@ -107,12 +106,12 @@ impl ModelToHeaderFilter {
         );
         inner_config.insert(
             serde_yaml::Value::String("header".into()),
-            serde_yaml::Value::String(header.to_owned()),
+            serde_yaml::Value::String(cfg.header.clone()),
         );
 
         let inner = JsonBodyFieldFilter::from_config(&serde_yaml::Value::Mapping(inner_config))?;
 
-        Ok(Box::new(Self { inner }))
+        Ok(Box::new(Self { inner, header }))
     }
 }
 
@@ -159,7 +158,13 @@ impl HttpFilter for ModelToHeaderFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
-
+        if !ctx.request_headers_to_remove.contains(&self.header) {
+            ctx.request_headers_to_remove.push(self.header.clone());
+            tracing::debug!(
+                header = %self.header,
+                "model_to_header: dropping client-supplied promotion header (anti-spoofing)"
+            );
+        }
         self.inner.on_request_body(ctx, body, end_of_stream).await
     }
 
@@ -286,6 +291,52 @@ mod tests {
         assert_eq!(
             value, "mistral-large-latest",
             "model value should be promoted to X-Model header"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_client_header_alongside_promotion() {
+        // A body-derived promotion must queue a Remove of the owned header in
+        // the same pre-read pass as the Add, so the pass's remove -> set -> add
+        // application drops any spoofed client copy. See praxis-proxy/ai#1039.
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let json = br#"{"model":"llama-3.2-8b","messages":[]}"#;
+        let mut body = Some(Bytes::from_static(json));
+
+        let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(
+            ctx.request_headers_to_remove.iter().any(|h| h == "x-model"),
+            "the owned header must be queued for removal before promotion"
+        );
+        let (name, value) = &ctx.extra_request_headers[0];
+        assert_eq!(name, "X-Model", "the body-derived value must still be promoted");
+        assert_eq!(value, "llama-3.2-8b", "the promoted value must be the body model");
+    }
+
+    #[tokio::test]
+    async fn strips_client_header_even_without_body_model() {
+        // Fail-closed: the client header is never trusted, so it is removed
+        // even when the body carries no model to promote.
+        let filter = ModelToHeaderFilter::from_config(&serde_yaml::Value::Null).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let json = br#"{"prompt":"hello"}"#;
+        let mut body = Some(Bytes::from_static(json));
+
+        let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(
+            ctx.request_headers_to_remove.iter().any(|h| h == "x-model"),
+            "the owned header must be removed even when no body model is promoted"
+        );
+        assert!(
+            ctx.extra_request_headers.is_empty(),
+            "no header is promoted when the body has no model"
         );
     }
 

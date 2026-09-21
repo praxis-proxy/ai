@@ -187,6 +187,37 @@ fn local_completion_preserves_deferred_done_sentinel() {
 }
 
 #[test]
+fn local_completion_does_not_arm_deferred_store_persistence() {
+    // #937 review regression: a request-phase local completion is returned to the
+    // store as a buffered `TerminalResponse` at end-of-stream, where the store
+    // already persists before the body is written. It must NOT set
+    // `logical_stream_terminal_emitted` — that flag means the terminal is a
+    // deferred non-end-of-stream chunk, and setting it here would make the store
+    // skip its end-of-stream persist and lose the record.
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        response_object: json!({"id":"resp_1", "object":"response", "status":"completed", "output":[]}),
+        ..ResponsesState::default()
+    });
+
+    let encoded = encode_local_completion(&mut ctx).expect("response object should encode");
+    assert!(
+        std::str::from_utf8(&encoded)
+            .unwrap()
+            .contains("event: response.completed"),
+        "local completion must emit a terminal response.completed frame"
+    );
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .logical_stream_terminal_emitted,
+        "a buffered local completion must not arm the deferred non-EOS persist path"
+    );
+}
+
+#[test]
 fn local_completion_flushes_file_search_lifecycle_before_terminal() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
@@ -3586,6 +3617,51 @@ async fn logical_terminal_only_output_survives_canonicalization() {
 }
 
 #[tokio::test]
+async fn deferred_terminal_arms_store_persistence_at_terminal_frame() {
+    // #937: the deferred terminal frame reaches the pre-IRR store as a
+    // non-end-of-stream chunk. `emit_deferred_terminal` must mark
+    // `logical_stream_terminal_emitted` exactly when it appends that frame so the
+    // store persists before releasing it. The flag must stay unset while the
+    // terminal is still deferred (held, not yet emitted).
+    let (filter, mut ctx) = make_armed_context();
+
+    let completed = json!({
+        "response": {
+            "id": "resp_937_defer",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-4o",
+            "created_at": 1_700_000_000,
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hi"}]}]
+        },
+        "sequence_number": 0
+    });
+
+    let mut terminal = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(terminal.is_none(), "the terminal event must be deferred until finalize");
+    assert!(
+        !ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .logical_stream_terminal_emitted,
+        "persistence must not be armed while the terminal is still deferred"
+    );
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    assert!(eos.is_some(), "finalize must emit the deferred terminal frame");
+    assert!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .logical_stream_terminal_emitted,
+        "emit_deferred_terminal must arm store persistence when it appends the terminal frame"
+    );
+}
+
+#[tokio::test]
 async fn terminal_event_authoritatively_populates_completed_function_calls() {
     let (filter, mut ctx) = make_armed_context();
     ctx.extensions.insert(ResponsesState::default());
@@ -4832,6 +4908,326 @@ async fn on_response_preserves_content_length_when_not_armed() {
             .get(http::header::CONTENT_LENGTH)
             .is_some(),
         "Content-Length should be preserved when filter is not armed"
+    );
+}
+
+#[tokio::test]
+async fn apply_arm_does_not_cap_timeout_before_first_chunk() {
+    use std::sync::Arc;
+
+    use praxis_core::connectivity::{ConnectionOptions, Upstream};
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 1").unwrap();
+    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+    ctx.upstream = Some(Upstream {
+        address: Arc::from("127.0.0.1:9"),
+        authority: None,
+        tls: None,
+        connection: Arc::new(ConnectionOptions::default()),
+    });
+
+    filter.apply_arm_decision(&mut ctx, ArmDecision::Arm);
+
+    assert!(
+        ctx.upstream.as_ref().and_then(|u| u.connection.read_timeout).is_none(),
+        "timeout_secs must not cap upstream reads before the first SSE chunk"
+    );
+}
+
+#[tokio::test]
+async fn apply_arm_does_not_cap_before_load_balancing() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 1").unwrap();
+    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+    ctx.upstream = None;
+
+    filter.apply_arm_decision(&mut ctx, ArmDecision::Arm);
+
+    assert!(
+        OpenaiStreamEventsFilter::is_armed(&ctx),
+        "arming must still install parser state when ctx.upstream is unset"
+    );
+    assert!(
+        ctx.upstream.is_none(),
+        "timeout_secs cannot invent a peer before load balancing"
+    );
+}
+
+#[tokio::test]
+async fn apply_arm_keeps_a_tighter_cluster_read_timeout() {
+    use std::{sync::Arc, time::Duration};
+
+    use praxis_core::connectivity::{ConnectionOptions, Upstream};
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 300").unwrap();
+    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.current_filter_id = Some(0);
+    ctx.upstream = Some(Upstream {
+        address: Arc::from("127.0.0.1:9"),
+        authority: None,
+        tls: None,
+        connection: Arc::new(ConnectionOptions {
+            read_timeout: Some(Duration::from_millis(250)),
+            ..ConnectionOptions::default()
+        }),
+    });
+
+    filter.apply_arm_decision(&mut ctx, ArmDecision::Arm);
+
+    assert_eq!(
+        ctx.upstream.as_ref().and_then(|u| u.connection.read_timeout),
+        Some(Duration::from_millis(250)),
+        "arming must not relax a tighter cluster read timeout before the first chunk"
+    );
+}
+
+#[test]
+fn stream_deadline_is_none_before_first_chunk() {
+    let (_filter, ctx) = make_armed_context();
+    let state = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    assert!(
+        super::stream_deadline_at(state).is_none(),
+        "timeout_secs must not start before the first SSE chunk"
+    );
+}
+
+#[test]
+fn stream_deadline_is_absolute_from_first_chunk() {
+    use std::time::Duration;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let state = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    let started = state.started_at.expect("first chunk must start the deadline");
+    assert_eq!(
+        super::stream_deadline_at(state),
+        Some(started + state.timeout),
+        "the cutoff must stay anchored at first-chunk + timeout_secs, not restart on each poll"
+    );
+    assert_eq!(state.timeout, Duration::from_secs(300));
+}
+
+#[test]
+fn first_chunk_recaps_absolute_deadline_onto_live_body() {
+    use std::time::Duration;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let state = ctx
+        .get_filter_state::<StreamEventsState>()
+        .expect("parser state must remain installed");
+    let applied = ctx
+        .stream_read_timeout_cap()
+        .expect("the first chunk must publish a read timeout cap");
+    assert!(applied > Duration::from_secs(299) && applied <= state.timeout);
+    assert!(
+        state.timeout <= Duration::from_secs(300),
+        "unexpected test timeout budget: {:?}",
+        state.timeout
+    );
+}
+
+#[test]
+fn stream_deadline_cap_shrinks_after_first_chunk() {
+    use std::time::Duration;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    state.started_at.expect("first chunk must start the deadline");
+    state.timeout = Duration::from_secs(1);
+    let adjusted_started = std::time::Instant::now() - Duration::from_millis(750);
+    state.started_at = Some(adjusted_started);
+    let expected = adjusted_started + state.timeout;
+    let now = std::time::Instant::now();
+    ctx.insert_filter_state(state);
+
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "again"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let applied = ctx
+        .stream_read_timeout_cap()
+        .expect("each chunk must republish a read timeout cap");
+    assert!(
+        applied <= expected.saturating_duration_since(now),
+        "each chunk must republish the remaining absolute budget, not a fresh relative timer at now={now:?}"
+    );
+}
+
+#[test]
+fn stream_deadline_caps_live_body_after_first_chunk() {
+    use std::time::Duration;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let started = state.started_at.expect("first chunk must start the deadline");
+    state.timeout = Duration::from_secs(1);
+    let expected = started + state.timeout;
+    ctx.insert_filter_state(state);
+    super::recap_stream_deadline(&mut ctx, expected);
+
+    assert!(
+        ctx.stream_read_timeout_cap().is_some(),
+        "absolute cutoff must be published on the live body"
+    );
+}
+
+#[tokio::test]
+async fn stream_deadline_recaps_live_body_on_irr_body_context() {
+    use std::{sync::Arc, time::Duration};
+
+    use praxis_core::connectivity::{ConnectionOptions, Upstream};
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_secs: 1").unwrap();
+    let filter = OpenaiStreamEventsFilter::build(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(Box::leak(Box::new(req)));
+    ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
+    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.current_filter_id = Some(0);
+    ctx.upstream = Some(Upstream {
+        address: Arc::from("127.0.0.1:9"),
+        authority: None,
+        tls: None,
+        connection: Arc::new(ConnectionOptions {
+            read_timeout: Some(Duration::from_secs(30)),
+            ..ConnectionOptions::default()
+        }),
+    });
+
+    filter.apply_arm_decision(&mut ctx, ArmDecision::Arm);
+
+    // IRR reconstructs response-body contexts with upstream: None.
+    ctx.upstream = None;
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let started = state.started_at.expect("first chunk must start the deadline");
+    state.timeout = Duration::from_secs(1);
+    state.started_at = Some(started.checked_sub(Duration::from_millis(750)).unwrap_or(started));
+    ctx.insert_filter_state(state);
+
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    assert!(
+        ctx.stream_read_timeout_cap().is_some(),
+        "absolute cutoff must be published for the live body even when ctx.upstream is None"
+    );
+}
+
+#[test]
+fn io_before_first_chunk_is_not_a_stream_timeout() {
+    use std::time::Instant;
+
+    let (_filter, ctx) = make_armed_context();
+    let state = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    assert!(
+        !super::io_exceeded_stream_deadline(state, Instant::now()),
+        "a transport reset before any SSE chunk is not the stream deadline"
+    );
+}
+
+#[test]
+fn io_before_deadline_is_not_a_stream_timeout() {
+    use std::time::{Duration, Instant};
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    state.timeout = Duration::from_secs(300);
+    assert!(
+        !super::io_exceeded_stream_deadline(&state, Instant::now()),
+        "a truncated chunk must not be labelled a timeout"
+    );
+}
+
+#[test]
+fn io_after_deadline_is_a_stream_timeout() {
+    use std::time::Duration;
+
+    let (filter, mut ctx) = make_armed_context();
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+    let mut state = ctx.remove_filter_state::<StreamEventsState>().unwrap();
+    let started = state.started_at.expect("first chunk must start the deadline");
+    state.timeout = Duration::from_secs(1);
+    assert!(
+        super::io_exceeded_stream_deadline(&state, started + Duration::from_secs(1)),
+        "an Io abort after timeout_secs from the first chunk is the stream deadline"
+    );
+}
+
+#[tokio::test]
+async fn idle_timeout_does_not_fail_a_completed_sse_stream() {
+    let (filter, mut ctx) = make_armed_context();
+
+    let completed =
+        json!({"id": "resp_1", "status": "completed", "model": "m", "created_at": 0, "output": [], "usage": {}});
+    let mut body = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    // Transport-level IdleTimeout cannot be injected here (`StreamTermination`
+    // is crate-private). The completeness guard is the same function that
+    // `record_idle_transport_timeout` calls before mark_stream_termination_handled.
+    super::publish_idle_timeout_if_incomplete(&mut ctx);
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+
+    assert_eq!(
+        ctx.get_filter_state::<StreamEventsState>()
+            .map(|state| state.completion_state),
+        Some(CompletionState::TerminalLifecycle),
+        "response.completed must leave the parser in a terminal lifecycle"
+    );
+    assert!(
+        ctx.get_metadata("responses.stream_error_code").is_none(),
+        "a terminal lifecycle event must not be rewritten as a transport timeout"
+    );
+    assert!(
+        ctx.get_metadata("responses.skip_persist").is_none(),
+        "a completed SSE stream must remain persistable when the HTTP body closes slowly"
+    );
+}
+
+#[tokio::test]
+async fn idle_timeout_fails_an_open_sse_stream() {
+    let (filter, mut ctx) = make_armed_context();
+
+    let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
+    filter.on_response_body(&mut ctx, &mut body, false).unwrap();
+
+    super::publish_idle_timeout_if_incomplete(&mut ctx);
+
+    assert_eq!(
+        ctx.get_metadata("responses.stream_error_code"),
+        Some("server_error"),
+        "an idle abort before a terminal event is a stream timeout"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.skip_persist"),
+        Some("true"),
+        "an incomplete idle abort must not be persisted"
     );
 }
 

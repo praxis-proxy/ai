@@ -28,11 +28,19 @@ see the [Praxis core filter reference][core-ref].
 |--------|-------------|
 | [`openai_chat_completions_to_azureai_chat_completions`](openai_chat_completions_to_azureai_chat_completions.md) | Transforms requests targeting Azure OpenAI deployments into standard Chat Completions-compatible form and normalizes responses back. |
 
+### General
+
+| Filter | Description |
+|--------|-------------|
+| [`state_owner`](state_owner.md) | Establishes a normalized [`StateOwner`] from trusted identity sources. |
+| [`state_owner_headers`](state_owner_headers.md) | Projects a normalized [`StateOwner`] into destination-specific HTTP headers. |
+
 ### OpenAI
 
 | Filter | Description |
 |--------|-------------|
 | [`openai_agentic_loop`](openai_agentic_loop.md) | Agentic loop controller for the Responses API pipeline. |
+| [`openai_client_tool_compat`](openai_client_tool_compat.md) | Lowers rich client-owned tool declarations to private `function` tools for a function-only Responses backend and restores the typed items on the way back. |
 | [`openai_conversations`](openai_conversations.md) | Handles all `/v1/conversations` endpoints locally. |
 | [`openai_doc_extract`](openai_doc_extract.md) | Converts `input_file` content parts to `input_text` for backends that do not support `input_file` natively (e.g. vLLM, llm-d). |
 | [`openai_file_resolve`](openai_file_resolve.md) | Resolves `file_id` and `file_url` references in Responses API input by fetching content from a Files API or remote URL via `ApiClient` and inlining the base64-encoded content in the provider-native field. |

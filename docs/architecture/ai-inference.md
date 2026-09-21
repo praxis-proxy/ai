@@ -93,9 +93,12 @@ when any of these hold:
 - `previous_response_id` is present
 - `tools` is present
 - `store` is not explicitly `false`
-- `background` is `true`
 - `has_conversation` is true
 - `has_prompt_id` is true
+
+Requests with `background: true` are rejected before mode
+classification because Praxis does not implement the
+asynchronous Responses lifecycle.
 
 Stateful mode influences routing decisions (e.g.
 directing to clusters with response store access).

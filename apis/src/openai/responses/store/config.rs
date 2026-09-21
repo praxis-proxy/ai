@@ -8,14 +8,9 @@ use praxis_filter::{FilterError, has_dot_dot_traversal};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
-use crate::store::{
-    PoolConfig, SslMode,
-    postgres_url::{
-        self, has_postgres_url_ssl_root_cert, is_verified_postgres_sslmode, postgres_url_sslmode,
-        validate_postgres_url_tls_file_params,
-    },
-    validate_postgres_table_identifiers, validate_table_identifier,
-};
+#[cfg(feature = "store-postgres")]
+use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
+use crate::store::{PoolConfig, SslMode, validate_table_identifier};
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_response_store";
@@ -25,13 +20,13 @@ const FILTER_NAME: &str = "openai_response_store";
 // -----------------------------------------------------------------------------
 
 /// Supported storage backends.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StorageBackend {
-    /// SQLite backend (file-backed or in-memory).
+    /// SQLite backend (file-backed or in-memory). Requires `store-sqlite`.
     Sqlite,
 
-    /// `PostgreSQL` backend.
+    /// `PostgreSQL` backend. Enabled by default through `store-postgres`.
     Postgres,
 }
 
@@ -73,6 +68,46 @@ pub(crate) struct ResponseStoreConfig {
     #[serde(default)]
     pub ssl_root_cert: Option<SecretString>,
 
+    /// Path to a PEM-encoded client certificate for mutual TLS with
+    /// `PostgreSQL`.
+    ///
+    /// Only valid when `backend` is `postgres` and the effective SSL
+    /// mode is `verify-ca` or `verify-full`. Must be configured together
+    /// with `ssl_client_key`. Enables certificate authentication so the
+    /// server does not challenge for a password.
+    #[serde(default)]
+    pub ssl_client_cert: Option<SecretString>,
+
+    /// Path to the PEM-encoded private key for `ssl_client_cert`.
+    ///
+    /// Only valid when `backend` is `postgres`. Must be an unencrypted
+    /// PKCS#8 key (mode `0600`) and configured together with
+    /// `ssl_client_cert`. The native-tls backend (`OpenSSL` on Linux,
+    /// Security.framework on macOS) accepts PKCS#8 only; convert a
+    /// SEC1/PKCS#1 key with `openssl pkcs8 -topk8 -nocrypt`.
+    #[serde(default)]
+    pub ssl_client_key: Option<SecretString>,
+
+    /// Enforce the certificate-authentication compliance profile for
+    /// `PostgreSQL`.
+    ///
+    /// When enabled, the filter fails to start unless `ssl_mode` is
+    /// `verify-full`, both `ssl_client_cert` and `ssl_client_key` are
+    /// set, and no password reaches the connection (rejecting a password
+    /// in `database_url`, TLS parameters in `database_url`, and the
+    /// `PGPASSWORD` environment variable). It also rejects non-addressing
+    /// connection parameters in `database_url` (`application_name`,
+    /// `options`/`options[...]`, `statement-cache-capacity`), which the
+    /// certificate-authentication rebuild would silently drop; set such
+    /// defaults on the database role instead (`ALTER ROLE ... SET ...`).
+    /// The `ssl_client_key` file must also be owner-only (mode `0600`,
+    /// enforced on Unix). This keeps application-side password
+    /// cryptography off the connection path. The `PostgreSQL` server must
+    /// independently use a `cert` rule in `pg_hba.conf`; the proxy cannot
+    /// enforce that server-side requirement.
+    #[serde(default)]
+    pub require_certificate_authentication: bool,
+
     /// Allow `PostgreSQL` URLs that target local-sensitive addresses.
     ///
     /// By default, DNS names, localhost, loopback, private,
@@ -90,12 +125,27 @@ pub(crate) struct ResponseStoreConfig {
     pub pool: Option<PoolConfig>,
 }
 
+#[cfg(feature = "store-postgres")]
+impl ResponseStoreConfig {
+    /// Borrow the `PostgreSQL` TLS settings as a [`PgTlsConfig`].
+    pub(crate) fn tls_config(&self) -> PgTlsConfig<'_> {
+        PgTlsConfig {
+            ssl_mode: self.ssl_mode,
+            ssl_root_cert: self.ssl_root_cert.as_ref().map(secrecy::ExposeSecret::expose_secret),
+            ssl_client_cert: self.ssl_client_cert.as_ref().map(secrecy::ExposeSecret::expose_secret),
+            ssl_client_key: self.ssl_client_key.as_ref().map(secrecy::ExposeSecret::expose_secret),
+            require_certificate_authentication: self.require_certificate_authentication,
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Config Validation
 // -----------------------------------------------------------------------------
 
 /// Validate the parsed configuration.
 pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterError> {
+    validate_backend_available(cfg.backend)?;
     let database_url = cfg.database_url.expose_secret();
     if database_url.is_empty() {
         return Err(format!("{FILTER_NAME}: 'database_url' must not be empty").into());
@@ -116,13 +166,44 @@ pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterErr
             reject_postgres_fields(cfg)?;
         },
         StorageBackend::Postgres => {
-            postgres_url::validate_postgres_database_url(FILTER_NAME, database_url, cfg.allow_private_database_url)?;
-            validate_postgres_table_identifiers(&cfg.responses_table, &cfg.conversations_table)
-                .map_err(|e| format!("{FILTER_NAME}: invalid postgres table identifier: {e}"))?;
-            validate_postgres_ssl_config(cfg, database_url)?;
+            #[cfg(feature = "store-postgres")]
+            validate_postgres_config(cfg, database_url)?;
         },
     }
     Ok(())
+}
+
+/// Reject a configured backend that was not compiled into this binary.
+#[cfg_attr(
+    all(feature = "store-postgres", feature = "store-sqlite"),
+    expect(clippy::unnecessary_wraps, reason = "other feature sets reject unavailable backends")
+)]
+fn validate_backend_available(backend: StorageBackend) -> Result<(), FilterError> {
+    match backend {
+        #[cfg(not(feature = "store-sqlite"))]
+        StorageBackend::Sqlite => Err(format!(
+            "{FILTER_NAME}: backend 'sqlite' is unavailable; rebuild with the 'store-sqlite' feature"
+        )
+        .into()),
+        #[cfg(feature = "store-sqlite")]
+        StorageBackend::Sqlite => Ok(()),
+        #[cfg(not(feature = "store-postgres"))]
+        StorageBackend::Postgres => Err(format!(
+            "{FILTER_NAME}: backend 'postgres' is unavailable; rebuild with the 'store-postgres' feature"
+        )
+        .into()),
+        #[cfg(feature = "store-postgres")]
+        StorageBackend::Postgres => Ok(()),
+    }
+}
+
+/// Validate configuration that is specific to the `PostgreSQL` backend.
+#[cfg(feature = "store-postgres")]
+fn validate_postgres_config(cfg: &ResponseStoreConfig, database_url: &str) -> Result<(), FilterError> {
+    postgres_url::validate_postgres_database_url(FILTER_NAME, database_url, cfg.allow_private_database_url)?;
+    validate_postgres_table_identifiers(&cfg.responses_table, &cfg.conversations_table)
+        .map_err(|e| format!("{FILTER_NAME}: invalid postgres table identifier: {e}"))?;
+    validate_postgres_ssl_config(cfg, database_url)
 }
 
 /// Reject `..` segments in the SQLite file path to prevent a
@@ -152,46 +233,16 @@ fn validate_sqlite_database_url(database_url: &str) -> Result<(), FilterError> {
 /// the SSRF-sensitive host rules on every retry without
 /// redundantly re-validating immutable fields (table names, SSL
 /// config, URL scheme).
+#[cfg(feature = "store-postgres")]
 pub(crate) fn revalidate_postgres_host(cfg: &ResponseStoreConfig) -> Result<(), FilterError> {
     let database_url = cfg.database_url.expose_secret();
     postgres_url::revalidate_postgres_host(FILTER_NAME, database_url, cfg.allow_private_database_url)
 }
 
 /// Validate `PostgreSQL` TLS options.
+#[cfg(feature = "store-postgres")]
 fn validate_postgres_ssl_config(cfg: &ResponseStoreConfig, database_url: &str) -> Result<(), FilterError> {
-    validate_postgres_url_tls_file_params(FILTER_NAME, database_url)?;
-
-    if let Some(root_cert) = &cfg.ssl_root_cert {
-        let root_cert = root_cert.expose_secret();
-        if has_dot_dot_traversal(root_cert) {
-            return Err(format!("{FILTER_NAME}: ssl_root_cert must not contain '..' path traversal").into());
-        }
-    }
-
-    if has_postgres_ssl_root_cert(cfg, database_url) && !has_verified_postgres_ssl_mode(cfg, database_url) {
-        return Err(format!("{FILTER_NAME}: 'ssl_root_cert' requires ssl_mode 'verify-ca' or 'verify-full'").into());
-    }
-    Ok(())
-}
-
-/// Return whether any configured `PostgreSQL` root CA path is present.
-fn has_postgres_ssl_root_cert(cfg: &ResponseStoreConfig, database_url: &str) -> bool {
-    cfg.ssl_root_cert.is_some() || has_postgres_url_ssl_root_cert(database_url)
-}
-
-/// Return whether the effective `PostgreSQL` SSL mode verifies certificates.
-///
-/// When no explicit `ssl_mode` is set, the runtime default is
-/// [`SslMode::VerifyFull`], so the `None` case is considered verified
-/// unless the URL carries a non-verifying `sslmode`.
-fn has_verified_postgres_ssl_mode(cfg: &ResponseStoreConfig, database_url: &str) -> bool {
-    match cfg.ssl_mode {
-        Some(SslMode::VerifyCa | SslMode::VerifyFull) => true,
-        Some(SslMode::Disable | SslMode::Prefer | SslMode::Require) => false,
-        None => postgres_url_sslmode(database_url)
-            .as_deref()
-            .is_none_or(is_verified_postgres_sslmode),
-    }
+    cfg.tls_config().validate(FILTER_NAME, database_url)
 }
 
 /// Reject `PostgreSQL`-specific fields when backend is SQLite.
@@ -201,6 +252,18 @@ fn reject_postgres_fields(cfg: &ResponseStoreConfig) -> Result<(), FilterError> 
     }
     if cfg.ssl_root_cert.is_some() {
         return Err(format!("{FILTER_NAME}: 'ssl_root_cert' is only valid with the 'postgres' backend").into());
+    }
+    if cfg.ssl_client_cert.is_some() {
+        return Err(format!("{FILTER_NAME}: 'ssl_client_cert' is only valid with the 'postgres' backend").into());
+    }
+    if cfg.ssl_client_key.is_some() {
+        return Err(format!("{FILTER_NAME}: 'ssl_client_key' is only valid with the 'postgres' backend").into());
+    }
+    if cfg.require_certificate_authentication {
+        return Err(format!(
+            "{FILTER_NAME}: 'require_certificate_authentication' is only valid with the 'postgres' backend"
+        )
+        .into());
     }
     if cfg.allow_private_database_url {
         return Err(
@@ -228,4 +291,48 @@ fn sqlite_file_path(database_url: &str) -> Option<&str> {
         .strip_prefix("sqlite://")
         .or_else(|| database_url.strip_prefix("sqlite:"))
         .map(|rest| rest.split_once('?').map_or(rest, |(path, _query)| path))
+}
+
+#[cfg(test)]
+#[cfg(any(not(feature = "store-postgres"), not(feature = "store-sqlite")))]
+#[expect(clippy::allow_attributes, reason = "test-only panic assertions")]
+#[allow(clippy::expect_used, reason = "tests")]
+mod backend_availability_tests {
+    use super::super::ResponseStoreFilter;
+
+    #[cfg(not(feature = "store-sqlite"))]
+    #[test]
+    fn from_config_rejects_sqlite_when_backend_is_not_compiled() {
+        let yaml = serde_yaml::from_str(
+            "backend: sqlite\n\
+             database_url: 'sqlite::memory:'\n\
+             responses_table: responses\n\
+             conversations_table: conversations\n",
+        )
+        .expect("valid YAML");
+
+        let error = ResponseStoreFilter::from_config(&yaml)
+            .err()
+            .expect("unavailable SQLite backend must fail during construction");
+
+        assert!(error.to_string().contains("'store-sqlite' feature"), "{error}");
+    }
+
+    #[cfg(not(feature = "store-postgres"))]
+    #[test]
+    fn from_config_rejects_postgres_when_backend_is_not_compiled() {
+        let yaml = serde_yaml::from_str(
+            "backend: postgres\n\
+             database_url: 'postgres://user:password@example.com/database'\n\
+             responses_table: responses\n\
+             conversations_table: conversations\n",
+        )
+        .expect("valid YAML");
+
+        let error = ResponseStoreFilter::from_config(&yaml)
+            .err()
+            .expect("unavailable PostgreSQL backend must fail during construction");
+
+        assert!(error.to_string().contains("'store-postgres' feature"), "{error}");
+    }
 }

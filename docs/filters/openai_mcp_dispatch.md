@@ -9,7 +9,8 @@ Executes MCP tool calls against upstream MCP servers within the Responses API ag
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `allow_loopback` | bool | no | Allow connections to loopback addresses (default: false). |
+| `outbound_chain` | string \| object | no | Inline outbound filter chain the MCP `tools/call` callout runs through. `openai_mcp_dispatch` runs inside an `iterative_request_router` step. praxis core builds each IRR step with a live chain-binding context, so an inline chain (`{ name, filters }`) is bound at step-build time. A named reference is rejected: IRR supplies each step an empty top-level named-chain map, so a `Named` reference can never resolve inside a step (see [`require_inline_outbound_chain`]). The chain carries only operator-configured cross-cutting filters — the SSRF-validated dial target is staged by the transport, so no upstream-selecting filter is prepended. When omitted, the callout runs through an empty chain and dials the staged target directly. Whether loopback/private MCP destinations are permitted is governed by the operator's global insecure posture, not a per-filter flag. |
+| `forward_headers` | string[] | no | Trusted request headers forwarded to connector-backed MCP `tools/call` requests. No request headers are forwarded by default. Credential headers such as `authorization` are rejected because MCP destinations are client-selected; use the MCP tool entry's dedicated `authorization` field instead. Direct, client-selected `server_url` targets never receive ambient request headers. |
 | `timeout_ms` | integer | no | Per-call timeout in milliseconds for `tools/call` calls. |
 | `max_calls_per_round` | integer | no | Hard cap on MCP calls processed from one model response (1..=1024; default: 32). |
 | `max_parallel_calls` | integer | no | Maximum concurrent MCP calls when `parallel_tool_calls` is enabled (1..=64; default: 8). |
@@ -28,6 +29,9 @@ filter: openai_mcp_dispatch
 
 ```yaml
 filter: openai_mcp_dispatch
+forward_headers:
+  - x-tenant-id
+  - x-user-id
 timeout_ms: 30000
 max_calls_per_round: 32
 max_parallel_calls: 8

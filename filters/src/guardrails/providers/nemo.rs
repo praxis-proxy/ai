@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! `NeMo` Guardrails provider: calls `/v1/guardrail/checks` and maps
-//! the response to [`GuardResult`].
+//! `NeMo` Guardrails provider: calls `/v1/checks` and maps the response
+//! to [`GuardResult`].
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -17,6 +17,9 @@ use super::{GuardPhase, GuardProvider, GuardResult};
 
 /// Default timeout for `NeMo` HTTP calls (10 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
+
+/// Default maximum number of per-message `/v1/checks` callouts per request.
+const DEFAULT_MAX_MESSAGE_CHECKS: u32 = 32;
 
 /// Maximum response body size accepted from `NeMo` (1 MiB).
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
@@ -36,9 +39,17 @@ struct NemoConfig {
     #[serde(default)]
     model: String,
 
+    /// Optional guardrail configuration selection sent to `NeMo`.
+    #[serde(default)]
+    guardrails: Option<NemoGuardrails>,
+
     /// Per-request timeout in milliseconds.
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
+
+    /// Maximum number of per-message `/v1/checks` callouts per proxy request.
+    #[serde(default = "default_max_message_checks")]
+    max_message_checks: u32,
 }
 
 /// Returns the default timeout value for serde deserialization.
@@ -46,29 +57,52 @@ fn default_timeout_ms() -> u64 {
     DEFAULT_TIMEOUT_MS
 }
 
-/// Outgoing request payload for `NeMo`
-#[derive(Serialize)]
-struct NemoRequest {
-    /// Model name
-    model: String,
-    /// List of messages to evaluate.
-    messages: Vec<serde_json::Value>,
+/// Returns the default per-request message check limit for serde deserialization.
+fn default_max_message_checks() -> u32 {
+    DEFAULT_MAX_MESSAGE_CHECKS
 }
 
-/// Incoming response payload for `NeMo`
+/// Guardrail configurations selected for evaluation.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NemoGuardrails {
+    /// Configuration IDs understood by the configured `NeMo` service.
+    config_ids: Vec<String>,
+}
+
+/// Phase-specific rail selection sent under `guardrails.rail_types`.
+#[derive(Serialize)]
+struct NemoGuardrailsRequest<'a> {
+    /// Omitted when the service should select its default configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_ids: Option<&'a [String]>,
+    /// Rail types `NeMo` should run for this check (`input` or `output`).
+    rail_types: Vec<&'static str>,
+}
+
+/// Outgoing request payload for `NeMo`
+#[derive(Serialize)]
+struct NemoRequest<'a> {
+    /// Model name
+    model: &'a str,
+    /// List of messages to evaluate.
+    messages: Vec<serde_json::Value>,
+    /// `NeMo` guardrails options for `/v1/checks`.
+    guardrails: NemoGuardrailsRequest<'a>,
+}
+
+/// Incoming response payload for `/v1/checks`.
 #[derive(Deserialize)]
 struct NemoResponse {
-    /// Overall verdict: `"success"`, `"blocked"`, or `"error"`.
+    /// Overall verdict: `"passed"`, `"blocked"`, or `"modified"`.
     status: String,
 
-    /// Per-rail evaluation results. The names of rails whose `status` is
-    /// `"blocked"` are joined to form the [`GuardResult::Block::reason`]
-    /// string.
-    rails_status: Option<serde_json::Value>,
+    /// Content after rails processing.
+    #[serde(default)]
+    content: String,
 
-    /// Error details returned when `status` is `"error"`.
-    /// Contains `"error"` and optionally `"details"` keys.
-    guardrails_data: Option<serde_json::Value>,
+    /// Name of the blocking rail, when `status` is `"blocked"`.
+    rail: Option<String>,
 }
 
 /// `NeMo` Guardrails provider.
@@ -82,11 +116,17 @@ pub(in crate::guardrails) struct NemoProvider {
     /// Model name included in every request. Empty string when not configured.
     model: String,
 
+    /// Optional guardrail configuration selection.
+    guardrails: Option<NemoGuardrails>,
+
     /// Per-request deadline covering admission, connect, and I/O.
     timeout: Duration,
 
     /// Connect-time policy for the configured endpoint.
     address_policy: praxis_ai_apis::callout_target::AddressPolicy,
+
+    /// Maximum per-message `/v1/checks` callouts per proxy request.
+    max_message_checks: u32,
 }
 
 impl NemoProvider {
@@ -103,6 +143,7 @@ impl NemoProvider {
     pub fn from_config(config: &serde_yaml::Value, client: SubRequestClient) -> Result<Self, FilterError> {
         let cfg: NemoConfig = serde_yaml::from_value(config.clone())
             .map_err(|e| -> FilterError { format!("ai_guardrails (nemo): {e}").into() })?;
+        validate_guardrails_config(&cfg)?;
         if cfg.endpoint.is_empty() {
             return Err("ai_guardrails (nemo): 'endpoint' must not be empty".into());
         }
@@ -116,27 +157,35 @@ impl NemoProvider {
         if cfg.timeout_ms == 0 {
             return Err("ai_guardrails (nemo): 'timeout_ms' must be greater than zero".into());
         }
+        if cfg.max_message_checks == 0 {
+            return Err("ai_guardrails (nemo): 'max_message_checks' must be greater than zero".into());
+        }
 
         Ok(Self {
             client,
             endpoint: cfg.endpoint,
             model: cfg.model,
+            guardrails: cfg.guardrails,
             timeout: Duration::from_millis(cfg.timeout_ms),
             address_policy,
+            max_message_checks: cfg.max_message_checks,
         })
     }
-}
 
-#[async_trait]
-impl GuardProvider for NemoProvider {
-    async fn evaluate(&self, messages: Vec<serde_json::Value>, _phase: GuardPhase) -> Result<GuardResult, FilterError> {
-        let request = build_request(&self.model, messages)?;
+    /// POST one message slice to `/v1/checks` and map the response.
+    async fn check_messages(
+        &self,
+        messages: Vec<serde_json::Value>,
+        phase: GuardPhase,
+        remaining: Duration,
+    ) -> Result<GuardResult, FilterError> {
+        let request = build_request(&self.model, messages, phase, self.guardrails.as_ref())?;
         let response = subrequest::execute_url(
             &self.client,
             &self.endpoint,
             request,
             MAX_RESPONSE_SIZE,
-            self.timeout,
+            remaining,
             self.address_policy,
         )
         .await
@@ -148,15 +197,123 @@ impl GuardProvider for NemoProvider {
     }
 }
 
+#[async_trait]
+impl GuardProvider for NemoProvider {
+    async fn evaluate(&self, messages: Vec<serde_json::Value>, phase: GuardPhase) -> Result<GuardResult, FilterError> {
+        let indices = target_message_indices(&messages, phase);
+        if indices.is_empty() {
+            return Ok(GuardResult::Pass);
+        }
+        if indices.len() > self.max_message_checks as usize {
+            return Err(format!(
+                "ai_guardrails (nemo): conversation has {} target messages, exceeding max_message_checks ({})",
+                indices.len(),
+                self.max_message_checks
+            )
+            .into());
+        }
+
+        let deadline = Instant::now() + self.timeout;
+        let mut pending_redact: Option<GuardResult> = None;
+        for end in indices {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| -> FilterError {
+                    "ai_guardrails (nemo): overall evaluation deadline exceeded".into()
+                })?;
+            let slice = messages
+                .get(..=end)
+                .ok_or_else(|| -> FilterError { "ai_guardrails (nemo): invalid message index".into() })?
+                .to_vec();
+            match apply_slice_result(pending_redact, self.check_messages(slice, phase, remaining).await?) {
+                Ok(pending) => pending_redact = pending,
+                Err(block) => return Ok(block),
+            }
+        }
+
+        Ok(pending_redact.unwrap_or(GuardResult::Pass))
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Private Utilities
 // -----------------------------------------------------------------------------
 
+/// Reject an explicitly empty configuration selection.
+fn validate_guardrails_config(config: &NemoConfig) -> Result<(), FilterError> {
+    if config.guardrails.as_ref().is_some_and(|g| g.config_ids.is_empty()) {
+        return Err(
+            "ai_guardrails (nemo): 'guardrails.config_ids' must not be empty; omit 'guardrails' to use the service default"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Combine a per-slice verdict into the running evaluation state.
+///
+/// `blocked` fails fast. `modified` is retained but later slices are still
+/// checked so a subsequent `blocked` verdict is not missed.
+fn apply_slice_result(
+    pending_redact: Option<GuardResult>,
+    result: GuardResult,
+) -> Result<Option<GuardResult>, GuardResult> {
+    match result {
+        GuardResult::Pass => Ok(pending_redact),
+        block @ GuardResult::Block { .. } => Err(block),
+        redact @ GuardResult::Redact { .. } => Ok(Some(redact)),
+    }
+}
+
+/// Indices of messages whose role matches the active guard phase.
+///
+/// `/v1/checks` evaluates only the last message of the relevant role per
+/// call. To preserve full-conversation coverage, the provider issues one
+/// HTTP request per target message, each carrying the prefix of the
+/// conversation up to and including that message.
+fn target_message_indices(messages: &[serde_json::Value], phase: GuardPhase) -> Vec<usize> {
+    let target_role = match phase {
+        GuardPhase::Request => "user",
+        GuardPhase::Response => "assistant",
+    };
+
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.get("role").and_then(|role| role.as_str()) == Some(target_role))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// `NeMo` rail types for the active guard phase.
+///
+/// When `rail_types` is omitted, `NeMo`'s `_determine_rails_from_messages`
+/// auto-detects from roles: if both `user` and `assistant` are present it
+/// runs **both** input and output rails (`llmrails.py` line 2123-2124).
+/// Cumulative request-phase slices include assistant history, so without
+/// this override output rails would run on historic assistant text during
+/// a request-phase check.
+fn rail_types_for_phase(phase: GuardPhase) -> Vec<&'static str> {
+    match phase {
+        GuardPhase::Request => vec!["input"],
+        GuardPhase::Response => vec!["output"],
+    }
+}
+
 /// Build the outbound `NeMo` JSON callout.
-fn build_request(model: &str, messages: Vec<serde_json::Value>) -> Result<SubRequest, FilterError> {
+fn build_request(
+    model: &str,
+    messages: Vec<serde_json::Value>,
+    phase: GuardPhase,
+    guardrails: Option<&NemoGuardrails>,
+) -> Result<SubRequest, FilterError> {
     let payload = NemoRequest {
-        model: model.to_owned(),
+        model,
         messages,
+        guardrails: NemoGuardrailsRequest {
+            rail_types: rail_types_for_phase(phase),
+            config_ids: guardrails.map(|settings| settings.config_ids.as_slice()),
+        },
     };
     let body =
         Bytes::from(serde_json::to_vec(&payload).map_err(|e| -> FilterError {
@@ -195,54 +352,21 @@ fn ensure_success_status(response: &SubResponse) -> Result<(), FilterError> {
 
 /// Map a deserialized [`NemoResponse`] to a [`GuardResult`].
 ///
-/// The `/v1/guardrail/checks` endpoint returns three statuses:
-/// - `"success"` - all rails passed
+/// The `/v1/checks` endpoint returns three statuses:
+/// - `"passed"` - all rails passed
 /// - `"blocked"` - at least one rail blocked the content
-/// - `"error"` - `NeMo` internal processing error (fail-closed)
+/// - `"modified"` - content was transformed (e.g. PII masked)
 fn map_nemo_response(nemo: &NemoResponse) -> Result<GuardResult, FilterError> {
     match nemo.status.as_str() {
-        "success" => Ok(GuardResult::Pass),
-        "blocked" => {
-            let reason = blocked_rail_names(nemo.rails_status.as_ref());
-            Ok(GuardResult::Block { reason })
-        },
-        "error" => {
-            let detail = extract_error_detail(nemo.guardrails_data.as_ref());
-            Err(format!("ai_guardrails (nemo): NeMo returned error status: {detail}").into())
-        },
+        "passed" => Ok(GuardResult::Pass),
+        "blocked" => Ok(GuardResult::Block {
+            reason: nemo.rail.clone().unwrap_or_default(),
+        }),
+        "modified" => Ok(GuardResult::Redact {
+            modified_text: nemo.content.clone(),
+            reason: nemo.rail.clone().unwrap_or_else(|| "modified".to_owned()),
+        }),
         other => Err(format!("ai_guardrails (nemo): unknown status '{other}'").into()),
-    }
-}
-
-/// Collect the names of all rails whose `status` is `"blocked"` from the
-/// `rails_status` map and join them with `", "` in sorted order.
-///
-/// Returns an empty string if `rails_status` is absent or no rails are blocked.
-fn blocked_rail_names(rails_status: Option<&serde_json::Value>) -> String {
-    let Some(map) = rails_status.and_then(|v| v.as_object()) else {
-        return String::new();
-    };
-    let mut names: Vec<&str> = map
-        .iter()
-        .filter(|(_, v)| v.get("status").and_then(|s| s.as_str()) == Some("blocked"))
-        .map(|(name, _)| name.as_str())
-        .collect();
-    names.sort_unstable();
-    names.join(", ")
-}
-
-/// Extract a human-readable error string from the `guardrails_data` object
-/// returned by `NeMo` when `status` is `"error"`.
-///
-/// Expected shape: `{"error": "...", "details": "..."}`.
-fn extract_error_detail(data: Option<&serde_json::Value>) -> String {
-    let Some(obj) = data.and_then(|v| v.as_object()) else {
-        return "no details available".to_owned();
-    };
-    let error = obj.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
-    match obj.get("details").and_then(|v| v.as_str()) {
-        Some(details) => format!("{error} ({details})"),
-        None => error.to_owned(),
     }
 }
 
@@ -252,73 +376,161 @@ fn extract_error_detail(data: Option<&serde_json::Value>) -> String {
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, clippy::str_to_string, reason = "tests")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::str_to_string,
+    clippy::indexing_slicing,
+    reason = "tests"
+)]
 mod tests {
     use super::*;
 
     #[test]
-    fn blocked_rail_names_sorts_alphabetically() {
-        let rails = serde_json::json!({
-            "toxicity": {"status": "blocked"},
-            "jailbreak": {"status": "blocked"},
-            "pii masking": {"status": "blocked"},
-        });
-        assert_eq!(blocked_rail_names(Some(&rails)), "jailbreak, pii masking, toxicity");
-    }
-
-    #[test]
-    fn blocked_rail_names_filters_out_non_blocked_rails() {
-        let rails = serde_json::json!({
-            "toxicity": {"status": "blocked"},
-            "jailbreak": {"status": "success"},
-        });
+    fn request_serializes_configured_guardrails() {
+        let config: NemoConfig = serde_yaml::from_str(
+            r#"
+endpoint: "http://localhost:8000/v1/checks"
+model: check-model
+guardrails:
+  config_ids: [your-config, another-config]
+"#,
+        )
+        .unwrap();
+        let request = build_request(
+            &config.model,
+            vec![serde_json::json!({"role": "user", "content": "Hello"})],
+            GuardPhase::Request,
+            config.guardrails.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(request.method, Method::POST);
+        assert_eq!(request.headers[http::header::CONTENT_TYPE], "application/json");
         assert_eq!(
-            blocked_rail_names(Some(&rails)),
-            "toxicity",
-            "only rails with status 'blocked' should be included in the reason string"
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+            serde_json::json!({
+                "model": "check-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "guardrails": {"rail_types": ["input"], "config_ids": ["your-config", "another-config"]}
+            })
         );
     }
 
     #[test]
-    fn blocked_rail_names_empty_rails_status_returns_empty_string() {
-        let rails = serde_json::json!({});
-        assert_eq!(blocked_rail_names(Some(&rails)), "");
-    }
-
-    #[test]
-    fn blocked_rail_names_absent_map_returns_empty_string() {
+    fn request_omits_unconfigured_config_ids() {
+        let config: NemoConfig = serde_yaml::from_str("endpoint: http://localhost:8000").unwrap();
+        let request = build_request(&config.model, vec![], GuardPhase::Response, config.guardrails.as_ref()).unwrap();
         assert_eq!(
-            blocked_rail_names(None),
-            "",
-            "missing rails_status should not panic or error"
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+            serde_json::json!({
+                "model": "", "messages": [], "guardrails": {"rail_types": ["output"]}
+            })
         );
     }
 
     #[test]
-    fn blocked_rail_names_non_object_rails_status_returns_empty_string() {
-        let rails = serde_json::json!("not an object");
-        assert_eq!(blocked_rail_names(Some(&rails)), "");
+    fn target_message_indices_request_collects_user_turns() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "first"}),
+            serde_json::json!({"role": "assistant", "content": "reply"}),
+            serde_json::json!({"role": "user", "content": "second"}),
+        ];
+
+        let indices = target_message_indices(&messages, GuardPhase::Request);
+        assert_eq!(indices, vec![1, 3]);
     }
 
     #[test]
-    fn map_nemo_response_success_returns_pass() {
+    fn target_message_indices_response_collects_assistant_turns() {
+        let messages = vec![
+            serde_json::json!({"role": "assistant", "content": "a"}),
+            serde_json::json!({"role": "assistant", "content": "b"}),
+        ];
+
+        let indices = target_message_indices(&messages, GuardPhase::Response);
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn target_message_indices_empty_when_no_target_role() {
+        let messages = vec![serde_json::json!({"role": "system", "content": "sys"})];
+        assert!(target_message_indices(&messages, GuardPhase::Request).is_empty());
+    }
+
+    #[test]
+    fn rail_types_for_request_phase_are_input_only() {
+        assert_eq!(rail_types_for_phase(GuardPhase::Request), vec!["input"]);
+    }
+
+    #[test]
+    fn rail_types_for_response_phase_are_output_only() {
+        assert_eq!(rail_types_for_phase(GuardPhase::Response), vec!["output"]);
+    }
+
+    #[test]
+    fn build_request_includes_phase_specific_rail_types() {
+        let request = build_request(
+            "test",
+            vec![serde_json::json!({"role": "user", "content": "hello"})],
+            GuardPhase::Request,
+            None,
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(payload["guardrails"]["rail_types"], serde_json::json!(["input"]));
+    }
+
+    #[test]
+    fn apply_slice_result_modified_then_blocked_fails_fast_on_blocked() {
+        let modified = GuardResult::Redact {
+            modified_text: "masked".into(),
+            reason: "pii".into(),
+        };
+        let blocked = GuardResult::Block {
+            reason: "toxicity".into(),
+        };
+
+        let pending = apply_slice_result(None, modified.clone()).unwrap();
+        assert_eq!(pending, Some(modified));
+
+        let err = apply_slice_result(pending, blocked.clone()).unwrap_err();
+        assert_eq!(err, blocked);
+    }
+
+    #[test]
+    fn apply_slice_result_modified_on_later_slice_overwrites_pending_redact() {
+        let first = GuardResult::Redact {
+            modified_text: "first".into(),
+            reason: "pii".into(),
+        };
+        let second = GuardResult::Redact {
+            modified_text: "second".into(),
+            reason: "pii".into(),
+        };
+
+        let pending = apply_slice_result(None, first).unwrap();
+        let pending = apply_slice_result(pending, GuardResult::Pass).unwrap();
+        let pending = apply_slice_result(pending, second.clone()).unwrap();
+        assert_eq!(pending, Some(second));
+    }
+
+    #[test]
+    fn map_nemo_response_passed_returns_pass() {
         let resp = NemoResponse {
-            status: "success".to_string(),
-            rails_status: None,
-            guardrails_data: None,
+            status: "passed".to_string(),
+            content: "hello".to_string(),
+            rail: None,
         };
         let result = map_nemo_response(&resp).unwrap();
         assert!(matches!(result, GuardResult::Pass));
     }
 
     #[test]
-    fn map_nemo_response_blocked_returns_block_with_reason() {
+    fn map_nemo_response_blocked_returns_block_with_rail() {
         let resp = NemoResponse {
             status: "blocked".to_string(),
-            rails_status: Some(serde_json::json!({
-                "toxicity": {"status": "blocked"},
-            })),
-            guardrails_data: None,
+            content: "blocked text".to_string(),
+            rail: Some("toxicity".to_string()),
         };
         let result = map_nemo_response(&resp).unwrap();
         assert!(
@@ -328,66 +540,62 @@ mod tests {
     }
 
     #[test]
-    fn map_nemo_response_error_extracts_guardrails_data() {
+    fn map_nemo_response_blocked_without_rail_returns_empty_reason() {
         let resp = NemoResponse {
-            status: "error".to_string(),
-            rails_status: None,
-            guardrails_data: Some(serde_json::json!({
-                "error": "Could not load guardrails configuration.",
-                "details": "Invalid config path /app/config/nonexistent-config."
-            })),
+            status: "blocked".to_string(),
+            content: "blocked text".to_string(),
+            rail: None,
         };
-        let err_msg = format!("{}", map_nemo_response(&resp).unwrap_err());
-        assert!(
-            err_msg.contains("Could not load guardrails configuration."),
-            "{err_msg}"
-        );
-        assert!(err_msg.contains("Invalid config path"), "{err_msg}");
+        let result = map_nemo_response(&resp).unwrap();
+        assert!(matches!(result, GuardResult::Block { reason } if reason.is_empty()));
     }
 
     #[test]
-    fn map_nemo_response_error_without_guardrails_data() {
+    fn map_nemo_response_modified_returns_redact() {
         let resp = NemoResponse {
-            status: "error".to_string(),
-            rails_status: None,
-            guardrails_data: None,
+            status: "modified".to_string(),
+            content: "masked text".to_string(),
+            rail: None,
         };
-        let err_msg = format!("{}", map_nemo_response(&resp).unwrap_err());
-        assert!(err_msg.contains("no details available"), "{err_msg}");
-    }
-
-    #[test]
-    fn map_nemo_response_error_with_error_key_only() {
-        let resp = NemoResponse {
-            status: "error".to_string(),
-            rails_status: None,
-            guardrails_data: Some(serde_json::json!({"error": "Internal failure"})),
-        };
-        let err_msg = format!("{}", map_nemo_response(&resp).unwrap_err());
-        assert!(err_msg.contains("Internal failure"), "{err_msg}");
+        let result = map_nemo_response(&resp).unwrap();
         assert!(
-            !err_msg.contains("Internal failure ("),
-            "should not append details in parens when details key is absent: {err_msg}"
+            matches!(
+                result,
+                GuardResult::Redact {
+                    modified_text,
+                    reason
+                } if modified_text == "masked text" && reason == "modified"
+            ),
+            "modified response should produce GuardResult::Redact"
         );
     }
 
     #[test]
-    fn map_nemo_response_error_with_missing_error_key() {
+    fn map_nemo_response_modified_with_empty_content_returns_redact() {
         let resp = NemoResponse {
-            status: "error".to_string(),
-            rails_status: None,
-            guardrails_data: Some(serde_json::json!({"unexpected": "shape"})),
+            status: "modified".to_string(),
+            content: String::new(),
+            rail: None,
         };
-        let err_msg = format!("{}", map_nemo_response(&resp).unwrap_err());
-        assert!(err_msg.contains("unknown error"), "{err_msg}");
+        let result = map_nemo_response(&resp).unwrap();
+        assert!(
+            matches!(
+                result,
+                GuardResult::Redact {
+                    modified_text,
+                    reason
+                } if modified_text.is_empty() && reason == "modified"
+            ),
+            "empty-string modified content is valid (full redaction)"
+        );
     }
 
     #[test]
     fn map_nemo_response_unknown_status_returns_error() {
         let resp = NemoResponse {
             status: "garbage".to_string(),
-            rails_status: None,
-            guardrails_data: None,
+            content: String::new(),
+            rail: None,
         };
         let err_msg = format!("{}", map_nemo_response(&resp).unwrap_err());
         assert!(

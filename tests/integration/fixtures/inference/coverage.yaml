@@ -5,6 +5,7 @@ scope:
   - responses_agentic_loop
   - responses_native_passthrough
   - responses_to_chat_completions
+  - responses_client_tool_compat
 features:
   - id: messages.request.minimal
     scopes:
@@ -77,6 +78,24 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.request.provider_parameter_passthrough
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/provider-parameter-passthrough
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.request.unrepresentable_parameters
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/unrepresentable-parameters
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.native.request
     scopes:
       - messages_native_passthrough
@@ -107,6 +126,15 @@ features:
     providers:
       anthropic:
         status: live_covered
+  - id: messages.native.count_tokens
+    scopes:
+      - messages_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - messages/native-count-tokens
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.native.request
     scopes:
       - responses_native_passthrough
@@ -143,6 +171,15 @@ features:
         status: live_covered
       vllm:
         status: live_covered
+  - id: responses.request.background_unsupported
+    scopes:
+      - responses_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - responses/background-unsupported
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.native.continuation
     scopes:
       - responses_native_passthrough
@@ -246,12 +283,30 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.unrepresentable_parameters
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-unrepresentable-parameters
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.tools.function_echo
     scopes:
       - responses_to_chat_completions
     status: synthetic_only
     scenarios:
       - responses/chat-tool-echo
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.client_tool_compat.lower_restore
+    scopes:
+      - responses_client_tool_compat
+    status: synthetic_only
+    scenarios:
+      - responses/client-tool-compat
     providers:
       synthetic:
         status: synthetic_only

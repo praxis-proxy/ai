@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use praxis_test_utils::{
     Backend, example_config_path, free_port, http_send, json_post, parse_body, parse_status, patch_yaml,
     start_postgres, start_proxy,
@@ -42,6 +43,10 @@ async fn response_store_persists_response_to_postgres() {
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml
+            .replace(
+                "      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default",
+                "      - filter: state_owner\n        mode: trusted_owner\n        header: x-authenticated-state-owner",
+            )
             .replace("backend: sqlite", "backend: postgres")
             .replace(
                 "database_url: \"sqlite://responses.db?mode=rwc\"",
@@ -66,7 +71,11 @@ async fn response_store_persists_response_to_postgres() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello from postgres"}"#),
+        &json_post_with_owner(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"Hello from postgres"}"#,
+            "alice",
+        ),
     );
 
     assert_eq!(parse_status(&raw), 200, "Responses API POST should return 200");
@@ -79,7 +88,10 @@ async fn response_store_persists_response_to_postgres() {
     let pool = Box::pin(sqlx::PgPool::connect(&pg.url()))
         .await
         .expect("should connect to test database");
-    let sql = format!("SELECT id, tenant_id, created_at, model, input, messages FROM {responses_table} WHERE id = $1");
+    let sql = format!(
+        "SELECT id, tenant_id, owner_issuer, owner_subject, created_at, model, input, messages \
+         FROM {responses_table} WHERE id = $1"
+    );
     let row: sqlx::postgres::PgRow = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind("resp_pg_abc")
         .fetch_one(&pool)
@@ -89,11 +101,15 @@ async fn response_store_persists_response_to_postgres() {
 
     let id: String = row.get("id");
     let tenant_id: String = row.get("tenant_id");
+    let owner_issuer: String = row.get("owner_issuer");
+    let owner_subject: String = row.get("owner_subject");
     let created_at: i64 = row.get("created_at");
     let model: String = row.get("model");
 
     assert_eq!(id, "resp_pg_abc", "persisted id should match response");
-    assert_eq!(tenant_id, "default", "default tenant should be used");
+    assert_eq!(tenant_id, "pg-tenant", "trusted owner tenant should be persisted");
+    assert_eq!(owner_issuer, "urn:praxis:postgres-test");
+    assert_eq!(owner_subject, "alice");
     assert_eq!(created_at, 2000, "persisted created_at should match response");
     assert_eq!(model, "gpt-4.1", "persisted model should match response");
 
@@ -118,6 +134,20 @@ async fn response_store_persists_response_to_postgres() {
         items[0],
         serde_json::json!({"type": "message", "role": "user", "content": "Hello from postgres"}),
         "first message should be the normalized user input"
+    );
+
+    let raw = http_send(
+        proxy.addr(),
+        &format!(
+            "GET /v1/responses/resp_pg_abc HTTP/1.1\r\nHost: localhost\r\n\
+             x-authenticated-state-owner: {}\r\nConnection: close\r\n\r\n",
+            owner_assertion("bob")
+        ),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        404,
+        "PostgreSQL must deny a same-tenant different subject"
     );
 }
 
@@ -190,4 +220,18 @@ fn unique_suffix() -> String {
     format!("{id}_{tid:?}")
         .replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_")
         .to_lowercase()
+}
+
+fn owner_assertion(subject: &str) -> String {
+    let payload = serde_json::to_vec(&["pg-tenant", "urn:praxis:postgres-test", subject]).unwrap();
+    format!("v1.{}", URL_SAFE_NO_PAD.encode(payload))
+}
+
+fn json_post_with_owner(path: &str, body: &str, subject: &str) -> String {
+    format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         x-authenticated-state-owner: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        owner_assertion(subject),
+        body.len()
+    )
 }

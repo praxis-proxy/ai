@@ -16,9 +16,11 @@ SDK to verify wire-format compatibility.
 
 Usage:
     cargo build -p praxis-ai-proxy
+    cargo build -p praxis-test-utils --example conversations_tenant_proxy
     uv run tests/integration/sdk/openai/test_openai_conversations.py -v
 """
 
+import base64
 import json
 import os
 import signal
@@ -30,12 +32,26 @@ import time
 
 import httpx
 import pytest
-from openai import BadRequestError, NotFoundError, OpenAI
+from openai import (
+    AuthenticationError,
+    BadRequestError,
+    InternalServerError,
+    NotFoundError,
+    OpenAI,
+)
 
 # When set to a postgres:// URL (the vllm-responses-postgres CI job), the
 # conversations store runs against PostgreSQL instead of the default in-memory
 # SQLite, so this suite exercises the same store backend as the responses tests.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+OWNER_HEADER = "x-authenticated-state-owner"
+
+
+def _owner_assertion(subject: str) -> str:
+    payload = json.dumps(
+        ["sdk-tenant", "urn:praxis:sdk-test", subject], separators=(",", ":")
+    ).encode()
+    return "v1." + base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -59,6 +75,23 @@ def _find_binary() -> str:
             return candidate
     raise FileNotFoundError(
         "praxis-ai binary not found — run `cargo build -p praxis-ai-proxy` first"
+    )
+
+
+def _find_tenant_binary() -> str:
+    configured = os.environ.get("PRAXIS_TENANT_TEST_BIN")
+    if configured:
+        if os.path.isfile(configured):
+            return configured
+        raise FileNotFoundError(
+            f"PRAXIS_TENANT_TEST_BIN={configured!r} not found"
+        )
+    candidate = "target/debug/examples/conversations_tenant_proxy"
+    if os.path.isfile(candidate):
+        return candidate
+    pytest.skip(
+        "tenant test proxy not found — run "
+        "`cargo build -p praxis-test-utils --example conversations_tenant_proxy`"
     )
 
 
@@ -89,6 +122,9 @@ def _conversations_filter() -> dict:
             {
                 "backend": "sqlite",
                 "database_url": "sqlite::memory:",
+                # Every pooled SQLite in-memory connection is a distinct
+                # database, so keep this SDK suite on one connection.
+                "pool": {"max_connections": 1},
             }
         )
     return cfg
@@ -106,7 +142,46 @@ def _write_config(port: int) -> str:
         "filter_chains": [
             {
                 "name": "conversations-pipeline",
-                "filters": [_conversations_filter()],
+                "filters": [
+                    {
+                        "filter": "state_owner",
+                        "mode": "trusted_owner",
+                        "header": OWNER_HEADER,
+                    },
+                    _conversations_filter(),
+                ],
+            }
+        ],
+    }
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        json.dump(config, f)
+    return path
+
+
+def _write_tenant_config(port: int) -> str:
+    conversations_filter = _conversations_filter()
+    conversations_filter.update(
+        {
+            "conversations_table": "tenant_test_conversations",
+            "items_table": "tenant_test_conversation_items",
+        }
+    )
+    config = {
+        "listeners": [
+            {
+                "name": "tenant-test",
+                "address": f"127.0.0.1:{port}",
+                "filter_chains": ["tenant-conversations-pipeline"],
+            }
+        ],
+        "filter_chains": [
+            {
+                "name": "tenant-conversations-pipeline",
+                "filters": [
+                    {"filter": "test_tenant_identity"},
+                    conversations_filter,
+                ],
             }
         ],
     }
@@ -158,14 +233,75 @@ def openai_client(praxis_proxy):
     return OpenAI(
         api_key="not-needed",
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
+        default_headers={OWNER_HEADER: _owner_assertion("alice")},
         max_retries=0,
         timeout=10.0,
+    )
+
+
+@pytest.fixture(scope="session")
+def other_owner_client(praxis_proxy):
+    """Return a same-tenant client with a distinct immutable subject."""
+    return OpenAI(
+        api_key="not-needed",
+        base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
+        default_headers={OWNER_HEADER: _owner_assertion("bob")},
+        max_retries=0,
+        timeout=10.0,
+    )
+
+
+@pytest.fixture(scope="session")
+def tenant_praxis_proxy():
+    """Start Praxis with deterministic test credentials mapped to tenants."""
+    binary = _find_tenant_binary()
+    port = _free_port()
+    config_path = _write_tenant_config(port)
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for_proxy(port)
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def tenant_clients(tenant_praxis_proxy):
+    """Return two official SDK clients sharing a store but not a tenant."""
+    base_url = f"http://127.0.0.1:{tenant_praxis_proxy}/v1"
+    options = {"base_url": base_url, "max_retries": 0, "timeout": 10.0}
+    return (
+        OpenAI(api_key="tenant-a-token", **options),
+        OpenAI(api_key="tenant-b-token", **options),
     )
 
 
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def _message_items(prefix: str, count: int) -> list[dict]:
+    return [
+        {
+            "id": f"{prefix}_{index}",
+            "type": "message",
+            "role": "user",
+            "content": f"message {index}",
+        }
+        for index in range(count)
+    ]
 
 
 class TestOpenAIConversations:
@@ -286,7 +422,7 @@ class TestOpenAIConversations:
             openai_client.conversations.retrieve(conversation.id)
         assert exc_info.value.status_code == 404
 
-    def test_conversation_delete_preserves_items(self, openai_client):
+    def test_deleted_conversation_hides_preserved_item_rows(self, openai_client):
         conversation = openai_client.conversations.create(
             items=[
                 {
@@ -299,14 +435,45 @@ class TestOpenAIConversations:
         )
         openai_client.conversations.delete(conversation.id)
 
-        item = openai_client.conversations.items.retrieve(
-            "item_keep",
-            conversation_id=conversation.id,
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.retrieve(
+                "item_keep",
+                conversation_id=conversation.id,
+            )
+        assert exc_info.value.status_code == 404
+
+    def test_same_tenant_other_owner_cannot_access_state(
+        self, openai_client, other_owner_client
+    ):
+        conversation = openai_client.conversations.create(
+            metadata={"visibility": "private"},
+            items=[
+                {
+                    "id": "item_owner_private",
+                    "type": "message",
+                    "role": "user",
+                    "content": "secret",
+                }
+            ],
         )
 
-        assert item.id == "item_keep"
-        assert item.type == "message"
-        assert item.content[0].text == "keep me"
+        with pytest.raises(NotFoundError):
+            other_owner_client.conversations.retrieve(conversation.id)
+        with pytest.raises(NotFoundError):
+            other_owner_client.conversations.items.list(conversation.id)
+        with pytest.raises(NotFoundError):
+            other_owner_client.conversations.items.retrieve(
+                "item_owner_private", conversation_id=conversation.id
+            )
+        with pytest.raises(NotFoundError):
+            other_owner_client.conversations.update(
+                conversation.id, metadata={"visibility": "public"}
+            )
+        with pytest.raises(NotFoundError):
+            other_owner_client.conversations.delete(conversation.id)
+
+        retrieved = openai_client.conversations.retrieve(conversation.id)
+        assert retrieved.metadata["visibility"] == "private"
 
     def test_empty_item_list_is_sdk_compatible(self, openai_client):
         conversation = openai_client.conversations.create()
@@ -581,7 +748,10 @@ class TestOpenAIConversations:
         response = httpx.get(
             f"{str(openai_client.base_url).rstrip('/')}"
             f"/conversations/{conversation.id}/items?{query}",
-            headers={"Authorization": "Bearer not-needed"},
+            headers={
+                "Authorization": "Bearer not-needed",
+                OWNER_HEADER: _owner_assertion("alice"),
+            },
             timeout=10,
         )
         assert response.status_code == 400
@@ -599,6 +769,326 @@ class TestOpenAIConversations:
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.conversations.create(metadata=metadata)
         assert exc_info.value.status_code == 400
+
+    def test_conversation_accepts_twenty_initial_items(self, openai_client):
+        conversation = openai_client.conversations.create(
+            items=_message_items("item_initial_limit", 20),
+        )
+
+        page = openai_client.conversations.items.list(
+            conversation.id,
+            limit=20,
+            order="asc",
+        )
+        assert [item.id for item in page.data] == [
+            f"item_initial_limit_{index}" for index in range(20)
+        ]
+        assert page.has_more is False
+
+    def test_conversation_rejects_more_than_twenty_initial_items(
+        self,
+        openai_client,
+    ):
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.create(
+                items=_message_items("item_initial_over_limit", 21),
+            )
+        assert exc_info.value.status_code == 400
+
+    def test_item_create_accepts_twenty_items(self, openai_client):
+        conversation = openai_client.conversations.create()
+
+        created = openai_client.conversations.items.create(
+            conversation.id,
+            items=_message_items("item_append_limit", 20),
+        )
+
+        assert [item.id for item in created.data] == [
+            f"item_append_limit_{index}" for index in range(20)
+        ]
+        assert created.has_more is False
+
+    def test_oversized_item_batch_is_rejected_atomically(self, openai_client):
+        conversation = openai_client.conversations.create()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.items.create(
+                conversation.id,
+                items=_message_items("item_append_over_limit", 21),
+            )
+        assert exc_info.value.status_code == 400
+
+        page = openai_client.conversations.items.list(conversation.id)
+        assert page.data == []
+
+    def test_metadata_length_boundaries_are_accepted(self, openai_client):
+        boundary_metadata = {"k" * 64: "v" * 512}
+        conversation = openai_client.conversations.create(
+            metadata=boundary_metadata,
+        )
+        assert conversation.metadata == boundary_metadata
+
+        updated_metadata = {"u" * 64: "w" * 512}
+        updated = openai_client.conversations.update(
+            conversation.id,
+            metadata=updated_metadata,
+        )
+        assert updated.metadata == updated_metadata
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            pytest.param({"k" * 65: "value"}, id="key-too-long"),
+            pytest.param({"key": "v" * 513}, id="value-too-long"),
+            pytest.param({"key": 123}, id="non-string-value"),
+        ],
+    )
+    def test_invalid_metadata_is_rejected_on_create(
+        self,
+        openai_client,
+        metadata,
+    ):
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.create(metadata=metadata)
+        assert exc_info.value.status_code == 400
+
+    @pytest.mark.parametrize(
+        "metadata",
+        [
+            pytest.param({"k" * 65: "value"}, id="key-too-long"),
+            pytest.param({"key": "v" * 513}, id="value-too-long"),
+            pytest.param({"key": 123}, id="non-string-value"),
+        ],
+    )
+    def test_invalid_metadata_is_rejected_on_update(
+        self,
+        openai_client,
+        metadata,
+    ):
+        conversation = openai_client.conversations.create()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.update(
+                conversation.id,
+                metadata=metadata,
+            )
+        assert exc_info.value.status_code == 400
+
+    def test_conversation_update_replaces_and_clears_metadata(self, openai_client):
+        conversation = openai_client.conversations.create(
+            metadata={"old": "value", "keep": "original"},
+        )
+
+        replaced = openai_client.conversations.update(
+            conversation.id,
+            metadata={"keep": "replacement", "new": "value"},
+        )
+        assert replaced.metadata == {"keep": "replacement", "new": "value"}
+
+        cleared = openai_client.conversations.update(
+            conversation.id,
+            metadata={},
+        )
+        assert cleared.metadata == {}
+
+    def test_function_call_items_round_trip(self, openai_client):
+        conversation = openai_client.conversations.create()
+        call_id = "call_conversation_round_trip"
+
+        created = openai_client.conversations.items.create(
+            conversation.id,
+            items=[
+                {
+                    "id": "item_function_call",
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "get_weather",
+                    "arguments": '{"city":"Paris"}',
+                },
+                {
+                    "id": "item_function_call_output",
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": "sunny",
+                },
+            ],
+        )
+
+        function_call, function_output = created.data
+        assert function_call.type == "function_call"
+        assert function_call.call_id == call_id
+        assert function_call.name == "get_weather"
+        assert json.loads(function_call.arguments) == {"city": "Paris"}
+        assert function_output.type == "function_call_output"
+        assert function_output.call_id == call_id
+        assert function_output.output == "sunny"
+
+        page = openai_client.conversations.items.list(
+            conversation.id,
+            order="asc",
+        )
+        assert [item.id for item in page.data] == [
+            "item_function_call",
+            "item_function_call_output",
+        ]
+
+        retrieved = openai_client.conversations.items.retrieve(
+            "item_function_call_output",
+            conversation_id=conversation.id,
+        )
+        assert retrieved.call_id == call_id
+        assert retrieved.output == "sunny"
+
+    def test_duplicate_ids_in_one_batch_are_rejected_atomically(
+        self,
+        openai_client,
+    ):
+        conversation = openai_client.conversations.create()
+        duplicate = {
+            "id": "item_duplicate_in_batch",
+            "type": "message",
+            "role": "user",
+            "content": "duplicate",
+        }
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.items.create(
+                conversation.id,
+                items=[duplicate, duplicate],
+            )
+        assert exc_info.value.status_code == 400
+        assert openai_client.conversations.items.list(conversation.id).data == []
+
+    def test_invalid_mixed_item_batch_is_rejected_atomically(self, openai_client):
+        conversation = openai_client.conversations.create()
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.conversations.items.create(
+                conversation.id,
+                items=[
+                    {
+                        "id": "item_valid_before_invalid",
+                        "type": "message",
+                        "role": "user",
+                        "content": "valid",
+                    },
+                    {
+                        "id": "item_invalid_in_batch",
+                        "type": "unsupported_item_type",
+                    },
+                ],
+            )
+        assert exc_info.value.status_code == 400
+        assert openai_client.conversations.items.list(conversation.id).data == []
+
+    def test_item_cannot_be_accessed_through_another_conversation(
+        self,
+        openai_client,
+    ):
+        owner = openai_client.conversations.create(
+            items=[
+                {
+                    "id": "item_parent_isolation",
+                    "type": "message",
+                    "role": "user",
+                    "content": "private to its parent",
+                }
+            ],
+        )
+        other = openai_client.conversations.create()
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.retrieve(
+                "item_parent_isolation",
+                conversation_id=other.id,
+            )
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.delete(
+                "item_parent_isolation",
+                conversation_id=other.id,
+            )
+        assert exc_info.value.status_code == 404
+
+        item = openai_client.conversations.items.retrieve(
+            "item_parent_isolation",
+            conversation_id=owner.id,
+        )
+        assert item.content[0].text == "private to its parent"
+
+    def test_descending_cursor_pagination_has_no_gaps_or_duplicates(
+        self,
+        openai_client,
+    ):
+        conversation = openai_client.conversations.create(
+            items=_message_items("item_desc_page", 5),
+        )
+
+        seen = []
+        after = None
+        while True:
+            page = openai_client.conversations.items.list(
+                conversation.id,
+                after=after,
+                limit=2,
+                order="desc",
+            )
+            seen.extend(item.id for item in page.data)
+            if not page.has_more:
+                break
+            after = page.last_id
+
+        assert seen == [f"item_desc_page_{index}" for index in range(4, -1, -1)]
+        assert len(seen) == len(set(seen))
+
+    def test_conversation_delete_is_not_repeatable(self, openai_client):
+        conversation = openai_client.conversations.create()
+        openai_client.conversations.delete(conversation.id)
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.delete(conversation.id)
+        assert exc_info.value.status_code == 404
+
+    def test_item_delete_updates_list_and_is_not_repeatable(self, openai_client):
+        conversation = openai_client.conversations.create(
+            metadata={"topic": "delete-item"},
+            items=[
+                {
+                    "id": "item_delete_once",
+                    "type": "message",
+                    "role": "user",
+                    "content": "delete me",
+                },
+                {
+                    "id": "item_keep_after_delete",
+                    "type": "message",
+                    "role": "user",
+                    "content": "keep me",
+                },
+            ],
+        )
+
+        updated = openai_client.conversations.items.delete(
+            "item_delete_once",
+            conversation_id=conversation.id,
+        )
+        assert updated.id == conversation.id
+        assert updated.created_at == conversation.created_at
+        assert updated.metadata == conversation.metadata
+
+        page = openai_client.conversations.items.list(
+            conversation.id,
+            order="asc",
+        )
+        assert [item.id for item in page.data] == ["item_keep_after_delete"]
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.delete(
+                "item_delete_once",
+                conversation_id=conversation.id,
+            )
+        assert exc_info.value.status_code == 404
 
     def test_full_workflow(self, openai_client):
         conversation = openai_client.conversations.create(
@@ -618,6 +1108,160 @@ class TestOpenAIConversations:
 
         with pytest.raises(NotFoundError):
             openai_client.conversations.retrieve(conversation.id)
+
+
+class TestConversationTenantIsolation:
+    """Tenant isolation exercised through independently authenticated SDK clients."""
+
+    def test_conversation_crud_is_tenant_scoped(self, tenant_clients):
+        tenant_a, tenant_b = tenant_clients
+        conversation = tenant_a.conversations.create(
+            metadata={"owner": "tenant-a"},
+        )
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.retrieve(conversation.id)
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.update(
+                conversation.id,
+                metadata={"owner": "tenant-b"},
+            )
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.delete(conversation.id)
+        assert exc_info.value.status_code == 404
+
+        retrieved = tenant_a.conversations.retrieve(conversation.id)
+        assert retrieved.metadata == {"owner": "tenant-a"}
+
+    def test_item_operations_are_tenant_scoped(self, tenant_clients):
+        tenant_a, tenant_b = tenant_clients
+        conversation = tenant_a.conversations.create(
+            items=[
+                {
+                    "id": "item_tenant_private",
+                    "type": "message",
+                    "role": "user",
+                    "content": "tenant-a secret",
+                }
+            ],
+        )
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.items.list(conversation.id)
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.items.create(
+                conversation.id,
+                items=[
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": "cross-tenant write",
+                    }
+                ],
+            )
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.items.retrieve(
+                "item_tenant_private",
+                conversation_id=conversation.id,
+            )
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.items.delete(
+                "item_tenant_private",
+                conversation_id=conversation.id,
+            )
+        assert exc_info.value.status_code == 404
+
+        page = tenant_a.conversations.items.list(conversation.id)
+        assert [item.id for item in page.data] == ["item_tenant_private"]
+
+    def test_item_id_cannot_transfer_between_tenants(self, tenant_clients):
+        tenant_a, tenant_b = tenant_clients
+        conversation_a = tenant_a.conversations.create(
+            items=[
+                {
+                    "id": "item_shared_across_tenants",
+                    "type": "message",
+                    "role": "user",
+                    "content": "tenant-a value",
+                }
+            ],
+        )
+        with pytest.raises(InternalServerError) as exc_info:
+            tenant_b.conversations.create(
+                items=[
+                    {
+                        "id": "item_shared_across_tenants",
+                        "type": "message",
+                        "role": "user",
+                        "content": "tenant-b value",
+                    }
+                ],
+            )
+        assert exc_info.value.status_code == 500
+
+        item_a = tenant_a.conversations.items.retrieve(
+            "item_shared_across_tenants",
+            conversation_id=conversation_a.id,
+        )
+        assert item_a.content[0].text == "tenant-a value"
+
+    def test_denied_access_does_not_affect_callers_own_resources(
+        self,
+        tenant_clients,
+    ):
+        tenant_a, tenant_b = tenant_clients
+        conversation_a = tenant_a.conversations.create()
+        conversation_b = tenant_b.conversations.create(
+            metadata={"owner": "tenant-b"},
+        )
+
+        with pytest.raises(NotFoundError) as exc_info:
+            tenant_b.conversations.retrieve(conversation_a.id)
+        assert exc_info.value.status_code == 404
+
+        retrieved = tenant_b.conversations.retrieve(conversation_b.id)
+        assert retrieved.metadata == {"owner": "tenant-b"}
+
+    def test_unknown_bearer_token_is_rejected(self, tenant_praxis_proxy):
+        client = OpenAI(
+            api_key="unknown-tenant-token",
+            base_url=f"http://127.0.0.1:{tenant_praxis_proxy}/v1",
+            max_retries=0,
+            timeout=10.0,
+        )
+
+        with pytest.raises(AuthenticationError) as exc_info:
+            client.conversations.create()
+        assert exc_info.value.status_code == 401
+
+    def test_tenant_header_cannot_override_authenticated_tenant(
+        self,
+        tenant_clients,
+        tenant_praxis_proxy,
+    ):
+        tenant_a, _tenant_b = tenant_clients
+        conversation = tenant_a.conversations.create()
+        spoofing_client = OpenAI(
+            api_key="tenant-b-token",
+            base_url=f"http://127.0.0.1:{tenant_praxis_proxy}/v1",
+            default_headers={"x-tenant-id": "tenant-a"},
+            max_retries=0,
+            timeout=10.0,
+        )
+
+        with pytest.raises(NotFoundError) as exc_info:
+            spoofing_client.conversations.retrieve(conversation.id)
+        assert exc_info.value.status_code == 404
 
 
 if __name__ == "__main__":

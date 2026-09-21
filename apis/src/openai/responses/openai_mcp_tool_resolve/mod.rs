@@ -54,16 +54,19 @@ mod config;
 mod tests;
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     hash::{Hash as _, Hasher as _},
+    sync::Arc,
     time::Duration,
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use praxis_core::config::InsecureOptions;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, TerminalResponse,
-    body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
+    HttpFilterContext, TerminalResponse, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::debug;
 
@@ -73,7 +76,8 @@ use super::{
     state::{DeferredMcpConnector, ResponsesState},
 };
 use crate::{
-    json_body::{SerializedJson, serialize_json_body},
+    callout_headers::effective_body_callout_headers,
+    json_body::{SerializedJson, serialize_json_body, serialized_len},
     mcp_client,
 };
 
@@ -136,6 +140,9 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 ///
 /// ```yaml
 /// filter: openai_mcp_tool_resolve
+/// forward_headers:
+///   - x-tenant-id
+///   - x-user-id
 /// timeout_ms: 5000
 /// max_rewritten_body_bytes: 67108864
 /// max_tools: 128
@@ -143,9 +150,14 @@ const MAX_FUNCTION_NAME_LEN: usize = 64;
 ///   - id: corp_drive
 ///     server_url: https://drive-mcp.internal/mcp
 /// ```
+///
+/// `forward_headers` applies only to configured `connector_id` targets. Direct
+/// client-selected `server_url` targets never receive ambient request headers.
+/// Credential headers are rejected; use the MCP tool entry's dedicated
+/// `authorization` field for per-target credentials.
 pub struct McpToolResolveFilter {
-    /// Allow connections to loopback addresses.
-    allow_loopback: bool,
+    /// Trusted request headers explicitly allowed across the MCP boundary.
+    forward_headers: Vec<http::HeaderName>,
 
     /// Connector ID to server URL mapping.
     connectors: HashMap<String, url::Url>,
@@ -160,19 +172,111 @@ pub struct McpToolResolveFilter {
     /// Maximum number of tools returned by a single MCP server.
     max_tools: usize,
 
+    /// Bound outbound filter pipeline the `tools/list` callout dials through.
+    ///
+    /// Carries only the operator's cross-cutting filters (if any); the dial
+    /// target is staged separately by the transport, so no upstream-selecting
+    /// filter is prepended. Constructed by [`Self::from_config_with_binding`]
+    /// (real operator chain, inline or named) or [`Self::from_config`] (empty
+    /// pipeline).
+    outbound_pipeline: Arc<FilterPipeline>,
+
     /// Per-server timeout for `tools/list` calls.
     timeout: Duration,
 }
 
 impl McpToolResolveFilter {
-    /// Build from parsed YAML config.
+    /// Build from parsed YAML config as a plain builtin (no chain binding).
+    ///
+    /// This path cannot bind an operator `outbound_chain` (it has no
+    /// [`ChainBindingContext`]), so it builds an empty outbound pipeline and
+    /// rejects a configured `outbound_chain`. Production registers this filter as
+    /// chain-binding via [`Self::from_config_with_binding`]; this method exists
+    /// for the no-chain default and unit tests, and keeps the `name()` +
+    /// `from_config()` pair the filter-docs generator anchors on.
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] if the config is invalid.
+    /// Returns [`FilterError`] if the config is invalid, carries an
+    /// `outbound_chain` (unsupported without chain binding), or the empty
+    /// outbound pipeline cannot be built.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: McpToolResolveConfig = parse_filter_config("openai_mcp_tool_resolve", config)?;
         let validated = build_config(cfg)?;
+        if validated.outbound_chain.is_some() {
+            return Err(FilterError::from(
+                "openai_mcp_tool_resolve: outbound_chain requires chain-binding registration; register this \
+                 filter with register_chain_binding, not as a plain builtin",
+            ));
+        }
+        // Empty outbound pipeline; posture stays at its safe default until
+        // pipeline finalization propagates the operator's global insecure options.
+        let outbound_pipeline = mcp_client::build_bare_outbound_pipeline(false)
+            .map_err(|error| FilterError::from(format!("openai_mcp_tool_resolve: {error}")))?;
+        Self::assemble(&validated, outbound_pipeline)
+    }
+
+    /// Build from parsed YAML config, binding the operator `outbound_chain`
+    /// against the active registry.
+    ///
+    /// Registered via [`FilterRegistry::register_chain_binding`]; the resolved
+    /// outbound pipeline is owned by the returned filter and participates in
+    /// runtime-resource propagation, hot-reload file discovery, and insecure-option
+    /// application through the delegating [`HttpFilter`] hooks. Because this runs
+    /// at top-level build time with a live [`ChainBindingContext`], both an inline
+    /// `outbound_chain` and a named reference (resolved against the top-level
+    /// `filter_chains`) are supported. The dial target is staged by the transport,
+    /// so the bound chain carries only cross-cutting outbound filters.
+    ///
+    /// [`FilterRegistry::register_chain_binding`]: praxis_filter::FilterRegistry::register_chain_binding
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the config is invalid or the outbound chain
+    /// cannot be bound (an unknown named reference, a cycle, excessive nesting, a
+    /// terminal filter, or an ordering violation).
+    pub fn from_config_with_binding(
+        config: &serde_yaml::Value,
+        ctx: &ChainBindingContext<'_>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let cfg: McpToolResolveConfig = parse_filter_config("openai_mcp_tool_resolve", config)?;
+        let mut validated = build_config(cfg)?;
+        let outbound_chain = validated.outbound_chain.take();
+        let outbound_pipeline =
+            mcp_client::bind_mcp_outbound_chain(outbound_chain, ctx, "openai_mcp_tool_resolve_outbound")?;
+        Self::assemble(&validated, outbound_pipeline)
+    }
+
+    /// Build the filter with an allow-private outbound pipeline, for unit tests
+    /// that dial a loopback MCP server directly.
+    ///
+    /// In production the outbound pipeline's private-upstream posture is set by
+    /// pipeline finalization from the operator's global insecure options; a unit
+    /// test that constructs the filter in isolation has no finalization pass, so
+    /// this seam bakes an allow-private empty outbound pipeline instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the config is invalid or the empty outbound
+    /// pipeline cannot be built.
+    #[cfg(test)]
+    pub(crate) fn from_config_allow_private(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let cfg: McpToolResolveConfig = parse_filter_config("openai_mcp_tool_resolve", config)?;
+        let validated = build_config(cfg)?;
+        let outbound_pipeline = mcp_client::build_bare_outbound_pipeline(true)
+            .map_err(|error| FilterError::from(format!("openai_mcp_tool_resolve: {error}")))?;
+        Self::assemble(&validated, outbound_pipeline)
+    }
+
+    /// Assemble the filter from a validated config and a bound outbound pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if a connector `server_url` cannot be parsed.
+    fn assemble(
+        validated: &McpToolResolveConfig,
+        outbound_pipeline: Arc<FilterPipeline>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let connectors = validated
             .connectors
             .iter()
@@ -183,13 +287,28 @@ impl McpToolResolveFilter {
             })
             .collect::<Result<HashMap<String, url::Url>, FilterError>>()?;
         Ok(Box::new(Self {
-            allow_loopback: validated.allow_loopback,
+            forward_headers: validated
+                .forward_headers
+                .iter()
+                .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
+                .collect(),
             connectors,
             max_rewritten_body_bytes: validated.max_rewritten_body_bytes,
             max_servers: validated.max_servers,
             max_tools: validated.max_tools,
+            outbound_pipeline,
             timeout: Duration::from_millis(validated.timeout_ms),
         }))
+    }
+
+    /// Acquire the MCP callout for this request: capture the parent transport
+    /// and downstream attributes and pair them with the bound outbound pipeline.
+    ///
+    /// Fails closed if the pipeline exposes no shared sub-request client (an MCP
+    /// callout cannot dial without one).
+    fn acquire_callout(&self, ctx: &HttpFilterContext<'_>) -> Result<mcp_client::McpCallout, ResolveError> {
+        mcp_client::McpCallout::from_context(ctx, Arc::clone(&self.outbound_pipeline))
+            .ok_or(ResolveError::NoSubrequestClient)
     }
 
     /// Core resolution: parse MCP entries, check cache, call
@@ -211,15 +330,17 @@ impl McpToolResolveFilter {
         require_tool_search_for_deferred(ctx, &mcp_entries)?;
         self.validate_entries(&mcp_entries)?;
 
+        // Capture the parent transport + downstream attributes for the outbound
+        // callout before the resolution work borrows `ctx` mutably; fails closed
+        // if no shared sub-request client is available.
+        let callout = self.acquire_callout(ctx)?;
         let deferred_mcp = collect_deferred_connectors(
             &mcp_entries,
             self.timeout,
             self.max_tools,
             self.max_rewritten_body_bytes,
-            self.allow_loopback,
         );
-        let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
-        let resolution = self.resolve_all_entries(&mcp_entries, previous_tools).await?;
+        let resolution = self.resolve_request_entries(ctx, &mcp_entries, &callout).await?;
         if !resolution.has_resolved && deferred_mcp.is_empty() {
             return Ok(FilterAction::Continue);
         }
@@ -262,6 +383,20 @@ impl McpToolResolveFilter {
         Ok(FilterAction::Continue)
     }
 
+    /// Resolve request entries using the effective trusted-header view.
+    async fn resolve_request_entries(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        entries: &[serde_json::Value],
+        callout: &mcp_client::McpCallout,
+    ) -> Result<Resolution, ResolveError> {
+        let previous_tools = ctx.extensions.get::<ResponsesState>().map(|s| &s.previous_tools);
+        let effective_headers = effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers));
+        let forwarded_headers = select_forward_headers(&self.forward_headers, &effective_headers);
+        self.resolve_all_entries(entries, previous_tools, &forwarded_headers, callout)
+            .await
+    }
+
     /// Validate MCP entries: check server count and duplicate labels.
     fn validate_entries(&self, entries: &[serde_json::Value]) -> Result<(), ResolveError> {
         let server_count = count_distinct_servers(entries);
@@ -286,6 +421,8 @@ impl McpToolResolveFilter {
         &self,
         entries: &[serde_json::Value],
         previous_tools: Option<&Vec<serde_json::Value>>,
+        forwarded_headers: &http::HeaderMap,
+        callout: &mcp_client::McpCallout,
     ) -> Result<Resolution, ResolveError> {
         let (entry_to_task, task_entries, task_allowed_names) = dedup_entries(entries);
 
@@ -293,7 +430,9 @@ impl McpToolResolveFilter {
             .iter()
             .zip(&task_allowed_names)
             .map(|(entry, allowed)| async {
-                let result = self.resolve_entry(entry, previous_tools, allowed.as_deref()).await;
+                let result = self
+                    .resolve_entry(entry, previous_tools, allowed.as_deref(), forwarded_headers, callout)
+                    .await;
                 redact_connector_client_error(result, entry)
             })
             .collect();
@@ -308,32 +447,48 @@ impl McpToolResolveFilter {
     /// across all entries sharing this resolution task; it is passed
     /// to [`find_cached_listing`] so the cache is only used when it
     /// covers every entry in the group.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "callout threads the per-request MCP subrequest executor through per-entry resolution"
+    )]
     async fn resolve_entry(
         &self,
         entry: &serde_json::Value,
         previous_tools: Option<&Vec<serde_json::Value>>,
         cache_allowed_names: Option<&[String]>,
+        forwarded_headers: &http::HeaderMap,
+        callout: &mcp_client::McpCallout,
     ) -> Result<Option<Vec<serde_json::Value>>, ResolveError> {
         let Some(server_url) = resolvable_server_url(entry) else {
             return Ok(None);
         };
         let label = server_label(entry);
         let is_connector = entry.get("connector_id").is_some();
-        mcp_client::validate_mcp_url(server_url, self.timeout, self.allow_loopback)
-            .await
-            .map_err(|source| ResolveError::Client {
-                server_label: label.to_owned(),
-                source,
-            })?;
-        if !has_entry_credentials(entry)
+        if can_reuse_cached_listing(entry, is_connector)
             && let Some(cached) =
                 find_cached_listing(previous_tools, label, server_url, cache_allowed_names, is_connector)
         {
+            // Cache hit: no dial is made, so validate the target here to preserve
+            // the SSRF-rejection invariant. A cache miss instead validates during
+            // the actual callout inside the subrequest transport, so exactly one
+            // DNS resolution happens per path.
+            mcp_client::validate_mcp_target(server_url, self.timeout, callout.allow_private())
+                .await
+                .map_err(|source| ResolveError::Client {
+                    server_label: label.to_owned(),
+                    source,
+                })?;
             debug!(label, tool_count = cached.len(), "reusing cached MCP tool listing");
             return Ok(Some(cached));
         }
-        let tools = fetch_tools(entry, server_url, self.timeout, self.max_tools, self.allow_loopback).await?;
-        Ok(Some(tools))
+        let options = FetchToolsOptions {
+            forwarded_header_names: &self.forward_headers,
+            forwarded_headers: is_connector.then_some(forwarded_headers),
+            timeout: self.timeout,
+            max_tools: self.max_tools,
+            callout,
+        };
+        fetch_tools(entry, server_url, options).await.map(Some)
     }
 }
 
@@ -341,6 +496,26 @@ impl McpToolResolveFilter {
 impl HttpFilter for McpToolResolveFilter {
     fn name(&self) -> &'static str {
         "openai_mcp_tool_resolve"
+    }
+
+    fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
+        // Propagate runtime resources and the finalized SSRF posture into the
+        // bound outbound pipeline. It is uniquely owned during configuration, so
+        // `Arc::get_mut` succeeds; a shared handle would mean the pipeline was
+        // already cloned before finalization, which must not happen.
+        if let Some(pipeline) = Arc::get_mut(&mut self.outbound_pipeline) {
+            visitor(pipeline);
+        } else {
+            debug_assert!(false, "outbound pipeline must be uniquely owned during configuration");
+        }
+    }
+
+    fn referenced_files(&self) -> Vec<std::path::PathBuf> {
+        self.outbound_pipeline.referenced_files()
+    }
+
+    fn apply_insecure_options(&self, options: &InsecureOptions) {
+        self.outbound_pipeline.apply_insecure_options(options);
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -480,6 +655,11 @@ pub(crate) enum ResolveError {
     /// A `tool_choice` references a resolved server with zero tools.
     #[error("tool_choice references server_label \"{0}\" which resolved to zero eligible tools")]
     EmptyResolvedToolChoice(String),
+
+    /// The pipeline exposes no shared sub-request client, so the filtered
+    /// MCP `tools/list` callout cannot be issued.
+    #[error("no sub-request client available for the MCP tools/list callout")]
+    NoSubrequestClient,
 }
 
 /// Per-entry resolution outcome.
@@ -684,6 +864,14 @@ fn redact_connector_client_error(
 }
 
 /// HTTP status and OpenAI error `type` for a [`ResolveError`].
+///
+/// An oversized `tools/list` response (surfaced by the callout transport or the
+/// executor body-limit as [`McpClientError::ResponseTooLarge`]), like a
+/// post-expansion `BodyTooLarge`, maps to `413`; other client/connector I/O
+/// failures map to `502`. A missing sub-request client is a fail-closed server
+/// misconfiguration and maps to `500`.
+///
+/// [`McpClientError::ResponseTooLarge`]: mcp_client::McpClientError::ResponseTooLarge
 fn resolve_error_status(err: &ResolveError) -> (u16, &'static str) {
     match err {
         ResolveError::DuplicateLabel(_)
@@ -695,9 +883,17 @@ fn resolve_error_status(err: &ResolveError) -> (u16, &'static str) {
         | ResolveError::InvalidConnectorId
         | ResolveError::MissingConnectorLabel(_)
         | ResolveError::EmptyResolvedToolChoice(_) => (400, "invalid_request_error"),
-        ResolveError::BodyTooLarge { .. } => (413, "invalid_request_error"),
+        ResolveError::BodyTooLarge { .. }
+        | ResolveError::Client {
+            source: mcp_client::McpClientError::ResponseTooLarge { .. },
+            ..
+        }
+        | ResolveError::ConnectorClient {
+            source: mcp_client::McpClientError::ResponseTooLarge { .. },
+            ..
+        } => (413, "invalid_request_error"),
         ResolveError::Client { .. } | ResolveError::ConnectorClient { .. } => (502, "server_error"),
-        ResolveError::Serialization(_) => (500, "server_error"),
+        ResolveError::Serialization(_) | ResolveError::NoSubrequestClient => (500, "server_error"),
     }
 }
 
@@ -805,8 +1001,10 @@ fn failure_server_label(err: &ResolveError) -> &str {
 }
 
 /// Return whether an MCP client error represents a discovery attempt that
-/// reached runtime I/O or response processing. Local request-policy failures
-/// such as SSRF blocking and malformed authorization retain their HTTP error.
+/// reached runtime I/O or response processing. Local request-policy failures --
+/// SSRF blocking, an invalid or disallowed target URL, and malformed
+/// authorization -- are permanent rejections that retain their HTTP error rather
+/// than degrading to an in-band streaming lifecycle.
 fn is_mcp_listing_runtime_failure(err: &ResolveError) -> bool {
     let (ResolveError::Client { source, .. } | ResolveError::ConnectorClient { source, .. }) = err else {
         return false;
@@ -819,6 +1017,7 @@ fn is_mcp_listing_runtime_failure(err: &ResolveError) -> bool {
             | mcp_client::McpClientError::Serialization(_)
             | mcp_client::McpClientError::TooManyTools { .. }
             | mcp_client::McpClientError::ListingTooLarge { .. }
+            | mcp_client::McpClientError::ResponseTooLarge { .. }
     )
 }
 
@@ -855,35 +1054,6 @@ const ECHOED_REQUEST_FIELDS: &[&str] = &[
 /// this bound is omitted and falls back to its API default in the snapshot.
 const MAX_ECHOED_OPTIONS_BYTES: usize = 256 * 1024;
 
-/// An [`std::io::Write`] sink that counts bytes and discards them, used to
-/// measure a value's serialized JSON size without allocating a buffer for it.
-struct ByteCounter(usize);
-
-impl std::io::Write for ByteCounter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0 = self.0.saturating_add(buf.len());
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// Serialized JSON byte length of `value`, computed without materializing the
-/// serialized bytes so that measuring a large field never copies it.
-fn serialized_len(value: &serde_json::Value) -> usize {
-    let mut counter = ByteCounter(0);
-    // Serializing an in-memory `Value` (no non-string map keys, no non-finite
-    // floats) into a counting sink that never errors cannot fail. Should the
-    // impossible happen, report the value as maximally large so the caller skips
-    // (never echoes) it — fail-safe for the size bound rather than panicking.
-    match serde_json::to_writer(&mut counter, value) {
-        Ok(()) => counter.0,
-        Err(_) => usize::MAX,
-    }
-}
-
 /// Extract the size-bounded, credential-free subset of request options echoed
 /// into a streaming discovery-failure snapshot.
 ///
@@ -905,7 +1075,10 @@ fn capture_echoed_options(body: &[u8]) -> Option<serde_json::Value> {
         // Measure before cloning so an oversized field is never copied into the
         // capture, and skip (rather than truncate) any field that would exceed
         // the aggregate bound so the retained JSON stays well-formed.
-        let len = serialized_len(value);
+        // Serializing an in-memory `Value` into the counting sink should not
+        // fail. If it does, treat the field as maximally large so it is skipped
+        // rather than weakening the echoed-options size bound.
+        let len = serialized_len(value).unwrap_or(usize::MAX);
         if total.saturating_add(len) > MAX_ECHOED_OPTIONS_BYTES {
             continue;
         }
@@ -1312,12 +1485,15 @@ fn has_tool_search(ctx: &HttpFilterContext<'_>) -> bool {
 }
 
 /// Snapshot deferred connector entries into request-scoped state.
+///
+/// The deferred `tools/list` callout is issued later by `openai_mcp_dispatch`
+/// inside the IRR step, so its SSRF posture is governed by that filter's outbound
+/// callout — not captured here.
 fn collect_deferred_connectors(
     entries: &[serde_json::Value],
     timeout: Duration,
     max_tools: usize,
     max_rewritten_body_bytes: usize,
-    allow_loopback: bool,
 ) -> Vec<DeferredMcpConnector> {
     entries
         .iter()
@@ -1326,7 +1502,6 @@ fn collect_deferred_connectors(
             let connector_id = entry.get("connector_id").and_then(serde_json::Value::as_str)?;
             let server_url = entry.get("server_url").and_then(serde_json::Value::as_str)?;
             Some(DeferredMcpConnector {
-                allow_loopback,
                 authorization: entry
                     .get("authorization")
                     .and_then(serde_json::Value::as_str)
@@ -1439,31 +1614,57 @@ fn count_distinct_servers(entries: &[serde_json::Value]) -> usize {
     seen.len()
 }
 
+/// Options shared by eager and deferred MCP `tools/list` requests.
+struct FetchToolsOptions<'a> {
+    /// Trusted header names removed from client-controlled MCP configuration.
+    forwarded_header_names: &'a [http::HeaderName],
+    /// Trusted header values projected for an operator-configured connector.
+    forwarded_headers: Option<&'a http::HeaderMap>,
+    /// End-to-end MCP request timeout.
+    timeout: Duration,
+    /// Maximum accepted tools in the listing.
+    max_tools: usize,
+    /// Outbound callout carrying the staged transport, downstream attributes,
+    /// and SSRF posture for the `tools/list` sub-request.
+    callout: &'a mcp_client::McpCallout,
+}
+
 /// Call `tools/list` on the MCP server with per-page
 /// `max_tools` enforcement.
 async fn fetch_tools(
     entry: &serde_json::Value,
     server_url: &str,
-    timeout: Duration,
-    max_tools: usize,
-    allow_loopback: bool,
+    options: FetchToolsOptions<'_>,
 ) -> Result<Vec<serde_json::Value>, ResolveError> {
     let display_url = mcp_client::parse_display_url(server_url);
     debug!(label = server_label(entry), url = %display_url, "calling MCP tools/list");
     let auth = entry.get("authorization").and_then(serde_json::Value::as_str);
-    mcp_client::list_tools(
+    mcp_client::list_tools_with_forwarded_headers(
         server_url,
         entry.get("headers"),
         auth,
-        timeout,
-        max_tools,
-        allow_loopback,
+        options.forwarded_header_names,
+        options.forwarded_headers,
+        options.timeout,
+        options.max_tools,
+        options.callout,
     )
     .await
     .map_err(|source| ResolveError::Client {
         server_label: server_label(entry).to_owned(),
         source,
     })
+}
+
+/// Select only configured headers from the effective body-phase request.
+fn select_forward_headers(names: &[http::HeaderName], source: &http::HeaderMap) -> http::HeaderMap {
+    let mut selected = http::HeaderMap::with_capacity(names.len());
+    for name in names {
+        if let Some(value) = source.get(name) {
+            selected.insert(name.clone(), value.clone());
+        }
+    }
+    selected
 }
 
 /// Rewrite the request body, replacing resolved `type: "mcp"`
@@ -2029,6 +2230,19 @@ pub(crate) fn has_pending_deferred_discovery(state: &ResponsesState) -> bool {
         && super::state::tool_search_discovery_is_within_budget(state)
 }
 
+/// Test helper for deferred discovery without ambient request headers.
+///
+/// Fabricates an allow-private callout so tests can dial a loopback MCP server;
+/// production always threads the dispatch filter's bound callout instead.
+#[cfg(test)]
+async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), ResolveError> {
+    let callout = mcp_client::McpCallout::fabricated(true).map_err(|source| ResolveError::Client {
+        server_label: String::new(),
+        source,
+    })?;
+    discover_deferred_connectors_with_forwarded_headers(state, &[], &http::HeaderMap::new(), &callout).await
+}
+
 /// Load tools for deferred connectors after a `tool_search_call`.
 ///
 /// Lists every pending connector before mutating state. Applies
@@ -2037,13 +2251,18 @@ pub(crate) fn has_pending_deferred_discovery(state: &ResponsesState) -> bool {
 /// sanitized deferred MCP entries with function tools. An exhausted
 /// `max_tool_calls` budget skips `tools/list` and leaves connectors
 /// pending so the round can return to the caller.
-pub(crate) async fn discover_deferred_connectors(state: &mut ResponsesState) -> Result<(), ResolveError> {
+pub(crate) async fn discover_deferred_connectors_with_forwarded_headers(
+    state: &mut ResponsesState,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
+    callout: &mcp_client::McpCallout,
+) -> Result<(), ResolveError> {
     if state.deferred_mcp.is_empty() || !super::state::tool_search_discovery_is_within_budget(state) {
         return Ok(());
     }
 
     let pending = std::mem::take(&mut state.deferred_mcp);
-    let prepared = match prepare_deferred_listings(&pending).await {
+    let prepared = match prepare_deferred_listings(&pending, forwarded_header_names, forwarded_headers, callout).await {
         Ok(prepared) => prepared,
         Err(err) => {
             state.deferred_mcp = pending;
@@ -2078,16 +2297,29 @@ struct PreparedDeferredListing {
 ///
 /// Independent servers are listed concurrently so total latency is bounded by
 /// the slowest connector rather than the sum of per-server timeouts. Commit
-/// remains transactional in [`discover_deferred_connectors`].
+/// remains transactional in [`discover_deferred_connectors_with_forwarded_headers`].
 async fn prepare_deferred_listings(
     pending: &[DeferredMcpConnector],
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
+    callout: &mcp_client::McpCallout,
 ) -> Result<Vec<PreparedDeferredListing>, ResolveError> {
-    futures::future::try_join_all(pending.iter().map(prepare_deferred_listing)).await
+    futures::future::try_join_all(
+        pending
+            .iter()
+            .map(|connector| prepare_deferred_listing(connector, forwarded_header_names, forwarded_headers, callout)),
+    )
+    .await
 }
 
 /// List and rewrite one deferred connector without mutating shared state.
-async fn prepare_deferred_listing(connector: &DeferredMcpConnector) -> Result<PreparedDeferredListing, ResolveError> {
-    let listing = list_deferred_connector(connector).await?;
+async fn prepare_deferred_listing(
+    connector: &DeferredMcpConnector,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
+    callout: &mcp_client::McpCallout,
+) -> Result<PreparedDeferredListing, ResolveError> {
+    let listing = list_deferred_connector(connector, forwarded_header_names, forwarded_headers, callout).await?;
     let entry = deferred_entry_view(connector);
     let allowed = extract_allowed_tools(&entry);
     let filtered = apply_allowed_tools_filter(listing, &allowed);
@@ -2111,7 +2343,7 @@ fn commit_deferred_listings(
     prepared: Vec<PreparedDeferredListing>,
     max_rewritten_body_bytes: usize,
 ) -> Result<(), ResolveError> {
-    let mut function_tools_by_label: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut function_tools_by_label: HashMap<&str, &[serde_json::Value]> = HashMap::new();
     let mut generated_names = HashSet::new();
     for item in &prepared {
         for name in item
@@ -2121,7 +2353,7 @@ fn commit_deferred_listings(
         {
             generated_names.insert(name.to_owned());
         }
-        function_tools_by_label.insert(item.server_label.clone(), item.functions.clone());
+        function_tools_by_label.insert(item.server_label.as_str(), item.functions.as_slice());
     }
 
     let expanded_tools = expand_deferred_tools_array(state.tools.clone(), &function_tools_by_label);
@@ -2146,7 +2378,7 @@ fn commit_deferred_listings(
 /// Expand deferred MCP entries in a cloned request body for size checking.
 fn expanded_request_body(
     request_body: &serde_json::Value,
-    functions_by_label: &HashMap<String, Vec<serde_json::Value>>,
+    functions_by_label: &HashMap<&str, &[serde_json::Value]>,
 ) -> serde_json::Value {
     let mut body = request_body.clone();
     if let Some(obj) = body.as_object_mut()
@@ -2162,7 +2394,7 @@ fn expanded_request_body(
 
 /// Reject an expanded provider body that exceeds `max_rewritten_body_bytes`.
 fn check_json_body_size(body: &serde_json::Value, max_rewritten_body_bytes: usize) -> Result<(), ResolveError> {
-    let actual = serde_json::to_vec(body).map_err(ResolveError::Serialization)?.len();
+    let actual = serialized_len(body).map_err(ResolveError::Serialization)?;
     if actual > max_rewritten_body_bytes {
         return Err(ResolveError::BodyTooLarge {
             actual,
@@ -2173,23 +2405,30 @@ fn check_json_body_size(body: &serde_json::Value, max_rewritten_body_bytes: usiz
 }
 
 /// Call `tools/list` for one deferred connector, redacting URLs on error.
-async fn list_deferred_connector(connector: &DeferredMcpConnector) -> Result<Vec<serde_json::Value>, ResolveError> {
+async fn list_deferred_connector(
+    connector: &DeferredMcpConnector,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: &http::HeaderMap,
+    callout: &mcp_client::McpCallout,
+) -> Result<Vec<serde_json::Value>, ResolveError> {
     let entry = deferred_entry_view(connector);
-    mcp_client::validate_mcp_url(&connector.server_url, connector.timeout, connector.allow_loopback)
+    // No upfront SSRF classifier: `fetch_tools` always dials, and the subrequest
+    // transport validates the target during the callout, so the SSRF rejection is
+    // reconstructed from the transport signal below without a second DNS
+    // resolution.
+    let options = FetchToolsOptions {
+        forwarded_header_names,
+        forwarded_headers: Some(forwarded_headers),
+        timeout: connector.timeout,
+        max_tools: connector.max_tools,
+        callout,
+    };
+    fetch_tools(&entry, &connector.server_url, options)
         .await
-        .map_err(|source| deferred_connector_client_error(connector, source))?;
-    fetch_tools(
-        &entry,
-        &connector.server_url,
-        connector.timeout,
-        connector.max_tools,
-        connector.allow_loopback,
-    )
-    .await
-    .map_err(|err| match err {
-        ResolveError::Client { source, .. } => deferred_connector_client_error(connector, source),
-        other => other,
-    })
+        .map_err(|err| match err {
+            ResolveError::Client { source, .. } => deferred_connector_client_error(connector, source),
+            other => other,
+        })
 }
 
 /// URL-redacted connector failure for deferred `tools/list`.
@@ -2276,7 +2515,7 @@ fn mcp_list_tools_id(server_label: &str) -> String {
 /// Swap deferred MCP entries for the given label with generated function tools.
 fn expand_deferred_tools_array(
     tools: Vec<serde_json::Value>,
-    functions_by_label: &HashMap<String, Vec<serde_json::Value>>,
+    functions_by_label: &HashMap<&str, &[serde_json::Value]>,
 ) -> Vec<serde_json::Value> {
     let mut result = Vec::with_capacity(tools.len());
     for tool in tools {
@@ -2385,6 +2624,15 @@ fn has_entry_credentials(entry: &serde_json::Value) -> bool {
             .get("headers")
             .and_then(serde_json::Value::as_object)
             .is_some_and(|h| !h.is_empty())
+}
+
+/// Whether a previous `tools/list` result is valid without current request context.
+fn can_reuse_cached_listing(entry: &serde_json::Value, is_connector: bool) -> bool {
+    // Persisted listings do not carry forwarding provenance. A connector may
+    // have been discovered under headers from a prior dynamically reloaded
+    // pipeline, so connector listings must always be refreshed. Direct URLs
+    // remain reusable only when their entry has no request-specific credentials.
+    !is_connector && !has_entry_credentials(entry)
 }
 
 /// Extract `server_label` from an MCP tool entry.

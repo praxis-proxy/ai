@@ -148,16 +148,23 @@ struct BedrockStreamMetadataInner {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BedrockStreamUsage {
-    /// Tokens in the input.
+    /// Uncached tokens in the input.
     input_tokens: u64,
 
     /// Tokens in the output.
     output_tokens: u64,
+
+    /// Tokens read from the prompt cache. Not included in `input_tokens`.
+    cache_read_input_tokens: Option<u64>,
+
+    /// Tokens written to the prompt cache. Not included in `input_tokens`.
+    cache_write_input_tokens: Option<u64>,
 }
 
 /// Parses Bedrock `ConverseStream` metadata events for token counts.
 ///
-/// The stream's metadata event carries no cache breakdown, so none is reported.
+/// Cache fields are folded into `input` the same way the non-streaming
+/// Converse parser normalizes `inputTokens`.
 pub(super) fn parse_bedrock_event(data: &[u8]) -> StreamingTokens {
     let Some(meta) = serde_json::from_slice::<BedrockStreamMetadata>(data).ok() else {
         return StreamingTokens::default();
@@ -165,9 +172,17 @@ pub(super) fn parse_bedrock_event(data: &[u8]) -> StreamingTokens {
     let Some(usage) = meta.metadata.and_then(|m| m.usage) else {
         return StreamingTokens::default();
     };
+    let cache_read = usage.cache_read_input_tokens;
+    let cache_write = usage.cache_write_input_tokens;
+    let actual_input = usage
+        .input_tokens
+        .saturating_add(cache_read.unwrap_or(0))
+        .saturating_add(cache_write.unwrap_or(0));
     StreamingTokens {
-        input: Some(usage.input_tokens),
+        input: Some(actual_input),
         output: Some(usage.output_tokens),
+        cache_read,
+        cache_write,
         ..StreamingTokens::default()
     }
 }
@@ -324,6 +339,26 @@ mod tests {
                 input: Some(7),
                 output: Some(11),
                 cache_read: None,
+                cache_write: None,
+                reasoning: None,
+            }
+        );
+    }
+
+    #[test]
+    fn bedrock_metadata_folds_cache_tokens_into_input() {
+        let event = br#"{"metadata":{"usage":{
+            "inputTokens":9,
+            "outputTokens":214,
+            "cacheReadInputTokens":1066
+        }}}"#;
+
+        assert_eq!(
+            parse_bedrock_event(event),
+            StreamingTokens {
+                input: Some(1075),
+                output: Some(214),
+                cache_read: Some(1066),
                 cache_write: None,
                 reasoning: None,
             }

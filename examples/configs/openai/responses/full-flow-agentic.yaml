@@ -1,4 +1,5 @@
 # Responses API Full Flow — Unified Agentic Gateway
+# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
 #
 # Runs the complete Responses API pipeline through an agentic
 # iterative_request_router that executes hosted file_search, web_search,
@@ -11,6 +12,16 @@
 # Pre-IRR filters run once on the client request to set up shared state
 # (ResponsesState) which persists across all IRR iterations via extension
 # swapping:
+#
+#   0. state_owner maps deployment-specific trusted ingress headers into one
+#      normalized tenant/issuer/subject context for owner-aware filters.
+#      state_owner_headers then projects that context as x-tenant-id and
+#      x-user-id for OGX and explicitly allowlisted callouts. The raw ingress
+#      names are stripped, and the projection is repeated inside the IRR step
+#      because it owns a separate destination request lifecycle.
+#      These adapters do not themselves change persistence predicates: this
+#      context-only configuration must be combined with owner-scoped store
+#      enforcement before it is exposed as a multi-owner state service.
 #
 #   1. openai_conversations handles CRUD for the Conversations API
 #      (/v1/conversations) and sets has_conversation metadata when a
@@ -67,6 +78,8 @@
 #      array by calling tools/list on each upstream MCP server. Runs after
 #      rehydrate so previous_tools is available for cross-request caching.
 #      Writes mcp_tool_map to ResponsesState for downstream tool dispatch.
+#      Projected identity headers are forwarded only to operator-configured
+#      connector_id targets, never arbitrary client-selected server_url values.
 #
 #   10. The bypass gateway (a no-op `headers` carrier hosting a
 #      branch_chains bypass) routes everything EXCEPT a classified
@@ -271,6 +284,24 @@ listeners:
 filter_chains:
   - name: full-flow-agentic-pipeline
     filters:
+      - filter: state_owner
+        # These source names are deployment-specific. The authentication
+        # boundary must overwrite them and prevent clients from bypassing it.
+        mode: trusted_headers
+        tenant:
+          header: x-auth-tenant
+        issuer:
+          static: urn:example:gateway
+        subject:
+          header: x-auth-user
+
+      # Emit the normalized owner in the contract expected by OGX and by the
+      # explicitly configured downstream callouts below. Raw x-auth-* inputs
+      # are stripped and never used directly as destination assertions.
+      - filter: state_owner_headers
+        tenant_header: x-tenant-id
+        subject_header: x-user-id
+
       - filter: openai_conversations
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
@@ -302,11 +333,22 @@ filter_chains:
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
-        allow_private_files_api_url: true
         allow_pre_security_callout: true
+        # file_id callouts run through this outbound filter chain via the
+        # filtered subrequest executor. SSRF protection for files_api_url
+        # derives from the pipeline's allow_private_upstreams; client
+        # file_url downloads never traverse this chain.
+        outbound_chain:
+          name: files-api-outbound
+          filters:
+            - filter: headers
+              request_set:
+                - name: x-file-callout
+                  value: file-resolve
         forward_headers:
           - authorization
           - x-tenant-id
+          - x-user-id
         on_missing: reject
         timeout_ms: 10000
 
@@ -315,6 +357,15 @@ filter_chains:
         on_unsupported: continue
 
       - filter: openai_mcp_tool_resolve
+        forward_headers:
+          - x-tenant-id
+          - x-user-id
+        # Ambient trusted headers are forwarded only for connector-backed MCP
+        # entries; arbitrary client-supplied server_url targets never receive
+        # them. Clients reference this destination with connector_id.
+        connectors:
+          - id: trusted-mcp
+            server_url: http://127.0.0.1:8001/mcp
 
       # Bypass gateway: a no-op carrier that runs for everything EXCEPT a
       # classified `POST /v1/responses` create request. When it runs, its
@@ -410,6 +461,14 @@ filter_chains:
         steps:
           - name: inference
             filters:
+              # Re-project inside the destination-owned subrequest. Core moves
+              # the normalized StateOwner extension into each IRR step; this
+              # strips any still-uncommitted raw ingress identity headers and
+              # recreates only the OGX/callout contract.
+              - filter: state_owner_headers
+                tenant_header: x-tenant-id
+                subject_header: x-user-id
+
               # Composes every inference SSE stream into one logical
               # Responses lifecycle: preserves one response identity across
               # rounds and withholds per-round terminal events until the IRR
@@ -429,10 +488,20 @@ filter_chains:
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
                 max_calls_per_round: 32
+                # Each provider callout executes through this outbound chain; the
+                # filtered-subrequest executor enforces destination authority,
+                # DNS/SSRF, TLS/SNI, and Host centrally.
+                outbound_chain:
+                  name: web-search-outbound
+                  filters:
+                    - filter: request_id
               # Request-phase dispatcher: runs second on re-entry to execute
               # MCP calls prepared and classified by the loop owner. Inert
               # until the model emits an MCP tool call.
               - filter: openai_mcp_dispatch
+                forward_headers:
+                  - x-tenant-id
+                  - x-user-id
                 max_calls_per_round: 32
                 max_parallel_calls: 8
                 max_result_bytes: 1048576
@@ -445,7 +514,15 @@ filter_chains:
               # so it is inert unless the model emits a hosted file_search_call.
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:3002
-                allow_private_url: true
+                # Cross-cutting outbound chain every vector-store sub-request runs
+                # through; the destination comes from vector_store_url.
+                outbound_chain:
+                  name: vector-store-outbound
+                  filters:
+                    - filter: headers
+                      request_set:
+                        - name: X-Vector-Store-Client
+                          value: praxis-ai-gateway
                 timeout_ms: 5000
                 max_response_bytes: 10485760
                 max_total_response_bytes: 67108864
@@ -453,6 +530,8 @@ filter_chains:
                 on_failure: closed
                 forward_headers:
                   - authorization
+                  - x-tenant-id
+                  - x-user-id
               # Sole loop owner: parses each model response, records the
               # hosted-tool assignments for the dispatchers, and publishes the
               # single continuation signal (action=loop|done). max_infer_iters
@@ -497,3 +576,7 @@ filter_chains:
 
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends
+  # Central SSRF control: permits resolved callout addresses (vector_store_url,
+  # file_id Files API) to be private/loopback at connect time (needed for
+  # local/private vector stores and Files API backends).
+  allow_private_upstreams: true

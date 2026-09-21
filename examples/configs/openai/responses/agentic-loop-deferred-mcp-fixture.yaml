@@ -1,4 +1,5 @@
 # Agentic Loop Deferred MCP Fixture
+# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
 #
 # Minimal agentic-loop pipeline that sanitizes deferred MCP connectors on the
 # first inference round. `defer_loading: true` skips `tools/list`, so replay
@@ -26,6 +27,10 @@ filter_chains:
       - filter: openai_responses_validate
 
       - filter: openai_tool_parse
+
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
 
       - filter: openai_response_store
         backend: sqlite

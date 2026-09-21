@@ -107,7 +107,7 @@ async fn delete_conversation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_conversation_preserves_item_rows() {
+async fn deleted_conversation_hides_preserved_item_rows() {
     let proxy = start_test_proxy();
     let conv_id = create_conversation(
         &proxy,
@@ -128,12 +128,9 @@ async fn delete_conversation_preserves_item_rows() {
     );
     assert_eq!(
         parse_status(&raw),
-        200,
-        "conversation delete should not delete item row"
+        404,
+        "items retained by the store must not remain addressable after their conversation is deleted"
     );
-    let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
-    assert_eq!(body["id"], "item_keep");
-    assert_eq!(body["content"][0]["text"], "keep me");
 }
 
 #[test]

@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    Backend, SessionReplay, TempSqlite, example_config_path, free_port, http_get, http_send, json_post, parse_body,
-    parse_status, patch_yaml, start_capturing_backend, start_echo_backend, start_proxy,
+    Backend, SessionReplay, TempSqlite, example_config_path, free_port, http_send, json_post, parse_body, parse_status,
+    patch_yaml, start_capturing_backend, start_echo_backend, start_proxy,
 };
 use serde_json::json;
 
@@ -477,7 +477,12 @@ async fn replay_codex_responses_session_through_full_flow_example() {
     let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
     let proxy = start_proxy(&config);
 
-    let raw = http_send(proxy.addr(), &json_post(turn.path(), &turn.request_body()));
+    let request = json_post(turn.path(), &turn.request_body()).replacen(
+        "\r\n\r\n",
+        "\r\nx-auth-tenant: replay-tenant\r\nx-auth-user: replay-user\r\n\r\n",
+        1,
+    );
+    let raw = http_send(proxy.addr(), &request);
     let status = parse_status(&raw);
     let body = parse_body(&raw);
     let response: serde_json::Value = serde_json::from_str(&body).expect("client body should be JSON");
@@ -490,7 +495,14 @@ async fn replay_codex_responses_session_through_full_flow_example() {
         .get("id")
         .and_then(serde_json::Value::as_str)
         .expect("Codex replay response should have an id");
-    let (get_status, get_body) = http_get(proxy.addr(), &format!("/v1/responses/{response_id}"), None);
+    let get_raw = http_send(
+        proxy.addr(),
+        &format!(
+            "GET /v1/responses/{response_id} HTTP/1.1\r\nHost: localhost\r\nx-auth-tenant: replay-tenant\r\nx-auth-user: replay-user\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    let get_status = parse_status(&get_raw);
+    let get_body = parse_body(&get_raw);
     let stored: serde_json::Value = serde_json::from_str(&get_body).expect("stored response should be JSON");
 
     assert_eq!(get_status, 200, "replayed response should be retrievable");

@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod azure;
+pub mod callout_headers;
 pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
@@ -18,12 +19,18 @@ pub mod http_hop;
 pub mod json_body;
 pub(crate) mod mcp_client;
 pub mod openai;
+pub mod operation;
 pub mod promotion;
+mod state_owner;
+mod state_owner_headers;
 #[cfg(feature = "store")]
 pub mod store;
 pub mod subrequest;
 pub mod token_cache;
 pub(crate) mod web_search;
+
+pub use state_owner::{StateOwner, StateOwnerError, StateOwnerFilter, project_state_owner};
+pub use state_owner_headers::StateOwnerHeadersFilter;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -52,6 +59,19 @@ pub(crate) mod test_utils {
 
     /// Deterministic ID generator for tests (seed=0).
     static TEST_ID_GENERATOR: LazyLock<IdGenerator> = LazyLock::new(|| IdGenerator::with_seed(0));
+
+    /// Shared sub-request transport for filter unit tests.
+    ///
+    /// Filters that dial an outbound callout (e.g. the MCP `tools/list` and
+    /// `tools/call` filters) read their parent transport from
+    /// [`HttpFilterContext::subrequest_client`]; a `None` client makes them fail
+    /// closed. This static provides a real (loopback-capable) connector so tests
+    /// exercise the callout path. Whether a private/loopback destination is then
+    /// permitted is governed by the filter's bound outbound pipeline posture, not
+    /// this client.
+    static TEST_SUBREQUEST_CLIENT: LazyLock<praxis_core::subrequest::SubRequestClient> = LazyLock::new(|| {
+        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(1, None))
+    });
 
     /// Build a minimal request for filter unit tests.
     pub(crate) fn make_request(method: Method, path: &str) -> Request {
@@ -102,7 +122,7 @@ pub(crate) mod test_utils {
             response_body_mode: praxis_filter::BodyMode::Stream,
             response_header: None,
             response_headers_modified: false,
-            subrequest_client: None,
+            subrequest_client: Some(&TEST_SUBREQUEST_CLIENT),
             subrequest_response_mode: praxis_filter::SubRequestResponseMode::Buffered,
             attempted_endpoints: Vec::new(),
             retry_policy: None,
@@ -127,12 +147,36 @@ pub(crate) mod test_utils {
         }
     }
 
+    /// Build a stable owner for tests that previously supplied only a tenant.
+    #[cfg(feature = "store-sqlite")]
+    pub(crate) fn test_owner(tenant_id: &str) -> crate::StateOwner {
+        crate::StateOwner::from_trusted_parts(tenant_id, "test-issuer", "test-subject")
+            .expect("test owner should be valid")
+    }
+
+    /// Build a filter context with the default trusted test owner installed.
+    #[cfg(feature = "store-sqlite")]
+    pub(crate) fn make_owned_filter_context(req: &Request) -> HttpFilterContext<'_> {
+        let mut ctx = make_filter_context(req);
+        ctx.extensions.insert(test_owner("default"));
+        ctx
+    }
+
     /// Build a [`FilterRegistry`] with core builtins plus AI API filters
     /// needed by pipeline integration tests.
     ///
     /// [`FilterRegistry`]: praxis_filter::FilterRegistry
+    #[cfg(feature = "store-sqlite")]
     pub(crate) fn make_ai_registry() -> praxis_filter::FilterRegistry {
         let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        praxis_filter::register_filters!(
+            @register registry,
+            http "state_owner" => crate::StateOwnerFilter::from_config
+        );
+        praxis_filter::register_filters!(
+            @register registry,
+            http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
+        );
         praxis_filter::register_filters!(
             @register registry,
             http "openai_responses_format" => crate::openai::ResponsesFormatFilter::from_config

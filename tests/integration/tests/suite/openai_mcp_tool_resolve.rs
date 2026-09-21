@@ -59,22 +59,34 @@ fn request_without_tools_passes_through() {
 // =============================================================================
 
 #[test]
-fn mcp_loopback_url_rejected_as_ssrf() {
+fn mcp_loopback_permitted_when_private_upstreams_allowed() {
     let backend_guard = start_backend_with_shutdown("inference");
     let proxy_port = free_port();
 
-    let yaml = resolve_yaml(proxy_port, backend_guard.port());
+    let yaml = resolve_yaml_loopback(proxy_port, backend_guard.port());
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"evil","server_url":"http://127.0.0.1/mcp","allowed_tools":["x"]}]}"#;
+    // Loopback is no longer blocked by a per-filter opt-in: the MCP callout's
+    // SSRF posture is the pipeline's `insecure_options.allow_private_upstreams`,
+    // which this config enables. Under that posture a loopback MCP URL passes
+    // the SSRF gate and is actually dialed; with no server listening it fails as
+    // a connection error, not an SSRF rejection. Loopback-blocking when private
+    // upstreams are disabled is covered by `mcp_localhost_url_rejected_as_ssrf`
+    // and the `mcp_client` unit tests; link-local metadata stays blocked
+    // regardless (see `mcp_metadata_url_rejected_as_ssrf`).
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"loop","server_url":"http://127.0.0.1/mcp","allowed_tools":["x"]}]}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
-    assert_eq!(parse_status(&raw), 502, "loopback MCP URL should be rejected");
+    assert_eq!(parse_status(&raw), 502, "loopback dial with no server should fail");
     let response_body = parse_body(&raw);
     assert!(
-        response_body.contains("SSRF"),
-        "rejection should mention SSRF: {response_body}"
+        response_body.contains("connection failed"),
+        "permitted loopback should fail as a connection error: {response_body}"
+    );
+    assert!(
+        !response_body.contains("SSRF"),
+        "permitted loopback must not be reported as SSRF: {response_body}"
     );
 }
 
@@ -576,15 +588,17 @@ async fn streaming_local_policy_failure_retains_http_error() {
     let proxy_port = free_port();
     let db = TempSqlite::new("mcp_stream_ssrf");
 
-    // The MCP filter's own `allow_loopback` defaults to false (independent of the
-    // global allow_private_endpoints the loopback inference upstream needs), so a
-    // loopback MCP URL is blocked as SSRF before any runtime I/O -- a local policy
-    // failure, not a runtime one.
+    // The MCP callout's SSRF posture is driven by `insecure_options.allow_private_upstreams`,
+    // which the integration harness forces on so loopback test backends can dial. Link-local
+    // metadata (169.254.0.0/16) is blocked unconditionally regardless of that posture, so a
+    // metadata MCP URL is rejected before any runtime I/O -- a local policy failure, not a
+    // runtime one (a permitted-but-unreachable target would instead surface as the runtime
+    // discovery lifecycle).
     let yaml = resolve_yaml_full_flow_store(proxy_port, backend.port(), db.url(), 500);
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    let body = r#"{"model":"gpt-4.1","input":"test","stream":true,"tools":[{"type":"mcp","server_label":"evil","server_url":"http://127.0.0.1/mcp","allowed_tools":["x"]}]}"#;
+    let body = r#"{"model":"gpt-4.1","input":"test","stream":true,"tools":[{"type":"mcp","server_label":"evil","server_url":"http://169.254.169.254/mcp","allowed_tools":["x"]}]}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
     assert_eq!(
@@ -707,7 +721,11 @@ fn authorization_does_not_bypass_ssrf_check() {
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"auth","server_url":"http://127.0.0.1/mcp","authorization":"tok_secret","allowed_tools":["x"]}]}"#;
+    // Link-local metadata (169.254.0.0/16) is blocked unconditionally, even when
+    // the harness permits private upstreams, so it exercises the SSRF path here
+    // (loopback would be dialed under the forced posture). An attached
+    // authorization credential must not bypass that check.
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"auth","server_url":"http://169.254.169.254/mcp","authorization":"tok_secret","allowed_tools":["x"]}]}"#;
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
 
     assert_eq!(parse_status(&raw), 502, "SSRF should reject even with authorization");
@@ -1110,6 +1128,81 @@ fn connector_with_authorization_forwarded() {
 }
 
 #[test]
+fn configured_request_headers_are_forwarded_to_mcp_discovery() {
+    let mcp_server = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    });
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+    let connectors = format!(
+        "        connectors:\n          - id: trusted\n            server_url: http://127.0.0.1:{}/mcp",
+        mcp_server.port()
+    );
+    let yaml = resolve_yaml_loopback_with_connectors_and_proxy(proxy_port, backend_guard.port(), &connectors).replacen(
+        "      - filter: openai_mcp_tool_resolve\n",
+        "      - filter: openai_mcp_tool_resolve\n        forward_headers: [x-tenant-id]\n",
+        1,
+    );
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1","input":"test","tools":[{"type":"mcp","server_label":"s","connector_id":"trusted","headers":{"x-tenant-id":"spoofed"},"allowed_tools":["tool_a"]}]}"#;
+    let request = json_post("/v1/responses", body).replacen(
+        "Content-Type: application/json",
+        "x-tenant-id: tenant-a\r\nContent-Type: application/json",
+        1,
+    );
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200, "MCP discovery should succeed: {raw}");
+    let requests = mcp_server.received_requests();
+    assert!(requests.iter().any(|request| {
+        request.json_rpc_method.as_deref() == Some("tools/list")
+            && request
+                .headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("x-tenant-id") && value == "tenant-a")
+    }));
+}
+
+#[test]
+fn configured_request_headers_are_not_forwarded_to_direct_mcp_urls() {
+    let mcp_server = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("tool_a")],
+        ..McpMockConfig::default()
+    });
+    let backend_guard = start_echo_backend();
+    let proxy_port = free_port();
+    let yaml = resolve_yaml_loopback(proxy_port, backend_guard.port()).replacen(
+        "      - filter: openai_mcp_tool_resolve\n",
+        "      - filter: openai_mcp_tool_resolve\n        forward_headers: [x-tenant-id]\n",
+        1,
+    );
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let body = format!(
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"s","server_url":"http://127.0.0.1:{}/mcp","allowed_tools":["tool_a"]}}]}}"#,
+        mcp_server.port()
+    );
+    let request = json_post("/v1/responses", &body).replacen(
+        "Content-Type: application/json",
+        "x-tenant-id: tenant-a\r\nContent-Type: application/json",
+        1,
+    );
+    let raw = http_send(proxy.addr(), &request);
+
+    assert_eq!(parse_status(&raw), 200, "direct MCP discovery should succeed: {raw}");
+    assert!(mcp_server.received_requests().iter().all(|request| {
+        request
+            .headers
+            .iter()
+            .all(|(name, _)| !name.eq_ignore_ascii_case("x-tenant-id"))
+    }));
+}
+
+#[test]
 fn deferred_connector_skips_eager_tools_list_and_strips_internal_fields() {
     let mcp_config = McpMockConfig {
         tools: vec![McpToolFixture::new("search")],
@@ -1304,10 +1397,16 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: test
       - filter: openai_responses_format
         on_invalid: reject
       - filter: openai_responses_validate
       - filter: openai_tool_parse
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
       - filter: openai_response_store
         backend: sqlite
         database_url: "{db_url}"
@@ -1353,10 +1452,16 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: test
       - filter: openai_responses_format
         on_invalid: reject
       - filter: openai_responses_validate
       - filter: openai_tool_parse
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
       - filter: openai_response_store
         backend: sqlite
         database_url: "{db_url}"
@@ -1405,9 +1510,15 @@ listeners:
 filter_chains:
   - name: main
     filters:
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: test
       - filter: openai_responses_format
         on_invalid: reject
       - filter: openai_tool_parse
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
       - filter: openai_response_store
         backend: sqlite
         database_url: "{db_url}"
@@ -1505,7 +1616,6 @@ filter_chains:
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
-        allow_loopback: true
       - filter: router
         routes:
           - path_prefix: "/"
@@ -1517,6 +1627,7 @@ filter_chains:
               - "127.0.0.1:{backend_port}"
 insecure_options:
   allow_private_endpoints: true
+  allow_private_upstreams: true
 "#
     )
 }
@@ -1535,7 +1646,6 @@ filter_chains:
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
-        allow_loopback: true
         max_tools: {max_tools}
       - filter: router
         routes:
@@ -1548,6 +1658,7 @@ filter_chains:
               - "127.0.0.1:{backend_port}"
 insecure_options:
   allow_private_endpoints: true
+  allow_private_upstreams: true
 "#
     )
 }
@@ -1566,7 +1677,6 @@ filter_chains:
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
-        allow_loopback: true
       - filter: openai_responses_proxy
         name: inference
       - filter: router
@@ -1580,6 +1690,7 @@ filter_chains:
               - "127.0.0.1:{backend_port}"
 insecure_options:
   allow_private_endpoints: true
+  allow_private_upstreams: true
 "#
     )
 }
@@ -1602,7 +1713,6 @@ filter_chains:
         on_invalid: continue
       - filter: openai_tool_parse
       - filter: openai_mcp_tool_resolve
-        allow_loopback: true
 {connectors_yaml}
       - filter: openai_responses_proxy
         name: inference
@@ -1617,6 +1727,7 @@ filter_chains:
               - "127.0.0.1:{backend_port}"
 insecure_options:
   allow_private_endpoints: true
+  allow_private_upstreams: true
 "#
     )
 }

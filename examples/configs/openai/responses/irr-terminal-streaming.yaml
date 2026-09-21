@@ -50,8 +50,6 @@ filter_chains:
             filters:
               - filter: openai_responses_proxy
 
-              - filter: openai_stream_events
-
               - filter: headers
                 request_set:
                   - name: Content-Type
@@ -67,6 +65,11 @@ filter_chains:
                   - name: "inference-backend"
                     endpoints:
                       - "127.0.0.1:3001"
+
+              # After load_balancer so IRR body hooks see the selected peer.
+              # timeout_secs starts at the first SSE chunk; each chunk recaps
+              # leftover budget onto the live body.
+              - filter: openai_stream_events
             on_result:
               - default: true
                 done: true

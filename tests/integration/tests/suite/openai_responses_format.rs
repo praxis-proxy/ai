@@ -433,7 +433,7 @@ fn filter_results_enable_branch_routing() {
 }
 
 #[test]
-fn background_filter_result_enables_branch_routing() {
+fn background_true_is_rejected_before_branch_routing() {
     let background_guard = start_backend_with_shutdown("background-branch-hit");
     let default_guard = start_backend_with_shutdown("default-branch-miss");
     let proxy_port = free_port();
@@ -447,14 +447,11 @@ fn background_filter_result_enables_branch_routing() {
 
     assert_eq!(
         parse_status(&raw),
-        200,
-        "background request should route without protocol validation"
+        400,
+        "background request should fail before branch routing"
     );
-    assert_eq!(
-        parse_body(&raw),
-        "background-branch-hit",
-        "branch on_result should fire for background:true"
-    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
+    assert_eq!(response["error"]["message"], "background mode is not supported");
 
     let foreground_body = r#"{"model":"gpt-4.1","input":"test","background":false}"#;
     let foreground_raw = http_send(proxy.addr(), &json_post("/v1/responses", foreground_body));

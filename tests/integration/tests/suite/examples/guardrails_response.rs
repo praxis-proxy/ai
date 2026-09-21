@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use praxis_test_utils::{Backend, BackendGuard, free_port, http_post, start_backend_with_shutdown, start_proxy};
+use praxis_test_utils::{
+    Backend, BackendGuard, free_port, http_post, start_backend_with_shutdown, start_capturing_backend, start_proxy,
+};
 
 use super::load_example_config;
 
@@ -71,12 +73,12 @@ fn response_guardrails_config_parses_correctly() {
     assert_eq!(config.listeners.len(), 1, "should have 1 listener");
 }
 
-/// NeMo returns `"success"` for the upstream response - the original Chat
+/// NeMo returns `"passed"` for the upstream response - the original Chat
 /// Completion body is forwarded to the client unchanged.
 #[test]
 fn response_guardrails_pass_forwards_upstream_body() {
     let backend = chat_backend("Hello! I'm doing well.");
-    let nemo = nemo_mock(r#"{"status":"success","rails_status":{"check output rail":{"status":"success"}}}"#);
+    let nemo = start_capturing_backend(r#"{"status":"passed"}"#);
     let proxy_port = free_port();
     let config = load_response_config(proxy_port, backend.port(), nemo.port());
     let proxy = start_proxy(&config);
@@ -87,7 +89,17 @@ fn response_guardrails_pass_forwards_upstream_body() {
         r#"{"model":"test","messages":[{"role":"user","content":"Hello"}]}"#,
     );
 
-    assert_eq!(status, 200, "NeMo 'success' should forward upstream response");
+    assert_eq!(status, 200, "NeMo 'passed' should forward upstream response");
+    let payload: serde_json::Value = serde_json::from_str(&nemo.body()).unwrap();
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "model": "",
+            "messages": [{"role": "assistant", "content": "Hello! I'm doing well."}],
+            "guardrails": {"rail_types": ["output"], "config_ids": ["your-config"]}
+        }),
+        "response example must select guardrails without overriding the configured NeMo model"
+    );
     let json: serde_json::Value = serde_json::from_str(&body).expect("response should be JSON");
     assert_eq!(
         json.get("choices")
@@ -106,7 +118,7 @@ fn response_guardrails_pass_forwards_upstream_body() {
 #[test]
 fn response_guardrails_block_replaces_body() {
     let backend = chat_backend("toxic content that should be blocked");
-    let nemo = nemo_mock(r#"{"status":"blocked","rails_status":{"toxicity":{"status":"blocked"}}}"#);
+    let nemo = nemo_mock(r#"{"status":"blocked","content":"blocked","rail":"toxicity"}"#);
     let proxy_port = free_port();
     let config = load_response_config(proxy_port, backend.port(), nemo.port());
     let proxy = start_proxy(&config);
@@ -135,12 +147,14 @@ fn response_guardrails_block_replaces_body() {
     );
 }
 
-/// NeMo returns `"error"` for the upstream response - the body is replaced
+/// NeMo returns HTTP 500 for the upstream response - the body is replaced
 /// with an error JSON payload (not a 500).
 #[test]
-fn response_guardrails_error_replaces_body() {
+fn response_guardrails_provider_http_error_replaces_body() {
     let backend = chat_backend("hello");
-    let nemo = nemo_mock(r#"{"status":"error","rails_status":{},"guardrails_data":{"error":"Config load failed."}}"#);
+    let nemo = Backend::status(500, "Internal Server Error")
+        .header("Content-Type", "application/json")
+        .start_with_shutdown();
     let proxy_port = free_port();
     let config = load_response_config(proxy_port, backend.port(), nemo.port());
     let proxy = start_proxy(&config);
@@ -191,7 +205,7 @@ fn response_guardrails_provider_down_replaces_body() {
 fn response_guardrails_non_chat_body_replaces_body() {
     let long_text = "x".repeat(512);
     let backend = start_backend_with_shutdown(&long_text);
-    let nemo = nemo_mock(r#"{"status":"success"}"#);
+    let nemo = nemo_mock(r#"{"status":"passed","content":"ok"}"#);
     let proxy_port = free_port();
     let config = load_response_config(proxy_port, backend.port(), nemo.port());
     let proxy = start_proxy(&config);

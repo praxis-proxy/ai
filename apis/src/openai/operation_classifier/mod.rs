@@ -32,10 +32,12 @@ use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, pa
 use tracing::debug;
 
 use self::config::{OperationClassifierConfig, ValidatedConfig, build_config};
-use crate::openai::{
-    conversations::routes as conversations_routes,
-    operation::{OpenAiApiFamily, OpenAiTransport},
-    responses::routes as responses_routes,
+use crate::{
+    openai::{
+        chat_completions::routes as chat_completions_routes, conversations::routes as conversations_routes,
+        responses::routes as responses_routes,
+    },
+    operation::{ApplicationProtocol, OperationEntry as _, OperationSpec, Transport},
 };
 
 /// Filter name as configured in a pipeline.
@@ -65,7 +67,7 @@ impl OpenaiOperationFilter {
     /// same name cannot survive alongside the classifier's own.
     fn set_routing_headers(&self, ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch) {
         if let Some(name) = &self.config.application_protocol_header
-            && let Ok(value) = http::HeaderValue::from_str(matched.family.application_protocol())
+            && let Ok(value) = http::HeaderValue::from_str(matched.application_protocol.as_str())
         {
             ctx.request_headers_to_set.push((name.clone(), value));
         }
@@ -98,17 +100,15 @@ impl OpenaiOperationFilter {
 /// each family's own matcher.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OpenAiOperationMatch {
-    /// API family that owns the operation.
-    ///
-    /// Published downstream as its provider-qualified application protocol,
-    /// for example `openai_responses`, rather than as the bare family name.
-    pub family: OpenAiApiFamily,
+    /// Application protocol that owns the operation, for example
+    /// `openai_responses`.
+    pub application_protocol: ApplicationProtocol,
 
     /// Stable operation ID.
     pub operation_id: &'static str,
 
     /// Transport the operation was reached over.
-    pub transport: OpenAiTransport,
+    pub transport: Transport,
 }
 
 #[async_trait]
@@ -136,7 +136,7 @@ impl HttpFilter for OpenaiOperationFilter {
         debug!(
             method,
             path,
-            application_protocol = matched.family.application_protocol(),
+            application_protocol = matched.application_protocol.as_str(),
             operation_id = matched.operation_id,
             transport = matched.transport.as_str(),
             "classified OpenAI operation"
@@ -155,7 +155,7 @@ impl HttpFilter for OpenaiOperationFilter {
 /// metadata is for logging and tracing, and the filter results are what
 /// `on_result` branch conditions evaluate.
 fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch) -> Result<(), FilterError> {
-    let application_protocol = matched.family.application_protocol();
+    let application_protocol = matched.application_protocol.as_str();
 
     ctx.extensions.insert(matched);
     ctx.set_metadata("openai_operation.application_protocol", application_protocol);
@@ -172,31 +172,34 @@ fn publish_match(ctx: &mut HttpFilterContext<'_>, matched: OpenAiOperationMatch)
 // Classification
 // -----------------------------------------------------------------------------
 
-/// Match a request head against every registered API family.
+/// Match a request head against every registered OpenAI protocol.
 ///
-/// Families are consulted in registration order. Their path spaces do not
-/// overlap, so at most one can match a given method and path.
-fn classify(method: &str, path: &str, transport: OpenAiTransport) -> Option<OpenAiOperationMatch> {
-    if let Some(route) = conversations_routes::match_route(method, path) {
-        // Conversations is reached over plain HTTP only.
-        if transport == OpenAiTransport::Http {
-            return Some(OpenAiOperationMatch {
-                family: route.spec.family,
-                operation_id: route.spec.operation_id,
-                transport: route.spec.transport,
-            });
-        }
-    }
+/// HTTP-only protocols are consulted from a shared list, so adding one does not
+/// introduce Chat- or Conversations-specific branching here. Responses is
+/// matched separately because transport is part of its operation identity.
+/// Path spaces do not overlap, so at most one match can succeed.
+fn classify(method: &str, path: &str, transport: Transport) -> Option<OpenAiOperationMatch> {
+    let http_match = (transport == Transport::Http).then(|| {
+        [
+            conversations_routes::match_route(method, path).map(|route| classified(route.spec.spec())),
+            chat_completions_routes::match_route(method, path).map(|route| classified(route.spec.spec())),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+    });
+    http_match
+        .flatten()
+        .or_else(|| responses_routes::match_route(method, path, transport).map(|route| classified(route.spec.spec())))
+}
 
-    if let Some(route) = responses_routes::match_route(method, path, transport) {
-        return Some(OpenAiOperationMatch {
-            family: route.spec.family,
-            operation_id: route.spec.operation_id,
-            transport: route.spec.transport,
-        });
+/// Build the published match from shared operation metadata.
+fn classified(spec: &OperationSpec) -> OpenAiOperationMatch {
+    OpenAiOperationMatch {
+        application_protocol: spec.application_protocol,
+        operation_id: spec.operation_id,
+        transport: spec.transport,
     }
-
-    None
 }
 
 /// Determine the transport a request arrived over.
@@ -212,9 +215,9 @@ fn classify(method: &str, path: &str, transport: OpenAiTransport) -> Option<Open
 ///
 /// [RFC 6455 Section 4.1]: https://datatracker.ietf.org/doc/html/rfc6455#section-4.1
 /// [RFC 9110 Section 7.6.1]: https://datatracker.ietf.org/doc/html/rfc9110#section-7.6.1
-fn request_transport(method: &str, headers: &http::HeaderMap) -> OpenAiTransport {
+fn request_transport(method: &str, headers: &http::HeaderMap) -> Transport {
     if method != http::Method::GET.as_str() {
-        return OpenAiTransport::Http;
+        return Transport::Http;
     }
 
     let connection_upgrades = headers
@@ -232,8 +235,8 @@ fn request_transport(method: &str, headers: &http::HeaderMap) -> OpenAiTransport
         && upgrade_values.next().is_none();
 
     if connection_upgrades && upgrades_to_websocket {
-        OpenAiTransport::WebSocket
+        Transport::WebSocket
     } else {
-        OpenAiTransport::Http
+        Transport::Http
     }
 }

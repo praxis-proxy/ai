@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 
+use praxis_core::config::ChainRef;
 use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 use url::Url;
@@ -53,6 +54,15 @@ pub(crate) struct ConnectorConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpToolResolveConfig {
+    /// Trusted request headers forwarded to connector-backed MCP `initialize`
+    /// and `tools/list` requests.
+    /// No request headers are forwarded by default. Credential headers such as
+    /// `authorization` are rejected because MCP destinations are client-selected;
+    /// use the MCP tool entry's dedicated `authorization` field instead. Direct,
+    /// client-selected `server_url` targets never receive ambient request headers.
+    #[serde(default)]
+    pub forward_headers: Vec<String>,
+
     /// Maximum size in bytes of the request body this filter *produces*
     /// after expanding `mcp` tool entries into `function` entries.
     ///
@@ -74,12 +84,21 @@ pub(crate) struct McpToolResolveConfig {
     #[serde(default = "default_max_tools")]
     pub max_tools: usize,
 
-    /// Allow connections to loopback addresses (`127.0.0.0/8`,
-    /// `::1`, `localhost`). Disabled by default for SSRF
-    /// protection; enable for development environments where MCP
-    /// servers run locally.
+    /// Outbound filter chain the MCP `tools/list` callout runs through.
+    ///
+    /// The chain is bound at build time and carries only operator-configured
+    /// cross-cutting filters, which observe and can act on the outbound MCP
+    /// request. The SSRF-validated dial target is staged by the transport, so no
+    /// upstream-selecting filter is prepended. Both an inline chain and a named
+    /// reference (resolved against the top-level `filter_chains`) are accepted,
+    /// because this filter binds at top level. When omitted, the callout runs
+    /// through an empty chain and dials the staged target directly.
+    ///
+    /// Whether loopback/private MCP destinations are permitted is governed by
+    /// the operator's global insecure posture (which pipeline finalization
+    /// applies to this bound chain), not a per-filter flag.
     #[serde(default)]
-    pub allow_loopback: bool,
+    pub outbound_chain: Option<ChainRef>,
 
     /// Named connectors mapping connector IDs to server URLs.
     #[serde(default)]
@@ -107,7 +126,9 @@ fn default_max_tools() -> usize {
 }
 
 /// Validate the parsed configuration.
-pub(crate) fn build_config(cfg: McpToolResolveConfig) -> Result<McpToolResolveConfig, FilterError> {
+pub(crate) fn build_config(mut cfg: McpToolResolveConfig) -> Result<McpToolResolveConfig, FilterError> {
+    crate::openai::api_client::validate_forward_headers("openai_mcp_tool_resolve", &mut cfg.forward_headers)?;
+    reject_mcp_sensitive_forward_headers(&cfg.forward_headers)?;
     validate_size_limit(
         "openai_mcp_tool_resolve",
         "max_rewritten_body_bytes",
@@ -124,6 +145,23 @@ pub(crate) fn build_config(cfg: McpToolResolveConfig) -> Result<McpToolResolveCo
     }
     validate_connectors(&cfg.connectors)?;
     Ok(cfg)
+}
+
+/// Reject ambient credentials and protocol-controlled fields at MCP's
+/// client-selected destination boundary.
+fn reject_mcp_sensitive_forward_headers(headers: &[String]) -> Result<(), FilterError> {
+    for configured in headers {
+        let name = http::HeaderName::from_bytes(configured.as_bytes()).map_err(|error| -> FilterError {
+            format!("openai_mcp_tool_resolve: invalid forward header: {error}").into()
+        })?;
+        if crate::mcp_client::is_blocked_mcp_header(&name) {
+            return Err(format!(
+                "openai_mcp_tool_resolve: 'forward_headers' must not include credential or MCP-controlled header '{name}'"
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Validate connector configuration entries.
