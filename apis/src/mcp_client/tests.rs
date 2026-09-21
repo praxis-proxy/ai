@@ -266,6 +266,21 @@ fn reserved_internal_headers_stripped_from_mcp_headers() {
     );
 }
 
+#[test]
+fn build_transport_config_bounds_retry_to_three() {
+    // To call `retry()` on the policy, we need the trait in scope.
+    use rmcp::transport::common::client_side_sse::SseRetryPolicy as _;
+
+    let config =
+        build_transport_config_with_forwarded_headers("https://mcp.example/mcp", None, None, &[], None).unwrap();
+    // A policy consulted past its max returns None (no further retry).
+    assert!(
+        config.retry_config.retry(3).is_none(),
+        "the 4th consecutive failed re-dial must not retry"
+    );
+    assert!(config.retry_config.retry(0).is_some(), "the first re-dial is allowed");
+}
+
 // =========================================================================
 // Cookie and forwarded header blocking
 // =========================================================================

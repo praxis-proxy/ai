@@ -20,6 +20,7 @@ mod subrequest_transport;
     clippy::needless_pass_by_value,
     clippy::unused_self,
     missing_docs,
+    unused_imports,
     reason = "tests"
 )]
 mod tests;
@@ -595,6 +596,15 @@ fn build_transport_config_with_forwarded_headers(
     forwarded_headers: Option<&http::HeaderMap>,
 ) -> Result<StreamableHttpClientTransportConfig, McpClientError> {
     let mut config = StreamableHttpClientTransportConfig::with_uri(server_url);
+    // Bound consecutive *failed* re-dials so a dead endpoint cannot drive an
+    // unbounded reconnect storm. This does NOT bound a re-breaching-but-reachable
+    // stream (retry_times resets to 0 on every successful reconnect); that case is
+    // bounded by the caller's outer deadline + the 413 side-channel (see #1244,
+    // and the F4b caller restructure). `ExponentialBackoff` is `#[non_exhaustive]`,
+    // so construct via `default()` then set the public field.
+    let mut backoff = rmcp::transport::common::client_side_sse::ExponentialBackoff::default();
+    backoff.max_times = Some(3);
+    config.retry_config = std::sync::Arc::new(backoff);
     let mut header_map = HashMap::new();
 
     if let Some(headers_obj) = headers.and_then(serde_json::Value::as_object) {
