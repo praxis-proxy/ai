@@ -96,9 +96,8 @@ fn session_id_header() -> HeaderName {
 /// entry points ([`McpSubrequestClient::execute_streaming`] and the GET-stream
 /// path). The auto-injected [`McpStreamingSelectorFilter`](crate::openai::McpStreamingSelectorFilter)
 /// reads it during `on_request` and, when present, sets the subrequest response
-/// mode to [`SubRequestResponseMode::Streaming`]. Its absence keeps every other
-/// callout (buffered `initialize`/`tools/list`/`tools/call`, DELETE) on the
-/// unchanged buffered ladder.
+/// mode to streaming. Its absence keeps every other callout (buffered
+/// `initialize`/`tools/list`/`tools/call`, DELETE) on the unchanged buffered ladder.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct McpStreamingRequested;
 
@@ -773,7 +772,7 @@ impl McpSubrequestClient {
         ))
     }
 
-    /// Streaming twin of [`execute`]: arms the callout for streaming and returns
+    /// Streaming twin of [`Self::execute`]: arms the callout for streaming and returns
     /// the header response plus the streaming body when praxis selected streaming.
     ///
     /// Returns `(response, None)` when the callout was buffered anyway (Blocker 5:

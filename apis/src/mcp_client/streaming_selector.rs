@@ -9,8 +9,8 @@
 //! It carries no config and never mutates the body: it declares the streaming
 //! subrequest capability and, when the transport armed the callout with
 //! [`McpStreamingRequested`], flips the subrequest response mode to
-//! [`SubRequestResponseMode::Streaming`] so praxis returns
-//! [`CalloutResponse::Streaming`] instead of buffering the SSE body.
+//! [`SubRequestResponseMode::Streaming`] so praxis returns a streaming callout
+//! response instead of buffering the SSE body.
 
 use async_trait::async_trait;
 use praxis_filter::{
