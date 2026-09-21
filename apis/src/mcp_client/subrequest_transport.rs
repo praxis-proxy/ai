@@ -455,6 +455,13 @@ pub(crate) struct McpSubrequestClient {
     /// bounded to [`MAX_CONTROL_RESPONSE_BYTES`]; only `tools/call` responses use
     /// this configured, JSON-expansion-adjusted ceiling (see [`Self::response_limit`]).
     tool_result_bytes: usize,
+    /// Cumulative wire-byte ceiling for a server-initiated GET SSE stream.
+    ///
+    /// An intentionally coarse raw-wire `DoS` backstop, not decoded parity: for a
+    /// control client it is `MAX_LISTING_RESPONSE_BYTES + MAX_CONTROL_RESPONSE_BYTES`
+    /// (5 MiB); `paginate_tools` remains the authoritative decoded gate. Read
+    /// only by the GET-stream path.
+    stream_cumulative_cap: usize,
     /// Per-exchange duration ceiling.
     step_timeout: Duration,
     /// Out-of-band record of a typed classification observed on a callout.
@@ -477,7 +484,12 @@ impl McpSubrequestClient {
     /// No `tools/call` result flows over this transport, so every response is
     /// bounded to [`MAX_CONTROL_RESPONSE_BYTES`] before deserialization.
     pub(crate) fn control(callout: McpCallout, step_timeout: Duration) -> Self {
-        Self::with_wire_cap(callout, step_timeout, MAX_CONTROL_RESPONSE_BYTES)
+        Self::with_wire_cap(
+            callout,
+            step_timeout,
+            MAX_CONTROL_RESPONSE_BYTES,
+            crate::mcp_client::MAX_LISTING_RESPONSE_BYTES.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+        )
     }
 
     /// Build a client for
@@ -490,16 +502,23 @@ impl McpSubrequestClient {
     /// the parent transport and the bound outbound pipeline whose finalized
     /// posture decides whether loopback destinations are permitted.
     pub(crate) fn for_tool(callout: McpCallout, step_timeout: Duration, max_result_bytes: usize) -> Self {
-        Self::with_wire_cap(callout, step_timeout, tool_result_wire_cap(max_result_bytes))
+        let wire = tool_result_wire_cap(max_result_bytes);
+        Self::with_wire_cap(callout, step_timeout, wire, wire.saturating_add(MAX_CONTROL_RESPONSE_BYTES))
     }
 
     /// Shared constructor: move in the callout and pin the `tools/call` wire
     /// ceiling.
-    fn with_wire_cap(callout: McpCallout, step_timeout: Duration, tool_result_bytes: usize) -> Self {
+    fn with_wire_cap(
+        callout: McpCallout,
+        step_timeout: Duration,
+        tool_result_bytes: usize,
+        stream_cumulative_cap: usize,
+    ) -> Self {
         Self {
             callout,
             tool_result_bytes,
             step_timeout,
+            stream_cumulative_cap,
             signal: Arc::new(OnceLock::new()),
         }
     }
@@ -514,6 +533,18 @@ impl McpSubrequestClient {
     /// [`transport_signal_error`]).
     pub(crate) fn signal_handle(&self) -> Arc<OnceLock<TransportSignal>> {
         Arc::clone(&self.signal)
+    }
+
+    /// Per-event wire ceiling for a GET SSE stream (the tool-result wire cap).
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the GET-stream path in Task 7"))]
+    fn wire_cap(&self) -> usize {
+        self.tool_result_bytes
+    }
+
+    /// Cumulative wire ceiling for a GET SSE stream.
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the GET-stream path in Task 7"))]
+    fn stream_cumulative_cap(&self) -> usize {
+        self.stream_cumulative_cap
     }
 
     /// Select the wire byte ceiling for one outbound message.
@@ -1371,5 +1402,37 @@ mod tests {
         let named = ChainRef::Named("shared".to_owned());
         let chain = selector_injected_chain(Some(named), "unused");
         assert!(matches!(chain, ChainRef::Named(n) if n == "shared"));
+    }
+
+    // -- Stream caps (cumulative GET backstop, Task 4 / F3) --------------------
+
+    #[test]
+    fn control_client_caps_are_control_per_event_and_5mib_cumulative() {
+        let client = McpSubrequestClient::control(McpCallout::fabricated(false).expect("fabricated callout"), Duration::from_secs(1));
+        // per-event GET cap == the client's tool-result wire cap, which for the
+        // control client is the 1 MiB control ceiling.
+        assert_eq!(client.wire_cap(), MAX_CONTROL_RESPONSE_BYTES);
+        // cumulative GET cap == 4 MiB listing budget + 1 MiB control budget = 5 MiB.
+        assert_eq!(
+            client.stream_cumulative_cap(),
+            crate::mcp_client::MAX_LISTING_RESPONSE_BYTES + MAX_CONTROL_RESPONSE_BYTES
+        );
+        assert_eq!(client.stream_cumulative_cap(), 5 * 1024 * 1024);
+    }
+
+    #[test]
+    fn tool_client_cumulative_cap_is_wire_cap_plus_control() {
+        let max_result_bytes = 2 * 1024 * 1024;
+        let client = McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(1),
+            max_result_bytes,
+        );
+        let expected_wire = tool_result_wire_cap(max_result_bytes);
+        assert_eq!(client.wire_cap(), expected_wire);
+        assert_eq!(
+            client.stream_cumulative_cap(),
+            expected_wire + MAX_CONTROL_RESPONSE_BYTES
+        );
     }
 }
