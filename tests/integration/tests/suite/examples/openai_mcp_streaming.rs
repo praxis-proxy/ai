@@ -583,7 +583,8 @@ filter_chains:
                 outbound_chain:
                   name: mcp-dispatch-outbound
                   filters:
-                    - filter: openai_responses_proxy
+                    - filter: anthropic_messages_format
+                      on_invalid: continue
                 max_calls_per_round: 32
                 max_result_bytes: 1048576
               - filter: openai_agentic_loop
