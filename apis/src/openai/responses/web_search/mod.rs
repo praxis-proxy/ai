@@ -91,16 +91,7 @@ struct PendingSearchBatch<'a> {
     context_size: SearchContextSize,
 }
 
-/// One pending call, with its hosted action parsed a single time for the whole
-/// batch.
-///
-/// Every dispatch outcome — executed, rejected, over-budget, or malformed —
-/// reads this one parse, so a call is never re-parsed per branch. The owned
-/// action is moved into the public output item after the bridge has serialized
-/// its arguments; no query data is cloned between those paths.
-///
-/// An empty `queries` marks a malformed call: a parsed action always yields at
-/// least one query, so the vector doubles as the validity signal.
+/// One pending call, with its hosted action parsed once for the whole batch.
 struct PreparedCall<'a> {
     /// Identities derived from this call's id, queries, and round position.
     ids: SearchCallIds<'a>,
@@ -343,23 +334,20 @@ impl WebSearchFilter {
                 .search(&self.outbound, callout, query, Some(context_size))
                 .await
             {
-                    SearchOutcome::Results(mut query_results) => results.append(&mut query_results),
-                    SearchOutcome::Failed => {
-                        warn!(
-                            call_id = ids.public,
-                            "web search provider failed; continuing with a failed tool result"
-                        );
-                        let status = if results.is_empty() { "failed" } else { "incomplete" };
-                        append_search_turn(ctx, &ids, status, action, &results, SEARCH_UNAVAILABLE);
-                        return dispatched;
-                    },
-                }
+                SearchOutcome::Results(mut query_results) => results.append(&mut query_results),
+                SearchOutcome::Failed => {
+                    warn!(
+                        call_id = ids.public,
+                        "web search provider failed; continuing with a failed tool result"
+                    );
+                    let status = if results.is_empty() { "failed" } else { "incomplete" };
+                    append_search_turn(ctx, &ids, status, action, &results, SEARCH_UNAVAILABLE);
+                    return dispatched;
+                },
             }
-        let status = if dispatched == queries.len() {
-            "completed"
-        } else {
-            "incomplete"
-        };
+        }
+        let is_completed = dispatched == queries.len();
+        let status = if is_completed { "completed" } else { "incomplete" };
         append_search_turn(ctx, &ids, status, action, &results, "Web search not performed.");
         dispatched
     }
@@ -570,13 +558,8 @@ fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
     })
 }
 
-/// Parse a hosted search action while preserving legacy compatibility.
-///
-/// A valid, non-empty `queries` array is authoritative. If it is present but
-/// invalid, do not fall back to `query`: doing so would execute an action other
-/// than the one the provider supplied. When both forms are valid, `query` is
-/// intentionally not appended to the current array, preventing duplicate
-/// dispatch of the same search.
+/// Parse a hosted search action while preserving legacy compatibility. A valid,
+/// non-empty `queries` array is authoritative, with (deprecated) `query` as a fallback.
 fn parse_search_request<'a>(call: &'a Value, call_id: &'a str, index: usize) -> Option<PreparedCall<'a>> {
     let action = call.get("action")?;
     let legacy_query = action.get("query").and_then(Value::as_str);
