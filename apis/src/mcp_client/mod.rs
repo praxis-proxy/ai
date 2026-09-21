@@ -7,6 +7,7 @@
 //! MCP tool declarations. Designed for reuse by `mcp_tool` (#27)
 //! when `call_tool` support is added.
 
+mod sse_adapter;
 mod streaming_selector;
 mod subrequest_transport;
 #[cfg(test)]
