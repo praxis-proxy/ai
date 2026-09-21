@@ -85,6 +85,23 @@ fn tool_result_wire_cap(max_result_bytes: usize) -> usize {
         .saturating_add(MAX_TOOL_RESULT_ENVELOPE_BYTES)
 }
 
+/// Loose executor backstop for a streaming callout (spec §4.5, F3).
+///
+/// praxis always arms its outer `CalloutStreamingBody` at the `max_response_bytes`
+/// passed to [`McpSubrequestClient::execute_streaming`] and rejects an overflowing
+/// chunk with an opaque `FilterError`, discarding our typed 413. If that ceiling
+/// equalled the adapter's binding cap, praxis would trip *first* and the
+/// transport's own `try_unfold` counter would never record
+/// [`TransportSignal::ResponseTooLarge`]. So the executor ceiling is loosened to
+/// twice the binding adapter cap: the adapter counter (still keyed to the exact
+/// per-message/cumulative cap) trips first for any single chunk up to the full cap
+/// size and yields HTTP 413, while the ceiling stays finite (not `usize::MAX`) so
+/// the `None`-body buffered fallback and the success-`application/json` drain
+/// (`collect_body`/`drain_body`) remain memory-bounded — at 2x the cap.
+fn streaming_executor_backstop(binding_cap: usize) -> usize {
+    binding_cap.saturating_mul(2)
+}
+
 /// The `mcp-session-id` header carrying the Streamable-HTTP session token.
 fn session_id_header() -> HeaderName {
     HeaderName::from_static("mcp-session-id")
@@ -751,8 +768,9 @@ impl McpSubrequestClient {
         let is_sse = status.is_success() && content_type.is_some_and(is_event_stream_content_type);
         if !is_sse {
             // 405 / 404 / any non-SSE success: this server has no GET stream.
+            // best-effort cancel the forwarded body before rejecting (it is None
+            // only when praxis buffered, handled by the Some guard below).
             if let Some(mut body) = body {
-                // best-effort cancel; body may be None if praxis buffered.
                 body.cancel().await;
             }
             return Err(StreamableHttpError::ServerDoesNotSupportSse);
@@ -993,12 +1011,22 @@ impl StreamableHttpClient for McpSubrequestClient {
             last_event_id.as_deref(),
         )?;
         let (response, body) = self
-            .execute_streaming(Method::GET, &uri, Bytes::new(), headers, self.stream_cumulative_cap())
+            .execute_streaming(
+                Method::GET,
+                &uri,
+                Bytes::new(),
+                headers,
+                streaming_executor_backstop(self.stream_cumulative_cap()),
+            )
             .await?;
         self.classify_get_stream_response(response, body, max_sse_event_size)
             .await
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "streaming + buffered-fallback ladder mirrors post_message structure"
+    )]
     async fn post_message_with_max_sse_event_size(
         &self,
         uri: Arc<str>,
@@ -1024,7 +1052,13 @@ impl StreamableHttpClient for McpSubrequestClient {
             serde_json::to_vec(&message).map_err(|_error| StreamableHttpError::Client(McpTransportError::Serialize))?;
 
         let (response, maybe_body) = self
-            .execute_streaming(Method::POST, &uri, Bytes::from(body), headers, max_response_bytes)
+            .execute_streaming(
+                Method::POST,
+                &uri,
+                Bytes::from(body),
+                headers,
+                streaming_executor_backstop(max_response_bytes),
+            )
             .await?;
         match maybe_body {
             // Blocker 5: praxis buffered anyway; classify the full buffered response.
@@ -1541,6 +1575,12 @@ mod tests {
     }
 
     #[test]
+    fn streaming_executor_backstop_doubles_and_saturates() {
+        assert_eq!(streaming_executor_backstop(1000), 2000);
+        assert_eq!(streaming_executor_backstop(usize::MAX), usize::MAX);
+    }
+
+    #[test]
     fn response_limit_uses_tool_cap_only_for_tools_call() {
         let client = McpSubrequestClient::for_tool(
             McpCallout::fabricated(false).expect("fabricated callout"),
@@ -1935,6 +1975,18 @@ mod tests {
         assert!(
             cancelled.load(std::sync::atomic::Ordering::SeqCst),
             "non-forward branch cancels the body"
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_get_stream_none_body_is_server_does_not_support_sse() {
+        let response = sub_response(200, Some("text/event-stream"), b"");
+        let result = client()
+            .classify_get_stream_response(response, None, 16 * 1024 * 1024)
+            .await;
+        assert!(
+            matches!(result, Err(StreamableHttpError::ServerDoesNotSupportSse)),
+            "200 + text/event-stream + buffered (None) body has no stream to forward"
         );
     }
 

@@ -20,7 +20,6 @@ mod subrequest_transport;
     clippy::needless_pass_by_value,
     clippy::unused_self,
     missing_docs,
-    unused_imports,
     reason = "tests"
 )]
 mod tests;

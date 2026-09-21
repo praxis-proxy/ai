@@ -268,9 +268,6 @@ fn reserved_internal_headers_stripped_from_mcp_headers() {
 
 #[test]
 fn build_transport_config_bounds_retry_to_three() {
-    // To call `retry()` on the policy, we need the trait in scope.
-    use rmcp::transport::common::client_side_sse::SseRetryPolicy as _;
-
     let config =
         build_transport_config_with_forwarded_headers("https://mcp.example/mcp", None, None, &[], None).unwrap();
     // A policy consulted past its max returns None (no further retry).
@@ -1444,11 +1441,20 @@ async fn list_tools_rejects_oversized_response() {
     // back out-of-band (rmcp discards the transport error) and surfaces the
     // dedicated `ResponseTooLarge` variant, which callers map to HTTP 413 —
     // distinct from the generic 502 a plain `ListTools` failure yields.
+    //
+    // NOTE: tools/list is a ClientRequest, so rmcp routes it through the
+    // streaming post_message_with_max_sse_event_size path. The server returns
+    // JSON (not SSE), so praxis buffers anyway (Blocker 5). The executor
+    // backstop passed to execute_streaming is 2x the binding cap (spec §4.5 F3),
+    // so when praxis buffers and trips on an oversized response, it reports the
+    // 2x limit. This is intentional: the buffered fallback is memory-bounded at
+    // 2x the cap (see subrequest_transport.rs streaming_executor_backstop doc).
     match err {
         McpClientError::ResponseTooLarge { limit, .. } => {
             assert_eq!(
-                limit, MAX_CONTROL_RESPONSE_BYTES,
-                "control-plane tools/list is bounded to the control ceiling"
+                limit,
+                2 * MAX_CONTROL_RESPONSE_BYTES,
+                "buffered fallback in execute_streaming is bounded at 2x the binding cap"
             );
         },
         other => panic!("oversized response should surface as ResponseTooLarge, got: {other:?}"),

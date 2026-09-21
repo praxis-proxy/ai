@@ -216,7 +216,8 @@ fn oversized_sse_tool_result_returns_413() {
     let model = StatefulCapturingBackend::new(vec![(200, serde_json::to_string(&first_response).unwrap())])
         .start_with_shutdown();
 
-    // max_result_bytes is 1048576 in the config, so use 2 MiB
+    // wire cap = tool_result_wire_cap(1 MiB) = 6_356_992 B; executor backstop = 2x =
+    // 12_713_984 B. Use 8 MiB: above the cap (adapter 413) but below the backstop.
     let mcp = start_mcp_mock_server_with_config(McpMockConfig {
         tools: vec![
             McpToolFixture::new("get_weather")
@@ -229,7 +230,7 @@ fn oversized_sse_tool_result_returns_413() {
                 })),
         ],
         sse_tool_results: true,
-        oversized_sse_bytes: Some(2 * 1024 * 1024),
+        oversized_sse_bytes: Some(8 * 1024 * 1024),
         ..McpMockConfig::default()
     });
 
@@ -261,19 +262,11 @@ fn oversized_sse_tool_result_returns_413() {
     let status = parse_status(&raw);
     let response_body = parse_body(&raw);
 
-    // Expect the proxy to surface a failure (not hang)
     assert!(
-        status == 200 || status >= 400,
-        "oversized SSE should surface a failure; got status {status}"
+        status >= 400 || (status == 200 && response_body.contains("413")),
+        "oversized SSE must surface a 413 (either an HTTP >=400 status or a 413 in \
+         the streamed error envelope); got status {status}, body: {response_body}"
     );
-
-    // If status is 200, the error should be in the body as an error envelope
-    if status == 200 {
-        assert!(
-            response_body.contains("error") || response_body.contains("413"),
-            "response body should contain an error indication: {response_body}"
-        );
-    }
 }
 
 // -----------------------------------------------------------------------------
