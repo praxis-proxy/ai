@@ -32,7 +32,6 @@ pub use conversations::{
     ConversationOperation, ConversationOperationSpec, OpenaiConversationsFilter,
     implementation_openapi_json as conversations_openapi_json, operation_specs as conversations_operation_specs,
 };
-pub use crate::mcp_client::McpStreamingSelectorFilter;
 pub use operation::OpenAiOperationSpec;
 pub use operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter};
 pub use responses::{
@@ -48,3 +47,5 @@ pub use responses::{
     },
     stream_events::OpenaiStreamEventsFilter,
 };
+
+pub use crate::mcp_client::McpStreamingSelectorFilter;

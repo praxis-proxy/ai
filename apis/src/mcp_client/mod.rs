@@ -37,8 +37,8 @@ use rmcp::{
     transport::{StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig},
 };
 
-use self::subrequest_transport::MAX_CONTROL_RESPONSE_BYTES;
 pub use self::streaming_selector::McpStreamingSelectorFilter;
+use self::subrequest_transport::MAX_CONTROL_RESPONSE_BYTES;
 pub(crate) use self::subrequest_transport::{
     McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
 };

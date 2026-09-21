@@ -9,8 +9,7 @@
 //! raw byte layer, *before* SSE parsing:
 //!
 //! * a cumulative *operation-stream* ceiling (total bytes across the stream), and
-//! * a per-event ceiling (the retained size of one SSE event), ported from
-//!   rmcp 3.4.0's private `SseEventSizeLimiter`.
+//! * a per-event ceiling (the retained size of one SSE event), ported from rmcp 3.4.0's private `SseEventSizeLimiter`.
 //!
 //! Either breach records a [`TransportSignal::ResponseTooLarge`] out-of-band
 //! (first signal wins) so the caller classifies it as HTTP 413, and terminates
@@ -66,7 +65,11 @@ impl std::error::Error for SseByteStreamError {}
 /// Tracks the retained size of the SSE event currently being assembled (data /
 /// id / event lines, excluding comment lines starting with `:`) and reports a
 /// breach once it would exceed `max_size`.
-#[allow(clippy::allow_attributes, dead_code, reason = "used by sse_stream_from_body wired in task 4")]
+#[allow(
+    clippy::allow_attributes,
+    dead_code,
+    reason = "used by sse_stream_from_body wired in task 4"
+)]
 #[derive(Debug)]
 struct SseEventSizeLimiter {
     /// Maximum retained size for one SSE event.
@@ -150,7 +153,11 @@ impl SseEventSizeLimiter {
 }
 
 /// Mutable state threaded through the byte-layer [`futures::stream::try_unfold`].
-#[allow(clippy::allow_attributes, dead_code, reason = "used by sse_stream_from_body wired in task 4")]
+#[allow(
+    clippy::allow_attributes,
+    dead_code,
+    reason = "used by sse_stream_from_body wired in task 4"
+)]
 struct ByteState {
     /// The praxis streaming response body being adapted.
     body: Box<dyn StreamingResponseBody>,
@@ -172,7 +179,10 @@ struct ByteState {
 /// cap is `min(per_event_cap, max_sse_event_size)`). A breach of either budget
 /// records `signal` (first wins) and terminates the stream.
 #[allow(clippy::allow_attributes, dead_code, reason = "wired by selector filter in task 4")]
-#[expect(clippy::too_many_lines, reason = "two-budget byte-layer adapter is inherently sequential")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "two-budget byte-layer adapter is inherently sequential"
+)]
 pub(super) fn sse_stream_from_body(
     body: Box<dyn StreamingResponseBody>,
     per_event_cap: usize,
@@ -291,12 +301,14 @@ impl StreamingResponseBody for FakeStreamingBody {
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, reason = "tests use unwrap/expect/indexing for brevity")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "tests use unwrap/expect/indexing for brevity"
+)]
 mod tests {
-    use std::sync::{
-        Arc, OnceLock,
-        atomic::AtomicBool,
-    };
+    use std::sync::{Arc, OnceLock, atomic::AtomicBool};
 
     use bytes::Bytes;
     use futures::StreamExt as _;
@@ -389,7 +401,10 @@ mod tests {
             }
         }
         assert!(saw_err, "max_sse_event_size acts as a per-event backstop");
-        assert!(matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit: 8 })));
+        assert!(matches!(
+            signal.get(),
+            Some(TransportSignal::ResponseTooLarge { limit: 8 })
+        ));
     }
 
     #[tokio::test]

@@ -676,7 +676,10 @@ impl McpSubrequestClient {
 
     /// Build the header map for a POST message, injecting Accept, Content-Type,
     /// and the optional session-id header.
-    #[expect(clippy::unused_self, reason = "method form matches the refactored post_message call site")]
+    #[expect(
+        clippy::unused_self,
+        reason = "method form matches the refactored post_message call site"
+    )]
     fn build_post_headers(
         &self,
         auth_header: Option<String>,
