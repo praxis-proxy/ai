@@ -26,7 +26,9 @@ use tracing::warn;
 /// dropped, the deprecated `functions`/`function_call` shape is never read,
 /// `web_search_options` annotations are dropped, and the top-level
 /// `moderation` results are dropped. Rejecting is honest; forwarding would
-/// bill the client for output it never sees.
+/// bill the client for output it never sees. A value equal to the field's
+/// documented default changes nothing and is dropped instead (see
+/// [`is_default_value`]).
 const UNREPRESENTABLE_FIELDS: [&str; 13] = [
     "service_tier",
     "container",
@@ -127,16 +129,41 @@ fn drop_unsupported_fields(body: &mut Map<String, Value>) {
 }
 
 /// Remove every [`UNREPRESENTABLE_FIELDS`] entry, failing on the first one
-/// that carries a value. A JSON `null` is treated as absent.
+/// that carries a value. A JSON `null` or the field's documented default is
+/// treated as absent.
 fn reject_unrepresentable_fields(body: &mut Map<String, Value>) -> Result<(), String> {
     for field in UNREPRESENTABLE_FIELDS {
-        if body.remove(field).is_some_and(|value| !value.is_null()) {
+        if body
+            .remove(field)
+            .is_some_and(|value| !value.is_null() && !is_default_value(field, &value))
+        {
             return Err(format!(
                 "`{field}` is not supported when translating Anthropic Messages to Chat Completions"
             ));
         }
     }
     Ok(())
+}
+
+/// Whether `value` is the documented default of `field`, so that sending it
+/// is indistinguishable from omitting it and the response misreports nothing.
+///
+/// The Chat Completions spec documents `n: 1`, `logprobs: false`,
+/// `modalities: ["text"]` and `function_call: "none"` (the default when no
+/// `functions` are present, which always holds since `functions` is
+/// rejected). Anthropic documents `service_tier: "auto"`, and an empty
+/// `mcp_servers` list configures nothing. The remaining rejected fields have
+/// no default other than null.
+fn is_default_value(field: &str, value: &Value) -> bool {
+    match field {
+        "n" => *value == 1,
+        "logprobs" => *value == false,
+        "modalities" => *value == json!(["text"]),
+        "function_call" => *value == "none",
+        "service_tier" => *value == "auto",
+        "mcp_servers" => *value == json!([]),
+        _ => false,
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1498,6 +1525,62 @@ mod tests {
             assert!(
                 error.contains(field),
                 "rejection for `{field}` must name the field: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_valued_rejected_fields_are_treated_as_absent() {
+        for (field, default) in [
+            ("n", json!(1)),
+            ("logprobs", json!(false)),
+            ("modalities", json!(["text"])),
+            ("function_call", json!("none")),
+            ("service_tier", json!("auto")),
+            ("mcp_servers", json!([])),
+        ] {
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hi"}],
+                field: default,
+            });
+            let result = transform_request(body);
+            assert!(
+                result.is_ok(),
+                "the default value of `{field}` must be accepted: {result:?}"
+            );
+            let parsed: Value = serde_json::from_slice(&result.unwrap()).unwrap();
+            assert!(
+                parsed.get(field).is_none(),
+                "the default value of `{field}` must not be forwarded"
+            );
+        }
+    }
+
+    #[test]
+    fn non_default_valued_rejected_fields_are_rejected() {
+        for (field, value) in [
+            ("n", json!(2)),
+            ("logprobs", json!(true)),
+            ("modalities", json!(["text", "audio"])),
+            ("function_call", json!("auto")),
+            ("service_tier", json!("standard_only")),
+            (
+                "mcp_servers",
+                json!([{"type": "url", "url": "https://example.com", "name": "x"}]),
+            ),
+        ] {
+            let body = json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hi"}],
+                field: value,
+            });
+            let error = transform_request(body).unwrap_err();
+            assert!(
+                error.contains(field),
+                "a non-default `{field}` must be rejected by name: {error}"
             );
         }
     }

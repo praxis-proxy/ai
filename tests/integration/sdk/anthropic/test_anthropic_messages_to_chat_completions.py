@@ -174,6 +174,22 @@ class TestRequestFieldHandling:
         assert "metadata" not in upstream
         assert "thinking" not in upstream
 
+    def test_default_valued_rejected_field_is_dropped(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            service_tier="auto",
+            extra_body={"n": 1},
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        assert "n" not in upstream
+        assert "service_tier" not in upstream
+
     def test_unrepresentable_field_is_rejected_before_the_backend(self, anthropic_client):
         RecordingBackend.bodies.clear()
 

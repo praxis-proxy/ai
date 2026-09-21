@@ -197,7 +197,8 @@ The `anthropic_messages_to_chat_completions` filter:
   the translated response would discard (`n`,
   `logprobs`, `top_logprobs`, `audio`, `modalities`,
   `functions`, `function_call`, `web_search_options`,
-  `moderation`)
+  `moderation`); a `null` or the field's documented
+  default (for example `n: 1`) is dropped instead
 - Drops `thinking` and `context_management` with a log
   warning; Claude Code sends both on every request and
   Chat Completions has no equivalent
