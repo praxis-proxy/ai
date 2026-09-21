@@ -2504,6 +2504,7 @@ fn make_ctx(req: &praxis_filter::Request) -> HttpFilterContext<'_> {
         request_headers_to_remove: Vec::new(),
         request_headers_to_set: Vec::new(),
         filter_metadata: HashMap::new(),
+        grpc_completion: None,
         structured_metadata: HashMap::new(),
         pre_read_mutations: Vec::new(),
         prior_pre_read_mutations: Vec::new(),
