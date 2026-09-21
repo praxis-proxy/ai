@@ -112,15 +112,21 @@
 //!
 //! # Streaming
 //!
-//! Restoration of a **streaming** response requires re-typing live SSE events,
-//! which this filter does not yet do. To honour the invariant that a private
-//! synthesized function name never reaches the client, a request that asks for
-//! `stream: true` and either declares rich client tools or carries
-//! `tool_search`-discovered tools that would be hoisted fails closed with HTTP 400
-//! **before any upstream call** — the lowered names are never put on the wire, so
-//! an un-restored SSE stream can never leak them (full streaming restoration is
-//! #1159). A streaming request that neither declares rich client tools nor carries
-//! discovered tools stays a transparent passthrough.
+//! On the streaming Responses path (`stream: true`) the lowered client-tool calls
+//! are restored **live in the SSE lifecycle** by the `openai_stream_events` logical
+//! owner, not by this filter: this filter records the reverse lowering map and the
+//! `tools`/`tool_choice` echo snapshot on the request, and `openai_stream_events`
+//! re-types each lowered `function_call` as it streams (#1159).
+//!
+//! That hand-off requires `openai_stream_events` to be placed **before**
+//! `openai_client_tool_compat` in the inference step: on the request it publishes a
+//! marker arming streaming restoration, which this filter reads before lowering. If
+//! a streaming request declares rich client tools (or carries `tool_search`-discovered
+//! tools that would be hoisted) but no `openai_stream_events` owner is armed ahead of
+//! it, the filter fails closed with **HTTP 500** — an operator misconfiguration —
+//! **before any upstream call**, so a private lowered `function` name can never reach
+//! an un-restored SSE stream. A streaming request that neither declares rich client
+//! tools nor carries discovered tools stays a transparent passthrough.
 //!
 //! When the request declares no rich client tools and carries no discovered tools
 //! the filter is a transparent passthrough, so native traffic is unchanged.
@@ -255,7 +261,12 @@ impl ClientToolCompatFilter {
     /// Returns `Err` with a terminal rejection when lowering cannot proceed
     /// losslessly; the request body is left byte-identical so no upstream call is
     /// made with a partial rewrite.
-    fn lower_request(&self, state: &mut ResponsesState, streaming: bool) -> Result<(), FilterAction> {
+    fn lower_request(
+        &self,
+        state: &mut ResponsesState,
+        streaming: bool,
+        stream_restoration_armed: bool,
+    ) -> Result<(), FilterAction> {
         // A present `tools` that is neither an array nor `null` is structurally
         // malformed: this filter's whole contract treats `tools` as an array. Fail
         // closed uniformly here — before any lowering, discovery, or native
@@ -274,15 +285,12 @@ impl ClientToolCompatFilter {
         // caught before any upstream call rather than being silently ignored on the
         // streaming path.
         let discovered = collect_discovered_tools(&state.messages)?;
-        // Discovered-tool hoisting is a buffered-only capability: the hoisted
-        // private names can only be restored on a buffered response, not on an SSE
-        // stream (full streaming restoration is #1159). A streaming request that
-        // carries discovered tools therefore fails closed rather than silently
-        // degrading them to non-callable stringified context. Rich declared tools
-        // are already rejected by the streaming guard in `on_request_body` before
-        // lowering runs.
-        if streaming && !discovered.is_empty() {
-            return Err(reject_streaming_discovered_unsupported());
+        // #1159: streaming restoration requires the openai_stream_events logical
+        // owner to be present (it published the marker in on_request). Without it
+        // there is no SSE owner to restore lowered calls, so fail closed rather than
+        // stream private lowered `function` shapes to the client.
+        if streaming && (has_rich || !discovered.is_empty()) && !stream_restoration_armed {
+            return Err(reject_streaming_missing_owner());
         }
         if !has_rich && discovered.is_empty() {
             // Native passthrough: still lower any prior typed client-owned items
@@ -366,9 +374,9 @@ impl ClientToolCompatFilter {
     /// Returns `Ok(None)` when nothing needs rewriting (the body is not a buffered
     /// Responses object, or the request lowered nothing).
     fn restore_response(&self, state: &ResponsesState, bytes: &[u8]) -> Result<Option<SerializedJson>, FilterAction> {
-        let Some(echo) = state.client_tool_echo.as_ref() else {
+        if state.client_tool_echo.is_none() {
             return Ok(None);
-        };
+        }
         let Ok(mut response) = serde_json::from_slice::<Value>(bytes) else {
             // Streaming SSE or a non-JSON body: leave it for `openai_stream_events`.
             return Ok(None);
@@ -379,16 +387,11 @@ impl ClientToolCompatFilter {
 
         if let Some(output) = response.get_mut("output").and_then(Value::as_array_mut) {
             for item in output.iter_mut() {
-                restore_output_item(item, &state.client_tool_lowering)?;
+                restore_output_item(item, &state.client_tool_lowering).map_err(reject_lossy_restore)?;
             }
         }
 
-        if let Some(obj) = response.as_object_mut() {
-            obj.insert("tools".to_owned(), Value::Array(echo.tools.clone()));
-            if !echo.tool_choice.is_null() {
-                obj.insert("tool_choice".to_owned(), echo.tool_choice.clone());
-            }
-        }
+        restore_snapshot_tools(&mut response, state.client_tool_echo.as_ref());
 
         let serialized = serialize_json_body(&response).map_err(|error| {
             FilterAction::Reject(responses_error_rejection(502, "server_error", &error.to_string()))
@@ -471,24 +474,19 @@ impl HttpFilter for ClientToolCompatFilter {
             return Ok(FilterAction::Continue);
         }
         let streaming = request_is_streaming(ctx);
+        let stream_restoration_armed = ctx.get_metadata("responses.client_tool_stream_restoration").is_some();
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
-        // Fail closed before any upstream call when a streaming request declares
-        // rich client tools: streaming restoration is not implemented, so lowering
-        // their private function names onto a streamed round would leak those names
-        // to the client in un-restored SSE events (see the module streaming note).
-        if streaming && request_has_rich_client_tool(state) {
-            return Ok(reject_streaming_unsupported());
-        }
-        if let Err(action) = self.lower_request(state, streaming) {
+        if let Err(action) = self.lower_request(state, streaming, stream_restoration_armed) {
             return Ok(action);
         }
         // The `state` borrow above ends here. Re-read the echo flag before mutating
         // `ctx`: when lowering armed restoration, buffer the response and strip
         // `Accept-Encoding` so restoration sees a single, complete, uncompressed
-        // body (see `arm_restoration`).
-        if restoration_armed(ctx) {
+        // body (see `arm_restoration`). On the streaming path, the stream owner
+        // drives restoration, so the compat filter must not buffer.
+        if !streaming && restoration_armed(ctx) {
             self.arm_restoration(ctx);
         }
         Ok(FilterAction::Continue)
@@ -2334,9 +2332,46 @@ fn carry_caller(out: &mut Value, source: &Value) {
 // Response restoration
 // -----------------------------------------------------------------------------
 
+/// Restore the client's original `tools`/`tool_choice` onto an echoed response
+/// from the pre-lowering snapshot, keeping private lowered `function` names out
+/// of client-visible output (#1159). Infallible: a `None` echo or a non-object
+/// response is a no-op. A `Null` snapshot `tool_choice` means the client never
+/// sent one, so the echoed field is REMOVED rather than set to null.
+pub(crate) fn restore_snapshot_tools(response: &mut Value, echo: Option<&ClientToolEcho>) {
+    let (Some(echo), Some(object)) = (echo, response.as_object_mut()) else {
+        return;
+    };
+    object.insert("tools".to_owned(), Value::Array(echo.tools.clone()));
+    if echo.tool_choice.is_null() {
+        object.remove("tool_choice");
+    } else {
+        object.insert("tool_choice".to_owned(), echo.tool_choice.clone());
+    }
+}
+
+/// Restore every lowered `function_call` in an echoed response's `output` array
+/// to its canonical typed item (#1159). Fallible: `Err(item_type)` on the first
+/// lossy item so the caller can fail the response closed. No-op when `output` is
+/// absent or not an array.
+pub(crate) fn restore_snapshot(
+    response: &mut Value,
+    reverse: &HashMap<String, LoweredClientTool>,
+) -> Result<(), &'static str> {
+    let Some(items) = response.get_mut("output").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for item in items {
+        restore_output_item(item, reverse)?;
+    }
+    Ok(())
+}
+
 /// Restore one output item, re-typing a lowered `function_call` when its name is
 /// in the reverse map.
-fn restore_output_item(item: &mut Value, reverse: &HashMap<String, LoweredClientTool>) -> Result<(), FilterAction> {
+pub(crate) fn restore_output_item(
+    item: &mut Value,
+    reverse: &HashMap<String, LoweredClientTool>,
+) -> Result<(), &'static str> {
     if item.get("type").and_then(Value::as_str) != Some("function_call") {
         return Ok(());
     }
@@ -2348,20 +2383,20 @@ fn restore_output_item(item: &mut Value, reverse: &HashMap<String, LoweredClient
     };
     match lowered.restore {
         ClientToolRestore::Custom => {
-            *item = restore_custom_call(item).map_err(|()| reject_lossy_restore("custom_tool_call"))?;
+            *item = restore_custom_call(item).map_err(|()| "custom_tool_call")?;
         },
         ClientToolRestore::Namespace => {
             restore_namespace_call(item, &lowered.original_name, lowered.namespace.as_deref());
         },
         ClientToolRestore::NamespaceCustom => {
             *item = restore_namespace_custom_call(item, &lowered.original_name, lowered.namespace.as_deref())
-                .map_err(|()| reject_lossy_restore("custom_tool_call"))?;
+                .map_err(|()| "custom_tool_call")?;
         },
         ClientToolRestore::Shell => {
-            *item = restore_shell_call(item).map_err(|()| reject_lossy_restore("shell_call"))?;
+            *item = restore_shell_call(item).map_err(|()| "shell_call")?;
         },
         ClientToolRestore::ToolSearch => {
-            *item = restore_tool_search_call(item).map_err(|()| reject_lossy_restore("tool_search_call"))?;
+            *item = restore_tool_search_call(item).map_err(|()| "tool_search_call")?;
         },
     }
     Ok(())
@@ -2382,7 +2417,7 @@ fn restore_output_item(item: &mut Value, reverse: &HashMap<String, LoweredClient
 /// schema, so carrying the backend `function_call`'s status would emit a
 /// noncanonical field. "Preserve status" applies only to target item types that
 /// define it.
-fn restore_custom_call(item: &Value) -> Result<Value, ()> {
+pub(crate) fn restore_custom_call(item: &Value) -> Result<Value, ()> {
     let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
     let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
     let call_id = item
@@ -2390,19 +2425,20 @@ fn restore_custom_call(item: &Value) -> Result<Value, ()> {
         .and_then(Value::as_str)
         .filter(|call_id| !call_id.trim().is_empty())
         .ok_or(())?;
+    let input = input_from_arguments_strict(arguments)?;
     let mut out = json!({
         "type": "custom_tool_call",
         "id": custom_public_item_id(id),
         "call_id": call_id,
         "name": item.get("name").cloned().unwrap_or(Value::Null),
-        "input": input_from_arguments(arguments),
+        "input": input,
     });
     carry_caller(&mut out, item);
     Ok(out)
 }
 
 /// Restore a lowered flat `function_call` to its namespaced form, in place.
-fn restore_namespace_call(item: &mut Value, original_name: &str, namespace: Option<&str>) {
+pub(crate) fn restore_namespace_call(item: &mut Value, original_name: &str, namespace: Option<&str>) {
     if let Some(object) = item.as_object_mut() {
         object.insert("name".to_owned(), json!(original_name));
         if let Some(namespace) = namespace {
@@ -2417,7 +2453,11 @@ fn restore_namespace_call(item: &mut Value, original_name: &str, namespace: Opti
 /// `CustomToolCall` carries an optional `namespace` field, so a namespaced custom
 /// member round-trips to a `custom_tool_call` that names both its member and its
 /// namespace.
-fn restore_namespace_custom_call(item: &Value, member_name: &str, namespace: Option<&str>) -> Result<Value, ()> {
+pub(crate) fn restore_namespace_custom_call(
+    item: &Value,
+    member_name: &str,
+    namespace: Option<&str>,
+) -> Result<Value, ()> {
     let mut out = restore_custom_call(item)?;
     if let Some(object) = out.as_object_mut() {
         object.insert("name".to_owned(), json!(member_name));
@@ -2434,7 +2474,7 @@ fn restore_namespace_custom_call(item: &Value, member_name: &str, namespace: Opt
 /// `FunctionShellAction` requires the `timeout_ms` and `max_output_length` keys
 /// (both nullable). The lowered function omits them, so a missing optional is
 /// normalized to an explicit null to keep the restored action schema-complete.
-fn parse_shell_action(arguments: &str) -> Result<Value, ()> {
+pub(crate) fn parse_shell_action(arguments: &str) -> Result<Value, ()> {
     let mut action: Value = serde_json::from_str(arguments).ok().ok_or(())?;
     {
         let object = action.as_object().ok_or(())?;
@@ -2466,7 +2506,7 @@ fn parse_shell_action(arguments: &str) -> Result<Value, ()> {
 /// never executes a call the backend reported as incomplete; an absent or null
 /// status defaults to `completed`, while a wrong-typed or unknown status fails
 /// closed so a malformed backend call never becomes an executable client call.
-fn restore_shell_call(item: &Value) -> Result<Value, ()> {
+pub(crate) fn restore_shell_call(item: &Value) -> Result<Value, ()> {
     let arguments = item.get("arguments").and_then(Value::as_str).unwrap_or_default();
     let action = parse_shell_action(arguments)?;
     let call_id = item
@@ -2495,7 +2535,7 @@ fn restore_shell_call(item: &Value) -> Result<Value, ()> {
 /// `ToolSearchCall.status` is a required `FunctionCallStatus`, so every valid
 /// `in_progress`/`completed`/`incomplete` value is preserved verbatim (absent or
 /// null defaults to `completed`); a wrong-typed or unknown status fails closed.
-fn restore_tool_search_call(item: &Value) -> Result<Value, ()> {
+pub(crate) fn restore_tool_search_call(item: &Value) -> Result<Value, ()> {
     let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
     let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or_default();
     if id.trim().is_empty() || call_id.trim().is_empty() {
@@ -2524,7 +2564,7 @@ fn restore_tool_search_call(item: &Value) -> Result<Value, ()> {
 /// `completed`, or `incomplete` string is preserved so a non-terminal backend
 /// call is never presented to the client as completed; a wrong-typed (non-string)
 /// or unknown value fails closed so a malformed call cannot become executable.
-fn restore_call_status(item: &Value) -> Result<&'static str, ()> {
+pub(crate) fn restore_call_status(item: &Value) -> Result<&'static str, ()> {
     match item.get("status") {
         None | Some(Value::Null) => Ok("completed"),
         Some(Value::String(status)) => match status.as_str() {
@@ -2537,18 +2577,27 @@ fn restore_call_status(item: &Value) -> Result<&'static str, ()> {
     }
 }
 
-/// Recover the freeform `custom_tool_call` input from lowered arguments.
+/// The private wire envelope a lowered `custom` tool's arguments carry: exactly
+/// one string field named `input`. `deny_unknown_fields` makes any extra key a
+/// hard parse error so a malformed backend echo cannot leak a private shape.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomInputEnvelope {
+    /// The single string argument the lowered `custom` tool wraps; unwrapped back
+    /// to the plain-string `input` of a canonical `custom_tool_call`.
+    input: String,
+}
+
+/// Unwrap a lowered `custom` call's `{"input": "<string>"}` arguments envelope
+/// back to the plain-string `input` field of a canonical `custom_tool_call`.
 ///
-/// Fails open: a JSON string is the input, a `{ "input": "..." }` object unwraps
-/// to its string, and anything else forwards the raw arguments verbatim.
-fn input_from_arguments(arguments: &str) -> String {
-    match serde_json::from_str::<Value>(arguments) {
-        Ok(Value::String(input)) => input,
-        Ok(Value::Object(fields)) => fields
-            .get("input")
-            .and_then(Value::as_str)
-            .map_or_else(|| arguments.to_owned(), str::to_owned),
-        _ => arguments.to_owned(),
+/// Fail-closed (#1159): returns `Err(())` on invalid JSON, a missing or extra
+/// key, or a non-string `input`, so restoration rejects the item rather than
+/// leaking the private lowered arguments shape to the client.
+pub(crate) fn input_from_arguments_strict(arguments: &str) -> Result<String, ()> {
+    match serde_json::from_str::<CustomInputEnvelope>(arguments) {
+        Ok(envelope) => Ok(envelope.input),
+        Err(_) => Err(()),
     }
 }
 
@@ -2656,7 +2705,7 @@ fn reject_reserved_namespace_delimiter(kind: &str, name: &str) -> Result<(), Fil
 }
 
 /// Derive the public `custom_tool_call` item id from a returned function id.
-fn custom_public_item_id(item_id: &str) -> String {
+pub(crate) fn custom_public_item_id(item_id: &str) -> String {
     if item_id.starts_with("ctc_") {
         return item_id.to_owned();
     }
@@ -2807,24 +2856,18 @@ fn reject_if_restricted_callers(tool: &Value, descriptor: &str) -> Result<(), Fi
     Ok(())
 }
 
-/// Reject a streaming request that declares rich client tools before any upstream
-/// call, so lowered private function names are never streamed un-restored.
-fn reject_streaming_unsupported() -> FilterAction {
-    reject_bad_request(
-        "streaming is not supported for rich client-owned tools on a function-only Responses backend; retry with \
-         stream=false",
-    )
-}
-
-/// Reject a streaming request that carries discovered `tool_search` tools before
-/// any upstream call: the hoisted private function names can only be restored on a
-/// buffered response, so a streamed round would leak them un-restored (full
-/// streaming restoration is #1159).
-fn reject_streaming_discovered_unsupported() -> FilterAction {
-    reject_bad_request(
-        "streaming is not supported for tool_search-discovered client tools on a function-only Responses backend; \
-         retry with stream=false",
-    )
+/// #1159: streaming client-tool restoration was requested but the
+/// `openai_stream_events` logical SSE owner is not in the pipeline, so there is
+/// nothing to restore the lowered calls in the stream. Misconfiguration, so a
+/// 500 (not a client 4xx): the operator must place `openai_stream_events` before
+/// `openai_client_tool_compat` in the inference step.
+fn reject_streaming_missing_owner() -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        500,
+        "server_error",
+        "openai_stream_events must precede openai_client_tool_compat to restore \
+         lowered client tools on the streaming Responses path",
+    ))
 }
 
 /// Reject a response whose lowered call cannot be restored losslessly.

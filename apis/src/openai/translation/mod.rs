@@ -1110,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_text_format_is_omitted_when_tools_are_translated() {
+    fn responses_text_format_is_preserved_when_tools_are_translated() {
         let mapped = map(&json!({
             "model": "gpt-4o-mini",
             "input": "look up the weather",
@@ -1122,7 +1122,45 @@ mod tests {
             }]
         }));
 
-        assert!(mapped.get("response_format").is_none());
+        // Chat Completions supports tools and structured output together, so the
+        // translated request must keep the client's `response_format` contract.
+        assert_eq!(mapped["response_format"], json!({"type": "json_object"}));
+        assert_eq!(mapped["tools"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn responses_json_schema_format_is_preserved_when_tools_are_translated() {
+        let mapped = map(&json!({
+            "model": "gpt-4o-mini",
+            "input": "look up the weather",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "weather",
+                    "description": "Weather payload",
+                    "strict": true,
+                    "schema": {"type": "object", "properties": {"temperature": {"type": "number"}}}
+                }
+            },
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object"}
+            }]
+        }));
+
+        assert_eq!(
+            mapped["response_format"],
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "weather",
+                    "description": "Weather payload",
+                    "strict": true,
+                    "schema": {"type": "object", "properties": {"temperature": {"type": "number"}}}
+                }
+            })
+        );
         assert_eq!(mapped["tools"][0]["function"]["name"], "get_weather");
     }
 

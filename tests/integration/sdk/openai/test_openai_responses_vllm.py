@@ -2388,6 +2388,62 @@ class TestResponsesToChatCompletionsVLLM:
             "marker": "CHAT-JSON-1357",
         }
 
+    @pytest.mark.critical_vllm
+    @requires_vllm_compat
+    def test_structured_output_preserved_with_tools_round_trip(
+        self,
+        chat_streaming_client,
+    ):
+        # Regression for issue #1248: the Responses-to-Chat translator used to
+        # drop `response_format` whenever tools were translated, silently
+        # weakening the structured-output contract. Chat Completions supports
+        # both together, so a request pairing `text.format` with a declared tool
+        # must still return schema-valid JSON. The tool flows through the
+        # translator's tool builder (the exact path that previously deleted the
+        # constraint); `tool_choice="none"` keeps the answer direct and
+        # deterministic while still exercising that path.
+        tool = {
+            "type": "function",
+            "name": "get_weather",
+            "description": "Get the current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        }
+        response = chat_streaming_client.responses.create(
+            model=VLLM_MODEL,
+            input="Return the marker CHAT-JSON-TOOLS-2468. /no_think",
+            temperature=0,
+            tools=[tool],
+            tool_choice="none",
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "marker_result",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "marker": {"type": "string"},
+                        },
+                        "required": ["marker"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            store=False,
+            max_output_tokens=128,
+        )
+
+        assert response.status == "completed"
+        assert json.loads(response.output_text) == {
+            "marker": "CHAT-JSON-TOOLS-2468",
+        }
+
     def test_function_call_and_output_round_trip(
         self,
         chat_streaming_client,
@@ -2860,28 +2916,71 @@ class TestClientToolCompatVLLM:
         # Request phase echo: the client sees its original ``custom`` tool back.
         assert any(t.type == "custom" for t in response.tools), response.tools
 
-    def test_streaming_rich_client_tool_fails_closed(
+    def test_streaming_custom_tool_restores_lifecycle(
         self, client_tool_compat_client
     ):
-        """Streaming + a rich client tool fails closed with HTTP 400 before any
-        upstream call (SSE restoration is a deliberate follow-up), so a lowered
-        private function name is never streamed un-restored to the client."""
-        with pytest.raises(BadRequestError) as exc_info:
-            client_tool_compat_client.responses.create(
-                model=VLLM_MODEL,
-                input="Apply the patch.",
-                tools=[
-                    {
-                        "type": "custom",
-                        "name": "apply_patch",
-                        "description": "Apply a unified diff.",
-                    }
-                ],
-                stream=True,
-                store=False,
-            )
-        assert exc_info.value.status_code == 400
-        assert "streaming is not supported" in str(exc_info.value)
+        """Issue #1159 (streaming half): a ``custom`` client tool is lowered to a
+        private ``function`` vLLM accepts, and the streamed ``function_call``
+        lifecycle is restored LIVE to a ``custom_tool_call`` by the
+        ``openai_stream_events`` owner — over ``POST /v1/responses`` as one logical
+        SSE lifecycle, with the private lowered name never leaking un-restored."""
+        stream = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            # Force the call so the small CI model is deterministic; the compat
+            # filter lowers this custom selector to a function selector for vLLM,
+            # and openai_stream_events restores the streamed function_call live.
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=False,
+            stream=True,
+            max_output_tokens=256,
+        )
+
+        event_types = []
+        final_response = None
+        for event in stream:
+            event_types.append(event.type)
+            if event.type == "response.completed":
+                final_response = event.response
+
+        # One coherent SSE lifecycle: created first, completed last.
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] == "response.completed", event_types
+        assert final_response is not None, (
+            f"stream must terminate with a response.completed event; got: {event_types}"
+        )
+        assert final_response.status == "completed", final_response
+
+        # The streamed function_call is restored LIVE to a custom_tool_call.
+        output_types = [item.type for item in final_response.output]
+        custom_calls = [
+            item for item in final_response.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            "openai_stream_events must restore the streamed function_call to a "
+            f"custom_tool_call; got output types: {output_types}"
+        )
+        assert custom_calls[0].name == "apply_patch"
+        assert isinstance(custom_calls[0].input, str)
+        # No un-restored private function_call item may leak to the client.
+        assert "function_call" not in output_types, (
+            f"lowered function must not leak on the stream: {output_types}"
+        )
+        # Request-phase echo: the client sees its original ``custom`` tool back.
+        assert any(t.type == "custom" for t in final_response.tools), (
+            final_response.tools
+        )
 
 
 class TestAgenticLoopVLLM:

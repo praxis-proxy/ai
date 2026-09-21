@@ -333,7 +333,6 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
     } = tools.map(build_chat_tools).transpose()?.unwrap_or_default();
     if let Some(tools) = built_tools {
         chat.insert("tools".to_owned(), tools);
-        chat.remove("response_format");
     }
     insert_chat_tool_choice(obj, &mut chat, overrides, has_web_search, has_file_search)?;
 

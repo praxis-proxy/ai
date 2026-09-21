@@ -1255,6 +1255,8 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
+                vec!["responses_client_tool_compat"],
                 vec!["responses_client_tool_compat"],
             ]
         );
@@ -1296,11 +1298,13 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 31);
-        assert_eq!(report.scenarios_total, 31);
-        assert_eq!(report.recordings_total, 36);
+        assert_eq!(report.features_total, 33);
+        assert_eq!(report.scenarios_total, 33);
+        assert_eq!(report.recordings_total, 38);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1324,11 +1328,13 @@ mod tests {
                 "responses/chat-basic-stream",
                 "responses/chat-file-search",
                 "responses/chat-malformed-compaction",
+                "responses/chat-structured-output-with-tools",
                 "responses/chat-tool-echo",
                 "responses/chat-unrepresentable-parameters",
                 "responses/chat-web-search",
                 "responses/chat-web-search-stream",
                 "responses/client-tool-compat",
+                "responses/client-tool-compat-stream",
                 "responses/irr-terminal-streaming",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
@@ -1337,7 +1343,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 31);
+        assert_eq!(manifest.features.len(), 33);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1499,8 +1505,16 @@ mod tests {
                     &vec!["responses/chat-tool-echo".to_owned()]
                 ),
                 (
+                    &"responses.chat.structured_output_with_tools".to_owned(),
+                    &vec!["responses/chat-structured-output-with-tools".to_owned()]
+                ),
+                (
                     &"responses.client_tool_compat.lower_restore".to_owned(),
                     &vec!["responses/client-tool-compat".to_owned()]
+                ),
+                (
+                    &"responses.client_tool_compat.stream_restore".to_owned(),
+                    &vec!["responses/client-tool-compat-stream".to_owned()]
                 ),
             ]
         );

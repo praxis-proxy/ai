@@ -88,11 +88,11 @@ tokio-stream = "0.1.19"
 zeroize = "1.9.0"
 
 # Praxis core dependencies
-praxis-core = { git = "https://github.com/praxis-proxy/praxis", rev = "fa8329ed4c0fd33f9af56d41fa30b9752f4a88d9", package = "praxis-proxy-core" }
-praxis-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "fa8329ed4c0fd33f9af56d41fa30b9752f4a88d9", package = "praxis-proxy-filter", features = ["basic-auth-filter", "chain-binding", "iterative-request-router", "spiffe"] }
-praxis-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "fa8329ed4c0fd33f9af56d41fa30b9752f4a88d9", package = "praxis-proxy-protocol" }
-praxis-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "fa8329ed4c0fd33f9af56d41fa30b9752f4a88d9", package = "praxis-proxy-tls" }
-praxis = { git = "https://github.com/praxis-proxy/praxis", rev = "fa8329ed4c0fd33f9af56d41fa30b9752f4a88d9", package = "praxis-proxy" }
+praxis-core = { version = "0.6.0", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.6.0", package = "praxis-proxy-filter", features = ["basic-auth-filter"] }
+praxis-protocol = { version = "0.6.0", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.6.0", package = "praxis-proxy-tls" }
+praxis = { version = "0.6.0", package = "praxis-proxy" }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer

@@ -42,7 +42,7 @@ mod agentic_mocks;
 mod anthropic_messages;
 mod claude_code;
 mod claude_code_vllm;
-#[cfg(feature = "store-sqlite")]
+mod codex_http;
 mod codex_websocket;
 #[cfg(feature = "store-sqlite")]
 mod conversations_rehydrate;
