@@ -40,7 +40,7 @@ use praxis_core::{
 use praxis_filter::{
     BodyMode, CalloutOutcome, CalloutResponse, ChainBindingContext, FilterEntry, FilterError, FilterPipeline,
     FilterRegistry, FilteredSubrequestExecutor, HttpFilterContext, IterationState, RequestExtensions, StagedUpstream,
-    StagedUpstreamFallback, SubRequest, SubResponse, SubrequestRuntime,
+    StagedUpstreamFallback, StreamingResponseBody, SubRequest, SubResponse, SubrequestRuntime,
 };
 use rmcp::{
     model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage},
@@ -191,10 +191,7 @@ pub(crate) enum TransportSignal {
 /// Build the auto-injected selector chain entry by deserializing through
 /// [`FilterEntry`]'s own path (the exact path operator configs use), so the
 /// entry is always structurally valid and free of conditions.
-#[expect(
-    clippy::expect_used,
-    reason = "static streaming-selector entry YAML is always valid"
-)]
+#[expect(clippy::expect_used, reason = "static streaming-selector entry YAML is always valid")]
 fn streaming_selector_entry() -> FilterEntry {
     serde_yaml::from_str(&format!(
         "filter: {name}",
@@ -274,7 +271,10 @@ pub(crate) fn bind_mcp_outbound_chain(
 
     // A response-body-buffering filter anywhere in the chain defeats streaming.
     // Reject at bind time; this is immune to `skip_pipeline_validation`.
-    if matches!(pipeline.body_capabilities().response_body_mode, BodyMode::StreamBuffer { .. }) {
+    if matches!(
+        pipeline.body_capabilities().response_body_mode,
+        BodyMode::StreamBuffer { .. }
+    ) {
         return Err(FilterError::from(format!(
             "openai_mcp_streaming_selector: outbound_chain '{chain_name}' contains a filter that \
              buffers the response body (StreamBuffer), which is incompatible with SSE streaming"
@@ -503,7 +503,12 @@ impl McpSubrequestClient {
     /// posture decides whether loopback destinations are permitted.
     pub(crate) fn for_tool(callout: McpCallout, step_timeout: Duration, max_result_bytes: usize) -> Self {
         let wire = tool_result_wire_cap(max_result_bytes);
-        Self::with_wire_cap(callout, step_timeout, wire, wire.saturating_add(MAX_CONTROL_RESPONSE_BYTES))
+        Self::with_wire_cap(
+            callout,
+            step_timeout,
+            wire,
+            wire.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+        )
     }
 
     /// Shared constructor: move in the callout and pin the `tools/call` wire
@@ -580,7 +585,10 @@ impl McpSubrequestClient {
         body: Bytes,
         headers: HeaderMap,
         max_response_bytes: usize,
-    ) -> Result<(FilteredSubrequestExecutor, SubRequest, RequestExtensions, Instant), StreamableHttpError<McpTransportError>> {
+    ) -> Result<
+        (FilteredSubrequestExecutor, SubRequest, RequestExtensions, Instant),
+        StreamableHttpError<McpTransportError>,
+    > {
         let deadline = Instant::now()
             .checked_add(self.step_timeout)
             .ok_or(StreamableHttpError::Client(McpTransportError::Setup))?;
@@ -644,8 +652,9 @@ impl McpSubrequestClient {
         headers: HeaderMap,
         max_response_bytes: usize,
     ) -> Result<SubResponse, StreamableHttpError<McpTransportError>> {
-        let (executor, request, extensions, deadline) =
-            self.prepare_staged_request(method, uri, body, headers, max_response_bytes).await?;
+        let (executor, request, extensions, deadline) = self
+            .prepare_staged_request(method, uri, body, headers, max_response_bytes)
+            .await?;
         let outcome = Box::pin(executor.run_classified(&self.callout.pipeline, &request, extensions, deadline))
             .await
             .map_err(|_error| StreamableHttpError::Client(McpTransportError::Transport))?;
@@ -664,61 +673,113 @@ impl McpSubrequestClient {
             _ => Err(StreamableHttpError::Client(McpTransportError::Transport)),
         }
     }
-}
 
-impl StreamableHttpClient for McpSubrequestClient {
-    type Error = McpTransportError;
-
-    #[expect(
-        clippy::too_many_lines,
-        reason = "response classification mirrors the rmcp reference client"
-    )]
-    async fn post_message(
+    /// Build the header map for a POST message, injecting Accept, Content-Type,
+    /// and the optional session-id header.
+    #[expect(clippy::unused_self, reason = "method form matches the refactored post_message call site")]
+    fn build_post_headers(
         &self,
-        uri: Arc<str>,
-        message: ClientJsonRpcMessage,
-        session_id: Option<Arc<str>>,
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
-    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
-        let session_was_attached = session_id.is_some();
+        session_id: Option<&Arc<str>>,
+    ) -> Result<HeaderMap, StreamableHttpError<McpTransportError>> {
         let mut headers = build_request_headers(auth_header, custom_headers)?;
         headers.insert(
             http::header::ACCEPT,
             HeaderValue::from_static("text/event-stream, application/json"),
         );
         headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(session) = &session_id {
+        if let Some(session) = session_id {
             let value = HeaderValue::from_str(session)
                 .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
             headers.insert(session_id_header(), value);
         }
+        Ok(headers)
+    }
 
-        let max_response_bytes = self.response_limit(&message);
-        let body =
-            serde_json::to_vec(&message).map_err(|_error| StreamableHttpError::Client(McpTransportError::Serialize))?;
-        let response =
-            Box::pin(self.execute(Method::POST, &uri, Bytes::from(body), headers, max_response_bytes)).await?;
+    /// Streaming twin of [`execute`]: arms the callout for streaming and returns
+    /// the header response plus the streaming body when praxis selected streaming.
+    ///
+    /// Returns `(response, None)` when the callout was buffered anyway (Blocker 5:
+    /// the full buffered body is preserved on `response.body`), and records a 413
+    /// signal on [`CalloutOutcome::ResponseTooLarge`].
+    #[expect(clippy::large_stack_frames, reason = "rmcp/executor futures are inherently large")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "method/uri/body/headers/limit describe one dial call"
+    )]
+    async fn execute_streaming(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Bytes,
+        headers: HeaderMap,
+        max_response_bytes: usize,
+    ) -> Result<(SubResponse, Option<Box<dyn StreamingResponseBody>>), StreamableHttpError<McpTransportError>> {
+        let (executor, request, mut extensions, deadline) = self
+            .prepare_staged_request(method, uri, body, headers, max_response_bytes)
+            .await?;
+        extensions.insert(McpStreamingRequested);
+        let outcome = Box::pin(executor.run_classified(&self.callout.pipeline, &request, extensions, deadline))
+            .await
+            .map_err(|_error| StreamableHttpError::Client(McpTransportError::Transport))?;
+        match outcome {
+            CalloutOutcome::Response(CalloutResponse::Streaming { response, body }) => Ok((response, Some(body))),
+            CalloutOutcome::Response(CalloutResponse::Buffered(response)) => Ok((response, None)),
+            CalloutOutcome::ResponseTooLarge { actual, limit } => {
+                tracing::debug!(actual = ?actual, limit, "mcp streaming callout response exceeded size limit");
+                self.signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
+                Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+            },
+            _ => Err(StreamableHttpError::Client(McpTransportError::Transport)),
+        }
+    }
 
+    /// Classify a streaming POST response into an rmcp post response.
+    ///
+    /// For the `200 text/event-stream` forward path, the body is moved into the
+    /// SSE adapter and ownership transfers to the returned stream. For every other
+    /// classification (ack, error, buffered JSON), the body is cancelled or drained
+    /// before the result is returned.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "response classification mirrors the rmcp reference client"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "response + budget args match the buffered ladder"
+    )]
+    async fn classify_streaming_post_response(
+        &self,
+        response: SubResponse,
+        mut body: Box<dyn StreamingResponseBody>,
+        session_was_attached: bool,
+        per_event_cap: usize,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
         let status = StatusCode::from_u16(response.status)
             .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
 
         if status == StatusCode::UNAUTHORIZED
             && let Some(header) = www_authenticate(&response.headers)
         {
+            body.cancel().await;
             return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(header)));
         }
         if status == StatusCode::FORBIDDEN
             && let Some(header) = www_authenticate(&response.headers)
         {
+            body.cancel().await;
             return Err(StreamableHttpError::InsufficientScope(InsufficientScopeError::new(
                 header, None,
             )));
         }
         if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
+            body.cancel().await;
             return Ok(StreamableHttpPostResponse::Accepted);
         }
         if status == StatusCode::NOT_FOUND && session_was_attached {
+            body.cancel().await;
             return Err(StreamableHttpError::SessionExpired);
         }
 
@@ -733,48 +794,62 @@ impl StreamableHttpClient for McpSubrequestClient {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
 
-        // A framing-only success for a one-way client message is an ack.
-        if status.is_success()
-            && response.body.is_empty()
-            && matches!(
-                message,
-                ClientJsonRpcMessage::Notification(_)
-                    | ClientJsonRpcMessage::Response(_)
-                    | ClientJsonRpcMessage::Error(_)
-            )
-        {
-            return Ok(StreamableHttpPostResponse::Accepted);
-        }
-
         if !status.is_success() {
-            if content_type.as_deref().is_some_and(is_json_content_type) {
-                let body = String::from_utf8_lossy(&response.body);
-                if let Some(message) = parse_json_rpc_error(&body) {
-                    return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
-                }
-            }
+            // F5: drain (and discard) the streaming body so the transport is not
+            // left holding an open connection, then surface a status error.
+            drain_body(&mut body).await;
             return Err(StreamableHttpError::UnexpectedServerResponse(
                 format!("HTTP {status}").into(),
             ));
         }
 
         match content_type.as_deref() {
-            Some(content_type) if is_event_stream_content_type(content_type) => {
-                match parse_buffered_sse_terminal(&response.body) {
-                    Some(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
-                    None => Err(StreamableHttpError::UnexpectedServerResponse(
-                        "buffered SSE stream contained no JSON-RPC message".into(),
-                    )),
-                }
+            Some(ct) if is_event_stream_content_type(ct) => {
+                let sse = crate::mcp_client::sse_adapter::sse_stream_from_body(
+                    body,
+                    per_event_cap,
+                    per_event_cap, // POST cumulative == per-message ceiling (F3: both from response_limit)
+                    max_sse_event_size,
+                    self.signal_handle(),
+                );
+                Ok(StreamableHttpPostResponse::Sse(sse, session_id_out))
             },
-            Some(content_type) if is_json_content_type(content_type) => {
-                match serde_json::from_slice::<ServerJsonRpcMessage>(&response.body) {
+            Some(ct) if is_json_content_type(ct) => {
+                // A streaming JSON body: buffer it (bounded by the executor cap) and
+                // parse the terminal message.
+                let buffered = collect_body(&mut body).await;
+                match serde_json::from_slice::<ServerJsonRpcMessage>(&buffered) {
                     Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
                     Err(_error) => Ok(StreamableHttpPostResponse::Accepted),
                 }
             },
-            other => Err(StreamableHttpError::UnexpectedContentType(other.map(str::to_owned))),
+            other => {
+                body.cancel().await;
+                Err(StreamableHttpError::UnexpectedContentType(other.map(str::to_owned)))
+            },
         }
+    }
+}
+
+impl StreamableHttpClient for McpSubrequestClient {
+    type Error = McpTransportError;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
+        let session_was_attached = session_id.is_some();
+        let headers = self.build_post_headers(auth_header, custom_headers, session_id.as_ref())?;
+        let max_response_bytes = self.response_limit(&message);
+        let body =
+            serde_json::to_vec(&message).map_err(|_error| StreamableHttpError::Client(McpTransportError::Serialize))?;
+        let response =
+            Box::pin(self.execute(Method::POST, &uri, Bytes::from(body), headers, max_response_bytes)).await?;
+        classify_buffered_post_response(response, &message, session_was_attached)
     }
 
     async fn delete_session(
@@ -818,11 +893,159 @@ impl StreamableHttpClient for McpSubrequestClient {
         // request/response prototype.
         Err(StreamableHttpError::ServerDoesNotSupportSse)
     }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
+        // Only client Requests can produce a streaming SSE result worth forwarding
+        // incrementally. Notifications / responses / errors are one-way; keep them
+        // on the unchanged buffered ack ladder.
+        if !matches!(message, ClientJsonRpcMessage::Request(_)) {
+            return self
+                .post_message(uri, message, session_id, auth_header, custom_headers)
+                .await;
+        }
+
+        let session_was_attached = session_id.is_some();
+        let headers = self.build_post_headers(auth_header, custom_headers, session_id.as_ref())?;
+        let max_response_bytes = self.response_limit(&message);
+        let body =
+            serde_json::to_vec(&message).map_err(|_error| StreamableHttpError::Client(McpTransportError::Serialize))?;
+
+        let (response, maybe_body) = self
+            .execute_streaming(Method::POST, &uri, Bytes::from(body), headers, max_response_bytes)
+            .await?;
+        match maybe_body {
+            // Blocker 5: praxis buffered anyway; classify the full buffered response.
+            None => classify_buffered_post_response(response, &message, session_was_attached),
+            Some(streaming_body) => {
+                self.classify_streaming_post_response(
+                    response,
+                    streaming_body,
+                    session_was_attached,
+                    max_response_bytes,
+                    max_sse_event_size,
+                )
+                .await
+            },
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Classify a fully buffered POST response into an rmcp post response.
+/// Verbatim the ladder previously inlined in `post_message`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "response classification mirrors the rmcp reference client"
+)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "takes ownership to match the buffered execute return and the Blocker-5 fallback"
+)]
+fn classify_buffered_post_response(
+    response: SubResponse,
+    message: &ClientJsonRpcMessage,
+    session_was_attached: bool,
+) -> Result<StreamableHttpPostResponse, StreamableHttpError<McpTransportError>> {
+    let status = StatusCode::from_u16(response.status)
+        .map_err(|_error| StreamableHttpError::Client(McpTransportError::InvalidStatus))?;
+
+    if status == StatusCode::UNAUTHORIZED
+        && let Some(header) = www_authenticate(&response.headers)
+    {
+        return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(header)));
+    }
+    if status == StatusCode::FORBIDDEN
+        && let Some(header) = www_authenticate(&response.headers)
+    {
+        return Err(StreamableHttpError::InsufficientScope(InsufficientScopeError::new(
+            header, None,
+        )));
+    }
+    if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
+        return Ok(StreamableHttpPostResponse::Accepted);
+    }
+    if status == StatusCode::NOT_FOUND && session_was_attached {
+        return Err(StreamableHttpError::SessionExpired);
+    }
+
+    let session_id_out = response
+        .headers
+        .get(session_id_header())
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let content_type = response
+        .headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    // A framing-only success for a one-way client message is an ack.
+    if status.is_success()
+        && response.body.is_empty()
+        && matches!(
+            message,
+            ClientJsonRpcMessage::Notification(_) | ClientJsonRpcMessage::Response(_) | ClientJsonRpcMessage::Error(_)
+        )
+    {
+        return Ok(StreamableHttpPostResponse::Accepted);
+    }
+
+    if !status.is_success() {
+        if content_type.as_deref().is_some_and(is_json_content_type) {
+            let body = String::from_utf8_lossy(&response.body);
+            if let Some(message) = parse_json_rpc_error(&body) {
+                return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
+            }
+        }
+        return Err(StreamableHttpError::UnexpectedServerResponse(
+            format!("HTTP {status}").into(),
+        ));
+    }
+
+    match content_type.as_deref() {
+        Some(content_type) if is_event_stream_content_type(content_type) => {
+            match parse_buffered_sse_terminal(&response.body) {
+                Some(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
+                None => Err(StreamableHttpError::UnexpectedServerResponse(
+                    "buffered SSE stream contained no JSON-RPC message".into(),
+                )),
+            }
+        },
+        Some(content_type) if is_json_content_type(content_type) => {
+            match serde_json::from_slice::<ServerJsonRpcMessage>(&response.body) {
+                Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
+                Err(_error) => Ok(StreamableHttpPostResponse::Accepted),
+            }
+        },
+        other => Err(StreamableHttpError::UnexpectedContentType(other.map(str::to_owned))),
+    }
+}
+
+/// Drain a streaming body to completion, discarding all chunks.
+async fn drain_body(body: &mut Box<dyn StreamingResponseBody>) {
+    while let Ok(Some(_chunk)) = body.next_chunk().await {}
+    body.cancel().await;
+}
+
+/// Collect a streaming body into a single `Bytes` buffer.
+async fn collect_body(body: &mut Box<dyn StreamingResponseBody>) -> Bytes {
+    let mut buf = bytes::BytesMut::new();
+    while let Ok(Some(chunk)) = body.next_chunk().await {
+        buf.extend_from_slice(&chunk);
+    }
+    buf.freeze()
+}
 
 /// Merge caller custom headers and an optional bearer token into a header map.
 ///
@@ -1404,8 +1627,7 @@ mod tests {
 
     #[test]
     fn inline_chain_gets_selector_prepended() {
-        let inline: ChainRef =
-            serde_yaml::from_str("name: my_chain\nfilters:\n  - filter: headers\n").unwrap();
+        let inline: ChainRef = serde_yaml::from_str("name: my_chain\nfilters:\n  - filter: headers\n").unwrap();
         let chain = selector_injected_chain(Some(inline), "unused");
         match chain {
             ChainRef::Inline { filters, .. } => {
@@ -1428,7 +1650,10 @@ mod tests {
 
     #[test]
     fn control_client_caps_are_control_per_event_and_5mib_cumulative() {
-        let client = McpSubrequestClient::control(McpCallout::fabricated(false).expect("fabricated callout"), Duration::from_secs(1));
+        let client = McpSubrequestClient::control(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(1),
+        );
         // per-event GET cap == the client's tool-result wire cap, which for the
         // control client is the 1 MiB control ceiling.
         assert_eq!(client.wire_cap(), MAX_CONTROL_RESPONSE_BYTES);
@@ -1454,5 +1679,100 @@ mod tests {
             client.stream_cumulative_cap(),
             expected_wire + MAX_CONTROL_RESPONSE_BYTES
         );
+    }
+
+    // -- Streaming POST path (Task 6) --
+
+    fn sub_response(status: u16, content_type: Option<&str>, body: &'static [u8]) -> SubResponse {
+        let mut headers = HeaderMap::new();
+        if let Some(ct) = content_type {
+            headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
+        }
+        SubResponse {
+            status,
+            headers,
+            body: Bytes::from_static(body),
+        }
+    }
+
+    fn client() -> McpSubrequestClient {
+        McpSubrequestClient::for_tool(
+            McpCallout::fabricated(false).expect("fabricated callout"),
+            Duration::from_secs(5),
+            1024,
+        )
+    }
+
+    #[tokio::test]
+    async fn streaming_post_forwards_event_stream_as_sse() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body = Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks(
+            [Bytes::from_static(
+                b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            )],
+            Arc::clone(&cancelled),
+        ));
+        let response = sub_response(200, Some("text/event-stream"), b"");
+        let out = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Sse(_, _)));
+        // The body is forwarded to the adapter, not cancelled.
+        assert!(!cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn streaming_post_cancels_body_on_202_ack() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body = Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks(
+            [],
+            Arc::clone(&cancelled),
+        ));
+        let response = sub_response(202, None, b"");
+        let out = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Accepted));
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "non-forward branch cancels the body"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_post_cancels_and_maps_401_to_auth_required() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut response = sub_response(401, None, b"");
+        response.headers.insert(
+            http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"mcp\""),
+        );
+        let body = Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks(
+            [],
+            Arc::clone(&cancelled),
+        ));
+        let err = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StreamableHttpError::AuthRequired(_)));
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn classify_buffered_post_response_parses_json() {
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}
+        }))
+        .unwrap();
+        let response = sub_response(
+            200,
+            Some("application/json"),
+            br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+        );
+        let out = classify_buffered_post_response(response, &message, false).unwrap();
+        assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
     }
 }
