@@ -89,6 +89,18 @@ fn session_id_header() -> HeaderName {
     HeaderName::from_static("mcp-session-id")
 }
 
+/// Request-extension marker that arms the streaming subrequest path.
+///
+/// Inserted into the callout's [`RequestExtensions`] only by the streaming
+/// entry points ([`McpSubrequestClient::execute_streaming`] and the GET-stream
+/// path). The auto-injected [`McpStreamingSelectorFilter`](crate::openai::McpStreamingSelectorFilter)
+/// reads it during `on_request` and, when present, sets the subrequest response
+/// mode to [`SubRequestResponseMode::Streaming`]. Its absence keeps every other
+/// callout (buffered `initialize`/`tools/list`/`tools/call`, DELETE) on the
+/// unchanged buffered ladder.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct McpStreamingRequested;
+
 // -----------------------------------------------------------------------------
 // McpTransportError
 // -----------------------------------------------------------------------------

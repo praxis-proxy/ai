@@ -379,6 +379,10 @@ fn register_mcp_callout_filters(registry: &mut FilterRegistry) {
             }),
         )
         .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_mcp_dispatch'"));
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_mcp_streaming_selector" => praxis_ai_apis::openai::McpStreamingSelectorFilter::from_config
+    );
 }
 
 /// Register OpenAI agentic loop filters.

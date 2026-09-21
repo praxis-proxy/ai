@@ -7,6 +7,7 @@
 //! MCP tool declarations. Designed for reuse by `mcp_tool` (#27)
 //! when `call_tool` support is added.
 
+mod streaming_selector;
 mod subrequest_transport;
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -36,6 +37,7 @@ use rmcp::{
 };
 
 use self::subrequest_transport::MAX_CONTROL_RESPONSE_BYTES;
+pub use self::streaming_selector::McpStreamingSelectorFilter;
 pub(crate) use self::subrequest_transport::{
     McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
 };
