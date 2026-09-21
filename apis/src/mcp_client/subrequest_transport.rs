@@ -38,8 +38,8 @@ use praxis_core::{
     subrequest::{DEPTH_HEADER, SubRequestClient},
 };
 use praxis_filter::{
-    CalloutOutcome, CalloutResponse, ChainBindingContext, FilterEntry, FilterError, FilterPipeline, FilterRegistry,
-    FilteredSubrequestExecutor, HttpFilterContext, IterationState, RequestExtensions, StagedUpstream,
+    BodyMode, CalloutOutcome, CalloutResponse, ChainBindingContext, FilterEntry, FilterError, FilterPipeline,
+    FilterRegistry, FilteredSubrequestExecutor, HttpFilterContext, IterationState, RequestExtensions, StagedUpstream,
     StagedUpstreamFallback, SubRequest, SubResponse, SubrequestRuntime,
 };
 use rmcp::{
@@ -188,6 +188,41 @@ pub(crate) enum TransportSignal {
 // Outbound chain construction
 // -----------------------------------------------------------------------------
 
+/// Build the auto-injected selector chain entry by deserializing through
+/// [`FilterEntry`]'s own path (the exact path operator configs use), so the
+/// entry is always structurally valid and free of conditions.
+#[expect(
+    clippy::expect_used,
+    reason = "static streaming-selector entry YAML is always valid"
+)]
+fn streaming_selector_entry() -> FilterEntry {
+    serde_yaml::from_str(&format!(
+        "filter: {name}",
+        name = super::McpStreamingSelectorFilter::NAME
+    ))
+    .expect("static streaming-selector entry YAML is always valid")
+}
+
+/// Return the outbound chain with the streaming selector guaranteed first.
+///
+/// `None` and inline chains are rewritten with the selector prepended. A named
+/// chain is returned untouched (we cannot mutate a shared named chain); its
+/// structural requirement — the selector must be its first, unconditional
+/// filter — is validated after binding in [`bind_mcp_outbound_chain`].
+fn selector_injected_chain(outbound_chain: Option<ChainRef>, chain_name: &str) -> ChainRef {
+    match outbound_chain {
+        None => ChainRef::Inline {
+            name: chain_name.to_owned(),
+            filters: vec![streaming_selector_entry()],
+        },
+        Some(ChainRef::Inline { name, mut filters }) => {
+            filters.insert(0, streaming_selector_entry());
+            ChainRef::Inline { name, filters }
+        },
+        Some(named @ ChainRef::Named(_)) => named,
+    }
+}
+
 /// Resolve a chain-binding MCP filter's configured `outbound_chain` into a bound
 /// outbound [`FilterPipeline`].
 ///
@@ -216,14 +251,36 @@ pub(crate) fn bind_mcp_outbound_chain(
     ctx: &ChainBindingContext<'_>,
     chain_name: &str,
 ) -> Result<Arc<FilterPipeline>, FilterError> {
-    let chain_ref = match outbound_chain {
-        None => ChainRef::Inline {
-            name: chain_name.to_owned(),
-            filters: Vec::new(),
-        },
-        Some(chain_ref) => chain_ref,
-    };
+    let is_named = matches!(outbound_chain, Some(ChainRef::Named(_)));
+    let chain_ref = selector_injected_chain(outbound_chain, chain_name);
     let pipeline = ctx.bind_chain(&chain_ref)?;
+
+    // A named chain is bound verbatim; require the selector to be its first,
+    // unconditional filter. Match on the resolved filter *type* name (not a
+    // user-assigned label) and reject conditions that could skip it.
+    if is_named {
+        let snapshot = pipeline.introspection();
+        let ok = snapshot
+            .first()
+            .is_some_and(|f| f.filter == super::McpStreamingSelectorFilter::NAME && f.conditions.is_empty());
+        if !ok {
+            return Err(FilterError::from(format!(
+                "openai_mcp_streaming_selector: named outbound_chain '{chain_name}' must list \
+                 '{name}' as its first, unconditional filter to support SSE streaming",
+                name = super::McpStreamingSelectorFilter::NAME
+            )));
+        }
+    }
+
+    // A response-body-buffering filter anywhere in the chain defeats streaming.
+    // Reject at bind time; this is immune to `skip_pipeline_validation`.
+    if matches!(pipeline.body_capabilities().response_body_mode, BodyMode::StreamBuffer { .. }) {
+        return Err(FilterError::from(format!(
+            "openai_mcp_streaming_selector: outbound_chain '{chain_name}' contains a filter that \
+             buffers the response body (StreamBuffer), which is incompatible with SSE streaming"
+        )));
+    }
+
     Ok(Arc::new(pipeline))
 }
 
@@ -1269,5 +1326,50 @@ mod tests {
         assert!(parse_json_rpc_error(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"x"}}"#).is_some());
         assert!(parse_json_rpc_error(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).is_none());
         assert!(parse_json_rpc_error("not json").is_none());
+    }
+
+    // -- Streaming selector auto-injection -------------------------------------
+
+    #[test]
+    fn selector_entry_names_the_selector_with_no_conditions() {
+        let entry = streaming_selector_entry();
+        assert_eq!(entry.filter_type, "openai_mcp_streaming_selector");
+        assert!(entry.conditions.is_empty());
+        assert!(entry.name.is_none());
+    }
+
+    #[test]
+    fn none_chain_becomes_inline_with_selector_first() {
+        let chain = selector_injected_chain(None, "mcp_outbound");
+        match chain {
+            ChainRef::Inline { name, filters } => {
+                assert_eq!(name, "mcp_outbound");
+                assert_eq!(filters.len(), 1);
+                assert_eq!(filters[0].filter_type, "openai_mcp_streaming_selector");
+            },
+            other @ ChainRef::Named(_) => panic!("expected inline chain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inline_chain_gets_selector_prepended() {
+        let inline: ChainRef =
+            serde_yaml::from_str("name: my_chain\nfilters:\n  - filter: headers\n").unwrap();
+        let chain = selector_injected_chain(Some(inline), "unused");
+        match chain {
+            ChainRef::Inline { filters, .. } => {
+                assert_eq!(filters.len(), 2);
+                assert_eq!(filters[0].filter_type, "openai_mcp_streaming_selector");
+                assert_eq!(filters[1].filter_type, "headers");
+            },
+            other @ ChainRef::Named(_) => panic!("expected inline chain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_chain_is_returned_unchanged() {
+        let named = ChainRef::Named("shared".to_owned());
+        let chain = selector_injected_chain(Some(named), "unused");
+        assert!(matches!(chain, ChainRef::Named(n) if n == "shared"));
     }
 }
