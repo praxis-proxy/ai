@@ -23,6 +23,7 @@ pub mod openai;
 pub mod operation;
 pub mod promotion;
 mod callout_credentials;
+mod callout_identity;
 mod state_owner;
 mod state_owner_headers;
 #[cfg(feature = "store")]
