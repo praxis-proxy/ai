@@ -465,8 +465,7 @@ impl McpToolResolveFilter {
         let label = server_label(entry);
         let is_connector = entry.get("connector_id").is_some();
         if can_reuse_cached_listing(entry, is_connector)
-            && let Some(cached) =
-                find_cached_listing(previous_tools, label, server_url, cache_allowed_names, is_connector)
+            && let Some(cached) = find_cached_listing(previous_tools, label, server_url, cache_allowed_names)
         {
             // Cache hit: no dial is made, so validate the target here to preserve
             // the SSRF-rejection invariant. A cache miss instead validates during
@@ -2725,22 +2724,13 @@ impl AllowedTools {
 }
 
 /// Check `previous_tools` for a cached listing matching
-/// `server_label` and `server_url`.
+/// `server_label` and the exact `server_url`.
 ///
-/// When the cached entry has `server_url`, both label and
-/// URL must match. When the cached entry lacks `server_url`
-/// (real `mcp_list_tools` output items from the API omit
-/// it), label-only matching is used.
-///
-/// # Safety of label-only matching
-///
-/// Real `mcp_list_tools` items in the API response carry
-/// `server_label` and `tools` but not `server_url`.
-/// Label-only matching is safe because:
-///
-/// 1. Tool dispatch uses the current request's `server_url`, so stale tools fail safely at call time.
-/// 2. When the cached entry _does_ carry `server_url` (e.g. enriched by a future storage layer), exact URL matching
-///    applies automatically.
+/// A listing without `server_url` has no target identity and
+/// must not be reused. API `mcp_list_tools` items may omit the
+/// URL, so those legacy listings cause a fresh `tools/list`
+/// request instead of attaching their definitions to the current
+/// destination.
 ///
 /// Requires `allowed_tools` to be `Some` and verifies the
 /// cache covers all named tools. Returns `None` for
@@ -2751,18 +2741,13 @@ fn find_cached_listing(
     label: &str,
     server_url: &str,
     allowed_tools: Option<&[String]>,
-    require_url_match: bool,
 ) -> Option<Vec<serde_json::Value>> {
     let previous = previous_tools?;
     let allowed = allowed_tools?;
 
     let entry = previous.iter().find(|pt| {
-        let label_matches = pt.get("server_label").and_then(serde_json::Value::as_str) == Some(label);
-        let url_ok = match pt.get("server_url").and_then(serde_json::Value::as_str) {
-            Some(cached_url) => cached_url == server_url,
-            None => !require_url_match,
-        };
-        label_matches && url_ok
+        pt.get("server_label").and_then(serde_json::Value::as_str) == Some(label)
+            && pt.get("server_url").and_then(serde_json::Value::as_str) == Some(server_url)
     })?;
 
     let cached_tools = entry.get("tools").and_then(serde_json::Value::as_array)?;

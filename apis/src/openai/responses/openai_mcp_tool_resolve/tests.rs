@@ -173,7 +173,7 @@ fn cache_hit_when_all_allowed_tools_present() {
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, Some(&allowed), false);
+    let result = find_cached_listing(Some(&previous), "weather", url, Some(&allowed));
     assert!(result.is_some(), "should hit cache");
     assert_eq!(result.unwrap().len(), 2, "should return full cached listing");
 }
@@ -188,7 +188,7 @@ fn cache_miss_when_allowed_tool_not_in_cache() {
     })];
     let allowed = vec!["unknown_tool".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, Some(&allowed), false);
+    let result = find_cached_listing(Some(&previous), "weather", url, Some(&allowed));
     assert!(result.is_none(), "should miss cache for unknown tool");
 }
 
@@ -201,7 +201,7 @@ fn cache_miss_when_unrestricted_allowed_tools() {
         "tools": [{"name": "get_weather"}, {"name": "get_forecast"}]
     })];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, None, false);
+    let result = find_cached_listing(Some(&previous), "weather", url, None);
     assert!(
         result.is_none(),
         "unrestricted entries must miss to avoid reusing partial listings"
@@ -217,7 +217,7 @@ fn cache_miss_when_unrestricted_widens_narrow_cached_listing() {
         "tools": [{"name": "get_weather"}]
     })];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, None, false);
+    let result = find_cached_listing(Some(&previous), "weather", url, None);
     assert!(
         result.is_none(),
         "unrestricted must miss when cached listing is a narrow subset"
@@ -234,14 +234,14 @@ fn cache_miss_when_wrong_server_label() {
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "calendar", url, Some(&allowed), false);
+    let result = find_cached_listing(Some(&previous), "calendar", url, Some(&allowed));
     assert!(result.is_none(), "should miss cache for different server");
 }
 
 #[test]
 fn cache_miss_when_no_previous_tools() {
     let allowed = vec!["get_weather".to_owned()];
-    let result = find_cached_listing(None, "weather", "http://10.0.0.5/mcp", Some(&allowed), false);
+    let result = find_cached_listing(None, "weather", "http://10.0.0.5/mcp", Some(&allowed));
     assert!(result.is_none(), "should miss when no previous_tools");
 }
 
@@ -254,13 +254,7 @@ fn cache_miss_when_server_url_changed() {
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(
-        Some(&previous),
-        "weather",
-        "http://10.0.0.99/mcp",
-        Some(&allowed),
-        false,
-    );
+    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.99/mcp", Some(&allowed));
     assert!(
         result.is_none(),
         "should miss cache when server_url differs from cached entry"
@@ -277,7 +271,7 @@ fn cache_miss_when_continuation_changes_allowed_tools() {
     })];
     let new_allowed = vec!["get_forecast".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, Some(&new_allowed), false);
+    let result = find_cached_listing(Some(&previous), "weather", url, Some(&new_allowed));
     assert!(
         result.is_none(),
         "cache should miss when continuation requests a tool not in the cached listing"
@@ -301,7 +295,6 @@ fn cache_miss_for_connector_when_cached_entry_lacks_server_url() {
         "drive",
         "https://drive.example.com/mcp",
         Some(&allowed),
-        true,
     );
     assert!(
         result.is_none(),
@@ -319,22 +312,22 @@ fn cache_hit_for_connector_when_cached_entry_has_matching_url() {
     })];
     let allowed = vec!["search".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "drive", url, Some(&allowed), true);
+    let result = find_cached_listing(Some(&previous), "drive", url, Some(&allowed));
     assert!(result.is_some(), "exact URL match should hit cache");
 }
 
 #[test]
-fn cache_hit_for_direct_url_label_only_still_works() {
+fn cache_miss_for_direct_url_when_cached_entry_lacks_server_url() {
     let previous = vec![serde_json::json!({
         "server_label": "weather",
         "tools": [{"name": "get_weather"}]
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.5/mcp", Some(&allowed), false);
+    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.5/mcp", Some(&allowed));
     assert!(
-        result.is_some(),
-        "direct URL entries should still use label-only matching"
+        result.is_none(),
+        "a direct URL must not reuse a listing without target identity"
     );
 }
 
@@ -867,17 +860,17 @@ fn extract_allowed_tools_unrestricted_when_absent() {
 // =========================================================================
 
 #[test]
-fn cache_hit_when_cached_entry_has_no_server_url() {
+fn cache_miss_when_cached_entry_lacks_target_identity() {
     let previous = vec![serde_json::json!({
         "server_label": "weather",
         "tools": [{"name": "get_weather"}]
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.5/mcp", Some(&allowed), false);
+    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.5/mcp", Some(&allowed));
     assert!(
-        result.is_some(),
-        "real mcp_list_tools items lack server_url; label-only match"
+        result.is_none(),
+        "a listing without its original URL must not be reused"
     );
 }
 
@@ -890,13 +883,7 @@ fn cache_miss_when_same_label_different_server_url() {
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(
-        Some(&previous),
-        "weather",
-        "http://10.0.0.99/mcp",
-        Some(&allowed),
-        false,
-    );
+    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.99/mcp", Some(&allowed));
     assert!(
         result.is_none(),
         "different server_url with same label should not match"

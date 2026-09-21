@@ -5,9 +5,9 @@
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, free_port, http_get, http_send, json_post,
-    parse_body, parse_status, start_backend_with_shutdown, start_echo_backend, start_mcp_mock_server_with_config,
-    start_proxy,
+    Backend, McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, free_port, http_get, http_send,
+    json_post, parse_body, parse_status, start_backend_with_shutdown, start_echo_backend,
+    start_mcp_mock_server_with_config, start_proxy,
 };
 
 // =============================================================================
@@ -820,6 +820,56 @@ fn mcp_tools_list_succeeds_against_mock_server() {
     assert!(
         mcp_server.method_count("tools/list") >= 1,
         "should have called tools/list on MCP server"
+    );
+}
+
+#[test]
+fn changed_direct_url_does_not_reuse_unbound_cached_tools() {
+    let old_mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("shared_tool")],
+        ..McpMockConfig::default()
+    });
+    let new_mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("fresh_tool")],
+        ..McpMockConfig::default()
+    });
+    let backend = Backend::fixed(
+        r#"{"id":"resp_previous","created_at":1000,"model":"gpt-4.1","status":"completed","output":[{"type":"mcp_list_tools","server_label":"weather","tools":[{"name":"shared_tool"}]}]}"#,
+    )
+    .header("content-type", "application/json")
+    .start_with_shutdown();
+    let db = TempSqlite::new("mcp_cache_target_identity");
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_store_stream_events_after_resolve(proxy_port, backend.port(), db.url(), 500);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+
+    let old_url = format!("http://127.0.0.1:{}/mcp", old_mcp.port());
+    let first_body = format!(
+        r#"{{"model":"gpt-4.1","input":"first","tools":[{{"type":"mcp","server_label":"weather","server_url":"{old_url}","allowed_tools":["shared_tool"]}}]}}"#
+    );
+    let first = http_send(proxy.addr(), &json_post("/v1/responses", &first_body));
+    assert_eq!(parse_status(&first), 200, "first request should persist the listing");
+    assert!(
+        old_mcp.method_count("tools/list") >= 1,
+        "first direct URL should be resolved"
+    );
+
+    let new_url = format!("http://127.0.0.1:{}/mcp", new_mcp.port());
+    let continuation_body = format!(
+        r#"{{"model":"gpt-4.1","input":"continue","previous_response_id":"resp_previous","tools":[{{"type":"mcp","server_label":"weather","server_url":"{new_url}","allowed_tools":["shared_tool"]}}]}}"#
+    );
+    let continuation = http_send(proxy.addr(), &json_post("/v1/responses", &continuation_body));
+
+    assert_eq!(
+        parse_status(&continuation),
+        200,
+        "continuation should reach the backend"
+    );
+    assert!(
+        new_mcp.method_count("tools/list") >= 1,
+        "changed direct URL must fetch its own listing rather than reuse an unbound cache entry"
     );
 }
 
