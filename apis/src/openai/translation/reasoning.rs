@@ -9,7 +9,17 @@ use serde_json::{Map, Value, json};
 use super::chat_completions::{TranslationError, json_type_name};
 
 /// Maximum size limit for raw reasoning.
-pub(crate) const DEFAULT_MAX_REASONING_BYTES: usize = 65_536;
+const DEFAULT_MAX_REASONING_BYTES: usize = 65_536;
+
+/// Default opening marker wrapping replayed prior-turn reasoning inlined into an
+/// assistant message's content.
+const DEFAULT_THINK_OPEN: &str = "<think>";
+
+/// Default closing marker for inlined replayed reasoning.
+const DEFAULT_THINK_CLOSE: &str = "</think>";
+
+/// The reasoning item content part type carrying raw chain-of-thought.
+const REASONING_TEXT_PART_TYPE: &str = "reasoning_text";
 
 /// Backend specific named reasoning dialect.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -41,13 +51,17 @@ impl ReasoningDialect {
 }
 
 /// Resolved backend-specific reasoning configuration.
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub(crate) struct ReasoningOptions {
     /// Selected backend reasoning contract.
     pub(crate) dialect: ReasoningDialect,
     /// Maximum raw reasoning size preserved per response.
     pub(crate) max_reasoning_bytes: usize,
+    /// Opening marker for inlined replayed reasoning. Defaults to `<think>`.
+    pub(crate) think_open: String,
+    /// Closing marker for inlined replayed reasoning. Defaults to `</think>`.
+    pub(crate) think_close: String,
 }
 
 impl Default for ReasoningOptions {
@@ -55,6 +69,71 @@ impl Default for ReasoningOptions {
         Self {
             dialect: ReasoningDialect::None,
             max_reasoning_bytes: DEFAULT_MAX_REASONING_BYTES,
+            think_open: DEFAULT_THINK_OPEN.to_owned(),
+            think_close: DEFAULT_THINK_CLOSE.to_owned(),
+        }
+    }
+}
+
+/// Prior-turn reasoning buffered for inline replay onto the assistant turn it
+/// precedes, paired with the dialect options that govern extraction and framing.
+pub(crate) struct ReplayBuffer<'a> {
+    /// Raw chain-of-thought awaiting an assistant turn, if any.
+    pending: Option<String>,
+    /// Dialect options governing extraction, the byte ceiling, and think markers.
+    options: &'a ReasoningOptions,
+}
+
+impl<'a> ReplayBuffer<'a> {
+    /// Create an empty buffer bound to the active reasoning options.
+    pub(crate) fn new(options: &'a ReasoningOptions) -> Self {
+        Self { pending: None, options }
+    }
+
+    /// Preserve reasoning-only output as an assistant turn at input boundaries.
+    pub(crate) fn flush_standalone(&mut self, messages: &mut Vec<Value>) -> Result<(), TranslationError> {
+        if self.pending.is_some() {
+            let content = self.take_inline(Value::Null)?;
+            messages.push(json!({"role": "assistant", "content": content}));
+        }
+        Ok(())
+    }
+
+    /// Buffer a rehydrated reasoning item's raw text for replay onto the assistant
+    /// turn it precedes, concatenating consecutive reasoning items.
+    pub(crate) fn buffer(&mut self, obj: &Map<String, Value>) -> Result<(), TranslationError> {
+        let text = reasoning_input_text(obj, self.options)?;
+        match &mut self.pending {
+            Some(existing) => {
+                // Each item is bounded individually, but consecutive items
+                // concatenate (with a newline separator), so the running total
+                // must still respect the ceiling.
+                let total = existing.len().saturating_add(1).saturating_add(text.len());
+                enforce_reasoning_limit(total, self.options.max_reasoning_bytes)?;
+                existing.push('\n');
+                existing.push_str(&text);
+            },
+            None => self.pending = Some(text),
+        }
+        Ok(())
+    }
+
+    /// Fold buffered prior-turn reasoning into assistant content using the
+    /// dialect's think markers, returning the content unchanged when nothing is
+    /// buffered.
+    pub(crate) fn take_inline(&mut self, content: Value) -> Result<Value, TranslationError> {
+        let Some(text) = self.pending.take() else {
+            return Ok(content);
+        };
+        let block = format!("{}{}{}", self.options.think_open, text, self.options.think_close);
+        match content {
+            Value::Null => Ok(Value::String(block)),
+            Value::String(existing) => Ok(Value::String(format!("{block}{existing}"))),
+            Value::Array(mut parts) => {
+                parts.insert(0, json!({"type": "text", "text": block}));
+                Ok(Value::Array(parts))
+            },
+            _ => Err(TranslationError::InvalidMessageContent),
         }
     }
 }
@@ -128,12 +207,7 @@ pub(crate) fn extract_reasoning_item(
     let Some(text) = resolve_raw_reasoning(message, options.dialect)? else {
         return Ok(None);
     };
-    if text.len() > options.max_reasoning_bytes {
-        return Err(TranslationError::ReasoningTooLarge {
-            bytes: text.len(),
-            max_bytes: options.max_reasoning_bytes,
-        });
-    }
+    enforce_reasoning_limit(text.len(), options.max_reasoning_bytes)?;
     Ok(Some(reasoning_item(reasoning_item_id, status, text)))
 }
 
@@ -147,6 +221,64 @@ pub(crate) fn message_has_reasoning(
         return Ok(false);
     };
     Ok(resolve_raw_reasoning(message, options.dialect)?.is_some())
+}
+
+/// Extract replayable raw reasoning text from a `Responses` reasoning item.
+fn reasoning_input_text(item: &Map<String, Value>, options: &ReasoningOptions) -> Result<String, TranslationError> {
+    if !options.dialect.is_enabled() {
+        return Err(TranslationError::UnsupportedReasoningInput(
+            "a reasoning dialect must be configured",
+        ));
+    }
+    if item.get("encrypted_content").is_some_and(|value| !value.is_null()) {
+        return Err(TranslationError::UnsupportedReasoningInput(
+            "encrypted_content cannot be replayed",
+        ));
+    }
+    let parts = item
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or(TranslationError::UnsupportedReasoningInput(
+            "content must contain raw reasoning_text parts",
+        ))?;
+    let text = concat_reasoning_text_parts(parts, options.max_reasoning_bytes)?;
+    if text.is_empty() {
+        return Err(TranslationError::UnsupportedReasoningInput(
+            "content must contain non-empty raw reasoning text",
+        ));
+    }
+    Ok(text)
+}
+
+/// Validate and concatenate raw reasoning parts within the configured byte limit.
+fn concat_reasoning_text_parts(parts: &[Value], max_bytes: usize) -> Result<String, TranslationError> {
+    let mut text = String::new();
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) != Some(REASONING_TEXT_PART_TYPE) {
+            return Err(TranslationError::UnsupportedReasoningInput(
+                "content must contain only reasoning_text parts",
+            ));
+        }
+        let chunk = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+            TranslationError::MalformedReasoningInput(
+                json_type_name(part.get("text").unwrap_or(&Value::Null)).to_owned(),
+            )
+        })?;
+        enforce_reasoning_limit(text.len().saturating_add(chunk.len()), max_bytes)?;
+        text.push_str(chunk);
+    }
+    Ok(text)
+}
+
+/// Fail closed when a raw reasoning byte count exceeds the configured ceiling.
+fn enforce_reasoning_limit(bytes: usize, max_reasoning_bytes: usize) -> Result<(), TranslationError> {
+    if bytes > max_reasoning_bytes {
+        return Err(TranslationError::ReasoningTooLarge {
+            bytes,
+            max_bytes: max_reasoning_bytes,
+        });
+    }
+    Ok(())
 }
 
 /// Resolve raw reasoning text from a Chat Completions message for a dialect.
@@ -188,7 +320,7 @@ fn reasoning_item(id: String, status: &str, text: &str) -> Value {
         "status": status,
         "summary": [],
         "content": [{
-            "type": "reasoning_text",
+            "type": REASONING_TEXT_PART_TYPE,
             "text": text
         }]
     })

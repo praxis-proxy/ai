@@ -81,7 +81,7 @@ fn reasoning_dialect_promotes_raw_reasoning_to_a_reasoning_item() {
 }
 
 #[test]
-fn reasoning_only_completion_is_returned_as_a_reasoning_item() {
+fn reasoning_only_completion_survives_stored_continuation() {
     // A completed choice whose only output is raw reasoning (content null) must
     // translate into a reasoning output item, not be rejected as empty.
     let chat_response = serde_json::json!({
@@ -99,7 +99,9 @@ fn reasoning_only_completion_is_returned_as_a_reasoning_item() {
         }],
         "usage": {"prompt_tokens": 10, "completion_tokens": 6, "total_tokens": 16}
     });
-    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
+    let backend =
+        StatefulCapturingBackend::new(vec![(200, chat_response.to_string()), (200, chat_response.to_string())])
+            .start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_test_config(
         "reasoning_only_completion",
@@ -112,7 +114,7 @@ fn reasoning_only_completion_is_returned_as_a_reasoning_item() {
         "input": "Think about 2+2 but do not answer.",
         "reasoning": {"effort": "medium"},
         "stream": false,
-        "store": false
+        "store": true
     });
 
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
@@ -132,6 +134,89 @@ fn reasoning_only_completion_is_returned_as_a_reasoning_item() {
         output[0]["summary"],
         serde_json::json!([]),
         "raw reasoning must never leak into the summary array"
+    );
+    let continuation = serde_json::json!({
+        "model": "deepseek-r1",
+        "previous_response_id": response["id"],
+        "input": "Now answer.",
+        "store": false,
+        "stream": false
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &continuation.to_string()));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "stored reasoning-only continuation should succeed"
+    );
+    let captured = backend.requests();
+    assert_eq!(captured.len(), 2);
+    let forwarded: serde_json::Value = serde_json::from_str(&captured[1].body).unwrap();
+    assert_eq!(
+        forwarded["messages"][1],
+        serde_json::json!({
+            "role": "assistant", "content": "<think>The user only wants me to think.</think>"
+        })
+    );
+    assert_eq!(
+        forwarded["messages"][2],
+        serde_json::json!({"role": "user", "content": "Now answer."})
+    );
+}
+
+#[test]
+fn rehydrated_reasoning_item_is_replayed_inline_into_the_assistant_turn() {
+    // On a continuation the client echoes a prior reasoning item ahead of the
+    // assistant turn it produced.
+    let chat_response = serde_json::json!({
+        "id": "chatcmpl_replay",
+        "object": "chat.completion",
+        "model": "deepseek-r1",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "42", "reasoning": "It is the answer."},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let (config, _db) = load_test_config(
+        "reasoning_replay_inline",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "deepseek-r1",
+        "input": [
+            {"role": "user", "content": "Pick a number and remember it."},
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "I picked 42."}]},
+            {"role": "assistant", "content": "Done."},
+            {"role": "user", "content": "What number did you pick?"}
+        ],
+        "stream": false,
+        "store": false
+    });
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+    assert_eq!(parse_status(&raw), 200);
+
+    let captured = backend.requests();
+    let forwarded: serde_json::Value =
+        serde_json::from_str(&captured[0].body).expect("forwarded chat request should be JSON");
+    let messages = forwarded["messages"].as_array().expect("messages should be an array");
+    let assistant = messages
+        .iter()
+        .find(|m| m["role"] == "assistant")
+        .expect("the assistant turn should be forwarded");
+    assert_eq!(
+        assistant["content"], "<think>I picked 42.</think>Done.",
+        "rehydrated reasoning must be replayed inline in the assistant turn"
+    );
+    // The raw chain-of-thought must never surface as a separate top-level field.
+    assert!(
+        assistant.get("reasoning").is_none(),
+        "replayed reasoning must not be forwarded as a separate reasoning field"
     );
 }
 

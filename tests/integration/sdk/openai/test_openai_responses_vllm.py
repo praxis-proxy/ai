@@ -258,6 +258,33 @@ def _write_reasoning_config(praxis_port: int, db_path: str) -> str:
     return path
 
 
+def _write_reasoning_backend_config(
+    praxis_port: int,
+    db_path: str,
+    backend_port: int,
+    dialect: str = "vllm",
+) -> str:
+    """Patch the reasoning example to target a specific Chat backend port.
+
+    Identical to :func:`_write_reasoning_config` except the ``127.0.0.1:3001``
+    backend is pointed at ``backend_port`` (a capturing mock) so a test can
+    observe the exact Chat Completions request body the backend receives after
+    the proxy inlines replayed reasoning.
+    """
+    with open(REASONING_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
+    config = config.replace("dialect: vllm", f"dialect: {dialect}")
+    config = _patch_store_backend(config, db_path)
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
 def _write_compact_config(
     praxis_port: int,
     db_path: str,
@@ -549,6 +576,58 @@ class CompactionHandler(BaseHTTPRequestHandler):
                         },
                     }
                 ],
+            }
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class ChatCaptureHandler(BaseHTTPRequestHandler):
+    """Capturing mock Chat Completions backend for reasoning-replay tests.
+
+    Records each request body and returns a fixed, properly framed completion
+    so a test can assert on exactly what the proxy forwards upstream without
+    depending on live vLLM or model output.
+    """
+
+    captured_bodies: ClassVar[list[dict]] = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b""
+        if body:
+            try:
+                type(self).captured_bodies.append(json.loads(body))
+            except json.JSONDecodeError:
+                pass
+        payload = json.dumps(
+            {
+                "id": "chatcmpl_reasoning_capture",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": VLLM_MODEL,
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning": "I picked 42.",
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 1,
+                    "total_tokens": 13,
+                },
             }
         ).encode()
         self.send_response(200)
@@ -992,6 +1071,72 @@ def _witness_proxy_session(tmp_path_factory, request):
 def witness_backend_client(tmp_path_factory, request):
     """Function-scoped witness proxy with the stock rehydrate config."""
     yield from _witness_proxy_session(tmp_path_factory, request)
+
+
+def _reasoning_capture_session(tmp_path_factory, request):
+    """Start the reasoning example with a capturing mock Chat backend.
+
+    Yields ``(client, captured_bodies)`` where ``captured_bodies`` accumulates
+    the Chat Completions request bodies the backend receives. A mock backend
+    (rather than live vLLM) keeps the assertion deterministic and independent of
+    model output: the test only cares how the proxy inlines a replayed reasoning
+    item into the assistant turn it forwards upstream.
+    """
+    ChatCaptureHandler.captured_bodies = []
+    captured = ChatCaptureHandler.captured_bodies
+    backend_port = _free_port()
+    server = HTTPServer(("127.0.0.1", backend_port), ChatCaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-reasoning-capture")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_reasoning_backend_config(
+        port, db_path, backend_port, getattr(request, "param", "vllm"),
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        client = OpenAI(
+            base_url=f"http://127.0.0.1:{port}/v1",
+            api_key="test",
+            max_retries=0,
+            timeout=300,
+        )
+        yield client, captured
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        server.shutdown()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Reasoning capture Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture()
+def reasoning_capture_client(tmp_path_factory, request):
+    """Function-scoped reasoning proxy with a capturing mock Chat backend."""
+    yield from _reasoning_capture_session(tmp_path_factory, request)
 
 
 @pytest.fixture(scope="session")
@@ -1990,7 +2135,7 @@ class TestResponsesReasoningVLLM:
             input="What is 2+2? Think briefly, then answer.",
             reasoning={"effort": "low"},
             temperature=0,
-            store=False,
+            store=True,
             max_output_tokens=256,
         )
 
@@ -2007,6 +2152,105 @@ class TestResponsesReasoningVLLM:
             assert item.content, "reasoning item must carry content"
             assert item.content[0].type == "reasoning_text"
             assert item.content[0].text
+
+        continuation = reasoning_client.responses.create(
+            model=VLLM_MODEL, previous_response_id=response.id,
+            input="Now give the answer briefly.",
+            temperature=0, store=False, max_output_tokens=128,
+        )
+        assert continuation.status in ("completed", "incomplete"), continuation.status
+        assert continuation.output, "stored reasoning continuation must produce output"
+
+    def test_replayed_reasoning_item_is_inlined_into_the_assistant_turn(
+        self, reasoning_capture_client,
+    ):
+        """A rehydrated reasoning item is folded back into its assistant turn."""
+        client, forwarded = reasoning_capture_client
+
+        before = len(forwarded)
+        response = client.responses.create(
+            model=VLLM_MODEL,
+            input=[
+                {"role": "user", "content": "Pick a number and remember it."},
+                {
+                    "type": "reasoning",
+                    "content": [
+                        {"type": "reasoning_text", "text": "I picked 42."}
+                    ],
+                },
+                {"role": "assistant", "content": "Done."},
+                {"role": "user", "content": "What number did you pick? /no_think"},
+            ],
+            temperature=0,
+            store=False,
+            max_output_tokens=64,
+        )
+        assert response.status in ("completed", "incomplete"), response.status
+
+        seen = forwarded[before:]
+        assert seen, "backend received no request"
+        messages = seen[-1].get("messages")
+        assert isinstance(messages, list), seen[-1]
+        assistant = next(
+            (m for m in messages if m.get("role") == "assistant"), None
+        )
+        assert assistant is not None, messages
+        assert assistant.get("content") == "<think>I picked 42.</think>Done.", (
+            "the replayed reasoning must be inlined into the assistant turn's "
+            f"content wrapped in the think markers; got: {assistant!r}"
+        )
+        assert "reasoning" not in assistant, (
+            "replayed reasoning must not be forwarded as a separate field; "
+            f"got: {assistant!r}"
+        )
+
+    def test_reasoning_only_stored_continuation(self, reasoning_capture_client):
+        client, forwarded = reasoning_capture_client
+        first = client.responses.create(
+            model=VLLM_MODEL, input="Pick a number.", store=True, stream=False,
+        )
+        assert len(first.output) == 1
+        assert first.output[0].type == "reasoning"
+        client.responses.create(
+            model=VLLM_MODEL, previous_response_id=first.id,
+            input="Now answer.", store=False, stream=False,
+        )
+        assert len(forwarded) == 2
+        assert forwarded[1]["messages"] == [
+            {"role": "user", "content": "Pick a number."},
+            {"role": "assistant", "content": "<think>I picked 42.</think>"},
+            {"role": "user", "content": "Now answer."},
+        ]
+
+    @pytest.mark.parametrize("item", [
+        {"type": "reasoning", "encrypted_content": "opaque", "summary": []},
+        {"type": "reasoning", "summary": []},
+        {"type": "reasoning", "content": "invalid"},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": None}]},
+    ])
+    def test_unreplayable_reasoning_rejected(self, reasoning_capture_client, item):
+        client, forwarded = reasoning_capture_client
+        with pytest.raises(BadRequestError, match="reasoning input item"):
+            client.responses.create(
+                model=VLLM_MODEL,
+                input=[item, {"role": "user", "content": "Continue."}],
+                store=False, stream=False,
+            )
+        assert not forwarded, "unreplayable reasoning must fail before forwarding"
+
+    @pytest.mark.parametrize("reasoning_capture_client", ["none"], indirect=True)
+    def test_reasoning_requires_dialect(self, reasoning_capture_client):
+        client, forwarded = reasoning_capture_client
+        with pytest.raises(BadRequestError, match="a reasoning dialect must be configured"):
+            client.responses.create(
+                model=VLLM_MODEL,
+                input=[{
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "I picked 42."}],
+                }],
+                store=False, stream=False,
+            )
+        assert not forwarded, "disabled reasoning replay must fail before forwarding"
 
 
 class TestResponsesCompactionVLLM:

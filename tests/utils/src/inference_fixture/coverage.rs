@@ -1251,6 +1251,7 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1287,11 +1288,12 @@ mod tests {
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 27);
-        assert_eq!(report.scenarios_total, 26);
-        assert_eq!(report.recordings_total, 31);
+        assert_eq!(report.features_total, 28);
+        assert_eq!(report.scenarios_total, 28);
+        assert_eq!(report.recordings_total, 33);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1311,7 +1313,9 @@ mod tests {
                 "responses/chat-basic-stream",
                 "responses/chat-file-search",
                 "responses/chat-malformed-compaction",
+                "responses/chat-reasoning-disabled",
                 "responses/chat-reasoning-nonstream",
+                "responses/chat-reasoning-replay",
                 "responses/chat-tool-echo",
                 "responses/chat-web-search",
                 "responses/chat-web-search-stream",
@@ -1323,7 +1327,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 27);
+        assert_eq!(manifest.features.len(), 28);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1471,6 +1475,13 @@ mod tests {
                 (
                     &"responses.chat.tools.function_echo".to_owned(),
                     &vec!["responses/chat-tool-echo".to_owned()]
+                ),
+                (
+                    &"responses.chat.reasoning.replay".to_owned(),
+                    &vec![
+                        "responses/chat-reasoning-replay".to_owned(),
+                        "responses/chat-reasoning-disabled".to_owned(),
+                    ]
                 ),
             ]
         );

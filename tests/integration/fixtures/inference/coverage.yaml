@@ -273,3 +273,13 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.reasoning.replay
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-reasoning-replay
+      - responses/chat-reasoning-disabled
+    providers:
+      synthetic:
+        status: synthetic_only

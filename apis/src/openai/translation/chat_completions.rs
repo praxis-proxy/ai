@@ -8,7 +8,7 @@ use serde_json::{Map, Number, Value, json};
 use thiserror::Error;
 
 use super::reasoning::{
-    ReasoningOptions, extract_reasoning_item, message_has_reasoning, reasoning_item_id, requested_summary,
+    ReasoningOptions, ReplayBuffer, extract_reasoning_item, message_has_reasoning, reasoning_item_id, requested_summary,
 };
 use crate::web_search::is_web_search_tool_type;
 
@@ -288,6 +288,13 @@ pub(crate) enum TranslationError {
     /// The provider returned raw reasoning in an unexpected shape.
     #[error("provider returned malformed raw reasoning content: expected string, found {0}")]
     MalformedReasoning(String),
+    /// A client-supplied reasoning input item carried raw reasoning in an
+    /// unexpected shape.
+    #[error("malformed reasoning input item: reasoning_text must be a string, found {0}")]
+    MalformedReasoningInput(String),
+    /// A reasoning input item cannot be faithfully replayed.
+    #[error("unsupported reasoning input item: {0}")]
+    UnsupportedReasoningInput(&'static str),
     /// A reasoning summary control was present but not a string or null.
     #[error("reasoning.{field} must be a string or null, found {actual}")]
     MalformedReasoningSummary {
@@ -317,8 +324,11 @@ struct RequestOverrides<'a> {
 // -----------------------------------------------------------------------------
 
 /// Convert an `OpenAI` `Responses` create request into a Chat Completions request.
-pub(crate) fn responses_request_to_chat_request(request: &Value) -> Result<Value, TranslationError> {
-    translate_responses_request(request, RequestOverrides::default())
+pub(crate) fn responses_request_to_chat_request(
+    request: &Value,
+    reasoning: &ReasoningOptions,
+) -> Result<Value, TranslationError> {
+    translate_responses_request(request, RequestOverrides::default(), reasoning)
 }
 
 /// Convert canonical Responses state into a Chat Completions request.
@@ -327,6 +337,7 @@ pub(crate) fn responses_state_to_chat_request(
     messages: &[Value],
     tools: &[Value],
     tool_choice: &Value,
+    reasoning: &ReasoningOptions,
 ) -> Result<Value, TranslationError> {
     translate_responses_request(
         request,
@@ -335,11 +346,16 @@ pub(crate) fn responses_state_to_chat_request(
             tools: Some(tools),
             tool_choice: Some(tool_choice),
         },
+        reasoning,
     )
 }
 
 /// Convert a Responses request using optional borrowed canonical state overrides.
-fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>) -> Result<Value, TranslationError> {
+fn translate_responses_request(
+    request: &Value,
+    overrides: RequestOverrides<'_>,
+    reasoning: &ReasoningOptions,
+) -> Result<Value, TranslationError> {
     let obj = request
         .as_object()
         .ok_or(TranslationError::ExpectedObject("Responses request"))?;
@@ -348,7 +364,7 @@ fn translate_responses_request(request: &Value, overrides: RequestOverrides<'_>)
     let mut chat = Map::new();
     map_request_parameters(obj, &mut chat);
 
-    let messages = build_chat_messages(obj, overrides.messages)?;
+    let messages = build_chat_messages(obj, overrides.messages, reasoning)?;
     chat.insert("messages".to_owned(), Value::Array(messages));
 
     let tools = overrides
@@ -488,6 +504,7 @@ fn json_schema_response_format(format: &Map<String, Value>) -> Value {
 fn build_chat_messages(
     obj: &Map<String, Value>,
     messages_override: Option<&[Value]>,
+    reasoning: &ReasoningOptions,
 ) -> Result<Vec<Value>, TranslationError> {
     let mut messages = Vec::new();
 
@@ -498,20 +515,24 @@ fn build_chat_messages(
     }
 
     if let Some(override_messages) = messages_override {
-        append_input_item_sequence(&mut messages, override_messages)?;
+        append_input_item_sequence(&mut messages, override_messages, reasoning)?;
     } else if let Some(input) = obj.get("input") {
-        append_input_messages(&mut messages, input)?;
+        append_input_messages(&mut messages, input, reasoning)?;
     }
 
     Ok(messages)
 }
 
 /// Append converted input messages to a Chat Completions message list.
-fn append_input_messages(messages: &mut Vec<Value>, input: &Value) -> Result<(), TranslationError> {
+fn append_input_messages(
+    messages: &mut Vec<Value>,
+    input: &Value,
+    reasoning: &ReasoningOptions,
+) -> Result<(), TranslationError> {
     match input {
         Value::String(text) => messages.push(json!({"role": "user", "content": text})),
-        Value::Array(items) => append_input_item_sequence(messages, items)?,
-        Value::Object(_) => append_input_item_sequence(messages, std::slice::from_ref(input))?,
+        Value::Array(items) => append_input_item_sequence(messages, items, reasoning)?,
+        Value::Object(_) => append_input_item_sequence(messages, std::slice::from_ref(input), reasoning)?,
         Value::Null => {},
         _ => return Err(unsupported_input_type(input)),
     }
@@ -520,50 +541,79 @@ fn append_input_messages(messages: &mut Vec<Value>, input: &Value) -> Result<(),
 }
 
 /// Append a sequence of Responses input items, batching adjacent function calls.
-fn append_input_item_sequence(messages: &mut Vec<Value>, items: &[Value]) -> Result<(), TranslationError> {
+fn append_input_item_sequence(
+    messages: &mut Vec<Value>,
+    items: &[Value],
+    reasoning: &ReasoningOptions,
+) -> Result<(), TranslationError> {
     let mut pending_tool_calls = Vec::new();
+    let mut replay = ReplayBuffer::new(reasoning);
     for item in items {
-        if let Some(obj) = item.as_object()
-            && obj.get("type").and_then(Value::as_str) == Some("function_call")
-        {
-            pending_tool_calls.push(function_call_tool_call(obj)?);
-            continue;
+        if let Some(obj) = item.as_object() {
+            match obj.get("type").and_then(Value::as_str) {
+                Some("function_call") => {
+                    pending_tool_calls.push(function_call_tool_call(obj)?);
+                    continue;
+                },
+                Some("reasoning") => {
+                    replay.buffer(obj)?;
+                    continue;
+                },
+                _ => {},
+            }
         }
 
-        flush_pending_function_calls(messages, &mut pending_tool_calls);
-        append_input_item(messages, item)?;
+        flush_pending_function_calls(messages, &mut pending_tool_calls, &mut replay)?;
+        append_input_item(messages, item, &mut replay)?;
     }
-    flush_pending_function_calls(messages, &mut pending_tool_calls);
+    flush_pending_function_calls(messages, &mut pending_tool_calls, &mut replay)?;
+    replay.flush_standalone(messages)?;
     Ok(())
 }
 
-/// Flush adjacent Responses function calls into one assistant message.
-fn flush_pending_function_calls(messages: &mut Vec<Value>, pending_tool_calls: &mut Vec<Value>) {
+/// Flush adjacent Responses function calls into one assistant message, inlining
+/// any buffered prior-turn reasoning into that assistant turn's content.
+fn flush_pending_function_calls(
+    messages: &mut Vec<Value>,
+    pending_tool_calls: &mut Vec<Value>,
+    replay: &mut ReplayBuffer<'_>,
+) -> Result<(), TranslationError> {
     if pending_tool_calls.is_empty() {
-        return;
+        return Ok(());
     }
 
+    let content = replay.take_inline(Value::Null)?;
     messages.push(json!({
         "role": "assistant",
-        "content": null,
+        "content": content,
         "tool_calls": std::mem::take(pending_tool_calls),
     }));
+    Ok(())
 }
 
 /// Convert a single `Responses` input item into one Chat Completions message.
-fn append_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), TranslationError> {
+fn append_input_item(
+    messages: &mut Vec<Value>,
+    item: &Value,
+    replay: &mut ReplayBuffer<'_>,
+) -> Result<(), TranslationError> {
     let Some(obj) = item.as_object() else {
         return Err(TranslationError::ExpectedObject("Responses input item"));
     };
 
     match input_item_type(obj)? {
-        Some("function_call_output") => append_tool_output(messages, obj)?,
-        Some("message") => append_message_item(messages, obj)?,
-        Some("compaction") => append_compaction_item(messages, obj)?,
-        // Cross-turn reasoning passthrough is Responses-native (encrypted
-        // reasoning items) outside the scope of Chat Completions translation.
-        Some("reasoning") => {},
-        None if obj.contains_key("role") || obj.contains_key("content") => append_message_item(messages, obj)?,
+        Some("function_call_output") => {
+            replay.flush_standalone(messages)?;
+            append_tool_output(messages, obj)?;
+        },
+        Some("message") => append_message_item(messages, obj, replay)?,
+        Some("compaction") => {
+            replay.flush_standalone(messages)?;
+            append_compaction_item(messages, obj)?;
+        },
+        None if obj.contains_key("role") || obj.contains_key("content") => {
+            append_message_item(messages, obj, replay)?;
+        },
         None => return Err(TranslationError::UnsupportedInputItemType("unknown".to_owned())),
         Some(input_type) => return Err(TranslationError::UnsupportedInputItemType(input_type.to_owned())),
     }
@@ -585,13 +635,23 @@ fn input_item_type(obj: &Map<String, Value>) -> Result<Option<&str>, Translation
 }
 
 /// Convert a Responses message item into a Chat Completions message.
-fn append_message_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) -> Result<(), TranslationError> {
+fn append_message_item(
+    messages: &mut Vec<Value>,
+    obj: &Map<String, Value>,
+    replay: &mut ReplayBuffer<'_>,
+) -> Result<(), TranslationError> {
     let role = required_input_item_string(obj, "message", "role")?;
     let content = obj.get("content").ok_or(TranslationError::MissingInputItemField {
         item_type: "message",
         field: "content",
     })?;
     let content = convert_input_content(content)?;
+    let content = if role == "assistant" {
+        replay.take_inline(content)?
+    } else {
+        replay.flush_standalone(messages)?;
+        content
+    };
     messages.push(json!({"role": role, "content": content}));
     Ok(())
 }
