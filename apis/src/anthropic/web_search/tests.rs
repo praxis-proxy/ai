@@ -16,7 +16,13 @@ use praxis_filter::{
 use serde_json::{Value, json};
 
 use super::*;
+use crate::callout_identity::CalloutIdentity;
 use crate::test_utils::{make_filter_context, make_request, make_response};
+
+/// A callout identity with no owner and no per-user credential (shared-key path).
+fn shared_key_identity() -> CalloutIdentity {
+    CalloutIdentity { owner: None, user_credential: None }
+}
 
 fn test_filter() -> Box<dyn HttpFilter> {
     let config = serde_yaml::from_str(
@@ -614,7 +620,7 @@ async fn pending_search_executes_and_appends_tool_result() {
     let pending = pending_search("potato");
 
     let outcome = filter
-        .execute_pending_search(CalloutContext::for_test(), &pending)
+        .execute_pending_search(CalloutContext::for_test(), &pending, &shared_key_identity())
         .await;
     let mut rebuilt = base_request();
     append_search_turns(&mut rebuilt, assistant_content("potato"), pending, &outcome).unwrap();
@@ -657,7 +663,7 @@ async fn provider_failure_appends_is_error_tool_result() {
     let pending = pending_search("potato");
 
     let outcome = filter
-        .execute_pending_search(CalloutContext::for_test(), &pending)
+        .execute_pending_search(CalloutContext::for_test(), &pending, &shared_key_identity())
         .await;
     assert!(
         matches!(&outcome, SearchOutcome::Failed),
@@ -684,7 +690,7 @@ async fn empty_results_appends_no_results_tool_result() {
     let pending = pending_search("potato");
 
     let outcome = filter
-        .execute_pending_search(CalloutContext::for_test(), &pending)
+        .execute_pending_search(CalloutContext::for_test(), &pending, &shared_key_identity())
         .await;
     assert!(
         matches!(&outcome, SearchOutcome::Results(results) if results.is_empty()),

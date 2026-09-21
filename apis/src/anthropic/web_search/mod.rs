@@ -18,6 +18,7 @@ use praxis_filter::{
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
+use crate::callout_identity::{CalloutIdentity, stage_callout_identity};
 use crate::web_search::{
     CalloutContext, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, WebSearchFilterConfig,
     build_config, format_search_results,
@@ -329,9 +330,14 @@ impl AnthropicWebSearchFilter {
     /// `callout` carries the originating client's attributes and the request's
     /// current outbound depth so the callout's outbound chain sees the real
     /// caller and the executor continues this request's depth accounting.
-    async fn execute_pending_search(&self, callout: CalloutContext, pending: &PendingSearch) -> SearchOutcome {
+    async fn execute_pending_search(
+        &self,
+        callout: CalloutContext,
+        pending: &PendingSearch,
+        identity: &CalloutIdentity,
+    ) -> SearchOutcome {
         self.search_client
-            .search(&self.outbound, callout, &pending.query, Some(self.default_context_size))
+            .search(&self.outbound, callout, &pending.query, Some(self.default_context_size), identity)
             .await
     }
 
@@ -398,7 +404,15 @@ impl AnthropicWebSearchFilter {
         // before mutating the context so the callout's outbound chain sees the
         // real client and the executor continues this request's depth accounting.
         let callout = CalloutContext::from_filter_context(ctx);
-        let outcome = self.execute_pending_search(callout, &pending).await;
+        // PR1 (issue #880) Task 9: project the caller's trusted owner into the
+        // web-search callout. The per-user credential slot and its fail-closed 401
+        // `authentication_error` terminal are wired on the Anthropic path in Task 10;
+        // passing `None` here requests owner attribution only, which never fails.
+        let identity = stage_callout_identity(ctx, None).unwrap_or_else(|_| CalloutIdentity {
+            owner: None,
+            user_credential: None,
+        });
+        let outcome = self.execute_pending_search(callout, &pending, &identity).await;
         if let Err(rejection) = append_search_turns(&mut request, assistant_content, pending, &outcome) {
             return Ok(FilterAction::Reject(rejection));
         }

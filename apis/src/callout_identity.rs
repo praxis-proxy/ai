@@ -13,10 +13,6 @@ use crate::CalloutCredentials;
 use crate::state_owner::StateOwner;
 
 /// Identity + credential resolved for a single callout.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the web-search/file-search/file-resolve/MCP callout adapters in Task 9/10")
-)]
 #[derive(Debug)]
 pub(crate) struct CalloutIdentity {
     /// The caller's trusted subject/tenant attribution, projected into the child subrequest.
@@ -26,10 +22,6 @@ pub(crate) struct CalloutIdentity {
 }
 
 /// A required callout-identity component was missing (a security-context failure).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the web-search/file-search/file-resolve/MCP callout adapters in Task 9/10")
-)]
 #[derive(Debug)]
 pub(crate) enum CalloutContextMissing {
     /// The configured credential slot had no populated (non-empty) value in [`CalloutCredentials`].
@@ -49,10 +41,6 @@ pub(crate) enum CalloutContextMissing {
 ///
 /// Returns [`CalloutContextMissing::Credential`] when `slot` is `Some` but the slot resolves to no
 /// populated (non-empty) secret; the caller converts this into the fail-closed security terminal.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by the web-search/file-search/file-resolve/MCP callout adapters in Task 9/10")
-)]
 pub(crate) fn stage_callout_identity(
     ctx: &HttpFilterContext<'_>,
     slot: Option<&str>,

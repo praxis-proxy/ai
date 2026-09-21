@@ -1543,3 +1543,29 @@ async fn on_request_body_without_max_tool_calls_dispatches_all_under_cap() {
         "all searches completed under the server cap"
     );
 }
+
+#[tokio::test]
+async fn missing_required_credential_records_security_failure() {
+    // Filter requires the caller's per-user "brave" slot; ctx has NO credentials.
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("provider: brave\napi_key: fallback-key\nuser_credential: brave").unwrap();
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        web_search_calls: vec![serde_json::json!({
+            "id": "ws_1",
+            "action": {"type": "search", "query": "hello"}
+        })],
+        ..ResponsesState::default()
+    });
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let failure = state.security_failure.as_ref().expect("security failure recorded");
+    assert_eq!(failure.status, 401);
+    assert_eq!(failure.code, "missing_callout_context");
+    assert_eq!(state.web_search_calls_executed, 0, "no provider request dispatched");
+}

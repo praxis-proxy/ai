@@ -44,8 +44,11 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use super::state::{
-    ResponsesState, consumed_builtin_tool_calls_before_current_round, current_round_tool_call_admissions,
+    DispatchFailure, ResponsesState, consumed_builtin_tool_calls_before_current_round,
+    current_round_tool_call_admissions,
 };
+use crate::callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity};
+use crate::callout_policy::MISSING_CALLOUT_CONTEXT;
 use crate::web_search::{
     CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
     SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
@@ -134,6 +137,10 @@ pub struct WebSearchFilter {
     max_calls_per_round: usize,
     /// Prebuilt outbound filter chain each provider request executes through.
     outbound: Arc<FilterPipeline>,
+    /// Configured callout-credential slot id (non-secret). When set, each provider
+    /// request uses the caller's per-user secret from this slot instead of the
+    /// shared `api_key`; a missing/empty slot value fails the response closed.
+    user_credential_slot: Option<String>,
 }
 
 impl WebSearchFilter {
@@ -223,6 +230,7 @@ impl WebSearchFilter {
             default_context_size: validated.default_context_size,
             max_calls_per_round,
             outbound,
+            user_credential_slot: validated.user_credential,
         }))
     }
 
@@ -266,7 +274,8 @@ impl WebSearchFilter {
     /// A provider failure never rejects the Response. The model instead
     /// receives a truthful `failed` `web_search_call` plus a bounded failure
     /// message — bridged as a backend-valid `function_call`/`function_call_output`
-    /// pair — so the agentic loop can continue.
+    /// pair — so the agentic loop can continue. Uses the batch-resolved caller
+    /// identity for provider credential staging and owner attribution.
     ///
     /// `index` is the call's position within the pending queue. It keeps the
     /// synthetic bridge `call_id` unique even when the hosted source ids
@@ -282,6 +291,7 @@ impl WebSearchFilter {
         call: &Value,
         index: usize,
         context_size: SearchContextSize,
+        identity: &CalloutIdentity,
     ) -> bool {
         let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
         let query = call.get("action").and_then(|a| a.get("query")).and_then(Value::as_str);
@@ -302,7 +312,7 @@ impl WebSearchFilter {
         let callout = CalloutContext::from_filter_context(ctx);
         match self
             .search_client
-            .search(&self.outbound, callout, query, Some(context_size))
+            .search(&self.outbound, callout, query, Some(context_size), identity)
             .await
         {
             SearchOutcome::Results(results) => append_result(ctx, &ids, "completed", query, &results),
@@ -328,6 +338,27 @@ impl WebSearchFilter {
     /// provider counter; a missing-query call consumes its model-call admission
     /// but does not issue a provider request.
     async fn execute_pending_searches(&self, ctx: &mut HttpFilterContext<'_>, batch: PendingSearchBatch<'_>) -> bool {
+        // Resolve the caller's identity once for the whole batch (slot is filter
+        // config; owner + credential come from ctx.extensions — nothing varies per
+        // call). A missing required per-user credential fails the response closed:
+        // record the shared security failure and return. The sole loop owner
+        // (`openai_agentic_loop`) converts `security_failure` into a 401 before the
+        // next round — no provider request is dispatched.
+        let identity = match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
+            Ok(identity) => identity,
+            Err(CalloutContextMissing::Credential { slot }) => {
+                if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                    state.record_security_failure(DispatchFailure {
+                        status: 401,
+                        code: MISSING_CALLOUT_CONTEXT,
+                        message: format!(
+                            "web search requires the '{slot}' per-user credential, which was not provided"
+                        ),
+                    });
+                }
+                return false;
+            },
+        };
         let mut dispatched = 0_usize;
         let mut tool_limit_exceeded = false;
         for (index, call) in batch.calls.iter().enumerate() {
@@ -344,7 +375,7 @@ impl WebSearchFilter {
                 append_excess_incomplete(ctx, call, index);
                 continue;
             }
-            if self.execute_single_search(ctx, call, index, batch.context_size).await {
+            if self.execute_single_search(ctx, call, index, batch.context_size, &identity).await {
                 dispatched = dispatched.saturating_add(1);
             }
         }

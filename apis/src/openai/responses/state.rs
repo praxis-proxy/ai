@@ -912,7 +912,6 @@ impl ResponsesState {
     }
 
     /// Record the first security-context failure; later calls are ignored (first wins).
-    #[cfg_attr(not(test), expect(dead_code, reason = "called by task 9 callout filters"))]
     pub(crate) fn record_security_failure(&mut self, failure: DispatchFailure) {
         if self.security_failure.is_none() {
             self.security_failure = Some(failure);
