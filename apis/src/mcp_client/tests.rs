@@ -1555,3 +1555,29 @@ async fn list_tools_rejects_oversized_cumulative_pagination() {
         "aggregate overflow should surface as ListingTooLarge, got: {err:?}"
     );
 }
+
+// =========================================================================
+// classify_deadline
+// =========================================================================
+
+#[test]
+fn classify_deadline_maps_size_signal_to_413_else_timeout() {
+    use std::sync::{Arc, OnceLock};
+    let url = parse_display_url("https://mcp.example/mcp");
+
+    // No signal recorded -> generic Timeout.
+    let signal: Arc<OnceLock<subrequest_transport::TransportSignal>> = Arc::new(OnceLock::new());
+    let err = classify_deadline(&signal, &url, Duration::from_secs(1));
+    assert!(matches!(err, McpClientError::Timeout { .. }));
+
+    // Size signal recorded -> 413-classified ResponseTooLarge.
+    let signal: Arc<OnceLock<subrequest_transport::TransportSignal>> = Arc::new(OnceLock::new());
+    assert!(
+        signal
+            .set(subrequest_transport::TransportSignal::ResponseTooLarge { limit: 5 })
+            .is_ok(),
+        "signal OnceLock should be empty"
+    );
+    let err = classify_deadline(&signal, &url, Duration::from_secs(1));
+    assert!(matches!(err, McpClientError::ResponseTooLarge { .. }));
+}

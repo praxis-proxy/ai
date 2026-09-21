@@ -35,6 +35,7 @@ use std::{
 use rmcp::{
     Peer, RoleClient, ServiceExt as _,
     model::{CallToolRequestParams, PaginatedRequestParams},
+    service::RunningService,
     transport::{StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig},
 };
 
@@ -347,51 +348,58 @@ pub(crate) async fn list_tools_with_forwarded_headers(
     max_tools: usize,
     callout: &McpCallout,
 ) -> Result<Vec<serde_json::Value>, McpClientError> {
+    // No upfront SSRF classifier: the subrequest transport validates the
+    // dial target during the callout via `prepare_url_target`, so this path
+    // resolves DNS exactly once. `initialize` and `tools/list` are
+    // control-plane exchanges: the transport bounds each response body to the
+    // control ceiling before deserialization, so an untrusted server cannot
+    // exhaust proxy memory before `max_tools` (a count-only limit) is ever
+    // evaluated. Across pagination the decoded listing is additionally
+    // bounded by `MAX_LISTING_RESPONSE_BYTES` (see `paginate_tools`).
     let display_url = parse_display_url(server_url);
+    let mcp_client = subrequest_transport::McpSubrequestClient::control(callout.clone(), timeout);
+    // Take the signal handle before the client is moved into the rmcp
+    // transport, so a `ResponseTooLarge` or `SsrfBlocked` classification
+    // recorded during the exchange (which rmcp otherwise discards) can be
+    // read back below.
+    let signal = mcp_client.signal_handle();
+    let transport = StreamableHttpClientTransport::with_client(
+        mcp_client,
+        build_transport_config_with_forwarded_headers(
+            server_url,
+            headers,
+            authorization,
+            forwarded_header_names,
+            forwarded_headers,
+        )?,
+    );
 
-    let work = async {
-        // No upfront SSRF classifier: the subrequest transport validates the
-        // dial target during the callout via `prepare_url_target`, so this path
-        // resolves DNS exactly once. `initialize` and `tools/list` are
-        // control-plane exchanges: the transport bounds each response body to the
-        // control ceiling before deserialization, so an untrusted server cannot
-        // exhaust proxy memory before `max_tools` (a count-only limit) is ever
-        // evaluated. Across pagination the decoded listing is additionally
-        // bounded by `MAX_LISTING_RESPONSE_BYTES` (see `paginate_tools`).
-        let mcp_client = subrequest_transport::McpSubrequestClient::control(callout.clone(), timeout);
-        // Take the signal handle before the client is moved into the rmcp
-        // transport, so a `ResponseTooLarge` or `SsrfBlocked` classification
-        // recorded during the exchange (which rmcp otherwise discards) can be
-        // read back below.
-        let signal = mcp_client.signal_handle();
-        let transport = StreamableHttpClientTransport::with_client(
-            mcp_client,
-            build_transport_config_with_forwarded_headers(
-                server_url,
-                headers,
-                authorization,
-                forwarded_header_names,
-                forwarded_headers,
-            )?,
-        );
-        let display_url = parse_display_url(server_url);
+    let mut running: Option<RunningService<RoleClient, ()>> = None;
+    let outcome = tokio::time::timeout(timeout, async {
         let client = Box::pin(().serve(transport)).await.map_err(|_source| {
             transport_signal_error(&signal, &display_url).unwrap_or_else(|| McpClientError::Connection {
                 url: display_url.clone(),
             })
         })?;
-        let tools = Box::pin(paginate_tools(&client, max_tools, &display_url))
+        let client = running.insert(client);
+        let tools = Box::pin(paginate_tools(client, max_tools, &display_url))
             .await
             .map_err(|err| transport_signal_error(&signal, &display_url).unwrap_or(err))?;
         tools_to_json(tools)
-    };
+    })
+    .await;
 
-    tokio::time::timeout(timeout, Box::pin(work))
-        .await
-        .map_err(|_elapsed| McpClientError::Timeout {
-            url: display_url,
-            timeout,
-        })?
+    // Close (not drop) the service on every post-serve exit so no background
+    // worker task is left holding our subrequest executor. (The pre-serve
+    // handshake window remains a parked upstream rmcp gap — see the plan header.)
+    if let Some(mut client) = running {
+        drop(client.close().await);
+    }
+
+    match outcome {
+        Ok(result) => result,
+        Err(_elapsed) => Err(classify_deadline(&signal, &display_url, timeout)),
+    }
 }
 
 /// Call `tools/call` on an MCP server and return the result.
@@ -441,7 +449,6 @@ pub(crate) async fn call_tool(
     reason = "trusted forwarded headers extend the existing API"
 )]
 #[expect(clippy::too_many_lines, reason = "transport setup + call follows list_tools pattern")]
-#[expect(clippy::large_stack_frames, reason = "rmcp call_tool future is inherently large")]
 pub(crate) async fn call_tool_with_forwarded_headers(
     server_url: &str,
     headers: Option<&serde_json::Value>,
@@ -454,38 +461,37 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     max_result_bytes: usize,
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
+    // No upfront SSRF classifier: the subrequest transport validates the
+    // dial target during the callout via `prepare_url_target`, so this path
+    // resolves DNS exactly once. `initialize` uses the control ceiling; the
+    // `tools/call` result is bounded to the configured `max_result_bytes` cap
+    // (expanded for worst-case JSON string escaping) before deserialization.
     let display_url = parse_display_url(server_url);
+    let mcp_client = subrequest_transport::McpSubrequestClient::for_tool(callout.clone(), timeout, max_result_bytes);
+    // Take the signal handle before the client is moved into the rmcp
+    // transport, so a `ResponseTooLarge` or `SsrfBlocked` classification
+    // recorded during the exchange (which rmcp otherwise discards) can be
+    // read back below.
+    let signal = mcp_client.signal_handle();
+    let transport = StreamableHttpClientTransport::with_client(
+        mcp_client,
+        build_transport_config_with_forwarded_headers(
+            server_url,
+            headers,
+            authorization,
+            forwarded_header_names,
+            forwarded_headers,
+        )?,
+    );
 
-    let work = async {
-        // No upfront SSRF classifier: the subrequest transport validates the
-        // dial target during the callout via `prepare_url_target`, so this path
-        // resolves DNS exactly once. `initialize` uses the control ceiling; the
-        // `tools/call` result is bounded to the configured `max_result_bytes` cap
-        // (expanded for worst-case JSON string escaping) before deserialization.
-        let mcp_client =
-            subrequest_transport::McpSubrequestClient::for_tool(callout.clone(), timeout, max_result_bytes);
-        // Take the signal handle before the client is moved into the rmcp
-        // transport, so a `ResponseTooLarge` or `SsrfBlocked` classification
-        // recorded during the exchange (which rmcp otherwise discards) can be
-        // read back below.
-        let signal = mcp_client.signal_handle();
-        let transport = StreamableHttpClientTransport::with_client(
-            mcp_client,
-            build_transport_config_with_forwarded_headers(
-                server_url,
-                headers,
-                authorization,
-                forwarded_header_names,
-                forwarded_headers,
-            )?,
-        );
-        let display_url = parse_display_url(server_url);
-
+    let mut running: Option<RunningService<RoleClient, ()>> = None;
+    let outcome = tokio::time::timeout(timeout, async {
         let client = Box::pin(().serve(transport)).await.map_err(|_source| {
             transport_signal_error(&signal, &display_url).unwrap_or_else(|| McpClientError::Connection {
                 url: display_url.clone(),
             })
         })?;
+        let client = running.insert(client);
 
         let parsed_args = match arguments {
             serde_json::Value::Object(obj) => Some(obj),
@@ -503,14 +509,20 @@ pub(crate) async fn call_tool_with_forwarded_headers(
                 tool_name: tool_name.to_owned(),
             })
         })
-    };
+    })
+    .await;
 
-    tokio::time::timeout(timeout, Box::pin(work))
-        .await
-        .map_err(|_elapsed| McpClientError::Timeout {
-            url: display_url,
-            timeout,
-        })?
+    // Close (not drop) the service on every post-serve exit so no background
+    // worker task is left holding our subrequest executor. (The pre-serve
+    // handshake window remains a parked upstream rmcp gap — see the plan header.)
+    if let Some(mut client) = running {
+        drop(client.close().await);
+    }
+
+    match outcome {
+        Ok(result) => result,
+        Err(_elapsed) => Err(classify_deadline(&signal, &display_url, timeout)),
+    }
 }
 
 /// Cap on pagination rounds to prevent infinite loops from
@@ -561,6 +573,20 @@ async fn paginate_tools(
 // -----------------------------------------------------------------------------
 // Private Helpers
 // -----------------------------------------------------------------------------
+
+/// Classify a step deadline: a recorded transport signal (e.g. an oversized
+/// response, surfaced only when the outer deadline fired) becomes its typed
+/// error (413 for a size breach); otherwise a generic timeout.
+fn classify_deadline(
+    signal: &std::sync::Arc<std::sync::OnceLock<subrequest_transport::TransportSignal>>,
+    url: &McpDisplayUrl,
+    timeout: Duration,
+) -> McpClientError {
+    transport_signal_error(signal, url).unwrap_or_else(|| McpClientError::Timeout {
+        url: url.clone(),
+        timeout,
+    })
+}
 
 /// Build transport config from server URL, optional headers, and
 /// optional `OAuth` authorization token.
