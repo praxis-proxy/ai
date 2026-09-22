@@ -888,11 +888,22 @@ impl McpSubrequestClient {
             .map(str::to_owned);
 
         if !status.is_success() {
-            // Streaming path: drain and fail without parsing a JSON-RPC error. The
-            // buffered path extracts a structured error from response.body, but here
-            // that would require buffering the entire response just to classify the
-            // failure — fail fast on the HTTP status instead.
-            drain_body(&mut body).await;
+            // Mirror the buffered classifier: surface a structured JSON-RPC error
+            // to the client instead of collapsing every failure to a generic
+            // "HTTP {status}". Bound the error body by the control ceiling and,
+            // unlike the success drain, record NO size signal — an oversize or
+            // unparseable error body falls back to the HTTP status, never a
+            // spurious 413 (see collect_capped). Exactly one of the two branches
+            // cancels the body.
+            if content_type.as_deref().is_some_and(is_json_content_type) {
+                if let Some(bytes) = collect_capped(&mut body, MAX_CONTROL_RESPONSE_BYTES).await
+                    && let Some(message) = parse_json_rpc_error(&String::from_utf8_lossy(&bytes))
+                {
+                    return Ok(StreamableHttpPostResponse::Json(message, session_id_out));
+                }
+            } else {
+                drain_body(&mut body).await;
+            }
             return Err(StreamableHttpError::UnexpectedServerResponse(
                 format!("HTTP {status}").into(),
             ));
@@ -1233,6 +1244,38 @@ async fn collect_body(
                 signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
                 body.cancel().await;
                 return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
+            },
+        }
+    }
+}
+
+/// Collect a non-2xx error body into a bounded buffer for structured-error
+/// extraction, without recording a size signal.
+///
+/// Distinct from [`collect_body`] on purpose: on the error path an oversize or
+/// truncated body must NOT surface as a 413. This helper takes no signal handle —
+/// so it structurally cannot record [`TransportSignal::ResponseTooLarge`] — and
+/// returns [`None`] on overflow (`buf.len() > cap`) or a `next_chunk()` error,
+/// letting the caller fall back to the true HTTP status. The body is cancelled in
+/// every case; a clean EOF within `cap` returns `Some(bytes)`.
+async fn collect_capped(body: &mut Box<dyn StreamingResponseBody>, cap: usize) -> Option<Bytes> {
+    let mut buf = bytes::BytesMut::new();
+    loop {
+        match body.next_chunk().await {
+            Ok(Some(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > cap {
+                    body.cancel().await;
+                    return None;
+                }
+            },
+            Ok(None) => {
+                body.cancel().await;
+                return Some(buf.freeze());
+            },
+            Err(_error) => {
+                body.cancel().await;
+                return None;
             },
         }
     }
@@ -2127,6 +2170,92 @@ mod tests {
         assert!(
             matches!(out, StreamableHttpPostResponse::Accepted),
             "a 202 ack must stay Accepted (R4)"
+        );
+    }
+
+    // -- collect_capped: bounded error-body collect, no size signal (F5) --
+
+    #[tokio::test]
+    async fn collect_capped_returns_bytes_within_cap() {
+        let (mut body, cancelled) = fake_body([Bytes::from_static(b"err"), Bytes::from_static(b"or")]);
+        let out = collect_capped(&mut body, 1024).await;
+        assert_eq!(out.as_deref(), Some(b"error".as_ref()));
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "a clean error-body collect cancels the body"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_capped_returns_none_when_over_cap() {
+        // Two 4-byte chunks exceed a 6-byte cap; the error body is discarded so the
+        // caller falls back to the HTTP status rather than a spurious 413. By
+        // construction collect_capped takes no signal handle, so it cannot record one.
+        let (mut body, cancelled) = fake_body([Bytes::from_static(b"aaaa"), Bytes::from_static(b"bbbb")]);
+        assert!(collect_capped(&mut body, 6).await.is_none());
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "an over-cap error body cancels the body"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_capped_returns_none_on_transport_error() {
+        let (mut body, cancelled) = erroring_body([Bytes::from_static(b"partial")]);
+        assert!(collect_capped(&mut body, 1024).await.is_none());
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "a transport error on the error path cancels the body"
+        );
+    }
+
+    // -- non-2xx streaming arm surfaces a structured JSON-RPC error (F5) --
+
+    #[tokio::test]
+    async fn streaming_post_non_2xx_json_rpc_error_is_surfaced_as_json() {
+        // The buffered path parses a structured JSON-RPC error out of a non-2xx
+        // JSON body; the streaming path must do the same instead of collapsing the
+        // reply to a generic "HTTP 500".
+        let (body, _cancelled) = fake_body([Bytes::from(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"#.to_owned(),
+        )]);
+        let response = sub_response(500, Some("application/json"), b"");
+        let out = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024)
+            .await
+            .expect("a JSON-RPC error is a valid reply, surfaced as Json");
+        assert!(matches!(out, StreamableHttpPostResponse::Json(JsonRpcMessage::Error(_), _)));
+    }
+
+    #[tokio::test]
+    async fn streaming_post_non_2xx_non_jsonrpc_body_falls_back_to_status() {
+        let (body, _cancelled) = fake_body([Bytes::from_static(b"internal error, not json-rpc")]);
+        let response = sub_response(500, Some("application/json"), b"");
+        let client = client();
+        let result = client
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024)
+            .await;
+        let Err(StreamableHttpError::UnexpectedServerResponse(msg)) = result else {
+            panic!("expected UnexpectedServerResponse for a non-JSON-RPC 500 body");
+        };
+        assert!(msg.contains("HTTP 500"), "should surface the HTTP status, got {msg}");
+        assert!(
+            client.signal_handle().get().is_none(),
+            "an unparseable error body must never record a 413 size signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_post_non_2xx_non_json_content_type_falls_back_to_status() {
+        let (body, cancelled) = fake_body([Bytes::from_static(b"boom")]);
+        let response = sub_response(503, Some("text/plain"), b"");
+        let result = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024)
+            .await;
+        assert!(matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(_))));
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "a non-JSON error body is drained and cancelled"
         );
     }
 
