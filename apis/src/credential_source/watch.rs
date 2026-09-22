@@ -368,6 +368,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removal_fails_closed_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, "tok-a\n").unwrap();
+        let src = CredentialSource::File(path.to_string_lossy().into_owned());
+        let (handle, _watch) = crate::credential_source::build_one(ctx("a/b/c"), &src, identity()).unwrap();
+        std::fs::remove_file(&path).unwrap(); // file disappears (rotation gap)
+        assert!(wait_until(|| handle.current().payload.is_none()).await);
+    }
+
+    #[tokio::test]
     async fn transform_failure_on_rotation_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("key");
