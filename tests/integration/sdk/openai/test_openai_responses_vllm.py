@@ -697,20 +697,19 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
         self._forward()
 
 
-class SimulatorBackendShimHandler(BaseHTTPRequestHandler):
-    """Adapt unsupported simulator tool behavior to vLLM's frontend.
+class SimulatorBackendHandler(BaseHTTPRequestHandler):
+    """Record Praxis requests and script hosted-tool Chat responses.
 
-    The simulator treats ``tool_choice=auto`` probabilistically and does not
-    stop choosing tools after a Chat ``role=tool`` result. Praxis agentic tests
-    need the opposite deterministic script: choose a tool on the first round,
-    then return assistant text after the locally executed result is re-entered.
-    This forcing is Chat-only.
-
-    Native Responses ``file_search`` lowering is no longer done here: Praxis
-    lowers the hosted tool into a private function before the request reaches the
-    backend (``openai_file_search_callout``), so the shim forwards native
-    ``/v1/responses`` requests untouched and exercises the real production path.
+    ``llm-d-inference-sim`` does not deterministically select a tool for
+    ``tool_choice=auto`` or stop selecting tools after a result. For the two
+    translated hosted tools exercised in simulator mode, this handler acts as
+    the backend and returns a deterministic tool call followed by assistant
+    text. It never rewrites or re-serializes the request Praxis sent. All other
+    requests, including native Responses requests, are forwarded byte-for-byte
+    to the simulator.
     """
+
+    recorded_requests: ClassVar[list[tuple[str, dict[str, Any]]]] = []
 
     def log_message(self, fmt, *args):
         pass
@@ -719,25 +718,12 @@ class SimulatorBackendShimHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         request_body = json.loads(body)
+        type(self).recorded_requests.append((self.path, request_body))
 
-        # Praxis lowers hosted Responses `file_search` into a private function
-        # before the request reaches the backend (openai_file_search_callout), so
-        # the shim forwards native `/v1/responses` requests untouched. The
-        # tool_choice forcing below is Chat-only: it inspects `messages`, which a
-        # Responses body does not carry, and only compensates for the simulator's
-        # probabilistic Chat tool selection.
-        if (
-            self.path.rstrip("/").endswith("/v1/chat/completions")
-            and request_body.get("tools")
-            and request_body.get("tool_choice", "auto") == "auto"
-        ):
-            has_tool_result = any(
-                message.get("role") == "tool"
-                for message in request_body.get("messages", [])
-                if isinstance(message, dict)
-            )
-            request_body["tool_choice"] = "none" if has_tool_result else "required"
-            body = json.dumps(request_body).encode()
+        scripted_tool = self._scripted_tool_name(request_body)
+        if scripted_tool is not None:
+            self._send_scripted_chat_response(request_body, scripted_tool)
+            return
 
         headers = {
             key: value
@@ -763,6 +749,157 @@ class SimulatorBackendShimHandler(BaseHTTPRequestHandler):
                     if chunk:
                         self.wfile.write(chunk)
                         self.wfile.flush()
+
+    def _scripted_tool_name(self, request_body: dict[str, Any]) -> str | None:
+        if not self.path.rstrip("/").endswith("/v1/chat/completions"):
+            return None
+
+        tool_names = [
+            tool.get("function", {}).get("name")
+            for tool in request_body.get("tools", [])
+            if isinstance(tool, dict) and tool.get("type") == "function"
+        ]
+        for hosted_tool in ("web_search", "file_search"):
+            if hosted_tool in tool_names:
+                return hosted_tool
+        return None
+
+    def _send_scripted_chat_response(
+        self, request_body: dict[str, Any], tool_name: str
+    ) -> None:
+        messages = request_body.get("messages", [])
+        has_tool_result = any(
+            message.get("role") == "tool"
+            for message in messages
+            if isinstance(message, dict)
+        )
+        if has_tool_result:
+            tool_results = [
+                message.get("content", "")
+                for message in messages
+                if isinstance(message, dict) and message.get("role") == "tool"
+            ]
+            message = {
+                "role": "assistant",
+                "content": "Tool result received: " + " ".join(tool_results),
+            }
+            finish_reason = "stop"
+        else:
+            query = (
+                "latest Praxis Proxy release"
+                if tool_name == "web_search"
+                else "Praxis marker"
+            )
+            message = {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"call_simulator_{tool_name}",
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps({"query": query}),
+                        },
+                    }
+                ],
+            }
+            finish_reason = "tool_calls"
+
+        completion = {
+            "id": f"chatcmpl_simulator_{time.time_ns()}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request_body.get("model", VLLM_MODEL),
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": finish_reason,
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 10,
+                "total_tokens": 20,
+            },
+        }
+        payload = json.dumps(completion).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def _assert_simulator_auto_tool_round(
+    request_start: int,
+    *,
+    tool_name: str,
+) -> None:
+    """Assert the exact Chat requests Praxis emitted for a scripted round."""
+    recorded = [
+        body
+        for path, body in SimulatorBackendHandler.recorded_requests[request_start:]
+        if path.rstrip("/").endswith("/v1/chat/completions")
+        and any(
+            tool.get("function", {}).get("name") == tool_name
+            for tool in body.get("tools", [])
+            if isinstance(tool, dict)
+        )
+    ]
+    assert len(recorded) == 2, (
+        f"expected exactly two {tool_name} Chat requests; got {recorded}"
+    )
+    first, reentry = recorded
+
+    description, max_length = {
+        "web_search": ("Search the web for up-to-date information.", 4_096),
+        "file_search": (
+            "Search the configured vector stores for relevant files.",
+            65_536,
+        ),
+    }[tool_name]
+    expected_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": max_length,
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
+    ]
+
+    for round_name, request_body in (("first", first), ("re-entry", reentry)):
+        assert request_body.get("tool_choice") == "auto", (
+            f"{round_name} request must preserve tool_choice='auto'; "
+            f"got {request_body.get('tool_choice')!r} in {request_body}"
+        )
+        assert request_body.get("tools") == expected_tools, (
+            f"{round_name} request has incorrect declared tools: {request_body}"
+        )
+
+    first_roles = [message.get("role") for message in first.get("messages", [])]
+    reentry_roles = [
+        message.get("role") for message in reentry.get("messages", [])
+    ]
+    assert "tool" not in first_roles, first
+    assert "tool" in reentry_roles, reentry
+
+
 
 def _write_witness_config(
     praxis_port: int,
@@ -880,13 +1017,14 @@ def _write_agentic_config(
 
 @pytest.fixture(scope="session")
 def backend_endpoint():
-    """Return the live backend or an inference-sim compatibility shim."""
+    """Return the live backend or the recording simulator backend."""
     if VLLM_TEST_BACKEND == "live":
         yield _vllm_endpoint()
         return
 
+    SimulatorBackendHandler.recorded_requests = []
     port = _free_port()
-    server = HTTPServer(("127.0.0.1", port), SimulatorBackendShimHandler)
+    server = HTTPServer(("127.0.0.1", port), SimulatorBackendHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -3861,6 +3999,7 @@ class TestAgenticLoopVLLM:
         translated_agentic_client,
     ):
         request_count = len(BraveSearchHandler.request_paths)
+        recorded_request_count = len(SimulatorBackendHandler.recorded_requests)
         response = translated_agentic_client.responses.create(
             model=VLLM_MODEL,
             input=(
@@ -3873,11 +4012,14 @@ class TestAgenticLoopVLLM:
                     "search_context_size": "low",
                 }
             ],
-            # Force the hosted call so the proxy's translate/execute path is
-            # exercised deterministically rather than relying on a small model
-            # electing to call the tool; the agentic loop resets tool_choice to
-            # "auto" on continuation, so the follow-up round answers freely.
-            tool_choice={"type": "web_search"},
+            # Live vLLM still needs the hosted call forced for deterministic
+            # coverage. The simulator backend is scripted, so use ``auto``
+            # there and assert that Praxis preserves it on both rounds.
+            tool_choice=(
+                "auto"
+                if VLLM_TEST_BACKEND == "simulator"
+                else {"type": "web_search"}
+            ),
             store=False,
             # Room for the continuation round's reasoning plus the final message
             # (Qwen3 emits a reasoning block that /no_think does not suppress).
@@ -3891,6 +4033,11 @@ class TestAgenticLoopVLLM:
         assert web_search_calls[0].status == "completed"
         assert len(BraveSearchHandler.request_paths) == request_count + 1
         assert any(item.type == "message" for item in response.output)
+        if VLLM_TEST_BACKEND == "simulator":
+            _assert_simulator_auto_tool_round(
+                recorded_request_count,
+                tool_name="web_search",
+            )
 
     @requires_real_inference
     def test_live_tavily_web_search_returns_real_sources(
@@ -5222,30 +5369,10 @@ def vector_store():
 def file_search_backend(backend_endpoint):
     """Backend endpoint for the native ``/v1/responses`` file-search path.
 
-    vLLM's native Responses frontend rejects the hosted ``file_search`` tool,
-    and the proxy's native path does not lower it to a backend ``function``
-    tool -- that lowering (``synthesized_file_search_tool`` /
-    ``build_object_tool_choice``) lives only in the chat-translation path. The
-    shipped :class:`SimulatorBackendShimHandler` performs exactly that
-    file_search->function substitution at the backend boundary and forwards to
-    real vLLM. In non-live mode ``backend_endpoint`` already routes through the
-    shim; in live mode it targets vLLM directly, so wrap it in the same shim
-    here. This exercises the real file-search callout + agentic loop + OGX
-    marker round-trip against genuine vLLM inference (no assertions relaxed).
+    Praxis lowers the hosted tool before the request reaches either the
+    simulator or live vLLM, so both modes use the configured backend directly.
     """
-    if VLLM_TEST_BACKEND != "live":
-        yield backend_endpoint
-        return
-
-    port = _free_port()
-    server = HTTPServer(("127.0.0.1", port), SimulatorBackendShimHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"127.0.0.1:{port}"
-    finally:
-        server.shutdown()
-        thread.join()
+    yield backend_endpoint
 
 
 @pytest.fixture(scope="session")
@@ -5515,6 +5642,7 @@ class TestFileSearchChatCompletionsVLLM:
         self, file_search_chat_client, vector_store
     ):
         store_id, marker = vector_store
+        recorded_request_count = len(SimulatorBackendHandler.recorded_requests)
         response = file_search_chat_client.responses.create(
             model=VLLM_MODEL,
             input=(
@@ -5600,6 +5728,11 @@ class TestFileSearchChatCompletionsVLLM:
             "OGX search results (via include=file_search_call.results) should "
             f"contain the indexed marker {marker!r}; got: {payload}"
         )
+        if VLLM_TEST_BACKEND == "simulator":
+            _assert_simulator_auto_tool_round(
+                recorded_request_count,
+                tool_name="file_search",
+            )
 
 
 # ---------------------------------------------------------------------------
