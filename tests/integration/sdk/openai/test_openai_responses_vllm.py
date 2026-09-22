@@ -72,6 +72,9 @@ TRUSTED_OWNER_HEADERS = {
 CLIENT_TOOL_COMPAT_CONFIG_PATH = (
     "examples/configs/openai/responses/client-tool-compat.yaml"
 )
+CLIENT_TOOL_COMPAT_CHAT_CONFIG_PATH = (
+    "examples/configs/openai/responses/client-tool-compat-chat-completions.yaml"
+)
 
 TERMINAL_RESPONSE_EVENTS = {
     "response.cancelled",
@@ -287,6 +290,28 @@ def _write_client_tool_compat_config(praxis_port: int, db_path: str) -> str:
     limited to those three (no OGX, no mock side-servers).
     """
     with open(CLIENT_TOOL_COMPAT_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
+    config = _patch_store_backend(config, db_path)
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+def _write_client_tool_compat_chat_config(praxis_port: int, db_path: str) -> str:
+    """Patch the composed client-tool-compat + Chat Completions example (#1206).
+
+    The composed config points at the proxy listener, a single Chat Completions
+    backend endpoint, and the SQLite store, so patching is limited to those three
+    (no OGX, no mock side-servers). Unlike ``_write_client_tool_compat_config`` the
+    backend receives ``POST /v1/chat/completions`` because
+    ``responses_to_chat_completions`` translates the lowered Responses request.
+    """
+    with open(CLIENT_TOOL_COMPAT_CHAT_CONFIG_PATH) as f:
         config = f.read()
 
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
@@ -1036,6 +1061,56 @@ def client_tool_compat_client(client_tool_compat_proxy):
     """Return an SDK client using the client-tool-compat pipeline."""
     return OpenAI(
         base_url=f"http://127.0.0.1:{client_tool_compat_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
+def client_tool_compat_chat_proxy(tmp_path_factory, request):
+    """Start the composed client-tool-compat + Chat Completions example (#1206)."""
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("client-tool-compat-chat")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_client_tool_compat_chat_config(port, db_path)
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Client tool compat (Chat) Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def client_tool_compat_chat_client(client_tool_compat_chat_proxy):
+    """Return an SDK client using the composed compat + Chat Completions pipeline."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{client_tool_compat_chat_proxy}/v1",
         api_key="test",
         max_retries=0,
         timeout=300,
@@ -3080,6 +3155,199 @@ class TestClientToolCompatVLLM:
         assert any(t.type == "custom" for t in final_response.tools), (
             final_response.tools
         )
+
+
+class TestClientToolCompatChatVLLM:
+    """Issue #1206: rich Codex client tools reach a function-only **Chat
+    Completions** backend by composing ``openai_client_tool_compat`` with
+    ``responses_to_chat_completions`` in one iterative-router step.
+
+    Unlike :class:`TestClientToolCompatVLLM` (native Responses backend), here the
+    backend only ever sees ``POST /v1/chat/completions`` with plain ``function``
+    tools: compat lowers the rich ``custom``/``namespace``/``shell``/``tool_search``
+    declarations into private functions in ``request_body``, r2c translates the
+    lowered Responses request into a Chat request, and on the response path r2c
+    rebuilds the Responses object first, then compat (buffered) or
+    ``openai_stream_events`` (streaming, #1159) restores the private
+    ``function_call`` items to their canonical typed items — with no private
+    lowered name ever leaking to the client.
+    """
+
+    @requires_real_inference
+    def test_custom_tool_round_trip_over_chat_backend(
+        self, client_tool_compat_chat_client
+    ):
+        """A ``custom`` client tool is lowered to a private ``function`` the Chat
+        backend accepts; the translated ``function_call`` is restored to a
+        ``custom_tool_call`` with the original ``custom`` tool echoed back."""
+        response = client_tool_compat_chat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            # Force the call so the small CI model is deterministic; compat lowers
+            # this custom selector to a function selector for the Chat backend.
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        custom_calls = [
+            item for item in response.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            "compat must restore the translated function_call to a custom_tool_call "
+            f"over a Chat backend; got output types: {[i.type for i in response.output]}"
+        )
+        assert custom_calls[0].name == "apply_patch"
+        assert isinstance(custom_calls[0].input, str)
+        # No un-restored private function_call may leak to the client.
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        # Request-phase echo: the client sees its original ``custom`` tool back.
+        assert any(t.type == "custom" for t in response.tools), response.tools
+
+    @requires_real_inference
+    def test_streaming_custom_tool_restores_over_chat_backend(
+        self, client_tool_compat_chat_client
+    ):
+        """The streamed Chat tool-call is translated by r2c into a Responses SSE
+        lifecycle and restored LIVE to a ``custom_tool_call`` by
+        ``openai_stream_events`` — one coherent SSE lifecycle, no leaked name."""
+        stream = client_tool_compat_chat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=False,
+            stream=True,
+            max_output_tokens=256,
+        )
+
+        event_types = []
+        final_response = None
+        for event in stream:
+            event_types.append(event.type)
+            if event.type == "response.completed":
+                final_response = event.response
+
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] == "response.completed", event_types
+        assert final_response is not None, (
+            f"stream must terminate with a response.completed event; got: {event_types}"
+        )
+        assert final_response.status == "completed", final_response
+
+        output_types = [item.type for item in final_response.output]
+        custom_calls = [
+            item for item in final_response.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            "openai_stream_events must restore the streamed function_call to a "
+            f"custom_tool_call over a Chat backend; got output types: {output_types}"
+        )
+        assert custom_calls[0].name == "apply_patch"
+        assert isinstance(custom_calls[0].input, str)
+        # A private ``custom_tool_call_input`` lifecycle must be emitted, never the
+        # private ``function_call_arguments`` events for the lowered name.
+        assert any(
+            evt.startswith("response.custom_tool_call_input") for evt in event_types
+        ), event_types
+        assert "function_call" not in output_types, (
+            f"lowered function must not leak on the stream: {output_types}"
+        )
+        assert any(t.type == "custom" for t in final_response.tools), (
+            final_response.tools
+        )
+
+    @requires_real_inference
+    def test_custom_tool_output_continuation_over_chat_backend(
+        self, client_tool_compat_chat_client
+    ):
+        """A ``custom_tool_call_output`` re-entered on a stored continuation is
+        lowered to a ``function_call_output`` history item and translated by r2c
+        into a Chat ``role: tool`` message, so the correlated second turn completes
+        without leaking the private lowered name."""
+        first = client_tool_compat_chat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=True,
+            max_output_tokens=256,
+        )
+
+        assert first.status == "completed", first
+        custom_calls = [
+            item for item in first.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            f"first turn must produce a custom_tool_call; got: {[i.type for i in first.output]}"
+        )
+        call_id = custom_calls[0].call_id
+
+        second = client_tool_compat_chat_client.responses.create(
+            model=VLLM_MODEL,
+            input=[
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "output": "Applied the patch successfully.",
+                }
+            ],
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            previous_response_id=first.id,
+            temperature=0,
+            store=True,
+            max_output_tokens=256,
+        )
+
+        assert second.status == "completed", second
+        # The continuation must correlate to the caller's turn and never surface a
+        # private lowered function_call/output to the client.
+        assert second.previous_response_id == first.id, second.previous_response_id
+        assert all(
+            item.type not in ("function_call", "function_call_output")
+            for item in second.output
+        ), f"lowered names must not leak on continuation: {[i.type for i in second.output]}"
+        assert any(t.type == "custom" for t in second.tools), second.tools
 
 
 class TestAgenticLoopVLLM:

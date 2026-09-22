@@ -533,16 +533,26 @@ fn translate_canonical_state(ctx: &HttpFilterContext<'_>) -> Result<serde_json::
         return Err(missing_pipeline_state());
     };
     ensure_previous_response_rehydrated(state)?;
-    responses_state_to_chat_request(&state.request_body, &state.messages, &state.tools, &state.tool_choice).map_err(
-        |error| {
-            debug!(error = %error, "Responses request cannot be represented by Chat Completions");
-            FilterAction::Reject(responses_error_rejection(
-                400,
-                "invalid_request_error",
-                &error.to_string(),
-            ))
-        },
+    // Read the *outbound* tools/tool_choice through the accessor so a
+    // `openai_client_tool_compat`-lowered request (rich client tools rewritten to
+    // private `function` tools in `request_body` only) translates the lowered view
+    // a function-only Chat backend can accept, not the canonical rich types that
+    // are retained for response-side restore (issue #1206). For every non-compat
+    // flow `request_body` mirrors canonical state, so this read is unchanged there.
+    responses_state_to_chat_request(
+        &state.request_body,
+        &state.messages,
+        state.request_tools(),
+        state.request_tool_choice(),
     )
+    .map_err(|error| {
+        debug!(error = %error, "Responses request cannot be represented by Chat Completions");
+        FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            &error.to_string(),
+        ))
+    })
 }
 
 /// Require stored history before translating a continuation request.

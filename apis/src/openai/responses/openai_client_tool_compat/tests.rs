@@ -3546,6 +3546,99 @@ fn legitimate_namespace_member_is_not_rejected_by_the_reserved_prefix() {
 }
 
 #[test]
+fn top_level_tool_named_a_reserved_hosted_tool_fails_closed() {
+    // `file_search` and `web_search` are function-call NAMES downstream filters
+    // silently re-route: a `function_call` named `file_search` is rewritten into a
+    // hosted `file_search_call` (agentic_loop → file_search_callout), and
+    // `web_search` both trips the Chat-Completions `WebSearchFunctionNameCollision`
+    // reject and aliases the proxy's synthesized web-search bridge. A client tool
+    // lowered to either bare name would be misclassified as hosted, so the filter
+    // fails closed up front — on the bare name, not conditioned on a hosted tool
+    // being configured, so isolation cannot depend on pipeline composition. The
+    // `tool_search` sibling engages the filter (a lone plain `function` is not rich
+    // and passes through untouched).
+    for hosted in ["file_search", "web_search"] {
+        for tool in [
+            json!({"type": "function", "name": hosted, "parameters": {"type": "object"}}),
+            json!({"type": "function", "name": hosted, "parameters": {"type": "object"}, "defer_loading": true}),
+            json!({"type": "custom", "name": hosted}),
+            json!({"type": "custom", "name": hosted, "defer_loading": true}),
+        ] {
+            let filter = ClientToolCompatFilter {
+                max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
+                max_client_tools: 512,
+            };
+            let mut state = ResponsesState::from_request_body(json!({ "tools": [tool, {"type": "tool_search"}] }));
+            let action = filter
+                .lower_request(&mut state, false, false)
+                .expect_err("a top-level tool named a reserved hosted tool fails closed");
+            let (status, message) = reject_parts(&action);
+            assert_eq!(status, 400, "the reserved hosted name is rejected");
+            assert!(
+                message.contains("reserved") && message.contains(hosted),
+                "the rejection names the reserved hosted tool: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn discovered_top_level_tool_named_a_reserved_hosted_tool_fails_closed() {
+    // A hoisted (discovered) top-level tool is subject to the same hosted-name
+    // reservation as a declared one, so a `tool_search` result cannot smuggle in a
+    // client tool that impersonates a hosted `file_search`/`web_search` call name.
+    for hosted in ["file_search", "web_search"] {
+        let filter = ClientToolCompatFilter {
+            max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
+            max_client_tools: 512,
+        };
+        let mut state = ResponsesState::from_request_body(json!({
+            "tools": [{"type": "tool_search"}],
+            "input": [
+                {"type": "tool_search_call", "call_id": "call_1", "execution": "client",
+                 "arguments": {"query": "x"}, "id": "tsc_1"},
+                {"type": "tool_search_output", "call_id": "call_1", "tools": [
+                    {"type": "custom", "name": hosted}
+                ]}
+            ],
+        }));
+        let action = filter
+            .lower_request(&mut state, false, false)
+            .expect_err("a discovered top-level tool named a reserved hosted tool fails closed");
+        let (status, message) = reject_parts(&action);
+        assert_eq!(
+            status, 400,
+            "the reserved hosted name is rejected on the discovery path"
+        );
+        assert!(
+            message.contains("reserved") && message.contains(hosted),
+            "the rejection names the reserved hosted tool: {message}"
+        );
+    }
+}
+
+#[test]
+fn client_tool_named_a_near_miss_of_a_hosted_tool_is_not_rejected() {
+    // The reservation is an EXACT-match on the closed set {file_search, web_search};
+    // names that merely embed a sentinel as a substring or prefix are legitimate
+    // client tools and must still lower (no over-rejection).
+    for name in ["file_search_helper", "web_searcher", "my_web_search", "search"] {
+        let filter = ClientToolCompatFilter {
+            max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
+            max_client_tools: 512,
+        };
+        let mut state = ResponsesState::from_request_body(json!({ "tools": [{"type": "custom", "name": name}] }));
+        filter
+            .lower_request(&mut state, false, false)
+            .expect("a near-miss client tool name lowers without rejection");
+        assert!(
+            state.client_tool_lowering.contains_key(name),
+            "the near-miss client tool '{name}' is registered under its own name"
+        );
+    }
+}
+
+#[test]
 fn namespace_name_embedding_the_reserved_delimiter_fails_closed() {
     // A `namespace` group name or member name carrying the `__` flattening delimiter
     // would make its flattened wire name ambiguous with a distinct namespace/member
