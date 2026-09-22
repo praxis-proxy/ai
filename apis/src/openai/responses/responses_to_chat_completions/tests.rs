@@ -743,6 +743,129 @@ async fn web_search_translation_preserves_canonical_hosted_tool_state() {
 }
 
 #[tokio::test]
+async fn lowered_request_body_tools_translate_over_canonical_rich_tools() {
+    // Issue #1206: `openai_client_tool_compat` lowers rich client tools (here a
+    // `custom` tool) into `request_body["tools"]` only, leaving canonical
+    // `state.tools` rich for response-side restore. Chat Completions translation
+    // must read the lowered outbound view so a function-only backend receives a
+    // valid `function` tool instead of being rejected with `UnsupportedToolType`.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "tools": [{"type": "custom", "name": "apply_patch", "description": "edit files"}],
+    }));
+    // Simulate compat lowering: only the outbound request body is rewritten.
+    state.request_body["tools"] = json!([{
+        "type": "function",
+        "name": "apply_patch",
+        "parameters": {"type": "object", "properties": {}},
+    }]);
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "lowered function tools must translate successfully, not reject as UnsupportedToolType"
+    );
+    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        translated["tools"][0]["type"], "function",
+        "the backend must receive the lowered function tool"
+    );
+    assert_eq!(translated["tools"][0]["function"]["name"], "apply_patch");
+    let state = context.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.tools[0]["type"], "custom",
+        "translation must not mutate canonical rich tools (needed for response-side restore)"
+    );
+}
+
+#[tokio::test]
+async fn lowered_request_body_tool_choice_translates_over_canonical() {
+    // Companion to the tools case: the outbound `tool_choice` in `request_body`
+    // must win over the canonical value so a lowered choice reaches the backend.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+        "tool_choice": "none",
+    }));
+    // Compat rewrote only the outbound choice; canonical stays "none".
+    state.request_body["tool_choice"] = json!("required");
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        translated["tool_choice"], "required",
+        "the lowered outbound tool_choice must win over the canonical value"
+    );
+    let state = context.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.tool_choice, "none",
+        "translation must not mutate the canonical tool_choice"
+    );
+}
+
+#[tokio::test]
+async fn non_compat_state_translation_is_golden_unchanged() {
+    // Regression lock for issue #1206's accessor switch: when no filter has lowered
+    // tools, `request_body` mirrors canonical state, so reading tools/tool_choice
+    // through `request_tools()`/`request_tool_choice()` must produce exactly the same
+    // Chat request as reading canonical `state.tools`/`state.tool_choice` did before.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "lookup",
+            "description": "look things up",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+        }],
+        "tool_choice": "auto",
+    })));
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        translated["tools"],
+        json!([{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "look things up",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+            },
+        }]),
+        "non-compat function tools translate to their exact Chat shape through the accessor"
+    );
+    assert_eq!(
+        translated["tool_choice"], "auto",
+        "an explicit tool_choice with tools present is preserved verbatim"
+    );
+}
+
+#[tokio::test]
 async fn streaming_translation_error_uses_responses_json_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");

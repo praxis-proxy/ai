@@ -1,0 +1,132 @@
+# Client Tool Compatibility over a Chat Completions backend
+#
+# Lets a rich Codex-style Responses client (POST /v1/responses with custom,
+# namespace, local shell, and client-executed tool_search tools) reach a
+# function-only Chat Completions backend (POST /v1/chat/completions) by composing
+# openai_client_tool_compat with responses_to_chat_completions in one
+# iterative-router step (GitHub issue #1206).
+#
+# Client boundary:
+#   POST /v1/responses
+#   Authorization: Bearer <gateway credential>
+#   OpenAI Responses JSON and SSE (rich typed items)
+#
+# Provider boundary:
+#   POST /v1/chat/completions
+#   Authorization: Bearer <provider credential>
+#   OpenAI Chat Completions JSON and SSE (function tools only)
+#
+# Request-path order inside the inference step is significant and test-locked:
+#
+#   openai_stream_events      arms streaming restoration (request-phase marker)
+#   openai_agentic_loop       prepares history / drives continuation rounds
+#   openai_client_tool_compat lowers rich client tools to private function tools
+#                             in request_body ONLY (canonical state.tools stays
+#                             rich for restore); fails closed on a client tool
+#                             named a reserved hosted call (file_search/web_search)
+#   responses_to_chat_completions  translates the lowered Responses request into a
+#                             Chat Completions request (reads the lowered
+#                             request_body tools via request_tools/request_tool_choice)
+#   path_rewrite              /v1/responses -> /v1/chat/completions
+#   router / credential_injection / load_balancer
+#
+# Response filters run in reverse, so responses_to_chat_completions rebuilds the
+# Responses object first, then openai_client_tool_compat restores the private
+# function_call items to their canonical typed items BEFORE openai_agentic_loop
+# observes them (this ordering keeps a client tool lowered to a private function
+# name from being misclassified as a hosted call). No private lowered name leaks
+# to the client. When the request declares no rich client tools the compat filter
+# is a transparent passthrough, so plain-function traffic is unchanged.
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [client-tool-compat-chat]
+
+filter_chains:
+  - name: client-tool-compat-chat
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_validate
+
+      # Persisted Responses/Conversations state is scoped to an immutable owner.
+      # This single-tenant demo installs a fixed owner directly (no auth gateway
+      # in front); a multi-tenant deployment would use mode: trusted_headers so
+      # an upstream gateway asserts the tenant/subject instead.
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_responses_rehydrate
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 4
+        timeout_ms: 30000
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_stream_events
+                # Must exceed the translator's complete-frame ceiling below.
+                max_buffer_bytes: 4194304
+                max_events: 1000
+                timeout_secs: 30
+
+              - filter: openai_agentic_loop
+                max_infer_iters: 4
+
+              - filter: openai_client_tool_compat
+                max_rewritten_body_bytes: 67108864
+                max_client_tools: 512
+
+              - filter: responses_to_chat_completions
+                max_rewritten_body_bytes: 1048576
+                max_emitted_sse_frame_bytes: 2097152
+                max_stream_events: 500
+                stream_timeout_secs: 30
+
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      path_prefix: "/v1/responses"
+                      methods: [POST]
+
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: chat-provider
+
+              - filter: credential_injection
+                clusters:
+                  - name: chat-provider
+                    header: Authorization
+                    value: "synthetic-provider-key"
+                    header_prefix: "Bearer "
+                    strip_client_credential: true
+
+              - filter: load_balancer
+                clusters:
+                  - name: chat-provider
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local scripted backend

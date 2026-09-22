@@ -1180,8 +1180,10 @@ fn append_logical_event(
 /// [`commit_chunk_events`], so this only mutates or replaces the event payload and
 /// forwards it. `RetypeInPlace` retypes a lowered `Namespace` member's
 /// `function_call` item back to its original name + namespace in place (Task 4).
-/// `EmitCustomShell`/`EmitCustomItemDone` splice the fully-typed public
-/// `custom_tool_call` payload the plan pass already built onto the corresponding
+/// `RetypeArgumentsName` overwrites the top-level `name` on a `Namespace`
+/// `function_call_arguments.done` (r2c populates it per the Responses schema, unlike
+/// native backends) with the member name, in place (#1206). `EmitCustomShell`/`EmitCustomItemDone` splice the
+/// fully-typed public `custom_tool_call` payload the plan pass already built onto the corresponding
 /// lifecycle event (Task 5). `EmitCustomInput`
 /// synthesizes the canonical `custom_tool_call_input` delta+done pair and drops the
 /// backend's `function_call_arguments.done` it replaces. `EmitTypedAdded`/`EmitTypedDone`
@@ -1197,7 +1199,7 @@ fn append_logical_event(
 /// `Suppress` is dropped before dispatch and must never reach the applier.
 #[expect(
     clippy::too_many_lines,
-    reason = "linear match dispatch over the eight client-tool restore arms, each with a load-bearing comment"
+    reason = "linear match dispatch over the nine client-tool restore arms, each with a load-bearing comment"
 )]
 fn apply_client_tool_disposition(
     state: &mut StreamEventsState,
@@ -1214,6 +1216,16 @@ fn apply_client_tool_disposition(
             namespace,
         } => {
             retype_item_in_place(event.payload_mut(), item_type, name, namespace.as_deref());
+            append_logical_event(state, ctx, event, logical_output);
+        },
+        // Namespace `function_call_arguments.done`: r2c populated the top-level `name`
+        // with the private lowered name; overwrite it with the member name in place so
+        // the `agentic_ns__{ns}__{member}` name never reaches the client. Only produced
+        // for frames that already carry a `name`, so this overwrites, never injects.
+        D::RetypeArgumentsName { name } => {
+            if let Some(object) = event.payload_mut().as_object_mut() {
+                object.insert("name".to_owned(), Value::String(name.clone()));
+            }
             append_logical_event(state, ctx, event, logical_output);
         },
         // Custom/NamespaceCustom synthesized custom_tool_call output-item events.

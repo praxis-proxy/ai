@@ -99,6 +99,16 @@ pub(super) enum ClientToolDisposition {
         /// The namespace to re-add, or `None` to remove it.
         namespace: Option<String>,
     },
+    /// Rewrite the top-level `name` on a lowered `Namespace` member's
+    /// `function_call_arguments.done` event. r2c (Responses->Chat->Responses)
+    /// populates `name` on this event per the Responses schema, unlike native
+    /// backends which omit it, so the private lowered name would otherwise surface
+    /// there. Only produced when the event actually carries a `name` (native
+    /// no-name frames stay `Passthrough`); the `.delta` counterpart carries no name.
+    RetypeArgumentsName {
+        /// The original member name to restore.
+        name: String,
+    },
     /// Emit a synthesized `custom_tool_call` `output_item.added` for
     /// `Custom`/`NamespaceCustom` (Task 5).
     EmitCustomShell {
@@ -205,7 +215,9 @@ fn plan_one_event(
     match event {
         ResponsesEvent::OutputItemAdded(payload) => plan_output_item_added(reverse, next_items, payload),
         ResponsesEvent::FunctionCallArgumentsDelta(payload) => Ok(plan_arguments_delta(next_items, payload)),
-        ResponsesEvent::FunctionCallArgumentsDone(payload) => plan_arguments_done(next_items, completions, payload),
+        ResponsesEvent::FunctionCallArgumentsDone(payload) => {
+            plan_arguments_done(reverse, next_items, completions, payload)
+        },
         ResponsesEvent::OutputItemDone(payload) => plan_output_item_done(reverse, next_items, payload),
         _ => Ok(ClientToolDisposition::Passthrough),
     }
@@ -370,6 +382,7 @@ fn plan_arguments_delta(next_items: &[ClientToolStreamItem], payload: &Value) ->
 /// no typed name, so lowered-ness is resolved by matching tracked items by key. Fails
 /// closed if the artifact is missing or the restore is lossy.
 fn plan_arguments_done(
+    reverse: &HashMap<String, LoweredClientTool>,
     next_items: &mut [ClientToolStreamItem],
     completions: &[ClientToolCompletion],
     payload: &Value,
@@ -385,8 +398,11 @@ fn plan_arguments_done(
     }
     tracked.phase = ClientToolPhase::ArgsComplete;
     match tracked.restore {
-        // Namespace args pass through unchanged; only the phase advances.
-        ClientToolRestore::Namespace => Ok(ClientToolDisposition::Passthrough),
+        // Namespace: args pass through, but r2c populates the top-level `name` on this
+        // event (native backends omit it), so restore the member name in place to keep
+        // the private lowered name from leaking. A no-name (native) frame stays a
+        // passthrough. The phase has already advanced above.
+        ClientToolRestore::Namespace => Ok(plan_namespace_arguments_done(reverse, tracked, payload)),
         // Custom/NamespaceCustom: synthesize the canonical custom input event pair.
         ClientToolRestore::Custom | ClientToolRestore::NamespaceCustom => {
             plan_custom_arguments_done(tracked, completions, &key)
@@ -396,6 +412,27 @@ fn plan_arguments_done(
         ClientToolRestore::Shell | ClientToolRestore::ToolSearch => {
             plan_typed_arguments_done(tracked, completions, &key)
         },
+    }
+}
+
+/// Plan the `function_call_arguments.done` disposition for a lowered `Namespace`
+/// member. r2c populates the top-level `name` on this event (native Responses
+/// backends omit it), so restore it to the client's member name in place; a native
+/// no-name frame carries nothing to leak and forwards unchanged. The member name is
+/// resolved from the lowering map keyed by the private name the backend returned.
+fn plan_namespace_arguments_done(
+    reverse: &HashMap<String, LoweredClientTool>,
+    tracked: &ClientToolStreamItem,
+    payload: &Value,
+) -> ClientToolDisposition {
+    if payload.get("name").and_then(Value::as_str).is_none() {
+        return ClientToolDisposition::Passthrough;
+    }
+    match reverse.get(tracked.private_name.as_str()) {
+        Some(lowered) => ClientToolDisposition::RetypeArgumentsName {
+            name: lowered.original_name.clone(),
+        },
+        None => ClientToolDisposition::Passthrough,
     }
 }
 
@@ -1144,6 +1181,43 @@ mod tests {
         // The private lowered name is tracked internally but never surfaces in a
         // client-visible disposition.
         assert_eq!(plan.next_items[0].private_name, "agentic_ns__fs__read");
+    }
+
+    // #1206 composition leak: r2c (Responses->Chat->Responses) populates `name` on
+    // `function_call_arguments.done` (native Responses backends omit it), so a lowered
+    // namespace member surfaces its private `agentic_ns__{ns}__{member}` name on that
+    // event. The plan pass must restore the top-level `name` to the member name; the
+    // `.delta` counterpart carries no name and stays a passthrough.
+    #[test]
+    fn namespace_arguments_done_with_name_restores_member_name() {
+        let reverse = reverse_namespace();
+        let added = ResponsesEvent::OutputItemAdded(serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "name": "agentic_ns__fs__read",
+                     "call_id": "c1", "id": "fc_1"}
+        }));
+        let args_done = ResponsesEvent::FunctionCallArgumentsDone(serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "name": "agentic_ns__fs__read",
+            "arguments": "{\"path\":\"/etc\"}"
+        }));
+        let events = [added, args_done];
+        let plan = plan_client_tool_restore(&reverse, None, &[], &events, &[]).unwrap();
+        assert_eq!(plan.dispositions.len(), 2);
+        assert!(matches!(
+            plan.dispositions[0],
+            ClientToolDisposition::RetypeInPlace { .. }
+        ));
+        match &plan.dispositions[1] {
+            ClientToolDisposition::RetypeArgumentsName { name } => {
+                assert_eq!(name, "read");
+            },
+            other => panic!("expected RetypeArgumentsName, got {other:?}"),
+        }
+        assert!(matches!(plan.next_items[0].phase, ClientToolPhase::ArgsComplete));
     }
 
     #[test]

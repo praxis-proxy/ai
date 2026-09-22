@@ -1,0 +1,43 @@
+version: 1
+id: responses/client-tool-compat-chat-stream
+description: Rich Codex custom client tool lowered to a private Chat function on a function-only Chat Completions backend; the backend's streamed chat.completion.chunk tool-call is translated by responses_to_chat_completions into a Responses SSE lifecycle and restored live to a custom_tool_call by openai_stream_events (GitHub issue #1206, #1159).
+protocol: openai_responses
+example_config: openai/responses/client-tool-compat-chat-completions.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.client_tool_compat.chat_stream_restore
+turns:
+  - name: custom-tool-lower-restore-over-chat-stream
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Apply the patch.
+          store: false
+          stream: true
+          tools:
+            - type: custom
+              name: apply_patch
+              description: Apply a unified diff to the workspace.
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events:
+        - response.created
+        - response.in_progress
+        - response.output_item.added
+        - response.custom_tool_call_input.delta
+        - response.custom_tool_call_input.done
+        - response.output_item.done
+        - response.completed
+      client_sse_repeatable_events:
+        - response.custom_tool_call_input.delta
+      upstream_sse_events: []

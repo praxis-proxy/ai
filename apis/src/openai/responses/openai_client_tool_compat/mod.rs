@@ -206,6 +206,15 @@ const TOOL_SEARCH_DEFAULT_DESCRIPTION: &str = "Search the client tool catalog";
 /// Default tool-search `query` parameter description.
 const TOOL_SEARCH_DEFAULT_QUERY_DESCRIPTION: &str = "A concise description of the needed capabilities.";
 
+/// Hosted-tool call NAMES a downstream filter silently re-routes by name, so a
+/// client tool may not lower to any of them (see [`reject_reserved_hosted_tool_name`]).
+/// A backend `function_call` named `file_search` is rewritten into a hosted
+/// `file_search_call` (`agentic_loop` → `file_search_callout`); one named
+/// `web_search` trips the Chat-Completions web-search collision reject and aliases
+/// the proxy's synthesized web-search bridge. These mirror the un-centralized
+/// sentinels in `translation/chat_completions.rs` and `file_search_callout`.
+const RESERVED_HOSTED_TOOL_NAMES: [&str; 2] = ["file_search", "web_search"];
+
 // -----------------------------------------------------------------------------
 // ClientToolCompatFilter
 // -----------------------------------------------------------------------------
@@ -227,10 +236,28 @@ const TOOL_SEARCH_DEFAULT_QUERY_DESCRIPTION: &str = "A concise description of th
 /// max_client_tools: 512
 /// ```
 ///
-/// Place the filter between `openai_agentic_loop` and `openai_responses_proxy` so
+/// Place the filter between `openai_agentic_loop` and the outbound serializer so
 /// it lowers after history is prepared and before the outbound body is
 /// serialized, and restores after the upstream body is captured and before the
-/// agentic loop parses it.
+/// agentic loop parses it. The outbound serializer is either:
+///
+/// - `openai_responses_proxy` for a native Responses backend — the proxy serializes its body from `state.request_body`,
+///   which already holds the lowered tools; or
+/// - `responses_to_chat_completions` for a function-only **Chat Completions** backend (§ issue #1206) — r2c reads the
+///   outbound tools through `ResponsesState::request_tools` / `request_tool_choice`, which return the lowered
+///   `request_body` view, so the backend receives valid `function` declarations while canonical `state.tools` stays
+///   rich for restore.
+///
+/// Two ordering invariants make the composition sound (praxis core performs no
+/// dependency-graph reorder, so a config must honor them; both are test-locked):
+///
+/// - **After `openai_agentic_loop` on the request path** (so it restores *before* the loop parses on the response
+///   path). `agentic_loop` rewrites a `function_call` named exactly `file_search` into a hosted `file_search_call` when
+///   a hosted file-search tool is configured; restoring first keeps a client tool that lowered to a private `function`
+///   name from being misclassified as a hosted call. `reject_reserved_hosted_tool_name` additionally reserves the
+///   `file_search`/`web_search` bare names so isolation does not depend on this placement alone.
+/// - **On the streaming path**, `openai_stream_events` must precede it so an SSE owner exists to restore the lowered
+///   calls; without it the filter fails closed rather than stream private `function` shapes to the client.
 pub struct ClientToolCompatFilter {
     /// Maximum size in bytes of a request or response body produced by lowering
     /// or restoration.
@@ -1293,6 +1320,10 @@ impl Lowering {
             // wire-name prefix; fail closed before it is withheld or lowered so its
             // name cannot collide with a synthesized namespace member.
             reject_reserved_top_level_name(tool)?;
+            // Nor may it lower to a hosted-tool call name a downstream filter
+            // re-routes by name (`file_search`/`web_search`); fail closed so
+            // client-tool isolation stays robust to pipeline composition.
+            reject_reserved_hosted_tool_name(tool)?;
             // A deferred declaration (`function` or `custom`) is not callable until
             // a `tool_search` loads it; withhold it from the outbound set so it
             // neither forwards a Responses-only `defer_loading` semantic a
@@ -1346,6 +1377,10 @@ impl Lowering {
             // reserved-prefix reservation as a declared one, so a hoisted tool cannot
             // impersonate a synthesized namespace member wire name either.
             reject_reserved_top_level_name(tool)?;
+            // The hosted-tool name reservation applies on the discovery path too, so
+            // a `tool_search` result cannot smuggle in a client tool that impersonates
+            // a hosted `file_search`/`web_search` call name.
+            reject_reserved_hosted_tool_name(tool)?;
             match tool.get("type").and_then(Value::as_str) {
                 Some("custom") => self.lower_custom(tool, lowered, LoweringSource::Discovery)?,
                 Some("shell") if shell_is_local(tool) => self.lower_shell(tool, lowered)?,
@@ -2699,6 +2734,33 @@ fn reject_reserved_top_level_name(tool: &Value) -> Result<(), FilterAction> {
     {
         return Err(reject_bad_request(&format!(
             "client tool '{name}' uses the reserved '{NAMESPACE_MEMBER_PREFIX}' namespace prefix"
+        )));
+    }
+    Ok(())
+}
+
+/// Fail closed on a client-declared or discovered top-level `function`/`custom`
+/// tool whose name is one of the hosted-tool call names a downstream filter
+/// silently re-routes by name ([`RESERVED_HOSTED_TOOL_NAMES`]).
+///
+/// A backend `function_call` named `file_search` is normalized into a hosted
+/// `file_search_call` by the agentic loop (`file_search_callout`), and one named
+/// `web_search` both trips the Chat-Completions web-search collision reject and
+/// aliases the proxy's synthesized web-search bridge. Lowering a client tool to
+/// either bare name would let a client-owned call be misclassified as hosted. Each
+/// downstream re-route is itself gated on a hosted tool being configured, but this
+/// filter runs before and independently of that configuration, so it reserves the
+/// bare names unconditionally — keeping client-tool isolation robust to pipeline
+/// composition rather than dependent on filter placement (§ issue #1206). The set
+/// is matched exactly: a name that merely embeds a sentinel (e.g. `web_searcher`)
+/// is a legitimate client tool and still lowers.
+fn reject_reserved_hosted_tool_name(tool: &Value) -> Result<(), FilterAction> {
+    if matches!(tool.get("type").and_then(Value::as_str), Some("function" | "custom"))
+        && let Some(name) = tool.get("name").and_then(Value::as_str)
+        && RESERVED_HOSTED_TOOL_NAMES.contains(&name)
+    {
+        return Err(reject_bad_request(&format!(
+            "client tool '{name}' collides with the reserved hosted tool name '{name}'"
         )));
     }
     Ok(())
