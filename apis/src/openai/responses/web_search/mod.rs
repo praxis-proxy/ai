@@ -602,11 +602,11 @@ fn parse_search_request<'a>(call: &'a Value, call_id: &'a str, index: usize) -> 
             let action = serde_json::json!({"type": "search", "queries": queries});
             Some(PreparedCall::new(call_id, index, queries, action))
         },
-        Some(_) => None,
-        None => legacy_query.map(|query| {
+        Some(Value::Array(_)) | None => legacy_query.map(|query| {
             let action = serde_json::json!({"type": "search", "query": query});
             PreparedCall::new(call_id, index, vec![query], action)
         }),
+        Some(_) => None,
     }
 }
 
