@@ -19,7 +19,8 @@ PRAXIS_AI_FEATURES ?= full
 # Crates that must never enter the default (standard) praxis-ai-proxy graph.
 DEFAULT_GRAPH_DENY := sqlx sqlx-core libsqlite3-sys openssl-sys native-tls rmcp sse-stream \
 	jsonschema utoipa tiktoken-rs reqwest serde_json_path tonic prost
-# Upper bound on crates (name@version, normal + build edges) in the default graph.
+# Upper bound on crates (name@version, normal + build edges, host target) in the
+# default graph. Linux hosts measure about 424, macOS about 428.
 DEFAULT_GRAPH_BUDGET ?= 430
 STORE_ALL_WORKSPACE_FEATURES := praxis-ai-proxy/store-all,praxis-tests-integration/store-all,praxis-tests-schema/store-all,praxis-tests-environment/store-all
 
@@ -99,6 +100,15 @@ test-store-features:
 	cargo check -p praxis-ai-proxy
 	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
 	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-all
+	@# Lint each opt-in group on its own so a gate leak in a partial feature set
+	@# cannot hide behind the lean and full builds that other targets cover.
+	@for group in openai-responses openai-file-resolve-filter store store-sqlite \
+		openai-conversations openai-compact openai-mcp-tools; do \
+		echo "clippy: standard + $$group"; \
+		cargo clippy -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy --all-targets \
+			--no-default-features --features praxis-ai-proxy/standard,praxis-ai-proxy/$$group \
+			-- -D warnings || exit 1; \
+	done
 	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-sqlite $(_NOCAPTURE)
 	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-all $(_NOCAPTURE)
 	@if cargo tree -p praxis-ai-proxy --features full --edges normal | grep -q libsqlite3-sys; then \
@@ -204,8 +214,11 @@ lint-lean:
 # Fail if a heavy crate enters the default praxis-ai-proxy graph, or if the
 # graph grows past DEFAULT_GRAPH_BUDGET crates.
 check-dep-budget:
-	@graph="$$(cargo tree --locked -p praxis-ai-proxy -e normal,build --target all \
-		--prefix none --format '{p}' | awk '{print $$1"@"$$2}' | sort -u)"; \
+	@tree="$$(cargo tree --locked -p praxis-ai-proxy -e normal,build --target all \
+		--prefix none --format '{p}')" || { echo "ERROR: cargo tree failed"; exit 1; }; \
+	host="$$(cargo tree --locked -p praxis-ai-proxy -e normal,build \
+		--prefix none --format '{p}')" || { echo "ERROR: cargo tree failed"; exit 1; }; \
+	graph="$$(printf '%s\n' "$$tree" | awk '{print $$1"@"$$2}' | sort -u)"; \
 	status=0; \
 	for crate in $(DEFAULT_GRAPH_DENY); do \
 		if printf '%s\n' "$$graph" | grep -q "^$$crate@"; then \
@@ -214,9 +227,9 @@ check-dep-budget:
 			status=1; \
 		fi; \
 	done; \
-	count=$$(cargo tree --locked -p praxis-ai-proxy -e normal,build --prefix none --format '{p}' \
-		| awk '{print $$1"@"$$2}' | sort -u | wc -l); \
-	echo "default praxis-ai-proxy graph: $$count crates (budget $(DEFAULT_GRAPH_BUDGET))"; \
+	count=$$(printf '%s\n' "$$host" | awk '{print $$1"@"$$2}' | sort -u | wc -l); \
+	[ "$$count" -gt 1 ] || { echo "ERROR: empty default dependency graph"; exit 1; }; \
+	echo "default praxis-ai-proxy graph: $$count crates for the host target (budget $(DEFAULT_GRAPH_BUDGET))"; \
 	[ "$$count" -le $(DEFAULT_GRAPH_BUDGET) ] || { echo "ERROR: over budget"; status=1; }; \
 	exit $$status
 
@@ -292,14 +305,14 @@ help:
 	@echo ""
 	@echo "Build:"
 	@echo "  build                cargo build --workspace"
-	@echo "  release              cargo build --workspace --release"
+	@echo "  release              cargo build --release -p praxis-ai-proxy --features $(PRAXIS_AI_FEATURES)"
 	@echo "  check                cargo check --workspace"
 	@echo "  clean                cargo clean"
 	@echo ""
 	@echo "Test:"
 	@echo "  test                 run all tests"
 	@echo "  test-unit            unit tests (providers, filters, server)"
-	@echo "  test-store-features   check PostgreSQL-only, SQLite-only, and combined store builds"
+	@echo "  test-store-features   check the lean and store builds and lint each feature group alone"
 	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
 	@echo "  test-inference-fixtures  inference fixture and replay tests"
