@@ -483,7 +483,10 @@ async fn on_request_body_executes_current_queries_without_duplicating_legacy_que
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a call carrying both field shapes is dispatched inline, not short-circuited"
+    );
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(state.web_search_calls_executed, 1, "one hosted action was dispatched");
@@ -527,7 +530,10 @@ async fn on_request_body_falls_back_to_legacy_query_when_queries_is_empty() {
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "the legacy fallback dispatches inline, not short-circuited"
+    );
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(
@@ -1766,7 +1772,10 @@ async fn multi_query_call_costs_one_tool_call_unit() {
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a multi-query call within the tool-call budget is dispatched, not short-circuited"
+    );
 
     assert_eq!(
         count.load(std::sync::atomic::Ordering::SeqCst),
@@ -1829,7 +1838,10 @@ async fn query_cap_bounds_the_whole_batch_and_keeps_partial_results() {
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a batch bounded by the fan-out cap still continues the request"
+    );
 
     assert_eq!(
         count.load(std::sync::atomic::Ordering::SeqCst),
@@ -1985,7 +1997,10 @@ async fn all_queries_failing_reports_failed_call() {
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a provider failure is reported to the model, not surfaced as a rejected request"
+    );
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(
@@ -2023,7 +2038,10 @@ async fn zero_result_success_before_failure_is_not_reported_as_failed() {
     ctx.extensions.insert(state);
 
     let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a partially failed call is reported to the model, not surfaced as a rejected request"
+    );
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(
