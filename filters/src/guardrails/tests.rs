@@ -504,14 +504,14 @@ async fn on_request_body_blocked_writes_filter_results() {
 }
 
 #[tokio::test]
-async fn on_request_body_modified_records_redaction_without_changing_body() {
+async fn on_request_body_modified_rewrites_last_user_message() {
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
     let mock_server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "status": "modified",
-            "content": "masked",
+            "content": "masked text",
             "rail": "pii"
         })))
         .mount(&mock_server)
@@ -521,8 +521,9 @@ async fn on_request_body_modified_records_redaction_without_changing_body() {
     let filter = nemo_filter(&endpoint);
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let original = bytes::Bytes::from_static(br#"{"messages":[{"role":"user","content":"secret"}]}"#);
-    let mut body = Some(original.clone());
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"model":"test","messages":[{"role":"system","content":"Be helpful"},{"role":"user","content":"first"},{"role":"assistant","content":"ok"},{"role":"user","content":"my email is secret@example.com"}]}"#,
+    ));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, praxis_filter::FilterAction::Continue));
@@ -530,7 +531,68 @@ async fn on_request_body_modified_records_redaction_without_changing_body() {
         ctx.filter_results.get("ai_guardrails").unwrap().get("status"),
         Some("redacted")
     );
-    assert_eq!(body, Some(original));
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .all(|(k, _)| k.as_ref() != "content-length"),
+        "filter must not set content-length (core handles framing)"
+    );
+
+    let forwarded: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        forwarded.get("model").and_then(|v| v.as_str()),
+        Some("test"),
+        "non-message fields should be preserved"
+    );
+    let messages = forwarded
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages");
+    assert_eq!(
+        messages.first().and_then(|m| m.get("content")).and_then(|v| v.as_str()),
+        Some("Be helpful")
+    );
+    assert_eq!(
+        messages.get(1).and_then(|m| m.get("content")).and_then(|v| v.as_str()),
+        Some("first")
+    );
+    assert_eq!(
+        messages.get(2).and_then(|m| m.get("content")).and_then(|v| v.as_str()),
+        Some("ok")
+    );
+    assert_eq!(
+        messages.get(3).and_then(|m| m.get("content")).and_then(|v| v.as_str()),
+        Some("masked text"),
+        "only the last user message content should be replaced"
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_modified_without_user_message_fails_closed() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "modified",
+            "content": "masked"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
+    let filter = nemo_filter(&endpoint);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"messages":[{"role":"system","content":"Be helpful"}]}"#,
+    ));
+
+    let result = filter.on_request_body(&mut ctx, &mut body, true).await;
+    assert!(
+        result.is_err(),
+        "modified with no user message to rewrite should fail closed"
+    );
 }
 
 #[tokio::test]
@@ -1241,4 +1303,45 @@ async fn on_response_body_blocked_replaces_body() {
         Some("blocked")
     );
     assert_blocked_body_json(&replaced, "toxicity");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_modified_rewrites_assistant_content() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "modified",
+            "content": "My SSN is [REDACTED]",
+            "rail": "pii"
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let endpoint = format!("{}/v1/checks", mock_server.uri());
+    let filter = nemo_filter_response(&endpoint);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
+    let original = chat_completion_response("My SSN is 123-45-6789");
+    let original_len = original.len();
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    let replaced = body.expect("body should be rewritten, not cleared");
+    assert_eq!(replaced.len(), original_len, "must match original Content-Length");
+    assert_eq!(
+        ctx.filter_results.get("ai_guardrails").unwrap().get("status"),
+        Some("redacted")
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(replaced.trim_ascii_end()).expect("redacted body should remain valid JSON");
+    assert_eq!(
+        json["choices"][0]["message"]["content"],
+        "My SSN is [REDACTED]",
+        "assistant content should be replaced with NeMo content"
+    );
 }

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use praxis_test_utils::{
     Backend, BackendGuard, StatefulCapturingBackend, free_port, http_post, http_send, json_post,
-    start_backend_with_shutdown, start_proxy, start_stateful_backend,
+    start_backend_with_shutdown, start_echo_backend, start_proxy, start_stateful_backend,
 };
 
 use super::load_example_config;
@@ -249,6 +249,45 @@ fn nemo_guardrails_block_rejects_with_403() {
     assert!(
         body.contains("jailbreak"),
         "triggered rail name should appear in response body; got: {body}"
+    );
+}
+
+/// `NeMo` returns `"modified"` → proxy rewrites the last user message with the
+/// masked text and forwards it to the upstream.
+#[test]
+fn nemo_guardrails_modified_forwards_redacted_body() {
+    let backend = start_echo_backend();
+    let nemo = nemo_mock(r#"{"status":"modified","content":"My SSN is [REDACTED]","rail":"pii"}"#);
+    let proxy_port = free_port();
+    let config = load_example_config(
+        "nemo-guardrails.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", nemo.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_post(
+        proxy.addr(),
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"system","content":"Be helpful"},{"role":"user","content":"My SSN is 123-45-6789"}]}"#,
+    );
+
+    assert_eq!(status, 200, "NeMo 'modified' should forward to upstream");
+    assert!(
+        !body.contains("123-45-6789"),
+        "original PII must not reach the upstream; got: {body}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("upstream should echo valid JSON");
+    let messages = parsed.get("messages").and_then(|v| v.as_array()).expect("messages should be an array");
+    assert_eq!(
+        messages.first().and_then(|m| m.get("content")),
+        Some(&serde_json::json!("Be helpful")),
+        "earlier messages should be preserved"
+    );
+    assert_eq!(
+        messages.get(1).and_then(|m| m.get("content")),
+        Some(&serde_json::json!("My SSN is [REDACTED]")),
+        "last user message should be replaced with NeMo content"
     );
 }
 

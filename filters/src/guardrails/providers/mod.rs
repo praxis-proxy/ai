@@ -55,9 +55,6 @@ pub enum GuardResult {
         reason: String,
     },
     /// Content contains sensitive data — forward with masked text.
-    ///
-    /// `modified_text` is populated from `NeMo` but not applied to the request
-    /// or response body until redaction support lands in `#49`.
     Redact {
         /// Provider-rewritten text with sensitive data masked.
         modified_text: String,

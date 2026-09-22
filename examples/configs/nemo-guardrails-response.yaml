@@ -9,7 +9,9 @@
 #     passed   - response forwarded to the client unchanged
 #     blocked  - response body replaced with a JSON error payload
 #                (status remains 200 because headers are already committed)
-#     modified - redaction verdict recorded; original body forwarded until #49
+#     modified - last assistant message replaced with masked text, then forwarded
+#     provider HTTP error - response body replaced with a JSON error payload
+#                (same as blocked; headers are already committed)
 
 listeners:
   - name: gateway
