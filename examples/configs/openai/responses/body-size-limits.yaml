@@ -44,7 +44,7 @@
 # required allow_pre_security_callout acknowledgements below.
 #
 # Build:
-#   cargo build -p praxis-ai-proxy
+#   cargo build -p praxis-ai-proxy --features openai-file-resolve-filter,openai-mcp-tools,store-sqlite
 
 body_limits:
   max_request_bytes: 1024

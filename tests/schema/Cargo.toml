@@ -9,8 +9,7 @@ publish = false
 
 [features]
 # Feature passthroughs mirroring praxis-ai-proxy (see its Cargo.toml). The
-# default is `full` so a plain `cargo test -p <crate>` exercises every filter;
-# lean runs use `--no-default-features --features standard`.
+# default is `full` so a plain `cargo test -p <crate>` exercises every filter.
 default = ["full"]
 standard = ["praxis-test-utils/standard"]
 openai-responses = ["praxis-test-utils/openai-responses"]

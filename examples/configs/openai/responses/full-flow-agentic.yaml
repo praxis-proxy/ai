@@ -283,7 +283,7 @@
 #           sni: api.openai.com
 #
 # Build:
-#   cargo build -p praxis-ai-proxy
+#   cargo build -p praxis-ai-proxy --features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite
 
 listeners:
   - name: ai-gateway

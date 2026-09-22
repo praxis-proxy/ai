@@ -38,6 +38,10 @@ store and the Conversations store:
 | `store-sqlite` | SQLite only |
 | `store-all` | PostgreSQL and SQLite |
 
+The store features only compile the Responses store filters. The Conversations
+API also needs `openai-conversations` (for example
+`--features openai-conversations,store-sqlite`).
+
 SQLite examples require an explicit build:
 
 ```console

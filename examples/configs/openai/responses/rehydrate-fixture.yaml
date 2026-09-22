@@ -24,7 +24,7 @@
 # `on_request`.
 #
 # Build:
-#   cargo build -p praxis-ai-proxy
+#   cargo build -p praxis-ai-proxy --features store-sqlite
 
 listeners:
   - name: ai-gateway

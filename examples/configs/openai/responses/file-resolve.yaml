@@ -29,7 +29,7 @@
 # extraction for vLLM is tracked separately in issue #397.
 #
 # Build:
-#   cargo build -p praxis-ai-proxy
+#   cargo build -p praxis-ai-proxy --features openai-file-resolve-filter
 
 listeners:
   - name: ai-gateway

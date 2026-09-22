@@ -5,7 +5,8 @@ Configuration examples organized by category.
 ## Running an Example
 
 ```console
-cargo run -p praxis-ai-proxy -- -c examples/configs/openai/responses/full-flow-agentic.yaml
+cargo run -p praxis-ai-proxy --features openai-all,store-sqlite -- \
+  -c examples/configs/openai/responses/full-flow-agentic.yaml
 curl http://localhost:8080/
 ```
 
