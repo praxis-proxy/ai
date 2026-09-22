@@ -910,12 +910,17 @@ impl McpSubrequestClient {
                 Ok(StreamableHttpPostResponse::Sse(sse, session_id_out))
             },
             Some(ct) if is_json_content_type(ct) => {
-                // A streaming JSON body: buffer it (bounded by the executor cap) and
-                // parse the terminal message.
-                let buffered = collect_body(&mut body).await;
+                // A streaming JSON body: buffer it (bounded by the per-message cap,
+                // failing closed on oversize or a transport error) and parse the
+                // terminal message. A Request always needs a reply, so an
+                // unparseable body is a typed UnexpectedServerResponse, never an
+                // Accepted ack (which is reserved for one-way messages).
+                let buffered = collect_body(&mut body, per_event_cap, &self.signal_handle()).await?;
                 match serde_json::from_slice::<ServerJsonRpcMessage>(&buffered) {
                     Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
-                    Err(_error) => Ok(StreamableHttpPostResponse::Accepted),
+                    Err(_error) => Err(StreamableHttpError::UnexpectedServerResponse(
+                        "streaming JSON response was not a valid JSON-RPC message".into(),
+                    )),
                 }
             },
             other => {
@@ -1027,6 +1032,7 @@ impl StreamableHttpClient for McpSubrequestClient {
         clippy::too_many_lines,
         reason = "streaming + buffered-fallback ladder mirrors post_message structure"
     )]
+    #[expect(clippy::large_stack_frames, reason = "rmcp/executor futures are inherently large")]
     async fn post_message_with_max_sse_event_size(
         &self,
         uri: Arc<str>,
@@ -1164,7 +1170,12 @@ fn classify_buffered_post_response(
         Some(content_type) if is_json_content_type(content_type) => {
             match serde_json::from_slice::<ServerJsonRpcMessage>(&response.body) {
                 Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id_out)),
-                Err(_error) => Ok(StreamableHttpPostResponse::Accepted),
+                // A Request always needs a reply; an unparseable body is a typed
+                // UnexpectedServerResponse, never an Accepted ack (which is
+                // reserved for one-way messages).
+                Err(_error) => Err(StreamableHttpError::UnexpectedServerResponse(
+                    "buffered JSON response was not a valid JSON-RPC message".into(),
+                )),
             }
         },
         other => Err(StreamableHttpError::UnexpectedContentType(other.map(str::to_owned))),
@@ -1177,14 +1188,54 @@ async fn drain_body(body: &mut Box<dyn StreamingResponseBody>) {
     body.cancel().await;
 }
 
-/// Collect a streaming body into a single `Bytes` buffer.
-async fn collect_body(body: &mut Box<dyn StreamingResponseBody>) -> Bytes {
+/// Collect a streaming body into a single `Bytes` buffer, failing closed.
+///
+/// Accumulates chunks into one bounded [`bytes::BytesMut`] and enforces a local
+/// byte `cap`. On overflow (`buf.len() > cap`) the size signal is recorded into
+/// `signal` (first wins) so the typed 413 survives rmcp's opaque error mapping,
+/// the body is cancelled, and a typed [`McpTransportError::ResponseTooLarge`] is
+/// returned — never the truncated buffer.
+///
+/// A `next_chunk()` error also fails closed the same way. On this armed
+/// streaming-JSON drain the body is wrapped at the loosened `2×` executor
+/// backstop specifically so that response *size* is the dominant failure mode:
+/// praxis withholds an oversize chunk as an opaque error, so mapping any
+/// `next_chunk()` error to `ResponseTooLarge` keeps the typed 413. Conflating a
+/// rare genuine transport error with a 413 on this path is still fail-closed and
+/// never turns an error into a success. Clean EOF (`Ok(None)`) cancels the body
+/// and returns the buffered bytes.
+async fn collect_body(
+    body: &mut Box<dyn StreamingResponseBody>,
+    cap: usize,
+    signal: &Arc<OnceLock<TransportSignal>>,
+) -> Result<Bytes, StreamableHttpError<McpTransportError>> {
     let mut buf = bytes::BytesMut::new();
-    while let Ok(Some(chunk)) = body.next_chunk().await {
-        buf.extend_from_slice(&chunk);
+    loop {
+        match body.next_chunk().await {
+            Ok(Some(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > cap {
+                    signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
+                    body.cancel().await;
+                    return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
+                }
+            },
+            Ok(None) => {
+                body.cancel().await;
+                return Ok(buf.freeze());
+            },
+            Err(_error) => {
+                // The armed streaming body withholds an oversize chunk at the 2x
+                // executor backstop as an opaque error; on this drain size is the
+                // dominant failure mode, so any next_chunk error fails closed as a
+                // 413. This never yields a false success and never returns the
+                // partial buffer.
+                signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit: cap });
+                body.cancel().await;
+                return Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge));
+            },
+        }
     }
-    body.cancel().await;
-    buf.freeze()
 }
 
 /// Merge caller custom headers and an optional bearer token into a header map.
@@ -1939,6 +1990,144 @@ mod tests {
         );
         let out = classify_buffered_post_response(response, &message, false).unwrap();
         assert!(matches!(out, StreamableHttpPostResponse::Json(_, _)));
+    }
+
+    // -- collect_body fail-closed (F4) --
+
+    fn fake_body(
+        chunks: impl IntoIterator<Item = Bytes>,
+    ) -> (Box<dyn StreamingResponseBody>, Arc<std::sync::atomic::AtomicBool>) {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body: Box<dyn StreamingResponseBody> = Box::new(
+            crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks(chunks, Arc::clone(&cancelled)),
+        );
+        (body, cancelled)
+    }
+
+    fn erroring_body(
+        chunks: impl IntoIterator<Item = Bytes>,
+    ) -> (Box<dyn StreamingResponseBody>, Arc<std::sync::atomic::AtomicBool>) {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body: Box<dyn StreamingResponseBody> = Box::new(
+            crate::mcp_client::sse_adapter::FakeStreamingBody::erroring_after(chunks, Arc::clone(&cancelled)),
+        );
+        (body, cancelled)
+    }
+
+    #[tokio::test]
+    async fn collect_body_fails_closed_on_next_chunk_error() {
+        // erroring_after yields all chunks, then next_chunk() returns Err — the
+        // praxis-withheld-oversize simulation. collect_body must fail closed with
+        // a typed 413, record the signal, cancel, and NOT return the partial buffer.
+        let (mut body, cancelled) = erroring_body([Bytes::from_static(b"partial")]);
+        let signal = Arc::new(OnceLock::new());
+        let result = collect_body(&mut body, 1024, &signal).await;
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(
+            matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit: 1024 })),
+            "a next_chunk error on the armed drain records a 413 signal at the cap"
+        );
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "collect_body must cancel the body on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_body_fails_closed_when_buffer_exceeds_cap() {
+        // Two 4-byte chunks exceed a 6-byte cap on the second chunk.
+        let (mut body, cancelled) = fake_body([Bytes::from_static(b"aaaa"), Bytes::from_static(b"bbbb")]);
+        let signal = Arc::new(OnceLock::new());
+        let result = collect_body(&mut body, 6, &signal).await;
+        assert!(matches!(
+            result,
+            Err(StreamableHttpError::Client(McpTransportError::ResponseTooLarge))
+        ));
+        assert!(
+            matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit: 6 })),
+            "an over-cap buffer records a 413 signal at the local cap"
+        );
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst), "cap breach cancels the body");
+    }
+
+    #[tokio::test]
+    async fn collect_body_returns_bytes_on_clean_eof() {
+        let (mut body, cancelled) = fake_body([Bytes::from_static(b"hello "), Bytes::from_static(b"world")]);
+        let signal = Arc::new(OnceLock::new());
+        let bytes = collect_body(&mut body, 1024, &signal).await.expect("clean body collects");
+        assert_eq!(bytes.as_ref(), b"hello world");
+        assert!(signal.get().is_none(), "a clean body records no size signal");
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "collect_body cancels the body after a clean EOF"
+        );
+    }
+
+    // -- JSON-parse failure for a Request fails closed, never Accepted (F4) --
+
+    #[tokio::test]
+    async fn streaming_post_unparseable_json_is_unexpected_server_response_not_accepted() {
+        let (body, _cancelled) = fake_body([Bytes::from_static(b"{not json")]);
+        let response = sub_response(200, Some("application/json"), b"");
+        let result = client()
+            .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024)
+            .await;
+        assert!(
+            matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(_))),
+            "an unparseable streaming JSON Request response must be a typed error, not Ok(Accepted)"
+        );
+        assert!(
+            !matches!(result, Ok(StreamableHttpPostResponse::Accepted)),
+            "Accepted is reserved for one-way messages, never a Request"
+        );
+    }
+
+    #[test]
+    fn classify_buffered_post_response_unparseable_json_is_unexpected_server_response() {
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}
+        }))
+        .unwrap();
+        let response = sub_response(200, Some("application/json"), b"{not json");
+        let result = classify_buffered_post_response(response, &message, false);
+        assert!(
+            matches!(result, Err(StreamableHttpError::UnexpectedServerResponse(_))),
+            "an unparseable buffered JSON Request response must be a typed error (was Accepted)"
+        );
+    }
+
+    // -- R4 regression: one-way acks still classify as Accepted --
+
+    #[test]
+    fn classify_buffered_post_response_empty_200_notification_is_accepted() {
+        // A framing-only success for a one-way notification is an ack, not an error.
+        let notification: ClientJsonRpcMessage =
+            serde_json::from_value(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+                .expect("deserialize notification");
+        assert!(matches!(notification, ClientJsonRpcMessage::Notification(_)));
+        let response = sub_response(200, None, b"");
+        let out = classify_buffered_post_response(response, &notification, false).unwrap();
+        assert!(
+            matches!(out, StreamableHttpPostResponse::Accepted),
+            "an empty-200 notification ack must stay Accepted (R4)"
+        );
+    }
+
+    #[test]
+    fn classify_buffered_post_response_202_is_accepted() {
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "x"}
+        }))
+        .unwrap();
+        let response = sub_response(202, None, b"");
+        let out = classify_buffered_post_response(response, &message, false).unwrap();
+        assert!(
+            matches!(out, StreamableHttpPostResponse::Accepted),
+            "a 202 ack must stay Accepted (R4)"
+        );
     }
 
     // -- GET SSE stream path (Task 7) --
