@@ -101,6 +101,7 @@ impl std::fmt::Debug for SecretSnapshot {
 /// same underlying cell; the watcher swaps the snapshot atomically.
 #[derive(Clone)]
 pub struct SecretHandle {
+    /// Shared, atomically-swappable cell holding the current published snapshot.
     inner: Arc<ArcSwap<SecretSnapshot>>,
 }
 
@@ -112,17 +113,10 @@ impl SecretHandle {
         self.inner.load()
     }
 
-    pub(crate) fn new(snapshot: SecretSnapshot) -> Self {
-        Self { inner: Arc::new(ArcSwap::from_pointee(snapshot)) }
-    }
-
-    pub(crate) fn cell(&self) -> Arc<ArcSwap<SecretSnapshot>> {
-        Arc::clone(&self.inner)
-    }
-
+    /// Build a fixed, non-watched handle for tests.
     #[cfg(test)]
     pub(crate) fn from_snapshot_for_test(payload: Option<Zeroizing<String>>) -> Self {
-        Self::new(SecretSnapshot { payload })
+        Self { inner: Arc::new(ArcSwap::from_pointee(SecretSnapshot { payload })) }
     }
 }
 
@@ -142,11 +136,13 @@ pub struct DiagnosticContext {
     /// Owning filter name, e.g. `"credential_inject"`.
     pub owner: &'static str,
     /// Preformatted non-secret label, e.g. `"name/namespace/key"`; `None` for a
-    /// single-credential filter (web_search).
+    /// single-credential filter (`web_search`).
     pub reference: Option<String>,
 }
 
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod tests {
     use super::*;
 
