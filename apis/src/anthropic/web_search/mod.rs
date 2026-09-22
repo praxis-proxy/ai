@@ -37,6 +37,11 @@ const REQUEST_ACCUMULATOR_KEY: &str = "anthropic_web_search.request";
 /// Maximum UTF-8 size accepted for a server-managed search query.
 const MAX_SEARCH_QUERY_BYTES: usize = 8 * 1024;
 
+/// The managed tool name this filter owns in the Anthropic Messages tool list.
+/// Matched both when a request *declares* the tool (credential preflight) and
+/// when a response *calls* it (managed-search classification).
+const MANAGED_TOOL_NAME: &str = "WebSearch";
+
 /// Server-owned search call classified from the accounted previous response.
 #[derive(Debug)]
 struct PendingSearch {
@@ -60,9 +65,31 @@ enum ResponseDecision {
 
 /// Initial request fields inspected without materializing the full payload.
 #[derive(Deserialize)]
-struct RequestEnvelope {
+struct RequestEnvelope<'a> {
     /// Whether the client requested streaming.
     stream: Option<bool>,
+    /// Declared tools, borrowed and inspected only to detect the managed
+    /// [`MANAGED_TOOL_NAME`] tool this filter will drive a callout for.
+    #[serde(borrow, default)]
+    tools: Vec<RequestTool<'a>>,
+}
+
+impl RequestEnvelope<'_> {
+    /// Whether the request declares the managed `WebSearch` tool this filter
+    /// owns, so a per-user credential preflight applies to it.
+    fn declares_managed_web_search(&self) -> bool {
+        self.tools
+            .iter()
+            .any(|tool| tool.name.as_ref().and_then(TextField::as_str) == Some(MANAGED_TOOL_NAME))
+    }
+}
+
+/// One declared tool from the request, inspected only for its name.
+#[derive(Deserialize)]
+struct RequestTool<'a> {
+    /// Tool name, matched against [`MANAGED_TOOL_NAME`].
+    #[serde(borrow)]
+    name: Option<TextField<'a>>,
 }
 
 /// A borrowed JSON string or an ignored value of another type.
@@ -349,6 +376,37 @@ impl AnthropicWebSearchFilter {
         )
     }
 
+    /// Whether this request body is an IRR re-entry (a later agentic round),
+    /// distinguished by the router-owned [`IterationState`] carrying the previous
+    /// round's response. A fresh, first-round request has none.
+    fn is_reentry(ctx: &HttpFilterContext<'_>) -> bool {
+        ctx.extensions
+            .get::<IterationState>()
+            .and_then(|state| state.previous_response.as_ref())
+            .is_some()
+    }
+
+    /// Preflight the required per-user credential before the first inference
+    /// stream begins.
+    ///
+    /// The re-entry credential check runs only after round 0, by which point
+    /// terminal streaming may have already committed HTTP 200 — too late to fail
+    /// closed. When the request declares the managed [`MANAGED_TOOL_NAME`] tool
+    /// this filter will drive a callout for, resolve the slot now so a missing
+    /// credential is rejected before any backend round or provider callout runs.
+    /// The identity is re-derived at re-entry from the same context, so this only
+    /// proves presence and discards its result.
+    fn preflight_managed_credential(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        request: &RequestEnvelope<'_>,
+    ) -> Result<(), Rejection> {
+        if self.user_credential_slot.is_some() && request.declares_managed_web_search() {
+            self.resolve_callout_identity(ctx)?;
+        }
+        Ok(())
+    }
+
     /// Execute one pending call, returning the provider outcome.
     ///
     /// A provider failure never rejects the Messages response: the caller
@@ -621,19 +679,14 @@ impl HttpFilter for AnthropicWebSearchFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if ctx
-            .extensions
-            .get::<IterationState>()
-            .and_then(|state| state.previous_response.as_ref())
-            .is_some()
-        {
+        if Self::is_reentry(ctx) {
             return self.handle_reentry(ctx, body).await;
         }
 
         let Some(bytes) = body.as_deref() else {
             return Ok(FilterAction::Continue);
         };
-        let request: RequestEnvelope = match serde_json::from_slice(bytes) {
+        let request: RequestEnvelope<'_> = match serde_json::from_slice(bytes) {
             Ok(value) => value,
             Err(_) => return Ok(FilterAction::Continue),
         };
@@ -644,6 +697,9 @@ impl HttpFilter for AnthropicWebSearchFilter {
                 "invalid_request_error",
                 "streaming is not supported with anthropic_web_search",
             )));
+        }
+        if let Err(rejection) = self.preflight_managed_credential(ctx, &request) {
+            return Ok(FilterAction::Reject(rejection));
         }
         self.apply_streaming_transport(ctx, streaming);
 
@@ -996,7 +1052,7 @@ fn classify_response(response_bytes: &[u8]) -> ResponseDecision {
     if tools.next().is_some() {
         return ResponseDecision::Done;
     }
-    if tool.name.as_ref().and_then(TextField::as_str) != Some("WebSearch") {
+    if tool.name.as_ref().and_then(TextField::as_str) != Some(MANAGED_TOOL_NAME) {
         return ResponseDecision::Done;
     }
     let Some(id) = tool

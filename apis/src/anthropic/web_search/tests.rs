@@ -1518,3 +1518,109 @@ fn absent_slot_resolves_without_a_credential() {
         "no slot configured means no per-user credential is selected"
     );
 }
+
+/// A terminal-streaming filter requiring the given per-user credential slot.
+fn streaming_filter_requiring_slot(slot: &str) -> AnthropicWebSearchFilter {
+    let mut filter = filter_requiring_slot(slot);
+    filter.terminal_streaming = true;
+    filter
+}
+
+/// A managed `WebSearch` request body with the given `stream` flag.
+fn managed_web_search_request(stream: bool) -> Bytes {
+    Bytes::from(
+        json!({
+            "model": "test",
+            "max_tokens": 32,
+            "stream": stream,
+            "tools": [{"name": "WebSearch", "description": "Search the web", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "search"}]
+        })
+        .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn streaming_missing_credential_rejects_before_first_inference_stream() {
+    // Under terminal streaming the callout credential was formerly first checked
+    // at re-entry, after round 0 may have already committed HTTP 200 — too late to
+    // fail closed. A managed-WebSearch `stream: true` request with a required-but-
+    // missing slot must be rejected with 401 before the first inference stream, so
+    // no backend round or provider callout ever runs.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    // No CalloutCredentials inserted: the required `brave` slot is absent.
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(managed_web_search_request(true));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a missing per-user credential must fail closed before the first inference stream");
+    };
+    assert_eq!(rejection.status, 401);
+    let rejection_body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(rejection_body["type"], "error");
+    assert_eq!(rejection_body["error"]["type"], "authentication_error");
+    assert!(
+        rejection_body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("brave")),
+        "the message names the missing slot id"
+    );
+    // Zero backend/provider calls: a preflight rejection terminates the request
+    // phase before the streaming transport is selected, so no inference stream
+    // began and no callout was dispatched.
+    assert_eq!(
+        ctx.subrequest_response_mode(),
+        SubRequestResponseMode::Buffered,
+        "a preflight rejection must not select the streaming transport"
+    );
+}
+
+#[tokio::test]
+async fn streaming_with_present_credential_accepts_and_selects_streaming_transport() {
+    // The preflight must not false-reject a valid request: with the required slot
+    // populated (threaded into the round-0 context by the outer callout_credentials
+    // filter), a managed-WebSearch `stream: true` request is accepted and selects
+    // the streaming transport for the terminal response.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut creds = CalloutCredentials::new();
+    creds.insert("brave".to_owned(), SecretString::from("user-secret"));
+    ctx.extensions.insert(creds);
+    let mut body = Some(managed_web_search_request(true));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a populated required slot must pass the preflight and continue"
+    );
+    assert_eq!(
+        ctx.subrequest_response_mode(),
+        SubRequestResponseMode::Streaming,
+        "an accepted effective streaming request must select the streaming transport"
+    );
+}
+
+#[tokio::test]
+async fn streaming_without_managed_tool_skips_credential_preflight() {
+    // The preflight is scoped to requests that declare the managed `WebSearch`
+    // tool. A configured slot must not over-reject a `stream: true` request that
+    // asks for no web search (no callout will run), even with no credential set.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"test","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a request without the managed WebSearch tool must skip the credential preflight"
+    );
+}
