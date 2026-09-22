@@ -26,8 +26,8 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SubRequestResponseMode,
-    body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SelectedUpstreamBodyOutcome,
+    SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde::Deserialize;
 use tracing::{debug, trace, warn};
@@ -361,7 +361,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         "responses_to_chat_completions"
     }
 
-    fn request_body_access(&self) -> BodyAccess {
+    fn selected_upstream_request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadWrite
     }
 
@@ -385,7 +385,7 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
     fn may_select_streaming_subrequest_response(&self) -> bool {
         // This filter runs inside the iterative router and always advertises the
         // streaming subrequest capability. The transport is chosen per request in
-        // `on_request_body` from the effective `stream` bit: an effective
+        // the selected-upstream body hook from the effective `stream` bit: an effective
         // `"stream": true` request streams so each translated per-round stream
         // stays internal to the router (letting `openai_agentic_loop` parse it and
         // dispatch tools), and a buffered request buffers. A build-time flag would
@@ -457,23 +457,18 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         }
     }
 
-    async fn on_request_body(
+    async fn on_selected_upstream_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        end_of_stream: bool,
-    ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream {
-            return Ok(FilterAction::Continue);
-        }
-
+    ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
         if let Some(action) = request_disposition(ctx) {
-            return Ok(action);
+            return selected_upstream_outcome(action);
         }
 
         let serialized = match self.translated_request_bytes(ctx)? {
             Ok(bytes) => bytes,
-            Err(action) => return Ok(action),
+            Err(action) => return selected_upstream_outcome(action),
         };
         ctx.request_headers_to_remove.push(http::header::ACCEPT_ENCODING);
         *body = Some(Bytes::from(serialized));
@@ -486,7 +481,22 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
             .map_or(now, |state| *state.response_created_at.get_or_insert(now));
         ctx.set_metadata(CREATED_AT_KEY, created_at.to_string());
 
-        Ok(FilterAction::Continue)
+        Ok(SelectedUpstreamBodyOutcome::Continue)
+    }
+}
+
+/// Convert the legacy request-body disposition into the selected-upstream
+/// phase's deliberately narrower continue-or-reject result.
+fn selected_upstream_outcome(action: FilterAction) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
+    match action {
+        FilterAction::Continue | FilterAction::Release | FilterAction::BodyDone => {
+            Ok(SelectedUpstreamBodyOutcome::Continue)
+        },
+        FilterAction::Reject(rejection) => Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
+        FilterAction::TerminalResponse(_) | FilterAction::StreamingTerminalResponse(_) => Err(
+            "responses_to_chat_completions: terminal response is invalid during selected-upstream body processing"
+                .into(),
+        ),
     }
 }
 

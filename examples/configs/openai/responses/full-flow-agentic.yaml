@@ -210,15 +210,15 @@
 #     - openai_responses_proxy         when application_protocol=openai_responses
 #     - responses_to_chat_completions  when application_protocol=openai_chat_completions
 #     - path_rewrite                   when application_protocol=openai_chat_completions
-#   Flip the cluster's http block (native openai_responses/openai vs
-#   openai_chat_completions/vllm) to switch protocols without editing the
-#   pipeline. selected_upstream fails closed: declare application_protocol on
-#   the cluster, or neither branch fires and no outbound body is built. The
-#   gated filters must sit AFTER the unconditional load balancer, so build-time
-#   validation can prove a load balancer always runs before them.
-#   NOTE (WIP): praxis#1241 is not yet merged. Until the pinned praxis-core rev
-#   in the workspace Cargo.toml includes it, the selected_upstream condition is
-#   unknown to the config parser and this example will fail to validate/CI.
+#   The load balancer declares both supported protocol variants because core
+#   validates selected_upstream matcher values against the clusters that can be
+#   selected. Change the inference router's cluster target from
+#   inference-backend (native Responses) to chat-completions-backend to switch
+#   protocols without editing the filter pipeline. selected_upstream fails
+#   closed: declare application_protocol on every selectable cluster, or neither
+#   branch fires and no outbound body is built. The gated filters must sit AFTER
+#   the unconditional load balancer, so build-time validation can prove a load
+#   balancer always runs before them.
 #
 # Security: StreamBuffer body callouts run before this listener's
 # header-phase filters. Deploy this example behind an outer authentication
@@ -300,10 +300,10 @@
 #   - Replace the local inference-backend endpoint with api.openai.com:443
 #     and configure tls.sni: api.openai.com (in BOTH the bypass branch's
 #     load_balancer and the IRR step's load_balancer). Keep the IRR step
-#     cluster's http.application_protocol: openai_responses (the default) so
-#     openai_responses_proxy runs and no translation is applied — api.openai.com
-#     speaks the Responses API natively. Point at a Chat Completions backend
-#     instead by switching that block to openai_chat_completions/vllm.
+#     inference-backend cluster's endpoint and keep the inference router target
+#     on inference-backend so openai_responses_proxy runs and no translation is
+#     applied — api.openai.com speaks the Responses API natively. Point the
+#     router at chat-completions-backend for a Chat Completions backend instead.
 #   - Add this headers filter inside the IRR step after the router to
 #     replace the downstream Host:
 #
@@ -665,6 +665,8 @@ filter_chains:
               - filter: router
                 routes:
                   - path: "/v1/responses"
+                    # Default: native Responses. Change only this target to
+                    # "chat-completions-backend" for a Chat Completions backend.
                     cluster: "inference-backend"
               # Unconditional load balancer: selects the upstream endpoint AND
               # publishes the selected cluster's typed application metadata
@@ -675,20 +677,20 @@ filter_chains:
               - filter: load_balancer
                 clusters:
                   - name: "inference-backend"
-                    # Declares the backend wire protocol. Flip this block to
-                    # switch the whole gateway between a native Responses
-                    # upstream and a Chat Completions upstream WITHOUT editing
-                    # the filter pipeline: the selected_upstream conditions
-                    # below fire the matching body-build path. Default: native
-                    # Responses (preserves this example's original behavior).
+                    # Native Responses variant (the router default).
                     http:
                       application_protocol: openai_responses
                       application_provider: openai
-                    # Chat Completions backend (e.g. vLLM) variant — comment the
-                    # block above and uncomment this one:
-                    #   http:
-                    #     application_protocol: openai_chat_completions
-                    #     application_provider: vllm
+                    endpoints:
+                      - "127.0.0.1:3001"
+                  - name: "chat-completions-backend"
+                    # Chat Completions variant (for example vLLM). Both
+                    # variants stay declared so selected_upstream matcher
+                    # validation can prove that every condition is reachable;
+                    # only the cluster targeted by the router is selected.
+                    http:
+                      application_protocol: openai_chat_completions
+                      application_provider: vllm
                     endpoints:
                       - "127.0.0.1:3001"
 
