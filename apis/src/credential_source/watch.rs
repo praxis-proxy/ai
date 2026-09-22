@@ -135,6 +135,10 @@ impl WatchRegistry {
     /// Register a `file` source: performs the authoritative initial read +
     /// transform (rejecting construction on failure) and returns its handle.
     ///
+    /// The `transform` closure must return `Err` for every failure mode and must not
+    /// panic: it runs on the watcher thread, where a panic terminates rotation and
+    /// freezes the last-published snapshot (fail-stale) instead of failing closed.
+    ///
     /// # Errors
     ///
     /// Returns [`FilterError`] when `source` is not a `File`, when the path is
@@ -209,7 +213,7 @@ impl WatchRegistry {
                 };
                 let mut directories = HashSet::new();
                 for item in &watched {
-                    let directory = item.path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+                    let directory = item.canonical_dir.clone();
                     if directories.insert(directory.clone())
                         && watcher.watch(&directory, RecursiveMode::NonRecursive).is_err()
                     {

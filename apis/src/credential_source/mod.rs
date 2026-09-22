@@ -179,7 +179,11 @@ pub(crate) fn resolve_raw_token(
                 None => String::new(),
             };
             let token = std::env::var(name).map_err(|error| -> FilterError {
-                format!("{owner}: env var '{name}' not set{for_ref}: {error}").into()
+                let detail = match error {
+                    std::env::VarError::NotPresent => "not set",
+                    std::env::VarError::NotUnicode(_) => "not valid UTF-8",
+                };
+                format!("{owner}: env var '{name}' {detail}{for_ref}").into()
             })?;
             file::validate_token(&token, ctx.owner)?;
             Ok(Zeroizing::new(token))
@@ -204,6 +208,10 @@ pub(crate) fn file_validate_source_len_for_registry(
 /// snapshot; `file` registers a watcher (see [`WatchRegistry`]) and returns a
 /// `WatchHandle`. An invalid initial token — for any source kind — rejects
 /// construction (fail loud at startup).
+///
+/// The `transform` closure must return `Err` for every failure mode and must not
+/// panic: it runs on the watcher thread, where a panic terminates rotation and
+/// freezes the last-published snapshot (fail-stale) instead of failing closed.
 ///
 /// # Errors
 ///
@@ -358,6 +366,9 @@ mod tests {
         assert!(msg.contains("credential_inject"), "{msg}");
         assert!(msg.contains("name/namespace/key"), "{msg}");
         assert!(msg.contains("not set"), "{msg}");
-        assert!(msg.contains(": "), "must retain the trailing VarError detail: {msg}");
+        assert!(
+            !msg.to_lowercase().contains("unicode"),
+            "must not fall through to VarError Display: {msg}"
+        );
     }
 }
