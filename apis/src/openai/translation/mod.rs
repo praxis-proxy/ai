@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn state_reasoning_item_is_replayed_inline_into_the_assistant_turn() {
+    fn state_reasoning_item_is_replayed_into_the_assistant_turn() {
         let request = json!({"model": "m", "input": "hi"});
         let messages = vec![
             json!({"role": "user", "content": "hi"}),
@@ -195,7 +195,8 @@ mod tests {
         let messages = mapped["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1]["role"], "assistant");
-        assert_eq!(messages[1]["content"], "<think>chain of thought</think>answer");
+        assert_eq!(messages[1]["reasoning"], "chain of thought");
+        assert_eq!(messages[1]["content"], "answer");
     }
 
     #[test]
@@ -2055,7 +2056,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_item_is_replayed_inline_into_the_following_assistant_message() {
+    fn reasoning_item_is_replayed_into_the_following_assistant_message() {
         let mapped = map_with_reasoning(
             &json!({
                 "model": "m",
@@ -2071,11 +2072,12 @@ mod tests {
         let messages = mapped["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1]["role"], "assistant");
-        assert_eq!(messages[1]["content"], "<think>chain of thought</think>answer");
+        assert_eq!(messages[1]["reasoning"], "chain of thought");
+        assert_eq!(messages[1]["content"], "answer");
     }
 
     #[test]
-    fn reasoning_item_is_replayed_inline_into_the_following_tool_call() {
+    fn reasoning_item_is_replayed_into_the_following_tool_call() {
         let mapped = map_with_reasoning(
             &json!({
                 "model": "m",
@@ -2090,7 +2092,8 @@ mod tests {
 
         let messages = mapped["messages"].as_array().unwrap();
         let assistant = messages.iter().find(|m| m["role"] == "assistant").unwrap();
-        assert_eq!(assistant["content"], "<think>why the tool</think>");
+        assert_eq!(assistant["reasoning"], "why the tool");
+        assert_eq!(assistant["content"], Value::Null);
         assert_eq!(assistant["tool_calls"][0]["function"]["name"], "lookup");
     }
 
@@ -2125,7 +2128,7 @@ mod tests {
             let messages = mapped["messages"].as_array().unwrap();
             assert_eq!(
                 messages[0],
-                json!({"role": "assistant", "content": "<think>prior thought</think>"})
+                json!({"role": "assistant", "content": null, "reasoning": "prior thought"})
             );
             assert_eq!(messages.len(), input.len());
             if input.len() > 1 {
@@ -2172,7 +2175,8 @@ mod tests {
         );
 
         let messages = mapped["messages"].as_array().unwrap();
-        assert_eq!(messages[0]["content"], "<think>first\nsecond</think>answer");
+        assert_eq!(messages[0]["reasoning"], "first\nsecond");
+        assert_eq!(messages[0]["content"], "answer");
     }
 
     #[test]
@@ -2180,7 +2184,6 @@ mod tests {
         let options = ReasoningOptions {
             dialect: super::reasoning::ReasoningDialect::Vllm,
             max_reasoning_bytes: 16,
-            ..ReasoningOptions::default()
         };
         // Each item is 10 bytes and passes its own check, but concatenating them
         // (with the newline separator) exceeds the ceiling.
@@ -2219,7 +2222,8 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "assistant");
         assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "lookup");
-        assert_eq!(messages[0]["content"], "<think>post-call thought</think>");
+        assert_eq!(messages[0]["reasoning"], "post-call thought");
+        assert_eq!(messages[0]["content"], Value::Null);
         assert_eq!(messages[1]["role"], "tool");
     }
 
@@ -2239,11 +2243,12 @@ mod tests {
         );
 
         // Reasoning on both sides of the call folds into one chronological block on
-        // the tool-call turn, not reversed across two `<think>` blocks.
+        // the tool-call turn, not reversed across two reasoning fields.
         let messages = mapped["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "assistant");
-        assert_eq!(messages[0]["content"], "<think>before\nafter</think>");
+        assert_eq!(messages[0]["reasoning"], "before\nafter");
+        assert_eq!(messages[0]["content"], Value::Null);
         assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "lookup");
         assert_eq!(messages[1]["role"], "tool");
     }
@@ -2253,7 +2258,6 @@ mod tests {
         let options = ReasoningOptions {
             dialect: super::reasoning::ReasoningDialect::Vllm,
             max_reasoning_bytes: 16,
-            ..ReasoningOptions::default()
         };
         // Two 10-byte items straddling a function call each pass individually, but
         // their combined size on the shared tool-call turn exceeds the ceiling.
@@ -2274,31 +2278,7 @@ mod tests {
     }
 
     #[test]
-    fn replayed_reasoning_uses_configured_markers() {
-        let options = ReasoningOptions {
-            dialect: super::reasoning::ReasoningDialect::Vllm,
-            think_open: "<seed:think>".to_owned(),
-            think_close: "</seed:think>".to_owned(),
-            ..ReasoningOptions::default()
-        };
-        let mapped = map_with_reasoning(
-            &json!({
-                "model": "m",
-                "input": [
-                    {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "cot"}]},
-                    {"role": "assistant", "content": "answer"}
-                ]
-            }),
-            &options,
-        );
-
-        assert_eq!(mapped["messages"][0]["content"], "<seed:think>cot</seed:think>answer");
-    }
-
-    #[test]
-    fn replayed_reasoning_is_prepended_to_array_content() {
-        // Mixed content stays an array (text collapses to a string), so the think
-        // block is inserted as a leading text part rather than string-prefixed.
+    fn replayed_reasoning_preserves_array_content() {
         let mapped = map_with_reasoning(
             &json!({
                 "model": "m",
@@ -2315,9 +2295,10 @@ mod tests {
 
         let content = mapped["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "<think>cot</think>");
-        assert_eq!(content[1]["text"], "answer");
-        assert_eq!(content[2]["type"], "image_url");
+        assert_eq!(mapped["messages"][0]["reasoning"], "cot");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["text"], "answer");
+        assert_eq!(content[1]["type"], "image_url");
     }
 
     #[test]
@@ -2345,7 +2326,6 @@ mod tests {
         let options = ReasoningOptions {
             dialect: super::reasoning::ReasoningDialect::Vllm,
             max_reasoning_bytes: 4,
-            ..ReasoningOptions::default()
         };
         let error = super::chat_completions::responses_request_to_chat_request(
             &json!({
@@ -2692,7 +2672,6 @@ mod tests {
         let options = ReasoningOptions {
             dialect: super::reasoning::ReasoningDialect::Vllm,
             max_reasoning_bytes: 4,
-            ..ReasoningOptions::default()
         };
         let context = super::chat_completions::ResponseContext::from_responses_request(&request, "abc".to_owned(), 0)
             .with_completed_at(1)

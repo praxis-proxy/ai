@@ -154,7 +154,7 @@ fn reasoning_only_completion_survives_stored_continuation() {
     assert_eq!(
         forwarded["messages"][1],
         serde_json::json!({
-            "role": "assistant", "content": "<think>The user only wants me to think.</think>"
+            "role": "assistant", "content": null, "reasoning": "The user only wants me to think."
         })
     );
     assert_eq!(
@@ -164,7 +164,7 @@ fn reasoning_only_completion_survives_stored_continuation() {
 }
 
 #[test]
-fn rehydrated_reasoning_item_is_replayed_inline_into_the_assistant_turn() {
+fn rehydrated_reasoning_item_is_replayed_into_the_assistant_turn() {
     // On a continuation the client echoes a prior reasoning item ahead of the
     // assistant turn it produced.
     let chat_response = serde_json::json!({
@@ -181,7 +181,7 @@ fn rehydrated_reasoning_item_is_replayed_inline_into_the_assistant_turn() {
     let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
     let proxy_port = free_port();
     let (config, _db) = load_test_config(
-        "reasoning_replay_inline",
+        "reasoning_replay_field",
         proxy_port,
         &HashMap::from([("127.0.0.1:3001", backend.port())]),
     );
@@ -209,14 +209,10 @@ fn rehydrated_reasoning_item_is_replayed_inline_into_the_assistant_turn() {
         .iter()
         .find(|m| m["role"] == "assistant")
         .expect("the assistant turn should be forwarded");
+    assert_eq!(assistant["content"], "Done.", "ordinary content must be preserved");
     assert_eq!(
-        assistant["content"], "<think>I picked 42.</think>Done.",
-        "rehydrated reasoning must be replayed inline in the assistant turn"
-    );
-    // The raw chain-of-thought must never surface as a separate top-level field.
-    assert!(
-        assistant.get("reasoning").is_none(),
-        "replayed reasoning must not be forwarded as a separate reasoning field"
+        assistant["reasoning"], "I picked 42.",
+        "rehydrated reasoning must use the vLLM assistant reasoning field"
     );
 }
 

@@ -328,7 +328,7 @@ def _write_reasoning_backend_config(
     Identical to :func:`_write_reasoning_config` except the ``127.0.0.1:3001``
     backend is pointed at ``backend_port`` (a capturing mock) so a test can
     observe the exact Chat Completions request body the backend receives after
-    the proxy inlines replayed reasoning.
+    the proxy replays reasoning in the assistant reasoning field.
     """
     with open(REASONING_CONFIG_PATH) as f:
         config = f.read()
@@ -1301,8 +1301,7 @@ def _reasoning_capture_session(tmp_path_factory, request):
     Yields ``(client, captured_bodies)`` where ``captured_bodies`` accumulates
     the Chat Completions request bodies the backend receives. A mock backend
     (rather than live vLLM) keeps the assertion deterministic and independent of
-    model output: the test only cares how the proxy inlines a replayed reasoning
-    item into the assistant turn it forwards upstream.
+    model output: the test checks the assistant reasoning field forwarded upstream.
     """
     ChatCaptureHandler.captured_bodies = []
     captured = ChatCaptureHandler.captured_bodies
@@ -2454,7 +2453,7 @@ class TestResponsesReasoningVLLM:
         assert continuation.status in ("completed", "incomplete"), continuation.status
         assert continuation.output, "stored reasoning continuation must produce output"
 
-    def test_replayed_reasoning_item_is_inlined_into_the_assistant_turn(
+    def test_replayed_reasoning_item_uses_the_assistant_reasoning_field(
         self, reasoning_capture_client,
     ):
         """A rehydrated reasoning item is folded back into its assistant turn."""
@@ -2488,14 +2487,8 @@ class TestResponsesReasoningVLLM:
             (m for m in messages if m.get("role") == "assistant"), None
         )
         assert assistant is not None, messages
-        assert assistant.get("content") == "<think>I picked 42.</think>Done.", (
-            "the replayed reasoning must be inlined into the assistant turn's "
-            f"content wrapped in the think markers; got: {assistant!r}"
-        )
-        assert "reasoning" not in assistant, (
-            "replayed reasoning must not be forwarded as a separate field; "
-            f"got: {assistant!r}"
-        )
+        assert assistant.get("content") == "Done.", assistant
+        assert assistant.get("reasoning") == "I picked 42.", assistant
 
     def test_reasoning_only_stored_continuation(self, reasoning_capture_client):
         client, forwarded = reasoning_capture_client
@@ -2511,7 +2504,7 @@ class TestResponsesReasoningVLLM:
         assert len(forwarded) == 2
         assert forwarded[1]["messages"] == [
             {"role": "user", "content": "Pick a number."},
-            {"role": "assistant", "content": "<think>I picked 42.</think>"},
+            {"role": "assistant", "content": None, "reasoning": "I picked 42."},
             {"role": "user", "content": "Now answer."},
         ]
 
@@ -2532,7 +2525,13 @@ class TestResponsesReasoningVLLM:
         assert not forwarded, "unreplayable reasoning must fail before forwarding"
 
     @pytest.mark.parametrize("reasoning_capture_client", ["none"], indirect=True)
-    def test_reasoning_requires_dialect(self, reasoning_capture_client):
+    @pytest.mark.parametrize("following", [
+        [],
+        [{"role": "assistant", "content": "Done."}],
+        [{"type": "function_call", "call_id": "call_1",
+          "name": "lookup", "arguments": "{}"}],
+    ])
+    def test_reasoning_requires_dialect(self, reasoning_capture_client, following):
         client, forwarded = reasoning_capture_client
         with pytest.raises(BadRequestError, match="a reasoning dialect must be configured"):
             client.responses.create(
@@ -2540,7 +2539,7 @@ class TestResponsesReasoningVLLM:
                 input=[{
                     "type": "reasoning",
                     "content": [{"type": "reasoning_text", "text": "I picked 42."}],
-                }],
+                }, *following],
                 store=False, stream=False,
             )
         assert not forwarded, "disabled reasoning replay must fail before forwarding"

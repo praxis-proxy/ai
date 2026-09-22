@@ -290,7 +290,8 @@
                   "role": "user"
                 },
                 {
-                  "content": "<think>I picked 42.</think>",
+                  "content": null,
+                  "reasoning": "I picked 42.",
                   "role": "assistant"
                 },
                 {
@@ -467,7 +468,8 @@
             "value": {
               "messages": [
                 {
-                  "content": "<think>I picked 42.</think>",
+                  "content": null,
+                  "reasoning": "I picked 42.",
                   "role": "assistant"
                 }
               ],

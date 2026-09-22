@@ -241,7 +241,6 @@ pub(super) fn build_config(
     }
     if config.reasoning.dialect.is_enabled() {
         validate_max_reasoning_bytes(config.reasoning.max_reasoning_bytes, config.max_rewritten_body_bytes)?;
-        validate_reasoning_markers(&config.reasoning.think_open, &config.reasoning.think_close)?;
     }
     Ok(config)
 }
@@ -254,18 +253,6 @@ fn validate_rewritten_body_limit(limit: usize) -> Result<(), FilterError> {
             "responses_to_chat_completions: max_rewritten_body_bytes ({limit}) must be at least {MIN_MAX_REWRITTEN_BODY_BYTES} bytes so the fail-closed response.failed resource always fits",
         )
         .into());
-    }
-    Ok(())
-}
-
-/// Validate the inline reasoning-replay markers for a dialect that folds a
-/// rehydrated reasoning item back into its assistant turn.
-fn validate_reasoning_markers(think_open: &str, think_close: &str) -> Result<(), FilterError> {
-    if think_open.is_empty() {
-        return Err("responses_to_chat_completions: reasoning.think_open must not be empty".into());
-    }
-    if think_close.is_empty() {
-        return Err("responses_to_chat_completions: reasoning.think_close must not be empty".into());
     }
     Ok(())
 }
@@ -292,7 +279,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::openai::{sse::SseParserConfig, translation::reasoning::ReasoningDialect};
+    use crate::openai::sse::SseParserConfig;
 
     #[test]
     fn defaults_are_compatible_with_stream_events_accumulator() {
@@ -439,60 +426,5 @@ mod tests {
     #[test]
     fn reasoning_bytes_equal_to_body_limit_accepted() {
         validate_max_reasoning_bytes(1024, 1024).expect("value equal to the body limit should be accepted");
-    }
-
-    #[test]
-    fn empty_think_open_marker_rejected() {
-        let err = validate_reasoning_markers("", "</think>").unwrap_err();
-        assert!(
-            err.to_string().contains("reasoning.think_open must not be empty"),
-            "empty open marker should be rejected, got: {err}"
-        );
-    }
-
-    #[test]
-    fn empty_think_close_marker_rejected() {
-        let err = validate_reasoning_markers("<think>", "").unwrap_err();
-        assert!(
-            err.to_string().contains("reasoning.think_close must not be empty"),
-            "empty close marker should be rejected, got: {err}"
-        );
-    }
-
-    #[test]
-    fn default_think_markers_accepted() {
-        validate_reasoning_markers("<think>", "</think>").expect("default markers should be accepted");
-    }
-
-    #[test]
-    fn empty_marker_rejected_through_build_config_for_replay_dialect() {
-        let config = ResponsesToChatCompletionsConfig {
-            reasoning: ReasoningOptions {
-                dialect: ReasoningDialect::Vllm,
-                think_open: String::new(),
-                ..ReasoningOptions::default()
-            },
-            ..ResponsesToChatCompletionsConfig::default()
-        };
-        let err = build_config(config).unwrap_err();
-        assert!(
-            err.to_string().contains("reasoning.think_open must not be empty"),
-            "build_config should reject an empty marker, got: {err}"
-        );
-    }
-
-    #[test]
-    fn empty_marker_ignored_for_none_dialect() {
-        // The default dialect performs no inline replay, so blank markers are inert
-        // and must not fail configuration validation.
-        let config = ResponsesToChatCompletionsConfig {
-            reasoning: ReasoningOptions {
-                think_open: String::new(),
-                think_close: String::new(),
-                ..ReasoningOptions::default()
-            },
-            ..ResponsesToChatCompletionsConfig::default()
-        };
-        build_config(config).expect("blank markers are inert without a replay dialect");
     }
 }

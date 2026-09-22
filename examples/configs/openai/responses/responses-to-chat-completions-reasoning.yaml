@@ -16,11 +16,8 @@
 #     rejected with a 400 before the request is forwarded.
 #   - max_reasoning_bytes bounds the raw reasoning preserved per
 #     response; oversized reasoning fails closed rather than truncating.
-#   - On a continuation, a rehydrated reasoning input item has no Chat
-#     Completions field to carry it, so its raw text is replayed inline into the
-#     following assistant turn wrapped in the backend's native think markers
-#     (think_open/think_close, defaulting to <think>/</think>). Override the
-#     markers for backends whose reasoning parser uses different delimiters.
+#   - On a continuation, raw reasoning is replayed in the following
+#     assistant turn's reasoning field, preserving its ordinary content.
 #   - Reasoning-only output is replayed as its own assistant message before
 #     the next non-assistant item or at the end of input.
 #   - Reasoning input requires an enabled dialect and non-empty raw reasoning_text
@@ -63,8 +60,6 @@ filter_chains:
         reasoning:
           dialect: vllm
           max_reasoning_bytes: 65536
-          think_open: "<think>"
-          think_close: "</think>"
 
       - filter: path_rewrite
         replace:

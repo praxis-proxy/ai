@@ -11,13 +11,6 @@ use super::chat_completions::{TranslationError, json_type_name};
 /// Maximum size limit for raw reasoning.
 const DEFAULT_MAX_REASONING_BYTES: usize = 65_536;
 
-/// Default opening marker wrapping replayed prior-turn reasoning inlined into an
-/// assistant message's content.
-const DEFAULT_THINK_OPEN: &str = "<think>";
-
-/// Default closing marker for inlined replayed reasoning.
-const DEFAULT_THINK_CLOSE: &str = "</think>";
-
 /// The reasoning item content part type carrying raw chain-of-thought.
 const REASONING_TEXT_PART_TYPE: &str = "reasoning_text";
 
@@ -58,10 +51,6 @@ pub(crate) struct ReasoningOptions {
     pub(crate) dialect: ReasoningDialect,
     /// Maximum raw reasoning size preserved per response.
     pub(crate) max_reasoning_bytes: usize,
-    /// Opening marker for inlined replayed reasoning. Defaults to `<think>`.
-    pub(crate) think_open: String,
-    /// Closing marker for inlined replayed reasoning. Defaults to `</think>`.
-    pub(crate) think_close: String,
 }
 
 impl Default for ReasoningOptions {
@@ -69,18 +58,16 @@ impl Default for ReasoningOptions {
         Self {
             dialect: ReasoningDialect::None,
             max_reasoning_bytes: DEFAULT_MAX_REASONING_BYTES,
-            think_open: DEFAULT_THINK_OPEN.to_owned(),
-            think_close: DEFAULT_THINK_CLOSE.to_owned(),
         }
     }
 }
 
-/// Prior-turn reasoning buffered for inline replay onto the assistant turn it
-/// precedes, paired with the dialect options that govern extraction and framing.
+/// Prior-turn reasoning buffered for replay onto the assistant turn it precedes,
+/// paired with the dialect options that govern extraction and size limits.
 pub(crate) struct ReplayBuffer<'a> {
     /// Raw chain-of-thought awaiting an assistant turn, if any.
     pending: Option<String>,
-    /// Dialect options governing extraction, the byte ceiling, and think markers.
+    /// Dialect options governing extraction and the byte ceiling.
     options: &'a ReasoningOptions,
 }
 
@@ -90,13 +77,23 @@ impl<'a> ReplayBuffer<'a> {
         Self { pending: None, options }
     }
 
-    /// Preserve reasoning-only output as an assistant turn at input boundaries.
-    pub(crate) fn flush_standalone(&mut self, messages: &mut Vec<Value>) -> Result<(), TranslationError> {
-        if self.pending.is_some() {
-            let content = self.take_inline(Value::Null)?;
-            messages.push(json!({"role": "assistant", "content": content}));
+    /// Move buffered reasoning into the dialect's assistant field, preserving content.
+    pub(crate) fn attach(&mut self, message: &mut Value) -> Result<(), TranslationError> {
+        if self.pending.is_none() {
+            return Ok(());
         }
-        Ok(())
+
+        match self.options.dialect {
+            ReasoningDialect::Vllm => {
+                if let Some(text) = self.pending.take() {
+                    message["reasoning"] = Value::String(text);
+                }
+                Ok(())
+            },
+            ReasoningDialect::None => Err(TranslationError::UnsupportedReasoningInput(
+                "a reasoning dialect must be configured",
+            )),
+        }
     }
 
     /// Buffer a rehydrated reasoning item's raw text for replay onto the assistant
@@ -118,23 +115,14 @@ impl<'a> ReplayBuffer<'a> {
         Ok(())
     }
 
-    /// Fold buffered prior-turn reasoning into assistant content using the
-    /// dialect's think markers, returning the content unchanged when nothing is
-    /// buffered.
-    pub(crate) fn take_inline(&mut self, content: Value) -> Result<Value, TranslationError> {
-        let Some(text) = self.pending.take() else {
-            return Ok(content);
-        };
-        let block = format!("{}{}{}", self.options.think_open, text, self.options.think_close);
-        match content {
-            Value::Null => Ok(Value::String(block)),
-            Value::String(existing) => Ok(Value::String(format!("{block}{existing}"))),
-            Value::Array(mut parts) => {
-                parts.insert(0, json!({"type": "text", "text": block}));
-                Ok(Value::Array(parts))
-            },
-            _ => Err(TranslationError::InvalidMessageContent),
+    /// Preserve reasoning-only output as an assistant turn at input boundaries.
+    pub(crate) fn flush_standalone(&mut self, messages: &mut Vec<Value>) -> Result<(), TranslationError> {
+        if self.pending.is_some() {
+            let mut message = json!({"role": "assistant", "content": null});
+            self.attach(&mut message)?;
+            messages.push(message);
         }
+        Ok(())
     }
 }
 
@@ -324,4 +312,51 @@ fn reasoning_item(id: String, status: &str, text: &str) -> Value {
             "text": text
         }]
     })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_replay_dialect_preserves_pending_reasoning_and_messages() {
+        let options = ReasoningOptions::default();
+        let mut replay = ReplayBuffer {
+            pending: Some("prior thought".to_owned()),
+            options: &options,
+        };
+        let mut message = json!({"role": "assistant", "content": "answer"});
+
+        assert!(matches!(
+            replay.attach(&mut message),
+            Err(TranslationError::UnsupportedReasoningInput(_))
+        ));
+        assert_eq!(message, json!({"role": "assistant", "content": "answer"}));
+        assert_eq!(replay.pending.as_deref(), Some("prior thought"));
+
+        let mut messages = Vec::new();
+        assert!(matches!(
+            replay.flush_standalone(&mut messages),
+            Err(TranslationError::UnsupportedReasoningInput(_))
+        ));
+        assert!(messages.is_empty(), "unsupported replay must not append a message");
+        assert_eq!(replay.pending.as_deref(), Some("prior thought"));
+    }
+
+    #[test]
+    fn empty_replay_is_a_noop_without_a_dialect() {
+        let options = ReasoningOptions::default();
+        let mut replay = ReplayBuffer::new(&options);
+        let mut message = json!({"role": "assistant", "content": "answer"});
+
+        assert!(replay.attach(&mut message).is_ok(), "empty replay needs no dialect");
+        assert_eq!(message, json!({"role": "assistant", "content": "answer"}));
+        let mut messages = Vec::new();
+        assert!(
+            replay.flush_standalone(&mut messages).is_ok(),
+            "empty replay emits no turn"
+        );
+        assert!(messages.is_empty());
+    }
 }

@@ -109,11 +109,11 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// the deprecated `reasoning.generate_summary`) is rejected. Streaming reasoning
 /// translation is not yet implemented, so a streaming request is rejected when
 /// valid reasoning dialect is configured. On continuation, raw reasoning
-/// is replayed into the following assistant turn using `think_open`/`think_close`
-/// markers (defaults: `<think>`/`</think>`). Reasoning-only output becomes a
-/// standalone assistant message at a turn boundary or end of input. Reasoning
-/// input requires an enabled dialect and non-empty raw `reasoning_text` content;
-/// encrypted, summary-only, and malformed items are rejected before forwarding.
+/// is replayed into the following assistant turn's `reasoning` field, preserving
+/// its ordinary `content`. Reasoning-only output becomes a standalone assistant
+/// message at a turn boundary or end of input. Reasoning input requires an
+/// enabled dialect and non-empty raw `reasoning_text` content; encrypted,
+/// summary-only, and malformed items are rejected before forwarding.
 ///
 /// To emit translated SSE events incrementally, this filter forces the
 /// reconciled response body mode to `Stream` for the entire filter chain. The

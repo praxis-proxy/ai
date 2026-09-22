@@ -647,8 +647,7 @@ fn append_input_item_sequence(
     Ok(())
 }
 
-/// Flush adjacent Responses function calls into one assistant message, inlining
-/// any buffered prior-turn reasoning into that assistant turn's content.
+/// Flush adjacent Responses function calls and buffered reasoning into one assistant message.
 fn flush_pending_function_calls(
     messages: &mut Vec<Value>,
     pending_tool_calls: &mut Vec<Value>,
@@ -658,12 +657,13 @@ fn flush_pending_function_calls(
         return Ok(());
     }
 
-    let content = replay.take_inline(Value::Null)?;
-    messages.push(json!({
+    let mut message = json!({
         "role": "assistant",
-        "content": content,
+        "content": null,
         "tool_calls": std::mem::take(pending_tool_calls),
-    }));
+    });
+    replay.attach(&mut message)?;
+    messages.push(message);
     Ok(())
 }
 
@@ -722,13 +722,13 @@ fn append_message_item(
         field: "content",
     })?;
     let content = convert_input_content(content)?;
-    let content = if role == "assistant" {
-        replay.take_inline(content)?
+    let mut message = json!({"role": role, "content": content});
+    if role == "assistant" {
+        replay.attach(&mut message)?;
     } else {
         replay.flush_standalone(messages)?;
-        content
-    };
-    messages.push(json!({"role": role, "content": content}));
+    }
+    messages.push(message);
     Ok(())
 }
 
