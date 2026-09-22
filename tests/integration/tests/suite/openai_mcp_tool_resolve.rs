@@ -824,6 +824,64 @@ fn mcp_tools_list_succeeds_against_mock_server() {
 }
 
 #[test]
+fn same_direct_url_reuses_persisted_listing() {
+    let mcp = start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![McpToolFixture::new("shared_tool")],
+        ..McpMockConfig::default()
+    });
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
+    let backend_body = format!(
+        r#"{{"id":"resp_previous","created_at":1000,"model":"gpt-4.1","status":"completed","output":[{{"type":"mcp_list_tools","server_label":"weather","server_url":"{mcp_url}","tools":[{{"name":"shared_tool"}}]}}]}}"#
+    );
+    let backend = Backend::fixed(&backend_body)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let db = TempSqlite::new("mcp_cache_same_target");
+    let proxy_port = free_port();
+
+    let yaml = resolve_yaml_store_stream_events_after_resolve(proxy_port, backend.port(), db.url(), 500);
+    let config = Config::from_yaml(&yaml).unwrap();
+    let proxy = start_proxy(&config);
+    let first_body = format!(
+        r#"{{"model":"gpt-4.1","input":"first","tools":[{{"type":"mcp","server_label":"weather","server_url":"{mcp_url}","allowed_tools":["shared_tool"]}}]}}"#
+    );
+    let first = http_send(proxy.addr(), &json_post("/v1/responses", &first_body));
+    assert_eq!(
+        parse_status(&first),
+        200,
+        "first request should persist the listing: {}",
+        parse_body(&first)
+    );
+    let first_response: serde_json::Value = serde_json::from_str(&parse_body(&first)).unwrap();
+    let persisted_listing = first_response["output"]
+        .as_array()
+        .and_then(|output| output.iter().find(|item| item["type"] == "mcp_list_tools"))
+        .expect("first response should contain the persisted MCP listing");
+    assert_eq!(
+        persisted_listing["server_url"], mcp_url,
+        "the persisted listing should retain its reusable target identity"
+    );
+    let list_calls = mcp.method_count("tools/list");
+    assert!(list_calls >= 1, "first request should discover MCP tools");
+
+    let continuation_body = format!(
+        r#"{{"model":"gpt-4.1","input":"continue","previous_response_id":"resp_previous","tools":[{{"type":"mcp","server_label":"weather","server_url":"{mcp_url}","allowed_tools":["shared_tool"]}}]}}"#
+    );
+    let continuation = http_send(proxy.addr(), &json_post("/v1/responses", &continuation_body));
+
+    assert_eq!(
+        parse_status(&continuation),
+        200,
+        "continuation should reach the backend"
+    );
+    assert_eq!(
+        mcp.method_count("tools/list"),
+        list_calls,
+        "an unchanged direct target should reuse its persisted listing"
+    );
+}
+
+#[test]
 fn changed_direct_url_does_not_reuse_unbound_cached_tools() {
     let old_mcp = start_mcp_mock_server_with_config(McpMockConfig {
         tools: vec![McpToolFixture::new("shared_tool")],

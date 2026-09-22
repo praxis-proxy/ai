@@ -691,12 +691,16 @@ struct Resolution {
 /// A successful local MCP discovery listing awaiting commit as an
 /// `mcp_list_tools` output item.
 ///
-/// Carries only the fields the output item needs; the item `id` is assigned at
-/// commit time from the request's id generator so it matches the failure path's
-/// `mcpl_` convention.
+/// The item `id` is assigned at commit time from the request's id generator so
+/// it matches the failure path's `mcpl_` convention. Direct, uncredentialed
+/// listings also carry their exact URL so a continuation can safely reuse the
+/// listing without repeating `tools/list`. Connector and credentialed listings
+/// omit it and remain ineligible for cache reuse.
 struct McpListing {
     /// The MCP server's client-visible label.
     server_label: String,
+    /// Exact target identity for a cacheable direct listing.
+    server_url: Option<String>,
     /// The resolved tools normalized to the `MCPListToolsTool` shape
     /// (`name`, `input_schema`, optional `description`/`annotations`).
     tools: Vec<serde_json::Value>,
@@ -741,6 +745,7 @@ fn collect_resolutions(
             resolved_labels.insert(label.clone());
             listings.push(McpListing {
                 server_label: label,
+                server_url: reusable_listing_server_url(entry).map(str::to_owned),
                 tools: listing_tools,
             });
             per_entry.push(resolution);
@@ -2574,14 +2579,24 @@ fn commit_discovery_items(ctx: &mut HttpFilterContext<'_>, listings: Vec<McpList
 
 /// Build one `mcp_list_tools` output item with a fresh `mcpl_` id (issue #1022).
 fn build_discovery_item(ctx: &HttpFilterContext<'_>, listing: McpListing) -> serde_json::Value {
-    let McpListing { server_label, tools } = listing;
+    let McpListing {
+        server_label,
+        server_url,
+        tools,
+    } = listing;
     let id = format!("mcpl_{}", ctx.id_generator.generate(ctx.time_source));
-    serde_json::json!({
-        "id": id,
-        "type": "mcp_list_tools",
-        "server_label": server_label,
-        "tools": tools,
-    })
+    let mut item = serde_json::Map::new();
+    item.insert("id".to_owned(), serde_json::Value::String(id));
+    item.insert(
+        "type".to_owned(),
+        serde_json::Value::String("mcp_list_tools".to_owned()),
+    );
+    item.insert("server_label".to_owned(), serde_json::Value::String(server_label));
+    item.insert("tools".to_owned(), serde_json::Value::Array(tools));
+    if let Some(server_url) = server_url {
+        item.insert("server_url".to_owned(), serde_json::Value::String(server_url));
+    }
+    serde_json::Value::Object(item)
 }
 
 /// Append a discovery item unless its server is already listed, recording the id
@@ -2617,12 +2632,21 @@ fn is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Whether the entry carries per-entry credentials that
 /// affect the `tools/list` response.
+///
+/// URL query parameters are treated as credentials because they may contain
+/// API keys. Such URLs are resolved normally but never copied into a reusable
+/// public listing.
 fn has_entry_credentials(entry: &serde_json::Value) -> bool {
     entry.get("authorization").and_then(serde_json::Value::as_str).is_some()
         || entry
             .get("headers")
             .and_then(serde_json::Value::as_object)
             .is_some_and(|h| !h.is_empty())
+        || entry
+            .get("server_url")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| url::Url::parse(raw).ok())
+            .is_some_and(|url| url.query().is_some())
 }
 
 /// Whether a previous `tools/list` result is valid without current request context.
@@ -2632,6 +2656,16 @@ fn can_reuse_cached_listing(entry: &serde_json::Value, is_connector: bool) -> bo
     // pipeline, so connector listings must always be refreshed. Direct URLs
     // remain reusable only when their entry has no request-specific credentials.
     !is_connector && !has_entry_credentials(entry)
+}
+
+/// Return the exact target only when it is safe to publish and reuse.
+fn reusable_listing_server_url(entry: &serde_json::Value) -> Option<&str> {
+    let is_connector = entry.get("connector_id").is_some();
+    if can_reuse_cached_listing(entry, is_connector) {
+        resolvable_server_url(entry)
+    } else {
+        None
+    }
 }
 
 /// Extract `server_label` from an MCP tool entry.

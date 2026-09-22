@@ -932,6 +932,18 @@ fn has_credentials_with_headers() {
 }
 
 #[test]
+fn has_credentials_with_server_url_query() {
+    let entry = serde_json::json!({
+        "server_label": "s",
+        "server_url": "https://mcp.example/mcp?api_key=secret"
+    });
+    assert!(
+        has_entry_credentials(&entry),
+        "query parameters can carry credentials and must not enter reusable listings"
+    );
+}
+
+#[test]
 fn no_credentials_without_auth_or_headers() {
     let entry = serde_json::json!({"server_label": "s", "server_url": "http://10.0.0.1/mcp"});
     assert!(!has_entry_credentials(&entry));
@@ -5000,8 +5012,50 @@ fn list_tools_items(state: &ResponsesState) -> Vec<&serde_json::Value> {
 fn single_tool_listing(label: &str, tool_name: &str) -> McpListing {
     McpListing {
         server_label: label.to_owned(),
+        server_url: None,
         tools: vec![mcp_tool_to_list_tools_entry(&serde_json::json!({"name": tool_name}))],
     }
+}
+
+#[test]
+fn collect_resolutions_preserves_only_reusable_target_identity() {
+    let entries = vec![
+        serde_json::json!({
+            "type": "mcp",
+            "server_label": "direct",
+            "server_url": "https://direct.example/mcp"
+        }),
+        serde_json::json!({
+            "type": "mcp",
+            "server_label": "credentialed",
+            "server_url": "https://credentialed.example/mcp",
+            "authorization": "secret"
+        }),
+        serde_json::json!({
+            "type": "mcp",
+            "server_label": "connector",
+            "connector_id": "configured",
+            "server_url": "https://connector.example/mcp"
+        }),
+    ];
+    let task_results = vec![
+        Some(vec![serde_json::json!({"name": "direct_tool"})]),
+        Some(vec![serde_json::json!({"name": "credentialed_tool"})]),
+        Some(vec![serde_json::json!({"name": "connector_tool"})]),
+    ];
+
+    let resolution = collect_resolutions(&entries, &[Some(0), Some(1), Some(2)], &task_results);
+    let target_urls: Vec<_> = resolution
+        .listings
+        .iter()
+        .map(|listing| listing.server_url.as_deref())
+        .collect();
+
+    assert_eq!(
+        target_urls,
+        vec![Some("https://direct.example/mcp"), None, None],
+        "only direct listings without request-specific credentials are reusable"
+    );
 }
 
 /// A cached `weather` listing carrying one `get_weather` tool, as a
@@ -5046,6 +5100,10 @@ async fn cache_hit_seeds_mcp_list_tools_output_item() {
     let tools = item["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 1, "one discovered tool");
     assert_eq!(tools[0]["name"], "get_weather", "real MCP tool name");
+    assert_eq!(
+        item["server_url"], server_url,
+        "a cache hit should preserve its reusable target identity"
+    );
     assert!(
         tools[0]["input_schema"]["properties"]["city"].is_object(),
         "tool input_schema surfaced"
@@ -5087,6 +5145,31 @@ fn commit_discovery_items_preserves_request_order() {
     );
 }
 
+#[test]
+fn commit_discovery_items_persists_cacheable_direct_target() {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::from_request_body(
+        serde_json::json!({"model": "gpt-4o"}),
+    ));
+
+    commit_discovery_items(
+        &mut ctx,
+        vec![McpListing {
+            server_label: "weather".to_owned(),
+            server_url: Some("https://weather.example/mcp".to_owned()),
+            tools: Vec::new(),
+        }],
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let item = list_tools_items(state)[0];
+    assert_eq!(
+        item["server_url"], "https://weather.example/mcp",
+        "cacheable direct target identity should survive persistence"
+    );
+}
+
 /// A zero-tool success still emits a listing item with an empty `tools` array.
 #[test]
 fn commit_discovery_items_emits_zero_tool_success() {
@@ -5100,6 +5183,7 @@ fn commit_discovery_items_emits_zero_tool_success() {
         &mut ctx,
         vec![McpListing {
             server_label: "empty".to_owned(),
+            server_url: None,
             tools: Vec::new(),
         }],
     );
@@ -5127,6 +5211,7 @@ fn commit_discovery_items_dedups_existing_server() {
     let make_listing = || {
         vec![McpListing {
             server_label: "weather".to_owned(),
+            server_url: None,
             tools: vec![mcp_tool_to_list_tools_entry(
                 &serde_json::json!({"name": "get_weather"}),
             )],
@@ -5168,6 +5253,7 @@ fn commit_discovery_items_appends_after_existing_output() {
         &mut ctx,
         vec![McpListing {
             server_label: "weather".to_owned(),
+            server_url: None,
             tools: Vec::new(),
         }],
     );
