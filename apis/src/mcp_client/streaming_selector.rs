@@ -14,7 +14,8 @@
 
 use async_trait::async_trait;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SubRequestResponseMode,
+    BodyAccess, BodyMode, EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    SubRequestResponseMode, parse_filter_config,
 };
 
 use super::subrequest_transport::McpStreamingRequested;
@@ -32,13 +33,11 @@ impl McpStreamingSelectorFilter {
     ///
     /// # Errors
     ///
-    /// Returns [`FilterError`] only if a non-null config mapping is supplied.
+    /// Returns [`FilterError`] if any configuration is supplied. Only a null or
+    /// empty mapping is accepted; a non-empty mapping, a scalar, or a sequence
+    /// is rejected via [`EmptyFilterConfig`]'s `deny_unknown_fields` contract.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        if !config.is_null() && config.as_mapping().is_some_and(|m| !m.is_empty()) {
-            return Err(FilterError::from(
-                "openai_mcp_streaming_selector takes no configuration".to_owned(),
-            ));
-        }
+        let _: EmptyFilterConfig = parse_filter_config(Self::NAME, config)?;
         Ok(Box::new(Self))
     }
 }
@@ -142,5 +141,17 @@ mod tests {
         assert!(McpStreamingSelectorFilter::from_config(&serde_yaml::Value::Null).is_ok());
         let empty: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
         assert!(McpStreamingSelectorFilter::from_config(&empty).is_ok());
+    }
+
+    #[test]
+    fn from_config_rejects_scalar() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("just-a-string").unwrap();
+        assert!(McpStreamingSelectorFilter::from_config(&yaml).is_err());
+    }
+
+    #[test]
+    fn from_config_rejects_sequence() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("[a, b]").unwrap();
+        assert!(McpStreamingSelectorFilter::from_config(&yaml).is_err());
     }
 }
