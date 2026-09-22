@@ -808,7 +808,10 @@ impl McpSubrequestClient {
             body,
             self.wire_cap(),
             self.stream_cumulative_cap(),
-            max_sse_event_size,
+            // rmcp always passes its `config.max_sse_event_size` (16 MiB default),
+            // which is only an outer sanity backstop. Raise it to the wire cap so it
+            // can never clamp the authoritative per-event bound below `wire_cap()`.
+            max_sse_event_size.max(self.wire_cap()),
             self.signal_handle(),
         ))
     }
@@ -938,7 +941,9 @@ impl McpSubrequestClient {
                     body,
                     per_event_cap,
                     per_event_cap, // POST cumulative == per-message ceiling (F3: both from response_limit)
-                    max_sse_event_size,
+                    // rmcp's `config.max_sse_event_size` is an outer backstop only; raise it to
+                    // the per-message cap so it never clamps the per-event bound below it.
+                    max_sse_event_size.max(per_event_cap),
                     self.signal_handle(),
                 );
                 Ok(StreamableHttpPostResponse::Sse(sse, session_id_out))
@@ -2308,6 +2313,59 @@ mod tests {
         let mut stream = stream;
         let first = futures::StreamExt::next(&mut stream).await.expect("event").expect("ok");
         assert_eq!(first.data.as_deref(), Some("{\"jsonrpc\":\"2.0\"}"));
+    }
+
+    // -- F6: rmcp's max_sse_event_size backstop must never clamp below the wire cap --
+
+    /// rmcp always passes its `config.max_sse_event_size` (16 MiB default) into
+    /// the sized-variant overrides, so a client whose wire cap exceeds that
+    /// default would have had every event wrongly rejected. The transport must
+    /// raise the backstop to the in-play wire tier before handing it to the SSE
+    /// adapter. This test drives the pathology directly: `max_sse_event_size = 8`
+    /// is far below both the event's retained bytes and the `client()` wire cap
+    /// (`tool_result_wire_cap(1024)`), so pre-fix the clamp rejected the event and
+    /// post-fix the wire cap wins and the event forwards.
+    #[tokio::test]
+    async fn get_stream_backstop_never_clamps_below_wire_cap() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body: Box<dyn StreamingResponseBody> =
+            Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks(
+                [Bytes::from_static(b"data: {\"jsonrpc\":\"2.0\"}\n\n")],
+                cancelled,
+            ));
+        let response = sub_response(200, Some("text/event-stream"), b"");
+        let mut stream = client()
+            .classify_get_stream_response(response, Some(body), 8)
+            .await
+            .unwrap();
+        let first = futures::StreamExt::next(&mut stream).await.expect("event").expect("ok");
+        assert_eq!(first.data.as_deref(), Some("{\"jsonrpc\":\"2.0\"}"));
+    }
+
+    /// Streaming-POST twin: a tiny `max_sse_event_size` must not clamp the
+    /// per-event bound below the per-message cap the caller passes in.
+    #[tokio::test]
+    async fn streaming_post_backstop_never_clamps_below_per_message_cap() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body = Box::new(crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks(
+            [Bytes::from_static(
+                b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            )],
+            Arc::clone(&cancelled),
+        ));
+        let response = sub_response(200, Some("text/event-stream"), b"");
+        let out = client()
+            .classify_streaming_post_response(response, body, false, 1024, 8)
+            .await
+            .unwrap();
+        let StreamableHttpPostResponse::Sse(mut stream, _) = out else {
+            panic!("expected an SSE post response");
+        };
+        let first = futures::StreamExt::next(&mut stream).await.expect("event").expect("ok");
+        assert_eq!(
+            first.data.as_deref(),
+            Some("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}")
+        );
     }
 
     #[tokio::test]
