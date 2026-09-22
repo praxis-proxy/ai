@@ -270,8 +270,16 @@ pub(crate) enum McpApprovalState {
     #[default]
     None,
     /// Return approval requests after a sibling dispatcher finishes re-entry.
+    #[cfg_attr(
+        all(not(test), not(feature = "openai-mcp-tools")),
+        expect(dead_code, reason = "only MCP dispatch defers approval responses")
+    )]
     ApprovalPendingThenReturn,
     /// Execute ungated siblings, then return the pending approval response.
+    #[cfg_attr(
+        not(feature = "openai-mcp-tools"),
+        expect(dead_code, reason = "only MCP dispatch defers approval responses")
+    )]
     ExecuteUngatedThenReturn,
 }
 
@@ -380,6 +388,10 @@ pub(crate) struct ResponsesState {
     /// definitions from the internally resolved endpoint. Holds the
     /// pipeline-local URL and credentials; never serialized to the
     /// inference backend, client responses, or persisted records.
+    #[cfg_attr(
+        all(not(test), not(feature = "openai-mcp-tools")),
+        expect(dead_code, reason = "deferred connectors are consumed only by MCP dispatch")
+    )]
     pub deferred_mcp: Vec<DeferredMcpConnector>,
 
     /// Maximum number of built-in tool invocations.
@@ -444,6 +456,10 @@ pub(crate) struct ResponsesState {
 
     /// Whether tool calls may execute concurrently within an
     /// iteration. Defaults to `true` per the API spec.
+    #[cfg_attr(
+        all(not(test), not(feature = "openai-mcp-tools")),
+        expect(dead_code, reason = "only MCP dispatch schedules concurrent tool calls")
+    )]
     pub parallel_tool_calls: bool,
 
     /// Full message history to persist for future rehydration.
@@ -460,6 +476,7 @@ pub(crate) struct ResponsesState {
     /// persisted as the authoritative record for correlating a later
     /// `mcp_approval_response`. Consent provenance lives here and in the
     /// store, never in the (client-influenced) conversation history.
+    #[cfg(feature = "store")]
     pub pending_approvals: Vec<crate::store::PendingApprovalRecord>,
 
     /// Whether the store filter armed persistence for this exchange.
@@ -475,6 +492,10 @@ pub(crate) struct ResponsesState {
     /// `response_conditions`-gated store filter, a non-2xx status, etc.); that
     /// narrower residual is unsupported for approval pipelines and still fails
     /// closed at resume.
+    #[cfg_attr(
+        all(not(test), not(feature = "store")),
+        expect(dead_code, reason = "read only by the store, rehydrate, and MCP approval paths")
+    )]
     pub store_persist_armed: bool,
 
     /// Whether the streaming `previous_response_id` wire rewrite was armed.
@@ -754,6 +775,10 @@ pub(crate) struct DeferredMcpConnector {
 
     /// Configured MCP endpoint URL. Never written to backend requests,
     /// client-visible responses, logs, or persisted response state.
+    #[cfg_attr(
+        not(feature = "openai-mcp-tools"),
+        expect(dead_code, reason = "only MCP dispatch dials deferred connectors")
+    )]
     pub server_url: String,
 
     /// Per-server timeout for the deferred `tools/list` call.
@@ -815,6 +840,7 @@ impl Default for ResponsesState {
             provider_history_len: 0,
             parallel_tool_calls: true,
             persisted_messages: Vec::new(),
+            #[cfg(feature = "store")]
             pending_approvals: Vec::new(),
             store_persist_armed: false,
             previous_response_id_stream_restore_armed: false,

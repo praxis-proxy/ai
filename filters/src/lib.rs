@@ -22,6 +22,8 @@ pub mod inference;
 pub mod metering;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
+#[cfg(any(feature = "azure-ad-filter", feature = "gcp-adc-filter"))]
+mod pinned_client;
 pub mod prompt_enrich;
 mod register;
 pub mod routing;

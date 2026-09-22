@@ -7,6 +7,14 @@
 //! backends, and supporting types. Used by AI API filters for persisting
 //! response records and conversation history.
 
+#[cfg_attr(
+    not(any(feature = "store-postgres", feature = "store-sqlite")),
+    expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),
+    allow(
+        dead_code,
+        reason = "backend helpers are unused until a SQL backend feature is enabled"
+    )
+)]
 mod pool;
 #[cfg(feature = "store-postgres")]
 mod postgres;
@@ -14,6 +22,14 @@ mod postgres;
 mod postgres_tls;
 #[cfg(feature = "store-postgres")]
 pub(crate) mod postgres_url;
+#[cfg_attr(
+    not(any(feature = "store-postgres", feature = "store-sqlite")),
+    expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),
+    allow(
+        dead_code,
+        reason = "backend helpers are unused until a SQL backend feature is enabled"
+    )
+)]
 mod schemas;
 #[cfg(feature = "store-sqlite")]
 mod sqlite;
@@ -40,7 +56,9 @@ use dashmap::{DashMap, mapref::entry::Entry};
 /// Validate response-store table identifiers.
 pub(crate) use schemas::validate_identifier as validate_table_identifier;
 #[cfg(feature = "store-postgres")]
-pub(crate) use schemas::{validate_postgres_table_identifiers, validate_postgres_table_set_identifiers};
+pub(crate) use schemas::validate_postgres_table_identifiers;
+#[cfg(all(feature = "store-postgres", feature = "openai-conversations"))]
+pub(crate) use schemas::validate_postgres_table_set_identifiers;
 
 #[cfg(feature = "store-postgres")]
 pub use self::postgres::PostgresResponseStore;

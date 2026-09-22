@@ -7,8 +7,10 @@
 //! `openai_operation` classifier can identify requests. The `OpenAPI` contract
 //! half lives in the `openapi` submodule and depends on `utoipa`.
 
+#[cfg(feature = "openai-conversations")]
 mod openapi;
 
+#[cfg(feature = "openai-conversations")]
 pub(crate) use openapi::{
     MediaTypeSpec, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec, ResponseSpec,
     SchemaBinding, implementation_openapi, schema_binding,
@@ -33,6 +35,7 @@ pub struct OpenAiOperationSpec {
     /// Path as it appears in the OpenAI spec, without `/v1`.
     pub spec_path: &'static str,
     /// Contract generated into the implementation `OpenAPI` document.
+    #[cfg(feature = "openai-conversations")]
     pub(crate) owned_contract: Option<OwnedOperationContract>,
 }
 
@@ -93,11 +96,13 @@ impl OpenAiOperationSpec {
     ///
     /// Answers the runtime question directly rather than inferring it from
     /// contract ownership, so proxied operations report their real body shape.
+    #[cfg(feature = "openai-conversations")]
     pub(crate) const fn has_request_body(&self) -> bool {
         self.runtime.has_request_body()
     }
 
     /// Return the locally owned `OpenAPI` contract, when applicable.
+    #[cfg(feature = "openai-conversations")]
     pub(crate) const fn owned_contract(&self) -> Option<OwnedOperationContract> {
         self.owned_contract
     }

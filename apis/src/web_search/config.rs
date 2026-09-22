@@ -17,9 +17,11 @@ use crate::callout_policy;
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 
 /// Default model-driven web searches accepted from one response round.
+#[cfg(feature = "openai-responses")]
 pub(crate) const DEFAULT_MAX_CALLS_PER_ROUND: usize = 32;
 
 /// Absolute model-driven web-search calls accepted from one response round.
+#[cfg(feature = "openai-responses")]
 pub(crate) const MAX_CALLS_PER_ROUND: usize = 1_024;
 
 // -----------------------------------------------------------------------------
@@ -79,6 +81,7 @@ impl SearchContextSize {
     ///
     /// Used at runtime for per-request metadata where rejecting is
     /// not appropriate.
+    #[cfg(feature = "openai-responses")]
     pub(crate) fn from_str_or_default(s: &str) -> Self {
         Self::from_str(s).unwrap_or(Self::Medium)
     }
@@ -171,6 +174,7 @@ pub(crate) struct WebSearchFilterConfig {
 /// exposes no `max_body_bytes` knob: raw request body size is governed by the
 /// pipeline's `body_limits`, not a per-filter limit (which praxis core merges
 /// to the largest sibling buffer and would therefore be bypassable).
+#[cfg(feature = "openai-responses")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OpenAiWebSearchConfig {
@@ -207,6 +211,7 @@ pub(crate) struct OpenAiWebSearchConfig {
 }
 
 /// Default value for `OpenAiWebSearchConfig::max_calls_per_round`.
+#[cfg(feature = "openai-responses")]
 fn default_max_calls_per_round() -> usize {
     DEFAULT_MAX_CALLS_PER_ROUND
 }
@@ -227,6 +232,7 @@ fn default_outbound_chain() -> ChainRef {
     }
 }
 
+#[cfg(feature = "openai-responses")]
 impl OpenAiWebSearchConfig {
     /// Convert into the shared [`WebSearchFilterConfig`] for validation reuse.
     ///
@@ -442,6 +448,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn openai_parse_config_defaults_missing_outbound_chain_to_empty_inline() {
         // The OpenAI-specific config carries its own `#[serde(default)]`, so it
@@ -458,6 +465,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn openai_web_search_rejects_terminal_streaming() {
         let yaml = serde_yaml::from_str("provider: you\napi_key: k\nterminal_streaming: true").unwrap();
@@ -666,6 +674,7 @@ mod tests {
         assert_eq!(SearchContextSize::High.result_count(), 10);
     }
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn search_context_size_parsing() {
         assert_eq!(SearchContextSize::from_str_or_default("low"), SearchContextSize::Low);

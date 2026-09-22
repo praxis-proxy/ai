@@ -60,7 +60,9 @@ http = { workspace = true }
 metrics = { workspace = true }
 notify = { workspace = true }
 percent-encoding = { workspace = true }
-praxis-ai-apis = { workspace = true }
+# Registers every OpenAI filter unconditionally for now; the filters and server
+# crates gain per-group features in the next step.
+praxis-ai-apis = { workspace = true, features = ["full"] }
 praxis-core = { workspace = true }
 # chain-binding: ChainBindingContext for register.rs outbound-chain wiring.
 # Off-by-default experimental feature in praxis 0.6.0 (no extra dependencies).
@@ -75,7 +77,7 @@ serde_json_path = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }

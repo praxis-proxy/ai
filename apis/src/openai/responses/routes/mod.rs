@@ -103,6 +103,7 @@ macro_rules! responses_operations {
                             request_body: request_body_shape!($body),
                         },
                         spec_path: $path,
+                        #[cfg(feature = "openai-conversations")]
                         owned_contract: None,
                     },
                 },
@@ -362,6 +363,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "openai-conversations")]
     #[test]
     fn registry_declares_no_owned_contract() {
         assert!(

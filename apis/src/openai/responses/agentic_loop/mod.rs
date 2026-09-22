@@ -143,9 +143,6 @@ use super::{
         ensure_public_output_item_ids_in_response, has_file_search_tool, is_file_search_function_call,
         is_pending_file_search_call, translate_function_calls_to_file_search,
     },
-    mcp_classify::{McpDisposition, classify_mcp},
-    mcp_dispatch::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
-    openai_mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
     state::{
         DispatchFailure, FileSearchAssignment, McpApprovalState, ResponsesState, SynthesisKind,
         current_round_file_search_admissions, tool_search_discovery_is_within_budget,
@@ -153,6 +150,12 @@ use super::{
     stream_events::{encode_local_completion, encode_local_error},
     usage::merge_usage,
     web_search::configured_max_calls_per_round as configured_web_max_calls,
+};
+#[cfg(feature = "openai-mcp-tools")]
+use super::{
+    mcp_classify::{McpDisposition, classify_mcp},
+    mcp_dispatch::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
+    openai_mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
 };
 use crate::http_hop::{connection_nominates_header, is_hop_by_hop};
 
@@ -383,6 +386,7 @@ fn prepare_dispatcher_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesSt
     // Direct owner tests and pipelines without that optional metadata still
     // need MCP ownership/approval preparation, so only the cap becomes
     // effectively unbounded when the metadata is absent.
+    #[cfg(feature = "openai-mcp-tools")]
     prepare_response_round(state, configured_mcp_max_calls(ctx).unwrap_or(usize::MAX))?;
     Ok(())
 }
@@ -687,10 +691,14 @@ fn request_is_streaming(state: &ResponsesState) -> bool {
 /// resolves to no dispatcher, so a round carrying only client calls must
 /// terminate as `done` rather than loop uselessly to the `max_infer_iters` cap.
 fn has_dispatchable_calls(state: &ResponsesState) -> bool {
-    if !state.web_search_calls.is_empty()
-        || !state.file_search_assignments.is_empty()
-        || has_pending_deferred_discovery(state)
-    {
+    !state.web_search_calls.is_empty() || !state.file_search_assignments.is_empty() || has_dispatchable_mcp_work(state)
+}
+
+/// Whether deferred MCP discovery is pending or a recorded call resolves to a
+/// configured MCP tool (auto or approval-required).
+#[cfg(feature = "openai-mcp-tools")]
+fn has_dispatchable_mcp_work(state: &ResponsesState) -> bool {
+    if has_pending_deferred_discovery(state) {
         return true;
     }
     if state.tool_calls.is_empty() || state.mcp_tool_map.is_empty() {
@@ -701,6 +709,12 @@ fn has_dispatchable_calls(state: &ResponsesState) -> bool {
         .tool_calls
         .iter()
         .any(|call| classify_mcp(call, &tool_index) != McpDisposition::NotMcp)
+}
+
+/// Without MCP tool support no call or discovery is MCP-owned.
+#[cfg(not(feature = "openai-mcp-tools"))]
+const fn has_dispatchable_mcp_work(_state: &ResponsesState) -> bool {
+    false
 }
 
 /// Decide the loop outcome: done (no dispatchable tool calls or model-owned
@@ -860,14 +874,14 @@ fn extract_tool_calls_from_body(body: &Bytes, state: &mut ResponsesState) {
 /// without sending the latter back to inference as an unresolved call, so fail
 /// before any external side effect.
 fn has_mixed_function_call_ownership(state: &ResponsesState) -> bool {
-    let mut has_server = !state.web_search_calls.is_empty()
+    let has_server = !state.web_search_calls.is_empty()
         || !state.file_search_assignments.is_empty()
         || has_hosted_queued_tool_search(state);
     // Scan this round's items in `accumulated_output` rather than
     // `response_object["output"]`: `collect_streaming_output_items` drains the
     // streamed round out of the response object into the accumulator before this
     // check runs, so `output_items()` is already empty on the streaming path.
-    let mut has_client = state
+    let has_client = state
         .accumulated_output
         .get(
             state
@@ -884,7 +898,17 @@ fn has_mixed_function_call_ownership(state: &ResponsesState) -> bool {
         // With no resolved MCP tools, every function call is client-owned.
         return has_server;
     }
+    let (server_calls, client_calls) = mcp_call_ownership(state);
+    (has_server || server_calls) && (has_client || client_calls)
+}
+
+/// Report whether this round's function calls include MCP-owned (server) and
+/// non-MCP (client) calls, as `(has_server, has_client)`.
+#[cfg(feature = "openai-mcp-tools")]
+fn mcp_call_ownership(state: &ResponsesState) -> (bool, bool) {
     let tool_index = McpToolIndex::new(&state.mcp_tool_map);
+    let mut has_server = false;
+    let mut has_client = false;
     for call in &state.tool_calls {
         let is_mcp = call
             .get("name")
@@ -893,7 +917,13 @@ fn has_mixed_function_call_ownership(state: &ResponsesState) -> bool {
         has_server |= is_mcp;
         has_client |= !is_mcp;
     }
-    has_server && has_client
+    (has_server, has_client)
+}
+
+/// Without MCP tool support every function call is client-owned.
+#[cfg(not(feature = "openai-mcp-tools"))]
+fn mcp_call_ownership(state: &ResponsesState) -> (bool, bool) {
+    (false, !state.tool_calls.is_empty())
 }
 
 /// Distribute output items from a parsed response into the accumulator and state vectors.

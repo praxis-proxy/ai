@@ -256,9 +256,11 @@ mod tests {
             kind: CapabilityKind::InferenceModel,
             name: Arc::from("model-a"),
             rank: Some(2),
+            selection_group: None,
             selection_tier: Some(Arc::from("same_region")),
             site: Arc::from("site-a"),
             stable_id: Arc::from("stable-a"),
+            traffic_weight: None,
         }
     }
 }
