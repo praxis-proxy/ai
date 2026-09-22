@@ -38,14 +38,17 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, IterationState, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::state::{
-    DispatchFailure, ResponsesState, consumed_builtin_tool_calls_before_current_round,
-    current_round_tool_call_admissions,
+use super::{
+    error::responses_error_rejection,
+    state::{
+        DispatchFailure, ResponsesState, consumed_builtin_tool_calls_before_current_round,
+        current_round_tool_call_admissions,
+    },
 };
 use crate::{
     callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
@@ -333,6 +336,27 @@ impl WebSearchFilter {
         true
     }
 
+    /// Fail closed with a 401 when the initial request declares an eligible hosted
+    /// web-search tool but the required per-user credential is absent, before the
+    /// first inference round runs.
+    ///
+    /// The re-entry check in [`Self::resolve_batch_identity`] runs only after the
+    /// model emits a `web_search` call; under terminal streaming that is after HTTP
+    /// 200 has committed — too late to fail closed, and it leaks the first round's
+    /// output. This round-0 preflight closes that gap for both streaming and
+    /// buffered transports. The identity is re-derived at re-entry from the same
+    /// context, so this only proves presence and discards its result.
+    fn preflight_managed_credential(&self, ctx: &HttpFilterContext<'_>) -> Result<(), Rejection> {
+        match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
+            Ok(_identity) => Ok(()),
+            Err(CalloutContextMissing::Credential { slot }) => Err(responses_error_rejection(
+                401,
+                MISSING_CALLOUT_CONTEXT,
+                &format!("web search requires the '{slot}' per-user credential, which was not provided"),
+            )),
+        }
+    }
+
     /// Resolve the caller's identity once for the whole batch, recording a fail-closed
     /// 401 security failure and returning `None` when a required per-user credential is absent.
     fn resolve_batch_identity(&self, ctx: &mut HttpFilterContext<'_>) -> Option<CalloutIdentity> {
@@ -479,6 +503,19 @@ impl HttpFilter for WebSearchFilter {
             return Ok(FilterAction::Continue);
         };
 
+        // Round-0 credential preflight. When the initial request declares a hosted
+        // web-search tool that could run under the effective `tool_choice` and a
+        // per-user credential slot is configured, resolve it now so a missing
+        // credential fails closed BEFORE any inference round runs — the re-entry
+        // check would otherwise fire only after streaming has committed HTTP 200.
+        if self.user_credential_slot.is_some()
+            && is_initial_request(ctx)
+            && request_declares_eligible_web_search(state)
+            && let Err(rejection) = self.preflight_managed_credential(ctx)
+        {
+            return Ok(FilterAction::Reject(rejection));
+        }
+
         if state.web_search_calls.is_empty() {
             return Ok(FilterAction::Continue);
         }
@@ -532,6 +569,46 @@ impl HttpFilter for WebSearchFilter {
 /// Return the response fan-out cap this dispatcher published for the owner.
 pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
+}
+
+/// Whether this is the initial client request (model round 0), not an IRR re-entry.
+///
+/// The credential preflight applies only to the fresh request: on re-entry the
+/// pending-queue path already resolves and fail-closes the credential.
+fn is_initial_request(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<IterationState>()
+        .is_none_or(|state| state.iteration() == 0)
+}
+
+/// Whether the initial request declares a hosted web-search tool that could run
+/// under the effective `tool_choice`, so a per-user credential preflight applies.
+fn request_declares_eligible_web_search(state: &ResponsesState) -> bool {
+    let declares = state.tools.iter().any(|tool| {
+        tool.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_web_search_tool_type)
+    });
+    declares && tool_choice_permits_web_search(&state.tool_choice)
+}
+
+/// Whether `tool_choice` leaves a hosted web-search tool eligible to run this turn.
+///
+/// `"none"` forbids all tools; an object forcing a single non-web-search tool
+/// (e.g. `{"type": "function", ...}`) also excludes it. Every other shape —
+/// `"auto"`, `"required"`, an object forcing a web-search tool, `allowed_tools`,
+/// or an absent/unknown choice — keeps web search eligible. Being conservatively
+/// eligible is safe: the re-entry check still fails closed if the callout runs.
+fn tool_choice_permits_web_search(tool_choice: &Value) -> bool {
+    match tool_choice {
+        Value::String(keyword) => keyword != "none",
+        Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
+            Some(kind) if is_web_search_tool_type(kind) => true,
+            Some("allowed_tools") | None => true,
+            Some(_) => false,
+        },
+        _ => true,
+    }
 }
 
 /// Recover per-request search context after IRR resets step-local metadata.

@@ -243,10 +243,90 @@ fn missing_credential_fails_closed_with_401_before_any_provider_callout() {
         search.requests().is_empty(),
         "no provider callout on a missing credential"
     );
+    assert!(
+        model.requests().is_empty(),
+        "the round-0 credential preflight fails closed before any inference round runs"
+    );
+}
+
+#[test]
+fn missing_credential_streaming_fails_closed_with_401_before_any_round() {
+    // Streaming variant of the fail-closed proof. Under terminal streaming the
+    // re-entry credential check runs only after HTTP 200 has committed, so the
+    // round-0 preflight is the only place a truthful 401 can be returned. This
+    // test proves a `stream: true` request with a missing credential is rejected
+    // as an ordinary JSON 401 before any provider or model round runs.
+    let first_response = json!({
+        "id": "chatcmpl_search",
+        "object": "chat.completion",
+        "model": "chat-only-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_search_1",
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "arguments": "{\"query\":\"Praxis Proxy latest release\"}"
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
+    });
+    let model = StatefulCapturingBackend::new(vec![(200, first_response.to_string())]).start_with_shutdown();
+    let brave_body = json!({
+        "web": {"results": [{
+            "title": "Praxis Proxy releases",
+            "url": "https://github.com/praxis-proxy/praxis/releases",
+            "description": "Current Praxis Proxy releases."
+        }]}
+    });
+    let search = StatefulCapturingBackend::new(vec![(200, brave_body.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_test_config(proxy_port, model.port(), search.port());
+    let proxy = start_proxy(&config);
+    let request = json!({
+        "model": "chat-only-model",
+        "input": "Find the latest Praxis Proxy release.",
+        "stream": true,
+        "tools": [{
+            "type": "web_search",
+            "search_context_size": "high",
+            "user_location": {"type": "approximate", "country": "FR"}
+        }],
+        "tool_choice": {"type": "web_search"},
+        "include": ["web_search_call.action.sources"],
+        "store": false
+    });
+    let headers = [("x-auth-tenant", "acme"), ("x-auth-user", "alice")];
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/responses", &request.to_string(), &headers),
+    );
+
     assert_eq!(
-        model.requests().len(),
-        1,
-        "only the first inference round runs before the 401 on re-entry"
+        parse_status(&raw),
+        401,
+        "a missing credential on a streaming request fails closed with a JSON 401: {raw}"
+    );
+    assert!(
+        parse_body(&raw).contains("missing_callout_context"),
+        "the streaming 401 carries the missing_callout_context code: {}",
+        parse_body(&raw)
+    );
+    assert!(
+        search.requests().is_empty(),
+        "no provider callout on a missing credential"
+    );
+    assert!(
+        model.requests().is_empty(),
+        "no inference round runs: the preflight rejects before the stream commits HTTP 200"
     );
 }
 
