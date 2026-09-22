@@ -397,7 +397,7 @@ fn record_verdict(
     }
 }
 
-/// Rewrite the buffered body with NeMo's masked text and continue.
+/// Rewrite the buffered body with `NeMo`'s masked text and continue.
 ///
 /// Request-phase framing is repaired by core via `mutated_request_body_len`.
 /// Response headers are already committed, so the rewritten JSON is fitted to
@@ -458,6 +458,7 @@ fn apply_response_redaction(body: &mut Option<Bytes>, modified_text: String) -> 
     Ok(())
 }
 
+/// Parse a buffered JSON body, labeling errors as `kind` (`request` or `response`).
 fn parse_json_body(body: &Option<Bytes>, kind: &str) -> Result<serde_json::Value, FilterError> {
     let Some(raw) = body.as_ref() else {
         return Err(format!("ai_guardrails: cannot redact a missing {kind} body").into());
@@ -466,6 +467,7 @@ fn parse_json_body(body: &Option<Bytes>, kind: &str) -> Result<serde_json::Value
         .map_err(|e| -> FilterError { format!("ai_guardrails: {kind} body is not valid JSON: {e}").into() })
 }
 
+/// Return the last chat message whose `role` field matches `role`.
 fn last_message_with_role<'m>(messages: &'m mut [serde_json::Value], role: &str) -> Option<&'m mut serde_json::Value> {
     messages
         .iter_mut()
@@ -473,6 +475,7 @@ fn last_message_with_role<'m>(messages: &'m mut [serde_json::Value], role: &str)
         .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some(role))
 }
 
+/// Set a chat message's `content` field to `modified_text`.
 fn set_message_content(message: &mut serde_json::Value, modified_text: String) -> Result<(), FilterError> {
     let Some(object) = message.as_object_mut() else {
         return Err("ai_guardrails: message is not a JSON object".into());
