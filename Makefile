@@ -87,10 +87,10 @@ test-unit:
 
 test-store-features:
 	cargo check -p praxis-ai-proxy
-	cargo check -p praxis-ai-proxy --no-default-features --features store-sqlite
-	cargo check -p praxis-ai-proxy --no-default-features --features store-all
-	cargo test -p praxis-ai-apis --no-default-features --features store-sqlite $(_NOCAPTURE)
-	cargo test -p praxis-ai-apis --no-default-features --features store-all $(_NOCAPTURE)
+	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
+	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-all
+	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-sqlite $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-all $(_NOCAPTURE)
 	@if cargo tree -p praxis-ai-proxy --edges normal | grep -q libsqlite3-sys; then \
 		echo "ERROR: default proxy dependency graph contains libsqlite3-sys"; \
 		exit 1; \
@@ -103,18 +103,18 @@ test-store-features:
 	fi
 
 test-schema:
-	cargo test -p praxis-tests-schema --no-default-features --features store-all $(_NOCAPTURE)
+	cargo test -p praxis-tests-schema --features store-all $(_NOCAPTURE)
 
 test-integration:
-	cargo test -p praxis-tests-integration --no-default-features --features store-all $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --no-default-features --features store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
+	cargo test -p praxis-tests-integration --features store-all $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --features store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
 		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit \
 		$(if $(V),--nocapture)
 
 test-inference-fixtures:
-	cargo test -p praxis-test-utils --no-default-features --features store-all $(_NOCAPTURE)
-	cargo test -p xtask --no-default-features --features store-all inference_fixtures $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --no-default-features --features store-all --test suite inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-test-utils --features store-all $(_NOCAPTURE)
+	cargo test -p xtask --features store-all inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --features store-all --test suite inference_fixtures $(_NOCAPTURE)
 
 test-postgres-unit:
 	cargo test -p praxis-ai-apis --no-default-features --features store-all store::tests::pg_ -- --ignored $(_NOCAPTURE)

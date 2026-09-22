@@ -8,15 +8,22 @@ readme = "../../README.md"
 publish = false
 
 [features]
-default = ["store-postgres"]
-store-postgres = [
-    "praxis-ai-proxy/store-postgres",
-    "praxis-test-utils/store-postgres",
-    "sqlx/postgres",
-    "sqlx/tls-native-tls",
-]
-store-sqlite = ["praxis-ai-proxy/store-sqlite", "praxis-test-utils/store-sqlite", "sqlx/sqlite"]
+# Feature passthroughs mirroring praxis-ai-proxy (see its Cargo.toml). The
+# default is `full` so a plain `cargo test -p <crate>` exercises every filter;
+# lean runs use `--no-default-features --features standard`.
+default = ["full"]
+standard = ["praxis-ai-proxy/standard", "praxis-test-utils/standard"]
+openai-responses = ["praxis-ai-proxy/openai-responses", "praxis-test-utils/openai-responses"]
+openai-file-resolve-filter = ["openai-responses", "praxis-ai-proxy/openai-file-resolve-filter", "praxis-test-utils/openai-file-resolve-filter"]
+store = ["openai-responses", "praxis-ai-proxy/store", "praxis-test-utils/store"]
+store-postgres = ["store", "praxis-ai-proxy/store-postgres", "praxis-test-utils/store-postgres", "sqlx/postgres", "sqlx/tls-native-tls"]
+store-sqlite = ["store", "praxis-ai-proxy/store-sqlite", "praxis-test-utils/store-sqlite", "sqlx/sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
+openai-conversations = ["store", "praxis-ai-proxy/openai-conversations", "praxis-test-utils/openai-conversations"]
+openai-compact = ["store", "praxis-ai-proxy/openai-compact", "praxis-test-utils/openai-compact"]
+openai-mcp-tools = ["store", "praxis-ai-proxy/openai-mcp-tools", "praxis-test-utils/openai-mcp-tools"]
+openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
+full = ["standard", "openai-all", "store-postgres"]
 cpex-policy-engine = []
 # Experimental: gates the lakera-guard example test, which needs the
 # http_callout filter registered in the in-process proxy registry.

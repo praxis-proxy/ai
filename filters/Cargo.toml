@@ -30,15 +30,10 @@ store-all = ["store-postgres", "store-sqlite"]
 openai-conversations = ["store", "praxis-ai-apis/openai-conversations"]
 openai-compact = ["store", "praxis-ai-apis/openai-compact"]
 openai-mcp-tools = ["store", "praxis-ai-apis/openai-mcp-tools"]
+# Every OpenAI group, without choosing a store backend.
+openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
 # Every non-experimental filter; equals the pre-feature-split capability.
-full = [
-    "standard",
-    "store-postgres",
-    "openai-file-resolve-filter",
-    "openai-conversations",
-    "openai-compact",
-    "openai-mcp-tools",
-]
+full = ["standard", "openai-all", "store-postgres"]
 # Experimental: the generic http_callout filter. Work in progress; the config
 # surface may change. Activates the `experimental` marker.
 http-callout-filter = ["experimental", "dep:serde_json_path"]

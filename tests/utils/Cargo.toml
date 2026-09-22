@@ -8,10 +8,22 @@ readme = "../../README.md"
 publish = false
 
 [features]
-default = ["store-postgres"]
-store-postgres = ["praxis-ai-apis/store-postgres", "praxis-ai-proxy/store-postgres"]
-store-sqlite = ["praxis-ai-apis/store-sqlite", "praxis-ai-proxy/store-sqlite"]
+# Feature passthroughs mirroring praxis-ai-proxy (see its Cargo.toml). The
+# default is `full` so a plain `cargo test -p <crate>` exercises every filter;
+# lean runs use `--no-default-features --features standard`.
+default = ["full"]
+standard = ["praxis-ai-proxy/standard"]
+openai-responses = ["praxis-ai-proxy/openai-responses"]
+openai-file-resolve-filter = ["openai-responses", "praxis-ai-proxy/openai-file-resolve-filter"]
+store = ["openai-responses", "praxis-ai-proxy/store", "praxis-ai-apis/store"]
+store-postgres = ["store", "praxis-ai-proxy/store-postgres", "praxis-ai-apis/store-postgres"]
+store-sqlite = ["store", "praxis-ai-proxy/store-sqlite", "praxis-ai-apis/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
+openai-conversations = ["store", "praxis-ai-proxy/openai-conversations"]
+openai-compact = ["store", "praxis-ai-proxy/openai-compact"]
+openai-mcp-tools = ["store", "praxis-ai-proxy/openai-mcp-tools"]
+openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
+full = ["standard", "openai-all", "store-postgres"]
 llmd-ext-proc = [
     "praxis-ai-proxy/llmd-ext-proc",
     "dep:praxis-ai-llmd-ext-proc",
@@ -62,3 +74,8 @@ tokio-tungstenite = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+
+# The tenant proxy serves the Conversations API, so it needs that filter group.
+[[example]]
+name = "conversations_tenant_proxy"
+required-features = ["openai-conversations"]

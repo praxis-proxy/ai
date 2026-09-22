@@ -33,8 +33,10 @@ openai-conversations = ["store", "dep:jsonschema", "dep:utoipa"]
 openai-compact = ["store", "dep:tiktoken-rs"]
 # MCP tool resolution and dispatch through the rmcp client (approvals persist).
 openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream"]
+# Every OpenAI group, without choosing a store backend.
+openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
 # Every non-experimental opt-in; equals the pre-feature-split capability.
-full = ["store-postgres", "openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
+full = ["openai-all", "store-postgres"]
 praxis-main = []
 
 [lints]
