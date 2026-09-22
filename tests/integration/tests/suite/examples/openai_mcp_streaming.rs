@@ -9,9 +9,26 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    McpMockConfig, McpToolFixture, StatefulCapturingBackend, free_port, http_send, json_post, load_example_config,
-    parse_body, parse_status, start_mcp_mock_server_with_config, start_proxy,
+    McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, allow_loopback_endpoints, example_config_path,
+    free_port, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
+    start_proxy,
 };
+
+/// Load the `mcp-streaming.yaml` example, patching the listener/backend ports and
+/// pointing the response store at a private temp SQLite database so tests never
+/// share persisted state (a stale shared `responses.db` otherwise surfaces as a
+/// spurious HTTP 500 after a schema change).
+fn load_mcp_streaming_config(proxy_port: u16, model_port: u16, db_url: &str) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/mcp-streaming.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    let patched = allow_loopback_endpoints(&patch_yaml(
+        &yaml,
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", model_port)]),
+    ));
+    praxis_core::config::Config::from_yaml(&patched).expect("parse mcp-streaming config")
+}
 
 // -----------------------------------------------------------------------------
 // Scenario 1: POST→SSE tool result streams and completes
@@ -65,11 +82,8 @@ fn post_sse_tool_result_streams_and_completes() {
     });
 
     let proxy_port = free_port();
-    let config = load_example_config(
-        "openai/responses/mcp-streaming.yaml",
-        proxy_port,
-        HashMap::from([("127.0.0.1:3001", model.port())]),
-    );
+    let db = TempSqlite::new("mcp_streaming_post_sse");
+    let config = load_mcp_streaming_config(proxy_port, model.port(), db.url());
     let proxy = start_proxy(&config);
 
     let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
@@ -155,11 +169,8 @@ fn buffered_json_tool_result_still_works() {
     });
 
     let proxy_port = free_port();
-    let config = load_example_config(
-        "openai/responses/mcp-streaming.yaml",
-        proxy_port,
-        HashMap::from([("127.0.0.1:3001", model.port())]),
-    );
+    let db = TempSqlite::new("mcp_streaming_buffered_json");
+    let config = load_mcp_streaming_config(proxy_port, model.port(), db.url());
     let proxy = start_proxy(&config);
 
     let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
@@ -235,11 +246,8 @@ fn oversized_sse_tool_result_returns_413() {
     });
 
     let proxy_port = free_port();
-    let config = load_example_config(
-        "openai/responses/mcp-streaming.yaml",
-        proxy_port,
-        HashMap::from([("127.0.0.1:3001", model.port())]),
-    );
+    let db = TempSqlite::new("mcp_streaming_oversized_413");
+    let config = load_mcp_streaming_config(proxy_port, model.port(), db.url());
     let proxy = start_proxy(&config);
 
     let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
@@ -324,11 +332,8 @@ fn clean_request_after_stream_succeeds() {
     });
 
     let proxy_port = free_port();
-    let config = load_example_config(
-        "openai/responses/mcp-streaming.yaml",
-        proxy_port,
-        HashMap::from([("127.0.0.1:3001", model.port())]),
-    );
+    let db = TempSqlite::new("mcp_streaming_clean_after_stream");
+    let config = load_mcp_streaming_config(proxy_port, model.port(), db.url());
     let proxy = start_proxy(&config);
 
     let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
