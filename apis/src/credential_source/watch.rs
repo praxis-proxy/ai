@@ -149,7 +149,7 @@ impl WatchRegistry {
         let CredentialSource::File(path) = source else {
             return Err(format!("{}: WatchRegistry only accepts a file source", ctx.owner).into());
         };
-        super::file_validate_source_len_for_registry(path)?;
+        super::file_validate_source_len_for_registry(path, ctx.owner)?;
         let transform: TransformFn = Arc::new(transform);
         // Initial read fails construction on a bad token (fail loud).
         let raw = resolve_raw_token(source, &ctx)?;

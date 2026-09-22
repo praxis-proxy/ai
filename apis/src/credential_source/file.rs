@@ -20,18 +20,20 @@ fn for_reference(ctx: &DiagnosticContext) -> String {
     }
 }
 
-/// Reject an empty (trimmed) or oversized token.
-pub(crate) fn validate_token(token: &str) -> Result<(), FilterError> {
+/// Reject an empty (trimmed) or oversized token. `owner` qualifies the error
+/// with the owning filter name (spec §7).
+pub(crate) fn validate_token(token: &str, owner: &str) -> Result<(), FilterError> {
     if token.trim().is_empty() || token.len() > MAX_TOKEN_BYTES {
-        return Err(format!("credential token must contain 1-{MAX_TOKEN_BYTES} bytes").into());
+        return Err(format!("{owner}: credential token must contain 1-{MAX_TOKEN_BYTES} bytes").into());
     }
     Ok(())
 }
 
-/// Reject an empty or oversized env-var name / file path.
-pub(crate) fn validate_source_len(kind: &str, value: &str) -> Result<(), FilterError> {
+/// Reject an empty or oversized env-var name / file path. `owner` qualifies the
+/// error with the owning filter name (spec §7).
+pub(crate) fn validate_source_len(kind: &str, value: &str, owner: &str) -> Result<(), FilterError> {
     if value.trim().is_empty() || value.len() > MAX_SOURCE_LEN {
-        return Err(format!("{kind} must contain 1-{MAX_SOURCE_LEN} bytes").into());
+        return Err(format!("{owner}: {kind} must contain 1-{MAX_SOURCE_LEN} bytes").into());
     }
     Ok(())
 }
@@ -58,7 +60,7 @@ pub(crate) fn read_projected_token(
         );
     }
     let token = Zeroizing::new(content.trim().to_owned());
-    validate_token(&token)?;
+    validate_token(&token, owner)?;
     Ok(token)
 }
 
@@ -113,5 +115,34 @@ mod tests {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(&[b'a'; MAX_TOKEN_BYTES + 1]).unwrap();
         assert!(read_projected_token(f.path().to_str().unwrap(), &ctx_with_ref()).is_err());
+    }
+
+    #[test]
+    fn validate_token_bounds_error_is_owner_qualified() {
+        let empty = validate_token("", "credential_inject").unwrap_err();
+        assert_eq!(
+            empty.to_string(),
+            "credential_inject: credential token must contain 1-16384 bytes"
+        );
+        let oversized_input = "a".repeat(MAX_TOKEN_BYTES + 1);
+        let oversized = validate_token(&oversized_input, "credential_inject").unwrap_err();
+        assert_eq!(
+            oversized.to_string(),
+            "credential_inject: credential token must contain 1-16384 bytes"
+        );
+    }
+
+    #[test]
+    fn validate_source_len_bounds_error_is_owner_qualified() {
+        let env_var = validate_source_len("env_var", "", "credential_inject").unwrap_err();
+        assert_eq!(env_var.to_string(), "credential_inject: env_var must contain 1-4096 bytes");
+        let file = validate_source_len("file", "", "credential_inject").unwrap_err();
+        assert_eq!(file.to_string(), "credential_inject: file must contain 1-4096 bytes");
+    }
+
+    #[test]
+    fn bounds_error_prefix_tracks_owner() {
+        let err = validate_source_len("file", "", "web_search").unwrap_err();
+        assert_eq!(err.to_string(), "web_search: file must contain 1-4096 bytes");
     }
 }

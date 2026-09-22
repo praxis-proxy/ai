@@ -168,11 +168,11 @@ pub(crate) fn resolve_raw_token(
 ) -> Result<Zeroizing<String>, FilterError> {
     match source {
         CredentialSource::Value(value) => {
-            file::validate_token(value)?;
+            file::validate_token(value, ctx.owner)?;
             Ok(value.clone())
         },
         CredentialSource::EnvVar(name) => {
-            file::validate_source_len("env_var", name)?;
+            file::validate_source_len("env_var", name, ctx.owner)?;
             let owner = ctx.owner;
             let for_ref = match &ctx.reference {
                 Some(reference) => format!(" for '{reference}'"),
@@ -181,11 +181,11 @@ pub(crate) fn resolve_raw_token(
             let token = std::env::var(name).map_err(|error| -> FilterError {
                 format!("{owner}: env var '{name}' not set{for_ref}: {error}").into()
             })?;
-            file::validate_token(&token)?;
+            file::validate_token(&token, ctx.owner)?;
             Ok(Zeroizing::new(token))
         },
         CredentialSource::File(path) => {
-            file::validate_source_len("file", path)?;
+            file::validate_source_len("file", path, ctx.owner)?;
             file::read_projected_token(path, ctx)
         },
     }
@@ -193,8 +193,11 @@ pub(crate) fn resolve_raw_token(
 
 /// Bridge so `watch.rs` can reuse the file/env bounds check without exposing the
 /// `file` submodule publicly.
-pub(crate) fn file_validate_source_len_for_registry(path: &str) -> Result<(), FilterError> {
-    file::validate_source_len("file", path)
+pub(crate) fn file_validate_source_len_for_registry(
+    path: &str,
+    owner: &str,
+) -> Result<(), FilterError> {
+    file::validate_source_len("file", path, owner)
 }
 
 /// Build a handle for a single source. `value`/`env_var` publish a fixed
