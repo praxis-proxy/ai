@@ -1,0 +1,184 @@
+{
+  "version": 1,
+  "scenario_id": "messages/stop-sequence-stream",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "live",
+    "provider": "vllm",
+    "model": "llama-32-3b-instruct",
+    "source_id": null
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "chatcmpl-ec7b7e6d6a8f4829a00fcff1a0941b94": "chatcmpl-recorded-0002",
+      "msg_18d7a5160a562324": "msg_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_tokens": 64,
+              "messages": [
+                {
+                  "content": "List the first five prime numbers separated by commas, nothing else.",
+                  "role": "user"
+                }
+              ],
+              "model": "llama-32-3b-instruct",
+              "stop_sequences": [
+                ","
+              ],
+              "stream": true,
+              "temperature": 0
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "message_start",
+                "data": "{\"message\":{\"container\":null,\"content\":[],\"id\":\"msg_recorded_0001\",\"model\":\"llama-32-3b-instruct\",\"role\":\"assistant\",\"stop_details\":null,\"stop_reason\":null,\"stop_sequence\":null,\"type\":\"message\",\"usage\":{\"cache_creation\":null,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"inference_geo\":null,\"input_tokens\":0,\"output_tokens\":0,\"output_tokens_details\":null,\"server_tool_use\":null,\"service_tier\":null}},\"type\":\"message_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_start",
+                "data": "{\"content_block\":{\"citations\":null,\"text\":\"\",\"type\":\"text\"},\"index\":0,\"type\":\"content_block_start\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"2\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_delta",
+                "data": "{\"delta\":{\"text\":\"\",\"type\":\"text_delta\"},\"index\":0,\"type\":\"content_block_delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "content_block_stop",
+                "data": "{\"index\":0,\"type\":\"content_block_stop\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_delta",
+                "data": "{\"delta\":{\"container\":null,\"stop_details\":null,\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\",\"},\"type\":\"message_delta\",\"usage\":{\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null,\"input_tokens\":48,\"output_tokens\":2,\"output_tokens_details\":null,\"server_tool_use\":null}}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "message_stop",
+                "data": "{\"type\":\"message_stop\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "max_completion_tokens": 64,
+              "messages": [
+                {
+                  "content": "List the first five prime numbers separated by commas, nothing else.",
+                  "role": "user"
+                }
+              ],
+              "model": "llama-32-3b-instruct",
+              "stop": [
+                ","
+              ],
+              "stream": true,
+              "stream_options": {
+                "include_usage": true
+              },
+              "temperature": 0
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream; charset=utf-8"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"llama-32-3b-instruct\",\"object\":\"chat.completion.chunk\",\"prompt_token_ids\":null}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"2\"},\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"llama-32-3b-instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\",\"index\":0,\"logprobs\":null,\"stop_reason\":\",\",\"token_ids\":null}],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"llama-32-3b-instruct\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[],\"created\":0,\"id\":\"chatcmpl-recorded-0002\",\"model\":\"llama-32-3b-instruct\",\"object\":\"chat.completion.chunk\",\"usage\":{\"completion_tokens\":2,\"prompt_tokens\":48,\"total_tokens\":50}}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": true
+          }
+        }
+      }
+    }
+  ]
+}

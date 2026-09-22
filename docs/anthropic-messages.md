@@ -295,6 +295,13 @@ The `anthropic_messages_to_chat_completions` filter:
   equivalent tool-result error flag
 - Maps `stop_sequences` to `stop`,
   `tool_choice` semantics, tool definitions
+- Reports a matched stop sequence as `stop_reason:
+  stop_sequence` with the matched value when the backend
+  names it in vLLM's choice-level `stop_reason`; a
+  backend that only returns `finish_reason: stop` (for
+  example the OpenAI API) cannot distinguish a stop
+  sequence from a natural stop, so the response reports
+  `end_turn`
 - Maps `metadata.user_id` to `safety_identifier` as its
   SHA-256 hex digest, `output_config.effort` to
   `reasoning_effort`, and a `json_schema`

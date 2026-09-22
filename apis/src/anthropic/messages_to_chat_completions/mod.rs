@@ -38,6 +38,13 @@ const RESPONSE_STATUS_KEY: &str = "anthropic_messages_to_chat_completions.respon
 /// Metadata key preserving the upstream request ID for the body phase.
 const RESPONSE_REQUEST_ID_KEY: &str = "anthropic_messages_to_chat_completions.response_request_id";
 
+/// Metadata key holding the client's `stop_sequences` as a JSON array.
+///
+/// Chat Completions reports a matched stop string only through vLLM's
+/// choice-level `stop_reason`; the response phase needs the client's list to
+/// report it back truthfully as `stop_reason: stop_sequence`.
+pub(crate) const STOP_SEQUENCES_KEY: &str = "anthropic_messages_to_chat_completions.stop_sequences";
+
 // -----------------------------------------------------------------------------
 // AnthropicMessagesToChatCompletionsFilter
 // -----------------------------------------------------------------------------
@@ -204,7 +211,9 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
                 .get("anthropic_messages_to_chat_completions.model")
                 .map_or("", String::as_str);
             let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
-            if let Some(finish_reason) = transform_non_streaming_body(body, request_model, request_id) {
+            let stop_sequences = client_stop_sequences(ctx);
+            if let Some(finish_reason) = transform_non_streaming_body(body, request_model, request_id, &stop_sequences)
+            {
                 ctx.set_metadata("openai.finish_reason", finish_reason);
             }
         }
@@ -239,6 +248,25 @@ fn extract_request_metadata(ctx: &mut HttpFilterContext<'_>, value: Option<&serd
         .map(str::to_owned)
         .unwrap_or_default();
     ctx.set_metadata("anthropic_messages_to_chat_completions.model", model);
+
+    if let Some(stop_sequences) = value
+        .get("stop_sequences")
+        .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+    {
+        ctx.set_metadata(STOP_SEQUENCES_KEY, stop_sequences.to_string());
+    }
+}
+
+/// Client `stop_sequences` retained from the request, or empty when none were sent.
+///
+/// A list that is not all strings is invalid Anthropic input the backend
+/// rejects on its own; treating it as empty keeps the response at
+/// `end_turn` rather than failing the translation.
+pub(crate) fn client_stop_sequences(ctx: &HttpFilterContext<'_>) -> Vec<String> {
+    ctx.filter_metadata
+        .get(STOP_SEQUENCES_KEY)
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default()
 }
 
 /// Install a translated request body, or reject when translation failed.
@@ -357,8 +385,9 @@ fn transform_non_streaming_body(
     body: &mut Option<Bytes>,
     request_model: &str,
     request_id: Option<&str>,
+    stop_sequences: &[String],
 ) -> Option<String> {
-    match response::transform_response(body.as_deref().unwrap_or_default(), request_model) {
+    match response::transform_response(body.as_deref().unwrap_or_default(), request_model, stop_sequences) {
         Ok(result) => {
             debug!(
                 original_len = body.as_ref().map_or(0, Bytes::len),
@@ -602,6 +631,47 @@ mod tests {
                 .get("anthropic_messages_to_chat_completions.model")
                 .unwrap(),
             "gpt-4"
+        );
+    }
+
+    #[test]
+    fn extract_request_metadata_retains_stop_sequences() {
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let value = parse(br#"{"model":"gpt-4","stop_sequences":[",","END"]}"#);
+
+        extract_request_metadata(&mut ctx, value.as_ref());
+
+        assert_eq!(
+            ctx.filter_metadata.get(STOP_SEQUENCES_KEY).unwrap(),
+            r#"[",","END"]"#,
+            "client stop sequences are retained for the response phase"
+        );
+    }
+
+    #[test]
+    fn extract_request_metadata_without_stop_sequences_sets_nothing() {
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let value = parse(br#"{"model":"gpt-4","stop_sequences":[]}"#);
+
+        extract_request_metadata(&mut ctx, value.as_ref());
+
+        assert!(
+            !ctx.filter_metadata.contains_key(STOP_SEQUENCES_KEY),
+            "empty stop_sequences should not be retained"
+        );
+    }
+
+    #[test]
+    fn client_stop_sequences_ignores_non_string_entries() {
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        ctx.set_metadata(STOP_SEQUENCES_KEY, r#"[1,","]"#);
+
+        assert!(
+            client_stop_sequences(&ctx).is_empty(),
+            "non-string stop_sequences should yield no client sequences"
         );
     }
 
@@ -872,7 +942,7 @@ mod tests {
     fn transform_non_streaming_body_missing_body_returns_api_error() {
         let mut body: Option<Bytes> = None;
 
-        let finish_reason = transform_non_streaming_body(&mut body, "gpt-4", None);
+        let finish_reason = transform_non_streaming_body(&mut body, "gpt-4", None, &[]);
         let parsed: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
 
         assert!(finish_reason.is_none());
@@ -885,7 +955,7 @@ mod tests {
     fn transform_non_streaming_body_empty_bytes_returns_api_error() {
         let mut body = Some(Bytes::new());
 
-        let finish_reason = transform_non_streaming_body(&mut body, "gpt-4", None);
+        let finish_reason = transform_non_streaming_body(&mut body, "gpt-4", None, &[]);
         let parsed: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
 
         assert!(finish_reason.is_none());
@@ -898,7 +968,7 @@ mod tests {
         let response_json = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Hello!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
         let mut body = Some(Bytes::from(response_json.to_vec()));
 
-        let finish_reason = transform_non_streaming_body(&mut body, "gpt-4", None);
+        let finish_reason = transform_non_streaming_body(&mut body, "gpt-4", None, &[]);
 
         assert!(body.is_some());
         let parsed: serde_json::Value = serde_json::from_slice(body.unwrap().as_ref()).unwrap();

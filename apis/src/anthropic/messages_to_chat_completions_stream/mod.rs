@@ -21,7 +21,10 @@ use tracing::debug;
 
 use self::config::{AnthropicMessagesToChatCompletionsStreamConfig, build_config};
 use crate::{
-    anthropic::wire::{ContentBlock, MessageDeltaUsage, MessageUsage},
+    anthropic::{
+        messages_to_chat_completions::client_stop_sequences,
+        wire::{ContentBlock, MessageDeltaUsage, MessageUsage},
+    },
     is_event_stream_content_type,
 };
 
@@ -63,6 +66,9 @@ const TOOL_BLOCK_COUNT_KEY: &str = "anthropic_stream.tool_block_count";
 
 /// Metadata key for the finish reason from the upstream provider.
 const FINISH_REASON_KEY: &str = "anthropic_stream.finish_reason";
+
+/// Metadata key for the client stop sequence the upstream reported as matched.
+const STOP_SEQUENCE_KEY: &str = "anthropic_stream.stop_sequence";
 
 /// Metadata key for accumulated output token count.
 const OUTPUT_TOKENS_KEY: &str = "anthropic_stream.output_tokens";
@@ -552,6 +558,13 @@ fn transform_chunk(
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             ctx.set_metadata(FINISH_REASON_KEY, reason.to_owned());
         }
+        // vLLM reports the matched stop string in a choice-level `stop_reason`;
+        // only a client-provided sequence may be reported back as one.
+        if let Some(matched) = choice.get("stop_reason").and_then(Value::as_str)
+            && client_stop_sequences(ctx).iter().any(|sequence| sequence == matched)
+        {
+            ctx.set_metadata(STOP_SEQUENCE_KEY, matched.to_owned());
+        }
     }
 
     extract_usage_tokens(ctx, chunk);
@@ -848,10 +861,12 @@ fn emit_final_block_stop(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>) 
 
 /// Emit the `message_delta` event with stop reason and usage.
 fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
-    let stop_reason = ctx
-        .filter_metadata
-        .get(FINISH_REASON_KEY)
-        .map_or("end_turn", |v| map_stop_reason(v));
+    let stop_sequence = ctx.filter_metadata.get(STOP_SEQUENCE_KEY);
+    let stop_reason = match ctx.filter_metadata.get(FINISH_REASON_KEY).map(String::as_str) {
+        Some("stop") if stop_sequence.is_some() => "stop_sequence",
+        Some(reason) => map_stop_reason(reason),
+        None => "end_turn",
+    };
 
     let usage = collect_delta_usage(ctx);
 
@@ -864,7 +879,7 @@ fn emit_message_delta(ctx: &HttpFilterContext<'_>, output: &mut Vec<u8>) {
                 "container": null,
                 "stop_details": null,
                 "stop_reason": stop_reason,
-                "stop_sequence": null
+                "stop_sequence": stop_sequence
             },
             "usage": usage
         }),
@@ -1167,6 +1182,60 @@ mod tests {
         );
         assert_u64_field(usage, "input_tokens", 0, "message_start usage");
         assert_u64_field(usage, "output_tokens", 0, "message_start usage");
+    }
+
+    #[test]
+    fn message_delta_reports_matched_stop_sequence() {
+        let (filter, mut ctx) = make_filter_and_context();
+        ctx.set_metadata(
+            crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
+            r#"[","]"#,
+        );
+
+        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Count: 1\"},\"index\":0,\"finish_reason\":\"stop\",\"stop_reason\":\",\"}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk1));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+        let mut body2 = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let out = String::from_utf8(body2.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_delta");
+        let delta = event.get("delta").unwrap();
+        assert_eq!(
+            delta.get("stop_reason").and_then(Value::as_str),
+            Some("stop_sequence"),
+            "matched stop → stop_sequence"
+        );
+        assert_eq!(
+            delta.get("stop_sequence").and_then(Value::as_str),
+            Some(","),
+            "matched value is reported"
+        );
+    }
+
+    #[test]
+    fn message_delta_ignores_stop_reason_outside_client_sequences() {
+        let (filter, mut ctx) = make_filter_and_context();
+        ctx.set_metadata(
+            crate::anthropic::messages_to_chat_completions::STOP_SEQUENCES_KEY,
+            r#"[","]"#,
+        );
+
+        let chunk1 = "data: {\"id\":\"c1\",\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"index\":0,\"finish_reason\":\"stop\",\"stop_reason\":\"</s>\"}]}\n\n";
+        let mut body1 = Some(Bytes::from(chunk1));
+        drop(filter.on_response_body(&mut ctx, &mut body1, false).unwrap());
+        let mut body2 = Some(Bytes::from("data: [DONE]\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut body2, false).unwrap());
+
+        let out = String::from_utf8(body2.unwrap().to_vec()).unwrap();
+        let event = event_data(&out, "message_delta");
+        let delta = event.get("delta").unwrap();
+        assert_eq!(
+            delta.get("stop_reason").and_then(Value::as_str),
+            Some("end_turn"),
+            "server-side stop → end_turn"
+        );
+        assert_null_fields(delta, &["stop_sequence"], "server-side stop");
     }
 
     #[test]
