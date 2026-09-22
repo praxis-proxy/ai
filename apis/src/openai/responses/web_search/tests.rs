@@ -1323,6 +1323,11 @@ fn format_search_results_multiple() {
 
 /// Brave mock that serves every connection and counts dispatched requests.
 fn spawn_counting_brave_mock(listener: std::net::TcpListener) -> Arc<std::sync::atomic::AtomicUsize> {
+    spawn_counting_body_mock(listener, brave_ok_body())
+}
+
+/// Counting mock that answers every connection with the same `body`.
+fn spawn_counting_body_mock(listener: std::net::TcpListener, body: String) -> Arc<std::sync::atomic::AtomicUsize> {
     use std::{
         io::{Read as _, Write as _},
         sync::{
@@ -1332,16 +1337,6 @@ fn spawn_counting_brave_mock(listener: std::net::TcpListener) -> Arc<std::sync::
     };
     let counter = Arc::new(AtomicUsize::new(0));
     let thread_counter = Arc::clone(&counter);
-    let body = serde_json::json!({
-        "web": {
-            "results": [{
-                "title": "Rust Lang",
-                "url": "https://rust-lang.org",
-                "description": "Systems programming language"
-            }]
-        }
-    })
-    .to_string();
     std::thread::spawn(move || {
         while let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0_u8; 4096];
@@ -1871,6 +1866,57 @@ async fn query_cap_bounds_the_whole_batch_and_keeps_partial_results() {
             "an undispatched call must not fabricate results"
         );
     }
+}
+
+#[tokio::test]
+async fn query_cap_boundary_keeps_zero_result_successes_truthful() {
+    // Both sides of the fan-out cap, with every query answered by an empty
+    // result set: a call that exactly fills the cap is dispatched whole and
+    // reports the successful no-results search, while one query past the cap is
+    // clipped and must still say the searches ran rather than claiming nothing
+    // was performed.
+    async fn dispatch(n_queries: usize) -> (usize, String, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let empty_body = serde_json::json!({"web": {"results": []}}).to_string();
+        let count = spawn_counting_body_mock(listener, empty_body);
+
+        let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+        let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let owned: Vec<String> = (0..n_queries).map(|index| format!("q{index}")).collect();
+        let queries: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test"}));
+        state.web_search_calls = vec![web_search_queries_call("ws_cap_boundary", &queries)];
+        ctx.extensions.insert(state);
+
+        let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "dispatching {n_queries} queries must not short-circuit the request"
+        );
+
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        let status = state.accumulated_output[0]["status"].as_str().unwrap().to_owned();
+        let bridge = find_queries_bridge_output(&state.messages, &queries).expect("bridge present");
+        let output = bridge["output"].as_str().unwrap().to_owned();
+        (count.load(std::sync::atomic::Ordering::SeqCst), status, output)
+    }
+
+    let cap = MAX_WEB_SEARCH_QUERIES_PER_CONTINUATION;
+    assert_eq!(
+        dispatch(cap).await,
+        (cap, "completed".to_owned(), NO_RESULTS_OUTPUT.to_owned()),
+        "a call filling the cap exactly is dispatched whole, and empty result sets are successes"
+    );
+    assert_eq!(
+        dispatch(cap + 1).await,
+        (cap, "incomplete".to_owned(), PARTIAL_CLIPPED_OUTPUT.to_owned()),
+        "one query past the cap clips the call, which still reached the provider {cap} times"
+    );
 }
 
 #[tokio::test]

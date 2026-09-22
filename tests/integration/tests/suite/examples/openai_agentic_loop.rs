@@ -4122,6 +4122,155 @@ fn streaming_web_search_round_trip_resumes_one_logical_response() {
 }
 
 #[test]
+fn streaming_web_search_multi_query_call_costs_one_tool_call() {
+    // Streaming counterpart of the buffered multi-query round trip: the model
+    // announces one web_search_call carrying three queries while the client caps
+    // built-in tool calls at one. `max_tool_calls` counts logical tool calls, so
+    // the call is admitted whole, fans out to three provider requests, and the
+    // synthesized lifecycle still resolves into a single logical response.
+    let queries = serde_json::json!(["Rust 2025 edition", "Rust async runtime", "Rust release notes"]);
+    let search_call = serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_stream_multi",
+        "status": "completed",
+        "action": {"type": "search", "queries": queries}
+    });
+    let first_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_ws_multi_1", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_item.added",
+            serde_json::json!({
+                "response_id": "resp_ws_multi_1",
+                "output_index": 0,
+                "item": search_call,
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_ws_multi_1",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [search_call],
+                    "usage": {"input_tokens": 8, "output_tokens": 2, "total_tokens": 10}
+                },
+                "sequence_number": 2
+            }),
+        ),
+    ];
+    let final_message = serde_json::json!({
+        "type": "message",
+        "id": "msg_ws_multi_2",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Rust search completed."}]
+    });
+    let second_response = vec![
+        sse_event(
+            "response.created",
+            serde_json::json!({
+                "response": {"id": "resp_ws_multi_2", "object": "response", "status": "in_progress", "output": []},
+                "sequence_number": 0
+            }),
+        ),
+        sse_event(
+            "response.output_text.delta",
+            serde_json::json!({
+                "response_id": "resp_ws_multi_2",
+                "item_id": "msg_ws_multi_2",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": "Rust search completed.",
+                "sequence_number": 1
+            }),
+        ),
+        sse_event(
+            "response.completed",
+            serde_json::json!({
+                "response": {
+                    "id": "resp_ws_multi_2",
+                    "object": "response",
+                    "status": "completed",
+                    "output": [final_message],
+                    "usage": {"input_tokens": 15, "output_tokens": 4, "total_tokens": 19}
+                },
+                "sequence_number": 2
+            }),
+        ),
+    ];
+    let (model_port, model_requests, model_thread) = start_streaming_model(vec![first_response, second_response]);
+    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_port = search_listener.local_addr().unwrap().port();
+    let search_calls = spawn_search_mock(search_listener);
+    let proxy_port = free_port();
+    let config = load_web_search_config(proxy_port, model_port, search_port);
+    let proxy = start_proxy(&config);
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "Search for Rust news",
+        "stream": true,
+        "store": false,
+        "max_tool_calls": 1,
+        "tools": [{"type": "web_search_preview"}]
+    });
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    let body = parse_body(&raw);
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streamed multi-query web search should return 200: {raw}"
+    );
+
+    let frames = assert_logical_stream_conformance(&body, "resp_ws_multi_1");
+    // Panics unless exactly one added frame carries a web_search_call: the
+    // fan-out stays one logical tool item rather than one item per query.
+    let ws_added = item_frame(&frames, "response.output_item.added", "web_search_call");
+    assert_eq!(
+        ws_added.data["item"]["action"]["queries"], queries,
+        "the announced tool item keeps every requested query: {body}"
+    );
+
+    let output = terminal_output(&frames);
+    assert_eq!(output[0]["type"], "web_search_call", "terminal[0] type: {body}");
+    assert_eq!(
+        output[0]["status"], "completed",
+        "a fully dispatched multi-query call is completed, not clipped by max_tool_calls: 1: {body}"
+    );
+    assert_eq!(
+        output[0]["action"]["queries"], queries,
+        "the streamed action preserves every requested query: {body}"
+    );
+
+    model_thread.join().expect("streaming model thread should finish");
+    assert_eq!(
+        search_calls.load(Ordering::SeqCst),
+        3,
+        "every query of the single admitted call reaches the provider"
+    );
+    let rounds = model_requests
+        .lock()
+        .expect("model request lock should not be poisoned")
+        .len();
+    assert_eq!(
+        rounds, 2,
+        "the call cost one tool-call unit, so the loop resumes with its results"
+    );
+}
+
+#[test]
 fn streaming_web_search_suppresses_premature_round_zero_done() {
     // #276 (finding): the model announces a web_search_call AND emits its
     // output_item.done in round 0 without ever streaming the tool's progress
