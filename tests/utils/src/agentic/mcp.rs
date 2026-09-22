@@ -48,6 +48,7 @@ const MOCK_SESSION_ID: &str = "mock-mcp-session-1";
 // -----------------------------------------------------------------------------
 
 /// Configuration for an MCP mock server instance.
+#[expect(clippy::struct_excessive_bools, reason = "test config struct with feature toggles")]
 pub struct McpMockConfig {
     /// Endpoint path the server listens on.
     pub path: String,
@@ -78,6 +79,13 @@ pub struct McpMockConfig {
     /// When `Some(n)`, pad the SSE `tools/call` result body to at least `n`
     /// bytes so the transport's wire ceiling rejects it (413 scenario).
     pub oversized_sse_bytes: Option<usize>,
+
+    /// Serve the eager server->client GET "common stream" as a held-open
+    /// `text/event-stream` (HTTP 200) instead of the default 405. rmcp opens this
+    /// stream right after the initialize handshake for any stateful session; the
+    /// default 405 makes the transport treat the server as not supporting SSE and
+    /// skip it. Enable this to exercise the GET-common-stream path end-to-end.
+    pub serve_get_stream: bool,
 }
 
 impl Default for McpMockConfig {
@@ -91,6 +99,7 @@ impl Default for McpMockConfig {
             failing_tools: Vec::new(),
             sse_tool_results: false,
             oversized_sse_bytes: None,
+            serve_get_stream: false,
         }
     }
 }
@@ -341,6 +350,12 @@ fn handle_connection(mut stream: TcpStream, config: &McpMockConfig, state: &Mute
         return;
     }
 
+    if req.method == "GET" {
+        record_request(state, build_record(&req));
+        handle_get_stream(&mut stream, &req, config);
+        return;
+    }
+
     if let Some(status) = reject_early(&req, config) {
         record_request(state, build_record(&req));
         write_response(&mut stream, status, reason_for(status), &[], "");
@@ -519,6 +534,43 @@ fn handle_delete(stream: &mut TcpStream, req: &AgenticHttpRequest, config: &McpM
         return;
     }
     write_response(stream, 204, "No Content", &[], "");
+}
+
+/// The eager server->client "common stream" rmcp opens after initialize.
+///
+/// When `serve_get_stream` is unset we mirror the default `reject_early`
+/// behaviour (405), so existing tests see identical wire behaviour. When set,
+/// we return an open `text/event-stream` (HTTP 200) and hold it open with
+/// keepalive comments until the client (the rmcp worker) closes the connection
+/// on transport drop. SSE comment lines (`: ...`) carry no event data, so the
+/// transport's SSE parser ignores them — this exercises the GET-common-stream
+/// success arm without injecting spurious server->client messages.
+fn handle_get_stream(stream: &mut TcpStream, req: &AgenticHttpRequest, config: &McpMockConfig) {
+    if !config.serve_get_stream {
+        write_response(stream, 405, "Method Not Allowed", &[], "");
+        return;
+    }
+    if !path_matches(&req.path, &config.path) {
+        write_response(stream, 404, "Not Found", &[], "");
+        return;
+    }
+
+    let head = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream\r\n\
+                Cache-Control: no-cache\r\n\
+                \r\n";
+    if stream.write_all(head.as_bytes()).is_err() || stream.flush().is_err() {
+        return;
+    }
+
+    // Hold the stream open until the client closes it (transport drop). The
+    // bounded cap keeps a stuck thread from leaking past the test's lifetime.
+    for _ in 0..600 {
+        if stream.write_all(b": keepalive\n\n").is_err() || stream.flush().is_err() {
+            return; // client closed -> exit the connection thread
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// JSON-RPC `-32601` error for unrecognized methods.
