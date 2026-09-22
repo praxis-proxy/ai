@@ -1462,6 +1462,84 @@ async fn chat_file_search_function_call_becomes_responses_function_call() {
 }
 
 #[tokio::test]
+async fn buffered_file_search_echo_uses_hosted_tools_after_backend_lowering() {
+    // Reproduces the state left by openai_file_search_callout: request_body carries
+    // the private lowered `file_search` function destined for the backend, while
+    // state.tools/state.tool_choice retain the client's hosted declaration. The
+    // client-visible response must echo the hosted file_search tool and forced
+    // choice, never the private function shim.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.time_source = &fixed_time;
+    let request_value = json!({
+        "model": "chat-only-model",
+        "input": "find revenue",
+        "stream": false,
+        "store": false,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_q4"]}],
+        "tool_choice": {"type": "file_search"}
+    });
+    let mut state = ResponsesState::from_request_body(request_value);
+    state.response_id = Some("resp_file_search".to_owned());
+    // openai_file_search_callout lowers request_body in place before this filter runs.
+    state.request_body["tools"] = json!([{
+        "type": "function",
+        "name": "file_search",
+        "description": "Search the configured vector stores for relevant files.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"]
+        },
+        "strict": true
+    }]);
+    state.request_body["tool_choice"] = json!({"type": "function", "name": "file_search"});
+    context.extensions.insert(state);
+    let mut request_body = Some(Bytes::from_static(
+        br#"{"model":"chat-only-model","input":"find revenue"}"#,
+    ));
+    let request_action = filter
+        .on_request_body(&mut context, &mut request_body, true)
+        .await
+        .unwrap();
+    assert!(matches!(request_action, FilterAction::Continue));
+
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    let response_action = filter.on_response(&mut context).await.unwrap();
+    assert!(matches!(response_action, FilterAction::Continue));
+    context.response_header = None;
+    let mut response_body = Some(Bytes::from_static(
+        br#"{"id":"chatcmpl_search","object":"chat.completion","model":"chat-only-model","choices":[{"index":0,"message":{"role":"assistant","content":"Revenue was strong."},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}"#,
+    ));
+
+    let body_action = filter.on_response_body(&mut context, &mut response_body, true).unwrap();
+
+    assert!(matches!(body_action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(response_body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        translated["tools"][0]["type"], "file_search",
+        "response must echo the hosted file_search tool, not the lowered private function"
+    );
+    assert_eq!(
+        translated["tools"][0]["vector_store_ids"],
+        json!(["vs_q4"]),
+        "hosted vector_store_ids must survive into the client-visible echo"
+    );
+    assert_eq!(
+        translated["tool_choice"],
+        json!({"type": "file_search"}),
+        "forced hosted tool_choice must be echoed, not the lowered private function choice"
+    );
+}
+
+#[tokio::test]
 async fn malformed_success_aborts_after_headers_are_sent() {
     let yaml = serde_yaml::from_str("{}").unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();

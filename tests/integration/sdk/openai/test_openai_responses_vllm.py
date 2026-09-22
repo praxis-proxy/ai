@@ -694,11 +694,12 @@ class SimulatorBackendShimHandler(BaseHTTPRequestHandler):
     stop choosing tools after a Chat ``role=tool`` result. Praxis agentic tests
     need the opposite deterministic script: choose a tool on the first round,
     then return assistant text after the locally executed result is re-entered.
+    This forcing is Chat-only.
 
-    Its native Responses frontend also rejects hosted ``file_search`` tools.
-    vLLM accepts those tools and emits the private ``function_call`` that the
-    Praxis file-search loop normalizes, so the shim substitutes that equivalent
-    private function at the backend boundary.
+    Native Responses ``file_search`` lowering is no longer done here: Praxis
+    lowers the hosted tool into a private function before the request reaches the
+    backend (``openai_file_search_callout``), so the shim forwards native
+    ``/v1/responses`` requests untouched and exercises the real production path.
     """
 
     def log_message(self, fmt, *args):
@@ -709,14 +710,15 @@ class SimulatorBackendShimHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         request_body = json.loads(body)
 
-        if self.path.rstrip("/").endswith("/v1/responses"):
-            request_body["tools"] = [
-                self._responses_tool(tool)
-                for tool in request_body.get("tools", [])
-            ]
-            body = json.dumps(request_body).encode()
-        elif (
-            request_body.get("tools")
+        # Praxis lowers hosted Responses `file_search` into a private function
+        # before the request reaches the backend (openai_file_search_callout), so
+        # the shim forwards native `/v1/responses` requests untouched. The
+        # tool_choice forcing below is Chat-only: it inspects `messages`, which a
+        # Responses body does not carry, and only compensates for the simulator's
+        # probabilistic Chat tool selection.
+        if (
+            self.path.rstrip("/").endswith("/v1/chat/completions")
+            and request_body.get("tools")
             and request_body.get("tool_choice", "auto") == "auto"
         ):
             has_tool_result = any(
@@ -751,29 +753,6 @@ class SimulatorBackendShimHandler(BaseHTTPRequestHandler):
                     if chunk:
                         self.wfile.write(chunk)
                         self.wfile.flush()
-
-    @staticmethod
-    def _responses_tool(tool: dict) -> dict:
-        if tool.get("type") != "file_search":
-            return tool
-        return {
-            "type": "function",
-            "name": "file_search",
-            "description": "Search the configured vector stores for relevant files.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 4096,
-                    }
-                },
-                "required": ["query"],
-                "additionalProperties": False,
-            },
-            "strict": True,
-        }
 
 
 def _write_witness_config(
@@ -5382,6 +5361,40 @@ class TestFileSearchChatCompletionsVLLM:
 
         assert response.status in ("completed", "incomplete"), (
             f"response should reach a terminal status; got {response.status}"
+        )
+
+        # The backend-lowered private function must not leak into the echoed
+        # request declarations. openai_file_search_callout rewrites
+        # request_body.tools into {"type":"function","name":"file_search"} for the
+        # Chat backend, but responses_to_chat_completions must echo the hosted
+        # tool the client sent, derived from the preserved ResponsesState.tools.
+        dumped = response.model_dump()
+        echoed_tools = dumped.get("tools") or []
+        assert echoed_tools, (
+            f"response should echo the client's tool declarations; got {dumped.get('tools')!r}"
+        )
+        assert any(t.get("type") == "file_search" for t in echoed_tools), (
+            f"response.tools must echo the hosted file_search tool; got {echoed_tools}"
+        )
+        assert not any(
+            t.get("type") == "function" and t.get("name") == "file_search"
+            for t in echoed_tools
+        ), (
+            "the backend-only private file_search function must not leak into "
+            f"response.tools; got {echoed_tools}"
+        )
+        echoed_file_search = next(
+            t for t in echoed_tools if t.get("type") == "file_search"
+        )
+        assert store_id in (echoed_file_search.get("vector_store_ids") or []), (
+            "the echoed hosted file_search tool must retain the client's "
+            f"vector_store_ids; got {echoed_file_search}"
+        )
+        # The client left tool_choice unset, so the echo must be the hosted
+        # default "auto", never the lowered {"type":"function","name":"file_search"}.
+        assert dumped.get("tool_choice") == "auto", (
+            "response.tool_choice should echo the hosted default 'auto'; got "
+            f"{dumped.get('tool_choice')!r}"
         )
 
         output_types = [item.type for item in response.output]

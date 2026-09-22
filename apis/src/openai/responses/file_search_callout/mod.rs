@@ -50,9 +50,16 @@ use crate::{
     callout_headers::effective_body_callout_headers,
     callout_policy::OnFailure,
     http_hop::connection_nominates_header,
-    openai::responses::{
-        bounded_json_size,
-        state::{DispatchFailure, FileSearchAssignment, MAX_CITATION_FILES, ResponsesState},
+    openai::{
+        responses::{
+            bounded_json_size,
+            error::responses_error_rejection,
+            state::{DispatchFailure, FileSearchAssignment, MAX_CITATION_FILES, ResponsesState},
+        },
+        translation::chat_completions::{
+            TranslationError, responses_file_search_tool_choice_lowering, synthesized_file_search_tool_responses,
+            validate_file_search_tools,
+        },
     },
     subrequest::SubRequestClient,
 };
@@ -457,7 +464,93 @@ impl HttpFilter for FileSearchCalloutFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
+        // Lower a hosted file_search tool into a private function before dispatch
+        // so a native `/v1/responses` backend that cannot consume hosted tools
+        // still runs the search. This mutates only the outbound body; the hosted
+        // configuration the dispatcher reads stays in `state.tools`.
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+            && let Err(rejection) = lower_native_file_search(state)
+        {
+            return Ok(rejection);
+        }
         self.dispatch(ctx).await
+    }
+}
+
+/// Lower a hosted Responses `file_search` tool into a private function for a
+/// native `/v1/responses` backend that cannot consume hosted tools.
+///
+/// Runs once at request-body EOS before dispatch. Self-gating and idempotent: it
+/// fires only while `request_body["tools"]` still carries a hosted
+/// `{"type":"file_search"}` entry, so continuation rounds (already lowered) and
+/// requests without hosted file search are no-ops. It mutates only
+/// `state.request_body` — the outbound body `openai_responses_proxy` serializes —
+/// and leaves `state.tools`/`state.tool_choice` holding the hosted configuration
+/// the dispatcher and response normalizer read. Rejections reuse the Chat
+/// Completions translation's validation so both backends reject the same
+/// malformed requests.
+fn lower_native_file_search(state: &mut ResponsesState) -> Result<(), FilterAction> {
+    if !request_body_has_hosted_file_search(state) {
+        return Ok(());
+    }
+    validate_file_search_tools(&state.tools).map_err(|error| reject_file_search(&error))?;
+    // Resolve the lowered choice before mutating, so a rejected choice leaves the
+    // outbound body untouched (no half-lowered request).
+    let lowered_choice = match state.request_body.get("tool_choice") {
+        Some(choice) => {
+            responses_file_search_tool_choice_lowering(choice).map_err(|error| reject_file_search(&error))?
+        },
+        None => None,
+    };
+    if let Some(choice) = lowered_choice {
+        set_request_body_tool_choice(state, choice);
+    }
+    lower_request_body_file_search_tools(state);
+    state.mark_request_body_for_rebuild();
+    Ok(())
+}
+
+/// Map a Chat-translation file-search error to a `400` rejection so the native
+/// and Chat paths reject identical malformed declarations.
+fn reject_file_search(error: &TranslationError) -> FilterAction {
+    FilterAction::Reject(responses_error_rejection(
+        400,
+        "invalid_request_error",
+        &error.to_string(),
+    ))
+}
+
+/// True while the outbound request body still carries a hosted `file_search` tool.
+fn request_body_has_hosted_file_search(state: &ResponsesState) -> bool {
+    state
+        .request_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.iter().any(is_hosted_file_search_tool))
+}
+
+/// True for a hosted `{"type":"file_search"}` tool declaration.
+fn is_hosted_file_search_tool(tool: &Value) -> bool {
+    tool.get("type").and_then(Value::as_str) == Some("file_search")
+}
+
+/// Replace every hosted `file_search` entry in the outbound `tools` with the
+/// private Responses function, preserving order and any client tools.
+fn lower_request_body_file_search_tools(state: &mut ResponsesState) {
+    let Some(tools) = state.request_body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools.iter_mut() {
+        if is_hosted_file_search_tool(tool) {
+            *tool = synthesized_file_search_tool_responses();
+        }
+    }
+}
+
+/// Overwrite the outbound `tool_choice` with the lowered function choice.
+fn set_request_body_tool_choice(state: &mut ResponsesState, choice: Value) {
+    if let Some(object) = state.request_body.as_object_mut() {
+        object.insert("tool_choice".to_owned(), choice);
     }
 }
 

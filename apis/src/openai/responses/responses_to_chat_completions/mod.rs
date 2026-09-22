@@ -303,7 +303,12 @@ impl ResponsesToChatCompletionsFilter {
         };
         let inputs = SnapshotInputs {
             request_body: &state.request_body,
-            original_tool_choice: state.original_tool_choice.as_ref(),
+            tools: &state.tools,
+            // The effective client-visible choice: the agentic-preserved original
+            // when set, otherwise the canonical request choice. Both retain the
+            // hosted form even after openai_file_search_callout lowers
+            // request_body for the backend.
+            original_tool_choice: state.original_tool_choice.as_ref().or(Some(&state.tool_choice)),
             now,
         };
 
@@ -729,9 +734,12 @@ fn translate_success_response(ctx: &HttpFilterContext<'_>, body: &[u8]) -> Resul
     let mut response_context =
         ResponseContext::from_responses_request(&state.request_body, response_id.to_owned(), created_at)
             .with_completed_at(ctx.time_source.now().as_secs());
-    if let Some(original_tool_choice) = state.original_tool_choice.as_ref() {
-        response_context.tool_choice = Some(original_tool_choice);
-    }
+    // Echo the client's canonical tool declarations, not the backend-lowered forms
+    // that openai_file_search_callout writes into request_body (e.g. a hosted
+    // `file_search` tool lowered to a private `function`). This mirrors how the
+    // outbound request is built from `state.tools`/`state.tool_choice`.
+    response_context.tools = &state.tools;
+    response_context.tool_choice = state.original_tool_choice.as_ref().or(Some(&state.tool_choice));
     let provider_response: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
     let translated = chat_response_to_response_resource(&provider_response, &response_context)
