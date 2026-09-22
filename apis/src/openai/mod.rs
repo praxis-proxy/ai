@@ -47,3 +47,5 @@ pub use responses::{
     },
     stream_events::OpenaiStreamEventsFilter,
 };
+
+pub use crate::mcp_client::McpStreamingSelectorFilter;

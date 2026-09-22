@@ -129,11 +129,15 @@
 #   Request phase (forward):
 #     openai_stream_events → openai_web_search → openai_mcp_dispatch
 #       → openai_file_search_callout → openai_agentic_loop
-#       → openai_responses_proxy → headers → router → load_balancer
+#       → headers → router → load_balancer → openai_responses_proxy
 #   Response phase (reverse):
-#     load_balancer → router → headers → openai_responses_proxy
+#     openai_responses_proxy → load_balancer → router → headers
 #       → openai_agentic_loop → (dispatchers have no response phase)
 #       → openai_stream_events
+#   The proxy's request-body hook still participates in the pipeline body
+#   pre-read. Its request-header hook runs after load_balancer selection, so it
+#   can fail closed unless the selected cluster explicitly declares both
+#   application_protocol: openai_responses and application_provider: openai.
 #   The three dispatchers (openai_web_search, openai_mcp_dispatch,
 #   openai_file_search_callout) have no response phase: each executes the
 #   loop owner's assigned calls at request-body EOS on the next iteration,
@@ -246,6 +250,11 @@
 #   - Replace the local inference-backend endpoint with api.openai.com:443
 #     and configure tls.sni: api.openai.com (in BOTH the bypass branch's
 #     load_balancer and the IRR step's load_balancer).
+#   - Uncomment the `http.application_protocol: openai_responses` and
+#     `http.application_provider: openai` declarations on BOTH
+#     inference-backend clusters below. The canonical IRR ordering already
+#     permits `prompt.id` once both capabilities are declared; endpoint
+#     identity does not participate in the trust decision.
 #   - Add this headers filter inside the IRR step after the router to
 #     replace the downstream Host:
 #
@@ -429,6 +438,13 @@ filter_chains:
                         endpoints:
                           - "127.0.0.1:9999"
                       - name: "inference-backend"
+                        # Optional provider capability. Uncomment only when
+                        # this backend implements OpenAI-managed features such
+                        # as prompt IDs; generic/vLLM backends should leave it
+                        # absent so prompt templates fail closed.
+                        # http:
+                        #   application_protocol: openai_responses
+                        #   application_provider: openai
                         endpoints:
                           - "127.0.0.1:3001"
                       - name: "vector-stores-backend"
@@ -538,9 +554,6 @@ filter_chains:
               # must stay below the IRR max_iterations safety cap (7 + 1 = 8).
               - filter: openai_agentic_loop
                 max_infer_iters: 7
-              # Selects typed streaming automatically when the effective
-              # outbound body carries `"stream": true`; otherwise buffers.
-              - filter: openai_responses_proxy
               - filter: headers
                 request_set:
                   - name: Content-Type
@@ -558,8 +571,21 @@ filter_chains:
               - filter: load_balancer
                 clusters:
                   - name: "inference-backend"
+                    # Optional provider capability. Uncomment only when this
+                    # backend can resolve OpenAI-managed prompt IDs.
+                    # Endpoint hostname, port, TLS, and SNI are not the trust
+                    # boundary.
+                    # http:
+                    #   application_protocol: openai_responses
+                    #   application_provider: openai
                     endpoints:
                       - "127.0.0.1:3001"
+              # Selects typed streaming automatically when the effective
+              # outbound body carries `"stream": true`; otherwise buffers.
+              # Its request hook runs after load-balancer selection. Prompt
+              # templates fail closed unless the selected cluster enables both
+              # optional application declarations above.
+              - filter: openai_responses_proxy
             on_result:
               # openai_agentic_loop is the sole loop authority (issue #1046):
               # it parses each model response, records assignments for the

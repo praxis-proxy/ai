@@ -78,6 +78,9 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// It converts the enriched request to Chat Completions wire format, converts
 /// finite successful Chat responses back to Responses resources, and
 /// normalizes finite provider errors while preserving their HTTP status.
+/// OpenAI-managed `prompt` template references fail closed because Chat
+/// Completions has no equivalent field and silently dropping them would change
+/// the requested prompt.
 /// Supported hosted web-search tools are exposed to the Chat backend as a
 /// private, bounded `web_search` function. Returned calls are restored to
 /// canonical `web_search_call` output before downstream agentic filters run.
@@ -325,7 +328,12 @@ impl ResponsesToChatCompletionsFilter {
         };
         let inputs = SnapshotInputs {
             request_body: &state.request_body,
-            original_tool_choice: state.original_tool_choice.as_ref(),
+            tools: &state.tools,
+            // The effective client-visible choice: the agentic-preserved original
+            // when set, otherwise the canonical request choice. Both retain the
+            // hosted form even after openai_file_search_callout lowers
+            // request_body for the backend.
+            original_tool_choice: state.original_tool_choice.as_ref().or(Some(&state.tool_choice)),
             now,
         };
 
@@ -559,11 +567,17 @@ fn translate_canonical_state(
     };
     ensure_previous_response_rehydrated(state)?;
     reject_incompatible_reasoning(&state.request_body, reasoning, request_is_streaming(ctx))?;
+    // Read the *outbound* tools/tool_choice through the accessor so a
+    // `openai_client_tool_compat`-lowered request (rich client tools rewritten to
+    // private `function` tools in `request_body` only) translates the lowered view
+    // a function-only Chat backend can accept, not the canonical rich types that
+    // are retained for response-side restore (issue #1206). For every non-compat
+    // flow `request_body` mirrors canonical state, so this read is unchanged there.
     responses_state_to_chat_request(
         &state.request_body,
         &state.messages,
-        &state.tools,
-        &state.tool_choice,
+        state.request_tools(),
+        state.request_tool_choice(),
         reasoning,
     )
     .map_err(|error| {
@@ -783,9 +797,11 @@ fn translate_success_response(
         ResponseContext::from_responses_request(&state.request_body, response_id.to_owned(), created_at)
             .with_completed_at(ctx.time_source.now().as_secs())
             .with_reasoning_options(reasoning.clone());
-    if let Some(original_tool_choice) = state.original_tool_choice.as_ref() {
-        response_context.tool_choice = Some(original_tool_choice);
-    }
+    // Echo the client's canonical tool declarations, not the backend-lowered forms
+    // that openai_file_search_callout writes into request_body (e.g. a hosted
+    // `file_search` tool lowered to a private `function`).
+    response_context.tools = &state.tools;
+    response_context.tool_choice = state.original_tool_choice.as_ref().or(Some(&state.tool_choice));
     let provider_response: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| -> FilterError { format!("responses_to_chat_completions: {error}").into() })?;
     let translated = chat_response_to_response_resource(&provider_response, &response_context)

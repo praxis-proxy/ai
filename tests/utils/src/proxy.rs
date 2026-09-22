@@ -78,6 +78,7 @@ fn resolve_listener_pipeline(
             config.insecure_options.allow_unbounded_body,
         )
         .unwrap();
+    pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
     pipeline.set_subrequest_client(client.clone());
     // Mirror the server: propagate the private-upstream override into the
     // pipeline and its nested callout chains (e.g. `openai_file_resolve`'s

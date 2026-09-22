@@ -237,6 +237,7 @@ filter_chains:
   # MCP callout's outbound chain via the named reference above.
   - name: mcp-egress
     filters:
+      - filter: openai_mcp_streaming_selector
       - filter: headers
         request_set:
           - name: x-mcp-outbound-probe

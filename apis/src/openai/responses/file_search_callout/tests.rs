@@ -1994,3 +1994,328 @@ fn continuation_state_charges_local_completion_response_template() {
         "clearing the response template must release its continuation-state charge"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Native request-side file_search lowering
+//
+// A native `/v1/responses` backend (e.g. vLLM) cannot consume the hosted
+// `{"type":"file_search"}` tool, so this dispatcher lowers it into a private
+// Responses function before dispatch. Lowering mutates only the outbound body
+// (`ResponsesState.request_body`) and leaves `state.tools`/`state.tool_choice`
+// holding the hosted configuration the dispatcher and response normalizer read.
+// -----------------------------------------------------------------------------
+
+/// Assert the action is a rejection and return its `(status, message)`.
+fn reject_parts(action: &FilterAction) -> (u16, String) {
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected FilterAction::Reject");
+    };
+    let body = rejection.body.clone().expect("rejection has a body");
+    let parsed: Value = serde_json::from_slice(&body).expect("rejection body is JSON");
+    let message = parsed["error"]["message"]
+        .as_str()
+        .expect("rejection carries an error message")
+        .to_owned();
+    (rejection.status, message)
+}
+
+#[test]
+fn native_lowering_replaces_hosted_file_search_tool_with_private_function() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "qwen",
+        "input": "find the launch checklist",
+        "tools": [{
+            "type": "file_search",
+            "vector_store_ids": ["vs_123"],
+            "max_num_results": 5
+        }]
+    }));
+
+    lower_native_file_search(&mut state).expect("valid hosted file_search lowers");
+
+    let lowered = &state.request_body["tools"][0];
+    assert_eq!(lowered["type"], json!("function"));
+    assert_eq!(lowered["name"], json!("file_search"));
+    assert_eq!(lowered["strict"], json!(true));
+    assert_eq!(
+        lowered["parameters"]["properties"]["query"]["maxLength"],
+        json!(65_536),
+        "the flat Responses schema must share the Chat query bound, not the shim's 4096"
+    );
+    assert!(
+        lowered.get("function").is_none(),
+        "Responses lowering must stay flat, not nest under `function`"
+    );
+
+    // The dispatcher and response normalizer keep reading the hosted config.
+    assert_eq!(state.tools[0]["type"], json!("file_search"));
+    assert_eq!(state.tools[0]["vector_store_ids"], json!(["vs_123"]));
+    assert!(
+        state.request_body_requires_rebuild(),
+        "the outbound body must be re-serialized after lowering"
+    );
+}
+
+#[test]
+fn native_lowering_preserves_hosted_configuration_in_state() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{
+            "type": "file_search",
+            "vector_store_ids": ["vs_a", "vs_b"],
+            "max_num_results": 7,
+            "ranking_options": {"score_threshold": 0.5},
+            "filters": {"type": "eq", "key": "k", "value": "v"}
+        }]
+    }));
+
+    lower_native_file_search(&mut state).expect("valid hosted file_search lowers");
+
+    let hosted = &state.tools[0];
+    assert_eq!(hosted["vector_store_ids"], json!(["vs_a", "vs_b"]));
+    assert_eq!(hosted["max_num_results"], json!(7));
+    assert_eq!(hosted["ranking_options"], json!({"score_threshold": 0.5}));
+    assert_eq!(hosted["filters"], json!({"type": "eq", "key": "k", "value": "v"}));
+    // The private outbound tool exposes none of the hosted configuration.
+    assert_eq!(state.request_body["tools"][0]["type"], json!("function"));
+    assert!(
+        state.request_body["tools"][0].get("vector_store_ids").is_none(),
+        "the lowered private function must not leak the hosted vector_store_ids to the backend"
+    );
+}
+
+#[test]
+fn native_lowering_converts_forced_file_search_tool_choice() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        "tool_choice": {"type": "file_search"}
+    }));
+
+    lower_native_file_search(&mut state).expect("forced file_search choice lowers");
+
+    assert_eq!(
+        state.request_body["tool_choice"],
+        json!({"type": "function", "name": "file_search"})
+    );
+    // The hosted choice is retained for the client-visible view.
+    assert_eq!(state.tool_choice, json!({"type": "file_search"}));
+}
+
+#[test]
+fn native_lowering_preserves_string_tool_choice() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        "tool_choice": "auto"
+    }));
+
+    lower_native_file_search(&mut state).expect("auto choice lowers tools only");
+
+    assert_eq!(state.request_body["tool_choice"], json!("auto"));
+    assert_eq!(state.request_body["tools"][0]["type"], json!("function"));
+}
+
+#[test]
+fn native_lowering_preserves_unrelated_forced_function_choice() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [
+            {"type": "file_search", "vector_store_ids": ["vs_1"]},
+            {"type": "function", "name": "lookup"}
+        ],
+        "tool_choice": {"type": "function", "name": "lookup"}
+    }));
+
+    lower_native_file_search(&mut state).expect("unrelated forced function is preserved");
+
+    assert_eq!(
+        state.request_body["tool_choice"],
+        json!({"type": "function", "name": "lookup"})
+    );
+    assert_eq!(state.request_body["tools"][0]["name"], json!("file_search"));
+    assert_eq!(
+        state.request_body["tools"][1],
+        json!({"type": "function", "name": "lookup"}),
+        "a client function tool must survive lowering unchanged"
+    );
+}
+
+#[test]
+fn native_lowering_rejects_client_function_named_file_search() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [
+            {"type": "file_search", "vector_store_ids": ["vs_1"]},
+            {"type": "function", "name": "file_search", "parameters": {"type": "object"}}
+        ]
+    }));
+
+    let err = lower_native_file_search(&mut state).expect_err("colliding client function rejects");
+    let (status, message) = reject_parts(&err);
+    assert_eq!(status, 400);
+    assert!(
+        message.contains("conflicts with the synthesized file_search function"),
+        "unexpected message: {message}"
+    );
+}
+
+#[test]
+fn native_lowering_rejects_forced_private_function_tool_choice() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        "tool_choice": {"type": "function", "name": "file_search"}
+    }));
+
+    let err = lower_native_file_search(&mut state).expect_err("forcing the private function rejects");
+    let (status, message) = reject_parts(&err);
+    assert_eq!(status, 400);
+    assert!(
+        message.contains("tool_choice for hosted file_search must use type file_search"),
+        "unexpected message: {message}"
+    );
+    // A rejected request must not leave a half-lowered outbound body.
+    assert_eq!(state.request_body["tools"][0]["type"], json!("file_search"));
+    assert!(
+        !state.request_body_requires_rebuild(),
+        "a rejected lowering must not request an outbound rebuild"
+    );
+}
+
+#[test]
+fn native_lowering_rejects_multiple_file_search_tools() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [
+            {"type": "file_search", "vector_store_ids": ["vs_1"]},
+            {"type": "file_search", "vector_store_ids": ["vs_2"]}
+        ]
+    }));
+
+    let err = lower_native_file_search(&mut state).expect_err("two file_search tools reject");
+    let (status, message) = reject_parts(&err);
+    assert_eq!(status, 400);
+    assert!(
+        message.contains("only one file_search tool may be declared"),
+        "unexpected message: {message}"
+    );
+}
+
+#[test]
+fn native_lowering_rejects_invalid_vector_store_ids() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "file_search", "vector_store_ids": []}]
+    }));
+
+    let err = lower_native_file_search(&mut state).expect_err("empty vector_store_ids reject");
+    let (status, message) = reject_parts(&err);
+    assert_eq!(status, 400);
+    assert!(
+        message.contains("vector_store_ids must be a non-empty array of non-empty strings"),
+        "unexpected message: {message}"
+    );
+}
+
+#[test]
+fn native_lowering_is_idempotent_across_continuations() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        "tool_choice": {"type": "file_search"}
+    }));
+
+    lower_native_file_search(&mut state).expect("round 0 lowers");
+    let after_first = state.request_body.clone();
+
+    lower_native_file_search(&mut state).expect("continuation is a no-op");
+    assert_eq!(
+        state.request_body, after_first,
+        "re-lowering an already-lowered body must not change it"
+    );
+    // The hosted config still drives the dispatcher after continuation.
+    assert_eq!(state.tools[0]["type"], json!("file_search"));
+}
+
+#[test]
+fn native_lowering_noop_without_hosted_file_search() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "function", "name": "lookup"}],
+        "tool_choice": {"type": "file_search"}
+    }));
+    let before = state.request_body.clone();
+
+    lower_native_file_search(&mut state).expect("no hosted file_search is a no-op");
+
+    assert_eq!(state.request_body, before, "no hosted tool means no rewrite");
+    assert!(
+        !state.request_body_requires_rebuild(),
+        "no rewrite means no rebuild request"
+    );
+}
+
+#[test]
+fn native_lowering_noop_when_request_body_absent() {
+    // Existing dispatch tests build state via `state_with`, leaving `request_body`
+    // null. Lowering must skip those so the demoted dispatcher path is unchanged.
+    let mut state = state_with(&["vs_1"], Vec::new());
+    assert!(state.request_body.is_null(), "state_with must leave request_body null");
+
+    lower_native_file_search(&mut state).expect("absent request body is a no-op");
+
+    assert!(
+        state.request_body.is_null(),
+        "lowering a null request_body must leave it null"
+    );
+    assert!(
+        !state.request_body_requires_rebuild(),
+        "a no-op lowering must not request an outbound rebuild"
+    );
+}
+
+#[test]
+fn native_lowering_preserves_tool_order_around_file_search() {
+    let mut state = ResponsesState::from_request_body(json!({
+        "tools": [
+            {"type": "function", "name": "alpha"},
+            {"type": "file_search", "vector_store_ids": ["vs_1"]},
+            {"type": "function", "name": "beta"}
+        ]
+    }));
+
+    lower_native_file_search(&mut state).expect("mixed tools lower");
+
+    let tools = state.request_body["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 3);
+    assert_eq!(tools[0], json!({"type": "function", "name": "alpha"}));
+    assert_eq!(tools[1]["name"], json!("file_search"));
+    assert_eq!(tools[1]["type"], json!("function"));
+    assert!(
+        tools[1].get("vector_store_ids").is_none(),
+        "the lowered middle tool must not leak the hosted vector_store_ids"
+    );
+    assert_eq!(tools[2], json!({"type": "function", "name": "beta"}));
+}
+
+#[tokio::test]
+async fn on_request_body_lowers_native_file_search_before_dispatch() {
+    // No assignments are recorded, so `dispatch` is a no-op `Continue`; the only
+    // observable effect is the request-side lowering wired ahead of dispatch.
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_filter(server.port, "");
+    let state = ResponsesState::from_request_body(json!({
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_1"]}],
+        "tool_choice": {"type": "file_search"}
+    }));
+    let mut ctx = make_context(Some(state));
+
+    let action = dispatch(&*filter, &mut ctx).await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "no assignments recorded means dispatch continues without a callout"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().expect("state present");
+    assert_eq!(state.request_body["tools"][0]["type"], json!("function"));
+    assert_eq!(
+        state.request_body["tool_choice"],
+        json!({"type": "function", "name": "file_search"})
+    );
+    assert_eq!(state.tools[0]["type"], json!("file_search"));
+    assert!(
+        server.requests().is_empty(),
+        "no assignments means no vector-store callout"
+    );
+}

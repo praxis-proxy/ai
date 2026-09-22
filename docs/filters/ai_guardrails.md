@@ -7,6 +7,10 @@ Calls an external AI guardrail provider to evaluate request and response bodies.
 
 ## Configuration Notes
 
+Every provider callout runs through Praxis's filtered-subrequest executor. The optional `outbound_chain` adds destination-bound authentication, authorization, audit, and static service credentials; when omitted it defaults to an empty pass-through chain. Parent and child contexts stay isolated; user-scoped credential projection is handled separately in #880.
+
+Because this filter reads the request body before the header-phase security filters on the main chain run, operators should treat the pre-read body as untrusted input and configure an outbound chain whenever the provider requires destination-bound policy enforcement.
+
 **Wire format:** Chat Completions only (`messages` on requests, `choices[].message` on responses). Responses API, Anthropic Messages, and MCP are not supported yet (see ai#1043).
 
 For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail configurations. When `provider.guardrails` is omitted, the request omits `config_ids` so the service can use its default configuration. Omit `provider.model` to leave the selected configuration's models unchanged; a non-empty value replaces or adds its main model.
@@ -15,6 +19,7 @@ For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail configur
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
+| `outbound_chain` | string \| object | no | Outbound filter chain executed for every `NeMo` callout. Optional. Callouts always run through the filtered-subrequest executor; omitting this field uses an empty inline chain (pure passthrough). |
 | `provider` | ProviderConfig | yes | External provider configuration (required). |
 | `provider.type` | `nemo` | yes | Provider type selector. |
 | `phase` | PhaseConfig | no | Which phases to evaluate. |
@@ -25,10 +30,10 @@ For `NeMo`, `provider.guardrails.config_ids` selects deployed guardrail configur
 
 ```yaml
 filter: ai_guardrails
+outbound_chain: nemo-outbound # optional
 provider:
   type: nemo
   endpoint: "http://nemo:8000/v1/checks"
-  allow_private_endpoint: true
   guardrails:
     config_ids: ["your-config"]
   timeout_ms: 5000

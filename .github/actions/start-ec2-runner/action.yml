@@ -1,0 +1,100 @@
+name: Start EC2 GPU runner
+description: >-
+  Provision an ephemeral EC2 GPU runner via AWS OIDC and
+  machulav/ec2-github-runner, validating the AMI, subnet, and security group
+  with an EC2 run-instances dry-run first. Pair with the stop-ec2-runner action,
+  which tears the instance down unconditionally. The calling job must grant
+  `id-token: write` (for AWS OIDC) and consume the `label` output as its
+  dependent job's `runs-on`.
+inputs:
+  aws-region:
+    description: AWS region hosting the runner (e.g. us-east-2).
+    required: true
+  aws-role-arn:
+    description: IAM role ARN assumed via GitHub OIDC to launch the instance.
+    required: true
+  ami-id:
+    description: GPU AMI id to boot (CUDA + container runtime + GH runner agent).
+    required: true
+  subnet-id:
+    description: VPC subnet id the instance is launched into.
+    required: true
+  security-group-id:
+    description: Security group id attached to the instance.
+    required: true
+  instance-type:
+    description: EC2 instance type.
+    required: false
+    default: g4dn.xlarge
+  github-token:
+    description: >-
+      Fine-grained PAT with Administration:read+write used to register the
+      self-hosted runner. NOT the default GITHUB_TOKEN.
+    required: true
+  role-session-name:
+    description: STS session name for the assumed role.
+    required: false
+    default: praxis-gpu-start
+outputs:
+  label:
+    description: Unique runner label to use as the dependent job's runs-on.
+    value: ${{ steps.start-ec2-runner.outputs.label }}
+  ec2-instance-id:
+    description: EC2 instance id, required by stop-ec2-runner to terminate it.
+    value: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
+      with:
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: ${{ inputs.role-session-name }}
+
+    - name: Validate EC2 runner configuration
+      shell: bash
+      env:
+        AWS_REGION: ${{ inputs.aws-region }}
+        AWS_GPU_AMI_ID: ${{ inputs.ami-id }}
+        AWS_SUBNET_ID: ${{ inputs.subnet-id }}
+        AWS_SECURITY_GROUP_ID: ${{ inputs.security-group-id }}
+        INSTANCE_TYPE: ${{ inputs.instance-type }}
+      run: |
+        set -euo pipefail
+
+        for name in AWS_GPU_AMI_ID AWS_SUBNET_ID AWS_SECURITY_GROUP_ID; do
+          if [[ -z "${!name}" ]]; then
+            echo "Required repository variable for $name is not configured" >&2
+            exit 1
+          fi
+        done
+
+        # Fail fast with a clear message when the AMI/subnet/SG are wrong,
+        # instead of booting an instance that never registers as a runner.
+        if validation="$(aws ec2 run-instances \
+          --region "$AWS_REGION" \
+          --image-id "$AWS_GPU_AMI_ID" \
+          --instance-type "$INSTANCE_TYPE" \
+          --subnet-id "$AWS_SUBNET_ID" \
+          --security-group-ids "$AWS_SECURITY_GROUP_ID" \
+          --dry-run 2>&1)"; then
+          echo "EC2 dry-run unexpectedly succeeded without returning DryRunOperation" >&2
+          exit 1
+        elif [[ "$validation" != *DryRunOperation* ]]; then
+          echo "$validation" >&2
+          exit 1
+        fi
+
+        echo "Validated AMI, subnet, and security group for $INSTANCE_TYPE in $AWS_REGION"
+
+    - name: Start EC2 runner
+      id: start-ec2-runner
+      uses: machulav/ec2-github-runner@a8c20fc0876503410b2b966c124abc2311984ce2 # v2.3.9
+      with:
+        mode: start
+        github-token: ${{ inputs.github-token }}
+        ec2-image-id: ${{ inputs.ami-id }}
+        ec2-instance-type: ${{ inputs.instance-type }}
+        subnet-id: ${{ inputs.subnet-id }}
+        security-group-id: ${{ inputs.security-group-id }}

@@ -85,6 +85,15 @@ const NETNS_ENV: &str = "PRAXIS_TEST_CLAUDE_CODE_NETNS";
 /// the advisory-only, non-isolated path. The client's only route is then the
 /// veth to Praxis, which the test verifies actively.
 const REQUIRE_EGRESS_ISOLATION_ENV: &str = "PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION";
+/// Optional environment variable demanding a real live run (no silent skip).
+///
+/// A Rust test that early-returns reports as PASSED — there is no distinct
+/// skipped status. So when a required live variable is missing the test would
+/// otherwise yield a false green, e.g. if `sudo --preserve-env` fails to
+/// propagate one of them. When this is truthy (`1`/`true`), a missing required
+/// variable is a hard failure instead of a skip, so CI cannot pass without
+/// actually exercising the flow.
+const REQUIRE_LIVE_ENV: &str = "PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE";
 /// Optional environment variable overriding the address Praxis binds.
 ///
 /// Under network isolation the client lives in a namespace and reaches Praxis
@@ -97,7 +106,21 @@ const LISTEN_ADDRESS_ENV: &str = "PRAXIS_TEST_LISTEN_ADDRESS";
 ///
 /// PIN: confirm the exact string against the pinned executable during the
 /// qualification run and update this constant and the manifest together.
-const CLAUDE_CODE_VERSION: &str = "2.0.1";
+const CLAUDE_CODE_VERSION: &str = "2.1.278";
+
+/// Output-token ceiling passed to the pinned client for the 16K vLLM context.
+///
+/// Claude Code otherwise requests 32K output tokens, which vLLM correctly
+/// rejects before inference when the pinned model server has a 16K total
+/// context. The coding task needs only short tool calls and a summary.
+const CLAUDE_CODE_MAX_OUTPUT_TOKENS: &str = "2048";
+
+/// Context window advertised to the pinned client for its compaction policy.
+///
+/// The client otherwise compacts after each small tool result when this is set
+/// to the backend's 16K generation window. Actual requests remain bounded by
+/// vLLM's 16K limit and the separate 2K output cap.
+const CLAUDE_CODE_MAX_CONTEXT_TOKENS: &str = "32768";
 
 /// The native-vLLM passthrough example config under test (no body translation).
 const CONFIG_NATIVE: &str = "anthropic/messages-native-vllm.yaml";
@@ -125,10 +148,14 @@ fn gateway_password() -> &'static str {
 }
 
 /// The deterministic coding-task prompt; the required value lives only on disk.
-const PROMPT: &str = "Read the file `source/value.txt`. Write its contents converted to UPPERCASE \
-     (with no surrounding whitespace) into `result/value.txt`. Then run `./verify.sh`. \
-     Finally, summarize what you changed. The current value in `result/value.txt` is a \
-     placeholder and must be replaced.";
+const PROMPT: &str = "Use tools immediately; do not explain before calling them. \
+     (1) Read `source/value.txt`. \
+     (2) Edit `result/value.txt`: replace the exact text `PLACEHOLDER` with the source text \
+     converted to UPPERCASE, with no surrounding whitespace. Do not use the source text as \
+     the Edit old_string. \
+     (3) You MUST use the Bash tool to run exactly `./verify.sh` and wait for `verify: OK`. \
+     Do not give a final answer before that command succeeds. \
+     (4) Only then give a concise final summary. /no_think";
 
 /// Hard timeout bounding the whole child run, matching the CI documented bound.
 const CHILD_TIMEOUT: Duration = Duration::from_secs(180);
@@ -136,14 +163,16 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(180);
 /// Pinned Claude Code launch flags (excluding `-p`, the prompt, and `--model`).
 ///
 /// PIN: these are the real print-mode headless flags accepted by the pinned
-/// executable. The #1025 design sketch listed an APPROXIMATE set (`--bare`,
-/// `--tools`, `--permission-mode dontAsk`, `--no-session-persistence`) that does
-/// not match real Claude Code flags; do NOT reintroduce those. Re-validate the
-/// full set below against the pinned executable during qualification and adjust
-/// here and in the manifest together.
+/// executable. Restricting the available built-ins to the three tools the task
+/// exercises keeps unrelated tool schemas out of the prompt and makes the 16K
+/// context pin representative. Re-validate the full set below against the
+/// pinned executable during qualification and adjust here and in the manifest
+/// together.
 const LAUNCH_FLAGS: &[&str] = &[
     "--permission-mode",
     "acceptEdits",
+    "--tools",
+    "Read,Edit,Bash",
     "--strict-mcp-config",
     "--output-format",
     "stream-json",
@@ -203,7 +232,11 @@ async fn run_full_flow(live: &LiveConfig, build_config: fn(&LiveConfig, u16) -> 
     // enforcement, not an advisory `ANTHROPIC_BASE_URL` that a client is free to
     // ignore.
     if let Some(namespace) = &live.netns {
-        verify_egress_isolation(namespace, live.listen_address, proxy_port);
+        let bound = proxy
+            .addr()
+            .parse::<std::net::SocketAddr>()
+            .unwrap_or_else(|error| panic!("parse Praxis listen address {}: {error}", proxy.addr()));
+        verify_egress_isolation(namespace, bound.ip(), bound.port());
     }
 
     let workspace = Workspace::create();
@@ -230,8 +263,8 @@ async fn run_full_flow(live: &LiveConfig, build_config: fn(&LiveConfig, u16) -> 
     //  * the work itself — the client's stream-json tool trace shows it Read the distinct input (receiving the per-run
     //    token back through Praxis), performed the distinct Edit writing the uppercase transform, and emitted a final
     //    summary.
-    workspace.assert_task_completed(started);
     workspace.assert_task_trace(&String::from_utf8_lossy(&output.stdout));
+    workspace.assert_task_completed(started);
 }
 
 // -----------------------------------------------------------------------------
@@ -263,6 +296,16 @@ impl LiveConfig {
 
         let (Some(claude_bin), Some(vllm_base), Some(model), Some(_)) = (claude_bin, vllm_base, model, backend_token)
         else {
+            // A live run demanded by CI must never be silently skipped: an
+            // early return reports as PASSED, so a required variable dropped by
+            // `sudo --preserve-env` (or otherwise unset) would be a false green.
+            assert!(
+                !env_is_truthy(REQUIRE_LIVE_ENV),
+                "{REQUIRE_LIVE_ENV} is set but a required variable is missing; set all of \
+                 {CLAUDE_CODE_BIN_ENV}, {VLLM_BASE_URL_ENV}, {VLLM_MODEL_ENV}, and \
+                 {BACKEND_TOKEN_ENV} — the acceptance run must not be skipped when a live run \
+                 is required"
+            );
             eprintln!(
                 "skipping native-vLLM Claude Code acceptance test; set {CLAUDE_CODE_BIN_ENV}, \
                  {VLLM_BASE_URL_ENV}, {VLLM_MODEL_ENV}, and {BACKEND_TOKEN_ENV} to run it"
@@ -458,8 +501,9 @@ impl Workspace {
         );
     }
 
-    /// Assert the client actually READ the distinct input and performed the
-    /// distinct EDIT, then summarized — proven from its stream-json tool trace.
+    /// Assert the client actually READ the distinct input, performed the
+    /// distinct EDIT, successfully ran verification, then summarized — proven
+    /// from its stream-json tool trace.
     ///
     /// The end-state file check in [`Self::assert_task_completed`] proves the
     /// right bytes landed on disk; this proves the client did the *work*: it did
@@ -513,6 +557,33 @@ impl Workspace {
             edit_result.text,
         );
 
+        let bash = trace
+            .tool_uses
+            .iter()
+            .find(|tool_use| {
+                tool_use.name == "Bash"
+                    && tool_use
+                        .input
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|command| command.contains("verify.sh"))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "client must call Bash to run verify.sh; tool calls observed: {:?}\nstdout:\n{stdout}",
+                    trace.tool_use_names(),
+                )
+            });
+        let bash_result = trace
+            .result_for(&bash.id)
+            .unwrap_or_else(|| panic!("the verify.sh Bash call must produce a tool_result"));
+        assert!(
+            !bash_result.is_error && bash_result.text.contains("verify: OK"),
+            "the verify.sh Bash tool_result for command {:?} must report success: {}",
+            bash.input.get("command").and_then(Value::as_str),
+            bash_result.text,
+        );
+
         assert!(
             trace.final_summary.is_some(),
             "Claude Code must emit a non-empty final summary in its stream-json output",
@@ -548,12 +619,13 @@ fn write_verify_script(path: &Path, marker_path: &Path, nonce: &str) {
     }
 }
 
-/// Draws a fresh lowercase hex seed for the task value and nonce.
+/// Draws a fresh decimal seed for the task value and nonce.
 ///
-/// Sourced from the OS RNG so the round-tripped token and the success marker
-/// nonce are unguessable per run and contain no hard-coded value.
+/// A numeric suffix keeps the model's required case conversion focused on the
+/// fixed lowercase prefix while preserving a distinct per-run value that can
+/// only enter the trace through the Read result.
 fn unique_seed() -> String {
-    random_token()
+    format!("{:010}", rand::random::<u32>())
 }
 
 /// Returns a fresh 128-bit lowercase hex token drawn from the OS RNG.
@@ -584,7 +656,13 @@ async fn launch_claude_code(live: &LiveConfig, proxy_base_url: &str, workspace: 
         .arg("--allowedTools")
         .arg("Read")
         .arg("Edit")
-        .arg("Bash(./verify.sh:*)")
+        // Qwen may render the required verification as `./verify.sh`, invoke it
+        // through a shell, or compose it with an inspection command. Claude
+        // Code's Bash permission rules are prefix matches, so enumerating exact
+        // spellings makes this real-model acceptance test nondeterministic. Bash
+        // is the only shell tool exposed by `--tools`, the project and HOME are
+        // temporary, and CI additionally runs the client without network egress.
+        .arg("Bash")
         .arg("--mcp-config")
         .arg(&mcp_config)
         .args(LAUNCH_FLAGS)
@@ -606,6 +684,8 @@ async fn launch_claude_code(live: &LiveConfig, proxy_base_url: &str, workspace: 
         .env("ANTHROPIC_DEFAULT_OPUS_MODEL", &live.model)
         .env("ANTHROPIC_DEFAULT_SONNET_MODEL", &live.model)
         .env("ANTHROPIC_DEFAULT_HAIKU_MODEL", &live.model)
+        .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", CLAUDE_CODE_MAX_OUTPUT_TOKENS)
+        .env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", CLAUDE_CODE_MAX_CONTEXT_TOKENS)
         .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
         .env("DISABLE_UPDATES", "1")
         .env("DISABLE_TELEMETRY", "1")
@@ -685,28 +765,51 @@ fn verify_egress_isolation(namespace: &str, praxis_host: IpAddr, praxis_port: u1
 
 /// Reports whether a TCP connection to `host:port` succeeds inside `namespace`.
 ///
-/// Uses bash's `/dev/tcp` under `ip netns exec`, bounded by `timeout(1)`, so no
-/// extra probe binary is required. A clean connect returns success; a refused,
-/// unreachable, or timed-out connect returns failure. This probe is Linux-only,
-/// matching the netns-gated acceptance run.
+/// Uses the runner's guaranteed Python interpreter under `ip netns exec`. This
+/// avoids depending on optional `timeout(1)` or Bash `/dev/tcp` support inside
+/// a minimal GPU image, and retains the concrete socket error in CI logs.
 fn netns_can_reach(namespace: &str, host: &str, port: u16) -> bool {
     let seconds = PROBE_TIMEOUT.as_secs().max(1).to_string();
-    let connect = format!("exec 3<>/dev/tcp/{host}/{port}");
-    std::process::Command::new(resolve_ip_binary())
+    let output = std::process::Command::new(resolve_ip_binary())
         .arg("netns")
         .arg("exec")
         .arg(namespace)
-        .arg("timeout")
-        .arg(&seconds)
-        .arg("bash")
+        .arg(resolve_python_binary())
         .arg("-c")
-        .arg(&connect)
+        .arg(
+            "import socket,sys; \
+             socket.create_connection((sys.argv[1], int(sys.argv[2])), \
+             timeout=float(sys.argv[3])).close()",
+        )
+        .arg(host)
+        .arg(port.to_string())
+        .arg(seconds)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            eprintln!(
+                "network-namespace TCP probe to {host}:{port} failed: status={:?}, stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            );
+            false
+        },
+        Err(error) => {
+            eprintln!("network-namespace TCP probe to {host}:{port} could not start: {error}");
+            false
+        },
+    }
+}
+
+/// Resolve the Python interpreter used by the workflow before entering netns.
+fn resolve_python_binary() -> PathBuf {
+    ["/usr/bin/python3", "/usr/local/bin/python3", "/bin/python3"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|candidate| candidate.exists())
+        .unwrap_or_else(|| PathBuf::from("python3"))
 }
 
 // -----------------------------------------------------------------------------

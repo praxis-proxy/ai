@@ -1,0 +1,45 @@
+name: Stop EC2 GPU runner
+description: >-
+  Tear down the ephemeral EC2 GPU runner provisioned by the start-ec2-runner
+  action. Invoke from a job with `if: always()` so the instance is always
+  terminated, even when the test job failed or was cancelled. The calling job
+  must grant `id-token: write` for AWS OIDC.
+inputs:
+  aws-region:
+    description: AWS region hosting the runner (e.g. us-east-2).
+    required: true
+  aws-role-arn:
+    description: IAM role ARN assumed via GitHub OIDC to terminate the instance.
+    required: true
+  github-token:
+    description: >-
+      Fine-grained PAT with Administration:read+write used to deregister the
+      self-hosted runner. NOT the default GITHUB_TOKEN.
+    required: true
+  label:
+    description: Runner label returned by start-ec2-runner.
+    required: true
+  ec2-instance-id:
+    description: EC2 instance id returned by start-ec2-runner.
+    required: true
+  role-session-name:
+    description: STS session name for the assumed role.
+    required: false
+    default: praxis-gpu-stop
+runs:
+  using: composite
+  steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
+      with:
+        role-to-assume: ${{ inputs.aws-role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+        role-session-name: ${{ inputs.role-session-name }}
+
+    - name: Stop EC2 runner
+      uses: machulav/ec2-github-runner@a8c20fc0876503410b2b966c124abc2311984ce2 # v2.3.9
+      with:
+        mode: stop
+        github-token: ${{ inputs.github-token }}
+        label: ${{ inputs.label }}
+        ec2-instance-id: ${{ inputs.ec2-instance-id }}

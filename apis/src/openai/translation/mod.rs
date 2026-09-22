@@ -86,6 +86,31 @@ mod tests {
     }
 
     #[test]
+    fn prompt_template_is_rejected_rather_than_silently_dropped() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": "hello",
+            "prompt": {"id": "pmpt_123", "version": "2", "variables": {"name": "Ada"}}
+        }));
+        assert_eq!(
+            error,
+            "Responses `prompt` has no Chat Completions representation: got object, \
+             this adapter supports only `prompt` null",
+            "a non-null prompt must fail instead of disappearing from the Chat request"
+        );
+    }
+
+    #[test]
+    fn null_prompt_is_treated_as_absent() {
+        let chat = map(&json!({"model": "m", "input": "hello", "prompt": Value::Null}));
+        assert_eq!(chat["model"], "m", "null prompt must not disturb mapped fields");
+        assert!(
+            !chat.as_object().unwrap().contains_key("prompt"),
+            "null prompt is semantically absent and has no Chat representation"
+        );
+    }
+
+    #[test]
     fn explicit_default_background_and_truncation_translate() {
         let chat = map(&json!({
             "model": "m",
@@ -136,6 +161,7 @@ mod tests {
         for request in [
             json!({"model": "m", "input": "hello", "background": true}),
             json!({"model": "m", "input": "hello", "truncation": "auto"}),
+            json!({"model": "m", "input": "hello", "prompt": {"id": "pmpt_123"}}),
         ] {
             assert!(
                 super::chat_completions::responses_request_to_chat_request(&request, &ReasoningOptions::default())

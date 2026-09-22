@@ -37,8 +37,9 @@ const MODEL_IDENTITY_HEADERS: &[&str] = &["x-praxis-ai-effective-model", "x-prax
 /// Hop-by-hop, framing, Host, and proxy-auth names that must not be
 /// used as promotion-header targets.
 ///
-/// Composes [`crate::http_hop::is_hop_by_hop`] with `Host` and
-/// `Content-Length`, which are transport-controlled but not hop-by-hop.
+/// Composes [`crate::http_hop::is_hop_by_hop`] with the names that are
+/// transport-controlled but not hop-by-hop: `Host`, `Content-Length`,
+/// `Content-Type`, and `Expect`.
 pub fn is_transport_controlled_header(name: &str) -> bool {
     is_transport_controlled_header_lowercase(&name.to_ascii_lowercase())
 }
@@ -46,9 +47,14 @@ pub fn is_transport_controlled_header(name: &str) -> bool {
 /// Like [`is_transport_controlled_header`], but `name` must already be a
 /// lowercase HTTP field name, as produced by
 /// [`http::HeaderName::as_str`].
+///
+/// `Content-Type` tells the upstream how to interpret the body and
+/// `Expect` governs whether the body is sent at all, so overwriting either
+/// corrupts the exchange rather than routing it, exactly as the framing
+/// names do.
 #[must_use]
 pub fn is_transport_controlled_header_lowercase(name: &str) -> bool {
-    name == "content-length" || name == "host" || crate::http_hop::is_hop_by_hop(name)
+    matches!(name, "content-length" | "content-type" | "expect" | "host") || crate::http_hop::is_hop_by_hop(name)
 }
 
 /// Whether `name` is known to carry credentials or provider API keys.
@@ -282,6 +288,16 @@ mod tests {
             assert!(
                 is_transport_controlled_header(name),
                 "transport header '{name}' should be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn representation_and_expectation_headers_are_transport_controlled() {
+        for name in ["content-type", "Content-Type", "expect", "Expect"] {
+            assert!(
+                is_transport_controlled_header(name),
+                "'{name}' governs how or whether the body is sent and must not be a promotion target"
             );
         }
     }

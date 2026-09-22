@@ -33,6 +33,8 @@ pub fn resolve_pipelines(
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
+    praxis_filter::set_policy_subrequest_connector(subrequest_client.connector());
+
     let chains: HashMap<&str, &[_]> = config
         .filter_chains
         .iter()

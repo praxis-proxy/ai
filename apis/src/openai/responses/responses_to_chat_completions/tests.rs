@@ -532,6 +532,51 @@ async fn canonical_state_is_translated_and_arms_response() {
     );
 }
 
+#[tokio::test]
+async fn prompt_template_is_rejected_before_chat_translation() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    let request_body = json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "prompt": {"id": "pmpt_123", "variables": {"name": "Ada"}},
+        "store": false
+    });
+    context
+        .extensions
+        .insert(ResponsesState::from_request_body(request_body.clone()));
+    let original = Bytes::from(serde_json::to_vec(&request_body).unwrap());
+    let mut body = Some(original.clone());
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a prompt template must not be silently dropped during Chat translation");
+    };
+    assert_eq!(rejection.status, 400, "prompt translation rejection must be HTTP 400");
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        error["error"]["type"], "invalid_request_error",
+        "prompt translation rejection must use the invalid-request error type"
+    );
+    assert_eq!(
+        error["error"]["message"],
+        "Responses `prompt` has no Chat Completions representation: got object, this adapter supports only `prompt` null",
+        "prompt translation rejection must explain the unsupported representation"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_ref()),
+        "rejection must not emit a Chat request"
+    );
+    assert!(
+        context.get_metadata(ARMED_KEY).is_none(),
+        "a rejected prompt must not arm response translation"
+    );
+}
+
 #[test]
 fn always_advertises_streaming_subrequest_capability() {
     // Running inside the iterative router, the filter always declares the
@@ -776,6 +821,129 @@ async fn web_search_translation_preserves_canonical_hosted_tool_state() {
     assert_eq!(state.tools.as_slice(), request_body["tools"].as_array().unwrap());
     assert_eq!(state.tool_choice, request_body["tool_choice"]);
     assert_eq!(context.get_metadata(ARMED_KEY), Some("true"));
+}
+
+#[tokio::test]
+async fn lowered_request_body_tools_translate_over_canonical_rich_tools() {
+    // Issue #1206: `openai_client_tool_compat` lowers rich client tools (here a
+    // `custom` tool) into `request_body["tools"]` only, leaving canonical
+    // `state.tools` rich for response-side restore. Chat Completions translation
+    // must read the lowered outbound view so a function-only backend receives a
+    // valid `function` tool instead of being rejected with `UnsupportedToolType`.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "tools": [{"type": "custom", "name": "apply_patch", "description": "edit files"}],
+    }));
+    // Simulate compat lowering: only the outbound request body is rewritten.
+    state.request_body["tools"] = json!([{
+        "type": "function",
+        "name": "apply_patch",
+        "parameters": {"type": "object", "properties": {}},
+    }]);
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "lowered function tools must translate successfully, not reject as UnsupportedToolType"
+    );
+    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        translated["tools"][0]["type"], "function",
+        "the backend must receive the lowered function tool"
+    );
+    assert_eq!(translated["tools"][0]["function"]["name"], "apply_patch");
+    let state = context.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.tools[0]["type"], "custom",
+        "translation must not mutate canonical rich tools (needed for response-side restore)"
+    );
+}
+
+#[tokio::test]
+async fn lowered_request_body_tool_choice_translates_over_canonical() {
+    // Companion to the tools case: the outbound `tool_choice` in `request_body`
+    // must win over the canonical value so a lowered choice reaches the backend.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+        "tool_choice": "none",
+    }));
+    // Compat rewrote only the outbound choice; canonical stays "none".
+    state.request_body["tool_choice"] = json!("required");
+    context.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        translated["tool_choice"], "required",
+        "the lowered outbound tool_choice must win over the canonical value"
+    );
+    let state = context.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.tool_choice, "none",
+        "translation must not mutate the canonical tool_choice"
+    );
+}
+
+#[tokio::test]
+async fn non_compat_state_translation_is_golden_unchanged() {
+    // Regression lock for issue #1206's accessor switch: when no filter has lowered
+    // tools, `request_body` mirrors canonical state, so reading tools/tool_choice
+    // through `request_tools()`/`request_tool_choice()` must produce exactly the same
+    // Chat request as reading canonical `state.tools`/`state.tool_choice` did before.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "lookup",
+            "description": "look things up",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+        }],
+        "tool_choice": "auto",
+    })));
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        translated["tools"],
+        json!([{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "look things up",
+                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
+            },
+        }]),
+        "non-compat function tools translate to their exact Chat shape through the accessor"
+    );
+    assert_eq!(
+        translated["tool_choice"], "auto",
+        "an explicit tool_choice with tools present is preserved verbatim"
+    );
 }
 
 #[tokio::test]
@@ -1372,6 +1540,84 @@ async fn chat_file_search_function_call_becomes_responses_function_call() {
     assert_eq!(translated["output"][0]["type"], "function_call");
     assert_eq!(translated["output"][0]["name"], "file_search");
     assert_eq!(translated["output"][0]["arguments"], "{\"query\":\"Q4 revenue\"}");
+}
+
+#[tokio::test]
+async fn buffered_file_search_echo_uses_hosted_tools_after_backend_lowering() {
+    // Reproduces the state left by openai_file_search_callout: request_body carries
+    // the private lowered `file_search` function destined for the backend, while
+    // state.tools/state.tool_choice retain the client's hosted declaration. The
+    // client-visible response must echo the hosted file_search tool and forced
+    // choice, never the private function shim.
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let fixed_time = FixedTimeSource::new(Duration::from_secs(1_700_000_000));
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.time_source = &fixed_time;
+    let request_value = json!({
+        "model": "chat-only-model",
+        "input": "find revenue",
+        "stream": false,
+        "store": false,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs_q4"]}],
+        "tool_choice": {"type": "file_search"}
+    });
+    let mut state = ResponsesState::from_request_body(request_value);
+    state.response_id = Some("resp_file_search".to_owned());
+    // openai_file_search_callout lowers request_body in place before this filter runs.
+    state.request_body["tools"] = json!([{
+        "type": "function",
+        "name": "file_search",
+        "description": "Search the configured vector stores for relevant files.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"]
+        },
+        "strict": true
+    }]);
+    state.request_body["tool_choice"] = json!({"type": "function", "name": "file_search"});
+    context.extensions.insert(state);
+    let mut request_body = Some(Bytes::from_static(
+        br#"{"model":"chat-only-model","input":"find revenue"}"#,
+    ));
+    let request_action = filter
+        .on_request_body(&mut context, &mut request_body, true)
+        .await
+        .unwrap();
+    assert!(matches!(request_action, FilterAction::Continue));
+
+    let response = Box::leak(Box::new(crate::test_utils::make_response()));
+    response.headers.insert(
+        http::header::CONTENT_TYPE,
+        http::HeaderValue::from_static("application/json"),
+    );
+    context.response_header = Some(response);
+    let response_action = filter.on_response(&mut context).await.unwrap();
+    assert!(matches!(response_action, FilterAction::Continue));
+    context.response_header = None;
+    let mut response_body = Some(Bytes::from_static(
+        br#"{"id":"chatcmpl_search","object":"chat.completion","model":"chat-only-model","choices":[{"index":0,"message":{"role":"assistant","content":"Revenue was strong."},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}"#,
+    ));
+
+    let body_action = filter.on_response_body(&mut context, &mut response_body, true).unwrap();
+
+    assert!(matches!(body_action, FilterAction::Continue));
+    let translated: serde_json::Value = serde_json::from_slice(response_body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        translated["tools"][0]["type"], "file_search",
+        "response must echo the hosted file_search tool, not the lowered private function"
+    );
+    assert_eq!(
+        translated["tools"][0]["vector_store_ids"],
+        json!(["vs_q4"]),
+        "hosted vector_store_ids must survive into the client-visible echo"
+    );
+    assert_eq!(
+        translated["tool_choice"],
+        json!({"type": "file_search"}),
+        "forced hosted tool_choice must be echoed, not the lowered private function choice"
+    );
 }
 
 #[tokio::test]

@@ -37,6 +37,10 @@ const WEB_SEARCH_QUERY_MAX_LENGTH: usize = 4_096;
 /// request, so multi-byte input remains bounded at the callout boundary.
 const FILE_SEARCH_QUERY_MAX_LENGTH: usize = 65_536;
 
+/// Description advertised by both synthesized file-search functions so the Chat
+/// Completions (nested) and Responses (flat) shapes never diverge.
+const FILE_SEARCH_FUNCTION_DESCRIPTION: &str = "Search the configured vector stores for relevant files.";
+
 /// Maximum number of vector stores a single hosted file-search tool may target.
 ///
 /// `openai_file_search_callout` issues an upstream vector-store query per id on
@@ -446,18 +450,20 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 
 /// Reject request parameters this adapter cannot represent.
 ///
-/// `background` and `truncation` describe behaviors the Chat Completions
-/// translation does not implement. Accepting a non-default value would send a
-/// foreground, untruncated Chat request and then report the defaults back as
-/// though they had been honored, so the request fails closed instead. Rejecting
-/// here is what lets [`response_resource`] state those defaults truthfully.
+/// `background`, `truncation`, and `prompt` describe behaviors the Chat
+/// Completions translation does not implement. Accepting an unsupported value
+/// would silently change the request semantics, so the request fails closed
+/// instead. Rejecting `background` and `truncation` here is what lets
+/// [`response_resource`] state their defaults truthfully.
 ///
-/// Unlike parameters this translator forwards, both fields are dropped rather
+/// Unlike parameters this translator forwards, these fields are dropped rather
 /// than sent upstream, so the backend never sees them and cannot validate them
 /// on our behalf. A malformed value is therefore rejected too: anything that is
 /// not demonstrably the default would otherwise be silently discarded and then
 /// reported back as the default.
 fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    validate_prompt_parameter(obj)?;
+
     if let Some(background) = obj.get("background").filter(|value| !value.is_null())
         && background.as_bool() != Some(false)
     {
@@ -487,6 +493,18 @@ fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), Tra
     }
 
     Ok(())
+}
+
+/// Reject a non-null prompt because Chat Completions cannot resolve it.
+fn validate_prompt_parameter(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    let Some(prompt) = obj.get("prompt").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    Err(TranslationError::UnrepresentableRequestParameter {
+        parameter: "prompt",
+        value: json_type_name(prompt),
+        supported: "`prompt` null",
+    })
 }
 
 /// Copy a field from one JSON object to another.
@@ -1054,7 +1072,11 @@ fn validate_web_search_tools(tools: &[Value]) -> Result<(), TranslationError> {
 }
 
 /// Reject ambiguous or structurally unusable file-search declarations.
-fn validate_file_search_tools(tools: &[Value]) -> Result<(), TranslationError> {
+///
+/// Shared by the Chat Completions translation and the native
+/// `openai_file_search_callout` lowering so both paths reject identical
+/// malformed hosted-tool declarations (collisions, duplicates, bad fields).
+pub(crate) fn validate_file_search_tools(tools: &[Value]) -> Result<(), TranslationError> {
     let mut file_search_count = 0_usize;
     let mut has_file_search_function = false;
 
@@ -1226,28 +1248,78 @@ fn validate_vector_store_ids(tool: &Map<String, Value>) -> Result<(), Translatio
     Ok(())
 }
 
+/// Shared JSON Schema parameters for the synthesized file-search function.
+///
+/// Both the Chat Completions [`synthesized_file_search_tool`] and the native
+/// Responses [`synthesized_file_search_tool_responses`] build from this so the
+/// two lowered shapes carry an identical query bound.
+fn file_search_function_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": FILE_SEARCH_QUERY_MAX_LENGTH
+            }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+    })
+}
+
 /// Build the private Chat Completions representation of hosted file search.
 fn synthesized_file_search_tool() -> Value {
     json!({
         "type": "function",
         "function": {
             "name": "file_search",
-            "description": "Search the configured vector stores for relevant files.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": FILE_SEARCH_QUERY_MAX_LENGTH
-                    }
-                },
-                "required": ["query"],
-                "additionalProperties": false
-            },
+            "description": FILE_SEARCH_FUNCTION_DESCRIPTION,
+            "parameters": file_search_function_parameters(),
             "strict": true
         }
     })
+}
+
+/// Build the private Responses representation of hosted file search.
+///
+/// The flat function shape (`{"type":"function","name":...}`) targets a native
+/// `/v1/responses` backend that cannot consume the hosted `file_search` tool. It
+/// shares the description and parameters schema with the Chat Completions
+/// [`synthesized_file_search_tool`] so the two never diverge; the native lowering
+/// in `openai_file_search_callout` substitutes it into the outbound request.
+pub(crate) fn synthesized_file_search_tool_responses() -> Value {
+    json!({
+        "type": "function",
+        "name": "file_search",
+        "description": FILE_SEARCH_FUNCTION_DESCRIPTION,
+        "parameters": file_search_function_parameters(),
+        "strict": true
+    })
+}
+
+/// Lower a Responses `tool_choice` for a native backend that cannot consume the
+/// hosted `file_search` choice.
+///
+/// Returns the flat function choice to substitute, or `None` when the choice
+/// needs no change (strings and object choices that do not target file search).
+/// Mirrors [`build_object_tool_choice`]'s file-search rules so the native
+/// lowering in `openai_file_search_callout` and the Chat translation reject the
+/// same mismatched choices. Callers must confirm a hosted `file_search` tool is
+/// declared before invoking this.
+pub(crate) fn responses_file_search_tool_choice_lowering(
+    tool_choice: &Value,
+) -> Result<Option<Value>, TranslationError> {
+    let Some(choice) = tool_choice.as_object() else {
+        return Ok(None);
+    };
+    match choice.get("type").and_then(Value::as_str) {
+        Some("file_search") => Ok(Some(json!({"type": "function", "name": "file_search"}))),
+        Some("function") if choice.get("name").and_then(Value::as_str) == Some("file_search") => Err(
+            TranslationError::InvalidFileSearchTool("tool_choice for hosted file_search must use type file_search"),
+        ),
+        _ => Ok(None),
+    }
 }
 
 /// Convert a `Responses` function tool to the Chat Completions nested shape.

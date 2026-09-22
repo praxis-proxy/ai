@@ -75,6 +75,10 @@ pub(super) struct StreamLimits {
 pub(super) struct SnapshotInputs<'a> {
     /// Original canonical Responses request body.
     pub(super) request_body: &'a Value,
+    /// Client-visible tool declarations, echoed instead of any backend-lowered
+    /// forms in `request_body` (e.g. a hosted `file_search` tool that
+    /// `openai_file_search_callout` rewrote to a private `function`).
+    pub(super) tools: &'a [Value],
     /// Client-visible tool choice preserved across internal agentic rounds.
     pub(super) original_tool_choice: Option<&'a Value>,
     /// Current wall-clock time in seconds.
@@ -1641,6 +1645,10 @@ impl StreamConverter {
     fn response_context<'a>(&self, inputs: &SnapshotInputs<'a>, completed_at: Option<u64>) -> ResponseContext<'a> {
         let mut context =
             ResponseContext::from_responses_request(inputs.request_body, self.response_id.clone(), self.created_at);
+        // Echo the client's canonical tools/tool_choice, not any backend-lowered
+        // forms in request_body (openai_file_search_callout rewrites a hosted
+        // file_search tool into a private function for the backend).
+        context.tools = inputs.tools;
         if let Some(original_tool_choice) = inputs.original_tool_choice {
             context.tool_choice = Some(original_tool_choice);
         }

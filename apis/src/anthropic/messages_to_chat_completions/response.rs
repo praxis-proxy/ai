@@ -294,12 +294,6 @@ mod tests {
 
     use super::*;
 
-    fn assert_absent_fields(value: &Value, fields: &[&str]) {
-        for field in fields {
-            assert!(value.get(*field).is_none(), "expected {field} to be absent");
-        }
-    }
-
     fn assert_null_fields(value: &Value, fields: &[&str]) {
         for field in fields {
             assert!(value.get(*field).is_some(), "expected {field} to be present");
@@ -438,7 +432,6 @@ mod tests {
         assert_null_fields(&parsed, &["container", "stop_details", "stop_sequence"]);
         assert_eq!(parsed["usage"]["input_tokens"], 10, "input tokens");
         assert_eq!(parsed["usage"]["output_tokens"], 5, "output tokens");
-        assert_absent_fields(&parsed["usage"], &["output_tokens_details"]);
         assert_null_fields(
             &parsed["usage"],
             &[
@@ -446,6 +439,7 @@ mod tests {
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
                 "inference_geo",
+                "output_tokens_details",
                 "server_tool_use",
                 "service_tier",
             ],
@@ -497,11 +491,11 @@ mod tests {
                 "cache_creation",
                 "cache_creation_input_tokens",
                 "inference_geo",
+                "output_tokens_details",
                 "server_tool_use",
                 "service_tier",
             ],
         );
-        assert_absent_fields(&parsed["usage"], &["output_tokens_details"]);
     }
 
     #[test]

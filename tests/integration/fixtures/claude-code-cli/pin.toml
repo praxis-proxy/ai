@@ -10,29 +10,60 @@
 # vLLM container serves both surfaces (`/v1/messages` natively AND
 # `/v1/chat/completions`), so both flows share this single pinned model.
 #
-# Values marked `TBD-at-qualification` are determined by the qualification run
-# described under [qualification] and MUST be filled in — together with the
-# matching constants in claude_code_vllm.rs — before CI executes the test.
+# The GPU acceptance job (`vllm-gpu-claude-acceptance`) reuses the ephemeral EC2
+# GPU runner and the Qwen3-8B weights the full suite already warmed on-disk. A
+# lightweight `pins` job parses this manifest and exports `qualified` (true only
+# when `qualification.status == "qualified"` and no exported value contains
+# "TBD"); the acceptance job stays dormant on the nightly schedule until that
+# flips, so PR/merge-queue/nightly CI stay green while qualification is pending.
+# Every launch value below is runnable as-is — only `qualification.status`
+# (pending) keeps the job dormant. `model_revision` is recorded for
+# reproducibility at qualification and is intentionally NOT a launch flag, so a
+# `workflow_dispatch` qualification run can execute before the revision is known.
 
 [claude_code]
 # Version substring asserted from `claude --version`. Keep in sync with
-# CLAUDE_CODE_VERSION in claude_code_vllm.rs.
-version = "2.0.1"
+# CLAUDE_CODE_VERSION in claude_code_vllm.rs. 2.1.278 is the current published
+# latest (npm dist-tags.latest and the anthropics/claude-code CHANGELOG head);
+# it clears the intermediate 2.1.265-2.1.267 and 2.1.275 self-hosted
+# ANTHROPIC_BASE_URL regressions that returned blanket HTTP 400s.
+version = "2.1.278"
 # Platform triple the pinned archive targets (e.g. "x86_64-unknown-linux-gnu").
 platform = "x86_64-unknown-linux-gnu"
-# Download URL for the pinned archive/executable.
-url = "TBD-at-qualification"
-# SHA-256 of the downloaded archive/executable; CI verifies this before running.
-sha256 = "TBD-at-qualification"
+# Download URL for the pinned executable. Native Claude Code binaries are served
+# per-version from downloads.claude.ai; "linux-x64" is the glibc x86_64 slug that
+# corresponds to the platform triple above. The matching sha256 is published at
+# https://downloads.claude.ai/claude-code-releases/2.1.278/manifest.json
+# (.platforms["linux-x64"].checksum) and is verified against the download in CI.
+url = "https://downloads.claude.ai/claude-code-releases/2.1.278/linux-x64/claude"
+# SHA-256 of the downloaded executable; CI verifies this before running.
+sha256 = "5c4735937844e84f8a93306e841a5b0e12252909b07870f789b190468da147ab"
 
 # Pinned launch flags (excluding `-p`, the prompt, `--model`, `--allowedTools`,
 # and `--mcp-config`, which the test supplies from the workspace). Keep in sync
 # with LAUNCH_FLAGS in claude_code_vllm.rs. Re-validate every flag against the
 # pinned executable during qualification.
 [claude_code.launch]
-allowed_tools = ["Read", "Edit", "Bash(./verify.sh:*)"]
+allowed_tools = [
+  "Read",
+  "Edit",
+  # The live model can spell the required verify invocation in multiple valid
+  # ways. Bash is the only shell tool exposed to the temporary, egress-isolated
+  # acceptance workspace, so approve it without command-shape coupling.
+  "Bash",
+]
+# Claude Code 2.1.278 otherwise asks for 32K output tokens. Pin its supported
+# environment overrides to the real vLLM window so the request is valid without
+# overcommitting the 24GB GPU. The acceptance task needs only short tool calls
+# and a final summary.
+max_output_tokens = 2048
+# Keep Claude Code's normal planning context so it does not compact after each
+# small tool result. Actual requests remain bounded by the 16K vLLM window and
+# the separate 2K output cap above.
+max_context_tokens = 32768
 flags = [
   "--permission-mode", "acceptEdits",
+  "--tools", "Read,Edit,Bash",
   "--strict-mcp-config",
   "--output-format", "stream-json",
   "--verbose",
@@ -40,37 +71,54 @@ flags = [
 ]
 
 [vllm]
-# Container image pinned by digest. The existing CPU image below is a starting
-# candidate only; the served model MUST pass qualification (see below) before it
-# is trusted for this test — Qwen3-0.6B / 4096 context is not assumed capable of
-# Claude Code's prompt and reliable tool use.
-image = "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
+# Container image pinned by digest — the SAME CUDA image the GPU full suite runs
+# (env.VLLM_GPU_IMAGE in .github/workflows/vllm-integration.yaml). vLLM v0.29.0
+# serves the native Anthropic Messages surface (`/v1/messages`,
+# `/v1/messages/count_tokens`) by default, in addition to `/v1/chat/completions`,
+# so one container backs both the native and transformed acceptance paths with no
+# extra flag. Qwen3-8B on the A10G (24GB) is the capable model the full suite is
+# already green with; the 0.6B CPU model cannot drive Claude Code's tool use.
+image = "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
 # Exact served model name. Set via `--served-model-name`; every model-selection
-# surface in the test (--model and the ANTHROPIC_*_MODEL env vars) pins this.
-served_model_name = "TBD-at-qualification"
-# Model weight revision / commit the image serves.
+# surface in the test (--model and the ANTHROPIC_*_MODEL env vars) pins this. A
+# slash-free ALIAS is used deliberately: vLLM's Anthropic client surface cannot
+# address a model name containing "/", and Claude Code addresses that surface.
+# The weights load from the Qwen/Qwen3-8B repo (see [vllm.launch]) and are served
+# under this alias. VALIDATE the alias resolves for Claude Code during qualification.
+served_model_name = "qwen3-8b"
+# HF commit the served weights resolve to. Recorded for reproducibility during
+# qualification (`curl https://huggingface.co/api/models/Qwen/Qwen3-8B | jq -r .sha`,
+# or the snapshot commit-hash dir under the warmed HF cache). Left TBD because a
+# qualification dispatch runs before the revision is known; it is NOT an exported
+# pin, so it does not gate the nightly. A follow-up may additionally pass
+# `--revision <sha>` once recorded.
 model_revision = "TBD-at-qualification"
-# Serving parameters.
+# Serving parameters (mirror the GPU full suite).
 tool_call_parser = "hermes"
-context_length = 4096
+context_length = 16384
 seed = 0
 
-# vLLM launch flags recorded for reproducibility. Native Anthropic Messages
-# serving (`/v1/messages`, `/v1/messages/count_tokens`) must be enabled, and the
-# default OpenAI Chat Completions surface (`/v1/chat/completions`) must remain
-# available for the transformed path.
+# vLLM launch flags recorded for reproducibility, mirroring the GPU full suite's
+# launch so both jobs load identical Qwen3-8B weights from the shared on-disk HF
+# cache. Native Anthropic Messages serving is on by default in this image; no
+# extra flag enables it, and the default OpenAI Chat Completions surface remains
+# available for the transformed path. Thinking is disabled by default for this
+# deterministic coding task: otherwise Qwen3 can consume the entire Claude Code
+# turn budget reasoning about which tool to call without issuing the call.
 #
 # `--model` is REQUIRED: without it vLLM has no weights to load and never becomes
-# ready. It is left `TBD-at-qualification` so the CI "unresolved TBD" fail-fast
-# gate trips until qualification pins the exact model repo/revision. Do NOT add
-# `--served-model-name` here; the CI docker run appends it separately from
-# `served_model_name` above, and duplicating it would pass the flag twice.
+# ready. Do NOT add `--served-model-name` or `--api-key` here; the CI container
+# run appends both separately (from `served_model_name` above and the
+# per-job ephemeral VLLM_API_KEY), and duplicating them would pass the flag twice.
 [vllm.launch]
 flags = [
-  "--model", "TBD-at-qualification",
-  "--max-model-len", "4096",
+  "--model", "Qwen/Qwen3-8B",
+  "--max-model-len", "16384",
   "--enable-auto-tool-choice",
   "--tool-call-parser", "hermes",
+  "--reasoning-parser", "qwen3",
+  "--default-chat-template-kwargs", '{"enable_thinking":false}',
+  "--gpu-memory-utilization", "0.9",
   "--seed", "0",
 ]
 
