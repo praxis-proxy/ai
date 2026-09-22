@@ -89,117 +89,6 @@ const PARTIAL_UNAVAILABLE_OUTPUT: &str = "Web search was performed partially bef
 /// Model-facing result when the call was clipped by the maximum query cap.
 const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before reaching the maximum query cap.";
 
-/// Borrowed inputs for one request-side web-search dispatch batch.
-struct PendingSearchBatch<'a> {
-    /// Calls retained from the current model round, parsed once.
-    calls: Vec<PreparedCall<'a>>,
-    /// Ordered response-wide budget decisions, when the client set a limit.
-    admissions: Option<&'a [bool]>,
-    /// Remaining built-in tool calls allowed by the client's `max_tool_calls`.
-    call_budget: usize,
-    /// Remaining provider requests (queries) allowed by the server-side fan-out cap.
-    query_budget: usize,
-    /// Search result size requested for this response.
-    context_size: SearchContextSize,
-}
-
-/// One pending call, with its hosted action parsed once for the whole batch.
-struct PreparedCall<'a> {
-    /// Identities derived from this call's id, queries, and round position.
-    ids: SearchCallIds<'a>,
-    /// Queries in provider-supplied order; empty when the call is malformed.
-    queries: Vec<&'a str>,
-    /// Canonical client-visible search action; `Null` when the call is malformed.
-    action: Value,
-}
-
-impl<'a> PreparedCall<'a> {
-    /// Pair a parsed action with the identities its queries and position derive.
-    fn new(call_id: &'a str, index: usize, queries: Vec<&'a str>, action: Value) -> Self {
-        Self {
-            ids: SearchCallIds::new(call_id, &queries, index),
-            queries,
-            action,
-        }
-    }
-
-    /// Placeholder for a call carrying no usable `action.queries` or `action.query`.
-    fn malformed(call_id: &'a str, index: usize) -> Self {
-        Self::new(call_id, index, Vec::new(), Value::Null)
-    }
-}
-
-/// Parse each pending call once, preserving pending-queue order.
-fn prepare_calls(calls: &[Value]) -> Vec<PreparedCall<'_>> {
-    calls
-        .iter()
-        .enumerate()
-        .map(|(index, call)| {
-            let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
-            parse_search_request(call, call_id, index).unwrap_or_else(|| PreparedCall::malformed(call_id, index))
-        })
-        .collect()
-}
-
-/// Whether the response-wide ordered admission pass refused the call at
-/// `index`. Absent admissions mean the client set no `max_tool_calls`.
-fn rejected(admissions: Option<&[bool]>, index: usize) -> bool {
-    admissions
-        .and_then(|values| values.get(index))
-        .is_some_and(|admitted| !admitted)
-}
-
-/// Decide whether one pending call may reach the provider, appending its
-/// terminal turn when it may not.
-///
-/// A call without a usable query is surfaced as incomplete on every path, since
-/// neither rejection nor a budget has anything to dispatch. A call `rejected` by
-/// the response-wide ordered admission pass fails locally and forces completion
-/// without another model round. An `over_budget` call — one that can spend
-/// neither a tool-call unit nor a single provider request — is surfaced as
-/// incomplete without reaching the provider.
-fn admit_call<'a>(
-    ctx: &mut HttpFilterContext<'_>,
-    prepared: PreparedCall<'a>,
-    rejected: bool,
-    over_budget: bool,
-) -> Option<PreparedCall<'a>> {
-    if prepared.queries.is_empty() {
-        warn!(
-            call_id = prepared.ids.public,
-            "web_search_call missing valid action.queries or action.query, skipping"
-        );
-        append_incomplete(ctx, &prepared.ids);
-        return None;
-    }
-    let (status, notice) = if rejected {
-        ("failed", TOOL_LIMIT_OUTPUT)
-    } else if over_budget {
-        ("incomplete", NOT_PERFORMED_OUTPUT)
-    } else {
-        return Some(prepared);
-    };
-    append_search_turn(ctx, &prepared.ids, status, prepared.action, &[], Some(notice));
-    None
-}
-
-/// Resolve one dispatched call's terminal status and its model-facing notice.
-fn status_and_notice(successful: usize, n_queries: usize, query_cap: usize) -> (&'static str, Option<&'static str>) {
-    if successful == 0 {
-        return ("failed", Some(SEARCH_UNAVAILABLE));
-    }
-
-    if successful < n_queries && successful < query_cap {
-        return ("incomplete", Some(PARTIAL_UNAVAILABLE_OUTPUT));
-    }
-
-    if successful == query_cap && successful < n_queries {
-        return ("incomplete", Some(PARTIAL_CLIPPED_OUTPUT));
-    }
-
-    ("completed", None)
-}
-
 // -----------------------------------------------------------------------------
 // WebSearchFilter
 // -----------------------------------------------------------------------------
@@ -593,6 +482,146 @@ pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Opt
     ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
 }
 
+/// Borrowed inputs for one request-side web-search dispatch batch.
+struct PendingSearchBatch<'a> {
+    /// Calls retained from the current model round, parsed once.
+    calls: Vec<PreparedCall<'a>>,
+    /// Ordered response-wide budget decisions, when the client set a limit.
+    admissions: Option<&'a [bool]>,
+    /// Remaining built-in tool calls allowed by the client's `max_tool_calls`.
+    call_budget: usize,
+    /// Remaining provider requests (queries) allowed by the server-side fan-out cap.
+    query_budget: usize,
+    /// Search result size requested for this response.
+    context_size: SearchContextSize,
+}
+
+/// Public and bridge identifiers for one appended web-search result.
+///
+/// `public` is the hosted, client-facing `web_search_call.id` retained on the
+/// public output item. `bridge` is the bounded, deterministic id used for the
+/// backend-valid `function_call`/`function_call_output` pair, since the raw
+/// hosted id can exceed the `OpenResponses` 64-character `call_id` limit (issue
+/// #808).
+///
+/// Owned by the [`PreparedCall`] it identifies, so both derive from one parse.
+struct SearchCallIds<'a> {
+    /// Client-facing `web_search_call.id` for the public output item.
+    public: &'a str,
+    /// Bounded, backend-valid id for the synthetic bridge pair.
+    bridge: String,
+    /// Position within the current model round.
+    index: usize,
+}
+
+impl<'a> SearchCallIds<'a> {
+    /// Derive the bounded bridge ID for one provider-facing ID and round position.
+    fn new(public: &'a str, queries: &[&str], index: usize) -> Self {
+        Self {
+            public,
+            bridge: bridge_call_id(public, queries, index),
+            index,
+        }
+    }
+}
+
+/// One pending call, with its hosted action parsed once for the whole batch.
+struct PreparedCall<'a> {
+    /// Identities derived from this call's id, queries, and round position.
+    ids: SearchCallIds<'a>,
+    /// Queries in provider-supplied order; empty when the call is malformed.
+    queries: Vec<&'a str>,
+    /// Canonical client-visible search action; `Null` when the call is malformed.
+    action: Value,
+}
+
+impl<'a> PreparedCall<'a> {
+    /// Pair a parsed action with the identities its queries and position derive.
+    fn new(call_id: &'a str, index: usize, queries: Vec<&'a str>, action: Value) -> Self {
+        Self {
+            ids: SearchCallIds::new(call_id, &queries, index),
+            queries,
+            action,
+        }
+    }
+
+    /// Placeholder for a call carrying no usable `action.queries` or `action.query`.
+    fn malformed(call_id: &'a str, index: usize) -> Self {
+        Self::new(call_id, index, Vec::new(), Value::Null)
+    }
+}
+
+/// Parse each pending call once, preserving pending-queue order.
+fn prepare_calls(calls: &[Value]) -> Vec<PreparedCall<'_>> {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
+            parse_search_request(call, call_id, index).unwrap_or_else(|| PreparedCall::malformed(call_id, index))
+        })
+        .collect()
+}
+
+/// Whether the response-wide ordered admission pass refused the call at
+/// `index`. Absent admissions mean the client set no `max_tool_calls`.
+fn rejected(admissions: Option<&[bool]>, index: usize) -> bool {
+    admissions
+        .and_then(|values| values.get(index))
+        .is_some_and(|admitted| !admitted)
+}
+
+/// Decide whether one pending call may reach the provider, appending its
+/// terminal turn when it may not.
+///
+/// A call without a usable query is surfaced as incomplete on every path, since
+/// neither rejection nor a budget has anything to dispatch. A call `rejected` by
+/// the response-wide ordered admission pass fails locally and forces completion
+/// without another model round. An `over_budget` call — one that can spend
+/// neither a tool-call unit nor a single provider request — is surfaced as
+/// incomplete without reaching the provider.
+fn admit_call<'a>(
+    ctx: &mut HttpFilterContext<'_>,
+    prepared: PreparedCall<'a>,
+    rejected: bool,
+    over_budget: bool,
+) -> Option<PreparedCall<'a>> {
+    if prepared.queries.is_empty() {
+        warn!(
+            call_id = prepared.ids.public,
+            "web_search_call missing valid action.queries or action.query, skipping"
+        );
+        append_incomplete(ctx, &prepared.ids);
+        return None;
+    }
+    let (status, notice) = if rejected {
+        ("failed", TOOL_LIMIT_OUTPUT)
+    } else if over_budget {
+        ("incomplete", NOT_PERFORMED_OUTPUT)
+    } else {
+        return Some(prepared);
+    };
+    append_search_turn(ctx, &prepared.ids, status, prepared.action, &[], Some(notice));
+    None
+}
+
+/// Resolve one dispatched call's terminal status and its model-facing notice.
+fn status_and_notice(successful: usize, n_queries: usize, query_cap: usize) -> (&'static str, Option<&'static str>) {
+    if successful == 0 {
+        return ("failed", Some(SEARCH_UNAVAILABLE));
+    }
+
+    if successful < n_queries && successful < query_cap {
+        return ("incomplete", Some(PARTIAL_UNAVAILABLE_OUTPUT));
+    }
+
+    if successful == query_cap && successful < n_queries {
+        return ("incomplete", Some(PARTIAL_CLIPPED_OUTPUT));
+    }
+
+    ("completed", None)
+}
+
 /// Recover per-request search context after IRR resets step-local metadata.
 fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
     state.tools.iter().find_map(|tool| {
@@ -627,35 +656,6 @@ fn parse_search_request<'a>(call: &'a Value, call_id: &'a str, index: usize) -> 
             PreparedCall::new(call_id, index, vec![query], action)
         }),
         Some(_) => None,
-    }
-}
-
-/// Public and bridge identifiers for one appended web-search result.
-///
-/// `public` is the hosted, client-facing `web_search_call.id` retained on the
-/// public output item. `bridge` is the bounded, deterministic id used for the
-/// backend-valid `function_call`/`function_call_output` pair, since the raw
-/// hosted id can exceed the `OpenResponses` 64-character `call_id` limit (issue
-/// #808).
-///
-/// Owned by the [`PreparedCall`] it identifies, so both derive from one parse.
-struct SearchCallIds<'a> {
-    /// Client-facing `web_search_call.id` for the public output item.
-    public: &'a str,
-    /// Bounded, backend-valid id for the synthetic bridge pair.
-    bridge: String,
-    /// Position within the current model round.
-    index: usize,
-}
-
-impl<'a> SearchCallIds<'a> {
-    /// Derive the bounded bridge ID for one provider-facing ID and round position.
-    fn new(public: &'a str, queries: &[&str], index: usize) -> Self {
-        Self {
-            public,
-            bridge: bridge_call_id(public, queries, index),
-            index,
-        }
     }
 }
 
