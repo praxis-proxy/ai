@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
+use praxis_filter::HttpFilter;
+
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
     filter::AiGuardrailsFilter,
+    providers::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult},
 };
 
 // =============================================================================
@@ -12,7 +15,7 @@ use super::{
 
 /// Build an `ai_guardrails` filter configured with a `nemo` provider pointed
 /// at `endpoint`. Request phase enabled, response phase disabled (default).
-fn nemo_filter(endpoint: &str) -> Box<dyn praxis_filter::HttpFilter> {
+fn nemo_filter(endpoint: &str) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 provider:
@@ -25,7 +28,7 @@ provider:
 }
 
 /// Build an `ai_guardrails` filter with response phase enabled.
-fn nemo_filter_response(endpoint: &str) -> Box<dyn praxis_filter::HttpFilter> {
+fn nemo_filter_response(endpoint: &str) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 provider:
@@ -567,21 +570,28 @@ async fn on_request_body_modified_rewrites_last_user_message() {
     );
 }
 
+/// Provider that always returns [`GuardResult::Redact`] so the rewrite
+/// path can be tested when `NeMo` would skip `/v1/checks` (no user turn).
+struct AlwaysRedactProvider;
+
+#[async_trait::async_trait]
+impl GuardProvider for AlwaysRedactProvider {
+    async fn evaluate(
+        &self,
+        _messages: Vec<serde_json::Value>,
+        _phase: GuardPhase,
+        _runtime: &GuardCalloutRuntime<'_>,
+    ) -> Result<GuardResult, praxis_filter::FilterError> {
+        Ok(GuardResult::Redact {
+            modified_text: "masked".into(),
+            reason: "pii".into(),
+        })
+    }
+}
+
 #[tokio::test]
 async fn on_request_body_modified_without_user_message_fails_closed() {
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-
-    let mock_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "status": "modified",
-            "content": "masked"
-        })))
-        .mount(&mock_server)
-        .await;
-
-    let endpoint = format!("{}/v1/checks", mock_server.uri());
-    let filter = nemo_filter(&endpoint);
+    let filter = AiGuardrailsFilter::with_provider(Box::new(AlwaysRedactProvider), PhaseConfig::default());
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(bytes::Bytes::from_static(

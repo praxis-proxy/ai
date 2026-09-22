@@ -142,6 +142,20 @@ impl AiGuardrailsFilter {
         Self::build(cfg, outbound, client)
     }
 
+    /// Test-only constructor so fail-closed redaction can be exercised
+    /// without a live `NeMo` call. `NeMo` skips `/v1/checks` when there
+    /// is no phase-target message, which would otherwise never produce
+    /// [`GuardResult::Redact`].
+    #[cfg(test)]
+    pub(super) fn with_provider(provider: Box<dyn GuardProvider>, phase: PhaseConfig) -> Self {
+        Self {
+            provider,
+            phase,
+            outbound: test_outbound_chain().expect("test outbound chain"),
+            callout_timeout: std::time::Duration::from_secs(5),
+        }
+    }
+
     /// Capture downstream identity, nesting, deadline, and the bound chain for a callout.
     fn callout_runtime(&self, ctx: &HttpFilterContext<'_>) -> GuardCalloutRuntime<'_> {
         let now = Instant::now();
