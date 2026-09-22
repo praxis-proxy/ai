@@ -67,6 +67,16 @@ struct CredentialSlot {
 }
 
 /// Establishing filter that captures per-user callout credentials from ingress headers.
+///
+/// SECURITY: every configured `source_header` is trusted-boundary-owned input. The
+/// authentication boundary that terminates ingress MUST unconditionally delete and
+/// then set each credential source header on every request, so a client can never
+/// spoof another user's credential by supplying the source header itself. This
+/// filter strips the source headers before they reach any upstream, but it cannot
+/// distinguish a boundary-set value from a client-supplied one; a deployment that
+/// exposes a `source_header` a client can reach without that delete-then-set step
+/// lets any caller inject an arbitrary per-user secret. Only route requests through
+/// this filter behind a boundary that owns every configured source header.
 #[derive(Debug)]
 pub struct CalloutCredentialsFilter {
     /// Validated credential slots.
@@ -326,12 +336,15 @@ mod config_tests {
     #[test]
     fn rejects_unknown_field() {
         let f = cfg("credentials:\n  - slot: a\n    source_header: x-user-a\nbogus: 1\n");
-        assert!(f.is_err());
+        assert!(f.is_err(), "an unknown top-level field must be rejected");
     }
 
     #[test]
     fn rejects_empty_slots() {
-        assert!(cfg("credentials: []\n").is_err());
+        assert!(
+            cfg("credentials: []\n").is_err(),
+            "at least one credential slot is required"
+        );
     }
 
     #[test]
@@ -339,7 +352,7 @@ mod config_tests {
         let f = cfg(
             "credentials:\n  - slot: dup\n    source_header: x-user-a\n  - slot: dup\n    source_header: x-user-b\n",
         );
-        assert!(f.is_err());
+        assert!(f.is_err(), "a duplicate slot id must be rejected");
     }
 
     #[test]
@@ -347,29 +360,50 @@ mod config_tests {
         let f = cfg(
             "credentials:\n  - slot: a\n    source_header: x-user-shared\n  - slot: b\n    source_header: x-user-shared\n",
         );
-        assert!(f.is_err());
+        assert!(f.is_err(), "a source header shared across two slots must be rejected");
     }
 
     #[test]
     fn rejects_reserved_and_framing_source_headers() {
-        assert!(cfg("credentials:\n  - slot: a\n    source_header: host\n").is_err());
-        assert!(cfg("credentials:\n  - slot: a\n    source_header: content-length\n").is_err());
-        assert!(cfg("credentials:\n  - slot: a\n    source_header: connection\n").is_err()); // hop-by-hop
+        assert!(
+            cfg("credentials:\n  - slot: a\n    source_header: host\n").is_err(),
+            "`host` is a framing header and must be rejected"
+        );
+        assert!(
+            cfg("credentials:\n  - slot: a\n    source_header: content-length\n").is_err(),
+            "`content-length` is a framing header and must be rejected"
+        );
+        assert!(
+            cfg("credentials:\n  - slot: a\n    source_header: connection\n").is_err(),
+            "`connection` is a hop-by-hop header and must be rejected"
+        );
     }
 
     #[test]
     fn rejects_routing_prefixed_source_headers() {
-        assert!(cfg("credentials:\n  - slot: a\n    source_header: x-praxis-ai-model\n").is_err());
-        assert!(cfg("credentials:\n  - slot: a\n    source_header: x-mcp-authorized\n").is_err());
-        assert!(cfg("credentials:\n  - slot: a\n    source_header: x-ext-foo\n").is_err());
-        assert!(cfg("credentials:\n  - slot: a\n    source_header: x-a2a-foo\n").is_err());
+        assert!(
+            cfg("credentials:\n  - slot: a\n    source_header: x-praxis-ai-model\n").is_err(),
+            "the internal-trust `x-praxis-` prefix must be rejected"
+        );
+        assert!(
+            cfg("credentials:\n  - slot: a\n    source_header: x-mcp-authorized\n").is_err(),
+            "the reserved `x-mcp-` prefix must be rejected"
+        );
+        assert!(
+            cfg("credentials:\n  - slot: a\n    source_header: x-ext-foo\n").is_err(),
+            "the reserved `x-ext-` prefix must be rejected"
+        );
+        assert!(
+            cfg("credentials:\n  - slot: a\n    source_header: x-a2a-foo\n").is_err(),
+            "the reserved `x-a2a-` prefix must be rejected"
+        );
     }
 
     #[test]
     fn rejects_oversized_slot_id() {
         let big = "x".repeat(MAX_SLOT_ID_BYTES + 1);
         let f = cfg(&format!("credentials:\n  - slot: {big}\n    source_header: x-user-a\n"));
-        assert!(f.is_err());
+        assert!(f.is_err(), "a slot id larger than MAX_SLOT_ID_BYTES must be rejected");
     }
 }
 
@@ -385,8 +419,8 @@ mod tests {
         let mut creds = CalloutCredentials::new();
         creds.insert("brave".to_owned(), SecretString::from("tok-123"));
         assert_eq!(creds.get("brave").unwrap().expose_secret(), "tok-123");
-        assert!(creds.get("absent").is_none());
-        assert!(!creds.is_empty());
+        assert!(creds.get("absent").is_none(), "an unset slot resolves to None");
+        assert!(!creds.is_empty(), "a populated store is not empty");
         assert_eq!(creds.len(), 1);
     }
 
@@ -406,7 +440,7 @@ mod tests {
     #[test]
     fn empty_by_default() {
         let creds = CalloutCredentials::new();
-        assert!(creds.is_empty());
+        assert!(creds.is_empty(), "a fresh store is empty");
         assert_eq!(creds.len(), 0);
     }
 }
@@ -440,11 +474,17 @@ mod runtime_tests {
         let mut ctx = make_filter_context(&request);
 
         let action = filter.on_request(&mut ctx).await.unwrap();
-        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "installing a slot must continue"
+        );
 
         let creds = ctx.extensions.get::<CalloutCredentials>().unwrap();
         assert_eq!(creds.get("brave").unwrap().expose_secret(), "tok-abc");
-        assert!(ctx.request_headers_to_remove.iter().any(|n| n == "x-user-brave-key"));
+        assert!(
+            ctx.request_headers_to_remove.iter().any(|n| n == "x-user-brave-key"),
+            "the ingress source header must be queued for removal"
+        );
     }
 
     #[tokio::test]
@@ -454,14 +494,21 @@ mod runtime_tests {
         let mut ctx = make_filter_context(&request);
 
         let action = filter.on_request(&mut ctx).await.unwrap();
-        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "a missing optional header must continue"
+        );
 
         assert!(
             ctx.extensions
                 .get::<CalloutCredentials>()
-                .is_none_or(|c| c.get("brave").is_none())
+                .is_none_or(|c| c.get("brave").is_none()),
+            "an absent source header leaves the slot unpopulated"
         );
-        assert!(ctx.request_headers_to_remove.iter().any(|n| n == "x-user-brave-key"));
+        assert!(
+            ctx.request_headers_to_remove.iter().any(|n| n == "x-user-brave-key"),
+            "the source header is still stripped even when absent-valued"
+        );
     }
 
     #[tokio::test]
@@ -505,11 +552,17 @@ mod runtime_tests {
         ctx.extensions.insert(prior_creds);
 
         let action = filter.on_request(&mut ctx).await.unwrap();
-        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "an already-installed store must continue"
+        );
 
         let creds = ctx.extensions.get::<CalloutCredentials>().unwrap();
         assert_eq!(creds.get("brave").unwrap().expose_secret(), "prior");
-        assert!(ctx.request_headers_to_remove.iter().any(|n| n == "x-user-brave-key"));
+        assert!(
+            ctx.request_headers_to_remove.iter().any(|n| n == "x-user-brave-key"),
+            "the source header is stripped even when the store is already installed"
+        );
     }
 
     #[tokio::test]
@@ -522,7 +575,10 @@ mod runtime_tests {
         let mut ctx = make_filter_context(&request);
 
         let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
-        assert!(matches!(action, FilterAction::BodyDone));
+        assert!(
+            matches!(action, FilterAction::BodyDone),
+            "the body phase maps Continue to BodyDone"
+        );
 
         let creds = ctx.extensions.get::<CalloutCredentials>().unwrap();
         assert_eq!(creds.get("brave").unwrap().expose_secret(), "tok-xyz");

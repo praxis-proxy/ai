@@ -5,6 +5,10 @@
 
 Establishing filter that captures per-user callout credentials from ingress headers.
 
+## Configuration Notes
+
+SECURITY: every configured `source_header` is trusted-boundary-owned input. The authentication boundary that terminates ingress MUST unconditionally delete and then set each credential source header on every request, so a client can never spoof another user's credential by supplying the source header itself. This filter strips the source headers before they reach any upstream, but it cannot distinguish a boundary-set value from a client-supplied one; a deployment that exposes a `source_header` a client can reach without that delete-then-set step lets any caller inject an arbitrary per-user secret. Only route requests through this filter behind a boundary that owns every configured source header.
+
 ## Configuration
 
 | Field | Type | Required | Description |
