@@ -34,8 +34,15 @@ use crate::pipelines::resolve_pipelines;
 #[expect(
     clippy::too_many_arguments,
     clippy::too_many_lines,
-    clippy::cognitive_complexity,
     reason = "orchestration function"
+)]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the lint only fires with some tracing feature sets"
+)]
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "orchestration function; tracing macro expansion varies with enabled features"
 )]
 pub(crate) fn reload_pipelines(
     new_config: &Config,
@@ -153,7 +160,14 @@ fn log_restart_required_changes(old: &Config, new: &Config) {
 }
 
 /// Detect listener additions, removals, and address rebinds.
-#[expect(clippy::cognitive_complexity, reason = "pre-existing complexity above threshold")]
+#[expect(
+    clippy::allow_attributes,
+    reason = "the lint only fires with some tracing feature sets"
+)]
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "pre-existing complexity above threshold; tracing macro expansion varies with enabled features"
+)]
 fn detect_listener_topology_changes(old: &Config, new: &Config) {
     let old_names: std::collections::HashSet<&str> = old.listeners.iter().map(|l| l.name.as_str()).collect();
     let new_names: std::collections::HashSet<&str> = new.listeners.iter().map(|l| l.name.as_str()).collect();

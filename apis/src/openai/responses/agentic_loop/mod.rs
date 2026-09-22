@@ -372,6 +372,13 @@ impl HttpFilter for AgenticLoopFilter {
 }
 
 /// Apply dispatcher-specific response validation before the sole loop decision.
+#[cfg_attr(
+    not(feature = "openai-mcp-tools"),
+    expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "only MCP round preparation mutates the state"
+    )
+)]
 fn prepare_dispatcher_round(ctx: &HttpFilterContext<'_>, state: &mut ResponsesState) -> Result<(), DispatchFailure> {
     if let Some(max_calls) = configured_web_max_calls(ctx)
         && state.web_search_calls.len() > max_calls

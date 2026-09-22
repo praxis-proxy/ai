@@ -1028,8 +1028,12 @@ async fn watch_loop(
 
 /// Process filesystem events until shutdown is requested.
 #[expect(
+    clippy::allow_attributes,
+    reason = "the lint only fires with some tokio feature sets"
+)]
+#[allow(
     clippy::cognitive_complexity,
-    reason = "complexity is from tokio::select! macro expansion"
+    reason = "complexity is from tokio::select! macro expansion, which varies with the enabled tokio features"
 )]
 #[expect(clippy::too_many_arguments, reason = "watcher loop needs all context")]
 async fn run_event_loop(

@@ -132,6 +132,10 @@ impl OpenaiConversationsFilter {
     }
 
     /// Build the configured store backend.
+    #[cfg_attr(
+        not(any(feature = "store-postgres", feature = "store-sqlite")),
+        expect(clippy::unused_async, reason = "only the SQL backends await during construction")
+    )]
     async fn build_store(&self) -> Result<Arc<dyn ConversationItemStore>, StoreError> {
         #[cfg_attr(
             not(any(feature = "store-postgres", feature = "store-sqlite")),

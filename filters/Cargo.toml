@@ -13,22 +13,42 @@ publish = false
 name = "praxis_ai_filters"
 
 [features]
-default = ["store-postgres"]
+default = ["standard", "full"]
+# Default-on filters that sit behind a gate so minimal builds can drop them.
+standard = ["aws-sigv4-filter"]
+# aws_sigv4_sign: AWS Signature V4 request signing (aws-sigv4).
+aws-sigv4-filter = ["dep:aws-sigv4", "dep:aws-credential-types"]
 # Backwards-compatible alias for the previous default API feature.
 apis = ["store-postgres"]
-store-postgres = ["praxis-ai-apis/store-postgres"]
-store-sqlite = ["praxis-ai-apis/store-sqlite"]
+# Opt-in OpenAI filter groups; see praxis-ai-apis for what each one contains.
+openai-responses = ["praxis-ai-apis/openai-responses"]
+openai-file-resolve-filter = ["openai-responses", "praxis-ai-apis/openai-file-resolve-filter"]
+store = ["openai-responses", "praxis-ai-apis/store"]
+store-postgres = ["store", "praxis-ai-apis/store-postgres"]
+store-sqlite = ["store", "praxis-ai-apis/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
+openai-conversations = ["store", "praxis-ai-apis/openai-conversations"]
+openai-compact = ["store", "praxis-ai-apis/openai-compact"]
+openai-mcp-tools = ["store", "praxis-ai-apis/openai-mcp-tools"]
+# Every non-experimental filter; equals the pre-feature-split capability.
+full = [
+    "standard",
+    "store-postgres",
+    "openai-file-resolve-filter",
+    "openai-conversations",
+    "openai-compact",
+    "openai-mcp-tools",
+]
 # Experimental: the generic http_callout filter. Work in progress; the config
 # surface may change. Activates the `experimental` marker.
-http-callout-filter = ["experimental"]
+http-callout-filter = ["experimental", "dep:serde_json_path"]
 # Experimental: the azure_ad (Entra ID) upstream authentication filter. Work in
 # progress; the config surface may change. Activates the `experimental` marker.
-azure-ad-filter = ["experimental"]
+azure-ad-filter = ["experimental", "dep:reqwest"]
 # Experimental: the gcp_adc (Application Default Credentials) upstream
 # authentication filter. Work in progress; the config surface may change.
 # Activates the `experimental` marker.
-gcp-adc-filter = ["experimental"]
+gcp-adc-filter = ["experimental", "dep:reqwest"]
 # Experimental: the token_rate_limit filter. Its parent proposal
 # (00121_token-rate-limiting in praxis-proxy/enhancements) is not yet
 # `accepted`, and open design questions remain (bucket-keying strategy,
@@ -50,8 +70,8 @@ workspace = true
 [dependencies]
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
-aws-credential-types = { workspace = true }
-aws-sigv4 = { workspace = true }
+aws-credential-types = { workspace = true, optional = true }
+aws-sigv4 = { workspace = true, optional = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
@@ -60,20 +80,18 @@ http = { workspace = true }
 metrics = { workspace = true }
 notify = { workspace = true }
 percent-encoding = { workspace = true }
-# Registers every OpenAI filter unconditionally for now; the filters and server
-# crates gain per-group features in the next step.
-praxis-ai-apis = { workspace = true, features = ["full"] }
+praxis-ai-apis = { workspace = true }
 praxis-core = { workspace = true }
 # chain-binding: ChainBindingContext for register.rs outbound-chain wiring.
 # Off-by-default experimental feature in praxis 0.6.0 (no extra dependencies).
 praxis-filter = { workspace = true, features = ["chain-binding"] }
 redis = { workspace = true, optional = true }
 rand = { workspace = true }
-reqwest.workspace = true
+reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
-serde_json_path = { workspace = true }
+serde_json_path = { workspace = true, optional = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true, optional = true }

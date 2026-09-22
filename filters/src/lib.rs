@@ -9,6 +9,7 @@
 //! inference routing, prompt enrichment, and token usage handling.
 
 pub mod agentic;
+#[cfg(feature = "aws-sigv4-filter")]
 pub mod aws;
 #[cfg(feature = "azure-ad-filter")]
 pub mod azure;
@@ -33,6 +34,7 @@ mod token_rate_limit;
 mod token_usage;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
+#[cfg(feature = "aws-sigv4-filter")]
 pub use aws::Sigv4SignFilter;
 #[cfg(feature = "azure-ad-filter")]
 pub use azure::AzureAdFilter;

@@ -124,6 +124,10 @@ impl ResponseStoreFilter {
 
     /// Build the configured store backend.
     #[expect(clippy::too_many_lines, reason = "tracing macros inflate complexity")]
+    #[cfg_attr(
+        not(any(feature = "store-postgres", feature = "store-sqlite")),
+        expect(clippy::unused_async, reason = "only the SQL backends await during construction")
+    )]
     pub(super) async fn build_store(&self) -> Result<Arc<dyn ResponseStore>, StoreError> {
         match self.config.backend {
             #[cfg(feature = "store-sqlite")]
