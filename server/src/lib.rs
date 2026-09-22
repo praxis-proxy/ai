@@ -9,6 +9,7 @@ mod server;
 mod subrequest;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
+pub use praxis_ai_filters::install_pipeline_extensions;
 pub use praxis_core::logging::init_tracing;
 pub use server::{check_root_privilege, fatal, resolve_config_path, run_server, run_server_with_registry};
 pub use subrequest::create_subrequest_client;
@@ -19,30 +20,6 @@ pub use subrequest::create_subrequest_client;
 
 /// Built-in fallback configuration branded for praxis-ai.
 const DEFAULT_CONFIG: &str = include_str!("default.yaml");
-
-// -----------------------------------------------------------------------------
-// Pipeline Extensions
-// -----------------------------------------------------------------------------
-
-/// Install the AI pipeline extensions the compiled-in filters rely on.
-///
-/// With the `store` feature this adds a fresh response store registry, which
-/// the OpenAI store, rehydrate, compaction, and MCP approval filters use to
-/// share backends. Builds without the store compile no such filters, so there
-/// is nothing to install.
-#[cfg_attr(
-    not(feature = "store"),
-    expect(
-        clippy::needless_pass_by_ref_mut,
-        reason = "the pipeline is only mutated when the store feature installs its registry"
-    )
-)]
-pub fn install_pipeline_extensions(pipeline: &mut praxis_filter::FilterPipeline) {
-    #[cfg(feature = "store")]
-    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
-    #[cfg(not(feature = "store"))]
-    let _ = pipeline;
-}
 
 // -----------------------------------------------------------------------------
 // Configuration Loading

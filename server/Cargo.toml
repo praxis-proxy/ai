@@ -31,9 +31,9 @@ aws-sigv4-filter = ["praxis-ai-filters/aws-sigv4-filter"]
 openai-responses = ["praxis-ai-filters/openai-responses"]
 openai-file-resolve-filter = ["openai-responses", "praxis-ai-filters/openai-file-resolve-filter"]
 # Response store support; installs the response store pipeline extension.
-store = ["openai-responses", "praxis-ai-filters/store", "praxis-ai-apis/store"]
-store-postgres = ["store", "praxis-ai-filters/store-postgres", "praxis-ai-apis/store-postgres"]
-store-sqlite = ["store", "praxis-ai-filters/store-sqlite", "praxis-ai-apis/store-sqlite"]
+store = ["openai-responses", "praxis-ai-filters/store"]
+store-postgres = ["store", "praxis-ai-filters/store-postgres"]
+store-sqlite = ["store", "praxis-ai-filters/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 openai-conversations = ["store", "praxis-ai-filters/openai-conversations"]
 openai-compact = ["store", "praxis-ai-filters/openai-compact"]
@@ -57,7 +57,7 @@ token-rate-limit-filter = ["praxis-ai-filters/token-rate-limit-filter", "experim
 experimental = ["praxis-ai-filters/experimental"]
 opentelemetry = ["praxis-ai-filters/opentelemetry"]
 llmd-ext-proc = ["dep:praxis-ai-llmd-ext-proc"]
-praxis-main = ["praxis-ai-filters/praxis-main", "praxis-ai-apis/praxis-main"]
+praxis-main = ["praxis-ai-filters/praxis-main"]
 
 [lints]
 workspace = true
@@ -66,7 +66,6 @@ workspace = true
 clap = { workspace = true }
 notify = { workspace = true }
 praxis-ai-filters = { workspace = true }
-praxis-ai-apis = { workspace = true }
 praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }
 # spiffe: enables the peer_identity_trust security builtin, required as the first

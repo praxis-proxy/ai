@@ -32,13 +32,9 @@ use crate::{
 /// Does not call [`FilterRegistry::with_builtins`].
 /// Does not register auto-discovered external filters.
 ///
-/// Pipelines that use OpenAI store or rehydrate filters must also install:
-///
-/// ```rust,ignore
-/// pipeline.add_pipeline_extension(
-///     Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()),
-/// );
-/// ```
+/// Pipelines built from this registry must also call
+/// [`install_pipeline_extensions`] so the OpenAI store, rehydrate, compaction,
+/// and MCP approval filters find their shared response store registry.
 pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     register_agentic_filters(registry);
     #[cfg(feature = "aws-sigv4-filter")]
@@ -58,6 +54,27 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     register_routing_filters(registry);
 }
 
+/// Install the pipeline extensions the registered AI filters rely on.
+///
+/// With the `store` feature this adds a fresh response store registry, which
+/// the OpenAI store, rehydrate, compaction, and MCP approval filters use to
+/// share backends. It is gated on this crate's `store` feature, the same one
+/// that registers those filters, so a pipeline can never carry them without
+/// their registry. Builds without the store have nothing to install.
+#[cfg_attr(
+    not(feature = "store"),
+    expect(
+        clippy::needless_pass_by_ref_mut,
+        reason = "the pipeline is only mutated when the store feature installs its registry"
+    )
+)]
+pub fn install_pipeline_extensions(pipeline: &mut praxis_filter::FilterPipeline) {
+    #[cfg(feature = "store")]
+    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
+    #[cfg(not(feature = "store"))]
+    let _ = pipeline;
+}
+
 /// Build a [`FilterRegistry`] with core builtins and in-tree AI filters.
 ///
 /// Equivalent to [`FilterRegistry::with_builtins`] followed by
@@ -68,8 +85,8 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
 /// connectors. Use [`register_ai_filters`] with a shared client
 /// when the server runtime is available.
 ///
-/// Pipelines that use OpenAI store or rehydrate filters must also install
-/// `praxis_ai_apis::store::ResponseStoreRegistry` as a pipeline extension.
+/// Pipelines built from this registry must also call
+/// [`install_pipeline_extensions`].
 #[must_use]
 pub fn build_ai_registry() -> FilterRegistry {
     let mut registry = FilterRegistry::with_builtins();

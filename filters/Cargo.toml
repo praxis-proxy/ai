@@ -57,7 +57,7 @@ token-rate-limit-filter = ["experimental", "dep:redis", "dep:thiserror"]
 # praxis core's server crate. Lets consumers gate on "anything experimental".
 experimental = []
 opentelemetry = []
-praxis-main = []
+praxis-main = ["praxis-ai-apis/praxis-main"]
 
 [lints]
 workspace = true

@@ -47,7 +47,7 @@ pub use identity_guard::IdentityHeaderGuardFilter;
 pub use inference::{LlmisvcModelProviderResolverFilter, ModelToHeaderFilter};
 pub use metering::ExternalMeteringFilter;
 pub use prompt_enrich::PromptEnrichFilter;
-pub use register::{build_ai_registry, register_ai_filters};
+pub use register::{build_ai_registry, install_pipeline_extensions, register_ai_filters};
 pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};
 pub use time_to_first_token::TimeToFirstTokenFilter;
 #[cfg(feature = "token-rate-limit-filter")]
