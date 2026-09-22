@@ -11,7 +11,7 @@ use sqlx::{
 use tracing::info;
 
 use super::{
-    compression::{StoreCompressionConfig, decode},
+    compression::{StoreCompressionConfig, decode, run_blocking},
     pool::{PoolConfig, apply_pool_config},
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, TableNames, check_schema,
@@ -469,9 +469,7 @@ async fn check_schema_version(pool: &SqlitePool, tables: &TableNames) -> Result<
 )]
 impl ResponseStore for SqliteResponseStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
-        let response_object = self.compression.encode(&record.response_object)?;
-        let input = self.compression.encode(&record.input)?;
-        let messages = self.compression.encode(&record.messages)?;
+        let [response_object, input, messages] = self.compression.encode(record).await?;
 
         let sql = format!(
             "INSERT INTO {} \
@@ -518,7 +516,10 @@ impl ResponseStore for SqliteResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        row.map(|r| row_to_response_record(&r)).transpose()
+        match row {
+            Some(row) => run_blocking(move || row_to_response_record(&row)).await.map(Some),
+            None => Ok(None),
+        }
     }
 
     async fn delete_response(&self, owner: &StateOwner, id: &str) -> Result<bool, StoreError> {
@@ -626,9 +627,7 @@ impl ResponseStore for SqliteResponseStore {
             return self.upsert_response(record).await;
         }
 
-        let response_object = self.compression.encode(&record.response_object)?;
-        let input = self.compression.encode(&record.input)?;
-        let messages = self.compression.encode(&record.messages)?;
+        let [response_object, input, messages] = self.compression.encode(record).await?;
 
         let upsert_sql = format!(
             "INSERT INTO {} \

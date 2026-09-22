@@ -16,6 +16,9 @@ workspace = true
 criterion = { workspace = true }
 praxis-ai-apis = { workspace = true, features = ["store-all"] }
 serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "sqlite", "tls-native-tls"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [[bench]]
 name = "compression"

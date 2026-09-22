@@ -5,7 +5,7 @@
 
 use serde::Deserialize;
 
-use super::StoreError;
+use super::{ResponseRecord, StoreError};
 
 /// zstd frame magic number (little-endian `0xFD2FB528`).
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -81,22 +81,34 @@ impl StoreCompressionConfig {
         Ok(())
     }
 
-    /// Effective zstd compression level.
-    fn zstd_level(&self) -> i32 {
-        self.level.unwrap_or(DEFAULT_ZSTD_LEVEL)
-    }
-
-    /// Encode a JSON value into its stored binary form.
+    /// Encode a response record's JSON columns into their stored binary form.
     ///
-    /// With `algorithm: none` this is the raw UTF-8 JSON bytes. With
+    /// With `algorithm: none` each field is the raw UTF-8 JSON bytes. With
     /// `algorithm: zstd` the JSON is compressed into a raw zstd frame.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Serialization`] if the value cannot be serialized,
+    /// Returns [`StoreError::Serialization`] if a field cannot be serialized,
     /// exceeds the size limit, or zstd compression fails.
-    pub fn encode(&self, value: &serde_json::Value) -> Result<Vec<u8>, StoreError> {
-        let json = serde_json::to_vec(value).map_err(|e| StoreError::Serialization(e.to_string()))?;
+    pub(crate) async fn encode(&self, record: &ResponseRecord) -> Result<[Vec<u8>; 3], StoreError> {
+        let [response_object, input, messages] = [&record.response_object, &record.input, &record.messages]
+            .map(|value| serde_json::to_vec(value).map_err(|e| StoreError::Serialization(e.to_string())));
+        let fields = [response_object?, input?, messages?];
+
+        if self.algorithm == CompressionAlgorithm::None {
+            return Ok(fields);
+        }
+
+        let config = self.clone();
+        run_blocking(move || {
+            let [response_object, input, messages] = fields.map(|json| config.encode_json(json));
+            Ok([response_object?, input?, messages?])
+        })
+        .await
+    }
+
+    /// Apply the configured codec to an owned JSON buffer.
+    fn encode_json(&self, json: Vec<u8>) -> Result<Vec<u8>, StoreError> {
         match self.algorithm {
             CompressionAlgorithm::None => Ok(json),
             CompressionAlgorithm::Zstd => {
@@ -112,6 +124,20 @@ impl StoreCompressionConfig {
             },
         }
     }
+
+    /// Effective zstd compression level.
+    fn zstd_level(&self) -> i32 {
+        self.level.unwrap_or(DEFAULT_ZSTD_LEVEL)
+    }
+}
+
+/// Run owned store codec work outside the async executor.
+pub(crate) async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, StoreError> + Send + 'static,
+) -> Result<T, StoreError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| StoreError::Unavailable(format!("store codec worker failed: {e}")))?
 }
 
 /// Decode a stored binary payload back into a JSON value.
@@ -127,7 +153,7 @@ impl StoreCompressionConfig {
 /// Returns [`StoreError::Serialization`] if a zstd frame is corrupt, the
 /// decompressed payload exceeds the size limit, or the bytes are not valid
 /// JSON.
-pub fn decode(stored: &[u8]) -> Result<serde_json::Value, StoreError> {
+pub(crate) fn decode(stored: &[u8]) -> Result<serde_json::Value, StoreError> {
     if stored.starts_with(&ZSTD_MAGIC) {
         use std::io::Read as _;
 
@@ -163,10 +189,46 @@ mod tests {
 
     use super::*;
 
-    fn zstd_config() -> StoreCompressionConfig {
-        StoreCompressionConfig {
-            algorithm: CompressionAlgorithm::Zstd,
-            level: None,
+    #[tokio::test(flavor = "current_thread")]
+    async fn codec_work_runs_off_the_async_worker() {
+        let async_thread = std::thread::current().id();
+        let codec_thread = run_blocking(|| Ok(std::thread::current().id())).await.unwrap();
+        assert_ne!(codec_thread, async_thread, "codec work must leave the async worker");
+
+        let error = run_blocking(|| Err::<(), _>(StoreError::Serialization("invalid payload".to_owned())))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StoreError::Serialization(message) if message == "invalid payload"));
+    }
+
+    #[test]
+    fn response_encoding_offloads_zstd_and_preserves_all_fields() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let worker_started = Arc::new(AtomicBool::new(false));
+        let started = Arc::clone(&worker_started);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .on_thread_start(move || started.store(true, Ordering::SeqCst))
+            .build()
+            .unwrap();
+        let record = response_record();
+
+        for config in [StoreCompressionConfig::default(), zstd_config()] {
+            let fields = runtime.block_on(config.encode(&record)).unwrap();
+            assert_eq!(
+                worker_started.load(Ordering::SeqCst),
+                config.algorithm == CompressionAlgorithm::Zstd,
+                "only compressed writes need a blocking worker"
+            );
+            for (encoded, value) in fields
+                .iter()
+                .zip([&record.response_object, &record.input, &record.messages])
+            {
+                assert_eq!(decode(encoded).unwrap(), *value);
+            }
         }
     }
 
@@ -181,7 +243,7 @@ mod tests {
     fn none_encode_is_raw_json_bytes() {
         let cfg = StoreCompressionConfig::default();
         let value = json!({"a": 1, "b": [1, 2, 3]});
-        let encoded = cfg.encode(&value).unwrap();
+        let encoded = encode_value(&cfg, &value);
         assert_eq!(encoded, serde_json::to_vec(&value).unwrap());
         assert!(!encoded.starts_with(&ZSTD_MAGIC));
     }
@@ -190,7 +252,7 @@ mod tests {
     fn zstd_encode_has_magic_and_roundtrips() {
         let cfg = zstd_config();
         let value = json!({"greeting": "hello world", "items": [1, 2, 3, 4, 5]});
-        let encoded = cfg.encode(&value).unwrap();
+        let encoded = encode_value(&cfg, &value);
         assert!(
             encoded.starts_with(&ZSTD_MAGIC),
             "expected zstd frame magic prefix: {encoded:?}"
@@ -216,7 +278,7 @@ mod tests {
                 algorithm: CompressionAlgorithm::Zstd,
                 level: Some(level),
             };
-            let encoded = cfg.encode(&value).unwrap();
+            let encoded = encode_value(&cfg, &value);
             assert_eq!(decode(&encoded).unwrap(), value, "level {level}");
         }
     }
@@ -226,7 +288,7 @@ mod tests {
         let cfg = zstd_config();
         let value = json!({"blob": "ababababab".repeat(1000)});
         let plain = serde_json::to_vec(&value).unwrap();
-        let encoded = cfg.encode(&value).unwrap();
+        let encoded = encode_value(&cfg, &value);
         assert!(
             encoded.len() < plain.len(),
             "compressed ({}) should be smaller than plain ({})",
@@ -239,7 +301,7 @@ mod tests {
     fn encode_is_deterministic() {
         let cfg = zstd_config();
         let value = json!({"stable": [1, 2, 3], "nested": {"k": "v"}});
-        assert_eq!(cfg.encode(&value).unwrap(), cfg.encode(&value).unwrap());
+        assert_eq!(encode_value(&cfg, &value), encode_value(&cfg, &value));
     }
 
     #[test]
@@ -301,5 +363,39 @@ mod tests {
     fn deserialize_denies_unknown_fields() {
         let result: Result<StoreCompressionConfig, _> = serde_yaml::from_str("algorithm: zstd\nbogus: true\n");
         assert!(result.is_err(), "unknown fields should be rejected");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
+
+    fn response_record() -> ResponseRecord {
+        ResponseRecord {
+            id: "resp_codec".to_owned(),
+            owner: crate::test_utils::test_owner("tenant_codec"),
+            created_at: 1000,
+            model: "test".to_owned(),
+            response_object: json!({"output": "x".repeat(65_536)}),
+            input: json!([{"role": "user", "content": "hello"}]),
+            messages: json!([{"role": "assistant", "content": "world"}]),
+        }
+    }
+
+    /// Encode a single JSON value through [`StoreCompressionConfig::encode`] by
+    /// carrying it in a record's `response_object` column, returning the stored
+    /// bytes for that column so codec properties can be asserted at value level.
+    fn encode_value(config: &StoreCompressionConfig, value: &serde_json::Value) -> Vec<u8> {
+        let mut record = response_record();
+        record.response_object = value.clone();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let [response_object, _, _] = runtime.block_on(config.encode(&record)).unwrap();
+        response_object
+    }
+
+    fn zstd_config() -> StoreCompressionConfig {
+        StoreCompressionConfig {
+            algorithm: CompressionAlgorithm::Zstd,
+            level: None,
+        }
     }
 }
