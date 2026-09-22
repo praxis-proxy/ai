@@ -2331,6 +2331,31 @@ class TestResponsesToChatCompletionsVLLM:
     # pipeline, not native Responses passthrough, so it measures the contract
     # owned by the translation filter.
 
+    def test_prompt_template_is_rejected_before_chat_backend(
+        self, chat_streaming_client
+    ):
+        with pytest.raises(BadRequestError) as exc_info:
+            chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="This prompt reference must not reach vLLM.",
+                prompt={"id": "pmpt_sdk_rejected"},
+                store=False,
+            )
+
+        error = exc_info.value
+        assert error.status_code == 400
+        assert error.type == "invalid_request_error"
+        assert error.param is None
+        assert error.body == {
+            "message": (
+                "Responses `prompt` has no Chat Completions representation: "
+                "got object, this adapter supports only `prompt` null"
+            ),
+            "type": "invalid_request_error",
+            "param": None,
+            "code": "invalid_request_error",
+        }
+
     def test_finite_response_round_trip(self, chat_streaming_client):
         response = chat_streaming_client.responses.create(
             model=VLLM_MODEL,

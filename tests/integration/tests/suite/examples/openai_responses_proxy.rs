@@ -85,6 +85,83 @@ fn openai_responses_proxy_example_preserves_native_conversation() {
 }
 
 #[test]
+fn openai_responses_proxy_example_rejects_prompt_templates_for_generic_backend() {
+    let backend_guard = start_backend_with_shutdown("must-not-be-contacted");
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "openai/responses/responses-proxy.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1-mini","prompt":{"id":"pmpt_123"}}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("error response should be JSON");
+
+    assert_eq!(parse_status(&raw), 400, "generic backend prompt must return HTTP 400");
+    assert_eq!(
+        response["error"]["type"], "invalid_request_error",
+        "generic backend prompt must use the invalid-request error type"
+    );
+    assert_eq!(
+        response["error"]["message"],
+        "prompt templates are supported only when the selected upstream declares application_protocol: openai_responses and application_provider: openai",
+        "generic backend prompt must explain the protocol and provider declaration requirement"
+    );
+}
+
+#[test]
+fn openai_responses_declaration_allows_prompt_templates_for_local_endpoint() {
+    let backend_guard = start_capturing_backend("inference-ok");
+    let proxy_port = free_port();
+    let config = format!(
+        r#"
+listeners:
+  - name: default
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/v1/responses"
+            cluster: "openai"
+      - filter: load_balancer
+        clusters:
+          - name: "openai"
+            http:
+              application_protocol: "openai_responses"
+              application_provider: "openai"
+            endpoints:
+              - "127.0.0.1:{}"
+      - filter: openai_responses_proxy
+insecure_options:
+  allow_private_endpoints: true
+"#,
+        backend_guard.port()
+    );
+    let config = praxis_core::config::Config::from_yaml(&config).expect("provider test config should parse");
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1-mini","prompt":{"id":"pmpt_123"}}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "declared OpenAI Responses backend should receive prompt"
+    );
+    assert_eq!(
+        backend_guard.body(),
+        body,
+        "application declarations must allow byte-exact prompt forwarding regardless of endpoint hostname"
+    );
+}
+
+#[test]
 fn openai_responses_proxy_example_forwards_subresource_paths() {
     let backend_guard = start_backend_with_shutdown("subresource-ok");
     let proxy_port = free_port();

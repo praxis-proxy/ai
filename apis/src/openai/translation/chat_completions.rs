@@ -390,18 +390,20 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 
 /// Reject request parameters this adapter cannot represent.
 ///
-/// `background` and `truncation` describe behaviors the Chat Completions
-/// translation does not implement. Accepting a non-default value would send a
-/// foreground, untruncated Chat request and then report the defaults back as
-/// though they had been honored, so the request fails closed instead. Rejecting
-/// here is what lets [`response_resource`] state those defaults truthfully.
+/// `background`, `truncation`, and `prompt` describe behaviors the Chat
+/// Completions translation does not implement. Accepting an unsupported value
+/// would silently change the request semantics, so the request fails closed
+/// instead. Rejecting `background` and `truncation` here is what lets
+/// [`response_resource`] state their defaults truthfully.
 ///
-/// Unlike parameters this translator forwards, both fields are dropped rather
+/// Unlike parameters this translator forwards, these fields are dropped rather
 /// than sent upstream, so the backend never sees them and cannot validate them
 /// on our behalf. A malformed value is therefore rejected too: anything that is
 /// not demonstrably the default would otherwise be silently discarded and then
 /// reported back as the default.
 fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    validate_prompt_parameter(obj)?;
+
     if let Some(background) = obj.get("background").filter(|value| !value.is_null())
         && background.as_bool() != Some(false)
     {
@@ -431,6 +433,18 @@ fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), Tra
     }
 
     Ok(())
+}
+
+/// Reject a non-null prompt because Chat Completions cannot resolve it.
+fn validate_prompt_parameter(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    let Some(prompt) = obj.get("prompt").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    Err(TranslationError::UnrepresentableRequestParameter {
+        parameter: "prompt",
+        value: json_type_name(prompt),
+        supported: "`prompt` null",
+    })
 }
 
 /// Copy a field from one JSON object to another.

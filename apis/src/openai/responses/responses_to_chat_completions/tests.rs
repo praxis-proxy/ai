@@ -496,6 +496,51 @@ async fn canonical_state_is_translated_and_arms_response() {
     );
 }
 
+#[tokio::test]
+async fn prompt_template_is_rejected_before_chat_translation() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    let request_body = json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "prompt": {"id": "pmpt_123", "variables": {"name": "Ada"}},
+        "store": false
+    });
+    context
+        .extensions
+        .insert(ResponsesState::from_request_body(request_body.clone()));
+    let original = Bytes::from(serde_json::to_vec(&request_body).unwrap());
+    let mut body = Some(original.clone());
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a prompt template must not be silently dropped during Chat translation");
+    };
+    assert_eq!(rejection.status, 400, "prompt translation rejection must be HTTP 400");
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        error["error"]["type"], "invalid_request_error",
+        "prompt translation rejection must use the invalid-request error type"
+    );
+    assert_eq!(
+        error["error"]["message"],
+        "Responses `prompt` has no Chat Completions representation: got object, this adapter supports only `prompt` null",
+        "prompt translation rejection must explain the unsupported representation"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(original.as_ref()),
+        "rejection must not emit a Chat request"
+    );
+    assert!(
+        context.get_metadata(ARMED_KEY).is_none(),
+        "a rejected prompt must not arm response translation"
+    );
+}
+
 #[test]
 fn always_advertises_streaming_subrequest_capability() {
     // Running inside the iterative router, the filter always declares the

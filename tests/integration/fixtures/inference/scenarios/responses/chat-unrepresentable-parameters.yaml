@@ -1,6 +1,6 @@
 version: 1
 id: responses/chat-unrepresentable-parameters
-description: Truncation modes the Chat Completions adapter cannot represent fail closed instead of being silently downgraded.
+description: Responses parameters the Chat Completions adapter cannot represent fail closed instead of being silently downgraded or dropped.
 protocol: openai_responses
 example_config: openai/responses/responses-to-chat-completions.yaml
 upstream_authority: 127.0.0.1:3001
@@ -20,6 +20,31 @@ turns:
           model: ${MODEL}
           input: Summarize a very long conversation.
           truncation: auto
+          store: false
+          stream: false
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ""
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: prompt-template
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Say hello to Ada.
+          prompt:
+            id: pmpt_123
+            variables:
+              name: Ada
           store: false
           stream: false
     expect:
