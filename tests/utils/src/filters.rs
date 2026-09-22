@@ -69,3 +69,36 @@ impl HttpFilter for BodyMutatingStreamBufferFilter {
         Ok(FilterAction::Release)
     }
 }
+
+/// Test-only filter that buffers the *response* body (`StreamBuffer`).
+///
+/// The MCP SSE outbound chain rejects, at bind time, any filter whose
+/// aggregate response-body mode is `StreamBuffer`, because buffering the
+/// response defeats SSE streaming
+/// ([`bind_mcp_outbound_chain`] in `praxis-ai-apis`). The existing
+/// [`BodyMutatingStreamBufferFilter`] reports `StreamBuffer` on the *request*
+/// body, which is the wrong axis to trip that check. This filter reports it on
+/// the *response* body so integration tests can drive the rejection through a
+/// real proxy boot.
+pub struct ResponseStreamBufferFilter;
+
+#[async_trait]
+impl HttpFilter for ResponseStreamBufferFilter {
+    fn name(&self) -> &'static str {
+        "test_response_stream_buffer"
+    }
+
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::StreamBuffer {
+            max_bytes: Some(65_536),
+        }
+    }
+
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        Ok(FilterAction::Continue)
+    }
+}

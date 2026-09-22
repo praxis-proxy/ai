@@ -10,8 +10,8 @@ use std::collections::HashMap;
 
 use praxis_test_utils::{
     McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, allow_loopback_endpoints, example_config_path,
-    free_port, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
-    start_proxy,
+    free_port, http_send, json_post, parse_body, parse_status, patch_yaml, registry_with,
+    start_mcp_mock_server_with_config, start_proxy, start_proxy_with_registry,
 };
 
 /// Load the `mcp-streaming.yaml` example, patching the listener/backend ports and
@@ -711,11 +711,78 @@ insecure_options:
 // -----------------------------------------------------------------------------
 // Scenario 7: StreamBuffer outbound filter fails to boot
 // -----------------------------------------------------------------------------
-// NOTE: This scenario cannot be tested at the integration level because no
-// stock filter that reports BodyMode::StreamBuffer is suitable for use in an
-// MCP outbound_chain context (filters like anthropic_messages_format are
-// conditional and don't activate their StreamBuffer mode in all contexts).
-// The validation code exists at apis/src/mcp_client/subrequest_transport.rs
-// lines 273-283 and would reject a StreamBuffer filter if present. A
-// test-only BodyMutatingStreamBufferFilter exists in tests/utils but is not
-// registered for YAML config use.
+// bind_mcp_outbound_chain rejects, at bind time, any outbound chain whose
+// aggregate response-body mode is StreamBuffer, because buffering the response
+// defeats SSE streaming. The stock filters usable in an MCP outbound chain
+// never report a response-body StreamBuffer, so we register a test-only filter
+// (ResponseStreamBufferFilter, name "test_response_stream_buffer") that does,
+// placed after the selector (so the selector-first check passes and the
+// StreamBuffer arm is the reason boot fails). Scenario 6 proves the same chain
+// shape boots when the trailing filter is a stock `headers` filter, so a boot
+// failure here isolates the StreamBuffer rejection.
+
+#[test]
+fn streambuffer_outbound_filter_fails_to_boot() {
+    let yaml = format!(
+        r#"
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:{}"
+    filter_chains: [mcp-pipeline]
+
+filter_chains:
+  - name: mcp-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+      - filter: openai_tool_parse
+      - filter: openai_mcp_tool_resolve
+        timeout_ms: 5000
+        outbound_chain: mcp-egress
+      - filter: openai_responses_proxy
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            headers:
+              x-praxis-ai-format: "openai_responses"
+            cluster: "inference-backend"
+      - filter: load_balancer
+        clusters:
+          - name: "inference-backend"
+            endpoints:
+              - "127.0.0.1:3001"
+
+  # Selector first (passes the selector-first check) followed by a response-body
+  # buffering filter - must be rejected at bind time.
+  - name: mcp-egress
+    filters:
+      - filter: openai_mcp_streaming_selector
+      - filter: test_response_stream_buffer
+
+insecure_options:
+  allow_private_endpoints: true
+  allow_private_upstreams: true
+"#,
+        free_port()
+    );
+
+    let config = praxis_core::config::Config::from_yaml(&yaml)
+        .expect("config parsing should succeed; bind-time validation happens at start_proxy");
+    let registry = registry_with("test_response_stream_buffer", || {
+        Box::new(praxis_test_utils::filters::ResponseStreamBufferFilter)
+    });
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _proxy = start_proxy_with_registry(&config, &registry);
+    }));
+
+    assert!(
+        result.is_err(),
+        "start_proxy should panic when the MCP outbound_chain contains a response-body \
+         StreamBuffer filter (incompatible with SSE streaming)"
+    );
+}
