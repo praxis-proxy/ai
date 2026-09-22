@@ -354,23 +354,26 @@ struct PromptTemplateState {
 // Helpers
 // -----------------------------------------------------------------------------
 
-/// Whether raw JSON contains a prompt or cannot prove that it does not.
+/// Whether raw JSON carries a non-null top-level `prompt`.
 ///
-/// The visitor validates the full top-level object and discards every value via
-/// [`IgnoredAny`]. Any syntax, shape, or depth error fails closed because the
-/// absence of a non-null `prompt` was not established.
-fn raw_request_has_prompt_or_is_ambiguous(body: &[u8]) -> bool {
-    serde_json::from_slice::<PromptTemplateProbe>(body).map_or(true, |probe| probe.present)
+/// The visitor validates the top-level object and discards every value via
+/// [`IgnoredAny`], which `serde_json` skips iteratively — so a non-null `prompt`
+/// is detected at any nesting depth without recursion, a depth limit, or
+/// retained allocation. A body that is not valid JSON is not attributed to
+/// prompt templates: it cannot carry a prompt that a strict OpenAI-compatible
+/// backend would parse and honor, and rejecting a malformed request belongs to
+/// normal request validation, not this prompt-template guard.
+fn raw_request_has_prompt(body: &[u8]) -> bool {
+    serde_json::from_slice::<PromptTemplateProbe>(body).is_ok_and(|probe| probe.present)
 }
 
-/// Whether the canonical or passthrough request carries a non-null `prompt`,
-/// failing closed when raw-body absence cannot be established.
+/// Whether the canonical or passthrough request carries a non-null `prompt`.
 fn request_has_prompt_template(ctx: &HttpFilterContext<'_>, body: &Option<Bytes>) -> bool {
     if let Some(state) = ctx.extensions.get::<ResponsesState>() {
         return state.request_body.get("prompt").is_some_and(|prompt| !prompt.is_null());
     }
 
-    body.as_deref().is_some_and(raw_request_has_prompt_or_is_ambiguous)
+    body.as_deref().is_some_and(raw_request_has_prompt)
 }
 
 /// Whether the selected cluster explicitly supports OpenAI Responses behavior.

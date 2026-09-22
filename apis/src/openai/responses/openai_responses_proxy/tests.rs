@@ -334,23 +334,53 @@ async fn null_prompt_is_allowed_by_default() {
 fn prompt_probe_validates_deep_values_without_retaining_them() {
     let prompt_body = deeply_nested_request("prompt", true);
     assert!(
-        super::raw_request_has_prompt_or_is_ambiguous(&prompt_body),
+        super::raw_request_has_prompt(&prompt_body),
         "a valid non-null prompt nested 256 levels deep must be detected"
     );
 
     let unrelated_body = deeply_nested_request("metadata", true);
     assert!(
-        !super::raw_request_has_prompt_or_is_ambiguous(&unrelated_body),
+        !super::raw_request_has_prompt(&unrelated_body),
         "a valid request with an unrelated 256-level value must prove prompt absence"
     );
 }
 
 #[test]
-fn prompt_probe_fails_closed_for_deep_malformed_json() {
-    let body = deeply_nested_request("metadata", false);
+fn prompt_probe_ignores_malformed_json() {
+    // A body that is not valid JSON cannot carry a prompt that a strict
+    // OpenAI-compatible backend would parse and honor. It is not attributed to
+    // prompt templates; normal request validation rejects the malformed body.
+    let truncated = deeply_nested_request("metadata", false);
     assert!(
-        super::raw_request_has_prompt_or_is_ambiguous(&body),
-        "malformed JSON must fail closed when prompt absence cannot be established"
+        !super::raw_request_has_prompt(&truncated),
+        "truncated JSON must not be reported as a prompt template"
+    );
+
+    assert!(
+        !super::raw_request_has_prompt(b"{not-json"),
+        "syntactically invalid JSON must not be reported as a prompt template"
+    );
+
+    assert!(
+        !super::raw_request_has_prompt(br#"{"prompt":{"id":"x"} trailing garbage"#),
+        "a prompt smuggled behind trailing garbage is not valid JSON and must not be attributed here"
+    );
+}
+
+#[test]
+fn prompt_probe_detects_prompt_beyond_serde_recursion_limit() {
+    // serde_json's `IgnoredAny` skip is iterative, so a valid non-null prompt is
+    // detected far past the recursion limit that a `Value` parse would hit.
+    let mut body = br#"{"metadata":"#.to_vec();
+    for _ in 0..5_000 {
+        body.extend_from_slice(br#"{"nested":"#);
+    }
+    body.extend_from_slice(b"null");
+    body.resize(body.len() + 5_000, b'}');
+    body.extend_from_slice(br#","prompt":{"id":"pmpt_deep"}}"#);
+    assert!(
+        super::raw_request_has_prompt(&body),
+        "a valid prompt after 5000 levels of unrelated nesting must still be detected"
     );
 }
 
@@ -358,18 +388,18 @@ fn prompt_probe_fails_closed_for_deep_malformed_json() {
 fn prompt_probe_allocation_is_independent_of_prompt_payload_size() {
     let small_body = br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123","variables":{"file":"x"}}}"#;
     let small_allocations = allocation_counter::measure(|| {
-        std::hint::black_box(super::raw_request_has_prompt_or_is_ambiguous(small_body));
+        std::hint::black_box(super::raw_request_has_prompt(small_body));
     });
     let payload = "x".repeat(1024 * 1024);
     let body = format!(r#"{{"model":"gpt-4.1","prompt":{{"id":"pmpt_123","variables":{{"file":"{payload}"}}}}}}"#);
     assert!(
-        super::raw_request_has_prompt_or_is_ambiguous(body.as_bytes()),
+        super::raw_request_has_prompt(body.as_bytes()),
         "the warm-up probe must detect the large prompt object"
     );
     let mut detected = false;
 
     let allocations = allocation_counter::measure(|| {
-        detected = std::hint::black_box(super::raw_request_has_prompt_or_is_ambiguous(body.as_bytes()));
+        detected = std::hint::black_box(super::raw_request_has_prompt(body.as_bytes()));
     });
 
     assert!(detected, "the large prompt object must be detected");
