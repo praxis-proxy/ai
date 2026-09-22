@@ -77,6 +77,9 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// It converts the enriched request to Chat Completions wire format, converts
 /// finite successful Chat responses back to Responses resources, and
 /// normalizes finite provider errors while preserving their HTTP status.
+/// OpenAI-managed `prompt` template references fail closed because Chat
+/// Completions has no equivalent field and silently dropping them would change
+/// the requested prompt.
 /// Supported hosted web-search tools are exposed to the Chat backend as a
 /// private, bounded `web_search` function. Returned calls are restored to
 /// canonical `web_search_call` output before downstream agentic filters run.
