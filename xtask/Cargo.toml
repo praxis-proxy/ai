@@ -15,8 +15,8 @@ publish = false
 # every non-experimental filter by default.
 default = ["full"]
 full = ["praxis-ai/full", "praxis-ai-apis/full", "praxis-test-utils/full"]
-store-postgres = ["praxis-ai/store-postgres", "praxis-ai-apis/store-postgres", "praxis-test-utils/store-postgres"]
-store-sqlite = ["praxis-ai/store-sqlite", "praxis-ai-apis/store-sqlite", "praxis-test-utils/store-sqlite"]
+store-postgres = ["full", "praxis-ai/store-postgres", "praxis-ai-apis/store-postgres", "praxis-test-utils/store-postgres"]
+store-sqlite = ["full", "praxis-ai/store-sqlite", "praxis-ai-apis/store-sqlite", "praxis-test-utils/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 
 [lints]
