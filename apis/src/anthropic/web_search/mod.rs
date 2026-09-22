@@ -72,6 +72,10 @@ struct RequestEnvelope<'a> {
     /// [`MANAGED_TOOL_NAME`] tool this filter will drive a callout for.
     #[serde(borrow, default)]
     tools: Vec<RequestTool<'a>>,
+    /// The effective tool selection, inspected only to decide whether the managed
+    /// tool could actually run this turn (see [`Self::managed_web_search_could_run`]).
+    #[serde(borrow, default)]
+    tool_choice: Option<ToolChoiceField<'a>>,
 }
 
 impl RequestEnvelope<'_> {
@@ -82,12 +86,55 @@ impl RequestEnvelope<'_> {
             .iter()
             .any(|tool| tool.name.as_ref().and_then(TextField::as_str) == Some(MANAGED_TOOL_NAME))
     }
+
+    /// Whether the managed `WebSearch` tool could actually be invoked this turn
+    /// under the effective `tool_choice`.
+    ///
+    /// The callout is response-driven: it fires only after the model emits a
+    /// `WebSearch` `tool_use`. A `tool_choice` of `none` forbids all tool calls, and
+    /// `{"type": "tool", "name": X}` forces exactly tool `X`; in both cases the
+    /// managed tool cannot run, so the credential preflight must be skipped to
+    /// avoid a spurious 401 (the re-entry check still fails closed if it ever runs).
+    /// `auto`, `any`, an absent choice, and unknown shapes stay eligible.
+    fn managed_web_search_could_run(&self) -> bool {
+        match self.tool_choice.as_ref() {
+            None => true,
+            Some(ToolChoiceField::Keyword(keyword)) => keyword.as_str() != Some("none"),
+            Some(ToolChoiceField::Object(choice)) => match choice.kind.as_ref().and_then(TextField::as_str) {
+                Some("none") => false,
+                Some("tool") => choice.name.as_ref().and_then(TextField::as_str) == Some(MANAGED_TOOL_NAME),
+                _ => true,
+            },
+        }
+    }
 }
 
 /// One declared tool from the request, inspected only for its name.
 #[derive(Deserialize)]
 struct RequestTool<'a> {
     /// Tool name, matched against [`MANAGED_TOOL_NAME`].
+    #[serde(borrow)]
+    name: Option<TextField<'a>>,
+}
+
+/// The request's `tool_choice`, accepting both the object form Anthropic emits and
+/// the bare-string keyword the messages converter also tolerates.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ToolChoiceField<'a> {
+    /// Object form, e.g. `{"type": "auto" | "any" | "none" | "tool", "name": "..."}`.
+    Object(#[serde(borrow)] ToolChoiceObject<'a>),
+    /// Bare keyword string, or any other non-object value (kept, never fatal).
+    Keyword(#[serde(borrow)] TextField<'a>),
+}
+
+/// The object form of `tool_choice`, inspected only for its type and named tool.
+#[derive(Deserialize)]
+struct ToolChoiceObject<'a> {
+    /// Selection type: `auto`, `any`, `none`, or `tool`.
+    #[serde(rename = "type", borrow)]
+    kind: Option<TextField<'a>>,
+    /// The tool name forced when `kind` is `tool`.
     #[serde(borrow)]
     name: Option<TextField<'a>>,
 }
@@ -392,16 +439,22 @@ impl AnthropicWebSearchFilter {
     /// The re-entry credential check runs only after round 0, by which point
     /// terminal streaming may have already committed HTTP 200 — too late to fail
     /// closed. When the request declares the managed [`MANAGED_TOOL_NAME`] tool
-    /// this filter will drive a callout for, resolve the slot now so a missing
-    /// credential is rejected before any backend round or provider callout runs.
-    /// The identity is re-derived at re-entry from the same context, so this only
-    /// proves presence and discards its result.
+    /// this filter will drive a callout for *and* the effective `tool_choice`
+    /// leaves it eligible to run, resolve the slot now so a missing credential is
+    /// rejected before any backend round or provider callout runs. The identity is
+    /// re-derived at re-entry from the same context, so this only proves presence
+    /// and discards its result. A `tool_choice` that makes the managed tool
+    /// ineligible skips the preflight so a legitimate request is not falsely
+    /// rejected; re-entry still fails closed if the callout ever runs.
     fn preflight_managed_credential(
         &self,
         ctx: &HttpFilterContext<'_>,
         request: &RequestEnvelope<'_>,
     ) -> Result<(), Rejection> {
-        if self.user_credential_slot.is_some() && request.declares_managed_web_search() {
+        if self.user_credential_slot.is_some()
+            && request.declares_managed_web_search()
+            && request.managed_web_search_could_run()
+        {
             self.resolve_callout_identity(ctx)?;
         }
         Ok(())

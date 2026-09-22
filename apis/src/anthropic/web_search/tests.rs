@@ -1624,3 +1624,101 @@ async fn streaming_without_managed_tool_skips_credential_preflight() {
         "a request without the managed WebSearch tool must skip the credential preflight"
     );
 }
+
+/// A managed `WebSearch` request body with an explicit `tool_choice`.
+fn managed_web_search_request_with_tool_choice(stream: bool, tool_choice: Value) -> Bytes {
+    Bytes::from(
+        json!({
+            "model": "test",
+            "max_tokens": 32,
+            "stream": stream,
+            "tool_choice": tool_choice,
+            "tools": [{"name": "WebSearch", "description": "Search the web", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "search"}]
+        })
+        .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn preflight_skips_when_tool_choice_disables_tools() {
+    // `tool_choice: {"type": "none"}` forbids the model from calling any tool, so
+    // the managed WebSearch callout can never fire this turn. Demanding the
+    // per-user credential here would falsely reject a legitimate request; the
+    // preflight must be skipped even though the tool is declared and no slot is set.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(managed_web_search_request_with_tool_choice(
+        true,
+        json!({"type": "none"}),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "tool_choice none makes WebSearch ineligible; the preflight must not reject"
+    );
+}
+
+#[tokio::test]
+async fn preflight_skips_when_tool_choice_names_a_different_tool() {
+    // `tool_choice: {"type": "tool", "name": X}` forces exactly tool X. When X is
+    // not the managed WebSearch tool, the callout can never fire, so the preflight
+    // must be skipped rather than reject on the missing slot.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(managed_web_search_request_with_tool_choice(
+        true,
+        json!({"type": "tool", "name": "Calculator"}),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a tool_choice naming a different tool makes WebSearch ineligible; no reject"
+    );
+}
+
+#[tokio::test]
+async fn preflight_rejects_when_tool_choice_names_web_search() {
+    // `tool_choice: {"type": "tool", "name": "WebSearch"}` forces the managed tool,
+    // so a missing per-user credential must still fail closed with 401.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(managed_web_search_request_with_tool_choice(
+        true,
+        json!({"type": "tool", "name": "WebSearch"}),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("tool_choice selecting WebSearch with a missing slot must fail closed");
+    };
+    assert_eq!(rejection.status, 401);
+}
+
+#[tokio::test]
+async fn preflight_rejects_when_tool_choice_requires_any_tool() {
+    // `tool_choice: {"type": "any"}` lets the model pick any declared tool, WebSearch
+    // included, so the managed callout may fire and the missing slot must fail closed.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(managed_web_search_request_with_tool_choice(
+        true,
+        json!({"type": "any"}),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("tool_choice any keeps WebSearch eligible; a missing slot must fail closed");
+    };
+    assert_eq!(rejection.status, 401);
+}
