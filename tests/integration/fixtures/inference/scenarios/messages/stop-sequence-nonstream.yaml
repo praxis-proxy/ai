@@ -1,0 +1,35 @@
+version: 1
+id: messages/stop-sequence-nonstream
+description: A client stop sequence matched by the backend is reported as stop_reason stop_sequence with the matched value.
+protocol: anthropic_messages
+example_config: anthropic/messages-to-openai.yaml
+upstream_authority: 127.0.0.1:8000
+features:
+  - messages.response.stop_sequence
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 64
+          stream: false
+          temperature: 0
+          stop_sequences:
+            - ","
+          messages:
+            - role: user
+              content: List the first five prime numbers separated by commas, nothing else.
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

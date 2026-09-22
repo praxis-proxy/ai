@@ -29,7 +29,7 @@ pub(crate) struct MessageResponse<'a> {
     /// Reason generation stopped.
     pub stop_reason: String,
     /// Matched stop sequence, when available.
-    pub stop_sequence: Option<&'static str>,
+    pub stop_sequence: Option<&'a str>,
     /// Response discriminator.
     pub r#type: &'static str,
     /// Token and service usage.
