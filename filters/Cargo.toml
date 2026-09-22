@@ -18,8 +18,9 @@ default = ["standard"]
 standard = ["aws-sigv4-filter"]
 # aws_sigv4_sign: AWS Signature V4 request signing (aws-sigv4).
 aws-sigv4-filter = ["dep:aws-sigv4", "dep:aws-credential-types"]
-# Backwards-compatible alias for the previous default API feature.
-apis = ["store-postgres"]
+# Backwards-compatible alias for the previous default, which built every
+# non-experimental filter.
+apis = ["full"]
 # Opt-in OpenAI filter groups; see praxis-ai-apis for what each one contains.
 openai-responses = ["praxis-ai-apis/openai-responses"]
 openai-file-resolve-filter = ["openai-responses", "praxis-ai-apis/openai-file-resolve-filter"]
