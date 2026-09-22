@@ -1,4 +1,5 @@
 # Responses Web Search Translation Fixture
+# Requires `--features openai-responses` because these filters are opt-in.
 #
 # Single-upstream fixture configuration for recording the private Chat
 # Completions function representation of a Responses web_search tool. The

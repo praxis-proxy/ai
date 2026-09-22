@@ -1,4 +1,5 @@
 # Inference Fallback with Protocol Translation
+# Requires `--features openai-responses` because these filters are opt-in.
 #
 # Demonstrates provider failover with Responses-to-Chat Completions
 # protocol translation using the iterative_request_router. When the

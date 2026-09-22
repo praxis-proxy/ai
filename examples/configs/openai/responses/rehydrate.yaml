@@ -1,5 +1,5 @@
 # Rehydrate
-# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
+# Requires `--features store-sqlite` because these filters are opt-in.
 #
 # Validates `previous_response_id` by fetching the stored
 # response, confirming its status is completed, and

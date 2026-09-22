@@ -1,5 +1,5 @@
 # Responses API Full Flow — Unified Agentic Gateway
-# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
+# Requires `--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Runs the complete Responses API pipeline through an agentic
 # iterative_request_router that executes hosted file_search, web_search,

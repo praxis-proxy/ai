@@ -1,9 +1,10 @@
 # Responses API Request Validation
+# Requires `--features openai-responses` because these filters are opt-in.
 #
 # Validates Responses API JSON and enriches request metadata.
 #
 # Build:
-#   cargo build -p praxis-ai-proxy
+#   cargo build -p praxis-ai-proxy --features openai-responses
 #
 # The openai_responses_format classifier must run before openai_responses_validate.
 # It buffers the body, classifies the request as Responses API, and

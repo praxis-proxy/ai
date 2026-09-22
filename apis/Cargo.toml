@@ -13,7 +13,7 @@ publish = false
 name = "praxis_ai_apis"
 
 [features]
-default = ["full"]
+default = []
 # Stateful OpenAI Responses subsystem: request state kernel, validation, body
 # rebuild, stream composition, Chat Completions translation filter, document
 # extraction, client-tool compatibility, agentic loop, file search and web

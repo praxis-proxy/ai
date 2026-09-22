@@ -75,6 +75,11 @@ make release
 ./target/release/praxis-ai
 ```
 
+`make release` builds the `full` feature set. A plain
+`cargo build -p praxis-ai-proxy` builds the smaller `standard` set, which
+leaves out the stateful OpenAI filter groups and their dependencies; see
+[Cargo features](docs/features.md#cargo-features).
+
 Then check that it is running:
 
 ```console

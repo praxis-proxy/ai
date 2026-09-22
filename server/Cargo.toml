@@ -22,7 +22,7 @@ name = "praxis-ai"
 path = "src/main.rs"
 
 [features]
-default = ["standard", "full"]
+default = ["standard"]
 # Default-on filters that sit behind a gate so minimal builds can drop them.
 standard = ["aws-sigv4-filter"]
 # aws_sigv4_sign: AWS Signature V4 request signing.

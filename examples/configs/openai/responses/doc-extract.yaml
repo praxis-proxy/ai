@@ -1,4 +1,5 @@
 # Responses Document Extraction (vLLM / llm-d)
+# Requires `--features openai-file-resolve-filter` because these filters are opt-in.
 #
 # Converts `input_file` content parts to `input_text` for inference
 # backends that do not natively support `input_file` (e.g. vLLM,
@@ -16,7 +17,7 @@
 # inline file_data (not file_id references), you can omit it.
 #
 # Build:
-#   cargo build -p praxis-ai-proxy
+#   cargo build -p praxis-ai-proxy --features openai-file-resolve-filter
 
 listeners:
   - name: ai-gateway

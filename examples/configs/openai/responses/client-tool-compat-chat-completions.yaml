@@ -1,4 +1,5 @@
 # Client Tool Compatibility over a Chat Completions backend
+# Requires `--features store-sqlite` because these filters are opt-in.
 #
 # Lets a rich Codex-style Responses client (POST /v1/responses with custom,
 # namespace, local shell, and client-executed tool_search tools) reach a

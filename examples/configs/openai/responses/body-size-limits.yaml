@@ -1,4 +1,5 @@
 # Responses API Body-Size Enforcement
+# Requires `--features openai-file-resolve-filter,openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Demonstrates how raw request body size is enforced across a chain of
 # OpenAI Responses filters that each buffer the request body.

@@ -1,4 +1,5 @@
 # MCP Tool Resolution
+# Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Demonstrates the `openai_mcp_tool_resolve` filter, which resolves MCP
 # tool entries in the Responses API `tools` array into concrete

@@ -6,6 +6,10 @@
 
 FROM rust:1.98-alpine AS builder
 
+# Cargo features for the published binary. `full` keeps every non-experimental
+# filter; the crate default (`standard`) leaves the heavier OpenAI groups out.
+ARG PRAXIS_AI_FEATURES=full
+
 ENV OPENSSL_STATIC=1
 
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf cmake make g++
@@ -58,7 +62,7 @@ RUN mkdir -p apis/src filters/src server/src integrations/llmd/ext-proc/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy
+    cargo build --release -p praxis-ai-proxy --features "${PRAXIS_AI_FEATURES}"
 
 # ------------------------------------------------------------------------------
 # Cache Tricks
@@ -82,7 +86,7 @@ RUN find apis/src filters/src server/src integrations/llmd/ext-proc/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy \
+    cargo build --release -p praxis-ai-proxy --features "${PRAXIS_AI_FEATURES}" \
     && cp target/release/praxis-ai /usr/local/bin/praxis-ai
 
 # ------------------------------------------------------------------------------

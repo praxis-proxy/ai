@@ -1,5 +1,5 @@
 # Agentic Loop Controller
-# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
+# Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Demonstrates the openai_agentic_loop filter with iterative_request_router
 # for step-based model-tool-model looping in the Responses API.

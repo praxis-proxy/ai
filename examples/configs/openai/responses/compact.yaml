@@ -1,5 +1,5 @@
 # Compact Filter Example
-# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
+# Requires `--features openai-file-resolve-filter,openai-compact,store-sqlite` because these filters are opt-in.
 #
 # Demonstrates compaction after rehydrate, file resolve, and document
 # extract so rewritten current-turn content survives history
@@ -17,7 +17,8 @@
 # required allow_pre_security_callout acknowledgement below.
 #
 # Usage:
-#   cargo run -p praxis-ai-proxy -- -c examples/configs/openai/responses/compact.yaml
+#   cargo run -p praxis-ai-proxy --features openai-file-resolve-filter,openai-compact,store-sqlite -- \
+#     -c examples/configs/openai/responses/compact.yaml
 #
 # Requires an OpenAI-compatible backend on port 11434 (e.g. Ollama).
 #
