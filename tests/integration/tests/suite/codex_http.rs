@@ -22,8 +22,9 @@
 
 use std::{
     collections::HashMap,
-    ffi::OsStr,
-    path::Path,
+    ffi::{OsStr, OsString},
+    net::{IpAddr, Ipv4Addr},
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{
         Arc, LazyLock,
@@ -64,6 +65,25 @@ const TEST_PROVIDER_API_KEY: &str = "synthetic-provider-key";
 /// Fixed prompt shared by the fixture and child process.
 const PROMPT: &str = "Reply with exactly PONG over HTTP. Do not call tools.";
 
+/// Environment variable holding the real vLLM base URL for live acceptance.
+const LIVE_VLLM_BASE_URL_ENV: &str = "PRAXIS_TEST_CODEX_VLLM_BASE_URL";
+/// Environment variable holding the exact model name served by live vLLM.
+const LIVE_VLLM_MODEL_ENV: &str = "PRAXIS_TEST_CODEX_VLLM_MODEL";
+/// Environment variable holding the ephemeral bearer Praxis injects upstream.
+const LIVE_BACKEND_TOKEN_ENV: &str = "CODEX_BACKEND_TOKEN";
+/// Environment variable holding the PostgreSQL response-store URL.
+const LIVE_DATABASE_URL_ENV: &str = "PRAXIS_TEST_CODEX_DATABASE_URL";
+/// Optional Linux network namespace in which the Codex child must run.
+const LIVE_NETNS_ENV: &str = "PRAXIS_TEST_CODEX_NETNS";
+/// Address exposed to the isolated Codex namespace by the HTTP observer.
+const LIVE_LISTEN_ADDRESS_ENV: &str = "PRAXIS_TEST_CODEX_LISTEN_ADDRESS";
+/// Demands a real live run instead of allowing the test to skip.
+const REQUIRE_LIVE_ENV: &str = "PRAXIS_TEST_CODEX_REQUIRE_LIVE";
+/// Demands that the Codex child run inside an egress-blocked namespace.
+const REQUIRE_EGRESS_ISOLATION_ENV: &str = "PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION";
+/// Live-model turns include inference and tool execution, so allow more time.
+const LIVE_CHILD_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Codex output item types that would indicate an attempted tool call.
 const TOOL_ITEM_TYPES: &[&str] = &["command_execution", "file_change", "mcp_tool_call", "web_search"];
 
@@ -86,7 +106,21 @@ async fn pinned_codex_uses_responses_http_through_full_flow() {
     let observer = HttpTransportObserver::start(proxy_port).await;
 
     let working_dir = tempfile::tempdir().expect("temporary working directory should be created");
-    let output = run_codex(&codex_bin, observer.port(), working_dir.path(), PROMPT, "read-only").await;
+    let proxy_base_url = format!("http://127.0.0.1:{}", observer.port());
+    let output = run_codex(
+        &codex_bin,
+        CodexRunOptions {
+            proxy_base_url: &proxy_base_url,
+            model: "test-model",
+            working_dir: working_dir.path(),
+            prompt: PROMPT,
+            sandbox: "read-only",
+            execution_timeout: Duration::from_secs(30),
+            no_proxy: "127.0.0.1,localhost",
+            netns: None,
+        },
+    )
+    .await;
     assert!(
         output.status.success(),
         "Codex failed with status {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
@@ -127,12 +161,19 @@ async fn pinned_codex_completes_chat_backend_coding_workflow_over_http() {
     let observer = HttpTransportObserver::start(proxy_port).await;
 
     let prompt = "Inspect input.json, copy its expected_content value into result.txt, run ./verify.sh, then summarize with exactly TASK_COMPLETE.";
+    let proxy_base_url = format!("http://127.0.0.1:{}", observer.port());
     let output = run_codex(
         &codex_bin,
-        observer.port(),
-        workspace.path(),
-        prompt,
-        "danger-full-access",
+        CodexRunOptions {
+            proxy_base_url: &proxy_base_url,
+            model: "test-model",
+            working_dir: workspace.path(),
+            prompt,
+            sandbox: "danger-full-access",
+            execution_timeout: Duration::from_secs(30),
+            no_proxy: "127.0.0.1,localhost",
+            netns: None,
+        },
     )
     .await;
     assert!(
@@ -148,6 +189,152 @@ async fn pinned_codex_completes_chat_backend_coding_workflow_over_http() {
     assert_translated_tool_turns(&requests);
     observer.assert_http_only();
     assert_coding_codex_jsonl(&output.stdout);
+}
+
+/// Prove pinned Codex completes a real coding/tool workflow through Praxis and
+/// vLLM's native Responses endpoint on the GPU runner.
+///
+/// Codex streams rich client-owned tools. The client-tool compatibility filter
+/// lowers those declarations to private functions for vLLM, while the shared
+/// stream owner restores the canonical tool lifecycle before Codex sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_codex_completes_native_vllm_coding_workflow_over_http() {
+    let Some(live) = CodexLiveConfig::from_env() else {
+        return;
+    };
+    assert_pinned_codex_version(&live.codex_bin).await;
+    live.require_egress_isolation_if_demanded();
+
+    let proxy_port = free_port();
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/client-tool-compat.yaml"))
+        .expect("Codex native Responses example should exist");
+    let patched = patch_live_native_codex_config(
+        &yaml,
+        proxy_port,
+        &live.vllm_authority,
+        &live.backend_token,
+        live.database_url
+            .as_deref()
+            .unwrap_or_else(|| panic!("{LIVE_DATABASE_URL_ENV} must be set for the native vLLM acceptance test")),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("live native Codex config should parse");
+
+    run_live_codex_coding_workflow(&live, proxy_port, config).await;
+}
+
+/// Prove pinned Codex completes the same real coding/tool workflow through
+/// Praxis's rich-client-tool Responses-to-Chat composition against live vLLM.
+///
+/// The backend requires a fresh credential from [`LIVE_BACKEND_TOKEN_ENV`],
+/// while Codex only receives [`TEST_API_KEY`]. A successful turn therefore also
+/// proves Praxis replaced the gateway credential before forwarding. The
+/// deterministic scripted test above remains the exact provider-wire oracle;
+/// this test adds real-model and real-client behavior without asserting
+/// model-dependent prose or turn count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pinned_codex_completes_translated_vllm_coding_workflow_over_http() {
+    let Some(live) = CodexLiveConfig::from_env() else {
+        return;
+    };
+    assert_pinned_codex_version(&live.codex_bin).await;
+    live.require_egress_isolation_if_demanded();
+
+    let proxy_port = free_port();
+    let yaml = std::fs::read_to_string(example_config_path(
+        "openai/responses/client-tool-compat-chat-completions.yaml",
+    ))
+    .expect("Codex client-tool Chat composition example should exist");
+    let patched = patch_live_codex_config(
+        &yaml,
+        proxy_port,
+        &live.vllm_authority,
+        &live.backend_token,
+        live.database_url
+            .as_deref()
+            .unwrap_or_else(|| panic!("{LIVE_DATABASE_URL_ENV} must be set for the translated vLLM acceptance test")),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("live Codex config should parse");
+
+    run_live_codex_coding_workflow(&live, proxy_port, config).await;
+}
+
+/// Drive the common pinned-Codex coding task through one live Praxis pipeline.
+async fn run_live_codex_coding_workflow(live: &CodexLiveConfig, proxy_port: u16, config: praxis_core::config::Config) {
+    let workspace = TempWorkspace::new().expect("temporary coding workspace should be created");
+    let _proxy = start_proxy(&config);
+    let observer = HttpTransportObserver::start_on(proxy_port, live.listen_address).await;
+
+    if let Some(namespace) = &live.netns {
+        verify_egress_isolation(namespace);
+    }
+
+    let prompt = "Inspect input.json, copy its expected_content value into result.txt, run ./verify.sh, then summarize what you changed.";
+    let proxy_base_url = format!("http://{}:{}", live.listen_address, observer.port());
+    let no_proxy = format!("127.0.0.1,localhost,{}", live.listen_address);
+    let output = run_codex(
+        &live.codex_bin,
+        CodexRunOptions {
+            proxy_base_url: &proxy_base_url,
+            model: &live.model,
+            working_dir: workspace.path(),
+            prompt,
+            sandbox: "danger-full-access",
+            execution_timeout: LIVE_CHILD_TIMEOUT,
+            no_proxy: &no_proxy,
+            netns: live.netns.as_deref(),
+        },
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "Codex failed with status {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        status = output.status.code(),
+        stdout = output.stdout,
+        stderr = output.stderr
+    );
+
+    workspace.assert_successful_completion();
+    observer.assert_http_only();
+    assert_live_coding_codex_jsonl(&output.stdout);
+}
+
+/// Keep the live backend credential ephemeral rather than coupled to the example fixture.
+#[test]
+fn live_codex_config_replaces_the_provider_credential() {
+    let yaml = std::fs::read_to_string(example_config_path(
+        "openai/responses/client-tool-compat-chat-completions.yaml",
+    ))
+    .expect("Codex client-tool Chat composition example should exist");
+    let backend_token = "ephemeral-backend-token-for-this-test";
+    let database_url = "postgres://praxis:praxis@127.0.0.1:5432/praxis";
+    let patched = patch_live_codex_config(&yaml, 18_080, "127.0.0.1:8000", backend_token, database_url);
+
+    assert!(patched.contains(backend_token));
+    assert!(!patched.contains(TEST_PROVIDER_API_KEY));
+    assert!(patched.contains(database_url));
+    assert!(patched.contains("backend: postgres"));
+    assert!(patched.contains("allow_private_database_url: true"));
+    assert!(!patched.contains("sqlite://responses.db?mode=rwc"));
+    praxis_core::config::Config::from_yaml(&patched).expect("patched live Codex config should parse");
+}
+
+/// Keep the native Responses acceptance store private and replace the client
+/// bearer before the request reaches keyed vLLM.
+#[test]
+fn live_native_codex_config_injects_the_provider_credential() {
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/client-tool-compat.yaml"))
+        .expect("Codex native Responses example should exist");
+    let backend_token = "ephemeral-native-backend-token-for-this-test";
+    let database_url = "postgres://praxis:praxis@127.0.0.1:5432/praxis";
+    let patched = patch_live_native_codex_config(&yaml, 18_080, "127.0.0.1:8000", backend_token, database_url);
+
+    assert!(patched.contains(backend_token));
+    assert!(patched.contains("strip_client_credential: true"));
+    assert!(patched.contains(database_url));
+    assert!(patched.contains("backend: postgres"));
+    assert!(patched.contains("allow_private_database_url: true"));
+    assert!(!patched.contains("sqlite://responses.db?mode=rwc"));
+    praxis_core::config::Config::from_yaml(&patched).expect("patched live native Codex config should parse");
 }
 
 /// Validate the native SSE fixture's resource snapshots against the pinned OpenResponses contract.
@@ -271,7 +458,7 @@ async fn translated_chat_sse_reaches_client_before_upstream_finishes() {
 async fn transport_observer_detects_websocket_attempts() {
     let mut backend = start_scripted_http_backend("GET", "/v1/responses", vec![]).await;
     let observer = HttpTransportObserver::start(backend.port()).await;
-    let mut client = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, observer.port()))
+    let mut client = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, observer.port()))
         .await
         .expect("WebSocket probe should connect to observer");
     client
@@ -320,6 +507,203 @@ async fn timed_out_child_kills_process_group_and_closes_inherited_pipes() {
     assert!(!output.status.success(), "terminated shell fixture should fail");
 }
 
+/// Live infrastructure supplied by the GPU acceptance workflow.
+struct CodexLiveConfig {
+    /// Absolute path to the checksum-verified Codex executable.
+    codex_bin: OsString,
+    /// Host and port of the live vLLM backend.
+    vllm_authority: String,
+    /// Exact slash-free model alias served by vLLM.
+    model: String,
+    /// Ephemeral backend bearer that Praxis must inject toward vLLM.
+    backend_token: String,
+    /// Optional PostgreSQL response store used by the native Responses path.
+    database_url: Option<String>,
+    /// Host-side address exposed to the isolated Codex namespace.
+    listen_address: IpAddr,
+    /// Optional namespace in which the Codex child must run.
+    netns: Option<String>,
+}
+
+impl CodexLiveConfig {
+    /// Resolve the live gate, skipping locally but failing when CI demands it.
+    fn from_env() -> Option<Self> {
+        let codex_bin = std::env::var_os("PRAXIS_TEST_CODEX_BIN");
+        let vllm_base = std::env::var(LIVE_VLLM_BASE_URL_ENV).ok();
+        let model = std::env::var(LIVE_VLLM_MODEL_ENV).ok();
+        let backend_token = std::env::var(LIVE_BACKEND_TOKEN_ENV).ok();
+        let (Some(codex_bin), Some(vllm_base), Some(model), Some(backend_token)) =
+            (codex_bin, vllm_base, model, backend_token)
+        else {
+            assert!(
+                !env_is_truthy(REQUIRE_LIVE_ENV),
+                "{REQUIRE_LIVE_ENV} is set but a required variable is missing; set all of \
+                 PRAXIS_TEST_CODEX_BIN, {LIVE_VLLM_BASE_URL_ENV}, {LIVE_VLLM_MODEL_ENV}, \
+                 and {LIVE_BACKEND_TOKEN_ENV}"
+            );
+            eprintln!(
+                "skipping live-vLLM Codex acceptance test; set PRAXIS_TEST_CODEX_BIN, \
+                 {LIVE_VLLM_BASE_URL_ENV}, {LIVE_VLLM_MODEL_ENV}, and \
+                 {LIVE_BACKEND_TOKEN_ENV} to run it"
+            );
+            return None;
+        };
+
+        let listen_address = std::env::var(LIVE_LISTEN_ADDRESS_ENV)
+            .ok()
+            .and_then(|value| value.parse::<IpAddr>().ok())
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        Some(Self {
+            codex_bin,
+            vllm_authority: authority_of(&vllm_base),
+            model,
+            backend_token,
+            database_url: std::env::var(LIVE_DATABASE_URL_ENV).ok(),
+            listen_address,
+            netns: std::env::var(LIVE_NETNS_ENV).ok().filter(|value| !value.is_empty()),
+        })
+    }
+
+    /// Refuse a CI live run that silently lost its namespace configuration.
+    fn require_egress_isolation_if_demanded(&self) {
+        if env_is_truthy(REQUIRE_EGRESS_ISOLATION_ENV) {
+            assert!(
+                self.netns.is_some(),
+                "{REQUIRE_EGRESS_ISOLATION_ENV} is set but {LIVE_NETNS_ENV} is not; \
+                 the Codex child would have external network access"
+            );
+        }
+    }
+}
+
+/// Patch the shipped translated-provider example for a real, slower backend.
+fn patch_live_codex_config(
+    yaml: &str,
+    proxy_port: u16,
+    vllm_authority: &str,
+    backend_token: &str,
+    database_url: &str,
+) -> String {
+    patch_yaml(yaml, proxy_port, &HashMap::new())
+        .replace("127.0.0.1:3001", vllm_authority)
+        .replace(TEST_PROVIDER_API_KEY, backend_token)
+        .replace("backend: sqlite", "backend: postgres")
+        .replace(
+            "database_url: \"sqlite://responses.db?mode=rwc\"",
+            &format!(
+                "database_url: \"{database_url}\"\n        allow_private_database_url: true\n        ssl_mode: disable"
+            ),
+        )
+        .replace("timeout_ms: 30000", "timeout_ms: 300000")
+        .replace("timeout_secs: 30", "timeout_secs: 300")
+        .replace(
+            "                  - name: chat-provider\n                    endpoints:",
+            "                  - name: chat-provider\n                    read_timeout_ms: 300000\n                    endpoints:",
+        )
+}
+
+/// Patch the native Responses example for a keyed, slower live vLLM backend.
+fn patch_live_native_codex_config(
+    yaml: &str,
+    proxy_port: u16,
+    vllm_authority: &str,
+    backend_token: &str,
+    database_url: &str,
+) -> String {
+    const LOAD_BALANCER_FILTER: &str = "              - filter: load_balancer";
+
+    let credential_filter = format!(
+        r#"              - filter: credential_injection
+                clusters:
+                  - name: inference-backend
+                    header: Authorization
+                    value: "{backend_token}"
+                    header_prefix: "Bearer "
+                    strip_client_credential: true
+"#
+    );
+    assert!(
+        yaml.contains(LOAD_BALANCER_FILTER),
+        "client-tool-compat example should contain the inference load balancer"
+    );
+
+    let patched = patch_yaml(yaml, proxy_port, &HashMap::new())
+        .replace("127.0.0.1:3001", vllm_authority)
+        .replace("backend: sqlite", "backend: postgres")
+        .replace(
+            "database_url: \"sqlite://responses.db?mode=rwc\"",
+            &format!(
+                "database_url: \"{database_url}\"\n        allow_private_database_url: true\n        ssl_mode: disable"
+            ),
+        )
+        .replace(
+            "        max_iterations: 4",
+            "        max_iterations: 4\n        timeout_ms: 300000\n        step_timeout_ms: 300000",
+        )
+        .replace(
+            "                  - name: \"inference-backend\"\n                    endpoints:",
+            "                  - name: \"inference-backend\"\n                    read_timeout_ms: 300000\n                    endpoints:",
+        );
+
+    patched.replacen(
+        LOAD_BALANCER_FILTER,
+        &format!("{credential_filter}{LOAD_BALANCER_FILTER}"),
+        1,
+    )
+}
+
+/// Strip scheme and trailing slash from a backend URL for Praxis endpoints.
+fn authority_of(base: &str) -> String {
+    base.trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+/// Reports whether a gate environment variable is explicitly truthy.
+fn env_is_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Prove the configured child namespace has no default or public route.
+fn verify_egress_isolation(namespace: &str) {
+    let routes = std::process::Command::new(resolve_ip_binary())
+        .args(["netns", "exec", namespace, "ip", "route", "show", "default"])
+        .output()
+        .expect("ip should inspect the Codex namespace");
+    assert!(routes.status.success(), "default-route inspection should succeed");
+    assert!(
+        routes.stdout.is_empty(),
+        "Codex namespace must not have a default route: {}",
+        String::from_utf8_lossy(&routes.stdout)
+    );
+
+    let public_route = std::process::Command::new(resolve_ip_binary())
+        .args(["netns", "exec", namespace, "ip", "route", "get", "1.1.1.1"])
+        .status()
+        .expect("ip should probe public routing from the Codex namespace");
+    assert!(
+        !public_route.success(),
+        "Codex namespace unexpectedly has a route to the public internet"
+    );
+}
+
+/// Resolve `ip(8)` before clearing the child environment.
+///
+/// GPU runner images commonly install it under `/usr/sbin`, which is absent
+/// from the deliberately minimal PATH passed to the pinned Codex process.
+fn resolve_ip_binary() -> PathBuf {
+    ["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|candidate| candidate.exists())
+        .unwrap_or_else(|| PathBuf::from("ip"))
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
@@ -332,6 +716,26 @@ struct CodexOutput {
     stderr: String,
     /// UTF-8-lossy standard output.
     stdout: String,
+}
+
+/// Inputs controlling one isolated Codex child process.
+struct CodexRunOptions<'a> {
+    /// Praxis base URL visible to the Codex child, without `/v1`.
+    proxy_base_url: &'a str,
+    /// Model name Codex sends through Praxis.
+    model: &'a str,
+    /// Coding workspace used as the child current directory.
+    working_dir: &'a Path,
+    /// User prompt for this acceptance turn.
+    prompt: &'a str,
+    /// Codex sandbox policy.
+    sandbox: &'a str,
+    /// Maximum wall-clock time allowed for the child.
+    execution_timeout: Duration,
+    /// Addresses the child may reach without using the deliberately dead proxy.
+    no_proxy: &'a str,
+    /// Optional egress-blocked Linux network namespace.
+    netns: Option<&'a str>,
 }
 
 /// Raw child-process output plus timeout state.
@@ -361,7 +765,12 @@ struct HttpTransportObserver {
 impl HttpTransportObserver {
     /// Bind a front-door observer that forwards all connections to Praxis.
     async fn start(upstream_port: u16) -> Self {
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        Self::start_on(upstream_port, IpAddr::V4(Ipv4Addr::LOCALHOST)).await
+    }
+
+    /// Bind the observer on an explicit address, including a host-side veth.
+    async fn start_on(upstream_port: u16, listen_address: IpAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind((listen_address, 0))
             .await
             .expect("transport observer should bind");
         let port = listener
@@ -427,7 +836,7 @@ async fn forward_observed_connection(
     upstream_port: u16,
     websocket_attempted: Arc<AtomicBool>,
 ) {
-    let mut upstream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, upstream_port))
+    let mut upstream = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, upstream_port))
         .await
         .expect("transport observer should connect to Praxis");
     let mut opening = Vec::with_capacity(4096);
@@ -470,7 +879,7 @@ async fn read_first_translated_delta(proxy_port: u16) {
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let mut stream = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, proxy_port))
+    let mut stream = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, proxy_port))
         .await
         .expect("streaming client should connect to Praxis");
     stream
@@ -819,10 +1228,20 @@ async fn assert_pinned_codex_version(codex_bin: &OsStr) {
 }
 
 /// Run Codex with isolated configuration, credentials, input, and workspace.
-async fn run_codex(codex_bin: &OsStr, proxy_port: u16, working_dir: &Path, prompt: &str, sandbox: &str) -> CodexOutput {
+async fn run_codex(codex_bin: &OsStr, options: CodexRunOptions<'_>) -> CodexOutput {
+    let CodexRunOptions {
+        proxy_base_url,
+        model,
+        working_dir,
+        prompt,
+        sandbox,
+        execution_timeout,
+        no_proxy,
+        netns,
+    } = options;
     let codex_home = tempfile::tempdir().expect("temporary CODEX_HOME should be created");
     let config = format!(
-        r#"model = "test-model"
+        r#"model = "{model}"
 model_provider = "praxis"
 web_search = "disabled"
 
@@ -838,14 +1257,21 @@ tool_suggest = false
 
 [model_providers.praxis]
 name = "Praxis test gateway"
-base_url = "http://127.0.0.1:{proxy_port}/v1"
+base_url = "{proxy_base_url}/v1"
 wire_api = "responses"
 env_key = "PRAXIS_TEST_API_KEY"
 "#
     );
     std::fs::write(codex_home.path().join("config.toml"), config).expect("test config should be written");
 
-    let mut child = tokio::process::Command::new(codex_bin);
+    let mut child = match netns {
+        Some(namespace) => {
+            let mut command = tokio::process::Command::new(resolve_ip_binary());
+            command.arg("netns").arg("exec").arg(namespace).arg(codex_bin);
+            command
+        },
+        None => tokio::process::Command::new(codex_bin),
+    };
     child
         .arg("exec")
         .arg("--ephemeral")
@@ -865,14 +1291,14 @@ env_key = "PRAXIS_TEST_API_KEY"
         .env("HTTP_PROXY", "http://127.0.0.1:1")
         .env("HTTPS_PROXY", "http://127.0.0.1:1")
         .env("ALL_PROXY", "http://127.0.0.1:1")
-        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("NO_PROXY", no_proxy)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     configure_isolated_process_group(&mut child);
     let child = child.spawn().expect("pinned Codex should start");
-    let captured = capture_child_output(child, Duration::from_secs(30)).await;
+    let captured = capture_child_output(child, execution_timeout).await;
 
     let output = CodexOutput {
         status: captured.status,
@@ -881,7 +1307,7 @@ env_key = "PRAXIS_TEST_API_KEY"
     };
     assert!(
         !captured.timed_out,
-        "Codex process exceeded 30-second acceptance-test timeout\nstdout:\n{}\nstderr:\n{}",
+        "Codex process exceeded {execution_timeout:?} acceptance-test timeout\nstdout:\n{}\nstderr:\n{}",
         output.stdout, output.stderr
     );
     output
@@ -1033,6 +1459,73 @@ fn assert_coding_codex_jsonl(stdout: &str) {
     assert!(
         saw_usage,
         "Codex should receive nonzero translated usage; stdout:\n{stdout}"
+    );
+}
+
+/// Validate model-independent lifecycle invariants from the live Codex turn.
+fn assert_live_coding_codex_jsonl(stdout: &str) {
+    let mut started_commands = Vec::new();
+    let mut saw_correlated_successful_command = false;
+    let mut saw_summary = false;
+    let mut saw_completed_turn = false;
+    let mut saw_usage = false;
+
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let event: serde_json::Value = serde_json::from_str(line).expect("Codex --json output should be JSONL");
+        let event_type = event["type"].as_str();
+        let item_type = event.pointer("/item/type").and_then(serde_json::Value::as_str);
+        let item_id = event
+            .pointer("/item/id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        if event_type == Some("item.started") && item_type == Some("command_execution") && !item_id.is_empty() {
+            started_commands.push(item_id.to_owned());
+        }
+        if event_type == Some("item.completed") && item_type == Some("command_execution") {
+            let command = event
+                .pointer("/item/command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let exit_code = event.pointer("/item/exit_code").and_then(serde_json::Value::as_i64);
+            saw_correlated_successful_command |= !command.is_empty()
+                && exit_code == Some(0)
+                && started_commands.iter().any(|started| started == item_id);
+        }
+        saw_summary |= event_type == Some("item.completed")
+            && item_type == Some("agent_message")
+            && event
+                .pointer("/item/text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty());
+        if event_type == Some("turn.completed") {
+            saw_completed_turn = true;
+            saw_usage |= event
+                .pointer("/usage/input_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|tokens| tokens > 0)
+                && event
+                    .pointer("/usage/output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|tokens| tokens > 0);
+        }
+    }
+
+    assert!(
+        saw_correlated_successful_command,
+        "Codex must emit a correlated command_execution start/completion with exit code 0; stdout:\n{stdout}"
+    );
+    assert!(
+        saw_summary,
+        "Codex must emit a non-empty terminal summary; stdout:\n{stdout}"
+    );
+    assert!(
+        saw_completed_turn,
+        "Codex must report a completed live turn; stdout:\n{stdout}"
+    );
+    assert!(
+        saw_usage,
+        "Codex must receive nonzero usage from live vLLM through Praxis; stdout:\n{stdout}"
     );
 }
 

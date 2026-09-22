@@ -50,6 +50,7 @@ VLLM_TEST_BACKEND = os.environ.get("VLLM_TEST_BACKEND", "live")
 OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+REQUIRE_LIVE_WEB_SEARCH = os.environ.get("PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH") == "1"
 CONFIG_PATH = "examples/configs/openai/responses/full-flow-agentic.yaml"
 AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
 IRR_STREAMING_CONFIG_PATH = (
@@ -162,6 +163,31 @@ def _patch_store_backend(config: str, db_path: str) -> str:
     return config
 
 
+def _persist_config(config: str) -> str:
+    """Write a generated Praxis config to a temp file and return its path.
+
+    When the harness runs as root — as it does on the ephemeral EC2 GPU runner
+    used by the nightly/label-triggered full suite — Praxis refuses to start
+    unless ``insecure_options.allow_root`` is set. Inject it here so every config
+    writer inherits the override in one place; non-root local and CPU CI runs are
+    left byte-for-byte unchanged.
+    """
+    if os.geteuid() == 0 and "allow_root:" not in config:
+        block = "\ninsecure_options:\n"
+        override = "\ninsecure_options:\n  allow_root: true\n"
+        if block in config:
+            config = config.replace(block, override, 1)
+        elif config.startswith("insecure_options:\n"):
+            config = "insecure_options:\n  allow_root: true\n" + config[len("insecure_options:\n") :]
+        else:
+            config = config.rstrip("\n") + override
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as handle:
+        handle.write(config)
+    return path
+
+
 def _write_config(praxis_port: int, db_path: str) -> str:
     with open(CONFIG_PATH) as f:
         config = f.read()
@@ -176,9 +202,7 @@ def _write_config(praxis_port: int, db_path: str) -> str:
     config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -259,9 +283,7 @@ def _write_irr_streaming_config(praxis_port: int) -> str:
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -276,9 +298,7 @@ def _write_chat_streaming_config(
     config = config.replace("127.0.0.1:3001", backend_endpoint)
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -296,10 +316,7 @@ def _write_client_tool_compat_config(praxis_port: int, db_path: str) -> str:
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
-    return path
+    return _persist_config(config)
 
 
 def _write_client_tool_compat_chat_config(praxis_port: int, db_path: str) -> str:
@@ -318,10 +335,7 @@ def _write_client_tool_compat_chat_config(praxis_port: int, db_path: str) -> str
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
-    return path
+    return _persist_config(config)
 
 
 def _write_compact_config(
@@ -346,9 +360,7 @@ def _write_compact_config(
     config = config.replace("127.0.0.1:11434", _vllm_endpoint())
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -385,9 +397,7 @@ def _write_web_search_chat_streaming_config(
         "allow_private_endpoints: true\n  allow_private_upstreams: true",
     )
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -754,7 +764,6 @@ class SimulatorBackendShimHandler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
                         self.wfile.flush()
 
-
 def _write_witness_config(
     praxis_port: int,
     db_path: str,
@@ -775,9 +784,7 @@ def _write_witness_config(
     config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -789,8 +796,9 @@ def _write_agentic_config(
     *,
     translate_to_chat: bool = False,
     backend_endpoint: str | None = None,
+    real_web_search: bool = False,
 ) -> str:
-    """Patch agentic-loop.yaml with test ports and loopback callout posture."""
+    """Patch agentic-loop.yaml for mocked or credentialed agentic tests."""
     with open(AGENTIC_CONFIG_PATH) as f:
         config = f.read()
 
@@ -821,15 +829,27 @@ def _write_agentic_config(
         "max_iterations: 11\n"
         "        step_timeout_ms: 300000\n",
     )
-    config = config.replace(
+    configured_web_search = (
         "- filter: openai_web_search\n"
         "                provider: brave\n"
-        "                api_key: ${WEB_SEARCH_API_KEY}",
-        "- filter: openai_web_search\n"
-        "                provider: brave\n"
-        "                api_key: test-key\n"
-        f"                base_url: http://127.0.0.1:{search_port}",
+        "                api_key: ${WEB_SEARCH_API_KEY}"
     )
+    if real_web_search:
+        replacement_web_search = (
+            "- filter: openai_web_search\n"
+            "                provider: tavily\n"
+            "                api_key: ${TAVILY_API_KEY}"
+        )
+    else:
+        replacement_web_search = (
+            "- filter: openai_web_search\n"
+            "                provider: brave\n"
+            "                api_key: test-key\n"
+            f"                base_url: http://127.0.0.1:{search_port}"
+        )
+    if configured_web_search not in config:
+        raise RuntimeError("agentic-loop.yaml web-search block changed")
+    config = config.replace(configured_web_search, replacement_web_search, 1)
     # agentic-loop.yaml already declares ``allow_private_upstreams: true`` in its
     # ``insecure_options``, which is the operator opt-in the executor's SSRF check
     # requires for the loopback provider callout — no test-time injection needed.
@@ -849,9 +869,7 @@ def _write_agentic_config(
             "              - filter: router",
         )
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -1754,7 +1772,12 @@ class TestOpenAIResponsesVLLM:
                 conversation={"id": conversation.id},
                 store=True,
                 temperature=0,
-                max_output_tokens=128,
+                # Qwen3 is a hybrid thinking model and its /no_think soft switch
+                # is not honored through this backend, so it emits a reasoning
+                # block before answering. Budget enough output tokens for the
+                # reasoning plus the short answer so the turn completes instead
+                # of truncating to status "incomplete".
+                max_output_tokens=2048,
             )
             # Ask the model to echo the earlier color rather than recall it in
             # free form: the small CI model reliably repeats an exact token from
@@ -1767,7 +1790,7 @@ class TestOpenAIResponsesVLLM:
                 conversation=conversation.id,
                 store=True,
                 temperature=0,
-                max_output_tokens=128,
+                max_output_tokens=2048,
             )
 
             assert first.status == "completed"
@@ -2253,7 +2276,12 @@ class TestResponsesCompactionVLLM:
             input="Remember the marker BELOW-THRESHOLD-2468. /no_think",
             temperature=0,
             store=True,
-            max_output_tokens=64,
+            # Qwen3 emits a reasoning block (its /no_think soft switch is not
+            # honored through this backend), so budget enough tokens for the
+            # reasoning plus the short ack; otherwise the turn truncates to
+            # "incomplete" and the continuation rejects the incomplete
+            # predecessor.
+            max_output_tokens=2048,
         )
         request_count = len(CompactionHandler.requests)
 
@@ -2265,11 +2293,13 @@ class TestResponsesCompactionVLLM:
             context_management=[
                 {
                     "type": "compaction",
-                    "compact_threshold": 1000,
+                    # Comfortably above the reasoning-inflated first-turn history
+                    # so this "below threshold" case reliably skips compaction.
+                    "compact_threshold": 8000,
                 }
             ],
             store=False,
-            max_output_tokens=128,
+            max_output_tokens=2048,
         )
 
         assert second.status == "completed"
@@ -2842,6 +2872,68 @@ def translated_agentic_client(translated_agentic_proxy):
         max_retries=0,
         timeout=300,
     )
+
+
+@pytest.fixture(scope="session")
+def live_tavily_client(tmp_path_factory, request, backend_endpoint):
+    """Run one credentialed Tavily search through the translated vLLM loop."""
+    if VLLM_TEST_BACKEND != "live":
+        pytest.skip("credentialed Tavily search requires the live backend")
+
+    if not os.environ.get("TAVILY_API_KEY"):
+        message = "TAVILY_API_KEY is required for credentialed live web search"
+        if REQUIRE_LIVE_WEB_SEARCH:
+            pytest.fail(message)
+        pytest.skip(message)
+
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("live-tavily-responses")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_agentic_config(
+        port,
+        db_path,
+        0,
+        0,
+        translate_to_chat=True,
+        backend_endpoint=backend_endpoint,
+        real_web_search=True,
+    )
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+    client = OpenAI(
+        base_url=f"http://127.0.0.1:{port}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield client
+    finally:
+        client.close()
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as handle:
+                print(
+                    f"\n=== Live Tavily Praxis logs ===\n{handle.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
 
 
 # ---------------------------------------------------------------------------
@@ -3781,8 +3873,15 @@ class TestAgenticLoopVLLM:
                     "search_context_size": "low",
                 }
             ],
+            # Force the hosted call so the proxy's translate/execute path is
+            # exercised deterministically rather than relying on a small model
+            # electing to call the tool; the agentic loop resets tool_choice to
+            # "auto" on continuation, so the follow-up round answers freely.
+            tool_choice={"type": "web_search"},
             store=False,
-            max_output_tokens=512,
+            # Room for the continuation round's reasoning plus the final message
+            # (Qwen3 emits a reasoning block that /no_think does not suppress).
+            max_output_tokens=2048,
         )
 
         web_search_calls = [
@@ -3792,6 +3891,43 @@ class TestAgenticLoopVLLM:
         assert web_search_calls[0].status == "completed"
         assert len(BraveSearchHandler.request_paths) == request_count + 1
         assert any(item.type == "message" for item in response.output)
+
+    @requires_real_inference
+    def test_live_tavily_web_search_returns_real_sources(
+        self,
+        live_tavily_client,
+    ):
+        """A real Tavily call executes inside the vLLM agentic loop."""
+        response = live_tavily_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "Use web search exactly once to find the official Rust "
+                "programming language website, then report its URL. /no_think"
+            ),
+            tools=[{"type": "web_search", "search_context_size": "low"}],
+            tool_choice={"type": "web_search"},
+            include=["web_search_call.action.sources"],
+            max_tool_calls=1,
+            store=False,
+            max_output_tokens=2048,
+        )
+
+        calls = [
+            item.model_dump()
+            for item in response.output
+            if item.type == "web_search_call" and item.status == "completed"
+        ]
+        assert len(calls) == 1, response.output
+        sources = calls[0].get("action", {}).get("sources", [])
+        assert sources, f"Tavily must return at least one source; got: {calls[0]}"
+        urls = [source.get("url") for source in sources]
+        assert all(url and url.startswith(("http://", "https://")) for url in urls), (
+            f"Tavily sources must contain absolute URLs; got: {sources}"
+        )
+        assert "https://example.com/mock" not in urls, (
+            f"credentialed test must not use the mock Brave result: {sources}"
+        )
+        assert any(item.type == "message" for item in response.output), response.output
 
     @requires_vllm_compat
     def test_web_search_streams_one_logical_response(
@@ -5003,9 +5139,7 @@ def _write_file_search_config(
         ogx_endpoint=ogx_endpoint or _ogx_endpoint(),
         vllm_endpoint=backend_endpoint,
     )
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -5085,7 +5219,37 @@ def vector_store():
 
 
 @pytest.fixture(scope="session")
-def file_search_proxy(tmp_path_factory, request, backend_endpoint):
+def file_search_backend(backend_endpoint):
+    """Backend endpoint for the native ``/v1/responses`` file-search path.
+
+    vLLM's native Responses frontend rejects the hosted ``file_search`` tool,
+    and the proxy's native path does not lower it to a backend ``function``
+    tool -- that lowering (``synthesized_file_search_tool`` /
+    ``build_object_tool_choice``) lives only in the chat-translation path. The
+    shipped :class:`SimulatorBackendShimHandler` performs exactly that
+    file_search->function substitution at the backend boundary and forwards to
+    real vLLM. In non-live mode ``backend_endpoint`` already routes through the
+    shim; in live mode it targets vLLM directly, so wrap it in the same shim
+    here. This exercises the real file-search callout + agentic loop + OGX
+    marker round-trip against genuine vLLM inference (no assertions relaxed).
+    """
+    if VLLM_TEST_BACKEND != "live":
+        yield backend_endpoint
+        return
+
+    port = _free_port()
+    server = HTTPServer(("127.0.0.1", port), SimulatorBackendShimHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"127.0.0.1:{port}"
+    finally:
+        server.shutdown()
+        thread.join()
+
+
+@pytest.fixture(scope="session")
+def file_search_proxy(tmp_path_factory, request, file_search_backend):
     """Start a Praxis proxy with the file-search-callout pipeline.
 
     The vector-store callout is pointed at an in-process recording shim
@@ -5100,7 +5264,11 @@ def file_search_proxy(tmp_path_factory, request, backend_endpoint):
     shim_thread.start()
 
     port = _free_port()
-    config_path = _write_file_search_config(port, backend_endpoint, ogx_endpoint=f"127.0.0.1:{shim_port}")
+    config_path = _write_file_search_config(
+        port,
+        file_search_backend,
+        ogx_endpoint=f"127.0.0.1:{shim_port}",
+    )
     binary = _find_binary()
 
     log_dir = tmp_path_factory.mktemp("file-search")
@@ -5126,6 +5294,7 @@ def file_search_proxy(tmp_path_factory, request, backend_endpoint):
             proc.wait()
         log_file.close()
         shim.shutdown()
+        shim_thread.join()
         if not started or request.session.testsfailed > 0:
             with open(log_path) as f:
                 print(
@@ -5168,9 +5337,15 @@ class TestFileSearchVLLM:
                     "vector_store_ids": [store_id],
                 }
             ],
+            # Force the hosted file_search call so the translate/execute path is
+            # exercised deterministically instead of depending on the small
+            # model to elect the tool.
+            tool_choice={"type": "file_search"},
             include=["file_search_call.results"],
             store=False,
-            max_output_tokens=512,
+            # Room for the continuation round's reasoning plus the final message
+            # (Qwen3 emits a reasoning block that /no_think does not suppress).
+            max_output_tokens=2048,
         )
 
         assert response.status in ("completed", "incomplete"), (
@@ -5270,9 +5445,7 @@ def _write_file_search_chat_config(
             "Chat backend endpoint was not patched"
         )
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
@@ -5467,20 +5640,18 @@ def _write_file_search_streaming_config(
     config = config.replace("step_timeout_ms: 60000", "step_timeout_ms: 300000")
     config = config.replace("timeout_ms: 5000", "timeout_ms: 30000")
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
+    path = _persist_config(config)
     return path
 
 
 @pytest.fixture(scope="session")
 def file_search_streaming_proxy(
-    tmp_path_factory, request, backend_endpoint
+    tmp_path_factory, request, file_search_backend
 ):
     """Start a Praxis proxy with the streaming file-search-callout pipeline."""
     port = _free_port()
     config_path = _write_file_search_streaming_config(
-        port, backend_endpoint
+        port, file_search_backend
     )
     binary = _find_binary()
 
@@ -5575,10 +5746,16 @@ class TestFileSearchStreamingVLLM:
             model=VLLM_MODEL,
             input=self._INPUT,
             tools=[{"type": "file_search", "vector_store_ids": [store_id]}],
+            # Force the hosted file_search call so the synthesized lifecycle is
+            # exercised deterministically instead of depending on the small
+            # model to elect the tool.
+            tool_choice={"type": "file_search"},
             include=["file_search_call.results"],
             store=False,
             stream=True,
-            max_output_tokens=512,
+            # Room for the continuation round's reasoning plus the final message
+            # (Qwen3 emits a reasoning block that /no_think does not suppress).
+            max_output_tokens=2048,
         )
 
         event_types, output_items, terminal_status = _drain_response_stream(
@@ -6390,10 +6567,7 @@ def _write_file_resolve_config(
         f'          - "http://127.0.0.1:{file_url_port}"',
     )
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
-    return path
+    return _persist_config(config)
 
 
 @pytest.fixture()
