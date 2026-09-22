@@ -1,0 +1,189 @@
+{
+  "version": 1,
+  "scenario_id": "responses/client-tool-compat-chat-stream",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-compat-model",
+    "source_id": "responses/client-tool-compat-chat-stream"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "call_recorded_0002": "call_recorded_0002",
+      "resp_5c00eccdb8cb4d787cbb000000000000": "resp_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "custom-tool-lower-restore-over-chat-stream",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "Apply the patch.",
+              "model": "synthetic-compat-model",
+              "store": false,
+              "stream": true,
+              "tools": [
+                {
+                  "description": "Apply a unified diff to the workspace.",
+                  "name": "apply_patch",
+                  "type": "custom"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": "response.created",
+                "data": "{\"response\":{\"background\":false,\"completed_at\":null,\"created_at\":0,\"error\":null,\"frequency_penalty\":0.0,\"id\":\"resp_recorded_0001\",\"incomplete_details\":null,\"input\":\"Apply the patch.\",\"instructions\":null,\"max_output_tokens\":null,\"max_tool_calls\":null,\"metadata\":{},\"model\":\"synthetic-compat-model\",\"object\":\"response\",\"output\":[],\"parallel_tool_calls\":true,\"presence_penalty\":0.0,\"previous_response_id\":null,\"prompt_cache_key\":null,\"reasoning\":null,\"safety_identifier\":null,\"service_tier\":\"default\",\"status\":\"in_progress\",\"store\":false,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tools\":[{\"description\":\"Apply a unified diff to the workspace.\",\"name\":\"apply_patch\",\"type\":\"custom\"}],\"top_logprobs\":0,\"top_p\":1.0,\"truncation\":\"disabled\",\"usage\":null},\"sequence_number\":0,\"type\":\"response.created\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.in_progress",
+                "data": "{\"response\":{\"background\":false,\"completed_at\":null,\"created_at\":0,\"error\":null,\"frequency_penalty\":0.0,\"id\":\"resp_recorded_0001\",\"incomplete_details\":null,\"input\":\"Apply the patch.\",\"instructions\":null,\"max_output_tokens\":null,\"max_tool_calls\":null,\"metadata\":{},\"model\":\"synthetic-compat-model\",\"object\":\"response\",\"output\":[],\"parallel_tool_calls\":true,\"presence_penalty\":0.0,\"previous_response_id\":null,\"prompt_cache_key\":null,\"reasoning\":null,\"safety_identifier\":null,\"service_tier\":\"default\",\"status\":\"in_progress\",\"store\":false,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tools\":[{\"description\":\"Apply a unified diff to the workspace.\",\"name\":\"apply_patch\",\"type\":\"custom\"}],\"top_logprobs\":0,\"top_p\":1.0,\"truncation\":\"disabled\",\"usage\":null},\"sequence_number\":1,\"type\":\"response.in_progress\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.added",
+                "data": "{\"item\":{\"arguments\":\"\",\"call_id\":\"call_recorded_0002\",\"id\":\"ctc_call_recorded_0002\",\"name\":\"apply_patch\",\"status\":\"in_progress\",\"type\":\"custom_tool_call\"},\"output_index\":0,\"sequence_number\":2,\"type\":\"response.output_item.added\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.custom_tool_call_input.delta",
+                "data": "{\"delta\":\"*** Begin Patch\",\"item_id\":\"ctc_call_recorded_0002\",\"output_index\":0,\"sequence_number\":3,\"type\":\"response.custom_tool_call_input.delta\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.custom_tool_call_input.done",
+                "data": "{\"input\":\"*** Begin Patch\",\"item_id\":\"ctc_call_recorded_0002\",\"output_index\":0,\"sequence_number\":4,\"type\":\"response.custom_tool_call_input.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.output_item.done",
+                "data": "{\"item\":{\"call_id\":\"call_recorded_0002\",\"id\":\"ctc_call_recorded_0002\",\"input\":\"*** Begin Patch\",\"name\":\"apply_patch\",\"type\":\"custom_tool_call\"},\"output_index\":0,\"sequence_number\":5,\"type\":\"response.output_item.done\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": "response.completed",
+                "data": "{\"response\":{\"background\":false,\"completed_at\":0,\"created_at\":0,\"error\":null,\"frequency_penalty\":0.0,\"id\":\"resp_recorded_0001\",\"incomplete_details\":null,\"input\":\"Apply the patch.\",\"instructions\":null,\"max_output_tokens\":null,\"max_tool_calls\":null,\"metadata\":{},\"model\":\"synthetic-compat-model\",\"object\":\"response\",\"output\":[{\"call_id\":\"call_recorded_0002\",\"id\":\"ctc_call_recorded_0002\",\"input\":\"*** Begin Patch\",\"name\":\"apply_patch\",\"type\":\"custom_tool_call\"}],\"parallel_tool_calls\":true,\"presence_penalty\":0.0,\"previous_response_id\":null,\"prompt_cache_key\":null,\"reasoning\":null,\"safety_identifier\":null,\"service_tier\":\"default\",\"status\":\"completed\",\"store\":false,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tools\":[{\"description\":\"Apply a unified diff to the workspace.\",\"name\":\"apply_patch\",\"type\":\"custom\"}],\"top_logprobs\":0,\"top_p\":1.0,\"truncation\":\"disabled\",\"usage\":{\"input_tokens\":0,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":0,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":0}},\"sequence_number\":6,\"type\":\"response.completed\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": false
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": "Apply the patch.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-compat-model",
+              "stream": true,
+              "stream_options": {
+                "include_usage": true
+              },
+              "tool_choice": "auto",
+              "tools": [
+                {
+                  "function": {
+                    "description": "Apply a unified diff to the workspace.\n\nProvide the raw tool input in the `input` string field.",
+                    "name": "apply_patch",
+                    "parameters": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "input": {
+                          "description": "Raw custom tool input. Follow the tool description and declared format exactly.",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "input"
+                      ],
+                      "type": "object"
+                    },
+                    "strict": true
+                  },
+                  "type": "function"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "text/event-stream"
+            ]
+          },
+          "body": {
+            "kind": "sse",
+            "frames": [
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"apply_patch\"},\"id\":\"call_recorded_0002\",\"index\":0,\"type\":\"function\"}]},\"index\":0}],\"id\":\"c1\",\"model\":\"synthetic-compat-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"input\\\":\\\"*** Begin Patch\\\"}\"},\"index\":0}]},\"index\":0}],\"id\":\"c1\",\"model\":\"synthetic-compat-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              },
+              {
+                "event": null,
+                "data": "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\",\"index\":0}],\"id\":\"c1\",\"model\":\"synthetic-compat-model\",\"object\":\"chat.completion.chunk\"}",
+                "id": null,
+                "retry": null
+              }
+            ],
+            "done": true
+          }
+        }
+      }
+    }
+  ]
+}

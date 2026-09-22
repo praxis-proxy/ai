@@ -78,7 +78,7 @@ fn response_guardrails_config_parses_correctly() {
 #[test]
 fn response_guardrails_pass_forwards_upstream_body() {
     let backend = chat_backend("Hello! I'm doing well.");
-    let nemo = start_capturing_backend(r#"{"status":"passed"}"#);
+    let nemo = start_capturing_backend(r#"{"status":"passed","content":"Hello! I'm doing well."}"#);
     let proxy_port = free_port();
     let config = load_response_config(proxy_port, backend.port(), nemo.port());
     let proxy = start_proxy(&config);

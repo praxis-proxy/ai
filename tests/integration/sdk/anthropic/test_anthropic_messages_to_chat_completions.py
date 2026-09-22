@@ -221,5 +221,19 @@ class TestRequestFieldHandling:
         assert RecordingBackend.bodies == []
 
 
+class TestResponseUsage:
+    def test_usage_carries_null_output_tokens_details(self, anthropic_client):
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        # The pinned Messages schema requires the key; the SDK defaults a missing
+        # key to None too, so check the wire payload actually carried it.
+        assert "output_tokens_details" in response.usage.model_fields_set
+        assert response.usage.output_tokens_details is None
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"] + sys.argv[1:]))

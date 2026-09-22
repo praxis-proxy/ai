@@ -2598,6 +2598,183 @@ fn discovered_custom_tool_is_hoisted_and_restored() {
 }
 
 #[test]
+fn relowering_with_captured_echo_preserves_canonical_restoration() {
+    // #1249 (defense-in-depth): pins the idempotency invariant that re-lowering a
+    // request whose canonical `tools`/`tool_choice` were already captured in
+    // `client_tool_echo` rebuilds from that echo — keeping the first echo and every
+    // restoration recipe intact — rather than treating the already lowered private
+    // `function`s as a fresh client declaration set and overwriting
+    // `client_tool_echo`/`client_tool_lowering` with those private shapes.
+    //
+    // This is a SYNTHETIC state, not a reachable production flow. The live agentic
+    // loop cannot re-enter `lower_declared_and_discovered` with an echo already set:
+    // after the first lowered round `commit_lowering` overwrites the request `tools`
+    // with the lowered functions and re-types the discovery-producing history in the
+    // persisted `ResponsesState` (carried across IRR rounds), so on any continuation
+    // `has_rich` is false and `collect_discovered_tools` is empty; a client-executed
+    // `tool_search` also terminates the loop rather than looping. The test constructs
+    // the state by hand to pin the invariant the fix guarantees.
+
+    // Round 1: the client declares a rich `custom` tool plus a client-executed
+    // `tool_search`, and forces the custom tool via `tool_choice`; both are lowered
+    // and the canonical snapshot (tools AND tool_choice) is captured.
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "m",
+        "input": "run some python",
+        "tools": [
+            {"type": "custom", "name": "run_python", "description": "Run python.", "format": {"type": "text"}},
+            {"type": "tool_search"}
+        ],
+        "tool_choice": {"type": "custom", "name": "run_python"},
+    }));
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("round 1 lowering succeeds");
+    let round1_echo = state
+        .client_tool_echo
+        .clone()
+        .expect("round 1 captures a canonical echo");
+    assert_eq!(round1_echo.tools[0]["type"], "custom");
+    assert_eq!(round1_echo.tools[0]["name"], "run_python");
+    assert_eq!(
+        round1_echo.tool_choice,
+        json!({"type": "custom", "name": "run_python"}),
+        "the canonical tool_choice is captured before lowering"
+    );
+    assert_eq!(
+        state
+            .client_tool_lowering
+            .get("run_python")
+            .map(|lowered| lowered.restore),
+        Some(ClientToolRestore::Custom)
+    );
+    assert_eq!(
+        state
+            .client_tool_lowering
+            .get("tool_search")
+            .map(|lowered| lowered.restore),
+        Some(ClientToolRestore::ToolSearch)
+    );
+
+    // Construct the synthetic continuation state by hand (the live loop cannot reach
+    // it, see above): an un-lowered client-executed `tool_search` and its discovered
+    // `custom` output are pushed onto the replayed conversation, while the request
+    // body still carries the private `function` declarations from round 1. Pushing
+    // these *after* round 1 is precisely what bypasses round 1's history lowering —
+    // the step the real runtime always performs, which is why this state is
+    // unreachable in production.
+    state.messages.push(json!({
+        "type": "tool_search_call",
+        "call_id": "call_ts",
+        "execution": "client",
+        "arguments": {"query": "patch"}
+    }));
+    state.messages.push(json!({
+        "type": "tool_search_output",
+        "call_id": "call_ts",
+        "status": "completed",
+        "tools": [{"type": "custom", "name": "apply_patch", "description": "Apply a patch.", "format": {"type": "text"}}]
+    }));
+    // The agentic loop resets `tool_choice` to `auto` on re-entry (see
+    // `agentic_loop::prepare_iteration`). Overwriting the echo here would replace the
+    // canonical `custom` selector with this `auto` value.
+    state
+        .request_body
+        .as_object_mut()
+        .expect("request body is an object")
+        .insert("tool_choice".to_owned(), json!("auto"));
+
+    // Second lowering on the synthetic continuation.
+    filter()
+        .lower_request(&mut state, false, false)
+        .expect("second lowering succeeds");
+
+    // The canonical echo survives verbatim — the private lowered `function`s and the
+    // `auto`-reset `tool_choice` never overwrite the client's declared snapshot.
+    let echo = state.client_tool_echo.as_ref().expect("echo survives re-entry");
+    assert_eq!(
+        echo, &round1_echo,
+        "the canonical echo is preserved unchanged across re-entry"
+    );
+    assert_eq!(
+        echo.tools[0]["type"], "custom",
+        "run_python stays a canonical custom declaration"
+    );
+    assert_eq!(
+        echo.tool_choice,
+        json!({"type": "custom", "name": "run_python"}),
+        "the canonical tool_choice is not clobbered by the re-entry auto reset"
+    );
+
+    // Every restoration recipe survives: the originally rich tools AND the newly
+    // discovered one. Before the fix, re-lowering the already lowered request tools
+    // dropped the run_python/tool_search recipes.
+    assert_eq!(
+        state
+            .client_tool_lowering
+            .get("run_python")
+            .map(|lowered| lowered.restore),
+        Some(ClientToolRestore::Custom),
+        "the rich tool's restoration recipe survives the continuation"
+    );
+    assert_eq!(
+        state
+            .client_tool_lowering
+            .get("tool_search")
+            .map(|lowered| lowered.restore),
+        Some(ClientToolRestore::ToolSearch),
+        "the tool_search restoration recipe survives the continuation"
+    );
+    assert!(
+        state.client_tool_lowering.contains_key("apply_patch"),
+        "the newly discovered tool is registered for restoration"
+    );
+
+    // The outbound wire re-lowers the canonical rich tools and hoists the discovery.
+    let tools = state.request_body["tools"].as_array().expect("outbound tools");
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "run_python" && tool["type"] == "function"),
+        "run_python is re-lowered onto the outbound function set"
+    );
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["name"] == "apply_patch" && tool["type"] == "function"),
+        "the discovered tool is hoisted onto the outbound function set"
+    );
+
+    // The terminal response restores the originally rich tool losslessly and echoes
+    // the client's canonical declaration rather than the private lowered function.
+    let response = json!({
+        "object": "response",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_rp",
+            "name": "run_python",
+            "arguments": "{\"input\":\"print(1)\"}",
+            "status": "completed"
+        }],
+    });
+    let restored = restore(&state, &response);
+    assert_eq!(
+        restored["output"][0]["type"], "custom_tool_call",
+        "run_python restores to its canonical custom_tool_call after the continuation"
+    );
+    assert_eq!(restored["output"][0]["input"], "print(1)");
+    assert!(
+        restored["tools"]
+            .as_array()
+            .expect("echoed tools")
+            .iter()
+            .any(|tool| tool["type"] == "custom" && tool["name"] == "run_python"),
+        "the response echoes the canonical custom declaration, not the lowered function"
+    );
+}
+
+#[test]
 fn discovered_tool_hoisted_without_declared_rich_tool() {
     // The continuation need not re-declare `tool_search`: a prior client-executed
     // search's discovered tool is still hoisted so it stays callable.
@@ -3366,6 +3543,99 @@ fn legitimate_namespace_member_is_not_rejected_by_the_reserved_prefix() {
             .contains_key(&namespace_member_name("git", "commit")),
         "the namespace member is registered under its flat wire name"
     );
+}
+
+#[test]
+fn top_level_tool_named_a_reserved_hosted_tool_fails_closed() {
+    // `file_search` and `web_search` are function-call NAMES downstream filters
+    // silently re-route: a `function_call` named `file_search` is rewritten into a
+    // hosted `file_search_call` (agentic_loop → file_search_callout), and
+    // `web_search` both trips the Chat-Completions `WebSearchFunctionNameCollision`
+    // reject and aliases the proxy's synthesized web-search bridge. A client tool
+    // lowered to either bare name would be misclassified as hosted, so the filter
+    // fails closed up front — on the bare name, not conditioned on a hosted tool
+    // being configured, so isolation cannot depend on pipeline composition. The
+    // `tool_search` sibling engages the filter (a lone plain `function` is not rich
+    // and passes through untouched).
+    for hosted in ["file_search", "web_search"] {
+        for tool in [
+            json!({"type": "function", "name": hosted, "parameters": {"type": "object"}}),
+            json!({"type": "function", "name": hosted, "parameters": {"type": "object"}, "defer_loading": true}),
+            json!({"type": "custom", "name": hosted}),
+            json!({"type": "custom", "name": hosted, "defer_loading": true}),
+        ] {
+            let filter = ClientToolCompatFilter {
+                max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
+                max_client_tools: 512,
+            };
+            let mut state = ResponsesState::from_request_body(json!({ "tools": [tool, {"type": "tool_search"}] }));
+            let action = filter
+                .lower_request(&mut state, false, false)
+                .expect_err("a top-level tool named a reserved hosted tool fails closed");
+            let (status, message) = reject_parts(&action);
+            assert_eq!(status, 400, "the reserved hosted name is rejected");
+            assert!(
+                message.contains("reserved") && message.contains(hosted),
+                "the rejection names the reserved hosted tool: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn discovered_top_level_tool_named_a_reserved_hosted_tool_fails_closed() {
+    // A hoisted (discovered) top-level tool is subject to the same hosted-name
+    // reservation as a declared one, so a `tool_search` result cannot smuggle in a
+    // client tool that impersonates a hosted `file_search`/`web_search` call name.
+    for hosted in ["file_search", "web_search"] {
+        let filter = ClientToolCompatFilter {
+            max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
+            max_client_tools: 512,
+        };
+        let mut state = ResponsesState::from_request_body(json!({
+            "tools": [{"type": "tool_search"}],
+            "input": [
+                {"type": "tool_search_call", "call_id": "call_1", "execution": "client",
+                 "arguments": {"query": "x"}, "id": "tsc_1"},
+                {"type": "tool_search_output", "call_id": "call_1", "tools": [
+                    {"type": "custom", "name": hosted}
+                ]}
+            ],
+        }));
+        let action = filter
+            .lower_request(&mut state, false, false)
+            .expect_err("a discovered top-level tool named a reserved hosted tool fails closed");
+        let (status, message) = reject_parts(&action);
+        assert_eq!(
+            status, 400,
+            "the reserved hosted name is rejected on the discovery path"
+        );
+        assert!(
+            message.contains("reserved") && message.contains(hosted),
+            "the rejection names the reserved hosted tool: {message}"
+        );
+    }
+}
+
+#[test]
+fn client_tool_named_a_near_miss_of_a_hosted_tool_is_not_rejected() {
+    // The reservation is an EXACT-match on the closed set {file_search, web_search};
+    // names that merely embed a sentinel as a substring or prefix are legitimate
+    // client tools and must still lower (no over-rejection).
+    for name in ["file_search_helper", "web_searcher", "my_web_search", "search"] {
+        let filter = ClientToolCompatFilter {
+            max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
+            max_client_tools: 512,
+        };
+        let mut state = ResponsesState::from_request_body(json!({ "tools": [{"type": "custom", "name": name}] }));
+        filter
+            .lower_request(&mut state, false, false)
+            .expect("a near-miss client tool name lowers without rejection");
+        assert!(
+            state.client_tool_lowering.contains_key(name),
+            "the near-miss client tool '{name}' is registered under its own name"
+        );
+    }
 }
 
 #[test]

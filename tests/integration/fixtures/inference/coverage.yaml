@@ -328,3 +328,23 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.client_tool_compat.chat_lower_restore
+    scopes:
+      - responses_client_tool_compat
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/client-tool-compat-chat
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.client_tool_compat.chat_stream_restore
+    scopes:
+      - responses_client_tool_compat
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/client-tool-compat-chat-stream
+    providers:
+      synthetic:
+        status: synthetic_only

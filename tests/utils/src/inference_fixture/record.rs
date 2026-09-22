@@ -3312,6 +3312,10 @@ mod tests {
         provider.finish().await;
     }
 
+    // Drives the Responses proxy with a sqlite-backed response store to persist
+    // and rebind `previous_response_id` across turns, so it needs the
+    // store-sqlite backend compiled in (run via `make test-inference-fixtures`).
+    #[cfg(feature = "store-sqlite")]
     #[tokio::test]
     async fn record_live_binds_previous_response_id_across_responses_turns() {
         let request_count = Arc::new(AtomicUsize::new(0));
@@ -3933,6 +3937,8 @@ mod tests {
         }
     }
 
+    // Only referenced by the store-sqlite-gated live recording test above.
+    #[cfg(feature = "store-sqlite")]
     fn live_responses_scenario() -> InferenceScenario {
         InferenceScenario {
             version: 1,
@@ -3949,6 +3955,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "store-sqlite")]
     fn live_responses_turn(name: &str, prompt: &str, previous_response_id: Option<&str>) -> ScenarioTurn {
         let mut value = json!({
             "model": "${MODEL}",

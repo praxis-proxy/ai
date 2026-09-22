@@ -72,6 +72,9 @@ TRUSTED_OWNER_HEADERS = {
 CLIENT_TOOL_COMPAT_CONFIG_PATH = (
     "examples/configs/openai/responses/client-tool-compat.yaml"
 )
+CLIENT_TOOL_COMPAT_CHAT_CONFIG_PATH = (
+    "examples/configs/openai/responses/client-tool-compat-chat-completions.yaml"
+)
 
 TERMINAL_RESPONSE_EVENTS = {
     "response.cancelled",
@@ -287,6 +290,28 @@ def _write_client_tool_compat_config(praxis_port: int, db_path: str) -> str:
     limited to those three (no OGX, no mock side-servers).
     """
     with open(CLIENT_TOOL_COMPAT_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
+    config = _patch_store_backend(config, db_path)
+
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        f.write(config)
+    return path
+
+
+def _write_client_tool_compat_chat_config(praxis_port: int, db_path: str) -> str:
+    """Patch the composed client-tool-compat + Chat Completions example (#1206).
+
+    The composed config points at the proxy listener, a single Chat Completions
+    backend endpoint, and the SQLite store, so patching is limited to those three
+    (no OGX, no mock side-servers). Unlike ``_write_client_tool_compat_config`` the
+    backend receives ``POST /v1/chat/completions`` because
+    ``responses_to_chat_completions`` translates the lowered Responses request.
+    """
+    with open(CLIENT_TOOL_COMPAT_CHAT_CONFIG_PATH) as f:
         config = f.read()
 
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
@@ -669,11 +694,12 @@ class SimulatorBackendShimHandler(BaseHTTPRequestHandler):
     stop choosing tools after a Chat ``role=tool`` result. Praxis agentic tests
     need the opposite deterministic script: choose a tool on the first round,
     then return assistant text after the locally executed result is re-entered.
+    This forcing is Chat-only.
 
-    Its native Responses frontend also rejects hosted ``file_search`` tools.
-    vLLM accepts those tools and emits the private ``function_call`` that the
-    Praxis file-search loop normalizes, so the shim substitutes that equivalent
-    private function at the backend boundary.
+    Native Responses ``file_search`` lowering is no longer done here: Praxis
+    lowers the hosted tool into a private function before the request reaches the
+    backend (``openai_file_search_callout``), so the shim forwards native
+    ``/v1/responses`` requests untouched and exercises the real production path.
     """
 
     def log_message(self, fmt, *args):
@@ -684,14 +710,15 @@ class SimulatorBackendShimHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         request_body = json.loads(body)
 
-        if self.path.rstrip("/").endswith("/v1/responses"):
-            request_body["tools"] = [
-                self._responses_tool(tool)
-                for tool in request_body.get("tools", [])
-            ]
-            body = json.dumps(request_body).encode()
-        elif (
-            request_body.get("tools")
+        # Praxis lowers hosted Responses `file_search` into a private function
+        # before the request reaches the backend (openai_file_search_callout), so
+        # the shim forwards native `/v1/responses` requests untouched. The
+        # tool_choice forcing below is Chat-only: it inspects `messages`, which a
+        # Responses body does not carry, and only compensates for the simulator's
+        # probabilistic Chat tool selection.
+        if (
+            self.path.rstrip("/").endswith("/v1/chat/completions")
+            and request_body.get("tools")
             and request_body.get("tool_choice", "auto") == "auto"
         ):
             has_tool_result = any(
@@ -726,29 +753,6 @@ class SimulatorBackendShimHandler(BaseHTTPRequestHandler):
                     if chunk:
                         self.wfile.write(chunk)
                         self.wfile.flush()
-
-    @staticmethod
-    def _responses_tool(tool: dict) -> dict:
-        if tool.get("type") != "file_search":
-            return tool
-        return {
-            "type": "function",
-            "name": "file_search",
-            "description": "Search the configured vector stores for relevant files.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 4096,
-                    }
-                },
-                "required": ["query"],
-                "additionalProperties": False,
-            },
-            "strict": True,
-        }
 
 
 def _write_witness_config(
@@ -1036,6 +1040,56 @@ def client_tool_compat_client(client_tool_compat_proxy):
     """Return an SDK client using the client-tool-compat pipeline."""
     return OpenAI(
         base_url=f"http://127.0.0.1:{client_tool_compat_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
+def client_tool_compat_chat_proxy(tmp_path_factory, request):
+    """Start the composed client-tool-compat + Chat Completions example (#1206)."""
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("client-tool-compat-chat")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_client_tool_compat_chat_config(port, db_path)
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Client tool compat (Chat) Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def client_tool_compat_chat_client(client_tool_compat_chat_proxy):
+    """Return an SDK client using the composed compat + Chat Completions pipeline."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{client_tool_compat_chat_proxy}/v1",
         api_key="test",
         max_retries=0,
         timeout=300,
@@ -2916,6 +2970,105 @@ class TestClientToolCompatVLLM:
         # Request phase echo: the client sees its original ``custom`` tool back.
         assert any(t.type == "custom" for t in response.tools), response.tools
 
+    def test_single_round_declared_and_discovered_tools_lower_without_leaking(
+        self, client_tool_compat_client
+    ):
+        """General single-request coverage: a declared rich ``custom`` tool and a
+        ``tool_search``-discovered ``custom`` tool coexist on one request, are both
+        lowered to private ``function`` selectors for the function-only backend, and
+        the canonical echo plus restoration stay leak-free.
+
+        A prior client-executed ``tool_search`` discovered ``apply_patch`` while the
+        request also declares the rich ``custom`` ``run_python`` and forces the
+        discovered tool via ``tool_choice``. The forced discovered selector is
+        accepted (lowered ``custom`` -> ``function``, not rejected), and the response
+        echoes the *declared* ``run_python`` back as ``custom`` (its echo is not
+        clobbered by the discovered set) while never leaking a private ``function``
+        tool or ``function_call`` item to the client.
+
+        This asserts only filter-guaranteed, model-independent invariants: whether
+        the small CI simulator actually emits the forced call is model-dependent, so
+        the test does not require a live tool call. It exercises a single lowering
+        only (the example pipeline transitions straight to ``done``), so it passes on
+        both pre- and post-fix code and is deliberately NOT the #1249 IRR re-entry
+        regression guard — that failure is unreachable through the live agentic loop
+        and is pinned synthetically by the Rust unit test
+        ``relowering_with_captured_echo_preserves_canonical_restoration``.
+        """
+        response = client_tool_compat_client.responses.create(
+            model=VLLM_MODEL,
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": (
+                        "You MUST call the apply_patch tool. Do not answer "
+                        "directly. /no_think"
+                    ),
+                },
+                {
+                    "type": "tool_search_call",
+                    "call_id": "call_ts",
+                    "execution": "client",
+                    "arguments": {"query": "patch"},
+                },
+                {
+                    "type": "tool_search_output",
+                    "call_id": "call_ts",
+                    "status": "completed",
+                    "tools": [
+                        {
+                            "type": "custom",
+                            "name": "apply_patch",
+                            "description": "Apply a unified diff to the workspace.",
+                            "format": {"type": "text"},
+                        }
+                    ],
+                },
+            ],
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "run_python",
+                    "description": "Run python code in the workspace.",
+                }
+            ],
+            # Force the discovered custom tool: this exercises the discovered
+            # tool_choice lowering path (custom -> function selector) and proves the
+            # backend accepts it rather than rejecting an undeclared selector.
+            # Whether the small CI simulator then honours the forced call is
+            # model-dependent, so the assertions below never require a live call.
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        # No un-restored private ``function_call`` may leak to the client, and any
+        # tool call the model did emit must have been restored to a typed
+        # ``custom_tool_call`` naming one of the two known tools (never a raw private
+        # function call). This holds whether or not the model honoured the forced
+        # choice, so it does not depend on the simulator emitting a call.
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        custom_calls = [
+            item for item in response.output if item.type == "custom_tool_call"
+        ]
+        assert all(
+            call.name in {"run_python", "apply_patch"} for call in custom_calls
+        ), f"unexpected restored tool name: {[c.name for c in custom_calls]}"
+        # The response echoes the *declared* rich tool back as ``custom`` — the
+        # discovered set never overwrites the canonical declaration echo, and no
+        # lowered private ``function`` tool leaks into the echoed set.
+        assert any(
+            t.type == "custom" and t.name == "run_python" for t in response.tools
+        ), response.tools
+        assert all(t.type != "function" for t in response.tools), response.tools
+        # The discovered tool was never declared, so it is not echoed.
+        assert all(t.name != "apply_patch" for t in response.tools), response.tools
+
     def test_streaming_custom_tool_restores_lifecycle(
         self, client_tool_compat_client
     ):
@@ -2981,6 +3134,199 @@ class TestClientToolCompatVLLM:
         assert any(t.type == "custom" for t in final_response.tools), (
             final_response.tools
         )
+
+
+class TestClientToolCompatChatVLLM:
+    """Issue #1206: rich Codex client tools reach a function-only **Chat
+    Completions** backend by composing ``openai_client_tool_compat`` with
+    ``responses_to_chat_completions`` in one iterative-router step.
+
+    Unlike :class:`TestClientToolCompatVLLM` (native Responses backend), here the
+    backend only ever sees ``POST /v1/chat/completions`` with plain ``function``
+    tools: compat lowers the rich ``custom``/``namespace``/``shell``/``tool_search``
+    declarations into private functions in ``request_body``, r2c translates the
+    lowered Responses request into a Chat request, and on the response path r2c
+    rebuilds the Responses object first, then compat (buffered) or
+    ``openai_stream_events`` (streaming, #1159) restores the private
+    ``function_call`` items to their canonical typed items — with no private
+    lowered name ever leaking to the client.
+    """
+
+    @requires_real_inference
+    def test_custom_tool_round_trip_over_chat_backend(
+        self, client_tool_compat_chat_client
+    ):
+        """A ``custom`` client tool is lowered to a private ``function`` the Chat
+        backend accepts; the translated ``function_call`` is restored to a
+        ``custom_tool_call`` with the original ``custom`` tool echoed back."""
+        response = client_tool_compat_chat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            # Force the call so the small CI model is deterministic; compat lowers
+            # this custom selector to a function selector for the Chat backend.
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=False,
+            max_output_tokens=256,
+        )
+
+        assert response.status == "completed", response
+        custom_calls = [
+            item for item in response.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            "compat must restore the translated function_call to a custom_tool_call "
+            f"over a Chat backend; got output types: {[i.type for i in response.output]}"
+        )
+        assert custom_calls[0].name == "apply_patch"
+        assert isinstance(custom_calls[0].input, str)
+        # No un-restored private function_call may leak to the client.
+        assert all(item.type != "function_call" for item in response.output), (
+            f"lowered function must not leak: {[i.type for i in response.output]}"
+        )
+        # Request-phase echo: the client sees its original ``custom`` tool back.
+        assert any(t.type == "custom" for t in response.tools), response.tools
+
+    @requires_real_inference
+    def test_streaming_custom_tool_restores_over_chat_backend(
+        self, client_tool_compat_chat_client
+    ):
+        """The streamed Chat tool-call is translated by r2c into a Responses SSE
+        lifecycle and restored LIVE to a ``custom_tool_call`` by
+        ``openai_stream_events`` — one coherent SSE lifecycle, no leaked name."""
+        stream = client_tool_compat_chat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=False,
+            stream=True,
+            max_output_tokens=256,
+        )
+
+        event_types = []
+        final_response = None
+        for event in stream:
+            event_types.append(event.type)
+            if event.type == "response.completed":
+                final_response = event.response
+
+        assert event_types[0] == "response.created", event_types
+        assert event_types[-1] == "response.completed", event_types
+        assert final_response is not None, (
+            f"stream must terminate with a response.completed event; got: {event_types}"
+        )
+        assert final_response.status == "completed", final_response
+
+        output_types = [item.type for item in final_response.output]
+        custom_calls = [
+            item for item in final_response.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            "openai_stream_events must restore the streamed function_call to a "
+            f"custom_tool_call over a Chat backend; got output types: {output_types}"
+        )
+        assert custom_calls[0].name == "apply_patch"
+        assert isinstance(custom_calls[0].input, str)
+        # A private ``custom_tool_call_input`` lifecycle must be emitted, never the
+        # private ``function_call_arguments`` events for the lowered name.
+        assert any(
+            evt.startswith("response.custom_tool_call_input") for evt in event_types
+        ), event_types
+        assert "function_call" not in output_types, (
+            f"lowered function must not leak on the stream: {output_types}"
+        )
+        assert any(t.type == "custom" for t in final_response.tools), (
+            final_response.tools
+        )
+
+    @requires_real_inference
+    def test_custom_tool_output_continuation_over_chat_backend(
+        self, client_tool_compat_chat_client
+    ):
+        """A ``custom_tool_call_output`` re-entered on a stored continuation is
+        lowered to a ``function_call_output`` history item and translated by r2c
+        into a Chat ``role: tool`` message, so the correlated second turn completes
+        without leaking the private lowered name."""
+        first = client_tool_compat_chat_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call the apply_patch tool. Do not answer directly. "
+                "/no_think"
+            ),
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            tool_choice={"type": "custom", "name": "apply_patch"},
+            temperature=0,
+            store=True,
+            max_output_tokens=256,
+        )
+
+        assert first.status == "completed", first
+        custom_calls = [
+            item for item in first.output if item.type == "custom_tool_call"
+        ]
+        assert len(custom_calls) >= 1, (
+            f"first turn must produce a custom_tool_call; got: {[i.type for i in first.output]}"
+        )
+        call_id = custom_calls[0].call_id
+
+        second = client_tool_compat_chat_client.responses.create(
+            model=VLLM_MODEL,
+            input=[
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "output": "Applied the patch successfully.",
+                }
+            ],
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a unified diff to the workspace.",
+                }
+            ],
+            previous_response_id=first.id,
+            temperature=0,
+            store=True,
+            max_output_tokens=256,
+        )
+
+        assert second.status == "completed", second
+        # The continuation must correlate to the caller's turn and never surface a
+        # private lowered function_call/output to the client.
+        assert second.previous_response_id == first.id, second.previous_response_id
+        assert all(
+            item.type not in ("function_call", "function_call_output")
+            for item in second.output
+        ), f"lowered names must not leak on continuation: {[i.type for i in second.output]}"
+        assert any(t.type == "custom" for t in second.tools), second.tools
 
 
 class TestAgenticLoopVLLM:
@@ -5015,6 +5361,40 @@ class TestFileSearchChatCompletionsVLLM:
 
         assert response.status in ("completed", "incomplete"), (
             f"response should reach a terminal status; got {response.status}"
+        )
+
+        # The backend-lowered private function must not leak into the echoed
+        # request declarations. openai_file_search_callout rewrites
+        # request_body.tools into {"type":"function","name":"file_search"} for the
+        # Chat backend, but responses_to_chat_completions must echo the hosted
+        # tool the client sent, derived from the preserved ResponsesState.tools.
+        dumped = response.model_dump()
+        echoed_tools = dumped.get("tools") or []
+        assert echoed_tools, (
+            f"response should echo the client's tool declarations; got {dumped.get('tools')!r}"
+        )
+        assert any(t.get("type") == "file_search" for t in echoed_tools), (
+            f"response.tools must echo the hosted file_search tool; got {echoed_tools}"
+        )
+        assert not any(
+            t.get("type") == "function" and t.get("name") == "file_search"
+            for t in echoed_tools
+        ), (
+            "the backend-only private file_search function must not leak into "
+            f"response.tools; got {echoed_tools}"
+        )
+        echoed_file_search = next(
+            t for t in echoed_tools if t.get("type") == "file_search"
+        )
+        assert store_id in (echoed_file_search.get("vector_store_ids") or []), (
+            "the echoed hosted file_search tool must retain the client's "
+            f"vector_store_ids; got {echoed_file_search}"
+        )
+        # The client left tool_choice unset, so the echo must be the hosted
+        # default "auto", never the lowered {"type":"function","name":"file_search"}.
+        assert dumped.get("tool_choice") == "auto", (
+            "response.tool_choice should echo the hosted default 'auto'; got "
+            f"{dumped.get('tool_choice')!r}"
         )
 
         output_types = [item.type for item in response.output]
