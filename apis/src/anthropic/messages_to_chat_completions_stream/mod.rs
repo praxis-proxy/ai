@@ -1159,12 +1159,12 @@ mod tests {
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
                 "inference_geo",
+                "output_tokens_details",
                 "server_tool_use",
                 "service_tier",
             ],
             "message_start usage",
         );
-        assert_absent_fields(usage, &["output_tokens_details"], "message_start usage");
         assert_u64_field(usage, "input_tokens", 0, "message_start usage");
         assert_u64_field(usage, "output_tokens", 0, "message_start usage");
     }
@@ -1197,11 +1197,11 @@ mod tests {
             &[
                 "cache_creation_input_tokens",
                 "cache_read_input_tokens",
+                "output_tokens_details",
                 "server_tool_use",
             ],
             "message_delta usage",
         );
-        assert_absent_fields(usage, &["output_tokens_details"], "message_delta usage");
         assert_u64_field(usage, "output_tokens", 7, "message_delta usage");
         assert_u64_field(usage, "input_tokens", 15, "message_delta usage");
     }
@@ -2103,12 +2103,6 @@ mod tests {
             .map(|data| serde_json::from_str::<Value>(data).unwrap())
             .map(|event| event.get("index").and_then(Value::as_u64).unwrap())
             .collect()
-    }
-
-    fn assert_absent_fields(value: &Value, fields: &[&str], label: &str) {
-        for field in fields {
-            assert!(value.get(*field).is_none(), "{label} should omit {field}");
-        }
     }
 
     fn assert_null_fields(value: &Value, fields: &[&str], label: &str) {

@@ -151,6 +151,7 @@ fn anthropic_messages_to_chat_completions_transforms_response_body() {
         "cache_creation_input_tokens",
         "cache_read_input_tokens",
         "inference_geo",
+        "output_tokens_details",
         "server_tool_use",
         "service_tier",
     ] {
@@ -160,10 +161,6 @@ fn anthropic_messages_to_chat_completions_transforms_response_body() {
         );
         assert!(transformed["usage"][field].is_null(), "usage {field} should be null");
     }
-    assert!(
-        transformed["usage"].get("output_tokens_details").is_none(),
-        "usage should omit output_tokens_details"
-    );
 }
 
 #[test]
