@@ -1,0 +1,117 @@
+//! Bounded, fail-closed projected-file token read.
+
+use std::fs::File;
+use std::io::Read as _;
+use std::path::Path;
+
+use praxis_filter::FilterError;
+use zeroize::Zeroizing;
+
+use super::{DiagnosticContext, MAX_SOURCE_LEN, MAX_TOKEN_BYTES};
+
+/// One more than the token cap, so a `.take()` read can detect overflow.
+const MAX_TOKEN_READ_BYTES: u64 = MAX_TOKEN_BYTES as u64 + 1;
+
+/// Format the trailing `for '{reference}'` clause only when a reference exists.
+fn for_reference(ctx: &DiagnosticContext) -> String {
+    match &ctx.reference {
+        Some(reference) => format!(" for '{reference}'"),
+        None => String::new(),
+    }
+}
+
+/// Reject an empty (trimmed) or oversized token.
+pub(crate) fn validate_token(token: &str) -> Result<(), FilterError> {
+    if token.trim().is_empty() || token.len() > MAX_TOKEN_BYTES {
+        return Err(format!("credential token must contain 1-{MAX_TOKEN_BYTES} bytes").into());
+    }
+    Ok(())
+}
+
+/// Reject an empty or oversized env-var name / file path.
+pub(crate) fn validate_source_len(kind: &str, value: &str) -> Result<(), FilterError> {
+    if value.trim().is_empty() || value.len() > MAX_SOURCE_LEN {
+        return Err(format!("{kind} must contain 1-{MAX_SOURCE_LEN} bytes").into());
+    }
+    Ok(())
+}
+
+/// Read a projected credential file with a hard byte cap; trim and validate.
+/// Secret bytes never appear in any error.
+pub(crate) fn read_projected_token(
+    path: &str,
+    ctx: &DiagnosticContext,
+) -> Result<Zeroizing<String>, FilterError> {
+    let owner = ctx.owner;
+    let file = File::open(Path::new(path)).map_err(|error| {
+        format!("{owner}: cannot read file '{path}'{}: {error}", for_reference(ctx))
+    })?;
+    let mut content = Zeroizing::new(String::new());
+    file.take(MAX_TOKEN_READ_BYTES)
+        .read_to_string(&mut content)
+        .map_err(|error| {
+            format!("{owner}: cannot read projected credential '{path}'{}: {error}", for_reference(ctx))
+        })?;
+    if content.len() > MAX_TOKEN_BYTES {
+        return Err(
+            format!("{owner}: projected credential '{path}' exceeds {MAX_TOKEN_BYTES} bytes").into(),
+        );
+    }
+    let token = Zeroizing::new(content.trim().to_owned());
+    validate_token(&token)?;
+    Ok(token)
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn ctx_with_ref() -> DiagnosticContext {
+        DiagnosticContext { owner: "credential_inject", reference: Some("name/namespace/key".to_owned()) }
+    }
+    fn ctx_no_ref() -> DiagnosticContext {
+        DiagnosticContext { owner: "anthropic_web_search", reference: None }
+    }
+
+    #[test]
+    fn reads_and_trims_token() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "  tok-value").unwrap();
+        let token = read_projected_token(f.path().to_str().unwrap(), &ctx_with_ref()).unwrap();
+        assert_eq!(token.as_str(), "tok-value");
+    }
+
+    #[test]
+    fn missing_file_error_names_reference_not_token() {
+        let err = read_projected_token("/no/such/projected/file", &ctx_with_ref()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("credential_inject"));
+        assert!(msg.contains("name/namespace/key"), "{msg}");
+        assert!(msg.contains("cannot read file"), "{msg}");
+    }
+
+    #[test]
+    fn missing_file_error_owner_only_when_no_reference() {
+        let err = read_projected_token("/no/such/projected/file", &ctx_no_ref()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("anthropic_web_search"), "{msg}");
+        assert!(!msg.contains(" for '"), "owner-only form must omit the reference clause: {msg}");
+    }
+
+    #[test]
+    fn empty_file_rejected() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        writeln!(f, "   ").unwrap();
+        assert!(read_projected_token(f.path().to_str().unwrap(), &ctx_with_ref()).is_err());
+    }
+
+    #[test]
+    fn oversized_file_rejected() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&[b'a'; MAX_TOKEN_BYTES + 1]).unwrap();
+        assert!(read_projected_token(f.path().to_str().unwrap(), &ctx_with_ref()).is_err());
+    }
+}

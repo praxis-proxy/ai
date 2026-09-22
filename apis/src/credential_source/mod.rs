@@ -8,9 +8,15 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use praxis_filter::FilterError;
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use zeroize::Zeroizing;
+
+mod file;
+mod watch;
+
+pub use watch::{WatchHandle, WatchRegistry};
 
 /// Maximum raw token size (bytes).
 pub const MAX_TOKEN_BYTES: usize = 16 * 1024;
@@ -106,6 +112,16 @@ pub struct SecretHandle {
 }
 
 impl SecretHandle {
+    /// Construct a handle whose cell starts at `snapshot`.
+    pub(crate) fn new(snapshot: SecretSnapshot) -> Self {
+        Self { inner: Arc::new(ArcSwap::from_pointee(snapshot)) }
+    }
+
+    /// Clone the shared cell so the watcher can atomically swap the snapshot.
+    pub(crate) fn cell(&self) -> Arc<ArcSwap<SecretSnapshot>> {
+        Arc::clone(&self.inner)
+    }
+
     /// Load the current snapshot. Returns a guard the caller borrows `&str` from
     /// via `snapshot.payload.as_deref()` — no per-request deep copy of the secret.
     #[must_use]
@@ -138,6 +154,73 @@ pub struct DiagnosticContext {
     /// Preformatted non-secret label, e.g. `"name/namespace/key"`; `None` for a
     /// single-credential filter (`web_search`).
     pub reference: Option<String>,
+}
+
+/// The shaping closure, shared between the initial read and the watcher thread.
+pub(crate) type TransformFn =
+    Arc<dyn Fn(&str) -> Result<Zeroizing<String>, FilterError> + Send + Sync>;
+
+/// Resolve a source to its raw token (pre-transform), enforcing bounds and
+/// reproducing `credential_inject`'s diagnostics via `ctx`.
+pub(crate) fn resolve_raw_token(
+    source: &CredentialSource,
+    ctx: &DiagnosticContext,
+) -> Result<Zeroizing<String>, FilterError> {
+    match source {
+        CredentialSource::Value(value) => {
+            file::validate_token(value)?;
+            Ok(value.clone())
+        },
+        CredentialSource::EnvVar(name) => {
+            file::validate_source_len("env_var", name)?;
+            let owner = ctx.owner;
+            let for_ref = match &ctx.reference {
+                Some(reference) => format!(" for '{reference}'"),
+                None => String::new(),
+            };
+            let token = std::env::var(name).map_err(|error| -> FilterError {
+                format!("{owner}: env var '{name}' not set{for_ref}: {error}").into()
+            })?;
+            file::validate_token(&token)?;
+            Ok(Zeroizing::new(token))
+        },
+        CredentialSource::File(path) => {
+            file::validate_source_len("file", path)?;
+            file::read_projected_token(path, ctx)
+        },
+    }
+}
+
+/// Bridge so `watch.rs` can reuse the file/env bounds check without exposing the
+/// `file` submodule publicly.
+pub(crate) fn file_validate_source_len_for_registry(path: &str) -> Result<(), FilterError> {
+    file::validate_source_len("file", path)
+}
+
+/// Build a handle for a single source. `value`/`env_var` publish a fixed
+/// snapshot; `file` registers a watcher (see [`WatchRegistry`]) and returns a
+/// `WatchHandle`. An invalid initial token — for any source kind — rejects
+/// construction (fail loud at startup).
+///
+/// # Errors
+///
+/// Returns [`FilterError`] when the source is invalid, unreadable, or produces an
+/// empty/oversized token, or when the `transform` rejects the initial token.
+pub fn build_one(
+    ctx: DiagnosticContext,
+    source: &CredentialSource,
+    transform: impl Fn(&str) -> Result<Zeroizing<String>, FilterError> + Send + Sync + 'static,
+) -> Result<(SecretHandle, Option<WatchHandle>), FilterError> {
+    if let CredentialSource::File(_) = source {
+        let mut registry = WatchRegistry::new();
+        let handle = registry.register(ctx, source, transform)?;
+        let watch = registry.finish()?;
+        Ok((handle, watch))
+    } else {
+        let raw = resolve_raw_token(source, &ctx)?;
+        let payload = transform(&raw)?;
+        Ok((SecretHandle::new(SecretSnapshot { payload: Some(payload) }), None))
+    }
 }
 
 #[cfg(test)]
@@ -216,5 +299,62 @@ mod tests {
         let rendered = format!("{ctx:?}");
         assert!(rendered.contains("credential_inject"));
         assert!(rendered.contains("name/namespace/key"));
+    }
+
+    fn identity_transform()
+    -> impl Fn(&str) -> Result<Zeroizing<String>, FilterError> + Send + Sync + 'static {
+        |token: &str| Ok(Zeroizing::new(token.to_owned()))
+    }
+
+    #[test]
+    fn build_one_value_publishes_transformed_payload() {
+        let ctx = DiagnosticContext { owner: "test", reference: None };
+        let src = CredentialSource::Value(Zeroizing::new("inline-tok".to_owned()));
+        let (handle, watch) = build_one(ctx, &src, identity_transform()).unwrap();
+        assert!(watch.is_none(), "value source must not spawn a watcher");
+        assert_eq!(handle.current().payload.as_deref().map(String::as_str), Some("inline-tok"));
+    }
+
+    #[test]
+    fn build_one_value_rejects_empty_token_at_construction() {
+        let ctx = DiagnosticContext { owner: "test", reference: None };
+        let src = CredentialSource::Value(Zeroizing::new("   ".to_owned()));
+        assert!(build_one(ctx, &src, identity_transform()).is_err());
+    }
+
+    #[test]
+    fn build_one_value_rejects_failing_transform_at_construction() {
+        let ctx = DiagnosticContext { owner: "web_search", reference: None };
+        let src = CredentialSource::Value(Zeroizing::new("bad".to_owned()));
+        let transform = |_t: &str| -> Result<Zeroizing<String>, FilterError> {
+            Err("web_search: invalid API key header value".to_owned().into())
+        };
+        let err = build_one(ctx, &src, transform).unwrap_err();
+        assert!(err.to_string().contains("invalid API key header value"));
+    }
+
+    #[test]
+    fn build_one_env_var_reads_and_transforms() {
+        // Use a var that already exists in every test environment.
+        let ctx = DiagnosticContext { owner: "test", reference: None };
+        let src = CredentialSource::EnvVar("CARGO_PKG_NAME".to_owned());
+        let (handle, watch) = build_one(ctx, &src, identity_transform()).unwrap();
+        assert!(watch.is_none());
+        assert_eq!(handle.current().payload.as_deref().map(String::as_str), Some("praxis-ai-apis"));
+    }
+
+    #[test]
+    fn build_one_env_var_not_set_error_names_reference() {
+        let ctx = DiagnosticContext {
+            owner: "credential_inject",
+            reference: Some("name/namespace/key".to_owned()),
+        };
+        let src = CredentialSource::EnvVar("DEFINITELY_NOT_SET_CREDSOURCE_12345".to_owned());
+        let err = build_one(ctx, &src, identity_transform()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("credential_inject"), "{msg}");
+        assert!(msg.contains("name/namespace/key"), "{msg}");
+        assert!(msg.contains("not set"), "{msg}");
+        assert!(msg.contains(": "), "must retain the trailing VarError detail: {msg}");
     }
 }
