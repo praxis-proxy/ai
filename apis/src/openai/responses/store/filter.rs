@@ -61,8 +61,8 @@ use tracing::{debug, trace, warn};
 use super::config::revalidate_postgres_host;
 use super::{
     super::{
-        DEFAULT_STORE_NAME, append_stored_input_items, compact::is_explicit_compact_request,
-        error::responses_error_rejection, state::ResponsesState,
+        DEFAULT_STORE_NAME, append_stored_input_items, error::responses_error_rejection, is_explicit_compact_request,
+        state::ResponsesState,
     },
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, StorageBackend, validate_config},

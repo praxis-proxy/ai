@@ -496,7 +496,7 @@ fn compaction_to_assistant_message(m: &serde_json::Value) -> serde_json::Value {
     let prefix = m
         .get("summary_prefix")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or(super::compact::DEFAULT_SUMMARY_PREFIX);
+        .unwrap_or(crate::openai::translation::chat_completions::DEFAULT_SUMMARY_PREFIX);
     serde_json::json!({
         "role": "assistant",
         "content": format!("{prefix}{summary}")

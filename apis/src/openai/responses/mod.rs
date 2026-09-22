@@ -29,6 +29,7 @@ pub(crate) mod agentic_loop;
 mod body_limits;
 pub(crate) mod compact;
 mod config;
+pub(crate) mod content_parts;
 pub(crate) mod doc_extract;
 pub(crate) mod error;
 pub(crate) mod file_resolve;
@@ -688,6 +689,14 @@ pub(crate) fn append_stored_input_items(messages: &mut Vec<serde_json::Value>, i
         serde_json::Value::Array(items) => messages.extend(items),
         other => messages.push(other),
     }
+}
+
+/// Check whether this is an explicit `POST /v1/responses/compact` request.
+///
+/// Shared by the store filter (best-effort store init) and the compaction
+/// filter, so neither optional filter depends on the other.
+pub(crate) fn is_explicit_compact_request(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.request.method == http::Method::POST && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
 }
 
 /// Build a Responses API user message item from string input.
