@@ -752,6 +752,10 @@ impl McpSubrequestClient {
     /// SSE adapter and ownership transfers to the returned stream. For every other
     /// classification (405, 404, any non-SSE success), the body is cancelled
     /// before the error is returned.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "response classification mirrors the rmcp reference client"
+    )]
     async fn classify_get_stream_response(
         &self,
         response: SubResponse,
@@ -764,6 +768,25 @@ impl McpSubrequestClient {
             .headers
             .get(http::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok());
+
+        if status == StatusCode::UNAUTHORIZED
+            && let Some(header) = www_authenticate(&response.headers)
+        {
+            if let Some(mut body) = body {
+                body.cancel().await;
+            }
+            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(header)));
+        }
+        if status == StatusCode::FORBIDDEN
+            && let Some(header) = www_authenticate(&response.headers)
+        {
+            if let Some(mut body) = body {
+                body.cancel().await;
+            }
+            return Err(StreamableHttpError::InsufficientScope(InsufficientScopeError::new(
+                header, None,
+            )));
+        }
 
         let is_sse = status.is_success() && content_type.is_some_and(is_event_stream_content_type);
         if !is_sse {
@@ -2093,14 +2116,19 @@ mod tests {
             matches!(signal.get(), Some(TransportSignal::ResponseTooLarge { limit: 6 })),
             "an over-cap buffer records a 413 signal at the local cap"
         );
-        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst), "cap breach cancels the body");
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "cap breach cancels the body"
+        );
     }
 
     #[tokio::test]
     async fn collect_body_returns_bytes_on_clean_eof() {
         let (mut body, cancelled) = fake_body([Bytes::from_static(b"hello "), Bytes::from_static(b"world")]);
         let signal = Arc::new(OnceLock::new());
-        let bytes = collect_body(&mut body, 1024, &signal).await.expect("clean body collects");
+        let bytes = collect_body(&mut body, 1024, &signal)
+            .await
+            .expect("clean body collects");
         assert_eq!(bytes.as_ref(), b"hello world");
         assert!(signal.get().is_none(), "a clean body records no size signal");
         assert!(
@@ -2224,7 +2252,10 @@ mod tests {
             .classify_streaming_post_response(response, body, false, 1024, 16 * 1024 * 1024)
             .await
             .expect("a JSON-RPC error is a valid reply, surfaced as Json");
-        assert!(matches!(out, StreamableHttpPostResponse::Json(JsonRpcMessage::Error(_), _)));
+        assert!(matches!(
+            out,
+            StreamableHttpPostResponse::Json(JsonRpcMessage::Error(_), _)
+        ));
     }
 
     #[tokio::test]
@@ -2323,5 +2354,95 @@ mod tests {
             .unwrap();
         assert_eq!(headers.get(HEADER_LAST_EVENT_ID).unwrap(), "99");
         assert_eq!(headers.get(http::header::ACCEPT).unwrap(), "text/event-stream");
+    }
+
+    // -- GET stream auth handling (F3) --
+
+    #[tokio::test]
+    async fn get_stream_401_with_www_authenticate_is_auth_required() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body: Box<dyn StreamingResponseBody> = Box::new(
+            crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks([], Arc::clone(&cancelled)),
+        );
+        let mut response = sub_response(401, None, b"");
+        response.headers.insert(
+            http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"mcp\""),
+        );
+        let result = client()
+            .classify_get_stream_response(response, Some(body), 16 * 1024 * 1024)
+            .await;
+        assert!(
+            matches!(result, Err(StreamableHttpError::AuthRequired(_))),
+            "401 + WWW-Authenticate must surface as AuthRequired"
+        );
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "the body must be cancelled on auth failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_stream_403_with_www_authenticate_is_insufficient_scope() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body: Box<dyn StreamingResponseBody> = Box::new(
+            crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks([], Arc::clone(&cancelled)),
+        );
+        let mut response = sub_response(403, None, b"");
+        response.headers.insert(
+            http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer scope=\"admin\""),
+        );
+        let result = client()
+            .classify_get_stream_response(response, Some(body), 16 * 1024 * 1024)
+            .await;
+        assert!(
+            matches!(result, Err(StreamableHttpError::InsufficientScope(_))),
+            "403 + WWW-Authenticate must surface as InsufficientScope"
+        );
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "the body must be cancelled on auth failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_stream_401_without_www_authenticate_is_server_does_not_support_sse() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body: Box<dyn StreamingResponseBody> = Box::new(
+            crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks([], Arc::clone(&cancelled)),
+        );
+        let response = sub_response(401, None, b"");
+        let result = client()
+            .classify_get_stream_response(response, Some(body), 16 * 1024 * 1024)
+            .await;
+        assert!(
+            matches!(result, Err(StreamableHttpError::ServerDoesNotSupportSse)),
+            "401 without WWW-Authenticate falls through to ServerDoesNotSupportSse"
+        );
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "the body is still cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_stream_405_remains_server_does_not_support_sse() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body: Box<dyn StreamingResponseBody> = Box::new(
+            crate::mcp_client::sse_adapter::FakeStreamingBody::from_chunks([], Arc::clone(&cancelled)),
+        );
+        let response = sub_response(405, None, b"");
+        let result = client()
+            .classify_get_stream_response(response, Some(body), 16 * 1024 * 1024)
+            .await;
+        assert!(
+            matches!(result, Err(StreamableHttpError::ServerDoesNotSupportSse)),
+            "405 continues to map to ServerDoesNotSupportSse (regression guard)"
+        );
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "the body is cancelled"
+        );
     }
 }
