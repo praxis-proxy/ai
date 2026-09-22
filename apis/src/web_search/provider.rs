@@ -172,6 +172,69 @@ impl std::fmt::Debug for SearchClient {
     }
 }
 
+/// The default API base URL for a search provider, used when the filter config
+/// supplies no `base_url` override.
+fn default_base_url(provider: SearchProvider) -> &'static str {
+    match provider {
+        SearchProvider::Brave => "https://api.search.brave.com",
+        SearchProvider::Tavily => "https://api.tavily.com",
+        SearchProvider::You => "https://api.you.com",
+    }
+}
+
+/// The request header a header-authenticated provider carries its API key in, or
+/// `None` for a body-authenticated provider (Tavily, whose key travels in the
+/// request body and is protected instead by the executor re-pinning the staged
+/// upstream against mid-chain retargeting).
+fn provider_auth_header(provider: SearchProvider) -> Option<http::HeaderName> {
+    match provider {
+        SearchProvider::Brave => Some(http::HeaderName::from_static("x-subscription-token")),
+        SearchProvider::You => Some(http::HeaderName::from_static("x-api-key")),
+        SearchProvider::Tavily => None,
+    }
+}
+
+/// Compute the exact `host:port` authority a deferred provider credential must
+/// bind to, derived from the callout URL the executor resolves its destination
+/// from.
+///
+/// The executor resolves the callout destination from this same URL (via
+/// [`prepare_url_target`]), so binding the credential to the authority derived
+/// here matches the resolved destination by construction while being dropped,
+/// zeroized, on any host *or* port divergence — an exact authority, never a host
+/// wildcard. The port is the URL's explicit port, else the scheme default (443
+/// for `https` or a scheme-less URL, 80 for `http`) — the same effective port the
+/// executor pins. `IPv6` literals are re-bracketed because `Uri::host` strips the
+/// brackets but [`DeferredCredential::new`] requires bracketed `IPv6` to separate
+/// host from port.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if `url` is not a valid URI or carries no host.
+fn credential_authority(url: &str) -> Result<String, FilterError> {
+    let uri = http::Uri::try_from(url).map_err(|e| {
+        FilterError::from(format!(
+            "search callout URL is not a valid URI for credential binding: {e}"
+        ))
+    })?;
+    let host = uri
+        .host()
+        .ok_or_else(|| FilterError::from("search callout URL has no host for credential binding".to_owned()))?;
+    let port = uri.port_u16().unwrap_or_else(|| match uri.scheme_str() {
+        Some("http") => 80,
+        _ => 443,
+    });
+    // `http::Uri::host()` already returns an IPv6 literal bracketed (`[::1]`), so
+    // only bracket an unbracketed literal; re-bracketing a bracketed host would
+    // produce `[[::1]]` and no longer parse as `host:port`.
+    let authority = if host.starts_with('[') || !host.contains(':') {
+        format!("{host}:{port}")
+    } else {
+        format!("[{host}]:{port}")
+    };
+    Ok(authority)
+}
+
 impl SearchClient {
     /// Build a search client from validated filter config.
     ///
@@ -186,6 +249,19 @@ impl SearchClient {
     ) -> Result<Self, FilterError> {
         http::HeaderValue::from_str(config.api_key.expose_secret())
             .map_err(|e| FilterError::from(format!("{filter_name}: invalid API key header value: {e}")))?;
+        // Validate up front that a header-authenticated provider's effective base
+        // URL yields a bindable `host:port` authority: a malformed authority would
+        // otherwise only surface at callout time, silently dropping the deferred
+        // credential and dialing the provider unauthenticated. Body-authenticated
+        // providers (Tavily) stage no header credential, so they bind no authority.
+        if provider_auth_header(config.provider).is_some() {
+            let base = config
+                .base_url
+                .as_deref()
+                .unwrap_or_else(|| default_base_url(config.provider));
+            credential_authority(base)
+                .map_err(|e| FilterError::from(format!("{filter_name}: invalid search base URL: {e}")))?;
+        }
         Ok(Self {
             client: subrequest_client,
             timeout: Duration::from_millis(config.timeout_ms),
@@ -367,26 +443,23 @@ impl SearchClient {
     /// the request body and is protected instead by the executor re-pinning the
     /// staged upstream against mid-chain retargeting).
     fn auth_header(&self) -> Option<http::HeaderName> {
-        match self.provider {
-            SearchProvider::Brave => Some(http::HeaderName::from_static("x-subscription-token")),
-            SearchProvider::You => Some(http::HeaderName::from_static("x-api-key")),
-            SearchProvider::Tavily => None,
-        }
+        provider_auth_header(self.provider)
     }
 
-    /// Stage a header-authenticated provider's API key as an authority-bound
+    /// Stage a header-authenticated provider's API key as an exact-authority-bound
     /// [`DeferredCredential`].
     ///
     /// Deferring the secret keeps it out of the outbound chain entirely: the
     /// executor injects it only after it resolves the destination and only into a
-    /// request bound for the URL's host, so a chain filter can neither observe the
-    /// secret (it is never present on the in-chain request) nor exfiltrate it by
-    /// retargeting `ctx.upstream` to another authority (the credential is bound to
-    /// the provider host and is dropped, zeroized, on any authority mismatch). The
-    /// credential is bound host-wildcard so it matches the executor's resolved
-    /// destination whether the URL used the provider default port or a `base_url`
-    /// override with an explicit port. The secret is the caller's per-user credential
-    /// when present, else the shared provider key.
+    /// request bound for the credential's authority, so a chain filter can neither
+    /// observe the secret (it is never present on the in-chain request) nor
+    /// exfiltrate it by retargeting `ctx.upstream` to another authority (the
+    /// credential is dropped, zeroized, on any authority mismatch). The credential
+    /// binds to the exact `host:port` authority [`credential_authority`] derives
+    /// from this same callout URL — the destination the executor resolves — so it
+    /// matches by construction while a divergence in *either* host or port drops it
+    /// (never a host wildcard). The secret is the caller's per-user credential when
+    /// present, else the shared provider key.
     ///
     /// Returns `Ok(None)` for a body-authenticated provider (Tavily) and
     /// `Err(_)` if the URL has no host or the key is not a valid header value.
@@ -398,10 +471,11 @@ impl SearchClient {
         let Some(header) = self.auth_header() else {
             return Ok(None);
         };
-        let host = http::Uri::try_from(url)
-            .ok()
-            .and_then(|uri| uri.host().map(str::to_owned))
-            .ok_or_else(|| FilterError::from("search callout URL has no host for credential binding".to_owned()))?;
+        // Bind to the exact `host:port` authority the executor resolves from this
+        // same callout URL, so an exact-authority credential matches the resolved
+        // destination by construction yet is dropped, zeroized, on any host or port
+        // divergence (a retargeted or port-shifted callout cannot carry the secret).
+        let authority = credential_authority(url)?;
         // Prefer the caller's per-user secret from the configured slot; fall back to
         // the shared provider key. Both are deferred (never placed on the in-chain
         // request) and injected by the executor only at the resolved, pinned host.
@@ -409,7 +483,7 @@ impl SearchClient {
             .user_credential
             .as_ref()
             .map_or_else(|| self.api_key.expose_secret(), |user| user.expose_secret());
-        let credential = DeferredCredential::new_host_wildcard(&host, header, secret)?;
+        let credential = DeferredCredential::new(&authority, header, secret)?;
         let mut pending = PendingCredentials::new();
         pending.push(credential);
         Ok(Some(pending))
@@ -502,10 +576,18 @@ impl SearchClient {
         }
     }
 
+    /// The effective API base URL: the configured `base_url` override, else the
+    /// provider default.
+    fn effective_base_url(&self) -> &str {
+        self.base_url
+            .as_deref()
+            .unwrap_or_else(|| default_base_url(self.provider))
+    }
+
     /// Build a Brave Search API request.
     fn build_brave_request(&self, query: &str, count: u32) -> (String, SubRequest) {
         let encoded_query = percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC);
-        let base = self.base_url.as_deref().unwrap_or("https://api.search.brave.com");
+        let base = self.effective_base_url();
         let url = format!("{base}/res/v1/web/search?q={encoded_query}&count={count}");
 
         // The API key is NOT set here: it is staged as an authority-bound
@@ -549,7 +631,7 @@ impl SearchClient {
         );
         headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
 
-        let base = self.base_url.as_deref().unwrap_or("https://api.tavily.com");
+        let base = self.effective_base_url();
         let url = format!("{base}/search");
         (
             url,
@@ -581,7 +663,7 @@ impl SearchClient {
         );
         headers.insert(http::header::ACCEPT, http::HeaderValue::from_static("application/json"));
 
-        let base = self.base_url.as_deref().unwrap_or("https://api.you.com");
+        let base = self.effective_base_url();
         let url = format!("{base}/v1/search");
         (
             url,
@@ -719,7 +801,16 @@ mod tests {
     use super::*;
 
     fn test_subrequest_client() -> SubRequestClient {
-        SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None))
+        // Build the TLS connector (and its one-time macOS platform-cert load) once
+        // for the whole module and hand out cheap clones. Constructing a fresh
+        // connector per test loads platform certs per call, and under the full
+        // suite's parallelism concurrent macOS keychain reads intermittently fail
+        // `build_connector().unwrap()`. A shared client keyed per-destination is
+        // the same pattern `crate::test_utils::TEST_SUBREQUEST_CLIENT` uses.
+        static CLIENT: std::sync::LazyLock<SubRequestClient> = std::sync::LazyLock::new(|| {
+            SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None))
+        });
+        CLIENT.clone()
     }
 
     #[test]
@@ -1582,6 +1673,91 @@ mod tests {
                 .expect("staging succeeds")
                 .is_some_and(|pending| !pending.is_empty()),
             "the shared provider key must still stage a deferred credential"
+        );
+    }
+
+    #[test]
+    fn credential_authority_uses_the_scheme_default_port() {
+        // A URL with no explicit port binds to the scheme's effective port — the
+        // same port the executor pins — so a default-port callout still matches.
+        assert_eq!(
+            credential_authority("https://api.search.brave.com/res/v1/web/search?q=x").unwrap(),
+            "api.search.brave.com:443"
+        );
+        assert_eq!(
+            credential_authority("http://provider.internal/search").unwrap(),
+            "provider.internal:80"
+        );
+    }
+
+    #[test]
+    fn credential_authority_preserves_an_explicit_port() {
+        // An explicit port (e.g. a `base_url` override) is bound verbatim, and an
+        // IPv6 literal is re-bracketed so host and port stay separable.
+        assert_eq!(
+            credential_authority("https://host.example:8443/search").unwrap(),
+            "host.example:8443"
+        );
+        assert_eq!(credential_authority("http://[::1]:9000/search").unwrap(), "[::1]:9000");
+    }
+
+    /// Dispatch a GET callout to `url` through the real executor with a
+    /// caller-supplied credential set staged, bypassing [`SearchClient::staged_credentials`]
+    /// so a test can bind a deliberately mismatched authority. Mirrors the staging
+    /// [`SearchClient::execute_search`] performs.
+    async fn dispatch_with_staged_credential(url: &str, pending: PendingCredentials) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let target = prepare_url_target(url, deadline, |_addrs| Ok(())).await.unwrap();
+        let mut extensions = RequestExtensions::default();
+        extensions.insert(StagedUpstream::from_prepared_target(&target).unwrap());
+        extensions.insert(StagedUpstreamFallback::from_prepared_target(&target));
+        extensions.insert(pending);
+        let callout = CalloutContext::for_test();
+        let executor = FilteredSubrequestExecutor::for_callout(
+            test_subrequest_client(),
+            callout.runtime,
+            callout.depth,
+            MAX_SEARCH_RESPONSE_BYTES,
+            Duration::from_secs(5),
+        );
+        let prepared = target.bind(test_get_request());
+        let _outcome =
+            SearchClient::dispatch_callout(executor, &test_outbound(), prepared.request(), extensions, deadline).await;
+    }
+
+    #[tokio::test]
+    async fn exact_authority_drops_a_port_mismatched_credential() {
+        // Regression guard for exact-authority binding: a credential bound to the
+        // provider host on a DIFFERENT port must be dropped by the executor. The
+        // former host-wildcard binding would have injected it regardless of port.
+        // The matching-port positive is proven by
+        // `per_user_credential_is_injected_instead_of_the_shared_key`.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rx = spawn_recording_server(listener, 200, r#"{"web":{"results":[]}}"#);
+        let url = format!("http://{addr}/res/v1/web/search?q=test&count=5");
+        let wrong_authority = format!("127.0.0.1:{}", addr.port() ^ 1);
+        let mut pending = PendingCredentials::new();
+        pending.push(
+            DeferredCredential::new(
+                &wrong_authority,
+                http::HeaderName::from_static("x-subscription-token"),
+                "leaked-secret",
+            )
+            .unwrap(),
+        );
+        dispatch_with_staged_credential(&url, pending).await;
+        let received = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("provider received the callout");
+        let received = String::from_utf8_lossy(&received).to_ascii_lowercase();
+        assert!(
+            !received.contains("leaked-secret"),
+            "a credential bound to a mismatched port must be dropped, not injected: {received}"
+        );
+        assert!(
+            !received.contains("x-subscription-token"),
+            "no credential header should reach the provider on a port mismatch: {received}"
         );
     }
 }
