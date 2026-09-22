@@ -118,6 +118,21 @@ mod tests {
     }
 
     #[test]
+    fn invalid_utf8_file_rejected_without_leaking_bytes() {
+        // A projected file whose bytes are not valid UTF-8 must fail closed, and
+        // the underlying `read_to_string` error (`ErrorKind::InvalidData`) must
+        // never surface the raw non-UTF-8 bytes in the diagnostic (spec §7).
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&[0xFF, 0xFE]).unwrap();
+        let err = read_projected_token(f.path().to_str().unwrap(), &ctx_with_ref()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("credential_inject"), "{msg}");
+        assert!(msg.contains("cannot read projected credential"), "{msg}");
+        assert!(!msg.as_bytes().contains(&0xFF), "{msg}");
+        assert!(!msg.as_bytes().contains(&0xFE), "{msg}");
+    }
+
+    #[test]
     fn validate_token_bounds_error_is_owner_qualified() {
         let empty = validate_token("", "credential_inject").unwrap_err();
         assert_eq!(

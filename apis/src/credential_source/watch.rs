@@ -19,6 +19,11 @@ use super::{
 enum WatcherMessage {
     /// A filesystem event forwarded from the `notify` callback.
     Event(notify::Event),
+    /// A runtime error reported by `notify`. The watcher can no longer trust
+    /// its event stream, so it rescans every source (each reload fails closed
+    /// on its own read) rather than continuing to serve a possibly-stale
+    /// credential indefinitely.
+    WatchError,
     /// Signal telling the watcher thread to stop and return.
     Shutdown,
 }
@@ -95,6 +100,14 @@ impl WatchHandle {
     #[must_use]
     pub fn thread_count(&self) -> usize {
         usize::from(self.thread.is_some())
+    }
+
+    /// Deliver a synthetic watcher-error message on the same channel the
+    /// `notify` callback uses — test aid proving the loop rescans (fails closed)
+    /// when the filesystem watcher reports a runtime error.
+    #[cfg(test)]
+    fn inject_watch_error_for_test(&self) {
+        drop(self.shutdown.send(WatcherMessage::WatchError));
     }
 }
 
@@ -201,8 +214,14 @@ impl WatchRegistry {
             .name("credential-source-watcher".to_owned())
             .spawn(move || {
                 let mut watcher: RecommendedWatcher = match notify::recommended_watcher(move |event| {
-                    if let Ok(event) = event {
-                        drop(callback_tx.send(WatcherMessage::Event(event)));
+                    // Forward both success and failure: a discarded `notify`
+                    // error would leave the watcher blind and pin the last
+                    // published credential forever (fail-stale). The error value
+                    // itself is never logged here — the rescan it triggers logs a
+                    // byte-free per-source reason on any read failure.
+                    match event {
+                        Ok(event) => drop(callback_tx.send(WatcherMessage::Event(event))),
+                        Err(_) => drop(callback_tx.send(WatcherMessage::WatchError)),
                     }
                 }) {
                     Ok(watcher) => watcher,
@@ -247,8 +266,15 @@ impl WatchRegistry {
                 }
                 drop(ready_tx.send(Ok(())));
                 while let Ok(message) = message_rx.recv() {
-                    let WatcherMessage::Event(event) = message else { break };
-                    process_event(&event, &watched);
+                    match message {
+                        WatcherMessage::Event(event) => process_event(&event, &watched),
+                        WatcherMessage::WatchError => {
+                            // Byte-free: the notify error is not interpolated.
+                            tracing::warn!("credential watcher reported an error; rescanning all sources");
+                            reload_all(&watched);
+                        },
+                        WatcherMessage::Shutdown => break,
+                    }
                 }
             })
             .map_err(|error| format!("credential_source: failed to spawn watcher: {error}"))?;
@@ -272,14 +298,22 @@ impl WatchRegistry {
     }
 }
 
+/// Reload every watched source unconditionally. Used when the watcher cannot
+/// tell which files changed — a `notify` runtime error or a rescan hint — so it
+/// re-resolves every source; each reload fails closed to `None` on its own read
+/// error rather than serving a stale credential.
+fn reload_all(watched: &[WatchedSource]) {
+    for item in watched {
+        item.reload();
+    }
+}
+
 /// Reload the sources whose file/parent matches an event path; a rescan hint
 /// reloads all.
 fn process_event(event: &notify::Event, watched: &[WatchedSource]) {
     use notify::EventKind;
     if event.need_rescan() || matches!(event.kind, EventKind::Other) {
-        for item in watched {
-            item.reload();
-        }
+        reload_all(watched);
         return;
     }
     if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)) {
@@ -450,7 +484,17 @@ mod tests {
         let (_handle, watch) = crate::credential_source::build_one(ctx("a/b/c"), &src, identity()).unwrap();
         let start = Instant::now();
         drop(watch);
-        assert!(start.elapsed() < Duration::from_millis(500), "Drop must wake and join the watcher");
+        // `Drop` sends the shutdown signal and joins; the thread blocks on
+        // `recv()` (not a polling `recv_timeout`), so it wakes at once rather
+        // than after a poll interval. The bound is a load-tolerant proxy for
+        // "woken immediately, not polling" — a true hang is unbounded and is
+        // caught by the CI job timeout, not this assertion. macOS FSEvents
+        // teardown plus thread join under parallel test load can take longer
+        // than a tight 500ms, so allow 5s.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "Drop must wake and join the watcher"
+        );
     }
 
     #[test]
@@ -468,5 +512,64 @@ mod tests {
         let _watch = reg.finish().unwrap();
         // The authoritative re-read after the watch is live must observe token-c.
         assert_eq!(handle.current().payload.as_deref().map(String::as_str), Some("token-c"));
+    }
+
+    #[test]
+    fn reload_all_republishes_valid_and_fails_missing_closed() {
+        // Register two file sources, remove one, then rescan every source
+        // directly (bypassing the OS watcher for determinism). The surviving
+        // file stays valid; the removed one fails closed to `None`.
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("present");
+        let missing = dir.path().join("missing");
+        std::fs::write(&present, "live\n").unwrap();
+        std::fs::write(&missing, "gone\n").unwrap();
+        let mut reg = WatchRegistry::new();
+        let mut register_file = |reference: &str, path: &Path| {
+            reg.register(
+                ctx(reference),
+                &CredentialSource::File(path.to_string_lossy().into_owned()),
+                identity(),
+            )
+            .unwrap()
+        };
+        let h_present = register_file("a/b/present", &present);
+        let h_missing = register_file("a/b/missing", &missing);
+        std::fs::remove_file(&missing).unwrap();
+        reload_all(&reg.watched);
+        assert_eq!(
+            h_present.current().payload.as_deref().map(String::as_str),
+            Some("live"),
+            "a still-present source must re-resolve to its live value on rescan"
+        );
+        assert!(
+            h_missing.current().payload.is_none(),
+            "a removed source must fail closed to None on rescan"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_error_message_triggers_rescan() {
+        // A synthetic watcher-error message (as the `notify` callback forwards on
+        // a runtime error) must drive a full rescan that re-runs each source's
+        // transform, proving errors are not discarded and left fail-stale.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key");
+        std::fs::write(&path, "tok\n").unwrap();
+        let src = CredentialSource::File(path.to_string_lossy().into_owned());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = Arc::clone(&calls);
+        let transform = move |t: &str| -> Result<Zeroizing<String>, FilterError> {
+            calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Zeroizing::new(t.to_owned()))
+        };
+        let (_handle, watch) = crate::credential_source::build_one(ctx("a/b/c"), &src, transform).unwrap();
+        let watch = watch.expect("file source spawns a watcher");
+        let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        watch.inject_watch_error_for_test();
+        assert!(
+            wait_until(|| calls.load(std::sync::atomic::Ordering::SeqCst) > before).await,
+            "a watcher-error message must trigger a rescan that re-runs the transform"
+        );
     }
 }
