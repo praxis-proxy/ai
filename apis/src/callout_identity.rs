@@ -6,7 +6,7 @@
 //! staged into the nested filtered-subrequest so the callout carries the caller's identity and a
 //! per-user credential instead of a single shared provider key.
 
-use praxis_filter::HttpFilterContext;
+use praxis_filter::{HttpFilterContext, RequestExtensions};
 use secrecy::{ExposeSecret as _, SecretString};
 
 use crate::{CalloutCredentials, state_owner::StateOwner};
@@ -18,6 +18,18 @@ pub(crate) struct CalloutIdentity {
     pub(crate) owner: Option<StateOwner>,
     /// The per-user secret to inject, when a credential slot is configured and populated.
     pub(crate) user_credential: Option<SecretString>,
+}
+
+impl CalloutIdentity {
+    /// Project trusted attribution into an isolated child request.
+    ///
+    /// The credential deliberately is not inserted directly: each callout binds
+    /// it to its own validated destination as a [`praxis_filter::DeferredCredential`].
+    pub(crate) fn project_owner_into(&self, child: &mut RequestExtensions) {
+        if let Some(owner) = self.owner.as_ref() {
+            child.insert(owner.clone());
+        }
+    }
 }
 
 /// A required callout-identity component was missing (a security-context failure).

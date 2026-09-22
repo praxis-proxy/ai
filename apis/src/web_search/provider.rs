@@ -428,13 +428,7 @@ impl SearchClient {
         if let Some(pending) = pending {
             extensions.insert(pending);
         }
-        // Project the caller's trusted owner into the isolated child subrequest so
-        // the outbound chain (e.g. `state_owner_headers`) can attribute the callout
-        // to the real caller. Mirrors `crate::state_owner::project_state_owner`; the
-        // bounded three-string clone is the sanctioned ownership boundary.
-        if let Some(owner) = identity.owner.as_ref() {
-            extensions.insert(owner.clone());
-        }
+        identity.project_owner_into(&mut extensions);
         Some(extensions)
     }
 

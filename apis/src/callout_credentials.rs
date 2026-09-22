@@ -77,6 +77,12 @@ struct CredentialSlot {
 /// exposes a `source_header` a client can reach without that delete-then-set step
 /// lets any caller inject an arbitrary per-user secret. Only route requests through
 /// this filter behind a boundary that owns every configured source header.
+///
+/// Place this filter once in the outer request chain, before body pre-read callouts
+/// and any `iterative_request_router`. It establishes one
+/// [`CalloutCredentials`] map that the router carries across iterations; callout
+/// consumers inside or outside the router select their own slot. Do not repeat the
+/// establishing filter inside router steps.
 #[derive(Debug)]
 pub struct CalloutCredentialsFilter {
     /// Validated credential slots.
@@ -104,22 +110,22 @@ impl CalloutCredentialsFilter {
         Ok(Box::new(Self { slots }))
     }
 
-    /// Read all present slots from the effective header view, or reject on a duplicate.
-    fn collect_present(
+    /// Build the request-scoped credential map from the effective header view.
+    fn collect_credentials(
         &self,
         ctx: &HttpFilterContext<'_>,
         body_phase: bool,
-    ) -> Result<Vec<(String, SecretString)>, FilterAction> {
+    ) -> Result<CalloutCredentials, FilterAction> {
         let view: Cow<'_, http::HeaderMap> = if body_phase {
             crate::callout_headers::effective_body_callout_headers(ctx, Cow::Borrowed(&ctx.request.headers))
         } else {
             Cow::Borrowed(&ctx.request.headers)
         };
-        let mut present = Vec::new();
+        let mut credentials = CalloutCredentials::new();
         for slot in &self.slots {
             match read_singular_slot(&view, &slot.header) {
                 SlotValue::Single(value) => {
-                    present.push((slot.id.clone(), SecretString::from(value)));
+                    credentials.insert(slot.id.clone(), SecretString::from(value));
                 },
                 SlotValue::Missing => {},
                 SlotValue::Duplicate => {
@@ -134,7 +140,7 @@ impl CalloutCredentialsFilter {
                 },
             }
         }
-        Ok(present)
+        Ok(credentials)
     }
 
     /// Strip every configured source header via the lifecycle-appropriate channel.
@@ -155,16 +161,12 @@ impl CalloutCredentialsFilter {
             self.queue_header_removal(ctx, body_phase);
             return FilterAction::Continue;
         }
-        let present = match self.collect_present(ctx, body_phase) {
-            Ok(present) => present,
+        let credentials = match self.collect_credentials(ctx, body_phase) {
+            Ok(credentials) => credentials,
             Err(action) => return action,
         };
-        if !present.is_empty() {
-            let mut creds = CalloutCredentials::new();
-            for (slot, value) in present {
-                creds.insert(slot, value);
-            }
-            ctx.extensions.insert(creds);
+        if !credentials.is_empty() {
+            ctx.extensions.insert(credentials);
         }
         self.queue_header_removal(ctx, body_phase);
         FilterAction::Continue
