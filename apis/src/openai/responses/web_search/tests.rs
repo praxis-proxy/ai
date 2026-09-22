@@ -197,10 +197,38 @@ fn parse_search_request_prefers_current_field_and_rejects_invalid_current_field(
     assert_eq!(legacy.queries, ["legacy"]);
     assert_eq!(legacy.action, serde_json::json!({"type": "search", "query": "legacy"}));
 
-    let invalid_current = serde_json::json!({"action": {"query": "legacy", "queries": []}});
+    // The OpenAI schema puts no `minItems` on `queries` and still permits the
+    // deprecated `query`, so an empty array carries no queries to prefer and
+    // must not discard a usable legacy query.
+    let empty_current = serde_json::json!({"action": {"query": "legacy", "queries": []}});
+    let empty_current = parse_search_request(&empty_current, "ws_empty", 0).unwrap();
+    assert_eq!(
+        empty_current.queries,
+        ["legacy"],
+        "an empty queries array falls back to the deprecated query"
+    );
+    assert_eq!(
+        empty_current.action,
+        serde_json::json!({"type": "search", "query": "legacy"}),
+        "the fallback reports the legacy action shape it actually dispatched"
+    );
+
+    let empty_without_legacy = serde_json::json!({"action": {"queries": []}});
+    assert!(
+        parse_search_request(&empty_without_legacy, "ws_empty_only", 0).is_none(),
+        "an empty queries array with no legacy query leaves nothing to dispatch"
+    );
+
+    let invalid_current = serde_json::json!({"action": {"query": "legacy", "queries": [42]}});
     assert!(
         parse_search_request(&invalid_current, "ws_invalid", 0).is_none(),
-        "a present but invalid queries field must not fall back to query"
+        "a non-string queries member must not fall back to query"
+    );
+
+    let non_array_current = serde_json::json!({"action": {"query": "legacy", "queries": "rust"}});
+    assert!(
+        parse_search_request(&non_array_current, "ws_non_array", 0).is_none(),
+        "a non-array queries field must not fall back to query"
     );
 }
 // -----------------------------------------------------------------------------
@@ -480,8 +508,12 @@ async fn on_request_body_executes_current_queries_without_duplicating_legacy_que
 }
 
 #[tokio::test]
-async fn on_request_body_does_not_fall_back_to_legacy_query_when_queries_is_empty() {
-    let yaml = make_filter_yaml("brave", "test-key");
+async fn on_request_body_falls_back_to_legacy_query_when_queries_is_empty() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_brave_mock(listener);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
     let filter = WebSearchFilter::from_config(&yaml).unwrap();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
@@ -489,7 +521,7 @@ async fn on_request_body_does_not_fall_back_to_legacy_query_when_queries_is_empt
     let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test"}));
     state.web_search_calls = vec![serde_json::json!({
         "type": "web_search_call",
-        "id": "ws_invalid_queries",
+        "id": "ws_empty_queries",
         "action": {"type": "search", "query": "legacy query", "queries": []}
     })];
     ctx.extensions.insert(state);
@@ -498,9 +530,16 @@ async fn on_request_body_does_not_fall_back_to_legacy_query_when_queries_is_empt
     assert!(matches!(action, FilterAction::Continue));
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.web_search_calls_executed, 0);
-    assert_eq!(state.accumulated_output[0]["status"], "incomplete");
-    assert_eq!(state.messages.last().unwrap()["output"], MISSING_QUERY_OUTPUT);
+    assert_eq!(
+        state.web_search_calls_executed, 1,
+        "an empty queries array still dispatches the deprecated query"
+    );
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+    assert_ne!(
+        state.messages.last().unwrap()["output"],
+        MISSING_QUERY_OUTPUT,
+        "a usable legacy query is never reported as a missing query"
+    );
 }
 
 #[tokio::test]
@@ -1054,10 +1093,9 @@ fn build_output_item_with_results() {
 fn build_tool_result_messages_empty() {
     let [call, output] = build_tool_result_messages(
         "ws_123",
-        "completed",
         &serde_json::json!({"type": "search", "query": "rust"}),
         &[],
-        "Web search not performed.",
+        None,
     );
     assert_eq!(
         call["type"], "function_call",
@@ -1081,10 +1119,9 @@ fn build_tool_result_messages_with_results() {
     }];
     let [call, output] = build_tool_result_messages(
         "ws_123",
-        "completed",
         &serde_json::json!({"type": "search", "query": "example query"}),
         &results,
-        "Web search not performed.",
+        None,
     );
     assert_eq!(call["type"], "function_call");
     assert_eq!(call["arguments"], r#"{"query":"example query"}"#);
@@ -1164,10 +1201,9 @@ fn bridge_call_id_is_unique_for_absent_source_ids() {
 fn build_tool_result_messages_failed_carry_bounded_notice() {
     let [call, output] = build_tool_result_messages(
         "ws_123",
-        "failed",
         &serde_json::json!({"type": "search", "query": "rust"}),
         &[],
-        SEARCH_UNAVAILABLE,
+        Some(SEARCH_UNAVAILABLE),
     );
     assert_eq!(
         call["type"], "function_call",
@@ -1251,10 +1287,9 @@ fn build_tool_result_messages_incomplete_reports_not_performed() {
     // misrepresented to the model as a completed search with no results.
     let [call, output] = build_tool_result_messages(
         "ws_123",
-        "incomplete",
         &serde_json::json!({"type": "search", "query": "rust"}),
         &[],
-        "Web search not performed.",
+        Some(NOT_PERFORMED_OUTPUT),
     );
     assert_eq!(call["type"], "function_call");
     assert_eq!(call["call_id"], "ws_123");
@@ -1918,6 +1953,85 @@ async fn all_queries_failing_reports_failed_call() {
     );
 }
 
+#[tokio::test]
+async fn zero_result_success_before_failure_is_not_reported_as_failed() {
+    // The first query succeeds with no rows and the second fails. Judging the
+    // call by its empty result set alone would report it `failed` with the
+    // unavailable notice, hiding the fact that a query did run and found
+    // nothing.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let empty_body = serde_json::json!({"web": {"results": []}}).to_string();
+    spawn_search_responses(listener, vec![(200, empty_body), (503, String::new())]);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let queries = ["finds nothing", "breaks"];
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![web_search_queries_call("ws_zero_then_fail", &queries)];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.accumulated_output[0]["status"], "incomplete",
+        "a query that ran and found nothing is a success, so the call is incomplete rather than failed"
+    );
+    let bridge = find_queries_bridge_output(&state.messages, &queries).expect("partial bridge present");
+    assert_eq!(
+        bridge["output"], PARTIAL_UNAVAILABLE_OUTPUT,
+        "the notice reports the partial dispatch, not a call that never reached the provider"
+    );
+}
+
+#[test]
+fn status_and_notice_separates_zero_result_successes_from_non_execution() {
+    // `successful` counts queries the provider answered, including those that
+    // answered with no rows, so each cause below is reported on its own terms.
+    let cases = [
+        (
+            (0, 2, 2),
+            ("failed", Some(SEARCH_UNAVAILABLE)),
+            "no query was ever answered",
+        ),
+        (
+            (1, 3, 3),
+            ("incomplete", Some(PARTIAL_UNAVAILABLE_OUTPUT)),
+            "short of both bounds, so a query was lost to a provider failure",
+        ),
+        (
+            (2, 5, 2),
+            ("incomplete", Some(PARTIAL_CLIPPED_OUTPUT)),
+            "stopped exactly at the cap with queries left, so the batch budget clipped it",
+        ),
+        (
+            (3, 3, 5),
+            ("completed", None),
+            "every query was answered well inside the cap",
+        ),
+        (
+            (2, 2, 2),
+            ("completed", None),
+            "a cap met exactly by the last query clipped nothing",
+        ),
+    ];
+
+    for ((successful, n_queries, query_cap), expected, reason) in cases {
+        assert_eq!(
+            status_and_notice(successful, n_queries, query_cap),
+            expected,
+            "{successful} of {n_queries} queries under a cap of {query_cap}: {reason}"
+        );
+    }
+}
+
 #[test]
 fn remaining_budget_leaves_calls_unbounded_without_max_tool_calls() {
     let state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
@@ -1936,9 +2050,14 @@ fn build_tool_result_messages_incomplete_with_results_keeps_them() {
         snippet: "Systems programming language".to_owned(),
     }];
     let action = serde_json::json!({"type": "search", "queries": ["a", "b"]});
-    let messages = build_tool_result_messages("ws_partial", "incomplete", &action, &results, SEARCH_UNAVAILABLE);
+    let messages = build_tool_result_messages("ws_partial", &action, &results, Some(PARTIAL_UNAVAILABLE_OUTPUT));
+    let output = messages[1]["output"].as_str().unwrap();
     assert!(
-        messages[1]["output"].as_str().unwrap().contains("Rust Lang"),
-        "partial results outrank the failure notice"
+        output.contains("Rust Lang"),
+        "a partial call keeps the rows it gathered before the provider failed"
+    );
+    assert!(
+        output.contains(PARTIAL_UNAVAILABLE_OUTPUT),
+        "the partial notice is appended so the model knows the rows are incomplete"
     );
 }

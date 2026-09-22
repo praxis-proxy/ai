@@ -80,6 +80,15 @@ const TOOL_LIMIT_OUTPUT: &str = "Web search was not executed because max_tool_ca
 /// Model-facing result for a call a budget left undispatched.
 const NOT_PERFORMED_OUTPUT: &str = "Web search not performed.";
 
+/// Model-facing result when the search service returned no results.
+const NO_RESULTS_OUTPUT: &str = "No search results found.";
+
+/// Model-facing result when the search service became unavailable before the call was completed.
+const PARTIAL_UNAVAILABLE_OUTPUT: &str = "Web search was performed partially before search service became unavailable.";
+
+/// Model-facing result when the call was clipped by the maximum query cap.
+const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before reaching the maximum query cap.";
+
 /// Borrowed inputs for one request-side web-search dispatch batch.
 struct PendingSearchBatch<'a> {
     /// Calls retained from the current model round, parsed once.
@@ -163,22 +172,32 @@ fn admit_call<'a>(
         append_incomplete(ctx, &prepared.ids);
         return None;
     }
-    if rejected {
-        append_search_turn(ctx, &prepared.ids, "failed", prepared.action, &[], TOOL_LIMIT_OUTPUT);
-        return None;
+    let (status, notice) = if rejected {
+        ("failed", TOOL_LIMIT_OUTPUT)
+    } else if over_budget {
+        ("incomplete", NOT_PERFORMED_OUTPUT)
+    } else {
+        return Some(prepared);
+    };
+    append_search_turn(ctx, &prepared.ids, status, prepared.action, &[], Some(notice));
+    None
+}
+
+/// Resolve one dispatched call's terminal status and its model-facing notice.
+fn status_and_notice(successful: usize, n_queries: usize, query_cap: usize) -> (&'static str, Option<&'static str>) {
+    if successful == 0 {
+        return ("failed", Some(SEARCH_UNAVAILABLE));
     }
-    if over_budget {
-        append_search_turn(
-            ctx,
-            &prepared.ids,
-            "incomplete",
-            prepared.action,
-            &[],
-            NOT_PERFORMED_OUTPUT,
-        );
-        return None;
+
+    if successful < n_queries && successful < query_cap {
+        return ("incomplete", Some(PARTIAL_UNAVAILABLE_OUTPUT));
     }
-    Some(prepared)
+
+    if successful == query_cap && successful < n_queries {
+        return ("incomplete", Some(PARTIAL_CLIPPED_OUTPUT));
+    }
+
+    ("completed", None)
 }
 
 // -----------------------------------------------------------------------------
@@ -370,12 +389,13 @@ impl WebSearchFilter {
         ctx: &mut HttpFilterContext<'_>,
         prepared: PreparedCall<'_>,
         context_size: SearchContextSize,
-        query_allowance: usize,
+        query_cap: usize,
     ) -> usize {
         let PreparedCall { ids, queries, action } = prepared;
         let mut results = Vec::new();
         let mut dispatched = 0_usize;
-        for query in queries.iter().take(query_allowance) {
+        let mut successful = 0_usize;
+        for query in queries.iter().take(query_cap) {
             dispatched = dispatched.saturating_add(1);
             // Capture the originating client's attributes and current outbound depth
             // so the callout's outbound chain sees the real caller and the executor
@@ -392,15 +412,15 @@ impl WebSearchFilter {
                         call_id = ids.public,
                         "web search provider failed; continuing with a failed tool result"
                     );
-                    let status = if results.is_empty() { "failed" } else { "incomplete" };
-                    append_search_turn(ctx, &ids, status, action, &results, SEARCH_UNAVAILABLE);
+                    let (status, notice) = status_and_notice(successful, queries.len(), query_cap);
+                    append_search_turn(ctx, &ids, status, action, &results, notice);
                     return dispatched;
                 },
             }
+            successful = successful.saturating_add(1);
         }
-        let is_completed = dispatched == queries.len();
-        let status = if is_completed { "completed" } else { "incomplete" };
-        append_search_turn(ctx, &ids, status, action, &results, NOT_PERFORMED_OUTPUT);
+        let (status, notice) = status_and_notice(successful, queries.len(), query_cap);
+        append_search_turn(ctx, &ids, status, action, &results, notice);
         dispatched
     }
 
@@ -420,13 +440,13 @@ impl WebSearchFilter {
         for prepared in batch.calls {
             let rejected = rejected(batch.admissions, prepared.ids.index);
             tool_limit_exceeded |= rejected;
-            let query_allowance = batch.query_budget.saturating_sub(queries_dispatched);
-            let over_budget = calls_dispatched >= batch.call_budget || query_allowance == 0;
+            let query_cap = batch.query_budget.saturating_sub(queries_dispatched);
+            let over_budget = calls_dispatched >= batch.call_budget || query_cap == 0;
             let Some(prepared) = admit_call(ctx, prepared, rejected, over_budget) else {
                 continue;
             };
             let dispatched = self
-                .execute_single_search(ctx, prepared, batch.context_size, query_allowance)
+                .execute_single_search(ctx, prepared, batch.context_size, query_cap)
                 .await;
             if dispatched > 0 {
                 calls_dispatched = calls_dispatched.saturating_add(1);
@@ -683,10 +703,10 @@ fn append_search_turn(
     status: &str,
     action: Value,
     results: &[SearchResult],
-    failure_output: &'static str,
+    notice: Option<&'static str>,
 ) {
     let include_sources = include_action_sources(ctx);
-    let bridge = build_tool_result_messages(&ids.bridge, status, &action, results, failure_output);
+    let bridge = build_tool_result_messages(&ids.bridge, &action, results, notice);
     let output_item = build_output_item(ids.public, status, action, results, include_sources);
     push_search_turn(ctx, output_item, bridge, ids.index);
 }
@@ -820,34 +840,31 @@ pub(crate) fn build_output_item(
 /// public `web_search_call` output item is emitted separately by
 /// [`build_output_item`] and only reaches `accumulated_output`.
 ///
-/// `status` is threaded through so a call that was never dispatched
-/// (over-budget or missing a query, `status != "completed"`) carries a
-/// truthful `Web search not performed.` output instead of a fabricated
-/// `No search results found.` result, keeping the model-facing bridge
-/// consistent with the client-visible incomplete output item. A call that did
-/// reach the provider keeps the results it gathered even when its remaining
-/// queries were clipped or failed, so `failure_output` only applies to an empty
-/// result set.
-///
 /// `call_id` must be a bounded, backend-valid identifier from
 /// [`bridge_call_id`]: the raw hosted id can exceed the `OpenResponses`
 /// 64-character `call_id` limit.
 pub(crate) fn build_tool_result_messages(
     call_id: &str,
-    status: &str,
     action: &Value,
     results: &[SearchResult],
-    failure_output: &'static str,
+    notice: Option<&'static str>,
 ) -> [Value; 2] {
-    let content = if !results.is_empty() {
-        format_search_results(results)
-    } else if status == "completed" {
-        "No search results found.".to_owned()
-    } else {
-        failure_output.to_owned()
+    let content = match (results.is_empty(), notice) {
+        // Completed with zero rows: a successful search that found nothing.
+        (true, None) => NO_RESULTS_OUTPUT.to_owned(),
+        // Never dispatched, every query failed, or no results: the notice is the only content.
+        (true, Some(notice)) => notice.to_owned(),
+        // Search successful without failure / partial: return the results.
+        (false, None) => format_search_results(results),
+        // Partial: keep the rows the call did gather and append the notice.
+        (false, Some(notice)) => {
+            let mut content = format_search_results(results);
+            content.push_str("\n\n");
+            content.push_str(notice);
+            content
+        },
     };
     let arguments = search_arguments(action).to_string();
-
     [
         serde_json::json!({
             "type": "function_call",
