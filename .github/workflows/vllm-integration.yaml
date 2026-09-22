@@ -715,7 +715,7 @@ jobs:
 
       - name: Build Praxis and acceptance test
         run: |
-          cargo build -p praxis-ai-proxy
+          cargo build -p praxis-ai-proxy --features full
           cargo test -p praxis-tests-integration --test suite --no-run
 
       - name: Create restricted network namespace
@@ -1092,7 +1092,7 @@ jobs:
 
       - name: Build Praxis and Codex acceptance test
         run: |
-          cargo build -p praxis-ai-proxy
+          cargo build -p praxis-ai-proxy --features full
           cargo test -p praxis-tests-integration --test suite --no-run
 
       - name: Create restricted Codex network namespace
@@ -1440,7 +1440,7 @@ jobs:
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy
+        run: cargo build -p praxis-ai-proxy --features full
 
       - name: Wait for vLLM readiness
         run: |
@@ -1676,7 +1676,7 @@ jobs:
 
       - name: Build Praxis
         run: |
-          cargo build -p praxis-ai-proxy
+          cargo build -p praxis-ai-proxy --features full
           cargo build -p praxis-test-utils --example conversations_tenant_proxy
 
       - name: Wait for inference simulator readiness
