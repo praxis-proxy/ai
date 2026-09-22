@@ -475,58 +475,70 @@ fn get_common_stream_and_delete_cleanup_route_through_outbound_chain() {
         "MCP server should receive one tool call"
     );
 
-    // GET common stream opened, session-scoped (non-negotiable core)
+    // GET common stream: opened, session-scoped, AND routed through the filtered
+    // outbound chain. The mcp_dispatch session's outbound chain stamps
+    // x-mcp-client via its `headers` filter; a correctly routed GET carries it.
     let reqs = mcp.received_requests();
-    let get = reqs
+    let chain_get = reqs
         .iter()
-        .find(|r| r.http_method == "GET")
-        .expect("rmcp should open the eager GET common stream after the initialize handshake");
+        .find(|r| {
+            r.http_method == "GET"
+                && r.headers
+                    .iter()
+                    .any(|(k, v)| k == "x-mcp-client" && v == "praxis-ai-gateway")
+        })
+        .expect(
+            "the mcp_dispatch session's eager GET common stream must route through the \
+             filtered outbound chain and carry x-mcp-client",
+        );
     assert!(
-        get.headers
+        chain_get
+            .headers
             .iter()
             .any(|(k, v)| k == "mcp-session-id" && v == "mock-mcp-session-1"),
         "GET common stream must carry the negotiated MCP session id; headers: {:?}",
-        get.headers
+        chain_get.headers
     );
 
-    // NOTE: The GET common stream does NOT carry the x-mcp-client outbound filter
-    // header. Observed headers on GET: mcp-protocol-version, accept, mcp-session-id,
-    // host, x-praxis-iterative-depth. This indicates the GET request routes through
-    // the transport but the outbound chain's `headers` filter is not applied to it.
+    // NOTE: The top-level openai_mcp_tool_resolve discovery session has NO
+    // outbound_chain, so its own GET/DELETE correctly carry no x-mcp-client. We
+    // assert on the mcp_dispatch session's GET/DELETE, which DO route through the
+    // chain — that is the outbound-filter-on-non-POST coverage this test exists for.
 
-    // DELETE cleanup routed through the chain (verify empirically, poll)
-    let saw_delete = wait_for_recorded(&mcp, |reqs| {
+    // DELETE cleanup fires asynchronously on transport drop; poll for the
+    // dispatch session's DELETE (the one that carries the egress header).
+    let saw_chain_delete = wait_for_recorded(&mcp, |reqs| {
         reqs.iter().any(|r| {
             r.http_method == "DELETE"
                 && r.headers
                     .iter()
-                    .any(|(k, v)| k == "mcp-session-id" && v == "mock-mcp-session-1")
+                    .any(|(k, v)| k == "x-mcp-client" && v == "praxis-ai-gateway")
         })
     });
     assert!(
-        saw_delete,
-        "DELETE cleanup should be recorded within 5s of transport drop"
+        saw_chain_delete,
+        "the mcp_dispatch session's DELETE cleanup should route through the filtered \
+         outbound chain and be recorded within 5s of transport drop"
     );
 
-    // Verify DELETE carries the session id
     let reqs = mcp.received_requests();
-    let delete = reqs
+    let chain_delete = reqs
         .iter()
-        .find(|r| r.http_method == "DELETE")
-        .expect("DELETE should be present after wait_for_recorded returned true");
+        .find(|r| {
+            r.http_method == "DELETE"
+                && r.headers
+                    .iter()
+                    .any(|(k, v)| k == "x-mcp-client" && v == "praxis-ai-gateway")
+        })
+        .expect("DELETE with x-mcp-client should be present after wait_for_recorded returned true");
     assert!(
-        delete
+        chain_delete
             .headers
             .iter()
             .any(|(k, v)| k == "mcp-session-id" && v == "mock-mcp-session-1"),
         "DELETE cleanup must carry the negotiated MCP session id; headers: {:?}",
-        delete.headers
+        chain_delete.headers
     );
-
-    // NOTE: The DELETE cleanup does NOT carry the x-mcp-client outbound filter
-    // header. Observed headers on DELETE: mcp-protocol-version, mcp-session-id,
-    // host, x-praxis-iterative-depth. Like GET, this indicates the DELETE routes
-    // through the transport but the outbound chain's `headers` filter is not applied.
 }
 
 // -----------------------------------------------------------------------------
