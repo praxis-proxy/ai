@@ -777,7 +777,7 @@ fn make_filter(on_failure: &str) -> CompactFilter {
     let cfg: CompactFilterConfig = serde_yaml::from_value(yaml).unwrap();
     let validated = build_config(&cfg).unwrap();
     CompactFilter {
-        client: crate::subrequest::isolated_client(1),
+        client: subrequest::isolated_client(1),
         config: validated,
     }
 }

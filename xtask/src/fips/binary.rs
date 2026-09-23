@@ -23,6 +23,10 @@ const BACKEND_PREFIXES: &[&str] = &["ring_core_", "GFp_", "aws_lc_", "AWSLC_", "
 const OPENSSL_PREFIXES: &[&str] = &["EVP_", "SSL_", "OSSL_", "RAND_"];
 
 /// Append the binary section.
+#[expect(
+    clippy::too_many_lines,
+    reason = "fail-closed artifact validation reports each missing or unreadable prerequisite separately"
+)]
 pub(crate) fn section(report: &mut Report, binary: Option<&Path>) {
     report.section("Binary");
     let Some(binary) = binary else {
@@ -89,6 +93,10 @@ pub(crate) fn section(report: &mut Report, binary: Option<&Path>) {
 // -----------------------------------------------------------------------------
 
 /// Which libcrypto the dynamic loader resolves, according to ldd.
+#[expect(
+    clippy::too_many_lines,
+    reason = "fail-closed linkage validation reports process and resolution failures separately"
+)]
 fn linkage(report: &mut Report, binary: &Path) {
     let output = match Command::new("ldd").arg(binary).output() {
         Ok(output) => output,

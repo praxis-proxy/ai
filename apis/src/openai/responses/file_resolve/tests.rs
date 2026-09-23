@@ -13,12 +13,9 @@ use bytes::Bytes;
 use serde_json::json;
 
 use super::*;
-use crate::{
-    openai::{
-        api_client::{ApiClient, ApiClientConfig},
-        responses::state::ResponsesState,
-    },
-    subrequest::SubRequestClient,
+use crate::openai::{
+    api_client::{ApiClient, ApiClientConfig},
+    responses::state::ResponsesState,
 };
 
 // -----------------------------------------------------------------------------

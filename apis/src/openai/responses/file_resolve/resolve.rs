@@ -876,10 +876,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        openai::api_client::{ApiClient, ApiClientConfig},
-        subrequest::SubRequestClient,
-    };
+    use crate::openai::api_client::{ApiClient, ApiClientConfig};
 
     #[test]
     fn infer_mime_pdf() {
