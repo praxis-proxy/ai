@@ -448,7 +448,7 @@ fn register_openai_agentic_filters(registry: &mut FilterRegistry) {
 /// optional outbound chain at construction time.
 #[expect(clippy::panic, reason = "matches register_filters! macro convention")]
 fn register_ai_guardrails(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
-    let isolated_client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+    let isolated_client = crate::isolated_subrequest_client(4);
     let shared_client = subrequest_client.cloned();
 
     registry
@@ -516,7 +516,7 @@ fn register_file_resolve(registry: &mut FilterRegistry, subrequest_client: Optio
                 let outbound = std::sync::Arc::new(ctx.bind_chain(&chain_ref)?);
                 let client = match &shared {
                     Some(client) => client.clone(),
-                    None => SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+                    None => crate::isolated_subrequest_client(4),
                 };
                 praxis_ai_apis::openai::FileResolveFilter::from_config_with_outbound(config, client, outbound)
             }),
@@ -558,7 +558,7 @@ fn register_compact(registry: &mut FilterRegistry, subrequest_client: Option<&Su
 fn register_file_search_callout(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
     let client = subrequest_client
         .cloned()
-        .unwrap_or_else(|| SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)));
+        .unwrap_or_else(|| crate::isolated_subrequest_client(4));
     registry
         .register_chain_binding(
             "openai_file_search_callout",
@@ -645,6 +645,16 @@ mod tests {
         for name in expected {
             assert!(names.contains(&name), "expected {name} in registry");
         }
+    }
+
+    #[cfg(feature = "policy-engine")]
+    #[test]
+    fn build_ai_registry_includes_policy_when_enabled() {
+        let registry = build_ai_registry();
+        assert!(
+            registry.available_filters().contains(&"policy"),
+            "the default standard profile preserves the Praxis policy builtin"
+        );
     }
 
     #[test]

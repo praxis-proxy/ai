@@ -111,11 +111,11 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::header::HeaderName;
 use metrics::{counter, gauge};
+use praxis_ai_apis::hash::Sha256;
 use praxis_filter::{
     AuthenticatedIdentity, BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     parse_filter_config,
 };
-use sha2::{Digest as _, Sha256};
 
 use self::{
     backend::{

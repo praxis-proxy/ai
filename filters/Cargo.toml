@@ -15,7 +15,10 @@ name = "praxis_ai_filters"
 [features]
 default = ["standard"]
 # Default-on filters that sit behind a gate so minimal builds can drop them.
-standard = ["aws-sigv4-filter"]
+standard = ["aws-sigv4-filter", "policy-engine"]
+# The `policy` filter from Praxis core. Kept explicit so no-default FIPS builds
+# can omit the policy engine and its pure-Rust cryptography.
+policy-engine = ["praxis-filter/policy-engine"]
 # aws_sigv4_sign: AWS Signature V4 request signing (aws-sigv4).
 aws-sigv4-filter = ["dep:aws-sigv4", "dep:aws-credential-types"]
 # Backwards-compatible alias for the previous default, which built every
@@ -81,6 +84,7 @@ praxis-core = { workspace = true }
 # chain-binding: ChainBindingContext for register.rs outbound-chain wiring.
 # Off-by-default experimental feature in praxis 0.6.0 (no extra dependencies).
 praxis-filter = { workspace = true, features = ["chain-binding"] }
+praxis-tls = { workspace = true }
 redis = { workspace = true, optional = true }
 rand = { workspace = true }
 reqwest = { workspace = true, optional = true }
@@ -89,7 +93,6 @@ serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
 serde_json_path = { workspace = true, optional = true }
 serde_yaml = { workspace = true }
-sha2 = { workspace = true }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tokio-util = { workspace = true }

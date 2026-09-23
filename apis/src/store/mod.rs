@@ -12,6 +12,15 @@
     expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),
     allow(
         dead_code,
+        reason = "codec helpers are unused until a SQL backend feature is enabled"
+    )
+)]
+mod compression;
+#[cfg_attr(
+    not(any(feature = "store-postgres", feature = "store-sqlite")),
+    expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),
+    allow(
+        dead_code,
         reason = "backend helpers are unused until a SQL backend feature is enabled"
     )
 )]
@@ -67,6 +76,7 @@ pub use self::postgres_tls::PgTlsConfig;
 #[cfg(feature = "store-sqlite")]
 pub use self::sqlite::SqliteResponseStore;
 pub use self::{
+    compression::{CompressionAlgorithm, StoreCompressionConfig},
     pool::PoolConfig,
     ssl_mode::SslMode,
     trait_def::{ConversationItemStore, ResponseStore},

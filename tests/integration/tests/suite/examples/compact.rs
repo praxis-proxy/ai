@@ -687,8 +687,8 @@ async fn compact_explicit_endpoint() {
     assert_eq!(tenant_id, "default", "compaction record should use the default tenant");
     assert_eq!(model, "gpt-4.1", "compaction record should persist the request model");
 
-    let stored_object: serde_json::Value =
-        serde_json::from_str(&row.get::<String, _>("response_object")).expect("response_object should be valid JSON");
+    let stored_object: serde_json::Value = serde_json::from_slice(&row.get::<Vec<u8>, _>("response_object"))
+        .expect("response_object should be valid JSON");
     assert_eq!(
         stored_object["object"], "response.compaction",
         "stored response_object should be a response.compaction"
@@ -700,7 +700,7 @@ async fn compact_explicit_endpoint() {
     assert_response_usage_contract(&stored_object["usage"]);
 
     let stored_messages: serde_json::Value =
-        serde_json::from_str(&row.get::<String, _>("messages")).expect("messages should be valid JSON");
+        serde_json::from_slice(&row.get::<Vec<u8>, _>("messages")).expect("messages should be valid JSON");
     let items = stored_messages.as_array().expect("messages should be an array");
     assert_eq!(
         items.len(),
@@ -712,6 +712,16 @@ async fn compact_explicit_endpoint() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_explicit_endpoint_response_is_valid_follow_up_target() {
+    assert_compaction_follow_up(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compact_explicit_endpoint_compressed_response_is_valid_follow_up_target() {
+    assert_compaction_follow_up(true).await;
+}
+
+/// Verify persisted compaction can be rehydrated with either storage codec.
+async fn assert_compaction_follow_up(compressed: bool) {
     // Regression: the compaction response must be usable as a
     // `previous_response_id`. `rehydrate::validate_response_status` rejects any
     // stored record whose `status` is not "completed" (missing status reads as
@@ -727,6 +737,14 @@ async fn compact_explicit_endpoint_response_is_valid_follow_up_target() {
     let db = TempSqlite::new("compact_follow_up");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/compact.yaml"))
         .expect("example config should exist");
+    let yaml = if compressed {
+        yaml.replace(
+            "        conversations_table: openai_conversations\n",
+            "        conversations_table: openai_conversations\n        compression:\n          algorithm: zstd\n          level: 3\n",
+        )
+    } else {
+        yaml
+    };
 
     let config1 = load_compact_config(&yaml, db.url(), proxy_port, backend1.port());
     let proxy1 = start_proxy(&config1);
@@ -764,6 +782,22 @@ async fn compact_explicit_endpoint_response_is_valid_follow_up_target() {
         .to_owned();
     drop(backend2);
     drop(proxy2);
+
+    if compressed {
+        let pool = sqlx::SqlitePool::connect(db.url()).await.expect("database should open");
+        let row = sqlx::query("SELECT response_object, input, messages FROM openai_responses WHERE id = ?")
+            .bind(&compaction_id)
+            .fetch_one(&pool)
+            .await
+            .expect("compaction record should be persisted");
+        pool.close().await;
+        for column in ["response_object", "input", "messages"] {
+            assert!(
+                row.get::<Vec<u8>, _>(column).starts_with(&[0x28, 0xB5, 0x2F, 0xFD]),
+                "explicit compaction must compress {column}"
+            );
+        }
+    }
 
     // Phase 3: send a follow-up request referencing the compaction id. Rehydrate
     // must accept the record (status == "completed") and continue from it. Before
@@ -990,7 +1024,7 @@ async fn compact_explicit_endpoint_fail_open_returns_schema_valid_empty_output()
     pool.close().await;
 
     let stored_messages: serde_json::Value =
-        serde_json::from_str(&row.get::<String, _>("messages")).expect("messages should be valid JSON");
+        serde_json::from_slice(&row.get::<Vec<u8>, _>("messages")).expect("messages should be valid JSON");
     let items = stored_messages.as_array().expect("messages should be an array");
     assert!(
         !items.is_empty(),

@@ -28,12 +28,19 @@ use tokio::sync::Notify;
 // -----------------------------------------------------------------------------
 
 /// Default sub-request client for registry-only tests without a config.
-fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
+///
+/// The connector builds a rustls client config, which needs the process-wide
+/// crypto provider first: the binary installs it at startup, and the harness
+/// does the same here (a no-op after the first call). Tests that build a
+/// registry themselves must take their client from here for the same reason.
+pub fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
+    praxis_tls::provider::install();
     praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
 }
 
 /// Shared client honoring runtime connector settings, including the circuit breaker.
 fn configured_subrequest_client(config: &Config) -> praxis_core::subrequest::SubRequestClient {
+    praxis_tls::provider::install();
     praxis_ai::create_subrequest_client(config)
 }
 

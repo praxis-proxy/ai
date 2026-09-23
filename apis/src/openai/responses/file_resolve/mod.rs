@@ -203,7 +203,7 @@ impl FileResolveFilter {
     /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
     /// [`from_config_with_client`]: Self::from_config_with_client
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+        let client = crate::subrequest::isolated_client(4);
         Self::build(config, client, None)
     }
 

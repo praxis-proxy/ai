@@ -17,7 +17,9 @@ INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-f
 # Features for `make release`; `full` matches the published container image.
 PRAXIS_AI_FEATURES ?= full
 # Crates that must never enter the default (standard) praxis-ai-proxy graph.
-DEFAULT_GRAPH_DENY := sqlx sqlx-core libsqlite3-sys openssl-sys native-tls rmcp sse-stream \
+# openssl-sys is not on the list: praxis performs all cryptography through the
+# system OpenSSL, so its bindings are part of every build by design.
+DEFAULT_GRAPH_DENY := sqlx sqlx-core libsqlite3-sys native-tls rmcp sse-stream \
 	jsonschema utoipa tiktoken-rs reqwest serde_json_path tonic prost
 # Upper bound on crates (name@version, normal + build edges, host target) in the
 # default graph. Linux hosts measure about 424, macOS about 428.
@@ -39,7 +41,12 @@ endif
 	require-container-engine \
 	container container-run \
 	setup-hooks help \
-	patch-praxis unpatch-praxis
+	patch-praxis unpatch-praxis \
+	require-podman require-go require-oc \
+	build-fips release-fips check-fips lint-fips test-fips \
+	container-fips container-fips-run \
+	fips-check fips-check-ubi fips-deps fips-report fips-signature-store fips-verify-image \
+	fips-image-ref fips-oc fips-scan fips-scanner fips-smoke
 
 # -------------------------------------------------------------------
 # All
@@ -191,6 +198,7 @@ lint:
 	cargo +nightly fmt --all -- --check
 	cargo machete --with-metadata .
 	cargo xtask lint-deps
+	$(MAKE) fips-deps
 	cargo xtask lint-separators
 	cargo xtask lint-filter-docs
 	cargo xtask lint-example-tests
@@ -256,33 +264,283 @@ coverage-check:
 	fi
 
 # -------------------------------------------------------------------
+# FIPS
+# -------------------------------------------------------------------
+#
+# The published image (`full`) enables every non-experimental filter. The
+# FIPS build turns off what is known not to be FIPS 140-3 compliant yet, so
+# nobody has to know which features to pick:
+#
+#   aws-sigv4-filter     the aws-sigv4 crate signs with pure-Rust hmac/sha2
+#   policy-engine        praxis-policy carries its own cryptography (sha2,
+#                        hmac, jsonwebtoken on aws-lc-rs)
+#   store, store-sqlite, store-postgres, openai-conversations, openai-compact
+#                        sqlx enables sqlx-core's `migrate` feature with its
+#                        tokio runtime, and that pulls sha2; store-postgres
+#                        adds sqlx-postgres' md-5/hmac/sha2/rsa (SCRAM)
+#   openai-file-resolve-filter, openai-mcp-tools, azure-ad-filter,
+#   gcp-adc-filter       reqwest's `rustls` feature compiles aws-lc-rs in
+#
+# What remains of the opt-in groups is openai-responses (the Responses API
+# kernel, which adds no crates). The experimental filters stay off for the
+# same reasons they are off in the standard build. FIPS_FEATURES is the
+# single place this is defined; Containerfile.fips (CARGO_FEATURES) mirrors
+# it and must be kept in sync.
+#
+# The FIPS build goes to its own target directory so it never overwrites,
+# or is mistaken for, the standard build.
+#
+#   make build-fips        FIPS build, debug profile
+#   make release-fips      FIPS build, release profile
+#   make lint-fips         clippy + rustfmt for the FIPS feature set
+#   make test-fips         unit tests for the FIPS feature set
+#   make container-fips    FIPS runtime image on UBI 9 (Red Hat toolchain,
+#                          signature-verified base images)
+#   make fips-check        build on UBI 9 and print the compliance report
+#   make fips-report       the same report against the local FIPS build
+#   make fips-deps         dependency graph only (seconds, no build; also
+#                          runs under `make lint`, so a PR cannot reintroduce
+#                          a denied crate into the FIPS build)
+#   make fips-smoke        run the FIPS image once (validates its config)
+#   make fips-scan         run Red Hat's scanner (check-payload) on the
+#                          FIPS image, warnings fatal: the actual gate
+#   make fips-scanner      build check-payload at the pinned revision
+#   make fips-oc           download the OpenShift CLI the scanner insists on
+#   make fips-signature-store
+#                          point podman at Red Hat's signature store; needed
+#                          once on Debian/Ubuntu hosts, a no-op elsewhere
+#
+# The report, the image verification and the signature-store setup are
+# `cargo xtask fips` commands (xtask/src/fips/). XTASK_FIPS builds xtask
+# without its default features, so these targets never compile the standard
+# proxy build to run.
+#
+# See docs/developing/fips.md and docs/developing/getting-started.md.
+
+FIPS_FEATURES           := openai-responses
+# The same list qualified for a multi-package cargo invocation.
+_COMMA                  := ,
+FIPS_FEATURES_QUALIFIED := $(subst $(_COMMA),$(_COMMA)praxis-ai-proxy/,praxis-ai-proxy/$(FIPS_FEATURES))
+FIPS_TARGET_DIR         := target/fips
+FIPS_BIN                ?= $(FIPS_TARGET_DIR)/release/praxis-ai
+FIPS_CARGO_ARGS         := -p praxis-ai-proxy --no-default-features --features $(FIPS_FEATURES) --target-dir $(FIPS_TARGET_DIR)
+# Red Hat's scanner reads the crate list that `cargo auditable` embeds in the
+# binary (the .dep-v0 section); without it a binary is graded inconclusive.
+# `make release-fips` embeds it when cargo-auditable is installed (`cargo
+# install cargo-auditable --version 0.7.6 --locked`); the report says so when
+# it was not.
+#
+# The list must be exactly the crates compiled in. On a stable toolchain
+# cargo-auditable derives it from `cargo metadata`, which unifies features
+# across the whole workspace and activates weak features (`dep?/feature`)
+# the real build never turns on; with rustls that puts `ring` in the manifest
+# of a binary that never compiled it, and the scanner fails on the name alone.
+# Cargo's SBOM precursor (`-Zsbom`, unstable) is the exact list, so the
+# release build enables it: RUSTC_BOOTSTRAP=1 lets stable cargo accept the
+# flag, and the env overrides hand rustc and every build script
+# RUSTC_BOOTSTRAP=-1, which forbids unstable features, so the code compiled is
+# the stable code. Drop this once cargo's `build.sbom` is stable
+# (rust-lang/cargo#13709). Same recipe in Containerfile.fips.
+CARGO_AUDITABLE         := $(shell command -v cargo-auditable >/dev/null 2>&1 && echo "cargo auditable" || echo "cargo")
+FIPS_SBOM_ENV           := RUSTC_BOOTSTRAP=1 CARGO_BUILD_SBOM=true
+FIPS_SBOM_ARGS          := -Zsbom --config 'env.RUSTC_BOOTSTRAP.value="-1"' --config 'env.RUSTC_BOOTSTRAP.force=true'
+FIPS_UBI9_DIGEST        := sha256:a4b9ec09b1e790a53ef25b7777c539976abe519248264298e5194dcbceac8c31
+FIPS_UBI9_MINIMAL_DIGEST := sha256:8ebe2ad8fdf3cab3e5a53c1edc69194c98209cfadab24b884f4ad9ebcf7bbbfc
+FIPS_UBI9_IMAGE         := registry.access.redhat.com/ubi9/ubi@$(FIPS_UBI9_DIGEST)
+FIPS_UBI9_MINIMAL_IMAGE := registry.access.redhat.com/ubi9/ubi-minimal@$(FIPS_UBI9_MINIMAL_DIGEST)
+FIPS_CHECK_IMAGE        ?= praxis-ai-fips-check
+FIPS_BUILD_ARGS         := --build-arg UBI9_DIGEST=$(FIPS_UBI9_DIGEST) \
+	--build-arg UBI9_MINIMAL_DIGEST=$(FIPS_UBI9_MINIMAL_DIGEST) \
+	--build-arg CARGO_FEATURES=$(FIPS_FEATURES)
+XTASK_FIPS              := cargo run -q -p xtask --no-default-features --
+# Red Hat's scanner, openshift/check-payload, at the revision that added Rust
+# support (the head of its PR #360, fetched by commit so a rewrite of the PR
+# cannot break the build). `make fips-scanner` builds it into target/fips;
+# point CHECK_PAYLOAD at another build to use it instead.
+CHECK_PAYLOAD_REPO      := https://github.com/openshift/check-payload
+CHECK_PAYLOAD_REV       := 1ce4e04ed214b98997797ce19a2442f794632e65
+CHECK_PAYLOAD_DIR       := $(FIPS_TARGET_DIR)/check-payload
+CHECK_PAYLOAD           ?= $(CHECK_PAYLOAD_DIR)/check-payload
+# The FIPS image as podman's storage names it: a bare name gets podman's
+# implicit localhost/ prefix, a registry-qualified IMAGE does not.
+_IMAGE_HEAD             := $(firstword $(subst /, ,$(IMAGE)))
+FIPS_IMAGE_REF          := $(if $(or $(findstring .,$(_IMAGE_HEAD)),$(findstring :,$(_IMAGE_HEAD)),$(filter localhost,$(_IMAGE_HEAD))),$(IMAGE),localhost/$(IMAGE)):$(VERSION)-fips
+# The scanner mounts the image from podman's store, which needs the user
+# namespace only for rootless podman.
+PODMAN_UNSHARE          := $(if $(filter 0,$(shell id -u)),,podman unshare)
+# check-payload refuses to run without the OpenShift CLI (oc) on PATH, even
+# for a local image scan. `make fips-oc` downloads Red Hat's pinned client
+# release into target/fips/bin and checks its published sha256 (the checksum
+# Red Hat lists next to the tarball on mirror.openshift.com); fips-scan puts
+# that directory on PATH. Pinned for Linux x86_64, which is what CI runs; on
+# any other platform install oc yourself and it is picked up from PATH.
+UNAME_S                 := $(shell uname -s | tr '[:upper:]' '[:lower:]')
+UNAME_M                 := $(shell uname -m)
+SHA256SUM               := $(if $(filter darwin,$(UNAME_S)),gsha256sum,sha256sum)
+OC_VERSION              := 4.22.14
+OC_DIR                  := $(FIPS_TARGET_DIR)/bin
+OC                      := $(OC_DIR)/oc
+OC_SHA256_linux_x86_64  := 7dbe8c2813bc09e18a666155eb4fa88dc3260c3832c553aa16d86c7c4277ba03
+OC_SHA256               := $(OC_SHA256_$(UNAME_S)_$(UNAME_M))
+
+require-podman:
+	@command -v podman >/dev/null || { echo "podman is required: Red Hat image signatures can only be verified with podman"; exit 1; }
+
+require-go:
+	@command -v go >/dev/null || { echo "go is required to build check-payload"; exit 1; }
+
+require-oc:
+	@command -v oc >/dev/null || [ -x $(OC) ] || { echo "oc (the OpenShift CLI) is required: check-payload refuses to scan without it on PATH; run 'make fips-oc'"; exit 1; }
+
+$(OC):
+	@mkdir -p $(OC_DIR)
+	curl -sSfL -o $(OC_DIR)/oc.tar.gz \
+		https://mirror.openshift.com/pub/openshift-v4/$(UNAME_M)/clients/ocp/$(OC_VERSION)/openshift-client-linux-$(OC_VERSION).tar.gz
+	$(if $(OC_SHA256),echo "$(OC_SHA256)  $(OC_DIR)/oc.tar.gz" | $(SHA256SUM) -c,$(error no pinned SHA256 for oc on $(UNAME_S)/$(UNAME_M); refusing to use an unverified download))
+	tar xz -C $(OC_DIR) -f $(OC_DIR)/oc.tar.gz oc
+	rm -f $(OC_DIR)/oc.tar.gz
+
+fips-oc: $(OC)
+
+# The debug build is the edit-compile loop; only the release build carries
+# the manifest.
+build-fips:
+	cargo build $(FIPS_CARGO_ARGS)
+
+# cargo before 1.99 does not relink a binary when only the SBOM setting
+# changed (rust-lang/cargo#15695, fixed by #17216), so the old binary goes
+# first; everything else stays cached. Drop the clean once the toolchains in
+# use (here and the UBI rust-toolset) are 1.99 or newer.
+release-fips:
+ifeq ($(CARGO_AUDITABLE),cargo auditable)
+	cargo clean --release -p praxis-ai-proxy --target-dir $(FIPS_TARGET_DIR)
+	$(FIPS_SBOM_ENV) cargo auditable $(FIPS_SBOM_ARGS) build --release $(FIPS_CARGO_ARGS)
+else
+	@echo "warning: cargo-auditable is not installed; no crate manifest will be embedded (cargo install cargo-auditable --version 0.7.6 --locked)"
+	cargo build --release $(FIPS_CARGO_ARGS)
+endif
+
+check-fips:
+	cargo check $(FIPS_CARGO_ARGS)
+
+# Clippy over every target of the FIPS build, plus the rustfmt check (which
+# is feature-independent but belongs in "is the FIPS version clean").
+lint-fips:
+	cargo clippy $(FIPS_CARGO_ARGS) --all-targets -- -D warnings
+	cargo +nightly fmt --all -- --check
+
+# Unit tests of the crates that make up the FIPS binary, resolved exactly as
+# the FIPS build resolves them: no default features anywhere, only
+# FIPS_FEATURES on the binary. The integration suites run the standard build
+# through the test harness and are covered by `make test-integration`.
+test-fips:
+	cargo test --target-dir $(FIPS_TARGET_DIR) --no-default-features \
+		-p praxis-ai-proxy -p praxis-ai-filters -p praxis-ai-apis \
+		--features $(FIPS_FEATURES_QUALIFIED) $(_NOCAPTURE)
+
+# podman finds Red Hat's detached image signatures through its registries.d
+# (containers-registries.d(5)). Fedora and RHEL ship the entry; Debian and
+# Ubuntu, GitHub's runners included, ship no registries.d at all, and then
+# every Red Hat image looks unsigned. This installs the bundled entry for the
+# current user when the registries.d podman reads names none, and does
+# nothing otherwise. CI runs it before fips-verify-image.
+fips-signature-store:
+	$(XTASK_FIPS) fips signature-store --install
+
+fips-verify-image: | require-podman
+	$(XTASK_FIPS) fips verify-image --pinned-in Containerfile.fips $(FIPS_UBI9_IMAGE)
+	$(XTASK_FIPS) fips verify-image --pinned-in Containerfile.fips $(FIPS_UBI9_MINIMAL_IMAGE)
+
+fips-image-ref:
+	@printf '%s\n' '$(FIPS_IMAGE_REF)'
+
+container-fips: fips-verify-image
+	podman build -f Containerfile.fips --target runtime $(FIPS_BUILD_ARGS) \
+		-t $(IMAGE):$(VERSION)-fips .
+
+container-fips-run: | require-podman
+	podman run --rm --network=host $(IMAGE):$(VERSION)-fips 2>&1
+
+# The binary starts on ubi-minimal, loads the system OpenSSL and accepts its
+# built-in default config; a cheap proof that the image runs before the scan.
+fips-smoke: | require-podman
+	podman run --rm --entrypoint praxis-ai $(IMAGE):$(VERSION)-fips --validate
+
+fips-check: fips-check-ubi
+
+fips-check-ubi: fips-verify-image
+	podman build -f Containerfile.fips --target report $(FIPS_BUILD_ARGS) \
+		-t $(FIPS_CHECK_IMAGE) .
+	podman run --rm $(FIPS_CHECK_IMAGE)
+
+fips-report:
+	$(XTASK_FIPS) fips report --features $(FIPS_FEATURES) $(FIPS_BIN)
+
+# The graph check is `cargo xtask fips report` (cargo tree scoped to the
+# binary and its feature set) rather than cargo-deny: cargo-deny resolves
+# features workspace-wide, and the test crates enable the policy engine and
+# the stores on the binary, so it cannot see the FIPS build's real graph.
+fips-deps:
+	$(XTASK_FIPS) fips report --deps-only --features $(FIPS_FEATURES)
+
+# --fail-on-warnings makes an inconclusive verdict (for example a binary
+# without a crate manifest) fail, as Red Hat's gated scans do. Needs a Linux
+# podman (rootless or root), not a podman machine.
+fips-scan: | require-podman require-oc
+	@[ -x "$(CHECK_PAYLOAD)" ] || { echo "check-payload not found at $(CHECK_PAYLOAD): run 'make fips-scanner' (needs go) or set CHECK_PAYLOAD"; exit 1; }
+	PATH="$(abspath $(OC_DIR)):$$PATH" $(PODMAN_UNSHARE) $(CHECK_PAYLOAD) scan image \
+		--spec containers-storage:$(FIPS_IMAGE_REF) --fail-on-warnings
+
+# Built as upstream builds it (CGO_ENABLED=0, vendored modules).
+fips-scanner: | require-go
+	@mkdir -p $(CHECK_PAYLOAD_DIR)
+	@[ -d $(CHECK_PAYLOAD_DIR)/.git ] || git -C $(CHECK_PAYLOAD_DIR) init --quiet
+	git -C $(CHECK_PAYLOAD_DIR) fetch --quiet --depth 1 $(CHECK_PAYLOAD_REPO) $(CHECK_PAYLOAD_REV)
+	git -C $(CHECK_PAYLOAD_DIR) checkout --quiet FETCH_HEAD
+	cd $(CHECK_PAYLOAD_DIR) && CGO_ENABLED=0 go build -o check-payload .
+
+# -------------------------------------------------------------------
 # Praxis path override (test against local ../praxis)
 # -------------------------------------------------------------------
+
+PRAXIS_PATCH_GIT := https://github.com/praxis-proxy/praxis
+PRAXIS_PATCH_REV := cb5371ed88613d6eaa53b303b934f4f9318cb027
 
 patch-praxis:
 	@if [ ! -d "../praxis" ]; then \
 		echo "ERROR: ../praxis not found — clone praxis core as a sibling directory first"; \
 		exit 1; \
 	fi
-	@if grep -q '\[patch\.crates-io\]' Cargo.toml; then \
-		echo "Already patched — run 'make unpatch-praxis' first"; \
-		exit 1; \
+	@if grep -q 'praxis-proxy-core = { path = "../praxis/core" }' Cargo.toml; then \
+		echo "Already patched to use ../praxis"; \
+	else \
+		if ! grep -q 'praxis-proxy-core = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }' Cargo.toml; then \
+			echo "ERROR: expected pinned Praxis patch not found in Cargo.toml"; \
+			exit 1; \
+		fi; \
+		sed -i.bak \
+			-e 's|^praxis-proxy = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }$$|praxis-proxy = { path = "../praxis/server" }|' \
+			-e 's|^praxis-proxy-core = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }$$|praxis-proxy-core = { path = "../praxis/core" }|' \
+			-e 's|^praxis-proxy-filter = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }$$|praxis-proxy-filter = { path = "../praxis/filter" }|' \
+			-e 's|^praxis-proxy-protocol = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }$$|praxis-proxy-protocol = { path = "../praxis/protocol" }|' \
+			-e 's|^praxis-proxy-tls = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }$$|praxis-proxy-tls = { path = "../praxis/tls" }|' \
+			Cargo.toml && rm -f Cargo.toml.bak; \
+		echo "Patched Cargo.toml to use ../praxis path dependencies"; \
 	fi
-	@printf '\n[patch.crates-io]\n\
-	praxis-proxy-core = { path = "../praxis/core" }\n\
-	praxis-proxy-filter = { path = "../praxis/filter" }\n\
-	praxis-proxy-protocol = { path = "../praxis/protocol" }\n\
-	praxis-proxy-tls = { path = "../praxis/tls" }\n\
-	praxis-proxy = { path = "../praxis/server" }\n' >> Cargo.toml
-	@echo "Patched Cargo.toml to use ../praxis path dependencies"
 
 unpatch-praxis:
-	@if ! grep -q '\[patch\.crates-io\]' Cargo.toml; then \
+	@if ! grep -q 'praxis-proxy-core = { path = "../praxis/core" }' Cargo.toml; then \
 		echo "Nothing to unpatch"; \
-		exit 0; \
+	else \
+		sed -i.bak \
+			-e 's|^praxis-proxy = { path = "../praxis/server" }$$|praxis-proxy = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }|' \
+			-e 's|^praxis-proxy-core = { path = "../praxis/core" }$$|praxis-proxy-core = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }|' \
+			-e 's|^praxis-proxy-filter = { path = "../praxis/filter" }$$|praxis-proxy-filter = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }|' \
+			-e 's|^praxis-proxy-protocol = { path = "../praxis/protocol" }$$|praxis-proxy-protocol = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }|' \
+			-e 's|^praxis-proxy-tls = { path = "../praxis/tls" }$$|praxis-proxy-tls = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }|' \
+			Cargo.toml && rm -f Cargo.toml.bak; \
+		echo "Restored the pinned Praxis git dependencies"; \
 	fi
-	@sed -i.bak '/^\[patch\.crates-io\]/,$$d' Cargo.toml && rm -f Cargo.toml.bak
-	@echo "Removed [patch.crates-io] from Cargo.toml"
 
 # -------------------------------------------------------------------
 # Dev Setup
@@ -335,6 +593,24 @@ help:
 	@echo "  container            build praxis-ai container image"
 	@echo "  container-run        run container in foreground (host network)"
 	@echo ""
+	@echo "FIPS (feature set: $(FIPS_FEATURES), see docs/developing/fips.md):"
+	@echo "  build-fips           FIPS build, debug profile, into target/fips"
+	@echo "  release-fips         FIPS build, release profile, with the cargo-auditable crate manifest"
+	@echo "  check-fips           cargo check of the FIPS build"
+	@echo "  lint-fips            clippy (all targets) + rustfmt check for the FIPS feature set"
+	@echo "  test-fips            unit tests resolved as the FIPS build (no defaults, FIPS_FEATURES on the binary)"
+	@echo "  container-fips       FIPS runtime image on UBI 9 (Red Hat toolchain, signature-verified bases)"
+	@echo "  container-fips-run   run the FIPS image in foreground (host network)"
+	@echo "  fips-check           build on UBI 9 and print the compliance report (fails while findings remain)"
+	@echo "  fips-report          compliance report against the local FIPS build (FIPS_BIN=target/fips/release/praxis-ai)"
+	@echo "  fips-smoke           run the FIPS image once to validate its config"
+	@echo "  fips-scan            run Red Hat's scanner (check-payload) on the FIPS image, warnings fatal"
+	@echo "  fips-scanner         build check-payload at the pinned revision into target/fips (needs go)"
+	@echo "  fips-oc              download the pinned OpenShift CLI (oc) the scanner insists on, checksum-verified"
+	@echo "  fips-deps            dependency graph vs Red Hat's crypto denylist (seconds, no build)"
+	@echo "  fips-verify-image    verify the pinned UBI 9 base images are Red Hat's (digest + signature)"
+	@echo "  fips-signature-store point podman at Red Hat's signature store (once, on Debian/Ubuntu hosts)"
+	@echo ""
 	@echo "Praxis override:"
 	@echo "  patch-praxis         use ../praxis path deps instead of crates.io"
-	@echo "  unpatch-praxis       revert to crates.io praxis deps"
+	@echo "  unpatch-praxis       restore the pinned Praxis git dependencies"

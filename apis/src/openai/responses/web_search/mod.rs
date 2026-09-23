@@ -167,8 +167,7 @@ impl WebSearchFilter {
         config: &serde_yaml::Value,
         ctx: &ChainBindingContext<'_>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let client =
-            crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+        let client = crate::subrequest::isolated_client(4);
         Self::build(config, client, ctx)
     }
 
@@ -252,8 +251,7 @@ impl WebSearchFilter {
     /// [`FilteredSubrequestExecutor`]: praxis_filter::FilteredSubrequestExecutor
     #[cfg(test)]
     fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let client =
-            crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+        let client = crate::subrequest::isolated_client(4);
         Self::from_config_with_client(config, client)
     }
 

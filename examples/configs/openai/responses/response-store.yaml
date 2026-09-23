@@ -69,6 +69,23 @@ filter_chains:
         #     idle_timeout_secs: 600   # seconds before idle connections close (default: 600, 0 to disable)
         #     acquire_timeout_secs: 30 # seconds to wait for a connection (default: 30)
         #
+        # At-rest payload compression (optional, defaults to none):
+        #   Compresses the responses table's stored JSON payloads
+        #   (response_object, input, messages) with zstd. These columns are
+        #   binary (BLOB on sqlite, BYTEA on postgres): uncompressed rows hold
+        #   raw JSON bytes and compressed rows hold a raw zstd frame. The read
+        #   path detects the zstd frame magic and decompresses transparently, so
+        #   uncompressed rows stay readable after enabling compression. Works
+        #   with both the sqlite and postgres backends.
+        #   compression:
+        #     algorithm: zstd          # none (default) or zstd
+        #     level: 3                 # optional zstd level (default: 3)
+        #
+        #   Upgrading an existing database: schema version 3 stores these
+        #   responses columns as binary. Databases created under version 2
+        #   (TEXT columns) must be migrated before the proxy will start — see
+        #   docs/store/schema-migration.md.
+        #
         # PostgreSQL backend:
         #   backend: postgres
         #   database_url: "postgres://user:pass@db.example.com:5432/praxis"

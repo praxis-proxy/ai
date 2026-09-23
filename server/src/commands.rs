@@ -110,6 +110,8 @@ filter_chains:
 
     #[test]
     fn validate_rejects_unknown_filter_type() {
+        // Validation builds a sub-request client, which needs the provider first.
+        praxis_ai::install_crypto_provider();
         let config = Config::from_yaml(
             r#"
 listeners:
@@ -165,6 +167,8 @@ filter_chains:
 
     #[test]
     fn validate_accepts_subrequest_circuit_breaker_config() {
+        // Validation builds a sub-request client, which needs the provider first.
+        praxis_ai::install_crypto_provider();
         let config = Config::from_yaml(
             r#"
 listeners:

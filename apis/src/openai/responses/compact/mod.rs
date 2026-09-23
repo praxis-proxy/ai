@@ -172,7 +172,7 @@ impl CompactFilter {
     ///
     /// Returns [`FilterError`] if config validation fails.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+        let client = subrequest::isolated_client(4);
         Self::build(config, client)
     }
 

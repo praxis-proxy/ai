@@ -60,7 +60,10 @@ A default build (`cargo build -p praxis-ai-proxy`) compiles the `standard`
 feature set: every filter on this page except the groups below, which carry
 heavier dependencies or a large amount of stateful code and compile only when
 their feature is enabled. The published container image and `make release`
-build `full`, which matches the complete filter set.
+build `full`, which matches the complete filter set. The FIPS build
+(`make release-fips`, the `-fips` image) compiles only `openai-responses` on
+top of the always-on filters; [FIPS 140-3](fips.md) lists what is left out
+and why.
 
 | Feature | Filters it adds | Notable dependencies |
 |---------|-----------------|----------------------|

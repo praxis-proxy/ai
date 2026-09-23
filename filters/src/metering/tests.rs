@@ -6,7 +6,7 @@ use crate::test_utils::{make_filter_context, make_request};
 
 /// Build the concrete filter with a private test client.
 fn build_filter(yaml: &serde_yaml::Value) -> Result<ExternalMeteringFilter, FilterError> {
-    ExternalMeteringFilter::build(yaml, SubRequestClient::new(SubRequestConnector::new(1, None)))
+    ExternalMeteringFilter::build(yaml, crate::isolated_subrequest_client(1))
 }
 
 // -----------------------------------------------------------------------------

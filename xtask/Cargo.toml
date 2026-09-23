@@ -11,31 +11,57 @@ readme = "../README.md"
 publish = false
 
 [features]
-# Dev commands run the proxy and read the OpenAI registries, so xtask builds
-# every non-experimental filter by default.
-default = ["full"]
-full = ["praxis-ai/full", "praxis-ai-apis/full", "praxis-test-utils/full"]
-store-postgres = ["full", "praxis-ai/store-postgres", "praxis-ai-apis/store-postgres", "praxis-test-utils/store-postgres"]
-store-sqlite = ["full", "praxis-ai/store-sqlite", "praxis-ai-apis/store-sqlite", "praxis-test-utils/store-sqlite"]
+# Everything except the FIPS tasks: the dev commands run the proxy and read the
+# OpenAI registries, so they build every non-experimental filter. Off inside
+# the FIPS check image, which needs only `cargo xtask fips` and must not
+# compile the standard proxy build to get it.
+default = ["dev"]
+dev = [
+    "dep:praxis-ai",
+    "dep:praxis-ai-apis",
+    "dep:praxis-core",
+    "dep:praxis-test-utils",
+    "dep:quote",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_yaml",
+    "dep:sha2",
+    "dep:syn",
+    "dep:tokio",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "praxis-ai/full",
+    "praxis-ai-apis/full",
+    "praxis-test-utils/full",
+]
+# The previous name of the dev feature set, kept for callers.
+full = ["dev"]
+store-postgres = ["dev", "praxis-ai/store-postgres", "praxis-ai-apis/store-postgres", "praxis-test-utils/store-postgres"]
+store-sqlite = ["dev", "praxis-ai/store-sqlite", "praxis-ai-apis/store-sqlite", "praxis-test-utils/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 
 [lints]
 workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 clap = { workspace = true }
-quote = { workspace = true }
-syn = { workspace = true }
-praxis-ai = { path = "../server", package = "praxis-ai-proxy", default-features = false }
-praxis-ai-apis = { workspace = true }
-praxis-core = { workspace = true }
-praxis-test-utils = { workspace = true }
-reqwest = { workspace = true, features = ["blocking"] }
-serde = { workspace = true }
+flate2 = { workspace = true }
+object = { workspace = true }
+openssl = { workspace = true }
+praxis-ai = { path = "../server", package = "praxis-ai-proxy", default-features = false, optional = true }
+praxis-ai-apis = { workspace = true, optional = true }
+praxis-core = { workspace = true, optional = true }
+praxis-test-utils = { workspace = true, optional = true }
+quote = { workspace = true, optional = true }
+regex = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"], optional = true }
+serde = { workspace = true, optional = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
-sha2 = { workspace = true }
+serde_yaml = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+syn = { workspace = true, optional = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
