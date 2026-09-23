@@ -734,7 +734,8 @@ impl FileSearchClient {
     /// file-search requires a buffered body.
     #[expect(
         clippy::too_many_arguments,
-        reason = "one sub-request threads the shared executor, chain, prepared headers, and SSRF policy"
+        clippy::too_many_lines,
+        reason = "one sub-request stages its target, identity, request, and bounded executor call"
     )]
     async fn execute_request(
         &self,

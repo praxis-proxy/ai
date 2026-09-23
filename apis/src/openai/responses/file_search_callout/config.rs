@@ -155,6 +155,7 @@ pub(crate) struct ValidatedConfig {
 
 /// Build validated config from filter config with a shared sub-request
 /// client.
+#[expect(clippy::too_many_lines, reason = "linear validation and config construction")]
 pub(crate) fn build_config_with_client(
     cfg: &FileSearchFilterConfig,
     client: SubRequestClient,

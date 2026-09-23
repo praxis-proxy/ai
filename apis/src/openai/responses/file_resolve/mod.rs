@@ -438,6 +438,10 @@ impl HttpFilter for FileResolveFilter {
 /// Takes ownership of the parsed body so the resolved value can be moved
 /// into [`ResponsesState`] instead of deep-cloned; nothing reads it after
 /// state synchronization.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential credential staging, resolution, body rewrite, and state synchronization"
+)]
 async fn resolve_and_rewrite(
     filter: &FileResolveFilter,
     ctx: &mut HttpFilterContext<'_>,

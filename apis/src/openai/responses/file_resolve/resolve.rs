@@ -1632,6 +1632,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines, reason = "one assertion per supported reference shape")]
     fn file_id_preflight_matches_resolver_and_excludes_file_url() {
         let file_id = serde_json::json!({
             "input": [{

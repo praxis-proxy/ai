@@ -8,6 +8,7 @@
 //! filter does not depend on the network-fetching resolver.
 
 /// Return the immutable content parts array for a given input item, if applicable.
+#[cfg(feature = "openai-file-resolve-filter")]
 pub(crate) fn content_parts(item: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
     match item.get("type").and_then(serde_json::Value::as_str) {
         Some("message") => item.get("content").and_then(serde_json::Value::as_array),

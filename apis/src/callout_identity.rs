@@ -58,6 +58,7 @@ impl CalloutIdentity {
 ///
 /// Callers invoke this during configuration and retain the result, preventing a malformed
 /// authority from degrading at request time into a silently unauthenticated callout.
+#[cfg(any(test, feature = "openai-responses"))]
 pub(crate) fn credential_authority(filter_name: &str, raw_url: &str) -> Result<String, FilterError> {
     let url = url::Url::parse(raw_url).map_err(|error| -> FilterError {
         format!("{filter_name}: target URL is not a valid URL for credential binding: {error}").into()
@@ -130,7 +131,7 @@ pub(crate) fn stage_callout_identity(
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::panic, reason = "tests")]
+#[expect(clippy::expect_used, clippy::panic, clippy::unwrap_used, reason = "tests")]
 mod tests {
     use http::Method;
     use secrecy::SecretString;
