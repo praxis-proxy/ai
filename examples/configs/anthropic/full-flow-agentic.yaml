@@ -13,6 +13,8 @@
 #     the managed `WebSearch` tool-use block is suppressed.
 #   * `"stream": false` -> the same loop runs buffered and returns one final
 #     Anthropic Messages JSON object.
+# Each nested web-search callout continues the request trace with the same
+# request/trace IDs and a fresh outbound span ID.
 #
 # Because the inference step may stream its response, every response filter in
 # that step uses `BodyMode::Stream`; `anthropic_web_search` rewrites the SSE body
@@ -55,6 +57,10 @@ listeners:
 filter_chains:
   - name: full-flow-agentic
     filters:
+      - filter: trace_context
+        # Establish typed correlation before IRR snapshots request extensions;
+        # Praxis core creates a fresh span ID for each search callout hop.
+
       - filter: callout_credentials
         # This filter establishes typed request context and strips the source
         # header; the trusted boundary remains responsible for its provenance.

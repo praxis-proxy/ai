@@ -27,6 +27,7 @@ use crate::{
 fn shared_key_identity() -> CalloutIdentity {
     CalloutIdentity {
         owner: None,
+        trace_context: None,
         user_credential: None,
     }
 }

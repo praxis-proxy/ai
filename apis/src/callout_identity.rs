@@ -6,7 +6,9 @@
 //! staged into the nested filtered-subrequest so the callout carries the caller's identity and a
 //! per-user credential instead of a single shared provider key.
 
-use praxis_filter::{DeferredCredential, FilterError, HttpFilterContext, PendingCredentials, RequestExtensions};
+use praxis_filter::{
+    DeferredCredential, FilterError, HttpFilterContext, PendingCredentials, RequestExtensions, TraceContext,
+};
 use secrecy::{ExposeSecret as _, SecretString};
 
 #[cfg(feature = "openai-mcp-tools")]
@@ -18,18 +20,23 @@ use crate::{CalloutCredentials, state_owner::StateOwner};
 pub(crate) struct CalloutIdentity {
     /// The caller's trusted subject/tenant attribution, projected into the child subrequest.
     pub(crate) owner: Option<StateOwner>,
+    /// Approved request correlation projected into the child subrequest.
+    pub(crate) trace_context: Option<TraceContext>,
     /// The per-user secret to inject, when a credential slot is configured and populated.
     pub(crate) user_credential: Option<SecretString>,
 }
 
 impl CalloutIdentity {
-    /// Project trusted attribution into an isolated child request.
+    /// Project approved request context into an isolated child request.
     ///
     /// The credential deliberately is not inserted directly: each callout binds
     /// it to its own validated destination as a [`praxis_filter::DeferredCredential`].
-    pub(crate) fn project_owner_into(&self, child: &mut RequestExtensions) {
+    pub(crate) fn project_context_into(&self, child: &mut RequestExtensions) {
         if let Some(owner) = self.owner.as_ref() {
             child.insert(owner.clone());
+        }
+        if let Some(trace_context) = self.trace_context.as_ref() {
+            child.insert(trace_context.clone());
         }
     }
 
@@ -44,7 +51,7 @@ impl CalloutIdentity {
         authority: &str,
         header: http::HeaderName,
     ) -> Result<(), FilterError> {
-        self.project_owner_into(child);
+        self.project_context_into(child);
         let Some(secret) = self.user_credential.as_ref() else {
             return Ok(());
         };
@@ -206,6 +213,7 @@ pub(crate) fn stage_callout_identity(
     slot: Option<&str>,
 ) -> Result<CalloutIdentity, CalloutContextMissing> {
     let owner = ctx.extensions.get::<StateOwner>().cloned();
+    let trace_context = ctx.extensions.get::<TraceContext>().cloned();
 
     let user_credential = match slot {
         None => None,
@@ -223,13 +231,18 @@ pub(crate) fn stage_callout_identity(
         },
     };
 
-    Ok(CalloutIdentity { owner, user_credential })
+    Ok(CalloutIdentity {
+        owner,
+        trace_context,
+        user_credential,
+    })
 }
 
 #[cfg(test)]
 #[expect(clippy::expect_used, clippy::panic, clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use http::Method;
+    use http::{HeaderValue, Method};
+    use praxis_filter::builtins::TraceContextFilter;
     use secrecy::SecretString;
 
     use super::*;
@@ -245,6 +258,7 @@ mod tests {
 
         let id = stage_callout_identity(&ctx, None).expect("no slot must succeed");
         assert!(id.owner.is_none(), "no state_owner ran, so owner is absent");
+        assert!(id.trace_context.is_none(), "no trace_context ran, so tracing is absent");
         assert!(id.user_credential.is_none(), "no slot configured, so no credential");
     }
 
@@ -259,6 +273,43 @@ mod tests {
         let owner = id.owner.expect("owner captured from ctx");
         assert_eq!(owner.tenant_id(), "tenant-a");
         assert_eq!(owner.subject(), "subject-a");
+    }
+
+    #[tokio::test]
+    async fn trace_context_is_the_only_additional_parent_extension_projected() {
+        #[derive(Debug)]
+        struct UnrelatedParentState;
+
+        let mut req = make_request(Method::POST, "/v1/responses");
+        req.headers
+            .insert("x-request-id", HeaderValue::from_static("request-parent"));
+        req.headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        let mut ctx = make_filter_context(&req);
+        ctx.extensions.insert(UnrelatedParentState);
+        let filter = TraceContextFilter::from_config(&serde_yaml::from_str("{}").expect("valid config"))
+            .expect("trace_context filter");
+        let _action = filter.on_request(&mut ctx).await.expect("trace context established");
+
+        let parent = ctx
+            .extensions
+            .get::<TraceContext>()
+            .expect("trace_context filter establishes typed context")
+            .clone();
+        let identity = stage_callout_identity(&ctx, None).expect("callout context stages");
+        let mut child = RequestExtensions::default();
+        identity.project_context_into(&mut child);
+
+        let projected = child.get::<TraceContext>().expect("trace context projected");
+        assert_eq!(projected.request_id(), parent.request_id());
+        assert_eq!(projected.trace_id(), parent.trace_id());
+        assert_eq!(projected.flags(), parent.flags());
+        assert!(
+            child.get::<UnrelatedParentState>().is_none(),
+            "ambient parent extensions must remain isolated"
+        );
     }
 
     #[test]
@@ -321,6 +372,7 @@ mod tests {
     fn stages_owner_and_exact_authority_credential() {
         let identity = CalloutIdentity {
             owner: Some(StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap()),
+            trace_context: None,
             user_credential: Some(SecretString::from("Bearer user-a")),
         };
         let mut child = RequestExtensions::default();

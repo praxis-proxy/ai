@@ -7,7 +7,9 @@
 # and streaming (`stream: true`) responses. This is the single config an
 # operator would deploy for a Responses API gateway that must serve the
 # full agentic loop, the Conversations API, and the dedicated
-# prompts/embeddings/files/vector_stores services behind one listener.
+# prompts/embeddings/files/vector_stores services behind one listener. The
+# request trace is continued through every nested web-search, OGX, and MCP
+# callout with a fresh span ID per hop.
 #
 # Pre-IRR filters run once on the client request to set up shared state
 # (ResponsesState) which persists across all IRR iterations via extension
@@ -305,6 +307,11 @@ listeners:
 filter_chains:
   - name: full-flow-agentic-pipeline
     filters:
+      - filter: trace_context
+        # Establish typed correlation before IRR snapshots request extensions.
+        # Child callouts retain this request/trace identity while Praxis core
+        # creates a fresh span ID for each outbound hop.
+
       - filter: state_owner
         # These source names are deployment-specific. The authentication
         # boundary must overwrite them and prevent clients from bypassing it.

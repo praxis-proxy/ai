@@ -428,7 +428,7 @@ impl SearchClient {
         if let Some(pending) = pending {
             extensions.insert(pending);
         }
-        identity.project_owner_into(&mut extensions);
+        identity.project_context_into(&mut extensions);
         Some(extensions)
     }
 
@@ -958,6 +958,7 @@ mod tests {
     fn shared_key_identity() -> CalloutIdentity {
         CalloutIdentity {
             owner: None,
+            trace_context: None,
             user_credential: None,
         }
     }
@@ -1606,8 +1607,8 @@ mod tests {
         let config = brave_config_with_shared_key("shared-secret");
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
         let identity = CalloutIdentity {
-            owner: None,
             user_credential: Some(SecretString::from("per-user-secret".to_owned())),
+            ..shared_key_identity()
         };
         let url = format!("http://{addr}/res/v1/web/search?q=test&count=5");
         let request = test_get_request();
@@ -1637,6 +1638,7 @@ mod tests {
             .unwrap();
         let identity = CalloutIdentity {
             owner: Some(crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap()),
+            trace_context: None,
             user_credential: None,
         };
         let ext = client

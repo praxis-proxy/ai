@@ -36,7 +36,7 @@ use praxis_core::{
 use praxis_filter::{
     BodyMode, CalloutOutcome, CalloutResponse, ChainBindingContext, FilterEntry, FilterError, FilterPipeline,
     FilterRegistry, FilteredSubrequestExecutor, HttpFilterContext, IterationState, RequestExtensions, StagedUpstream,
-    StagedUpstreamFallback, StreamingResponseBody, SubRequest, SubResponse, SubrequestRuntime,
+    StagedUpstreamFallback, StreamingResponseBody, SubRequest, SubResponse, SubrequestRuntime, TraceContext,
 };
 use rmcp::{
     model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage},
@@ -361,6 +361,8 @@ pub(crate) struct McpCallout {
     pipeline: Arc<FilterPipeline>,
     /// Sub-request nesting depth for callouts issued from this context.
     depth: u8,
+    /// Approved request correlation projected into every MCP exchange.
+    trace_context: Option<TraceContext>,
     /// Whether private/loopback MCP destinations are permitted, taken from the
     /// bound pipeline's finalized posture (never a per-filter opt-in).
     allow_private: bool,
@@ -392,11 +394,13 @@ impl McpCallout {
             ctx.extensions.get::<IterationState>().map(IterationState::depth),
             &ctx.request.headers,
         );
+        let trace_context = ctx.extensions.get::<TraceContext>().cloned();
         Some(Self {
             client,
             downstream,
             pipeline,
             depth,
+            trace_context,
             allow_private,
         })
     }
@@ -421,6 +425,7 @@ impl McpCallout {
             downstream: SubrequestRuntime::new(None, false, None, Instant::now()),
             pipeline,
             depth: 0,
+            trace_context: None,
             allow_private,
         })
     }
@@ -651,6 +656,9 @@ impl McpSubrequestClient {
         extensions.insert(fallback);
         if let Some(owner) = self.owner.as_ref() {
             extensions.insert(owner.clone());
+        }
+        if let Some(trace_context) = self.callout.trace_context.as_ref() {
+            extensions.insert(trace_context.clone());
         }
 
         let executor = FilteredSubrequestExecutor::for_callout(
@@ -1598,7 +1606,11 @@ fn parse_buffered_sse_terminal(body: &[u8]) -> Option<ServerJsonRpcMessage> {
 mod tests {
     use std::net::SocketAddr;
 
+    use http::HeaderValue;
+    use praxis_filter::builtins::TraceContextFilter;
+
     use super::*;
+    use crate::test_utils::{make_filter_context, make_request};
 
     // -- Reserved-header hygiene (codex finding: reserved MCP session header) ---
 
@@ -1747,6 +1759,52 @@ mod tests {
         )
         .expect("deserialize tools/call");
         assert_eq!(client.response_limit(&call), MAX_CONTROL_RESPONSE_BYTES);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test establishes trusted parent context and inspects one staged MCP exchange"
+    )]
+    async fn mcp_projects_trace_context_into_every_prepared_exchange() {
+        let mut request = make_request(Method::POST, "/v1/responses");
+        request
+            .headers
+            .insert("x-request-id", HeaderValue::from_static("request-parent"));
+        request.headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        let mut context = make_filter_context(&request);
+        let filter = TraceContextFilter::from_config(&serde_yaml::from_str("{}").expect("valid config"))
+            .expect("trace_context filter");
+        let _action = filter
+            .on_request(&mut context)
+            .await
+            .expect("trace context established");
+        let parent = context
+            .extensions
+            .get::<TraceContext>()
+            .expect("typed trace context")
+            .clone();
+        let pipeline = build_bare_outbound_pipeline(true).expect("outbound pipeline");
+        let callout = McpCallout::from_context(&context, pipeline).expect("MCP callout context");
+        let client = McpSubrequestClient::control(callout, Duration::from_secs(5), None);
+
+        let (_executor, _request, extensions, _deadline) = client
+            .prepare_staged_request(
+                Method::POST,
+                "http://127.0.0.1:8321/mcp",
+                Bytes::new(),
+                HeaderMap::new(),
+                MAX_CONTROL_RESPONSE_BYTES,
+            )
+            .await
+            .expect("request prepares without dialing");
+        let projected = extensions.get::<TraceContext>().expect("trace context projected");
+        assert_eq!(projected.request_id(), parent.request_id());
+        assert_eq!(projected.trace_id(), parent.trace_id());
+        assert_eq!(projected.flags(), parent.flags());
     }
 
     // -- SSRF hook (codex finding: chain propagates real posture) --------------
