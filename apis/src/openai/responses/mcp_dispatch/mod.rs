@@ -880,7 +880,10 @@ impl HttpFilter for McpDispatchFilter {
             matches!(index.get(name), Some(McpToolMatch::Unique { entry, .. }) if is_connector_tool_entry(entry))
         });
         let needs_connector_context = needs_discovery || has_connector_calls;
-        debug_assert!(!needs_connector_context || has_connector_state);
+        debug_assert!(
+            !needs_connector_context || has_connector_state,
+            "connector calls or discovery must originate from staged connector state"
+        );
 
         // Capture the parent transport and downstream attributes once, pairing
         // them with the bound outbound pipeline. Both deferred `tools/list`
