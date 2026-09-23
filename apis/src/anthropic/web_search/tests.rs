@@ -69,7 +69,7 @@ outbound_chain: web_search_outbound
     .unwrap();
     let config: WebSearchFilterConfig = parse_filter_config(FILTER_NAME, &config).unwrap();
     let validated = build_config(FILTER_NAME, &config).unwrap();
-    let client = crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+    let client = crate::subrequest::isolated_client(4);
     let search_client = SearchClient::from_config(FILTER_NAME, &validated, client).unwrap();
     // Bind a minimal builtin-only outbound chain; the executor seeds the staged
     // upstream from the search client and still enforces SSRF/TLS/Host, and

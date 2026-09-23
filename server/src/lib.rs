@@ -111,6 +111,7 @@ mod tests {
     use super::*;
 
     fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
+        praxis_tls::provider::install();
         praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
     }
 

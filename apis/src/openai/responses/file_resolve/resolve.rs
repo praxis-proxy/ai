@@ -1012,7 +1012,7 @@ mod tests {
     fn test_api_client(api_base_url: &str, timeout_ms: u64) -> ApiClient {
         ApiClient::new(ApiClientConfig {
             api_base_url: api_base_url.to_owned(),
-            client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+            client: crate::subrequest::isolated_client(4),
             timeout: std::time::Duration::from_millis(timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),

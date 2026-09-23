@@ -81,6 +81,7 @@ praxis-core = { workspace = true }
 # chain-binding: ChainBindingContext for register.rs outbound-chain wiring.
 # Off-by-default experimental feature in praxis 0.6.0 (no extra dependencies).
 praxis-filter = { workspace = true, features = ["chain-binding"] }
+praxis-tls = { workspace = true }
 redis = { workspace = true, optional = true }
 rand = { workspace = true }
 reqwest = { workspace = true, optional = true }
@@ -97,7 +98,6 @@ url = { workspace = true }
 zeroize = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
-praxis-tls = { workspace = true }
 metrics-util = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

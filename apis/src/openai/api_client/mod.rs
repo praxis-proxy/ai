@@ -586,12 +586,10 @@ mod tests {
         }
     }
 
-    use praxis_core::subrequest::SubRequestConnector;
-
     fn test_client(base_url: &str) -> ApiClient {
         ApiClient::new(ApiClientConfig {
             api_base_url: base_url.to_owned(),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
@@ -625,7 +623,7 @@ mod tests {
     fn forward_headers_copies_configured_headers() {
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: "http://ogx:8321".to_owned(),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: vec![
@@ -659,7 +657,7 @@ mod tests {
     fn forward_headers_skips_connection_nominated_fields() {
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: "http://ogx:8321".to_owned(),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: vec![
@@ -970,7 +968,7 @@ mod tests {
 
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: format!("http://{address}"),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: vec![http::header::CONTENT_TYPE],
@@ -1225,7 +1223,7 @@ mod tests {
 
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: format!("http://{addr}"),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(50),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),

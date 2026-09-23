@@ -59,6 +59,7 @@ praxis-core = { workspace = true }
 # bind_chain for outbound callout chains. Both are off-by-default experimental
 # features in praxis 0.6.0 that carry no extra dependencies.
 praxis-filter = { workspace = true, features = ["iterative-request-router", "chain-binding"] }
+praxis-tls = { workspace = true }
 reqwest = { workspace = true, optional = true }
 rmcp = { workspace = true, optional = true }
 secrecy = { workspace = true }
@@ -76,7 +77,6 @@ utoipa = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
-praxis-tls = { workspace = true }
 allocation-counter = { workspace = true }
 axum = { workspace = true }
 rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }

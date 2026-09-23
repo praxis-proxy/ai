@@ -38,7 +38,6 @@ use praxis_ai_apis::{
     callout_target::AddressPolicy,
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
 };
-use praxis_core::subrequest::SubRequestConnector;
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
 };
@@ -204,7 +203,7 @@ impl ExternalMeteringFilter {
     ///
     /// [`from_config_with_client`]: Self::from_config_with_client
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let client = SubRequestClient::new(SubRequestConnector::new(PRIVATE_POOL_SIZE, None));
+        let client = crate::isolated_subrequest_client(PRIVATE_POOL_SIZE);
         Ok(Box::new(Self::build(config, client)?))
     }
 

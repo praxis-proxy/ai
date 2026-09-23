@@ -54,6 +54,16 @@ pub use time_to_first_token::TimeToFirstTokenFilter;
 pub use token_rate_limit::TokenRateLimitFilter;
 pub use token_usage::{TokenCountFilter, TokenUsageHeadersFilter};
 
+/// Build an isolated client after installing the process-wide crypto provider.
+///
+/// Constructing a connector creates a rustls client configuration, so provider
+/// installation must happen at this boundary rather than relying on a binary
+/// entry point having run first.
+fn isolated_subrequest_client(pool_size: usize) -> praxis_core::subrequest::SubRequestClient {
+    praxis_tls::provider::install();
+    praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(pool_size, None))
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------

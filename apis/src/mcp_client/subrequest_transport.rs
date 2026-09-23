@@ -28,8 +28,6 @@ use std::{
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-#[cfg(test)]
-use praxis_core::subrequest::SubRequestConnector;
 use praxis_core::{
     config::ChainRef,
     connectivity::{UrlTargetError, prepare_url_target},
@@ -418,7 +416,7 @@ impl McpCallout {
     pub(crate) fn fabricated(allow_private: bool) -> Result<Self, McpClientError> {
         let pipeline = build_bare_outbound_pipeline(allow_private)?;
         Ok(Self {
-            client: SubRequestClient::new(SubRequestConnector::new(1, None)),
+            client: crate::subrequest::isolated_client(1),
             downstream: SubrequestRuntime::new(None, false, None, Instant::now()),
             pipeline,
             depth: 0,

@@ -26,23 +26,58 @@ const OPENSSL_PREFIXES: &[&str] = &["EVP_", "SSL_", "OSSL_", "RAND_"];
 pub(crate) fn section(report: &mut Report, binary: Option<&Path>) {
     report.section("Binary");
     let Some(binary) = binary else {
-        report.warn("no binary given; build one (make release-fips) and pass its path");
+        report.fail(Finding {
+            title: "no binary was provided".to_owned(),
+            why: "a full report cannot assess linkage, symbols, or embedded dependency metadata without the shipped \
+                  binary"
+                .to_owned(),
+            location: "the binary argument to `cargo xtask fips report`".to_owned(),
+            fix: "build one with `make release-fips` and pass its path, or use --deps-only for an intentionally \
+                  dependency-only report"
+                .to_owned(),
+        });
         return;
     };
     if !binary.is_file() {
-        report.warn(&format!("binary not found at {}; skipped", binary.display()));
+        report.fail(Finding {
+            title: "the binary does not exist or is not a regular file".to_owned(),
+            why: "a full report must inspect the exact artifact that will ship".to_owned(),
+            location: binary.display().to_string(),
+            fix: "pass the FIPS release binary, or use --deps-only for an intentionally dependency-only report"
+                .to_owned(),
+        });
         return;
     }
     report.info(&format!("path: {}", binary.display()));
+    let data = match std::fs::read(binary) {
+        Ok(data) => data,
+        Err(err) => {
+            report.fail(Finding {
+                title: "could not read the binary".to_owned(),
+                why: "the report cannot assess symbols or embedded dependency metadata without reading the artifact"
+                    .to_owned(),
+                location: format!("{}: {err}", binary.display()),
+                fix: "make the artifact readable and rerun the full report".to_owned(),
+            });
+            return;
+        },
+    };
+    let file = match object::File::parse(&*data) {
+        Ok(file) => file,
+        Err(err) => {
+            report.fail(Finding {
+                title: "the binary is not a supported ELF file".to_owned(),
+                why: "the shipped Linux artifact must be inspected; silently skipping an unknown format can produce \
+                      a false clean result"
+                    .to_owned(),
+                location: format!("{}: {err}", binary.display()),
+                fix: "pass the Linux FIPS release binary, or use --deps-only on a non-Linux development host"
+                    .to_owned(),
+            });
+            return;
+        },
+    };
     linkage(report, binary);
-    let Ok(data) = std::fs::read(binary) else {
-        report.warn("could not read the binary; ELF checks skipped");
-        return;
-    };
-    let Ok(file) = object::File::parse(&*data) else {
-        report.warn("not an ELF file; ELF checks skipped");
-        return;
-    };
     defined_symbols(report, &file);
     imports(report, &file);
     manifest(report, &file, binary);
@@ -55,10 +90,34 @@ pub(crate) fn section(report: &mut Report, binary: Option<&Path>) {
 
 /// Which libcrypto the dynamic loader resolves, according to ldd.
 fn linkage(report: &mut Report, binary: &Path) {
-    let Ok(output) = Command::new("ldd").arg(binary).output() else {
-        report.warn("ldd not found; dynamic linkage not checked");
-        return;
+    let output = match Command::new("ldd").arg(binary).output() {
+        Ok(output) => output,
+        Err(err) => {
+            report.fail(Finding {
+                title: "could not inspect dynamic linkage with ldd".to_owned(),
+                why: "the report cannot prove that cryptography resolves to the system libcrypto without inspecting \
+                      dynamic linkage"
+                    .to_owned(),
+                location: format!("{}: {err}", binary.display()),
+                fix: "run the full report in the Linux FIPS build environment, or use --deps-only on this host"
+                    .to_owned(),
+            });
+            return;
+        },
     };
+    if !output.status.success() {
+        report.fail(Finding {
+            title: "ldd could not inspect the binary".to_owned(),
+            why: "the report cannot prove that cryptography resolves to the system libcrypto when ldd fails".to_owned(),
+            location: format!(
+                "{}: {}",
+                binary.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            fix: "pass the Linux FIPS release binary and rerun the full report in its build environment".to_owned(),
+        });
+        return;
+    }
     let ldd = String::from_utf8_lossy(&output.stdout);
     if ldd.lines().any(is_system_libcrypto) {
         report.ok("dynamically links the system libcrypto.so.3");
@@ -386,6 +445,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_full_report_requires_a_binary() {
+        let mut report = Report::default();
+        section(&mut report, None);
+        assert!(report.has_finding("no binary was provided"));
+    }
+
+    #[test]
+    fn a_non_elf_binary_is_a_finding() {
+        let mut binary = tempfile::NamedTempFile::new().expect("temporary file");
+        binary.write_all(b"not an ELF binary").expect("temporary binary");
+        let mut report = Report::default();
+        section(&mut report, Some(binary.path()));
+        assert!(report.has_finding("not a supported ELF file"));
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_test_binary_itself_is_a_rust_elf_and_the_symbol_scan_sees_what_it_links() {
         let me = std::env::current_exe().expect("the test binary has a path");

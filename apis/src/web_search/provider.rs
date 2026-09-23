@@ -801,9 +801,8 @@ mod tests {
         // suite's parallelism concurrent macOS keychain reads intermittently fail
         // `build_connector().unwrap()`. A shared client keyed per-destination is
         // the same pattern `crate::test_utils::TEST_SUBREQUEST_CLIENT` uses.
-        static CLIENT: std::sync::LazyLock<SubRequestClient> = std::sync::LazyLock::new(|| {
-            SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None))
-        });
+        static CLIENT: std::sync::LazyLock<SubRequestClient> =
+            std::sync::LazyLock::new(|| crate::subrequest::isolated_client(4));
         CLIENT.clone()
     }
 
