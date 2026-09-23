@@ -22,8 +22,11 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
+use secrecy::{ExposeSecret as _, SecretString};
+
 use crate::{
-    hash::Sha256, openai::responses::openai_mcp_tool_resolve::encode_function_name, store::PendingApprovalRecord,
+    StateOwner, hash::Sha256, openai::responses::openai_mcp_tool_resolve::encode_function_name,
+    store::PendingApprovalRecord,
 };
 
 // -----------------------------------------------------------------------------
@@ -35,6 +38,10 @@ const APPROVAL_RESPONSE_TYPE: &str = "mcp_approval_response";
 
 /// Private tool-map field binding approvals to ambient connector identity.
 const FORWARDED_HEADERS_FINGERPRINT: &str = "_praxis_forwarded_headers_fingerprint";
+/// Private stable-owner binding carried only in the in-memory MCP tool map.
+pub(crate) const OWNER_FINGERPRINT: &str = "_praxis_owner_fingerprint";
+/// Private effective-bearer binding carried only in the in-memory MCP tool map.
+const CREDENTIAL_FINGERPRINT: &str = "_praxis_credential_fingerprint";
 
 /// A parsed client-supplied `mcp_approval_response`.
 ///
@@ -265,6 +272,8 @@ pub(crate) fn target_fingerprint(entry: &serde_json::Value) -> String {
         "authorization",
         "connector_id",
         FORWARDED_HEADERS_FINGERPRINT,
+        OWNER_FINGERPRINT,
+        CREDENTIAL_FINGERPRINT,
     ] {
         hash_segment(&mut hasher, field.as_bytes());
         hash_segment(&mut hasher, &scalar_bytes(entry.get(field)));
@@ -290,6 +299,71 @@ pub(crate) fn target_fingerprint(entry: &serde_json::Value) -> String {
             hash_segment(&mut hasher, &scalar_bytes(headers.get(key)));
         }
     }
+    hex_digest(hasher.finish())
+}
+
+/// Bind a connector entry to its effective request-scoped bearer.
+///
+/// Only a domain-separated digest enters the in-memory tool map and approval
+/// fingerprint. The raw credential remains in request-scoped secret storage.
+/// Direct client-selected URLs never retain this private binding.
+pub(crate) fn bind_credential_context(entry: &mut serde_json::Value, credential: Option<&SecretString>) {
+    let connector = super::is_connector_tool_entry(entry);
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+    if connector {
+        if let Some(credential) = credential {
+            object.insert(
+                CREDENTIAL_FINGERPRINT.to_owned(),
+                serde_json::Value::String(credential_fingerprint(credential)),
+            );
+        } else {
+            object.remove(CREDENTIAL_FINGERPRINT);
+        }
+    } else {
+        object.remove(CREDENTIAL_FINGERPRINT);
+    }
+}
+
+/// Bind a connector entry to the full trusted owner tuple.
+///
+/// The digest is domain-separated and versioned. Raw identity components never
+/// enter approval records or client-visible items.
+pub(crate) fn bind_owner_context(entry: &mut serde_json::Value, owner: Option<&StateOwner>) {
+    let connector = super::is_connector_tool_entry(entry);
+    let Some(object) = entry.as_object_mut() else {
+        return;
+    };
+    if connector {
+        if let Some(owner) = owner {
+            object.insert(
+                OWNER_FINGERPRINT.to_owned(),
+                serde_json::Value::String(owner_fingerprint(owner)),
+            );
+        } else {
+            object.remove(OWNER_FINGERPRINT);
+        }
+    } else {
+        object.remove(OWNER_FINGERPRINT);
+    }
+}
+
+/// Stable, process-independent digest of `(tenant_id, issuer, subject)`.
+pub(crate) fn owner_fingerprint(owner: &StateOwner) -> String {
+    let mut hasher = Sha256::new();
+    hash_segment(&mut hasher, b"praxis.ai/mcp-owner/v1");
+    hash_segment(&mut hasher, owner.tenant_id().as_bytes());
+    hash_segment(&mut hasher, owner.issuer().as_bytes());
+    hash_segment(&mut hasher, owner.subject().as_bytes());
+    hex_digest(hasher.finish())
+}
+
+/// Stable digest of the effective connector bearer without retaining it.
+fn credential_fingerprint(credential: &SecretString) -> String {
+    let mut hasher = Sha256::new();
+    hash_segment(&mut hasher, b"praxis.ai/mcp-credential/v1");
+    hash_segment(&mut hasher, credential.expose_secret().as_bytes());
     hex_digest(hasher.finish())
 }
 

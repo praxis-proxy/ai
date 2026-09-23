@@ -25,10 +25,7 @@ use crate::{
 
 /// A callout identity with no owner and no per-user credential (shared-key path).
 fn shared_key_identity() -> CalloutIdentity {
-    CalloutIdentity {
-        owner: None,
-        user_credential: None,
-    }
+    CalloutIdentity::for_test(None, None)
 }
 
 fn test_filter() -> Box<dyn HttpFilter> {
@@ -1496,7 +1493,7 @@ fn present_required_credential_resolves_to_per_user_secret() {
 
     assert_eq!(
         identity
-            .user_credential
+            .user_credential()
             .expect("per-user secret present")
             .expose_secret(),
         "user-secret"
@@ -1514,7 +1511,7 @@ fn absent_slot_resolves_without_a_credential() {
         .expect("no configured slot resolves without a credential");
 
     assert!(
-        identity.user_credential.is_none(),
+        identity.user_credential().is_none(),
         "no slot configured means no per-user credential is selected"
     );
 }

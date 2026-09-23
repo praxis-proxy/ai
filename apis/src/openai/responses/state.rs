@@ -394,6 +394,16 @@ pub(crate) struct ResponsesState {
     )]
     pub deferred_mcp: Vec<DeferredMcpConnector>,
 
+    /// Slot policy under which configured MCP connector state was resolved.
+    ///
+    /// `openai_mcp_tool_resolve` records this while building MCP state.
+    /// `openai_mcp_dispatch` compares it with its own configuration before
+    /// issuing a configured-connector callout, preventing discovery and
+    /// execution from silently using different request-scoped credential or
+    /// authorization slots. Direct `server_url` entries ignore this field.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub mcp_connector_context_policy: McpConnectorContextPolicy,
+
     /// Maximum number of built-in tool invocations.
     ///
     /// Enforced by built-in tool filters across retained output.
@@ -791,6 +801,30 @@ pub(crate) struct DeferredMcpConnector {
     pub timeout: Duration,
 }
 
+/// Request-scoped slot policy bound to configured MCP connector state.
+///
+/// This contains slot identifiers only, never credential or assertion values.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct McpConnectorContextPolicy {
+    /// Per-user bearer slot configured on the resolver.
+    credential_slot: Option<String>,
+
+    /// Opaque authorization-assertion slot configured on the resolver.
+    authorization_slot: Option<String>,
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+impl McpConnectorContextPolicy {
+    /// Snapshot a filter's configured connector-context slots.
+    pub(crate) fn new(credential_slot: Option<&str>, authorization_slot: Option<&str>) -> Self {
+        Self {
+            credential_slot: credential_slot.map(str::to_owned),
+            authorization_slot: authorization_slot.map(str::to_owned),
+        }
+    }
+}
+
 impl fmt::Debug for DeferredMcpConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeferredMcpConnector")
@@ -835,6 +869,8 @@ impl Default for ResponsesState {
             input: Vec::new(),
             iteration: 0,
             deferred_mcp: Vec::new(),
+            #[cfg(feature = "openai-mcp-tools")]
+            mcp_connector_context_policy: McpConnectorContextPolicy::default(),
             max_tool_calls: None,
             mcp_approval_state: McpApprovalState::None,
             deferred_tool_limit_completion: false,

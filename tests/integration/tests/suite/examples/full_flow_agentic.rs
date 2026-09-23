@@ -1406,6 +1406,18 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         credentials_index < irr_index,
         "callout_credentials must capture and strip ingress secrets before IRR"
     );
+    let authorization_index = outer_filters
+        .iter()
+        .position(|filter| filter["filter"].as_str() == Some("callout_authorization"))
+        .expect("full-flow must establish the MCP assertion");
+    assert!(
+        authorization_index < irr_index,
+        "callout_authorization must capture and strip its assertion before IRR"
+    );
+    assert_eq!(
+        outer_filters[authorization_index]["assertion_slot"].as_str(),
+        Some("mcp_gateway")
+    );
 
     let credentials = outer_filters[credentials_index]["credentials"]
         .as_sequence()
@@ -1424,6 +1436,12 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         Some("x-user-brave-key"),
         "the example must name its trusted ingress source explicitly"
     );
+    let mcp_credential = credentials
+        .iter()
+        .find(|credential| credential["slot"].as_str() == Some("mcp_gateway"))
+        .expect("MCP gateway slot must be declared");
+    assert_eq!(mcp_credential["slot"].as_str(), Some("mcp_gateway"));
+    assert_eq!(mcp_credential["source_header"].as_str(), Some("x-user-mcp-key"));
 
     let web_search = outer_filters[irr_index]["steps"][0]["filters"]
         .as_sequence()
@@ -1454,6 +1472,21 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .find(|filter| filter["filter"].as_str() == Some("openai_file_search_callout"))
         .expect("IRR inference step should contain openai_file_search_callout");
     assert_eq!(file_search["user_credential"].as_str(), Some("ogx_files"));
+
+    let mcp_resolve = outer_filters
+        .iter()
+        .find(|filter| filter["filter"].as_str() == Some("openai_mcp_tool_resolve"))
+        .expect("outer chain should contain openai_mcp_tool_resolve");
+    assert_eq!(mcp_resolve["user_credential"].as_str(), Some("mcp_gateway"));
+    assert_eq!(mcp_resolve["authorization_assertion"].as_str(), Some("mcp_gateway"));
+    let mcp_dispatch = outer_filters[irr_index]["steps"][0]["filters"]
+        .as_sequence()
+        .expect("IRR inference step should contain filters")
+        .iter()
+        .find(|filter| filter["filter"].as_str() == Some("openai_mcp_dispatch"))
+        .expect("IRR inference step should contain openai_mcp_dispatch");
+    assert_eq!(mcp_dispatch["user_credential"].as_str(), Some("mcp_gateway"));
+    assert_eq!(mcp_dispatch["authorization_assertion"].as_str(), Some("mcp_gateway"));
 }
 
 #[test]

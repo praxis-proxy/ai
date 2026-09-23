@@ -41,6 +41,16 @@ pub(super) const MIN_RETAINED_RESULT_BYTES: usize = 1_024;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpDispatchConfig {
+    /// Optional per-user bearer slot from `callout_credentials`. Must match the
+    /// corresponding `openai_mcp_tool_resolve` setting.
+    #[serde(default)]
+    pub user_credential: Option<String>,
+
+    /// Optional opaque assertion slot from `callout_authorization`. Must match
+    /// the corresponding `openai_mcp_tool_resolve` setting.
+    #[serde(default)]
+    pub authorization_assertion: Option<String>,
+
     /// Inline outbound filter chain the MCP `tools/call` callout runs through.
     ///
     /// `openai_mcp_dispatch` runs inside an `iterative_request_router` step. praxis
@@ -65,7 +75,9 @@ pub(crate) struct McpDispatchConfig {
     #[serde(default)]
     pub forward_headers: Vec<String>,
 
-    /// Per-call timeout in milliseconds for `tools/call` calls.
+    /// Per-call timeout in milliseconds for `tools/call` calls. Inside an
+    /// iterative request router, every MCP exchange is capped by the router's
+    /// remaining deadline.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 
@@ -119,6 +131,8 @@ fn default_max_total_result_bytes() -> usize {
 pub(crate) fn build_config(mut cfg: McpDispatchConfig) -> Result<McpDispatchConfig, FilterError> {
     crate::openai::api_client::validate_forward_headers("openai_mcp_dispatch", &mut cfg.forward_headers)?;
     reject_mcp_sensitive_forward_headers("openai_mcp_dispatch", &cfg.forward_headers)?;
+    validate_context_slot("user_credential", cfg.user_credential.as_deref())?;
+    validate_context_slot("authorization_assertion", cfg.authorization_assertion.as_deref())?;
     if cfg.timeout_ms == 0 {
         return Err("openai_mcp_dispatch: timeout_ms must be greater than 0".into());
     }
@@ -164,6 +178,16 @@ pub(crate) fn build_config(mut cfg: McpDispatchConfig) -> Result<McpDispatchConf
         );
     }
     Ok(cfg)
+}
+
+/// Validate one optional request-scoped context slot name.
+fn validate_context_slot(field: &str, slot: Option<&str>) -> Result<(), FilterError> {
+    if let Some(slot) = slot
+        && (slot.is_empty() || slot.len() > 128)
+    {
+        return Err(format!("openai_mcp_dispatch: {field} must be 1..=128 bytes").into());
+    }
+    Ok(())
 }
 
 /// Reject a `Named` outbound-chain reference, requiring an inline chain.

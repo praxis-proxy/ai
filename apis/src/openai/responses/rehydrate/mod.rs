@@ -41,6 +41,8 @@ use praxis_filter::{
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
+#[cfg(feature = "openai-mcp-tools")]
+use super::mcp_dispatch::{OWNER_FINGERPRINT, owner_fingerprint};
 use super::{
     DEFAULT_STORE_NAME, append_stored_input_items, canonical_openresponses_replay_item,
     error::responses_error_rejection, extract_conversation_id, state::ResponsesState,
@@ -135,6 +137,10 @@ impl RehydrateFilter {
             Err(action) => return Ok(action),
         };
         let previous_tools = collect_mcp_tool_listings(&record);
+        #[cfg(feature = "openai-mcp-tools")]
+        let mut previous_tools = previous_tools;
+        #[cfg(feature = "openai-mcp-tools")]
+        bind_previous_tools_to_owner(&mut previous_tools, &owner);
         let previous_usage = record.response_object.get("usage").filter(|u| !u.is_null()).cloned();
         let stored = stored_messages_for_response(record);
         let state = build_state(parsed_body, stored, previous_tools, previous_usage);
@@ -1309,6 +1315,21 @@ fn collect_mcp_tool_listings(record: &ResponseRecord) -> Vec<Value> {
     }
 
     listings
+}
+
+/// Bind cache-only MCP listings to the trusted owner that scoped the read.
+///
+/// The annotation is added after extracting fresh objects from the persisted
+/// public response, so it exists only in [`ResponsesState::previous_tools`] and
+/// can never leak into the client-visible `mcp_list_tools` item.
+#[cfg(feature = "openai-mcp-tools")]
+fn bind_previous_tools_to_owner(listings: &mut [Value], owner: &StateOwner) {
+    let fingerprint = Value::String(owner_fingerprint(owner));
+    for listing in listings {
+        if let Some(object) = listing.as_object_mut() {
+            object.insert(OWNER_FINGERPRINT.to_owned(), fingerprint.clone());
+        }
+    }
 }
 
 /// Append MCP tool listings from a sequence of response items.

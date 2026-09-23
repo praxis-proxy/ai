@@ -98,7 +98,8 @@ pub(crate) struct FileSearchFilterConfig {
     /// `iterative_request_router`; the smaller limit wins at runtime.
     pub max_state_bytes: Option<usize>,
 
-    /// Whole-call timeout in milliseconds.
+    /// Whole-call timeout in milliseconds. Inside an iterative request router,
+    /// the effective timeout is capped by the router's remaining deadline.
     pub timeout_ms: Option<u64>,
 
     /// Base URL for the vector store API.

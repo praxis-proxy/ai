@@ -24,6 +24,90 @@ fn config_with_custom_timeout() {
 }
 
 #[test]
+fn config_accepts_scoped_connector_slots() {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("user_credential: mcp_gateway\nauthorization_assertion: mcp_gateway\n").unwrap();
+    assert!(McpToolResolveFilter::from_config(&yaml).is_ok());
+}
+
+#[tokio::test]
+async fn configured_connector_missing_scoped_context_fails_before_dispatch() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+user_credential: mcp_gateway
+authorization_assertion: mcp_gateway
+connectors:
+  - id: trusted
+    server_url: https://mcp.example/mcp
+",
+    )
+    .unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4o","tools":[{"type":"mcp","server_label":"corp","connector_id":"trusted"}]}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Reject(_)));
+}
+
+#[tokio::test]
+async fn configured_connector_missing_credential_fails_before_dispatch() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+user_credential: mcp_gateway
+connectors:
+  - id: trusted
+    server_url: https://mcp.example/mcp
+",
+    )
+    .unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.extensions.insert(
+        StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").expect("trusted owner should be valid"),
+    );
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4o","tools":[{"type":"mcp","server_label":"corp","connector_id":"trusted"}]}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401));
+}
+
+#[tokio::test]
+async fn configured_connector_missing_assertion_fails_before_dispatch() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "
+authorization_assertion: mcp_gateway
+connectors:
+  - id: trusted
+    server_url: https://mcp.example/mcp
+",
+    )
+    .unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+    ctx.extensions.insert(
+        StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").expect("trusted owner should be valid"),
+    );
+    ctx.set_metadata("openai_tool_parse.has_mcp", "true");
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4o","tools":[{"type":"mcp","server_label":"corp","connector_id":"trusted"}]}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(&action, FilterAction::Reject(rejection) if rejection.status == 401));
+}
+
+#[test]
 fn config_validates_forward_headers() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("forward_headers: [X-Tenant-ID, x-user-id]").unwrap();
     assert!(McpToolResolveFilter::from_config(&yaml).is_ok());
@@ -173,7 +257,7 @@ fn cache_hit_when_all_allowed_tools_present() {
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, Some(&allowed), false);
+    let result = find_cached_listing(Some(&previous), "weather", url, None, Some(&allowed), false);
     assert!(result.is_some(), "should hit cache");
     assert_eq!(result.unwrap().len(), 2, "should return full cached listing");
 }
@@ -188,7 +272,7 @@ fn cache_miss_when_allowed_tool_not_in_cache() {
     })];
     let allowed = vec!["unknown_tool".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, Some(&allowed), false);
+    let result = find_cached_listing(Some(&previous), "weather", url, None, Some(&allowed), false);
     assert!(result.is_none(), "should miss cache for unknown tool");
 }
 
@@ -201,7 +285,7 @@ fn cache_miss_when_unrestricted_allowed_tools() {
         "tools": [{"name": "get_weather"}, {"name": "get_forecast"}]
     })];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, None, false);
+    let result = find_cached_listing(Some(&previous), "weather", url, None, None, false);
     assert!(
         result.is_none(),
         "unrestricted entries must miss to avoid reusing partial listings"
@@ -217,7 +301,7 @@ fn cache_miss_when_unrestricted_widens_narrow_cached_listing() {
         "tools": [{"name": "get_weather"}]
     })];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, None, false);
+    let result = find_cached_listing(Some(&previous), "weather", url, None, None, false);
     assert!(
         result.is_none(),
         "unrestricted must miss when cached listing is a narrow subset"
@@ -234,14 +318,14 @@ fn cache_miss_when_wrong_server_label() {
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "calendar", url, Some(&allowed), false);
+    let result = find_cached_listing(Some(&previous), "calendar", url, None, Some(&allowed), false);
     assert!(result.is_none(), "should miss cache for different server");
 }
 
 #[test]
 fn cache_miss_when_no_previous_tools() {
     let allowed = vec!["get_weather".to_owned()];
-    let result = find_cached_listing(None, "weather", "http://10.0.0.5/mcp", Some(&allowed), false);
+    let result = find_cached_listing(None, "weather", "http://10.0.0.5/mcp", None, Some(&allowed), false);
     assert!(result.is_none(), "should miss when no previous_tools");
 }
 
@@ -258,6 +342,7 @@ fn cache_miss_when_server_url_changed() {
         Some(&previous),
         "weather",
         "http://10.0.0.99/mcp",
+        None,
         Some(&allowed),
         false,
     );
@@ -277,7 +362,7 @@ fn cache_miss_when_continuation_changes_allowed_tools() {
     })];
     let new_allowed = vec!["get_forecast".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", url, Some(&new_allowed), false);
+    let result = find_cached_listing(Some(&previous), "weather", url, None, Some(&new_allowed), false);
     assert!(
         result.is_none(),
         "cache should miss when continuation requests a tool not in the cached listing"
@@ -300,6 +385,7 @@ fn cache_miss_for_connector_when_cached_entry_lacks_server_url() {
         Some(&previous),
         "drive",
         "https://drive.example.com/mcp",
+        None,
         Some(&allowed),
         true,
     );
@@ -319,8 +405,40 @@ fn cache_hit_for_connector_when_cached_entry_has_matching_url() {
     })];
     let allowed = vec!["search".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "drive", url, Some(&allowed), true);
+    let result = find_cached_listing(Some(&previous), "drive", url, None, Some(&allowed), true);
     assert!(result.is_some(), "exact URL match should hit cache");
+}
+
+#[test]
+fn cache_hit_for_same_owner_fingerprint() {
+    let url = "https://drive.example.com/mcp";
+    let previous = vec![serde_json::json!({
+        "server_label": "drive",
+        "server_url": url,
+        "_praxis_owner_fingerprint": "owner-a",
+        "tools": [{"name": "search"}]
+    })];
+    let allowed = vec!["search".to_owned()];
+
+    let result = find_cached_listing(Some(&previous), "drive", url, Some("owner-a"), Some(&allowed), true);
+
+    assert!(result.is_some(), "the same owner should reuse its cache entry");
+}
+
+#[test]
+fn cache_miss_for_different_owner_fingerprint() {
+    let url = "https://drive.example.com/mcp";
+    let previous = vec![serde_json::json!({
+        "server_label": "drive",
+        "server_url": url,
+        "_praxis_owner_fingerprint": "owner-a",
+        "tools": [{"name": "search"}]
+    })];
+    let allowed = vec!["search".to_owned()];
+
+    let result = find_cached_listing(Some(&previous), "drive", url, Some("owner-b"), Some(&allowed), true);
+
+    assert!(result.is_none(), "another owner must not reuse this cache entry");
 }
 
 #[test]
@@ -331,7 +449,14 @@ fn cache_hit_for_direct_url_label_only_still_works() {
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.5/mcp", Some(&allowed), false);
+    let result = find_cached_listing(
+        Some(&previous),
+        "weather",
+        "http://10.0.0.5/mcp",
+        None,
+        Some(&allowed),
+        false,
+    );
     assert!(
         result.is_some(),
         "direct URL entries should still use label-only matching"
@@ -707,7 +832,8 @@ fn write_state_creates_state_when_missing() {
         ("weather".to_owned(), "get_weather".to_owned()),
         serde_json::json!({"tool": true}),
     );
-    write_state(&mut ctx, &body_bytes, map, Vec::new());
+    let context_policy = McpConnectorContextPolicy::new(Some("connector_bearer"), Some("connector_assertion"));
+    write_state(&mut ctx, &body_bytes, map, Vec::new(), context_policy.clone());
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should be created");
     assert!(
@@ -721,6 +847,10 @@ fn write_state_creates_state_when_missing() {
         "request_body should be parsed from body"
     );
     assert!(!state.request_body.is_null(), "request_body must not be null");
+    assert_eq!(
+        state.mcp_connector_context_policy, context_policy,
+        "dispatch must be bound to the slot policy used for connector discovery"
+    );
 }
 
 /// `write_state` updates existing state without replacing it.
@@ -740,7 +870,13 @@ fn write_state_updates_existing_state() {
         ("weather".to_owned(), "get_weather".to_owned()),
         serde_json::json!({"tool": true}),
     );
-    write_state(&mut ctx, &body_bytes, map, Vec::new());
+    write_state(
+        &mut ctx,
+        &body_bytes,
+        map,
+        Vec::new(),
+        McpConnectorContextPolicy::default(),
+    );
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
     assert!(
@@ -1048,7 +1184,14 @@ fn cache_hit_when_cached_entry_has_no_server_url() {
     })];
     let allowed = vec!["get_weather".to_owned()];
 
-    let result = find_cached_listing(Some(&previous), "weather", "http://10.0.0.5/mcp", Some(&allowed), false);
+    let result = find_cached_listing(
+        Some(&previous),
+        "weather",
+        "http://10.0.0.5/mcp",
+        None,
+        Some(&allowed),
+        false,
+    );
     assert!(
         result.is_some(),
         "real mcp_list_tools items lack server_url; label-only match"
@@ -1068,6 +1211,7 @@ fn cache_miss_when_same_label_different_server_url() {
         Some(&previous),
         "weather",
         "http://10.0.0.99/mcp",
+        None,
         Some(&allowed),
         false,
     );
@@ -1541,7 +1685,13 @@ fn write_state_skips_state_creation_with_previous_response_id() {
         ("w".to_owned(), "get_weather".to_owned()),
         serde_json::json!({"tool": true}),
     );
-    write_state(&mut ctx, &body_bytes, map, Vec::new());
+    write_state(
+        &mut ctx,
+        &body_bytes,
+        map,
+        Vec::new(),
+        McpConnectorContextPolicy::default(),
+    );
 
     let state = ctx
         .extensions
@@ -2274,7 +2424,13 @@ fn write_state_syncs_request_body_and_tools_on_existing_state() {
     ctx.extensions.insert(ResponsesState::from_request_body(original_body));
 
     let body_bytes = serde_json::to_vec(&rewritten_body_json()).unwrap();
-    write_state(&mut ctx, &body_bytes, weather_tool_map(), Vec::new());
+    write_state(
+        &mut ctx,
+        &body_bytes,
+        weather_tool_map(),
+        Vec::new(),
+        McpConnectorContextPolicy::default(),
+    );
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should exist");
     assert_eq!(state.tools.len(), 1, "tools synced from rewritten body");
@@ -5170,6 +5326,19 @@ fn assert_valid_list_tools_item(item: &serde_json::Value, server_label: &str) {
         item.get("error").is_none(),
         "successful listings omit error rather than sending null: {item}"
     );
+    for private in [
+        "_praxis_owner_fingerprint",
+        "authorization",
+        "headers",
+        "server_url",
+        "connector_id",
+        "x-mcp-authorized",
+    ] {
+        assert!(
+            item.get(private).is_none(),
+            "public listing leaked private field {private}"
+        );
+    }
     let id = item["id"].as_str().expect("id present");
     assert!(id.starts_with("mcpl_"), "id uses mcpl_ prefix, got {id}");
 }

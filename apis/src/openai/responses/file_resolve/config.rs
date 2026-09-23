@@ -136,7 +136,9 @@ pub(crate) struct FileResolveConfig {
     #[serde(default)]
     pub on_missing: OnMissing,
 
-    /// HTTP timeout in milliseconds for Files API callout requests.
+    /// HTTP timeout in milliseconds for Files API callout requests. Inside an
+    /// iterative request router, the effective timeout is capped by the
+    /// router's remaining deadline.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 

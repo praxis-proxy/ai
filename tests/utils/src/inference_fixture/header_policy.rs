@@ -375,6 +375,7 @@ mod tests {
             ("X-Api-Key".to_owned(), vec!["secret".to_owned()]),
             ("Api-Key".to_owned(), vec!["secret".to_owned()]),
             ("X-Goog-Api-Key".to_owned(), vec!["secret".to_owned()]),
+            ("X-Mcp-Authorized".to_owned(), vec!["signed-secret".to_owned()]),
             ("WWW-Authenticate".to_owned(), vec!["Bearer".to_owned()]),
             ("X-Safe".to_owned(), vec!["first".to_owned(), "second".to_owned()]),
             (
@@ -406,6 +407,7 @@ mod tests {
             "x-api-key",
             "api-key",
             "x-goog-api-key",
+            "x-mcp-authorized",
             "www-authenticate",
         ] {
             assert!(!transport.contains_key(removed), "transport retained {removed}");
@@ -429,6 +431,7 @@ mod tests {
             "x-api-key",
             "api-key",
             "x-goog-api-key",
+            "x-mcp-authorized",
             "www-authenticate",
         ] {
             assert!(!fixture.contains_key(removed), "fixture retained {removed}");

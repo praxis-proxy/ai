@@ -18,6 +18,8 @@ mod subrequest_transport;
     clippy::indexing_slicing,
     clippy::panic,
     clippy::needless_pass_by_value,
+    clippy::significant_drop_tightening,
+    clippy::too_many_lines,
     clippy::unused_self,
     missing_docs,
     reason = "tests"
@@ -37,12 +39,28 @@ use rmcp::{
     service::RunningService,
     transport::{StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig},
 };
+use secrecy::{ExposeSecret as _, SecretString};
 
 pub use self::streaming_selector::McpStreamingSelectorFilter;
 use self::subrequest_transport::MAX_CONTROL_RESPONSE_BYTES;
 pub(crate) use self::subrequest_transport::{
     McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
 };
+use crate::StateOwner;
+
+/// Request-scoped ambient context authorized only for a configured connector.
+///
+/// Direct client-selected `server_url` callsites must pass `None`. The raw
+/// assertion and bearer are exposed only while constructing the RMCP transport
+/// headers and never enter the tool map or retained response state.
+pub(crate) struct McpConnectorContext<'a> {
+    /// Trusted owner projected into each filtered MCP exchange.
+    pub owner: &'a StateOwner,
+    /// Optional per-user bearer token overriding a static entry token.
+    pub bearer: Option<&'a SecretString>,
+    /// Optional opaque MCP Gateway assertion.
+    pub assertion: Option<&'a SecretString>,
+}
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -323,6 +341,7 @@ pub(crate) async fn list_tools(
         authorization,
         &[],
         None,
+        None,
         timeout,
         max_tools,
         callout,
@@ -343,6 +362,7 @@ pub(crate) async fn list_tools_with_forwarded_headers(
     authorization: Option<&str>,
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: Option<&http::HeaderMap>,
+    connector_context: Option<&McpConnectorContext<'_>>,
     timeout: Duration,
     max_tools: usize,
     callout: &McpCallout,
@@ -356,7 +376,11 @@ pub(crate) async fn list_tools_with_forwarded_headers(
     // evaluated. Across pagination the decoded listing is additionally
     // bounded by `MAX_LISTING_RESPONSE_BYTES` (see `paginate_tools`).
     let display_url = parse_display_url(server_url);
-    let mcp_client = subrequest_transport::McpSubrequestClient::control(callout.clone(), timeout);
+    let mcp_client = subrequest_transport::McpSubrequestClient::control(
+        callout.clone(),
+        timeout,
+        connector_context.map(|context| context.owner.clone()),
+    );
     // Take the signal handle before the client is moved into the rmcp
     // transport, so a `ResponseTooLarge` or `SsrfBlocked` classification
     // recorded during the exchange (which rmcp otherwise discards) can be
@@ -370,6 +394,7 @@ pub(crate) async fn list_tools_with_forwarded_headers(
             authorization,
             forwarded_header_names,
             forwarded_headers,
+            connector_context,
         )?,
     );
 
@@ -389,8 +414,9 @@ pub(crate) async fn list_tools_with_forwarded_headers(
     .await;
 
     // Close (not drop) the service on every post-serve exit so no background
-    // worker task is left holding our subrequest executor. (The pre-serve
-    // handshake window remains a parked upstream rmcp gap — see the plan header.)
+    // worker task is left holding our subrequest executor. A pre-serve
+    // initialization failure owns no `RunningService`; dropping the failed
+    // `serve` future drops its transport without starting the service worker.
     if let Some(mut client) = running {
         drop(client.close().await);
     }
@@ -432,6 +458,7 @@ pub(crate) async fn call_tool(
         authorization,
         &[],
         None,
+        None,
         tool_name,
         arguments,
         timeout,
@@ -454,6 +481,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     authorization: Option<&str>,
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: Option<&http::HeaderMap>,
+    connector_context: Option<&McpConnectorContext<'_>>,
     tool_name: &str,
     arguments: serde_json::Value,
     timeout: Duration,
@@ -466,7 +494,12 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     // `tools/call` result is bounded to the configured `max_result_bytes` cap
     // (expanded for worst-case JSON string escaping) before deserialization.
     let display_url = parse_display_url(server_url);
-    let mcp_client = subrequest_transport::McpSubrequestClient::for_tool(callout.clone(), timeout, max_result_bytes);
+    let mcp_client = subrequest_transport::McpSubrequestClient::for_tool(
+        callout.clone(),
+        timeout,
+        max_result_bytes,
+        connector_context.map(|context| context.owner.clone()),
+    );
     // Take the signal handle before the client is moved into the rmcp
     // transport, so a `ResponseTooLarge` or `SsrfBlocked` classification
     // recorded during the exchange (which rmcp otherwise discards) can be
@@ -480,6 +513,7 @@ pub(crate) async fn call_tool_with_forwarded_headers(
             authorization,
             forwarded_header_names,
             forwarded_headers,
+            connector_context,
         )?,
     );
 
@@ -512,8 +546,9 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     .await;
 
     // Close (not drop) the service on every post-serve exit so no background
-    // worker task is left holding our subrequest executor. (The pre-serve
-    // handshake window remains a parked upstream rmcp gap — see the plan header.)
+    // worker task is left holding our subrequest executor. A pre-serve
+    // initialization failure owns no `RunningService`; dropping the failed
+    // `serve` future drops its transport without starting the service worker.
     if let Some(mut client) = running {
         drop(client.close().await);
     }
@@ -600,7 +635,7 @@ fn build_transport_config(
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
 ) -> Result<StreamableHttpClientTransportConfig, McpClientError> {
-    build_transport_config_with_forwarded_headers(server_url, headers, authorization, &[], None)
+    build_transport_config_with_forwarded_headers(server_url, headers, authorization, &[], None, None)
 }
 
 /// Build transport config and overlay trusted, operator-allowlisted headers.
@@ -610,8 +645,9 @@ fn build_transport_config(
 /// prevents client-controlled headers from impersonating ambient identity at a
 /// connector endpoint reached through an equivalent direct URL.
 #[expect(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "client filtering and trusted overlay are one security boundary"
+    reason = "target config, trusted overlays, and scoped context form one security boundary"
 )]
 fn build_transport_config_with_forwarded_headers(
     server_url: &str,
@@ -619,6 +655,7 @@ fn build_transport_config_with_forwarded_headers(
     authorization: Option<&str>,
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: Option<&http::HeaderMap>,
+    connector_context: Option<&McpConnectorContext<'_>>,
 ) -> Result<StreamableHttpClientTransportConfig, McpClientError> {
     let mut config = StreamableHttpClientTransportConfig::with_uri(server_url);
     // Bound consecutive *failed* re-dials so a dead endpoint cannot drive an
@@ -658,13 +695,35 @@ fn build_transport_config_with_forwarded_headers(
         }
     }
 
-    inject_authorization(&mut header_map, authorization)?;
+    let effective_authorization = connector_context
+        .and_then(|context| context.bearer)
+        .map(SecretString::expose_secret)
+        .or(authorization);
+    inject_authorization(&mut header_map, effective_authorization)?;
+    inject_connector_assertion(&mut header_map, connector_context)?;
 
     if !header_map.is_empty() {
         config = config.custom_headers(header_map);
     }
 
     Ok(config)
+}
+
+/// Inject the opaque Gateway assertion after every client/operator header merge.
+///
+/// `is_blocked_mcp_header` remains unchanged, so neither client tool-entry
+/// headers nor `forward_headers` can inject or shadow this fixed field.
+fn inject_connector_assertion(
+    header_map: &mut HashMap<http::HeaderName, http::HeaderValue>,
+    connector_context: Option<&McpConnectorContext<'_>>,
+) -> Result<(), McpClientError> {
+    let Some(assertion) = connector_context.and_then(|context| context.assertion) else {
+        return Ok(());
+    };
+    let value = http::HeaderValue::from_str(assertion.expose_secret())
+        .map_err(|_invalid| McpClientError::InvalidAuthorization)?;
+    header_map.insert(crate::callout_authorization::MCP_AUTHORIZED_HEADER, value);
+    Ok(())
 }
 
 /// Inject `authorization` as a Bearer token.
