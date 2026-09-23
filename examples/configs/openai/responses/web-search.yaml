@@ -1,4 +1,5 @@
 # Web Search Filter
+# Requires `--features openai-responses` because these filters are opt-in.
 #
 # Demonstrates the `openai_web_search` filter configuration. The filter
 # validates its configuration (provider, API key, timeouts), binds its

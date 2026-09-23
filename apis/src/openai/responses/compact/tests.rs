@@ -777,7 +777,7 @@ fn make_filter(on_failure: &str) -> CompactFilter {
     let cfg: CompactFilterConfig = serde_yaml::from_value(yaml).unwrap();
     let validated = build_config(&cfg).unwrap();
     CompactFilter {
-        client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(1, None)),
+        client: subrequest::isolated_client(1),
         config: validated,
     }
 }
@@ -986,7 +986,7 @@ fn parse_compact_request_body_with_previous_response_id() {
 #[cfg(feature = "store-sqlite")]
 async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
     let backend: std::sync::Arc<dyn crate::store::ResponseStore> = std::sync::Arc::new(
-        crate::store::SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", None, None)
+        crate::store::SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", None, None, None)
             .await
             .unwrap(),
     );

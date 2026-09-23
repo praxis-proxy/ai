@@ -1384,6 +1384,52 @@ fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
 }
 
 #[test]
+fn full_flow_agentic_establishes_scoped_web_search_credentials_before_irr() {
+    let path = example_config_path("openai/responses/full-flow-agentic.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("config should be valid YAML");
+    let outer_filters = config["filter_chains"][0]["filters"]
+        .as_sequence()
+        .expect("outer filter chain should contain filters");
+    let credentials_index = outer_filters
+        .iter()
+        .position(|filter| filter["filter"].as_str() == Some("callout_credentials"))
+        .expect("full-flow must establish callout credentials");
+    let irr_index = outer_filters
+        .iter()
+        .position(|filter| filter["filter"].as_str() == Some("iterative_request_router"))
+        .expect("full-flow must contain an iterative request router");
+    assert!(
+        credentials_index < irr_index,
+        "callout_credentials must capture and strip ingress secrets before IRR"
+    );
+
+    let credential = &outer_filters[credentials_index]["credentials"][0];
+    assert_eq!(
+        credential["slot"].as_str(),
+        Some("brave_search"),
+        "the outer filter must establish the slot consumed by web search"
+    );
+    assert_eq!(
+        credential["source_header"].as_str(),
+        Some("x-user-brave-key"),
+        "the example must name its trusted ingress source explicitly"
+    );
+
+    let web_search = outer_filters[irr_index]["steps"][0]["filters"]
+        .as_sequence()
+        .expect("IRR inference step should contain filters")
+        .iter()
+        .find(|filter| filter["filter"].as_str() == Some("openai_web_search"))
+        .expect("IRR inference step should contain openai_web_search");
+    assert_eq!(
+        web_search["user_credential"].as_str(),
+        Some("brave_search"),
+        "web search must explicitly consume the established per-user slot"
+    );
+}
+
+#[test]
 fn full_flow_agentic_rejects_responses_subpath() {
     let backend =
         start_backend_with_shutdown(r#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#);

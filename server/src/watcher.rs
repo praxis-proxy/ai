@@ -511,8 +511,11 @@ mod tests {
         }
     }
 
-    /// Minimal sub-request client for tests.
+    /// Minimal sub-request client for tests. The connector builds a rustls
+    /// config, which needs the process-wide crypto provider first (the binary
+    /// installs it at startup; a no-op after the first call).
     fn test_client() -> praxis_core::subrequest::SubRequestClient {
+        praxis_tls::provider::install();
         praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
     }
 

@@ -9,6 +9,7 @@
 //! inference routing, prompt enrichment, and token usage handling.
 
 pub mod agentic;
+#[cfg(feature = "aws-sigv4-filter")]
 pub mod aws;
 #[cfg(feature = "azure-ad-filter")]
 pub mod azure;
@@ -22,6 +23,8 @@ pub mod inference;
 pub mod metering;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
+#[cfg(any(feature = "azure-ad-filter", feature = "gcp-adc-filter"))]
+mod pinned_client;
 pub mod prompt_enrich;
 mod register;
 pub mod routing;
@@ -31,6 +34,7 @@ mod token_rate_limit;
 mod token_usage;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
+#[cfg(feature = "aws-sigv4-filter")]
 pub use aws::Sigv4SignFilter;
 #[cfg(feature = "azure-ad-filter")]
 pub use azure::AzureAdFilter;
@@ -43,12 +47,22 @@ pub use identity_guard::IdentityHeaderGuardFilter;
 pub use inference::{LlmisvcModelProviderResolverFilter, ModelToHeaderFilter};
 pub use metering::ExternalMeteringFilter;
 pub use prompt_enrich::PromptEnrichFilter;
-pub use register::{build_ai_registry, register_ai_filters};
+pub use register::{build_ai_registry, install_pipeline_extensions, register_ai_filters};
 pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};
 pub use time_to_first_token::TimeToFirstTokenFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 pub use token_rate_limit::TokenRateLimitFilter;
 pub use token_usage::{TokenCountFilter, TokenUsageHeadersFilter};
+
+/// Build an isolated client after installing the process-wide crypto provider.
+///
+/// Constructing a connector creates a rustls client configuration, so provider
+/// installation must happen at this boundary rather than relying on a binary
+/// entry point having run first.
+fn isolated_subrequest_client(pool_size: usize) -> praxis_core::subrequest::SubRequestClient {
+    praxis_tls::provider::install();
+    praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(pool_size, None))
+}
 
 // -----------------------------------------------------------------------------
 // Test Utilities
@@ -68,8 +82,16 @@ pub(crate) mod test_utils {
     use praxis_filter::{HttpFilterContext, Request, RequestExtensions, Response};
 
     /// Shared sub-request client for filter unit tests that exercise callouts.
-    static TEST_SUBREQUEST_CLIENT: LazyLock<SubRequestClient> =
-        LazyLock::new(|| SubRequestClient::new(SubRequestConnector::new(4, None)));
+    static TEST_SUBREQUEST_CLIENT: LazyLock<SubRequestClient> = LazyLock::new(|| SubRequestClient::new(connector(4)));
+
+    /// A sub-request connector for tests. The connector builds a rustls
+    /// client config, and rustls needs the process-wide crypto provider (the
+    /// system OpenSSL, installed by the binary at startup) before that; the
+    /// helper installs it, which is a no-op after the first call.
+    pub(crate) fn connector(pool_size: usize) -> SubRequestConnector {
+        praxis_tls::provider::install();
+        SubRequestConnector::new(pool_size, None)
+    }
 
     /// Deterministic ID generator for tests (seed=0).
     static TEST_ID_GENERATOR: LazyLock<IdGenerator> = LazyLock::new(|| IdGenerator::with_seed(0));

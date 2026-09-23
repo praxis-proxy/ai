@@ -6,4 +6,5 @@
 mod event;
 mod parser;
 
+#[cfg(feature = "openai-responses")]
 pub(crate) use event::ResponsesEvent;

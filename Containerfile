@@ -4,11 +4,20 @@
 # Stage 1: Build
 # ------------------------------------------------------------------------------
 
-FROM rust:1.98-alpine AS builder
+FROM rust:1.98-alpine3.24 AS builder
 
-ENV OPENSSL_STATIC=1
+# Cargo features for the published binary. `full` keeps every non-experimental
+# filter; the crate default (`standard`) leaves the heavier OpenAI groups out.
+ARG PRAXIS_AI_FEATURES=full
 
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf cmake make g++
+# praxis-ai performs all of its cryptography in the system OpenSSL and links it
+# dynamically, so the musl target must not produce a static executable (the
+# Alpine Rust image's default) and the builder needs the OpenSSL headers. The
+# builder and the runtime image are the same Alpine release, so the libraries
+# the binary was linked against are the ones it finds at runtime.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+
+RUN apk add --no-cache musl-dev openssl-dev pkgconf cmake make g++
 
 WORKDIR /src
 
@@ -45,7 +54,7 @@ COPY integrations/llmd/ext-proc/build.rs ./integrations/llmd/ext-proc/build.rs
 COPY integrations/llmd/ext-proc/proto ./integrations/llmd/ext-proc/proto
 
 # Strip workspace members not needed for the binary.
-RUN sed -i '/xtask/d; /tests\//d' Cargo.toml
+RUN sed -i '/xtask/d; /tests\//d; /benchmarks/d' Cargo.toml
 
 # Create stub source files for the crates whose real source isn't
 # needed until after dependencies are cached.
@@ -58,7 +67,7 @@ RUN mkdir -p apis/src filters/src server/src integrations/llmd/ext-proc/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy
+    cargo build --release -p praxis-ai-proxy --features "${PRAXIS_AI_FEATURES}"
 
 # ------------------------------------------------------------------------------
 # Cache Tricks
@@ -82,7 +91,7 @@ RUN find apis/src filters/src server/src integrations/llmd/ext-proc/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy \
+    cargo build --release -p praxis-ai-proxy --features "${PRAXIS_AI_FEATURES}" \
     && cp target/release/praxis-ai /usr/local/bin/praxis-ai
 
 # ------------------------------------------------------------------------------
@@ -95,7 +104,11 @@ LABEL org.opencontainers.image.source="https://github.com/praxis-proxy/ai" \
     org.opencontainers.image.description="Praxis AI proxy server" \
     org.opencontainers.image.licenses="Apache-2.0"
 
-RUN apk add --no-cache ca-certificates \
+# Runtime dependencies:
+#   ca-certificates: TLS certificate validation
+#   libcrypto3, libssl3: the system OpenSSL the binary links dynamically
+#   libgcc: the unwinder (libgcc_s) a dynamically linked musl binary needs
+RUN apk add --no-cache ca-certificates libcrypto3 libssl3 libgcc \
     && addgroup -S praxis \
     && adduser -S -G praxis -h /nonexistent -s /sbin/nologin praxis \
     && mkdir -p /etc/praxis

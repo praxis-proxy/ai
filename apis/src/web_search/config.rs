@@ -17,9 +17,11 @@ use crate::callout_policy;
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
 
 /// Default model-driven web searches accepted from one response round.
+#[cfg(feature = "openai-responses")]
 pub(crate) const DEFAULT_MAX_CALLS_PER_ROUND: usize = 32;
 
 /// Absolute model-driven web-search calls accepted from one response round.
+#[cfg(feature = "openai-responses")]
 pub(crate) const MAX_CALLS_PER_ROUND: usize = 1_024;
 
 // -----------------------------------------------------------------------------
@@ -79,6 +81,7 @@ impl SearchContextSize {
     ///
     /// Used at runtime for per-request metadata where rejecting is
     /// not appropriate.
+    #[cfg(feature = "openai-responses")]
     pub(crate) fn from_str_or_default(s: &str) -> Self {
         Self::from_str(s).unwrap_or(Self::Medium)
     }
@@ -103,6 +106,13 @@ impl SearchContextSize {
 pub(crate) struct WebSearchFilterConfig {
     /// Search backend provider.
     pub(crate) provider: SearchProvider,
+
+    /// Optional callout-credential slot id. When set, the web-search callout uses the caller's
+    /// per-user secret from that slot instead of the shared provider `api_key`. Non-secret (a slot
+    /// name). Only valid for header-authenticated providers (Brave, You); rejected for Tavily,
+    /// which authenticates via the request body.
+    #[serde(default)]
+    pub(crate) user_credential: Option<String>,
 
     /// API key for the search provider (supports `${ENV_VAR}`).
     /// Wrapped in [`SecretString`] to prevent accidental logging.
@@ -171,11 +181,16 @@ pub(crate) struct WebSearchFilterConfig {
 /// exposes no `max_body_bytes` knob: raw request body size is governed by the
 /// pipeline's `body_limits`, not a per-filter limit (which praxis core merges
 /// to the largest sibling buffer and would therefore be bypassable).
+#[cfg(feature = "openai-responses")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OpenAiWebSearchConfig {
     /// Search backend provider.
     provider: SearchProvider,
+
+    /// Optional callout-credential slot id (see [`WebSearchFilterConfig::user_credential`]).
+    #[serde(default)]
+    user_credential: Option<String>,
 
     /// API key for the search provider (supports `${ENV_VAR}`).
     /// Wrapped in [`SecretString`] to prevent accidental logging.
@@ -207,6 +222,7 @@ pub(crate) struct OpenAiWebSearchConfig {
 }
 
 /// Default value for `OpenAiWebSearchConfig::max_calls_per_round`.
+#[cfg(feature = "openai-responses")]
 fn default_max_calls_per_round() -> usize {
     DEFAULT_MAX_CALLS_PER_ROUND
 }
@@ -227,6 +243,7 @@ fn default_outbound_chain() -> ChainRef {
     }
 }
 
+#[cfg(feature = "openai-responses")]
 impl OpenAiWebSearchConfig {
     /// Convert into the shared [`WebSearchFilterConfig`] for validation reuse.
     ///
@@ -236,6 +253,7 @@ impl OpenAiWebSearchConfig {
     pub(crate) fn into_shared(self) -> WebSearchFilterConfig {
         WebSearchFilterConfig {
             provider: self.provider,
+            user_credential: self.user_credential,
             api_key: self.api_key,
             default_context_size: self.default_context_size,
             timeout_ms: self.timeout_ms,
@@ -275,6 +293,9 @@ pub(crate) struct ValidatedConfig {
     /// Override the provider's default API base URL.
     pub base_url: Option<String>,
 
+    /// Configured callout-credential slot id (non-secret), or `None` for the shared key.
+    pub user_credential: Option<String>,
+
     /// Whether to stream the terminal Messages response incrementally.
     pub terminal_streaming: bool,
 }
@@ -288,6 +309,7 @@ impl std::fmt::Debug for ValidatedConfig {
             .field("timeout_ms", &self.timeout_ms)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("base_url", &self.base_url)
+            .field("user_credential", &self.user_credential)
             .field("terminal_streaming", &self.terminal_streaming)
             .finish()
     }
@@ -316,6 +338,12 @@ fn build_validated_config(
     raw: &WebSearchFilterConfig,
     api_key: String,
 ) -> Result<ValidatedConfig, FilterError> {
+    if raw.user_credential.is_some() && matches!(raw.provider, SearchProvider::Tavily) {
+        return Err(FilterError::from(format!(
+            "{filter_name}: user_credential is not supported for the Tavily provider \
+             (Tavily authenticates via the request body, not a header)"
+        )));
+    }
     if let Some(base_url) = raw.base_url.as_deref() {
         // Structural checks only (scheme, embedded credentials, path). Private-
         // address / SSRF enforcement is deferred to the outbound executor's
@@ -333,6 +361,7 @@ fn build_validated_config(
         timeout_ms: callout_policy::validate_timeout_ms(filter_name, raw.timeout_ms, DEFAULT_TIMEOUT_MS)?,
         max_body_bytes: validate_max_body_bytes_field(filter_name, raw.max_body_bytes)?,
         base_url: raw.base_url.clone(),
+        user_credential: raw.user_credential.clone(),
         terminal_streaming: raw.terminal_streaming,
     })
 }
@@ -394,6 +423,7 @@ mod tests {
     fn base_config() -> WebSearchFilterConfig {
         WebSearchFilterConfig {
             provider: SearchProvider::Brave,
+            user_credential: None,
             api_key: SecretString::from("test-key-123".to_owned()),
             default_context_size: None,
             timeout_ms: None,
@@ -442,6 +472,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn openai_parse_config_defaults_missing_outbound_chain_to_empty_inline() {
         // The OpenAI-specific config carries its own `#[serde(default)]`, so it
@@ -458,6 +489,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn openai_web_search_rejects_terminal_streaming() {
         let yaml = serde_yaml::from_str("provider: you\napi_key: k\nterminal_streaming: true").unwrap();
@@ -666,6 +698,7 @@ mod tests {
         assert_eq!(SearchContextSize::High.result_count(), 10);
     }
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn search_context_size_parsing() {
         assert_eq!(SearchContextSize::from_str_or_default("low"), SearchContextSize::Low);
@@ -685,5 +718,48 @@ mod tests {
         assert_eq!(SearchProvider::Brave.as_str(), "brave");
         assert_eq!(SearchProvider::Tavily.as_str(), "tavily");
         assert_eq!(SearchProvider::You.as_str(), "you");
+    }
+
+    // -------------------------------------------------------------------------
+    // user_credential slot (issue #880)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn brave_accepts_user_credential_slot() {
+        let mut cfg = base_config(); // provider = Brave
+        cfg.user_credential = Some("brave".to_owned());
+        let validated = build_config("anthropic_web_search", &cfg).unwrap();
+        assert_eq!(validated.user_credential.as_deref(), Some("brave"));
+    }
+
+    #[test]
+    fn no_user_credential_is_valid_for_tavily() {
+        let mut cfg = base_config();
+        cfg.provider = SearchProvider::Tavily;
+        cfg.user_credential = None;
+        let validated = build_config("anthropic_web_search", &cfg).unwrap();
+        assert!(validated.user_credential.is_none());
+    }
+
+    #[test]
+    fn tavily_rejects_user_credential_slot() {
+        let mut cfg = base_config();
+        cfg.provider = SearchProvider::Tavily;
+        cfg.user_credential = Some("tav".to_owned());
+        let err = build_config("anthropic_web_search", &cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("user_credential"),
+            "Tavily rejection must name the offending field: {err}"
+        );
+    }
+
+    #[cfg(feature = "openai-responses")]
+    #[test]
+    fn openai_config_threads_user_credential_through_into_shared() {
+        // Locks that `into_shared` does not drop the slot id on the OpenAI path.
+        let yaml = serde_yaml::from_str("provider: brave\napi_key: k\nuser_credential: brave").unwrap();
+        let raw = parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search", &yaml).unwrap();
+        let validated = build_config("openai_web_search", &raw.into_shared()).unwrap();
+        assert_eq!(validated.user_credential.as_deref(), Some("brave"));
     }
 }

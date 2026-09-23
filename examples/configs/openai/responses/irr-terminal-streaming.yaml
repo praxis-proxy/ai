@@ -1,4 +1,5 @@
 # Terminal Responses Streaming through IRR
+# Requires `--features openai-responses` because these filters are opt-in.
 #
 # Demonstrates a single-step iterative_request_router pipeline that exposes a
 # native OpenAI Responses SSE body incrementally. `openai_responses_proxy`

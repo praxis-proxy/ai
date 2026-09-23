@@ -28,12 +28,19 @@ use tokio::sync::Notify;
 // -----------------------------------------------------------------------------
 
 /// Default sub-request client for registry-only tests without a config.
-fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
+///
+/// The connector builds a rustls client config, which needs the process-wide
+/// crypto provider first: the binary installs it at startup, and the harness
+/// does the same here (a no-op after the first call). Tests that build a
+/// registry themselves must take their client from here for the same reason.
+pub fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
+    praxis_tls::provider::install();
     praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
 }
 
 /// Shared client honoring runtime connector settings, including the circuit breaker.
 fn configured_subrequest_client(config: &Config) -> praxis_core::subrequest::SubRequestClient {
+    praxis_tls::provider::install();
     praxis_ai::create_subrequest_client(config)
 }
 
@@ -84,8 +91,7 @@ fn resolve_listener_pipeline(
     // pipeline and its nested callout chains (e.g. `openai_file_resolve`'s
     // outbound chain) so their runtime SSRF checks read the configured value.
     pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
-    pipeline.add_pipeline_extension(Box::new(praxis_ai_apis::store::ResponseStoreRegistry::new()));
-    pipeline.set_allow_private_upstreams(config.insecure_options.allow_private_upstreams);
+    praxis_ai::install_pipeline_extensions(&mut pipeline);
     pipeline.apply_insecure_options(&config.insecure_options);
     Arc::new(pipeline)
 }

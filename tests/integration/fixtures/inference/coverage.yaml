@@ -348,3 +348,13 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.response.stop_sequence
+    scopes:
+      - messages_to_chat_completions
+    status: live_covered
+    scenarios:
+      - messages/stop-sequence-nonstream
+      - messages/stop-sequence-stream
+    providers:
+      vllm:
+        status: live_covered

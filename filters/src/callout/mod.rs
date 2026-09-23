@@ -465,6 +465,7 @@ fn build_subrequest_client(cfg: &HttpCalloutConfig) -> SubRequestClient {
         half_open_timeout: cb.recovery_timeout,
     });
 
+    praxis_tls::provider::install();
     let connector = SubRequestConnector::with_options(SubRequestConnectorOptions {
         keepalive_pool_size: 16,
         max_connections: None,

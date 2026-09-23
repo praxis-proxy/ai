@@ -63,8 +63,16 @@ The release workflow produces these tags per run:
 | `sha-<hash>` | `sha-abc1234` | Git commit SHA |
 | `<version>` | `0.1.0` | Full semver (from git tag) |
 | `<major>.<minor>` | `0.1` | Major.minor shorthand |
+| `<any of the above>-fips` | `0.1.0-fips` | Same runs, for the FIPS image |
 
 The workflow also publishes a `sha-<hash>` tag for traceability.
+
+Every run that pushes a standard image also pushes the FIPS image, built
+from `Containerfile.fips` on UBI 9 with Red Hat's toolchain and OpenSSL,
+under the same tag with a `-fips` suffix. The pinned Red Hat base images are
+verified to be signed by Red Hat before every such build
+(`make fips-verify-image`). See [FIPS 140-3](fips.md) for what that image
+contains and how to run it.
 
 ## Changelog
 
@@ -88,12 +96,17 @@ created from it. The tag triggers the release workflow as usual.
 
 The production image is a minimal Alpine container:
 
-- Static musl build with LTO, single codegen unit,
-  and stripped symbols
+- musl build with LTO, single codegen unit and stripped symbols, linked
+  dynamically against Alpine's OpenSSL (all cryptography goes through the
+  system library)
 - Runs as non-root user (`praxis`)
 - Exposes ports `8080` (proxy) and `9901` (admin)
 - Built-in health check at
   `http://127.0.0.1:9901/healthy`
 - Config directory and working directory: `/etc/praxis`
+
+The `-fips` image is the same binary's FIPS feature set on
+`ubi9/ubi-minimal`, built with Red Hat's `rust-toolset` and linked against
+UBI's OpenSSL; see [FIPS 140-3](fips.md).
 
 > **Note**: This is subject to change.

@@ -1,4 +1,5 @@
 # Trusted OpenAI State Ownership
+# Requires `--features openai-conversations,store-sqlite` because these filters are opt-in.
 #
 # Provider-neutral owner isolation for persisted OpenAI Responses and Conversations.
 # A trusted authentication boundary must replace (not merely preserve) the

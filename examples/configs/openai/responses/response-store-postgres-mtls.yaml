@@ -1,4 +1,5 @@
 # Response Store — PostgreSQL with certificate authentication
+# Requires `--features store-postgres` because these filters are opt-in.
 #
 # Persists non-streaming Responses API responses to PostgreSQL over a
 # TLS-verified connection that authenticates with a client certificate

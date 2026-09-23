@@ -15,7 +15,7 @@ then exercises the Conversations API using the official OpenAI Python
 SDK to verify wire-format compatibility.
 
 Usage:
-    cargo build -p praxis-ai-proxy
+    cargo build -p praxis-ai-proxy --features full
     cargo build -p praxis-test-utils --example conversations_tenant_proxy
     uv run tests/integration/sdk/openai/test_openai_conversations.py -v
 """
@@ -74,7 +74,7 @@ def _find_binary() -> str:
         if os.path.isfile(candidate):
             return candidate
     raise FileNotFoundError(
-        "praxis-ai binary not found — run `cargo build -p praxis-ai-proxy` first"
+        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full` first"
     )
 
 

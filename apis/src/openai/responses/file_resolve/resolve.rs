@@ -25,7 +25,10 @@ use tracing::{debug, warn};
 use super::resolve_url::{FileUrlResolver, redact_url};
 use crate::{
     callout_policy::OnMissing,
-    openai::api_client::{ApiClient, ApiClientError, DownstreamRuntime, OutboundExecution},
+    openai::{
+        api_client::{ApiClient, ApiClientError, DownstreamRuntime, OutboundExecution},
+        responses::content_parts::{content_parts_mut, infer_mime_from_filename},
+    },
 };
 
 /// Files API path prefix used in resource URL construction.
@@ -637,23 +640,6 @@ async fn resolve_item(item: &mut serde_json::Value, resolver: &mut ContentResolv
     Ok(resolved_count)
 }
 
-/// Return the mutable content parts array for a given input item,
-/// if applicable.
-pub(crate) fn content_parts_mut(item: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
-    match item.get("type").and_then(serde_json::Value::as_str) {
-        Some("message") => item.get_mut("content").and_then(serde_json::Value::as_array_mut),
-        Some("function_call_output") => item.get_mut("output").and_then(serde_json::Value::as_array_mut),
-        Some(_) => None,
-        None => {
-            if item.get("role").and_then(serde_json::Value::as_str).is_some() && item.get("content").is_some() {
-                item.get_mut("content").and_then(serde_json::Value::as_array_mut)
-            } else {
-                None
-            }
-        },
-    }
-}
-
 /// Resolve a single content part if it contains a resolvable reference.
 async fn resolve_content_part(
     part: &mut serde_json::Value,
@@ -874,28 +860,6 @@ pub(super) fn max_content_bytes_for_data_url(max_data_url_bytes: usize, content_
     Some((available / 4) * 3)
 }
 
-/// Infer MIME type from a filename extension.
-pub(crate) fn infer_mime_from_filename(filename: Option<&str>) -> Option<&'static str> {
-    let ext = filename?.rsplit('.').next()?;
-    match ext.to_ascii_lowercase().as_str() {
-        "csv" => Some("text/csv"),
-        "doc" => Some("application/msword"),
-        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-        "gif" => Some("image/gif"),
-        "html" | "htm" => Some("text/html"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "json" => Some("application/json"),
-        "pdf" => Some("application/pdf"),
-        "png" => Some("image/png"),
-        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-        "txt" => Some("text/plain"),
-        "webp" => Some("image/webp"),
-        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-        "xml" => Some("application/xml"),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -912,10 +876,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        openai::api_client::{ApiClient, ApiClientConfig},
-        subrequest::SubRequestClient,
-    };
+    use crate::openai::api_client::{ApiClient, ApiClientConfig};
 
     #[test]
     fn infer_mime_pdf() {
@@ -1048,7 +1009,7 @@ mod tests {
     fn test_api_client(api_base_url: &str, timeout_ms: u64) -> ApiClient {
         ApiClient::new(ApiClientConfig {
             api_base_url: api_base_url.to_owned(),
-            client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+            client: crate::subrequest::isolated_client(4),
             timeout: std::time::Duration::from_millis(timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),

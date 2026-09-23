@@ -7,8 +7,6 @@ use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-#[cfg(test)]
-use praxis_core::subrequest::SubRequestConnector;
 use praxis_core::{
     config::InsecureOptions,
     subrequest::{DEPTH_HEADER, SubRequestClient},
@@ -124,7 +122,7 @@ impl AiGuardrailsFilter {
     /// Returns [`FilterError`] if config parsing or validation fails.
     #[cfg(test)]
     pub(crate) fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let client = SubRequestClient::new(SubRequestConnector::new(4, None));
+        let client = crate::isolated_subrequest_client(4);
         Self::from_config_with_client(config, client)
     }
 

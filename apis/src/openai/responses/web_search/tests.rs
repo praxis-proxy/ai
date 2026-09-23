@@ -1543,3 +1543,197 @@ async fn on_request_body_without_max_tool_calls_dispatches_all_under_cap() {
         "all searches completed under the server cap"
     );
 }
+
+#[tokio::test]
+async fn missing_required_credential_records_security_failure() {
+    // Filter requires the caller's per-user "brave" slot; ctx has NO credentials.
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("provider: brave\napi_key: fallback-key\nuser_credential: brave").unwrap();
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        web_search_calls: vec![serde_json::json!({
+            "id": "ws_1",
+            "action": {"type": "search", "query": "hello"}
+        })],
+        ..ResponsesState::default()
+    });
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let failure = state.security_failure.as_ref().expect("security failure recorded");
+    assert_eq!(failure.status, 401);
+    assert_eq!(failure.code, "missing_callout_context");
+    assert_eq!(state.web_search_calls_executed, 0, "no provider request dispatched");
+}
+
+// -----------------------------------------------------------------------------
+// Round-0 credential preflight
+//
+// On the initial client request (no web_search_calls yet) the filter must fail
+// closed with a 401 BEFORE any inference round when a hosted web-search tool is
+// declared, could run under the effective `tool_choice`, and the required
+// per-user credential is absent. Under terminal streaming the re-entry check
+// fires only after HTTP 200 has committed, so the preflight is the only place a
+// truthful 401 can be returned for a streaming request.
+// -----------------------------------------------------------------------------
+
+/// Build a web-search filter that requires the caller's per-user "brave" slot.
+fn scoped_web_search_filter() -> Box<dyn HttpFilter> {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("provider: brave\napi_key: fallback-key\nuser_credential: brave").unwrap();
+    WebSearchFilter::from_config(&yaml).unwrap()
+}
+
+/// Run `on_request_body` for a fresh initial request built from `body`, with no
+/// pending `web_search_calls`, returning the resulting action.
+async fn run_initial_request(filter: &dyn HttpFilter, body: Value) -> FilterAction {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::from_request_body(body));
+    filter.on_request_body(&mut ctx, &mut None, true).await.unwrap()
+}
+
+#[tokio::test]
+async fn initial_streaming_request_missing_credential_rejects_before_first_round() {
+    // A fresh streaming request that declares web_search but omits the required
+    // per-user credential must be rejected with a 401 before any round runs; the
+    // re-entry check is unreachable once the stream has committed HTTP 200.
+    let filter = scoped_web_search_filter();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "search for cats",
+            "stream": true,
+            "tools": [{"type": "web_search"}]
+        }),
+    )
+    .await;
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected a fail-closed rejection, got {action:?}");
+    };
+    assert_eq!(
+        rejection.status, 401,
+        "missing per-user credential must fail closed with 401"
+    );
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        body["error"]["code"], "missing_callout_context",
+        "rejection must carry the missing_callout_context code"
+    );
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("brave"),
+        "rejection message should name the missing slot"
+    );
+}
+
+#[tokio::test]
+async fn initial_request_with_populated_credential_passes_preflight() {
+    // The credential is present, so the preflight succeeds; with no pending
+    // web_search_calls the filter simply continues without rejecting.
+    let filter = scoped_web_search_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut creds = crate::CalloutCredentials::new();
+    creds.insert("brave".to_owned(), secrecy::SecretString::from("tok-xyz"));
+    ctx.extensions.insert(creds);
+    ctx.extensions
+        .insert(ResponsesState::from_request_body(serde_json::json!({
+            "model": "gpt-4o",
+            "input": "search for cats",
+            "stream": true,
+            "tools": [{"type": "web_search"}]
+        })));
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a populated credential must pass the preflight, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn initial_request_tool_choice_none_skips_preflight() {
+    // `tool_choice: "none"` forbids all tools, so web search cannot run and no
+    // credential is required even though the tool is declared.
+    let filter = scoped_web_search_filter();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "tool_choice": "none",
+            "tools": [{"type": "web_search"}]
+        }),
+    )
+    .await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "tool_choice=none disables web search, so no credential preflight applies, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn initial_request_tool_choice_forces_other_tool_skips_preflight() {
+    // Forcing a non-web-search tool means web search cannot run this turn.
+    let filter = scoped_web_search_filter();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "tool_choice": {"type": "function", "name": "get_weather"},
+            "tools": [{"type": "web_search"}, {"type": "function", "name": "get_weather"}]
+        }),
+    )
+    .await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "forcing a different tool skips the web-search credential preflight, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn initial_request_without_web_search_tool_skips_preflight() {
+    // No hosted web-search tool is declared, so the preflight never applies.
+    let filter = scoped_web_search_filter();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "tools": [{"type": "function", "name": "get_weather"}]
+        }),
+    )
+    .await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "no declared web-search tool means no credential preflight, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn initial_request_tool_choice_forces_web_search_rejects() {
+    // An object `tool_choice` that forces the hosted web-search tool keeps it
+    // eligible, so a missing credential still fails closed at round 0.
+    let filter = scoped_web_search_filter();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "search for cats",
+            "tool_choice": {"type": "web_search"},
+            "tools": [{"type": "web_search"}]
+        }),
+    )
+    .await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("forcing web_search with a missing credential must reject, got {action:?}");
+    };
+    assert_eq!(rejection.status, 401, "forced web search without a credential must 401");
+}

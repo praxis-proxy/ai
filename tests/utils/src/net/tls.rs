@@ -286,9 +286,11 @@ pub struct ClientCert {
 // CA Generation
 // -----------------------------------------------------------------------------
 
-/// Install a process-wide default crypto provider for TLS tests.
+/// Install the process-wide crypto provider for TLS tests: the same one the
+/// binary installs at startup (the system OpenSSL), so the proxy under test
+/// runs on the provider it ships with. A no-op after the first call.
 fn ensure_crypto_provider() {
-    drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+    praxis_tls::provider::install();
 }
 
 /// Generate a self-signed CA certificate, parameters, and key pair.

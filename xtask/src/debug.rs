@@ -51,5 +51,6 @@ pub(crate) fn run(args: &Args) {
         config.admin.address = Some("127.0.0.1:9090".to_owned());
     }
 
+    praxis_ai::install_crypto_provider();
     praxis_ai::run_server(config, None)
 }

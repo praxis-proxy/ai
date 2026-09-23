@@ -119,6 +119,7 @@ async fn build_config_with_client_shares_connector_circuit_state() {
         subrequest::{SubRequestConnector, SubRequestConnectorOptions, SubRequestError},
     };
 
+    praxis_tls::provider::install();
     let shared = SubRequestClient::with_max_response_bytes(
         SubRequestConnector::with_options(SubRequestConnectorOptions {
             keepalive_pool_size: 4,
@@ -1536,9 +1537,7 @@ fn parse_config(yaml: &str) -> Result<ValidatedConfig, FilterError> {
 
 /// A default sub-request client for config-parsing tests that never dials.
 fn test_subrequest_client() -> SubRequestClient {
-    use praxis_core::subrequest::SubRequestConnector;
-
-    SubRequestClient::new(SubRequestConnector::new(4, None))
+    crate::subrequest::isolated_client(4)
 }
 
 /// An outbound pipeline that permits loopback/private upstreams so tests can

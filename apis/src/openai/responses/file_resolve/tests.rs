@@ -13,12 +13,9 @@ use bytes::Bytes;
 use serde_json::json;
 
 use super::*;
-use crate::{
-    openai::{
-        api_client::{ApiClient, ApiClientConfig},
-        responses::state::ResponsesState,
-    },
-    subrequest::SubRequestClient,
+use crate::openai::{
+    api_client::{ApiClient, ApiClientConfig},
+    responses::state::ResponsesState,
 };
 
 // -----------------------------------------------------------------------------
@@ -910,7 +907,7 @@ fn make_filter_with_outbound_for_url(files_api_url: &str) -> Box<dyn HttpFilter>
 /// filter YAML.
 fn make_filter_with_outbound_from_yaml(yaml_str: &str) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(yaml_str).unwrap();
-    let client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+    let client = crate::subrequest::isolated_client(4);
     FileResolveFilter::from_config_with_outbound(&yaml, client, private_outbound_pipeline()).unwrap()
 }
 
@@ -921,7 +918,7 @@ fn make_client() -> FilesApiClient {
 fn make_client_for_url_with_max(files_api_url: &str, max_resolved_bytes: usize) -> FilesApiClient {
     let api = ApiClient::new(ApiClientConfig {
         api_base_url: files_api_url.to_owned(),
-        client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+        client: crate::subrequest::isolated_client(4),
         timeout: Duration::from_secs(5),
         max_response_bytes: 1_048_576,
         forward_header_names: vec![],

@@ -12,9 +12,9 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use praxis_ai_apis::hash::{self, Sha256};
 use praxis_filter::FilterError;
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 
 use super::metadata::{CandidateCredential, is_supported_strategy};
 
@@ -247,17 +247,10 @@ pub(crate) fn default_stable_id(kind: CapabilityKind, name: &str, site: &str, cl
 
     let mut digest = Sha256::new();
     for field in [kind.as_str(), name, site, cluster] {
-        digest.update(field.len().to_be_bytes());
+        digest.update(&field.len().to_be_bytes());
         digest.update(field.as_bytes());
     }
-    let mut hashed = String::with_capacity(71);
-    hashed.push_str("sha256:");
-    for byte in digest.finalize() {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        hashed.push(HEX.get(usize::from(byte >> 4)).copied().map_or('0', char::from));
-        hashed.push(HEX.get(usize::from(byte & 0x0F)).copied().map_or('0', char::from));
-    }
-    Arc::from(hashed)
+    Arc::from(format!("sha256:{}", hash::hex(&digest.finish())))
 }
 
 /// Validate and build the candidate list from raw config entries.

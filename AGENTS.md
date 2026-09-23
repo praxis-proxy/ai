@@ -43,15 +43,21 @@ make lint           # clippy, fmt, dependency, docs, and example checks
 make doc            # rustdoc with -D warnings
 make audit          # cargo audit + cargo deny check
 make container      # build praxis-ai container image
+make container-fips # FIPS runtime image on UBI 9 (see docs/fips.md)
 ```
 
 Run a single test:
 
 ```console
-cargo test -p praxis-ai-apis -- test_name
-cargo test -p praxis-ai-filters -- test_name
-cargo test -p praxis-ai-proxy -- test_name
+cargo test -p praxis-ai-apis --features full -- test_name
+cargo test -p praxis-ai-filters --features full -- test_name
+cargo test -p praxis-ai-proxy --features full -- test_name
 ```
+
+The product crates default to the lean `standard` feature set, so tests for the
+opt-in OpenAI groups are compiled out without `--features full` (or the group's
+own feature). A name filter that matches only compiled-out tests reports
+"0 passed" and exits successfully.
 
 ## Architecture
 

@@ -9,6 +9,13 @@ use thiserror::Error;
 
 use crate::web_search::is_web_search_tool_type;
 
+/// Default prefix prepended to the summary when translating
+/// compaction items to backend-compatible messages.
+///
+/// Lives with the translation helpers (always compiled) so the stateless
+/// Responses path does not depend on the optional compaction filter.
+pub const DEFAULT_SUMMARY_PREFIX: &str = "[Previous conversation summary]\n\n";
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -655,7 +662,7 @@ fn append_compaction_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) -
         let prefix = obj
             .get("summary_prefix")
             .and_then(Value::as_str)
-            .unwrap_or(crate::openai::responses::compact::DEFAULT_SUMMARY_PREFIX);
+            .unwrap_or(DEFAULT_SUMMARY_PREFIX);
         messages.push(json!({
             "role": "assistant",
             "content": format!("{prefix}{summary}")

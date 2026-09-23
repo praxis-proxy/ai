@@ -151,6 +151,7 @@ pub fn project_state_owner(parent: &RequestExtensions, child: &mut RequestExtens
 ///
 /// Request-driven persisted-state filters fail closed when the security filter
 /// is absent or incorrectly ordered.
+#[cfg(feature = "store")]
 pub(crate) fn require_state_owner<'a>(ctx: &'a HttpFilterContext<'_>) -> Result<&'a StateOwner, FilterAction> {
     ctx.extensions.get::<StateOwner>().ok_or_else(|| {
         log_owner_decision("deny", "request_context", "missing_owner");

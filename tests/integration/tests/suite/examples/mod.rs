@@ -13,6 +13,7 @@ mod anthropic_full_flow_agentic;
 mod anthropic_messages;
 mod anthropic_messages_native_vllm;
 mod anthropic_messages_to_openai_vllm;
+mod anthropic_web_search_scoped_credentials;
 mod aws_sigv4;
 #[cfg(feature = "azure-ad-filter")]
 mod azure_ad;
@@ -70,6 +71,8 @@ mod openai_responses_format;
 mod openai_responses_model_rewrite;
 mod openai_responses_proxy;
 mod openai_responses_validate;
+// The state-ownership example selects the SQLite store backend.
+#[cfg(feature = "store-sqlite")]
 mod openai_state_ownership;
 #[cfg(feature = "store-sqlite")]
 mod openai_stream_events;
@@ -96,3 +99,4 @@ mod vector_stores_routing;
 mod vllm_agentic_api;
 mod web_search;
 mod web_search_chat_completions;
+mod web_search_scoped_credentials;

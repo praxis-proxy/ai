@@ -1260,6 +1260,7 @@ mod tests {
                 vec!["responses_client_tool_compat"],
                 vec!["responses_client_tool_compat", "responses_to_chat_completions"],
                 vec!["responses_client_tool_compat", "responses_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1304,11 +1305,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::LiveCovered,
             ]
         );
-        assert_eq!(report.features_total, 35);
-        assert_eq!(report.scenarios_total, 35);
-        assert_eq!(report.recordings_total, 40);
+        assert_eq!(report.features_total, 36);
+        assert_eq!(report.scenarios_total, 37);
+        assert_eq!(report.recordings_total, 42);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1321,6 +1323,8 @@ mod tests {
                 "messages/native-count-tokens",
                 "messages/native-tool-use",
                 "messages/provider-parameter-passthrough",
+                "messages/stop-sequence-nonstream",
+                "messages/stop-sequence-stream",
                 "messages/typed-server-tools",
                 "messages/unrepresentable-parameters",
                 "messages/upstream-error",
@@ -1349,7 +1353,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 35);
+        assert_eq!(manifest.features.len(), 36);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1530,6 +1534,13 @@ mod tests {
                     &"responses.client_tool_compat.chat_stream_restore".to_owned(),
                     &vec!["responses/client-tool-compat-chat-stream".to_owned()]
                 ),
+                (
+                    &"messages.response.stop_sequence".to_owned(),
+                    &vec![
+                        "messages/stop-sequence-nonstream".to_owned(),
+                        "messages/stop-sequence-stream".to_owned(),
+                    ]
+                ),
             ]
         );
         assert_eq!(
@@ -1624,7 +1635,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[16..] {
+        for feature in &manifest.features[16..35] {
             assert_eq!(
                 feature
                     .providers
@@ -1634,6 +1645,14 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
+        assert_eq!(
+            manifest.features[35]
+                .providers
+                .iter()
+                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                .collect::<Vec<_>>(),
+            vec![("vllm", CoverageStatus::LiveCovered)]
+        );
         assert!(manifest.features.iter().all(|feature| {
             feature.reason.is_none() && feature.providers.values().all(|coverage| coverage.reason.is_none())
         }));

@@ -1,4 +1,5 @@
 # File Search Callout Filter — Streaming (stream: true)
+# Requires `--features openai-responses` because these filters are opt-in.
 #
 # Demonstrates streaming hosted file_search through the iterative_request_router.
 # The IRR sends the request to the model, executes any returned file_search_call

@@ -1,4 +1,5 @@
 # Pinned Codex HTTP Responses to Chat Completions
+# Requires `--features openai-responses` because these filters are opt-in.
 #
 # Release-acceptance configuration for GitHub issue #870. A Codex
 # client speaks the OpenAI Responses API over HTTP while Praxis selects a

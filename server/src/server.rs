@@ -83,8 +83,10 @@ pub fn run_server_with_registry(config: Config, registry: FilterRegistry, config
     boot_server(config, registry, subrequest_client, config_path)
 }
 
-/// Common server startup: enforce checks, build pipelines, register
-/// protocols, spawn the config watcher, and run.
+/// Common server startup: install the crypto provider (a no-op when the entry
+/// point already did, but tracing is up now, so this is where its status gets
+/// logged), enforce checks, build pipelines, register protocols, spawn the
+/// config watcher, and run.
 #[expect(clippy::allow_attributes, reason = "lint is platform/config-dependent")]
 #[allow(clippy::needless_pass_by_value, reason = "server owns config")]
 fn boot_server(
@@ -93,6 +95,7 @@ fn boot_server(
     subrequest_client: praxis_core::subrequest::SubRequestClient,
     config_path: Option<PathBuf>,
 ) -> ! {
+    install_crypto_provider();
     enforce_root_check(&config);
     warn_insecure_options(&config);
     init_runtime_limits(&config.runtime);
@@ -438,6 +441,46 @@ fn spawn_health_check_tasks(
 // Utility Functions
 // -----------------------------------------------------------------------------
 
+/// Install the process-wide rustls crypto provider, the one backed by the
+/// system OpenSSL, and log the FIPS status it reports.
+///
+/// Call it before anything that might build a TLS configuration, including
+/// `--validate` and `--dump`. With `PRAXIS_REQUIRE_FIPS` set the process
+/// refuses to start unless FIPS mode is in effect (the provider reports
+/// FIPS-approved algorithms and the kernel flag is on), naming each missing
+/// signal. It is a check, never a switch: FIPS mode comes from the host, and
+/// praxis-ai never enables a provider on its own.
+pub fn install_crypto_provider() {
+    praxis_tls::provider::install();
+
+    if !praxis_tls::provider::installed() {
+        fatal(&format!(
+            "failed to install the {} crypto provider; refusing to start",
+            praxis_tls::provider::name()
+        ));
+    }
+
+    let status = praxis_tls::provider::status();
+    info!(
+        provider = status.name,
+        provider_fips = status.provider_fips,
+        kernel_fips = ?status.kernel_fips,
+        fips_required = praxis_tls::provider::required(),
+        "installed rustls crypto provider"
+    );
+
+    if praxis_tls::provider::required() {
+        let unmet = status.unmet();
+        if !unmet.is_empty() {
+            fatal(&format!(
+                "{} is set but FIPS mode is not in effect: {}",
+                praxis_tls::provider::REQUIRE_FIPS_ENV,
+                unmet.join("; ")
+            ));
+        }
+    }
+}
+
 /// Print a fatal error to stderr and exit the process.
 #[expect(
     clippy::print_stderr,
@@ -523,5 +566,22 @@ mod tests {
         if !std::path::Path::new("praxis.yaml").exists() {
             assert!(path.is_none(), "should return None when praxis.yaml does not exist");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Crypto provider
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn install_crypto_provider_installs_the_system_openssl_provider() {
+        super::install_crypto_provider();
+        let status = praxis_tls::provider::status();
+        assert!(status.installed, "a process-wide provider is installed");
+        assert_eq!(
+            status.name, "openssl",
+            "the only compiled-in provider is the OpenSSL one"
+        );
+        super::install_crypto_provider();
+        assert!(praxis_tls::provider::installed(), "installing again is harmless");
     }
 }
