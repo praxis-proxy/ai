@@ -85,7 +85,8 @@ jobs:
 
   store-features:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Also lints each opt-in feature group on its own (one clippy pass each).
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:

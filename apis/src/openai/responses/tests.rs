@@ -1145,6 +1145,7 @@ fn make_filter(yaml_str: &str) -> Box<dyn HttpFilter> {
 // streamed_round_is_dispatchable Tests
 // -----------------------------------------------------------------------------
 
+#[cfg(feature = "openai-responses")]
 #[test]
 fn dispatchable_requires_terminal_completed_no_parse_error() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -1163,6 +1164,7 @@ fn dispatchable_requires_terminal_completed_no_parse_error() {
     );
 }
 
+#[cfg(feature = "openai-responses")]
 #[test]
 fn non_streaming_request_is_always_dispatchable() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
@@ -1171,6 +1173,7 @@ fn non_streaming_request_is_always_dispatchable() {
     assert!(streamed_round_is_dispatchable(&ctx, &state));
 }
 
+#[cfg(feature = "openai-responses")]
 #[test]
 fn fs_end_stream_writes_five_keys_and_is_idempotent() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");

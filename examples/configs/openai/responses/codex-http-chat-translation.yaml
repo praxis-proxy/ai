@@ -1,0 +1,92 @@
+# Pinned Codex HTTP Responses to Chat Completions
+# Requires `--features openai-responses` because these filters are opt-in.
+#
+# Release-acceptance configuration for GitHub issue #870. A Codex
+# client speaks the OpenAI Responses API over HTTP while Praxis selects a
+# Chat Completions-only provider, translates both request and streaming
+# response, rewrites the provider path, and replaces the client credential.
+#
+# Client boundary:
+#   POST /v1/responses
+#   Authorization: Bearer <gateway credential>
+#   OpenAI Responses JSON and SSE
+#
+# Provider boundary:
+#   POST /v1/chat/completions
+#   Authorization: Bearer <provider credential>
+#   OpenAI Chat Completions JSON and SSE
+#
+# `openai_stream_events` and `responses_to_chat_completions` live in the same
+# iterative-router step. Response filters run in reverse order, so translated
+# Responses SSE is accumulated as it streams rather than buffered until the
+# Chat response completes.
+
+listeners:
+  - name: codex-http
+    address: "127.0.0.1:8080"
+    filter_chains: [codex-chat-provider]
+
+filter_chains:
+  - name: codex-chat-provider
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_validate
+
+      - filter: iterative_request_router
+        initial_step: selected-provider
+        max_iterations: 1
+        timeout_ms: 30000
+        steps:
+          - name: selected-provider
+            filters:
+              - filter: openai_stream_events
+                # Must exceed the translator's complete-frame ceiling below.
+                max_buffer_bytes: 4194304
+                max_events: 1000
+                timeout_secs: 30
+
+              - filter: responses_to_chat_completions
+                max_rewritten_body_bytes: 1048576
+                max_emitted_sse_frame_bytes: 2097152
+                max_stream_events: 500
+                stream_timeout_secs: 30
+
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      path_prefix: "/v1/responses"
+                      methods: [POST]
+
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: codex-chat-provider
+
+              - filter: credential_injection
+                clusters:
+                  - name: codex-chat-provider
+                    header: Authorization
+                    value: "synthetic-provider-key"
+                    header_prefix: "Bearer "
+                    strip_client_credential: true
+
+              - filter: load_balancer
+                clusters:
+                  - name: codex-chat-provider
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local scripted backend

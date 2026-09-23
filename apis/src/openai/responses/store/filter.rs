@@ -52,6 +52,7 @@ use praxis_filter::{
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 use secrecy::ExposeSecret as _;
 use serde_json::Value;
 use tokio::sync::OnceCell;
@@ -61,8 +62,8 @@ use tracing::{debug, trace, warn};
 use super::config::revalidate_postgres_host;
 use super::{
     super::{
-        DEFAULT_STORE_NAME, append_stored_input_items, compact::is_explicit_compact_request,
-        error::responses_error_rejection, state::ResponsesState,
+        DEFAULT_STORE_NAME, append_stored_input_items, error::responses_error_rejection, is_explicit_compact_request,
+        state::ResponsesState,
     },
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
     config::{ResponseStoreConfig, StorageBackend, validate_config},
@@ -123,6 +124,10 @@ impl ResponseStoreFilter {
 
     /// Build the configured store backend.
     #[expect(clippy::too_many_lines, reason = "tracing macros inflate complexity")]
+    #[cfg_attr(
+        not(any(feature = "store-postgres", feature = "store-sqlite")),
+        expect(clippy::unused_async, reason = "only the SQL backends await during construction")
+    )]
     pub(super) async fn build_store(&self) -> Result<Arc<dyn ResponseStore>, StoreError> {
         match self.config.backend {
             #[cfg(feature = "store-sqlite")]

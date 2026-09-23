@@ -8,9 +8,9 @@ pub(crate) mod provider;
 
 use std::fmt::Write as _;
 
-pub(crate) use config::{
-    OpenAiWebSearchConfig, SearchContextSize, ValidatedConfig, WebSearchFilterConfig, build_config,
-};
+#[cfg(feature = "openai-responses")]
+pub(crate) use config::OpenAiWebSearchConfig;
+pub(crate) use config::{SearchContextSize, ValidatedConfig, WebSearchFilterConfig, build_config};
 #[cfg(test)]
 use praxis_filter::FilterError;
 pub(crate) use provider::{CalloutContext, SearchClient, SearchOutcome, SearchResult};

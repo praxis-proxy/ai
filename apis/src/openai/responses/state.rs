@@ -270,8 +270,16 @@ pub(crate) enum McpApprovalState {
     #[default]
     None,
     /// Return approval requests after a sibling dispatcher finishes re-entry.
+    #[cfg_attr(
+        all(not(test), not(feature = "openai-mcp-tools")),
+        expect(dead_code, reason = "only MCP dispatch defers approval responses")
+    )]
     ApprovalPendingThenReturn,
     /// Execute ungated siblings, then return the pending approval response.
+    #[cfg_attr(
+        not(feature = "openai-mcp-tools"),
+        expect(dead_code, reason = "only MCP dispatch defers approval responses")
+    )]
     ExecuteUngatedThenReturn,
 }
 
@@ -380,6 +388,10 @@ pub(crate) struct ResponsesState {
     /// definitions from the internally resolved endpoint. Holds the
     /// pipeline-local URL and credentials; never serialized to the
     /// inference backend, client responses, or persisted records.
+    #[cfg_attr(
+        all(not(test), not(feature = "openai-mcp-tools")),
+        expect(dead_code, reason = "deferred connectors are consumed only by MCP dispatch")
+    )]
     pub deferred_mcp: Vec<DeferredMcpConnector>,
 
     /// Maximum number of built-in tool invocations.
@@ -444,6 +456,10 @@ pub(crate) struct ResponsesState {
 
     /// Whether tool calls may execute concurrently within an
     /// iteration. Defaults to `true` per the API spec.
+    #[cfg_attr(
+        all(not(test), not(feature = "openai-mcp-tools")),
+        expect(dead_code, reason = "only MCP dispatch schedules concurrent tool calls")
+    )]
     pub parallel_tool_calls: bool,
 
     /// Full message history to persist for future rehydration.
@@ -460,6 +476,7 @@ pub(crate) struct ResponsesState {
     /// persisted as the authoritative record for correlating a later
     /// `mcp_approval_response`. Consent provenance lives here and in the
     /// store, never in the (client-influenced) conversation history.
+    #[cfg(feature = "store")]
     pub pending_approvals: Vec<crate::store::PendingApprovalRecord>,
 
     /// Whether the store filter armed persistence for this exchange.
@@ -475,6 +492,10 @@ pub(crate) struct ResponsesState {
     /// `response_conditions`-gated store filter, a non-2xx status, etc.); that
     /// narrower residual is unsupported for approval pipelines and still fails
     /// closed at resume.
+    #[cfg_attr(
+        all(not(test), not(feature = "store")),
+        expect(dead_code, reason = "read only by the store, rehydrate, and MCP approval paths")
+    )]
     pub store_persist_armed: bool,
 
     /// Whether the streaming `previous_response_id` wire rewrite was armed.
@@ -754,6 +775,10 @@ pub(crate) struct DeferredMcpConnector {
 
     /// Configured MCP endpoint URL. Never written to backend requests,
     /// client-visible responses, logs, or persisted response state.
+    #[cfg_attr(
+        not(feature = "openai-mcp-tools"),
+        expect(dead_code, reason = "only MCP dispatch dials deferred connectors")
+    )]
     pub server_url: String,
 
     /// Per-server timeout for the deferred `tools/list` call.
@@ -815,6 +840,7 @@ impl Default for ResponsesState {
             provider_history_len: 0,
             parallel_tool_calls: true,
             persisted_messages: Vec::new(),
+            #[cfg(feature = "store")]
             pending_approvals: Vec::new(),
             store_persist_armed: false,
             previous_response_id_stream_restore_armed: false,
@@ -915,6 +941,38 @@ impl ResponsesState {
     /// Return whether provider-visible request state requires serialization.
     pub(crate) fn request_body_requires_rebuild(&self) -> bool {
         self.request_body_rebuild == RequestBodyRebuild::Required
+    }
+
+    /// Borrow the **outbound** request tools that downstream translation emits.
+    ///
+    /// [`Self::request_body`] is the single lowered-tool view:
+    /// `openai_client_tool_compat` lowers rich client tools into
+    /// `request_body["tools"]` **only**, leaving canonical [`Self::tools`] holding
+    /// the original rich types for response-side restore. Provider-body consumers
+    /// (`openai_responses_proxy`, `responses_to_chat_completions`) must read the
+    /// outbound tools through this accessor so they translate the lowered view, not
+    /// the canonical rich tools that a function-only backend cannot accept.
+    ///
+    /// Returns `request_body["tools"]` when present as an array, else falls back to
+    /// canonical [`Self::tools`]. A present-but-non-array override is not trusted.
+    /// Compat must keep **not** writing canonical [`Self::tools`]; this accessor is
+    /// the contract that keeps the lowered view single-sourced (no duplicate field,
+    /// no clone).
+    pub(crate) fn request_tools(&self) -> &[serde_json::Value] {
+        self.request_body
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .map_or(self.tools.as_slice(), Vec::as_slice)
+    }
+
+    /// Borrow the **outbound** request `tool_choice` downstream translation emits.
+    ///
+    /// Mirrors [`Self::request_tools`]: returns `request_body["tool_choice"]` when
+    /// the key is present, else canonical [`Self::tool_choice`]. The check is on key
+    /// presence, not value shape, so it preserves `auto` omission — it never
+    /// synthesizes a choice the caller or `openai_agentic_loop` did not set.
+    pub(crate) fn request_tool_choice(&self) -> &serde_json::Value {
+        self.request_body.get("tool_choice").unwrap_or(&self.tool_choice)
     }
 
     /// Finalize the response into [`Self::response_object`] and serialize it to
@@ -1982,5 +2040,110 @@ mod tests {
         };
         assert_eq!(rejection.status, 502, "size overflow returns a server error");
         assert!(body.is_none(), "no body is written on a finalize failure");
+    }
+
+    #[test]
+    fn request_tools_returns_lowered_request_body_tools_over_canonical() {
+        // `openai_client_tool_compat` lowers rich client tools into
+        // `request_body["tools"]` only, leaving canonical `state.tools` rich. The
+        // accessor must return the lowered outbound view so downstream translation
+        // (`responses_to_chat_completions`) sees valid `function` tools.
+        let mut state = ResponsesState::from_request_body(json!({
+            "model": "m",
+            "tools": [{"type": "custom", "name": "apply_patch"}],
+        }));
+        assert_eq!(
+            state.tools,
+            vec![json!({"type": "custom", "name": "apply_patch"})],
+            "canonical tools start as the rich client types",
+        );
+        // Simulate compat lowering: rewrite only the outbound request body.
+        state.request_body["tools"] = json!([{"type": "function", "name": "apply_patch"}]);
+
+        assert_eq!(
+            state.request_tools(),
+            &[json!({"type": "function", "name": "apply_patch"})],
+            "accessor returns the lowered outbound tools, not canonical rich tools",
+        );
+        assert_eq!(
+            state.tools,
+            vec![json!({"type": "custom", "name": "apply_patch"})],
+            "accessor is read-only: canonical tools remain rich",
+        );
+    }
+
+    #[test]
+    fn request_tools_falls_back_to_canonical_when_key_absent() {
+        // No outbound override present: the accessor must return canonical tools so
+        // non-compat pipelines are byte-identical.
+        let mut state = ResponsesState::from_request_body(json!({"model": "m"}));
+        state.tools = vec![json!({"type": "function", "name": "lookup"})];
+        state
+            .request_body
+            .as_object_mut()
+            .expect("request body is an object")
+            .remove("tools");
+
+        assert_eq!(
+            state.request_tools(),
+            &[json!({"type": "function", "name": "lookup"})],
+            "accessor falls back to canonical tools when request_body has no tools key",
+        );
+    }
+
+    #[test]
+    fn request_tools_falls_back_to_canonical_when_non_array() {
+        // A present-but-malformed override must not be trusted; fall back to canonical.
+        let mut state = ResponsesState::from_request_body(json!({"model": "m"}));
+        state.tools = vec![json!({"type": "function", "name": "lookup"})];
+        state.request_body["tools"] = json!("not-an-array");
+
+        assert_eq!(
+            state.request_tools(),
+            &[json!({"type": "function", "name": "lookup"})],
+            "accessor falls back to canonical tools when request_body tools is not an array",
+        );
+    }
+
+    #[test]
+    fn request_tool_choice_returns_lowered_request_body_value_over_canonical() {
+        // Compat may lower a rich `tool_choice` (e.g. an `allowed_tools` object) into
+        // the outbound body; the accessor must surface the lowered value.
+        let mut state = ResponsesState::from_request_body(json!({
+            "model": "m",
+            "tool_choice": {"type": "allowed_tools", "tools": [{"type": "custom", "name": "apply_patch"}]},
+        }));
+        state.request_body["tool_choice"] = json!("required");
+
+        assert_eq!(
+            state.request_tool_choice(),
+            &json!("required"),
+            "accessor returns the lowered outbound tool_choice",
+        );
+        assert_eq!(
+            state.tool_choice,
+            json!({"type": "allowed_tools", "tools": [{"type": "custom", "name": "apply_patch"}]}),
+            "accessor is read-only: canonical tool_choice remains rich",
+        );
+    }
+
+    #[test]
+    fn request_tool_choice_falls_back_to_canonical_when_key_absent() {
+        // Preserve `auto` omission: when the outbound body carries no explicit
+        // tool_choice, the accessor must return the canonical value unchanged rather
+        // than synthesizing one.
+        let mut state = ResponsesState::from_request_body(json!({"model": "m"}));
+        state.tool_choice = json!("none");
+        state
+            .request_body
+            .as_object_mut()
+            .expect("request body is an object")
+            .remove("tool_choice");
+
+        assert_eq!(
+            state.request_tool_choice(),
+            &json!("none"),
+            "accessor falls back to canonical tool_choice when request_body has no key",
+        );
     }
 }

@@ -1,0 +1,162 @@
+# MCP Streaming Callout Transport
+# Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
+#
+# Demonstrates MCP tool calls over the filtered-subrequest transport with SSE
+# streaming support. The openai_mcp_dispatch filter executes MCP calls against
+# server URLs supplied in the client request, routing them through a filtered
+# outbound chain that can observe and stamp headers without selecting an
+# upstream (the MCP transport itself stages the destination).
+#
+# SSE streaming support:
+#   The MCP callout transport can consume both buffered JSON and SSE-streamed
+#   tool results from MCP servers. When the MCP server returns a tools/call
+#   result as `text/event-stream`, the transport parses the SSE stream, applies
+#   byte and time budgets, and materializes the result for dispatch. Oversized
+#   SSE streams are classified as 413 per the configured max_result_bytes.
+#
+# Outbound chain requirements:
+#   The openai_mcp_streaming_selector filter is required in any MCP outbound
+#   chain to enable SSE transport negotiation. For an INLINE outbound_chain
+#   (name + filters), the selector is auto-injected as the first entry; you do
+#   NOT add it manually. For a NAMED outbound_chain (a top-level filter_chains
+#   reference), you MUST list `- filter: openai_mcp_streaming_selector` as the
+#   first, unconditional filter or the proxy refuses to start.
+#
+# StreamBuffer validation:
+#   A response-body-buffering (StreamBuffer) filter in the MCP outbound_chain
+#   is rejected at boot, since SSE streams must be consumed incrementally and
+#   cannot be buffered.
+#
+# This example uses an INLINE outbound_chain for openai_mcp_dispatch, so the
+# selector is auto-injected. Only the request-stamping headers filter is
+# explicitly listed.
+#
+# Example request:
+#
+#   curl -X POST http://localhost:8080/v1/responses \
+#     -H "Content-Type: application/json" \
+#     -d '{
+#       "model": "gpt-4.1",
+#       "input": "What is the weather in SF?",
+#       "tools": [{
+#         "type": "mcp",
+#         "server_label": "weather",
+#         "server_url": "http://mcp-weather:8001/mcp",
+#         "allowed_tools": ["get_weather"],
+#         "require_approval": "never"
+#       }]
+#     }'
+#
+# Build:
+#   cargo build -p praxis-ai-proxy --features openai-mcp-tools,store-sqlite
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [mcp-streaming-pipeline]
+
+filter_chains:
+  - name: mcp-streaming-pipeline
+    filters:
+      - filter: openai_responses_format
+        on_invalid: reject
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+          stream: x-praxis-ai-stream
+
+      - filter: openai_responses_validate
+
+      - filter: openai_tool_parse
+
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: default
+
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        responses_table: openai_responses
+        conversations_table: openai_conversations
+
+      - filter: openai_mcp_tool_resolve
+        timeout_ms: 5000
+
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 11
+        max_stream_response_bytes: 67108864
+        timeout_ms: 360000
+        steps:
+          - name: inference
+            filters:
+              # Composes every inference SSE stream into one logical Responses
+              # lifecycle: preserves one response identity across rounds and
+              # withholds per-round terminal events until the IRR transition is
+              # known. Stays before openai_agentic_loop so response-phase reverse
+              # order lets the loop parse the raw SSE.
+              #
+              # REQUIRED because `openai_responses_proxy` below selects typed
+              # streaming automatically for an effective `"stream": true`
+              # request.
+              - filter: openai_stream_events
+
+              # Request-phase dispatcher: executes MCP calls prepared by the
+              # loop owner. The outbound_chain is INLINE (name + filters), so
+              # openai_mcp_streaming_selector is auto-injected as the first
+              # entry; we only list the request-stamping headers filter here.
+              #
+              # This filter runs inside an iterative_request_router step, whose
+              # pipeline is built with an empty named-chain map, so only inline
+              # outbound_chain definitions are supported here (top-level
+              # filter_chains references cannot resolve).
+              #
+              # Do NOT put static credentials in this chain: MCP destinations
+              # are client-selected (server_url), so a blanket credential header
+              # would leak to attacker-chosen hosts.
+              - filter: openai_mcp_dispatch
+                outbound_chain:
+                  name: mcp-dispatch-outbound
+                  filters:
+                    - filter: headers
+                      request_set:
+                        - name: X-MCP-Client
+                          value: praxis-ai-gateway
+                max_calls_per_round: 32
+                max_parallel_calls: 8
+                max_result_bytes: 1048576
+                max_total_result_bytes: 8388608
+
+              - filter: openai_agentic_loop
+                max_infer_iters: 10
+
+              # Selects typed streaming automatically when the effective
+              # outbound body carries `"stream": true`.
+              - filter: openai_responses_proxy
+
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "inference-backend"
+
+              - filter: load_balancer
+                clusters:
+                  - name: "inference-backend"
+                    read_timeout_ms: 300000
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              # openai_agentic_loop is the sole loop authority: it parses each
+              # model response, records assignments for the request-phase
+              # dispatchers, and publishes the single continuation signal.
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true
+  # Required for loopback MCP server URLs supplied in the client request.
+  allow_private_upstreams: true

@@ -27,19 +27,25 @@ is a generic async trait shared across providers.
 
 ## Backend Features
 
-PostgreSQL is the default production backend. The same feature selection
-applies to both the Responses store and the Conversations store:
+No store backend is compiled into the default `standard` build. PostgreSQL
+is the production backend and is part of the `full` feature set that the
+release image uses. The same feature selection applies to both the Responses
+store and the Conversations store:
 
 | Feature | Backends |
 |---------|----------|
-| `store-postgres` | PostgreSQL through SQLx native TLS (default) |
+| `store-postgres` | PostgreSQL through SQLx native TLS (part of `full`) |
 | `store-sqlite` | SQLite only |
 | `store-all` | PostgreSQL and SQLite |
+
+The store features only compile the Responses store filters. The Conversations
+API also needs `openai-conversations` (for example
+`--features openai-conversations,store-sqlite`).
 
 SQLite examples require an explicit build:
 
 ```console
-cargo run -p praxis-ai-proxy --no-default-features --features store-sqlite -- \
+cargo run -p praxis-ai-proxy --features store-sqlite -- \
   -c examples/configs/openai/responses/response-store.yaml
 ```
 

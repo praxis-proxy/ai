@@ -5,8 +5,8 @@
 //!
 //! Provides URL construction, SSRF-safe base-URL validation,
 //! resource-ID path-segment encoding, header forwarding, bounded
-//! JSON and byte reads, and normalized error mapping. Used by
-//! [`FilesApiClient`] and vector-store search.
+//! JSON and byte reads, and normalized error mapping. Used by the
+//! `openai_file_resolve` Files API client and vector-store search.
 //!
 //! All requests route through the [`SubRequestClient`] from
 //! praxis-core for connection pooling, TLS, admission control,
@@ -14,7 +14,6 @@
 //!
 //! Each consuming filter retains its own [`ApiClient`] instance.
 //!
-//! [`FilesApiClient`]: super::responses::file_resolve
 //! [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
 
 pub(crate) mod error;
@@ -34,9 +33,11 @@ use praxis_filter::{
     StagedUpstreamFallback, SubrequestRuntime, TlsPeerIdentity,
 };
 
+#[cfg(feature = "openai-responses")]
+pub(crate) use self::url::validate_forward_headers;
 pub(crate) use self::{
     error::ApiClientError,
-    url::{resource_url, validate_base_url, validate_forward_headers},
+    url::{resource_url, validate_base_url},
 };
 use crate::{
     callout_target::AddressPolicy,

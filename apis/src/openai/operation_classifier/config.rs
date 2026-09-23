@@ -6,33 +6,23 @@
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
+use super::FILTER_NAME;
+use crate::promotion::parse_dedicated_promotion_header;
+
 /// Default header carrying the classified application protocol.
 pub(crate) const DEFAULT_APPLICATION_PROTOCOL_HEADER: &str = "x-praxis-ai-application-protocol";
 
 /// Default header carrying the classified operation ID.
 pub(crate) const DEFAULT_OPERATION_HEADER: &str = "x-praxis-ai-operation";
 
-/// Header names a classifier target may never use.
+/// Internal namespaces owned by other protocol filters.
 ///
-/// Each of these carries authentication state or HTTP framing that the proxy
-/// or upstream depends on, so overwriting or removing one would corrupt the
-/// exchange rather than route it. Matched case-insensitively against the
-/// parsed [`http::HeaderName`], which is always lowercase.
-const FORBIDDEN_HEADER_TARGETS: &[&str] = &[
-    "authorization",
-    "proxy-authorization",
-    "cookie",
-    "set-cookie",
-    "host",
-    "content-length",
-    "content-type",
-    "transfer-encoding",
-    "connection",
-    "upgrade",
-    "te",
-    "trailer",
-    "expect",
-];
+/// The shared promotion validator leaves these to the MCP and A2A filters,
+/// which legitimately write their own namespaces. This classifier owns
+/// neither, and it writes with set semantics and strips its targets from
+/// unmatched requests, so pointing it at one would corrupt that filter's
+/// state rather than route the request.
+const FOREIGN_INTERNAL_PREFIXES: &[&str] = &["x-mcp-", "x-a2a-"];
 
 /// Configurable header names for the classified operation.
 ///
@@ -111,8 +101,13 @@ pub(crate) fn build_config(config: &OperationClassifierConfig) -> Result<Validat
     let application_protocol_header = parse_header(
         config.headers.application_protocol.as_deref(),
         "headers.application_protocol",
+        DEFAULT_APPLICATION_PROTOCOL_HEADER,
     )?;
-    let operation_header = parse_header(config.headers.operation.as_deref(), "headers.operation")?;
+    let operation_header = parse_header(
+        config.headers.operation.as_deref(),
+        "headers.operation",
+        DEFAULT_OPERATION_HEADER,
+    )?;
 
     // Both targets are written with set semantics, so sharing a name means the
     // operation value silently replaces the application protocol.
@@ -133,17 +128,27 @@ pub(crate) fn build_config(config: &OperationClassifierConfig) -> Result<Validat
 
 /// Parse one optional header name, naming the offending field on failure.
 ///
-/// Rejects targets carrying authentication state or HTTP framing, which the
-/// classifier overwrites or removes and so must never own.
-fn parse_header(value: Option<&str>, field: &str) -> Result<Option<http::HeaderName>, FilterError> {
+/// Defers the safety policy to the shared promotion-header validator, so this
+/// filter cannot drift from the rules every other promoting filter enforces.
+/// The classifier writes its outputs with set semantics and strips them from
+/// unmatched requests, so a target it does not own would be silently
+/// overwritten or removed.
+///
+/// Each field permits only its own dedicated default or a custom
+/// non-`x-praxis-*` name. Transport-controlled names, credential headers
+/// including provider API keys, and every other internal `x-praxis-*` name —
+/// such as another filter's `x-praxis-ai-format` — are rejected.
+fn parse_header(value: Option<&str>, field: &str, dedicated: &str) -> Result<Option<http::HeaderName>, FilterError> {
     value
         .map(|name| {
-            let header = http::HeaderName::try_from(name).map_err(|_ignored| {
-                FilterError::from(format!("openai_operation: {field} is not a valid header name"))
-            })?;
-            if FORBIDDEN_HEADER_TARGETS.contains(&header.as_str()) {
+            let header = parse_dedicated_promotion_header(FILTER_NAME, field, name, &[dedicated])?;
+            if let Some(prefix) = FOREIGN_INTERNAL_PREFIXES
+                .iter()
+                .find(|prefix| header.as_str().starts_with(*prefix))
+            {
                 return Err(FilterError::from(format!(
-                    "openai_operation: {field} must not target {header:?}, which carries authentication or framing state"
+                    "{FILTER_NAME}: '{field}' must not use the reserved '{prefix}' namespace, \
+                     which belongs to another filter"
                 )));
             }
             Ok(header)

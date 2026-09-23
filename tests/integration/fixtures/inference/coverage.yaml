@@ -301,6 +301,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.structured_output_with_tools
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-structured-output-with-tools
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.client_tool_compat.lower_restore
     scopes:
       - responses_client_tool_compat
@@ -310,3 +319,42 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.client_tool_compat.stream_restore
+    scopes:
+      - responses_client_tool_compat
+    status: synthetic_only
+    scenarios:
+      - responses/client-tool-compat-stream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.client_tool_compat.chat_lower_restore
+    scopes:
+      - responses_client_tool_compat
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/client-tool-compat-chat
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.client_tool_compat.chat_stream_restore
+    scopes:
+      - responses_client_tool_compat
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/client-tool-compat-chat-stream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: messages.response.stop_sequence
+    scopes:
+      - messages_to_chat_completions
+    status: live_covered
+    scenarios:
+      - messages/stop-sequence-nonstream
+      - messages/stop-sequence-stream
+    providers:
+      vllm:
+        status: live_covered

@@ -16,8 +16,9 @@ use praxis_filter::{
 use serde_json::json;
 
 use super::{
-    DEFAULT_PAGE_LIMIT, ListParams, MAX_PAGE_LIMIT, Order, ResponseStoreFilter,
+    ListParams, MAX_PAGE_LIMIT, Order, ResponseStoreFilter,
     config::{ResponseStoreConfig, revalidate_postgres_host, validate_config},
+    input_items::DEFAULT_PAGE_LIMIT,
     list_input_items,
 };
 use crate::{

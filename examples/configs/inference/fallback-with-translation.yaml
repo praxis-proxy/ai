@@ -1,4 +1,5 @@
 # Inference Fallback with Protocol Translation
+# Requires `--features openai-responses` because these filters are opt-in.
 #
 # Demonstrates provider failover with Responses-to-Chat Completions
 # protocol translation using the iterative_request_router. When the
@@ -56,7 +57,7 @@
 #     /api/v1/chat/completions for OpenRouter).
 #
 # Usage:
-#   cargo run -p praxis-ai-proxy -- -c examples/configs/inference/fallback-with-translation.yaml
+#   cargo run -p praxis-ai-proxy --features openai-responses -- -c examples/configs/inference/fallback-with-translation.yaml
 
 listeners:
   - name: ai-gateway

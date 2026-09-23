@@ -14,6 +14,14 @@ V                ?=
 # crate; it is not a praxis-ai-filters feature.
 FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter
 INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter
+# Features for `make release`; `full` matches the published container image.
+PRAXIS_AI_FEATURES ?= full
+# Crates that must never enter the default (standard) praxis-ai-proxy graph.
+DEFAULT_GRAPH_DENY := sqlx sqlx-core libsqlite3-sys openssl-sys native-tls rmcp sse-stream \
+	jsonschema utoipa tiktoken-rs reqwest serde_json_path tonic prost
+# Upper bound on crates (name@version, normal + build edges, host target) in the
+# default graph. Linux hosts measure about 424, macOS about 428.
+DEFAULT_GRAPH_BUDGET ?= 430
 STORE_ALL_WORKSPACE_FEATURES := praxis-ai-proxy/store-all,praxis-tests-integration/store-all,praxis-tests-schema/store-all,praxis-tests-environment/store-all
 
 ifneq ($(V),)
@@ -27,7 +35,7 @@ endif
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
 	test-responses-conformance \
-	lint fmt doc audit coverage-check \
+	lint lint-lean check-dep-budget fmt doc audit coverage-check \
 	require-container-engine \
 	container container-run \
 	setup-hooks help \
@@ -47,7 +55,7 @@ build:
 	cargo build --workspace
 
 release:
-	cargo build --workspace --release
+	cargo build --release -p praxis-ai-proxy --features $(PRAXIS_AI_FEATURES)
 
 check:
 	cargo check --workspace
@@ -79,42 +87,54 @@ test:
 
 test-unit:
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --features full $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
-	cargo test -p praxis-ai-filters --features $(FILTER_EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
+	cargo test -p praxis-ai-filters --features full $(_NOCAPTURE)
+	cargo test -p praxis-ai-filters --features full,$(FILTER_EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
 	cargo test -p praxis-ai-proxy $(_NOCAPTURE)
-	cargo test -p praxis-ai-proxy --features basic-auth-filter $(_NOCAPTURE)
+	cargo test -p praxis-ai-proxy --features full $(_NOCAPTURE)
+	cargo test -p praxis-ai-proxy --features full,basic-auth-filter $(_NOCAPTURE)
 	cargo test -p praxis-ai-build-support $(_NOCAPTURE)
 
 test-store-features:
 	cargo check -p praxis-ai-proxy
-	cargo check -p praxis-ai-proxy --no-default-features --features store-sqlite
-	cargo check -p praxis-ai-proxy --no-default-features --features store-all
-	cargo test -p praxis-ai-apis --no-default-features --features store-sqlite $(_NOCAPTURE)
-	cargo test -p praxis-ai-apis --no-default-features --features store-all $(_NOCAPTURE)
-	@if cargo tree -p praxis-ai-proxy --edges normal | grep -q libsqlite3-sys; then \
-		echo "ERROR: default proxy dependency graph contains libsqlite3-sys"; \
+	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
+	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-all
+	@# Lint each opt-in group on its own so a gate leak in a partial feature set
+	@# cannot hide behind the lean and full builds that other targets cover.
+	@for group in openai-responses openai-file-resolve-filter store store-sqlite \
+		openai-conversations openai-compact openai-mcp-tools; do \
+		echo "clippy: standard + $$group"; \
+		cargo clippy -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy --all-targets \
+			--no-default-features --features praxis-ai-proxy/standard,praxis-ai-proxy/$$group \
+			-- -D warnings || exit 1; \
+	done
+	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-sqlite $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-all $(_NOCAPTURE)
+	@if cargo tree -p praxis-ai-proxy --features full --edges normal | grep -q libsqlite3-sys; then \
+		echo "ERROR: full proxy dependency graph contains libsqlite3-sys"; \
 		exit 1; \
 	fi
-	@cargo tree -p praxis-ai-proxy --edges features -i sqlx-core | grep -q '_tls-native-tls' || \
-		(echo "ERROR: default proxy SQLx graph does not enable native TLS"; exit 1)
-	@if cargo tree -p praxis-ai-proxy --edges features -i sqlx-core | grep -q '_tls-rustls'; then \
-		echo "ERROR: default proxy SQLx graph contains a rustls TLS backend"; \
+	@cargo tree -p praxis-ai-proxy --features full --edges features -i sqlx-core | grep -q '_tls-native-tls' || \
+		(echo "ERROR: full proxy SQLx graph does not enable native TLS"; exit 1)
+	@if cargo tree -p praxis-ai-proxy --features full --edges features -i sqlx-core | grep -q '_tls-rustls'; then \
+		echo "ERROR: full proxy SQLx graph contains a rustls TLS backend"; \
 		exit 1; \
 	fi
 
 test-schema:
-	cargo test -p praxis-tests-schema --no-default-features --features store-all $(_NOCAPTURE)
+	cargo test -p praxis-tests-schema --features store-all $(_NOCAPTURE)
 
 test-integration:
-	cargo test -p praxis-tests-integration --no-default-features --features store-all $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --no-default-features --features store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
+	cargo test -p praxis-tests-integration --features store-all $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --features store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
 		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit \
 		$(if $(V),--nocapture)
 
 test-inference-fixtures:
-	cargo test -p praxis-test-utils --no-default-features --features store-all $(_NOCAPTURE)
-	cargo test -p xtask --no-default-features --features store-all inference_fixtures $(_NOCAPTURE)
-	cargo test -p praxis-tests-integration --no-default-features --features store-all --test suite inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-test-utils --features store-all $(_NOCAPTURE)
+	cargo test -p xtask --features store-all inference_fixtures $(_NOCAPTURE)
+	cargo test -p praxis-tests-integration --features store-all --test suite inference_fixtures $(_NOCAPTURE)
 
 test-postgres-unit:
 	cargo test -p praxis-ai-apis --no-default-features --features store-all store::tests::pg_ -- --ignored $(_NOCAPTURE)
@@ -166,6 +186,8 @@ lint:
 	cargo clippy --workspace --all-targets \
 		--features praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter \
 		-- -D warnings
+	$(MAKE) lint-lean
+	$(MAKE) check-dep-budget
 	cargo +nightly fmt --all -- --check
 	cargo machete --with-metadata .
 	cargo xtask lint-deps
@@ -180,6 +202,36 @@ lint:
 	cargo xtask check-responses-registry
 	cargo xtask check-chat-completions-registry
 	cargo xtask openresponses-coverage
+
+# Lint the product crates with only the default-on gates. `-p` without
+# `--workspace` keeps test-crate features from unifying in and hiding leaks.
+lint-lean:
+	cargo clippy -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy --all-targets \
+		--no-default-features --features praxis-ai-proxy/standard -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy \
+		--no-deps --document-private-items --no-default-features --features praxis-ai-proxy/standard
+
+# Fail if a heavy crate enters the default praxis-ai-proxy graph, or if the
+# graph grows past DEFAULT_GRAPH_BUDGET crates.
+check-dep-budget:
+	@tree="$$(cargo tree --locked -p praxis-ai-proxy -e normal,build --target all \
+		--prefix none --format '{p}')" || { echo "ERROR: cargo tree failed"; exit 1; }; \
+	host="$$(cargo tree --locked -p praxis-ai-proxy -e normal,build \
+		--prefix none --format '{p}')" || { echo "ERROR: cargo tree failed"; exit 1; }; \
+	graph="$$(printf '%s\n' "$$tree" | awk '{print $$1"@"$$2}' | sort -u)"; \
+	status=0; \
+	for crate in $(DEFAULT_GRAPH_DENY); do \
+		if printf '%s\n' "$$graph" | grep -q "^$$crate@"; then \
+			echo "ERROR: $$crate is in the default praxis-ai-proxy graph:"; \
+			cargo tree --locked -p praxis-ai-proxy -e normal,build --target all -i "$$crate" | head -n 15; \
+			status=1; \
+		fi; \
+	done; \
+	count=$$(printf '%s\n' "$$host" | awk '{print $$1"@"$$2}' | sort -u | wc -l); \
+	[ "$$count" -gt 1 ] || { echo "ERROR: empty default dependency graph"; exit 1; }; \
+	echo "default praxis-ai-proxy graph: $$count crates for the host target (budget $(DEFAULT_GRAPH_BUDGET))"; \
+	[ "$$count" -le $(DEFAULT_GRAPH_BUDGET) ] || { echo "ERROR: over budget"; status=1; }; \
+	exit $$status
 
 fmt:
 	cargo +nightly fmt --all
@@ -253,14 +305,14 @@ help:
 	@echo ""
 	@echo "Build:"
 	@echo "  build                cargo build --workspace"
-	@echo "  release              cargo build --workspace --release"
+	@echo "  release              cargo build --release -p praxis-ai-proxy --features $(PRAXIS_AI_FEATURES)"
 	@echo "  check                cargo check --workspace"
 	@echo "  clean                cargo clean"
 	@echo ""
 	@echo "Test:"
 	@echo "  test                 run all tests"
 	@echo "  test-unit            unit tests (providers, filters, server)"
-	@echo "  test-store-features   check PostgreSQL-only, SQLite-only, and combined store builds"
+	@echo "  test-store-features   check the lean and store builds and lint each feature group alone"
 	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
 	@echo "  test-inference-fixtures  inference fixture and replay tests"

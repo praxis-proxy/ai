@@ -16,6 +16,7 @@
 //! [`ResponsesState`]: super::state::ResponsesState
 
 pub(crate) mod accumulator;
+pub(super) mod client_tools;
 mod config;
 mod local_tools;
 
@@ -36,13 +37,17 @@ use tracing::{debug, trace, warn};
 
 #[cfg(test)]
 use self::accumulator::accumulate_response_object;
-use self::{accumulator::accumulate_event, config::StreamEventsConfig};
+use self::{
+    accumulator::{accumulate_event, find_output_item, tool_call_key},
+    config::StreamEventsConfig,
+};
 use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
     openai::{
         responses::{
             error::{responses_error_rejection, responses_error_sse_payload},
+            openai_client_tool_compat::{restore_snapshot, restore_snapshot_tools},
             state::{EmittedItem, ResponsesState},
         },
         sse::{SseFrame, SseFrameParser, SseParseError, SseParserConfig, responses::ResponsesEvent},
@@ -69,6 +74,10 @@ pub(super) enum CompletionState {
 }
 
 /// Per-request parser and accumulation state.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent per-round lifecycle flags (deferred [DONE], local-item flush, poison)"
+)]
 pub(super) struct StreamEventsState {
     /// Byte-level SSE frame parser.
     frame_parser: SseFrameParser,
@@ -119,6 +128,14 @@ pub(super) struct StreamEventsState {
     /// `index:{output_index}` → suppression mode (§4.1). Transient per-round: created
     /// in `arm()`, dropped when the state is removed at `finalize_logical_stream`.
     local_tool_items: std::collections::HashMap<String, local_tools::LocalToolMode>,
+    /// #1159: lowered client-tool items tracked across their streaming lifecycle,
+    /// so the plan pass can enforce lifecycle order and (Tasks 5-7) synthesize the
+    /// typed restoration. Empty for native (non-lowered) traffic.
+    client_tool_items: Vec<client_tools::ClientToolStreamItem>,
+    /// #1159 C1: once any chunk fails, the whole logical stream is poisoned; every
+    /// later chunk is dropped closed so a post-failure event (e.g. a co-batched
+    /// lowered `output_item.done` whose `.added` was rolled back) cannot emit.
+    stream_failed: bool,
 }
 
 /// Composes the current IRR execution into one logical Responses stream.
@@ -209,6 +226,8 @@ impl OpenaiStreamEventsFilter {
             deferred_done: false,
             local_items_flushed: false,
             local_tool_items: std::collections::HashMap::new(),
+            client_tool_items: Vec::new(),
+            stream_failed: false,
         }
     }
 
@@ -238,6 +257,11 @@ impl OpenaiStreamEventsFilter {
         // every armed round because the agentic loop overwrites it after each
         // check.
         ctx.set_metadata("responses.logical_stream", "true");
+        // #1159: advertise to openai_client_tool_compat (which runs later, in
+        // on_request_body) that this logical SSE owner is present and will drive
+        // streaming client-tool restoration, so the compat filter arms lowering
+        // instead of failing streaming closed.
+        ctx.set_metadata(CLIENT_TOOL_STREAM_RESTORATION_MARKER, "true");
     }
 
     /// Apply the guard [`ArmDecision`], returning an early [`FilterAction`] when
@@ -298,6 +322,13 @@ enum ArmDecision {
     Arm,
 }
 
+/// Metadata marker published so `openai_client_tool_compat` (which lowers rich
+/// client tools in `on_request_body`) knows this logical SSE owner is present
+/// and will restore the lowered calls live in the stream (#1159). Published in
+/// both the request and request-body phases so the compat guard observes it
+/// regardless of which phase the IRR step executor runs first.
+const CLIENT_TOOL_STREAM_RESTORATION_MARKER: &str = "responses.client_tool_stream_restoration";
+
 /// Decide whether to arm logical composition for the current request.
 ///
 /// Arms only for a streaming Responses create request, and only inside an IRR
@@ -311,10 +342,60 @@ const fn arm_decision(is_streaming_responses: bool, inside_irr: bool) -> ArmDeci
     }
 }
 
+/// Classify the current request from context signals, shared by the request
+/// and request-body phases.
+///
+/// The `iterative_request_router` runner moves request extensions into each
+/// step but builds a fresh `filter_metadata` map, so metadata set by pre-IRR
+/// filters (e.g. `openai_responses_format`) is not visible here. `ResponsesState`
+/// is created pre-IRR and travels through extensions, so fall back to it for
+/// format and stream detection — mirroring how `responses_to_chat_completions`
+/// resolves `request_is_streaming`. `IterationState` is inserted by the IRR
+/// runner before the request phase of every iteration (including iteration 0),
+/// so its presence is the runtime signal that the filter is placed inside an
+/// IRR step.
+///
+/// Called from both `on_request` and `on_request_body` because the IRR step
+/// executor's phase order depends on the step's aggregate request body mode: a
+/// `StreamBuffer`-mode step (forced when `openai_agentic_loop` shares the step)
+/// runs `on_request_body` before `on_request`, while a `Stream`-mode step runs
+/// `on_request` first. The streaming client-tool-restoration marker (#1159)
+/// must be published in whichever phase runs first, so both call this.
+fn arm_decision_for(ctx: &HttpFilterContext<'_>) -> ArmDecision {
+    let typed_streaming = ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming;
+    let responses_state = ctx.extensions.get::<ResponsesState>();
+    let has_responses_state = responses_state.is_some();
+    let body_stream = responses_state
+        .and_then(|state| state.request_body.get("stream"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        && (typed_streaming
+            || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+            || has_responses_state);
+    let is_streaming =
+        typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
+    let inside_irr = ctx.extensions.get::<IterationState>().is_some();
+    arm_decision(is_responses && is_streaming, inside_irr)
+}
+
 #[async_trait]
 impl HttpFilter for OpenaiStreamEventsFilter {
     fn name(&self) -> &'static str {
         "openai_stream_events"
+    }
+
+    fn request_body_access(&self) -> BodyAccess {
+        // ReadOnly (not None) so the IRR step executor invokes `on_request_body`,
+        // where the streaming client-tool-restoration marker is published for the
+        // `StreamBuffer`-first phase ordering (#1159). The body is never mutated;
+        // the mode stays `Stream` so this never escalates the aggregate step to
+        // buffering.
+        BodyAccess::ReadOnly
+    }
+
+    fn request_body_mode(&self) -> BodyMode {
+        BodyMode::Stream
     }
 
     fn response_body_access(&self) -> BodyAccess {
@@ -328,34 +409,36 @@ impl HttpFilter for OpenaiStreamEventsFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        let typed_streaming = ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming;
-        // The `iterative_request_router` runner moves request extensions into
-        // each step but builds a fresh `filter_metadata` map, so metadata set by
-        // pre-IRR filters (e.g. `openai_responses_format`) is not visible here.
-        // `ResponsesState` is created pre-IRR and travels through extensions, so
-        // fall back to it for format and stream detection — mirroring how
-        // `responses_to_chat_completions` resolves `request_is_streaming`.
-        let responses_state = ctx.extensions.get::<ResponsesState>();
-        let has_responses_state = responses_state.is_some();
-        let body_stream = responses_state
-            .and_then(|state| state.request_body.get("stream"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let is_responses = is_responses_create(&ctx.request.method, ctx.request.uri.path())
-            && (typed_streaming
-                || ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
-                || has_responses_state);
-        let is_streaming =
-            typed_streaming || ctx.get_metadata("openai_responses_format.stream") == Some("true") || body_stream;
-        // `IterationState` is inserted by the IRR runner before the request phase
-        // of every iteration (including iteration 0), so its presence is the
-        // runtime signal that the filter is placed inside an IRR step.
-        let inside_irr = ctx.extensions.get::<IterationState>().is_some();
-        let decision = arm_decision(is_responses && is_streaming, inside_irr);
+        let decision = arm_decision_for(ctx);
         if let Some(action) = self.apply_arm_decision(ctx, decision) {
             return Ok(action);
         }
 
+        Ok(FilterAction::Continue)
+    }
+
+    async fn on_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        _body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        // #1159: When `openai_agentic_loop` shares this IRR step its
+        // `StreamBuffer` request body mode makes the step executor run
+        // `on_request_body` for every step filter BEFORE any `on_request`. In
+        // that ordering `on_request`'s `arm()` — which publishes the
+        // restoration marker — has not run yet when `openai_client_tool_compat`
+        // reaches its own `on_request_body` streaming guard, so it would fail the
+        // streaming request closed. Publish the marker here too: this filter
+        // precedes the compat filter in step order, so its `on_request_body`
+        // runs first in BOTH phase orderings and the guard always observes the
+        // marker. Full arming (parser-state install) still happens in
+        // `on_request`, which always runs before the upstream response, so the
+        // response-phase restoration path is unaffected. The body is only read,
+        // never mutated.
+        if arm_decision_for(ctx) == ArmDecision::Arm {
+            ctx.set_metadata(CLIENT_TOOL_STREAM_RESTORATION_MARKER, "true");
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -494,6 +577,13 @@ fn process_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>) {
     state.started_at.get_or_insert(now);
 
     let parsed = parse_and_accumulate(&mut state, ctx, bytes, now);
+    // #1159 C1: any fatal chunk error poisons the whole logical stream. Mark it
+    // sticky before re-inserting state so the next chunk fails closed at the top
+    // of `parse_and_accumulate` — a co-batched lowered `output_item.done` whose
+    // `.added` was rolled back by this chunk must never emit its raw private name.
+    if parsed.is_err() {
+        state.stream_failed = true;
+    }
     handle_parse_result(ctx, body, &state, parsed);
 
     if let Some(deadline) = stream_deadline_at(&state) {
@@ -530,14 +620,31 @@ fn handle_parse_error(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>,
     warn!(%error, "SSE parse error in stream_events");
     ctx.set_metadata("responses.stream_parse_error", "true".to_owned());
     ctx.set_metadata("responses.stream_error_code", "server_error");
-    ctx.set_metadata(
-        "responses.stream_error_message",
-        if matches!(error, SseParseError::Timeout { .. }) {
-            "upstream Responses stream exceeded timeout"
-        } else {
-            "upstream Responses stream could not be parsed"
+    // M3: surface a client-tool-restore-specific message when the failure is a
+    // restore error. `reason` is client-safe by construction (never a private
+    // name; see `client_tools::client_tool_restore_error`). Timeouts keep their
+    // dedicated message; all other error kinds keep the generic message.
+    // Diagnostic-only — control flow is unchanged.
+    match error {
+        SseParseError::ClientToolRestore { reason, .. } => {
+            ctx.set_metadata(
+                "responses.stream_error_message",
+                format!("client tool restoration failed: {reason}"),
+            );
         },
-    );
+        SseParseError::Timeout { .. } => {
+            ctx.set_metadata(
+                "responses.stream_error_message",
+                "upstream Responses stream exceeded timeout",
+            );
+        },
+        _ => {
+            ctx.set_metadata(
+                "responses.stream_error_message",
+                "upstream Responses stream could not be parsed",
+            );
+        },
+    }
     ctx.set_metadata("responses.skip_persist", "true");
     *body = None;
 }
@@ -549,6 +656,15 @@ fn parse_and_accumulate(
     bytes: &Bytes,
     now: Instant,
 ) -> Result<Option<Bytes>, SseParseError> {
+    // #1159 C1: a prior chunk already failed the logical stream. Fail every
+    // remaining chunk closed before parsing so a later terminal or lowered event
+    // cannot emit on a poisoned stream (mirrors the accumulation-budget guard
+    // below). This covers ALL error kinds — parse, restore, timeout, budget — not
+    // just client-tool restore, so it is not a `client_tool_restore_error`.
+    if state.stream_failed {
+        return Err(SseParseError::StreamPoisoned);
+    }
+
     check_timeout(state, now)?;
 
     // A prior chunk or round may have tripped the aggregate accumulation budget.
@@ -760,15 +876,61 @@ fn accumulation_count_exceeded(state: &StreamEventsState, ctx: &HttpFilterContex
 /// On a rejected chunk phase 2a has already grown the retained output past a cap, so
 /// the request-wide guards in [`accumulation_budget_exceeded`] stay sticky for every
 /// later chunk and round. The byte guard fails closed per event, so transient
-/// overshoot is bounded to the single clone that trips the cap. Phase 2b is
-/// infallible, so every recorded milestone still corresponds to bytes that actually
-/// reach the client. Returns the logical-stream bytes.
+/// overshoot is bounded to the single clone that trips the cap. Phase 2b's only
+/// fallible step, the client-tool restoration plan pass (see
+/// [`restore_and_append_chunk`]), runs before any byte is appended or milestone is
+/// recorded, so a malformed lowered lifecycle fails the chunk closed with nothing
+/// delivered; every recorded milestone therefore still corresponds to bytes that
+/// actually reach the client. Returns the logical-stream bytes.
 fn commit_chunk_events(
     state: &mut StreamEventsState,
     ctx: &mut HttpFilterContext<'_>,
     events: Vec<ResponsesEvent>,
 ) -> Result<Vec<u8>, SseParseError> {
-    for event in &events {
+    // Phase 2a: accumulate every event and charge the retained-clone byte budget,
+    // capturing lowered client-tool completion artifacts for the restore plan.
+    let completions = accumulate_chunk(state, ctx, &events)?;
+
+    // The retained item count only exists after phase 2a grows it. Enforce it here,
+    // before phase 2b records any delivery milestone, so a rejected chunk leaves no
+    // milestone for undelivered bytes. Any overshoot is bounded to a single chunk.
+    if let Some(error) = accumulation_count_exceeded(state, ctx) {
+        return Err(error);
+    }
+
+    // Phase 2b: plan lowered client-tool restoration (fallible) then append every
+    // committed event to the logical stream applying its disposition (infallible).
+    let logical_output = restore_and_append_chunk(state, ctx, events, &completions)?;
+
+    // Mirror the parser's deferred-`[DONE]` decision into shared response state,
+    // but only now that the whole chunk has parsed and committed. Filter-local
+    // parser state is re-armed before request-side dispatchers run on the next
+    // IRR step, so the sentinel must survive in shared state as well.
+    if state.deferred_done
+        && let Some(response_state) = ctx.extensions.get_mut::<ResponsesState>()
+    {
+        response_state.deferred_stream_done = true;
+    }
+
+    Ok(logical_output)
+}
+
+/// Phase 2a of the chunk commit: accumulate every event into `ResponsesState`,
+/// charge the retained-clone byte budget, and capture lowered client-tool
+/// completion artifacts for the phase-2b restore plan (#1159).
+///
+/// Split out of [`commit_chunk_events`] so the per-event byte charge and the
+/// artifact capture stay under one owner. Fails closed the instant the request-wide
+/// accumulation byte total exceeds the cap (#556); the returned completions are the
+/// authoritative source the plan pass reads when synthesizing the `custom_tool_call`
+/// lifecycle.
+fn accumulate_chunk(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    events: &[ResponsesEvent],
+) -> Result<Vec<client_tools::ClientToolCompletion>, SseParseError> {
+    let mut completions: Vec<client_tools::ClientToolCompletion> = Vec::new();
+    for event in events {
         let retained_clone_bytes = accumulate_event(ctx, state, event);
         // A `function_call_arguments.done` clones a whole retained output item into
         // `tool_calls` — the one accumulator whose growth the driving `done` frame
@@ -788,30 +950,103 @@ fn commit_chunk_events(
                 return Err(error);
             }
         }
+        // Capture the just-completed lowered `function_call` item (now carrying its
+        // final arguments in `ResponsesState`) so the plan pass can restore the
+        // canonical `custom_tool_call` lifecycle without re-borrowing mutable state.
+        capture_client_tool_completion(ctx, &mut completions, event);
     }
+    Ok(completions)
+}
 
-    // The retained item count only exists after phase 2a grows it. Enforce it here,
-    // before phase 2b records any delivery milestone, so a rejected chunk leaves no
-    // milestone for undelivered bytes. Any overshoot is bounded to a single chunk.
-    if let Some(error) = accumulation_count_exceeded(state, ctx) {
-        return Err(error);
+/// Capture the completed lowered `function_call` item at
+/// `function_call_arguments.done` as a [`client_tools::ClientToolCompletion`].
+///
+/// Only fires when client-tool lowering is armed and the just-accumulated item's
+/// name is a lowering-map key, so native (non-lowered) traffic pays nothing. The
+/// completed item lives in [`ResponsesState::output_items`] after [`accumulate_event`]
+/// merged its arguments; the accumulator's own copy is moved into `tool_calls`, so
+/// the plan pass needs this owned snapshot to synthesize the restored lifecycle.
+fn capture_client_tool_completion(
+    ctx: &HttpFilterContext<'_>,
+    completions: &mut Vec<client_tools::ClientToolCompletion>,
+    event: &ResponsesEvent,
+) {
+    let ResponsesEvent::FunctionCallArgumentsDone(payload) = event else {
+        return;
+    };
+    let Some(responses) = ctx.extensions.get::<ResponsesState>() else {
+        return;
+    };
+    if responses.client_tool_lowering.is_empty() {
+        return;
     }
+    let Some(item) = find_output_item(responses.output_items(), payload) else {
+        return;
+    };
+    let is_lowered = item
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| responses.client_tool_lowering.contains_key(name));
+    if !is_lowered {
+        return;
+    }
+    let Some(key) = tool_call_key(payload) else {
+        return;
+    };
+    // Necessary clone (AGENTS.md boundary): the accumulator moved its only owned copy
+    // of the completed item into `tool_calls`, so the plan pass needs an owned
+    // snapshot to restore the `custom_tool_call` lifecycle without re-borrowing the
+    // mutable `ResponsesState` (#1159).
+    completions.push(client_tools::ClientToolCompletion {
+        key,
+        item: item.clone(),
+    });
+}
+
+/// Phase 2b of the chunk commit: plan lowered client-tool restoration, then append
+/// every committed event to the logical stream applying its disposition (#1159).
+///
+/// The plan pass ([`client_tools::plan_client_tool_restore`]) is the only fallible
+/// step: it runs after phase 2a (accumulate) and before any byte is appended, so a
+/// malformed lowered lifecycle fails the chunk closed with nothing delivered. The
+/// lowering map + echo live on the shared `ResponsesState` (populated by
+/// `openai_client_tool_compat` earlier in this pipeline); the per-round lifecycle
+/// progress lives on this `StreamEventsState`. Native passthrough (no lowering
+/// armed) skips the plan pass entirely — zero overhead, no behavior change for
+/// non-lowered traffic. Appending each event is infallible.
+fn restore_and_append_chunk(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    events: Vec<ResponsesEvent>,
+    completions: &[client_tools::ClientToolCompletion],
+) -> Result<Vec<u8>, SseParseError> {
+    let dispositions = match ctx.extensions.get::<ResponsesState>() {
+        Some(responses) if !responses.client_tool_lowering.is_empty() => {
+            let plan = client_tools::plan_client_tool_restore(
+                &responses.client_tool_lowering,
+                responses.client_tool_echo.as_ref(),
+                &state.client_tool_items,
+                &events,
+                completions,
+            )?;
+            state.client_tool_items = plan.next_items;
+            Some(plan.dispositions)
+        },
+        _ => None,
+    };
 
     let mut logical_output = Vec::new();
-    for event in events {
-        append_logical_event(state, ctx, event, &mut logical_output);
+    for (index, event) in events.into_iter().enumerate() {
+        match dispositions.as_ref().and_then(|dispositions| dispositions.get(index)) {
+            None | Some(client_tools::ClientToolDisposition::Passthrough) => {
+                append_logical_event(state, ctx, event, &mut logical_output);
+            },
+            Some(client_tools::ClientToolDisposition::Suppress) => {},
+            Some(disposition) => {
+                apply_client_tool_disposition(state, ctx, disposition, event, &mut logical_output);
+            },
+        }
     }
-
-    // Mirror the parser's deferred-`[DONE]` decision into shared response state,
-    // but only now that the whole chunk has parsed and committed. Filter-local
-    // parser state is re-armed before request-side dispatchers run on the next
-    // IRR step, so the sentinel must survive in shared state as well.
-    if state.deferred_done
-        && let Some(response_state) = ctx.extensions.get_mut::<ResponsesState>()
-    {
-        response_state.deferred_stream_done = true;
-    }
-
     Ok(logical_output)
 }
 
@@ -936,6 +1171,185 @@ fn append_logical_event(
     let mut payload = event.into_payload();
     normalize_logical_payload(ctx, &mut payload, state.output_index_offset);
     encode_sse_event(&event_type, &payload, output);
+}
+
+/// Apply a non-`Passthrough`/`Suppress` client-tool restoration disposition to a
+/// committed event, then append it to the logical stream (#1159).
+///
+/// Infallible by contract: the fallible planning already ran in
+/// [`commit_chunk_events`], so this only mutates or replaces the event payload and
+/// forwards it. `RetypeInPlace` retypes a lowered `Namespace` member's
+/// `function_call` item back to its original name + namespace in place (Task 4).
+/// `RetypeArgumentsName` overwrites the top-level `name` on a `Namespace`
+/// `function_call_arguments.done` (r2c populates it per the Responses schema, unlike
+/// native backends) with the member name, in place (#1206). `EmitCustomShell`/`EmitCustomItemDone` splice the
+/// fully-typed public `custom_tool_call` payload the plan pass already built onto the corresponding
+/// lifecycle event (Task 5). `EmitCustomInput`
+/// synthesizes the canonical `custom_tool_call_input` delta+done pair and drops the
+/// backend's `function_call_arguments.done` it replaces. `EmitTypedAdded`/`EmitTypedDone`
+/// construct a fresh `output_item.added`/`output_item.done` carrying the restored
+/// `shell_call`/`tool_search_call` (Task 6) — `EmitTypedAdded` fires on the incoming
+/// `function_call_arguments.done` and must emit under an `output_item.added` line, so it
+/// cannot splice onto the incoming event; the dropped args.done is replaced by the
+/// synthesized added. None of these ever leak the private `agentic_ns__{ns}__{member}` /
+/// lowered `fc_` id. `RestoreSnapshot` (which the plan pass produces for the
+/// non-terminal `response.created`/`queued`/`in_progress` snapshots) splices the
+/// already-restored response object back onto the lifecycle event's payload before
+/// forwarding it, so a lowered name never appears in an intermediate snapshot;
+/// `Suppress` is dropped before dispatch and must never reach the applier.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear match dispatch over the nine client-tool restore arms, each with a load-bearing comment"
+)]
+fn apply_client_tool_disposition(
+    state: &mut StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    disposition: &client_tools::ClientToolDisposition,
+    mut event: ResponsesEvent,
+    logical_output: &mut Vec<u8>,
+) {
+    use client_tools::ClientToolDisposition as D;
+    match disposition {
+        D::RetypeInPlace {
+            item_type,
+            name,
+            namespace,
+        } => {
+            retype_item_in_place(event.payload_mut(), item_type, name, namespace.as_deref());
+            append_logical_event(state, ctx, event, logical_output);
+        },
+        // Namespace `function_call_arguments.done`: r2c populated the top-level `name`
+        // with the private lowered name; overwrite it with the member name in place so
+        // the `agentic_ns__{ns}__{member}` name never reaches the client. Only produced
+        // for frames that already carry a `name`, so this overwrites, never injects.
+        D::RetypeArgumentsName { name } => {
+            if let Some(object) = event.payload_mut().as_object_mut() {
+                object.insert("name".to_owned(), Value::String(name.clone()));
+            }
+            append_logical_event(state, ctx, event, logical_output);
+        },
+        // Custom/NamespaceCustom synthesized custom_tool_call output-item events.
+        // Each fires on the matching incoming lifecycle event (added / done), so the
+        // carried payload already has the right shape; splice it on and append.
+        D::EmitCustomShell { item } | D::EmitCustomItemDone { item } => {
+            *event.payload_mut() = item.clone();
+            append_logical_event(state, ctx, event, logical_output);
+        },
+        D::EmitCustomInput {
+            item_id,
+            output_index,
+            input,
+            ..
+        } => {
+            // Synthesize the canonical custom_tool_call_input delta+done pair (public
+            // `ctc_` id); the backend `function_call_arguments.done` it replaces is
+            // dropped by not appending `event` (#1159).
+            synthesize_custom_tool_input(state, ctx, (item_id, *output_index, input), logical_output);
+        },
+        // Shell/ToolSearch synthesized typed `output_item.added`. Fires on the incoming
+        // function_call_arguments.done, so CONSTRUCT a fresh OutputItemAdded — the SSE event
+        // type derives from the variant; splicing onto the args.done event would emit the
+        // added body under a function_call_arguments.done line (#1159 R-T6a).
+        D::EmitTypedAdded { item } => {
+            append_logical_event(
+                state,
+                ctx,
+                ResponsesEvent::OutputItemAdded(item.clone()),
+                logical_output,
+            );
+        },
+        // Shell/ToolSearch restored typed `output_item.done` (incoming is already
+        // output_item.done; construct fresh for symmetry with the added path).
+        D::EmitTypedDone { item } => {
+            append_logical_event(state, ctx, ResponsesEvent::OutputItemDone(item.clone()), logical_output);
+        },
+        // Non-terminal snapshot restoration: splice the restored response object back
+        // onto the lifecycle event's payload (response.created/queued/in_progress).
+        // Tools/tool_choice and output items are already restored in the disposition.
+        D::RestoreSnapshot { response } => {
+            if let Some(object) = event.payload_mut().as_object_mut() {
+                object.insert("response".to_owned(), response.clone());
+            }
+            append_logical_event(state, ctx, event, logical_output);
+        },
+        // Passthrough is forwarded by restore_and_append_chunk before dispatch;
+        // reaching it here would still mean "forward", so append.
+        D::Passthrough => append_logical_event(state, ctx, event, logical_output),
+        // Suppress is dropped by restore_and_append_chunk before dispatch and must
+        // NEVER forward; reaching the applier is a bug (debug panic; release drops).
+        D::Suppress => {
+            debug_assert!(
+                false,
+                "Suppress is dropped in restore_and_append_chunk, never dispatched to the applier"
+            );
+        },
+    }
+}
+
+/// Retype a lowered `Namespace` member's `function_call` item in place: set
+/// `type`/`name` and re-add or remove `namespace`, never leaking the private
+/// `agentic_ns__{ns}__{member}` name (#1159).
+fn retype_item_in_place(payload: &mut Value, item_type: &str, name: &str, namespace: Option<&str>) {
+    let Some(item) = payload.get_mut("item").and_then(Value::as_object_mut) else {
+        return;
+    };
+    item.insert("type".to_owned(), Value::String(item_type.to_owned()));
+    item.insert("name".to_owned(), Value::String(name.to_owned()));
+    match namespace {
+        Some(namespace) => {
+            item.insert("namespace".to_owned(), Value::String(namespace.to_owned()));
+        },
+        None => {
+            item.remove("namespace");
+        },
+    }
+}
+
+/// Synthesize the canonical `custom_tool_call_input` delta+done pair for a restored
+/// `Custom`/`NamespaceCustom` call (#1159).
+///
+/// `fields` is `(item_id, output_index, input)`. Both frames reference the PUBLIC
+/// `ctc_` item id (never the private `fc_` id) and carry the unwrapped plain-string
+/// input. The input is emitted on two distinct SSE frames, so it is necessarily
+/// copied once per frame at this boundary.
+fn synthesize_custom_tool_input(
+    state: &StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    fields: (&str, u64, &str),
+    output: &mut Vec<u8>,
+) {
+    let (item_id, output_index, input) = fields;
+    let delta = serde_json::json!({
+        "type": "response.custom_tool_call_input.delta",
+        "item_id": item_id,
+        "output_index": output_index,
+        "delta": input,
+    });
+    emit_synthetic_event(state, ctx, "response.custom_tool_call_input.delta", delta, output);
+    let done = serde_json::json!({
+        "type": "response.custom_tool_call_input.done",
+        "item_id": item_id,
+        "output_index": output_index,
+        "input": input,
+    });
+    emit_synthetic_event(state, ctx, "response.custom_tool_call_input.done", done, output);
+}
+
+/// Emit a synthesized logical SSE event with no originating provider frame (#1159).
+///
+/// Mirrors [`append_logical_event`]'s tail: normalizes the payload (stamping the
+/// running `output_index` offset and logical sequence number) then encodes it. Used
+/// by the `custom_tool_call_input` synthesis, whose delta+done frames are generated
+/// wholesale rather than derived from a committed [`ResponsesEvent`].
+fn emit_synthetic_event(
+    state: &StreamEventsState,
+    ctx: &mut HttpFilterContext<'_>,
+    event_type: &str,
+    mut payload: Value,
+    output: &mut Vec<u8>,
+) {
+    normalize_logical_payload(ctx, &mut payload, state.output_index_offset);
+    encode_sse_event(event_type, &payload, output);
 }
 
 /// Reconcile locally executed tool items against the resumed model stream for one
@@ -1653,7 +2067,12 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     // caller id on any rehydrated turn — there is no separate upstream wire whose
     // narrower eligibility to match.
     let restore_previous_response_id = state.history_rehydrated;
-    canonicalize_logical_response(state, restore_previous_response_id);
+    if let Err(e) = canonicalize_logical_response(state, restore_previous_response_id) {
+        // #1159: a lossy terminal restore fails closed. `output` already holds the
+        // drained local-tool events, so emit the error terminal INLINE rather than via
+        // `encode_local_error` (which would re-drain those events).
+        return Some(encode_local_restore_error(ctx, output, &e));
+    }
     if !state.response_object.is_object() {
         return None;
     }
@@ -1676,6 +2095,31 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
         output.extend_from_slice(b"data: [DONE]\n\n");
     }
     Some(Bytes::from(output))
+}
+
+/// Emit a fail-closed terminal `error` frame INLINE for a locally completed stream
+/// whose terminal client-tool restore was lossy (#1159).
+///
+/// `output` already holds the drained local-tool events from
+/// `prepare_local_terminal_events`, so the error frame is appended directly rather
+/// than through `encode_local_error` (which would re-drain those events). Marks the
+/// record un-persistable so a later GET cannot serve the private lowered shape.
+fn encode_local_restore_error(ctx: &mut HttpFilterContext<'_>, mut output: Vec<u8>, error: &SseParseError) -> Bytes {
+    let message = error.to_string();
+    let sequence_number = ctx.extensions.get_mut::<ResponsesState>().map_or(0, |state| {
+        let sequence_number = state.logical_stream_sequence;
+        state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
+        sequence_number
+    });
+    let mut payload = responses_error_sse_payload("server_error", &message);
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("sequence_number".to_owned(), Value::from(sequence_number));
+    }
+    encode_sse_event("error", &payload, &mut output);
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata("responses.stream_error_message", message);
+    ctx.set_metadata("responses.skip_persist", "true");
+    Bytes::from(output)
 }
 
 /// Encode a terminal `error` event for an already-committed logical stream.
@@ -1772,18 +2216,36 @@ fn finalize_logical_stream(ctx: &mut HttpFilterContext<'_>, body: &mut Option<By
     }
     let continues = logical_stream_continues(ctx); // re-read AFTER drain + arm-stop: a
     // (b)-site failure or the arm-stop above flips the owner action=done.
+    finalize_emit_terminal(ctx, &mut parser_state, &mut output, continues);
+    *body = (!output.is_empty()).then(|| Bytes::from(output));
+    ctx.insert_filter_state(parser_state);
+}
+
+/// Emit the logical stream's terminal frame: a locally recorded `error`, otherwise
+/// the held deferred terminal snapshot. A lossy #1159 client-tool restore on the
+/// deferred path is routed to a fail-closed error terminal instead.
+fn finalize_emit_terminal(
+    ctx: &mut HttpFilterContext<'_>,
+    parser_state: &mut StreamEventsState,
+    output: &mut Vec<u8>,
+    continues: bool,
+) {
     if !continues && let Some(mut error) = logical_stream_error(ctx) {
         // #276: surface any locally executed tool items that never reached the
         // client before the stream terminates with an error, so already-executed
         // tool activity is not silently dropped by a resumed-round parse failure.
-        flush_local_output_items(ctx, &mut output);
+        flush_local_output_items(ctx, output);
         normalize_logical_payload(ctx, &mut error, parser_state.output_index_offset);
-        encode_sse_event("error", &error, &mut output);
-    } else if !continues && let Some(mut terminal) = parser_state.deferred_terminal.take() {
-        emit_deferred_terminal(ctx, &mut terminal, &parser_state, &mut output);
+        encode_sse_event("error", &error, output);
+    } else if !continues
+        && let Some(mut terminal) = parser_state.deferred_terminal.take()
+        && let Err(e) = emit_deferred_terminal(ctx, &mut terminal, parser_state, output)
+    {
+        // #1159: a lossy terminal client-tool restore fails the whole logical stream
+        // closed. `emit_deferred_terminal` bailed before writing the terminal frame,
+        // so `output` holds only the flushed local items.
+        emit_deferred_terminal_restore_error(ctx, output, &e);
     }
-    *body = (!output.is_empty()).then(|| Bytes::from(output));
-    ctx.insert_filter_state(parser_state);
 }
 
 /// Emit the deferred terminal snapshot as the logical stream's final event,
@@ -1793,17 +2255,15 @@ fn emit_deferred_terminal(
     terminal: &mut DeferredTerminalEvent,
     parser_state: &StreamEventsState,
     output: &mut Vec<u8>,
-) {
+) -> Result<(), SseParseError> {
     // #276: stream any locally generated tool items that never reached the
-    // client as incremental events (e.g. an MCP approval request that ends the
-    // loop without a resumed round) before the terminal snapshot.
+    // client as incremental events before the terminal snapshot.
     flush_local_output_items(ctx, output);
     let state = ctx.extensions.get_or_insert_with(ResponsesState::default);
-    // The upstream event stream is the client-visible terminal, rewritten (or left
-    // untouched) by `openai_responses_rehydrate`; match its wire-rewrite decision so
-    // the persisted store source cannot disagree with the streamed frame (#1150).
+    // Match the wire-rewrite decision so the persisted store source cannot disagree
+    // with the streamed frame (#1150).
     let restore_previous_response_id = state.previous_response_id_stream_restore_armed;
-    let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id);
+    let (accumulated_output, usage) = canonicalize_logical_response(state, restore_previous_response_id)?;
     // #937: `response_object` is now canonical and the client-visible terminal
     // frame is appended below as a deferred, non-end-of-stream chunk. Signal the
     // pre-IRR `openai_response_store` to persist BEFORE it releases that chunk so
@@ -1817,11 +2277,32 @@ fn emit_deferred_terminal(
             response.insert("usage".to_owned(), usage);
         }
     }
+    // #1159: the upstream deferred terminal echoes the LOWERED private tools/tool_choice.
+    // Restore them on the wire copy — this is the only place tools are restored on the
+    // deferred path (the output items were already restored inside canonicalize). No-op
+    // when nothing was lowered (echo is None).
+    if let Some(response) = terminal.payload.get_mut("response") {
+        restore_snapshot_tools(response, state.client_tool_echo.as_ref());
+    }
     normalize_logical_payload(ctx, &mut terminal.payload, parser_state.output_index_offset);
     encode_sse_event(&terminal.event_type, &terminal.payload, output);
     if parser_state.deferred_done {
         output.extend_from_slice(b"data: [DONE]\n\n");
     }
+    Ok(())
+}
+
+/// Route a lossy deferred-terminal client-tool restore to a fail-closed error
+/// terminal (#1159): emit an `error` event instead of leaking a private lowered
+/// shape and mark the record un-persistable so a later GET cannot serve the leak.
+fn emit_deferred_terminal_restore_error(ctx: &mut HttpFilterContext<'_>, output: &mut Vec<u8>, error: &SseParseError) {
+    let message = error.to_string();
+    ctx.set_metadata("responses.stream_error_code", "server_error");
+    ctx.set_metadata("responses.skip_persist", "true");
+    if let Some(err_bytes) = encode_local_error(ctx, "server_error", &message) {
+        output.extend_from_slice(&err_bytes);
+    }
+    ctx.set_metadata("responses.stream_error_message", message);
 }
 
 /// Whether the agentic-loop owner requested another inference step.
@@ -1863,7 +2344,7 @@ fn logical_stream_error(ctx: &HttpFilterContext<'_>) -> Option<Value> {
 fn canonicalize_logical_response(
     state: &mut ResponsesState,
     restore_previous_response_id: bool,
-) -> (Vec<Value>, Value) {
+) -> Result<(Vec<Value>, Value), SseParseError> {
     let logical_id = state.logical_stream_response_id.clone();
     let usage = state.usage.clone();
     let restored_previous_response_id = restore_previous_response_id
@@ -1904,7 +2385,44 @@ fn canonicalize_logical_response(
             response.insert("usage".to_owned(), usage.clone());
         }
     }
-    (output, usage)
+    restore_terminal_client_tools(state, &mut output)?;
+    Ok((output, usage))
+}
+
+/// #1159: last-chance restoration of every lowered client-tool call plus
+/// `tools`/`tool_choice` on the terminal response object. A lossy restore fails
+/// the whole logical stream closed rather than leaking a private lowered shape.
+///
+/// Re-syncs `output` from the now-restored `response_object`, since the
+/// deferred-terminal caller writes THAT vec to the wire (not the object). No-op
+/// when nothing was lowered.
+fn restore_terminal_client_tools(state: &mut ResponsesState, output: &mut Vec<Value>) -> Result<(), SseParseError> {
+    if state.client_tool_lowering.is_empty() {
+        return Ok(());
+    }
+    // The output items were inserted into `response_object` above; restore needs
+    // that object. If it is not an object we cannot restore -> fail closed rather
+    // than return the un-restored (lowered) output.
+    if !state.response_object.is_object() {
+        return Err(SseParseError::ClientToolRestore {
+            key: "terminal".to_owned(),
+            reason: "terminal response object unavailable for client-tool restore".to_owned(),
+        });
+    }
+    restore_snapshot(&mut state.response_object, &state.client_tool_lowering).map_err(|item_type| {
+        SseParseError::ClientToolRestore {
+            key: "terminal".to_owned(),
+            reason: format!("lossy restore of {item_type}"),
+        }
+    })?;
+    restore_snapshot_tools(&mut state.response_object, state.client_tool_echo.as_ref());
+    // Re-sync the returned vec from the now-restored object (an ownership boundary
+    // returning an owned restored vec) — a once-per-logical-stream terminal clone,
+    // not a per-chunk clone.
+    if let Some(restored) = state.response_object.get("output").and_then(Value::as_array) {
+        output.clone_from(restored);
+    }
+    Ok(())
 }
 
 /// Check whether the stream has exceeded its wall-clock timeout.
@@ -1978,6 +2496,16 @@ fn stream_end_kind(ctx: &HttpFilterContext<'_>) -> StreamEndKind {
         },
         Ok(()) if state.completion_state == CompletionState::Open => {
             warn!("stream did not terminate cleanly: missing terminal event");
+            StreamEndKind::Incomplete { timed_out: false }
+        },
+        Ok(())
+            if state
+                .client_tool_items
+                .iter()
+                .any(|item| !matches!(item.phase, client_tools::ClientToolPhase::Done)) =>
+        {
+            // #1159: incomplete client-tool lifecycle (never reached Done) → fail closed.
+            warn!("stream did not terminate cleanly: incomplete client-tool lifecycle");
             StreamEndKind::Incomplete { timed_out: false }
         },
         Ok(()) => StreamEndKind::Complete,

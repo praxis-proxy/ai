@@ -205,6 +205,38 @@ impl ResponsesEvent {
         }
     }
 
+    /// Mutable access to this event's JSON payload, for in-place restoration
+    /// (#1159 retype-in-place of a lowered `function_call`).
+    pub(crate) fn payload_mut(&mut self) -> &mut Value {
+        match self {
+            Self::ResponseCreated(payload)
+            | Self::ResponseQueued(payload)
+            | Self::ResponseInProgress(payload)
+            | Self::ResponseCompleted(payload)
+            | Self::ResponseIncomplete(payload)
+            | Self::ResponseFailed(payload)
+            | Self::OutputItemAdded(payload)
+            | Self::OutputItemDone(payload)
+            | Self::ContentPartAdded(payload)
+            | Self::ContentPartDone(payload)
+            | Self::OutputTextDelta(payload)
+            | Self::OutputTextDone(payload)
+            | Self::OutputTextAnnotationAdded(payload)
+            | Self::FunctionCallArgumentsDelta(payload)
+            | Self::FunctionCallArgumentsDone(payload)
+            | Self::RefusalDelta(payload)
+            | Self::RefusalDone(payload)
+            | Self::ReasoningDelta(payload)
+            | Self::ReasoningDone(payload)
+            | Self::ReasoningSummaryTextDelta(payload)
+            | Self::ReasoningSummaryTextDone(payload)
+            | Self::ReasoningSummaryPartAdded(payload)
+            | Self::ReasoningSummaryPartDone(payload)
+            | Self::Error(payload)
+            | Self::Unknown { data: payload, .. } => payload,
+        }
+    }
+
     /// Take ownership of the JSON payload after read-only consumers are done.
     pub fn into_payload(self) -> Value {
         match self {

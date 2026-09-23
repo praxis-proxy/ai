@@ -21,8 +21,8 @@
 use std::collections::HashMap;
 
 use praxis_test_utils::{
-    StatefulCapturingBackend, TempSqlite, build_pipeline, example_config_path, free_port, http_send, json_post,
-    parse_body, parse_status, patch_yaml, start_proxy,
+    Backend, StatefulCapturingBackend, TempSqlite, build_pipeline, example_config_path, free_port, http_send,
+    json_post, parse_body, parse_header, parse_status, patch_yaml, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -38,6 +38,27 @@ fn load_client_tool_compat_config(proxy_port: u16, model_port: u16, db_url: &str
     let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
     praxis_core::config::Config::from_yaml(&yaml).expect("parse client-tool-compat config")
+}
+
+/// Like [`load_client_tool_compat_config`] but with the `openai_stream_events`
+/// filter removed from the inference step, so the streaming-restoration marker is
+/// never armed. Exercises the missing-owner fail-closed path (#1159).
+fn load_client_tool_compat_config_without_stream_owner(
+    proxy_port: u16,
+    model_port: u16,
+    db_url: &str,
+) -> praxis_core::config::Config {
+    let path = example_config_path("openai/responses/client-tool-compat.yaml");
+    let yaml = std::fs::read_to_string(path).expect("read client-tool-compat example");
+    let yaml = yaml.replace("sqlite://responses.db?mode=rwc", db_url);
+    // Drop the streaming owner line; the remaining filters keep their order.
+    let yaml = yaml
+        .lines()
+        .filter(|line| line.trim() != "- filter: openai_stream_events")
+        .collect::<Vec<_>>()
+        .join("\n");
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", model_port)]));
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse client-tool-compat config without stream owner")
 }
 
 // -----------------------------------------------------------------------------
@@ -723,15 +744,16 @@ fn all_client_tool_types_lower_to_functions() {
 }
 
 // -----------------------------------------------------------------------------
-// Streaming: a rich client tool fails closed before any upstream call
+// Streaming: a rich client tool fails closed without the streaming owner
 // -----------------------------------------------------------------------------
 
 /// A streaming request that declares a rich `custom` client tool fails closed
-/// with HTTP 400 before any upstream call, so the lowered private function name is
-/// never streamed to the client in an un-restored SSE event. The backend must
-/// never be contacted.
+/// with HTTP 500 before any upstream call when the `openai_stream_events` logical
+/// SSE owner is NOT in the pipeline to restore the lowered calls — an operator
+/// misconfiguration. The lowered private function name is never streamed to the
+/// client in an un-restored SSE event, and the backend must never be contacted.
 #[test]
-fn streaming_rich_client_tool_fails_closed_before_upstream() {
+fn streaming_rich_client_tool_without_stream_owner_fails_closed() {
     // The backend would 200 if ever contacted; the test asserts it is not.
     let backend_response = serde_json::json!({
         "id": "resp_never",
@@ -741,8 +763,9 @@ fn streaming_rich_client_tool_fails_closed_before_upstream() {
     });
     let model = StatefulCapturingBackend::new(vec![(200, backend_response.to_string())]).start_with_shutdown();
     let proxy_port = free_port();
-    let db = TempSqlite::new("client_tool_compat_streaming");
-    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let db = TempSqlite::new("client_tool_compat_streaming_no_owner");
+    // Config variant WITHOUT openai_stream_events so the marker is never armed.
+    let config = load_client_tool_compat_config_without_stream_owner(proxy_port, model.port(), db.url());
     let proxy = start_proxy(&config);
 
     let request = serde_json::json!({
@@ -762,13 +785,13 @@ fn streaming_rich_client_tool_fails_closed_before_upstream() {
 
     assert_eq!(
         parse_status(&raw),
-        400,
-        "streaming + rich client tools must fail closed: {raw}"
+        500,
+        "streaming rich client tools without openai_stream_events must fail closed: {raw}"
     );
     let body = parse_body(&raw);
     assert!(
-        body.contains("streaming is not supported"),
-        "the rejection explains the streaming limitation: {body}"
+        body.contains("openai_stream_events"),
+        "the rejection names the missing streaming owner: {body}"
     );
     assert!(
         model.requests().is_empty(),
@@ -899,5 +922,213 @@ fn native_function_tool_passes_through_unchanged() {
     assert!(
         output.iter().all(|item| item["type"] != "custom_tool_call"),
         "native traffic must not gain a restored typed item: {response}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Streaming: a custom client tool is restored live in the SSE lifecycle
+// -----------------------------------------------------------------------------
+
+/// A streaming request that declares a rich `custom` client tool has the tool
+/// lowered to a private `function` on the wire and the backend's streamed
+/// `function_call` lifecycle restored live to a `custom_tool_call` — with the
+/// single string parameter unwrapped into the plain-string `input` — by the
+/// `openai_stream_events` owner (#1159). The client never sees a bare
+/// `function_call` output item for the restored tool.
+#[test]
+fn streaming_custom_tool_restores_lifecycle() {
+    let sse_body = concat!(
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"arguments\":\"\"}}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"output_index\":0,\"delta\":\"{\\\"input\\\":\\\"*** Begin Patch\\\"}\"}\n\n",
+        "event: response.function_call_arguments.done\n",
+        "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"output_index\":0,\"arguments\":\"{\\\"input\\\":\\\"*** Begin Patch\\\"}\"}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"*** Begin Patch\\\"}\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_custom_stream\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"apply_patch\",\"arguments\":\"{\\\"input\\\":\\\"*** Begin Patch\\\"}\"}],\"tools\":[{\"type\":\"function\",\"name\":\"apply_patch\"}]}}\n\n",
+        "event: done\ndata: [DONE]\n\n",
+    );
+    let model = Backend::fixed(sse_body)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_stream_custom");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "stream": true,
+        "input": "Apply the patch.",
+        "tools": [{
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a unified diff to the workspace."
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streaming custom restore should return 200: {raw}"
+    );
+    assert_eq!(
+        parse_header(&raw, "content-type").as_deref(),
+        Some("text/event-stream"),
+        "streaming response keeps the SSE content type"
+    );
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("\"type\":\"custom_tool_call\""),
+        "the streamed function_call is restored to a custom_tool_call: {body}"
+    );
+    assert!(
+        body.contains("*** Begin Patch"),
+        "the custom input is unwrapped and streamed to the client: {body}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Streaming: a local shell client tool is restored live to a shell_call
+// -----------------------------------------------------------------------------
+
+/// A streaming request that declares a local `shell` client tool has the tool
+/// lowered to a private `function` named `shell` and the backend's streamed
+/// `function_call` restored live to a `shell_call` with `environment.type ==
+/// "local"` and the shell commands recovered (#1159).
+#[test]
+fn streaming_shell_tool_restores_local_shell_call() {
+    let sse_body = concat!(
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_sh1\",\"call_id\":\"call_sh1\",\"name\":\"shell\",\"arguments\":\"\"}}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_sh1\",\"output_index\":0,\"delta\":\"{\\\"commands\\\":[\\\"ls\\\",\\\"-la\\\"]}\"}\n\n",
+        "event: response.function_call_arguments.done\n",
+        "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_sh1\",\"output_index\":0,\"arguments\":\"{\\\"commands\\\":[\\\"ls\\\",\\\"-la\\\"]}\"}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_sh1\",\"call_id\":\"call_sh1\",\"name\":\"shell\",\"arguments\":\"{\\\"commands\\\":[\\\"ls\\\",\\\"-la\\\"]}\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_shell_stream\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_sh1\",\"call_id\":\"call_sh1\",\"name\":\"shell\",\"arguments\":\"{\\\"commands\\\":[\\\"ls\\\",\\\"-la\\\"]}\"}],\"tools\":[{\"type\":\"function\",\"name\":\"shell\"}]}}\n\n",
+        "event: done\ndata: [DONE]\n\n",
+    );
+    let model = Backend::fixed(sse_body)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_stream_shell");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "stream": true,
+        "input": "List the files.",
+        "tools": [{"type": "shell", "environment": {"type": "local"}}]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streaming shell restore should return 200: {raw}"
+    );
+    let body = parse_body(&raw);
+    assert!(
+        body.contains("\"type\":\"shell_call\""),
+        "the streamed function_call is restored to a shell_call: {body}"
+    );
+    assert!(
+        body.contains("\"local\""),
+        "the restored shell call is stamped with a local environment: {body}"
+    );
+    assert!(
+        body.contains("\"ls\"") && body.contains("\"-la\""),
+        "the shell commands are recovered onto the restored call: {body}"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Streaming: a namespace member never leaks its private lowered name
+// -----------------------------------------------------------------------------
+
+/// A streaming request that declares a `namespace` member has the member lowered
+/// to a flat private `function` name (`agentic_ns__utils__read_file`) and the
+/// backend's streamed `function_call` restored in place to its namespaced form
+/// (bare member name `read_file`, `namespace` `utils` re-added). The private
+/// lowered name must never appear anywhere in the streamed body (#1159).
+#[test]
+fn streaming_namespace_member_never_leaks_private_name() {
+    let sse_body = concat!(
+        "event: response.output_item.added\n",
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_ns1\",\"call_id\":\"call_ns1\",\"name\":\"agentic_ns__utils__read_file\",\"arguments\":\"\"}}\n\n",
+        "event: response.function_call_arguments.delta\n",
+        "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_ns1\",\"output_index\":0,\"delta\":\"{\\\"path\\\":\\\"/etc/hosts\\\"}\"}\n\n",
+        "event: response.function_call_arguments.done\n",
+        "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_ns1\",\"output_index\":0,\"arguments\":\"{\\\"path\\\":\\\"/etc/hosts\\\"}\"}\n\n",
+        "event: response.output_item.done\n",
+        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_ns1\",\"call_id\":\"call_ns1\",\"name\":\"agentic_ns__utils__read_file\",\"arguments\":\"{\\\"path\\\":\\\"/etc/hosts\\\"}\"}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ns_stream\",\"object\":\"response\",\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_ns1\",\"call_id\":\"call_ns1\",\"name\":\"agentic_ns__utils__read_file\",\"arguments\":\"{\\\"path\\\":\\\"/etc/hosts\\\"}\"}],\"tools\":[{\"type\":\"function\",\"name\":\"agentic_ns__utils__read_file\"}]}}\n\n",
+        "event: done\ndata: [DONE]\n\n",
+    );
+    let model = Backend::fixed(sse_body)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("client_tool_compat_stream_namespace");
+    let config = load_client_tool_compat_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "stream": true,
+        "input": "Read the hosts file.",
+        "tools": [{
+            "type": "namespace",
+            "name": "utils",
+            "description": "Local filesystem utilities.",
+            "tools": [{
+                "type": "function",
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }]
+        }]
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "streaming namespace restore should return 200: {raw}"
+    );
+    let body = parse_body(&raw);
+    assert!(
+        !body.contains("agentic_ns__"),
+        "the private lowered namespace name must never reach the client on the stream: {body}"
+    );
+    assert!(
+        body.contains("\"name\":\"read_file\""),
+        "the restored namespaced call carries the bare member name: {body}"
+    );
+    assert!(
+        body.contains("\"namespace\":\"utils\""),
+        "the restored namespaced call re-adds its namespace: {body}"
     );
 }

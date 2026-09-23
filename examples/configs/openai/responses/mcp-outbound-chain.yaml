@@ -1,4 +1,5 @@
 # MCP Outbound Chain
+# Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Demonstrates binding an operator `outbound_chain` onto the outbound MCP
 # callout made by `openai_mcp_tool_resolve` (the `tools/list` discovery
@@ -42,7 +43,7 @@
 #     }'
 #
 # Build:
-#   cargo build -p praxis-ai-proxy
+#   cargo build -p praxis-ai-proxy --features openai-mcp-tools,store-sqlite
 
 listeners:
   - name: ai-gateway

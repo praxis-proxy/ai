@@ -1,4 +1,5 @@
 # Responses API Proxy (non-streaming passthrough)
+# Requires `--features openai-responses` because these filters are opt-in.
 #
 # Proxies OpenAI Responses API requests to a native /v1/responses
 # backend. The openai_responses_proxy filter is a pipeline waypoint

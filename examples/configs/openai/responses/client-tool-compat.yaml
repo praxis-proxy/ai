@@ -1,4 +1,5 @@
 # Client Tool Compatibility
+# Requires `--features store-sqlite` because these filters are opt-in.
 #
 # Lets a rich Codex-style Responses client talk to a function-only Responses
 # backend (for example vLLM at POST /v1/responses) without routing through
@@ -7,11 +8,18 @@
 # The openai_client_tool_compat filter runs between openai_agentic_loop and
 # openai_responses_proxy. On the request it lowers client-owned custom,
 # namespace, local shell, and client-executed tool_search declarations to
-# private function tools the backend understands; on the response it restores
-# the returned function_call items to their canonical typed items
+# private function tools the backend understands; on a buffered response it
+# restores the returned function_call items to their canonical typed items
 # (custom_tool_call, namespaced function_call, shell_call, tool_search_call).
 # When the request declares no rich client tools the filter is a transparent
 # passthrough, so native traffic is unchanged.
+#
+# openai_stream_events leads the inference step so it arms streaming restoration
+# (a request-phase marker) before this filter lowers tools. On a streaming
+# response (stream: true) the openai_stream_events owner restores the lowered
+# calls live in the SSE lifecycle; if this filter lowers client tools for a
+# streaming request without that owner ahead of it, it fails closed with HTTP
+# 500 so private lowered names never reach an un-restored stream.
 
 listeners:
   - name: ai-gateway
@@ -52,6 +60,7 @@ filter_chains:
         steps:
           - name: inference
             filters:
+              - filter: openai_stream_events
               - filter: openai_agentic_loop
                 max_infer_iters: 4
               - filter: openai_client_tool_compat

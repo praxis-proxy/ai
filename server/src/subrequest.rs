@@ -171,6 +171,7 @@ runtime:
         );
     }
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn client_aware_factories_accept_configured_client() {
         use std::collections::HashMap;

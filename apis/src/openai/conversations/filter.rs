@@ -14,6 +14,7 @@ use praxis_filter::{
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 use secrecy::ExposeSecret as _;
 use serde_json::Value;
 use tokio::sync::OnceCell;
@@ -131,7 +132,18 @@ impl OpenaiConversationsFilter {
     }
 
     /// Build the configured store backend.
+    #[cfg_attr(
+        not(any(feature = "store-postgres", feature = "store-sqlite")),
+        expect(clippy::unused_async, reason = "only the SQL backends await during construction")
+    )]
     async fn build_store(&self) -> Result<Arc<dyn ConversationItemStore>, StoreError> {
+        #[cfg_attr(
+            not(any(feature = "store-postgres", feature = "store-sqlite")),
+            expect(
+                unused_variables,
+                reason = "only the compiled-in backends read the responses table name"
+            )
+        )]
         let responses_table = self.config.responses_table();
         match self.config.backend {
             #[cfg(feature = "store-sqlite")]

@@ -24,7 +24,7 @@ origin.
 | `openai_file_resolve` `file_url` fetch | Request-derived URL | Exact `allowed_file_url_origins` | No-follow | Anonymous; no downstream headers |
 | `openai_file_search_callout` | Configured `vector_store_url` | `allow_private_url` | No-follow | Only headers named by `forward_headers` |
 | `openai_responses_compact` | Configured `inference_url` | `allow_private_inference_url` | No-follow | Anonymous; no downstream or cluster headers |
-| `ai_guardrails` with NeMo | Configured `endpoint` | `allow_private_endpoint` | No-follow | Anonymous; no downstream headers |
+| `ai_guardrails` with NeMo | Configured `endpoint` | Global `allow_private_upstreams` | No-follow | Configured `outbound_chain`; no downstream headers by default |
 | `http_callout` | Configured `target.url` | `allow_private_addresses` | No-follow | Configured static headers plus allowed `forward_headers` |
 | MCP client | Request-derived server URL or configured connector | `allow_loopback` for loopback only | No-follow | Sanitized request-provided MCP authorization/headers |
 | `azure_ad` token fetch | Configured authority plus tenant | `allow_private_authority` | No-follow | Client secret in the token POST body |

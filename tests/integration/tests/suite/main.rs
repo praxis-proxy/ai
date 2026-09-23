@@ -42,7 +42,7 @@ mod agentic_mocks;
 mod anthropic_messages;
 mod claude_code;
 mod claude_code_vllm;
-#[cfg(feature = "store-sqlite")]
+mod codex_http;
 mod codex_websocket;
 #[cfg(feature = "store-sqlite")]
 mod conversations_rehydrate;
@@ -51,6 +51,8 @@ mod examples;
 mod failure_mode;
 mod guardrails;
 mod harness;
+// Several replayed scenarios run examples backed by the SQLite response store.
+#[cfg(feature = "store-sqlite")]
 mod inference_fixtures;
 mod mcp;
 mod mcp_broker;

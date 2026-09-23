@@ -1797,6 +1797,10 @@ mod tests {
         );
     }
 
+    // Materializes through the Responses proxy, whose pipeline builds the
+    // sqlite-backed response store, so it needs the store-sqlite backend
+    // compiled in (run via `make test-inference-fixtures`).
+    #[cfg(feature = "store-sqlite")]
     #[tokio::test]
     async fn materialize_records_uncontacted_upstream_when_translation_rejects() {
         let scenario = malformed_compaction_scenario();
@@ -2604,6 +2608,10 @@ mod tests {
         }
     }
 
+    // Asserts the live ResponseStore API accepts scheme-less sqlite paths, so it
+    // needs the store-sqlite backend compiled in (run via
+    // `make test-inference-fixtures`).
+    #[cfg(feature = "store-sqlite")]
     #[test]
     fn replay_config_matches_response_store_scheme_less_sqlite_paths() {
         let source = replay_config_source("openai/responses/response-store.yaml");
@@ -3273,6 +3281,10 @@ mod tests {
         }
     }
 
+    // Asserts the live ResponseStore API accepts empty/temporary sqlite targets,
+    // so it needs the store-sqlite backend compiled in (run via
+    // `make test-inference-fixtures`).
+    #[cfg(feature = "store-sqlite")]
     #[test]
     fn replay_config_matches_response_store_empty_sqlite_temporary_databases() {
         for database_url in ["sqlite:", "sqlite://", "sqlite:?", "sqlite://?"] {

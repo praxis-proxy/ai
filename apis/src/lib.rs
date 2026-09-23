@@ -17,6 +17,7 @@ pub mod callout_target;
 pub mod classifier;
 pub mod http_hop;
 pub mod json_body;
+#[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_client;
 pub mod openai;
 pub mod operation;
@@ -93,6 +94,7 @@ pub(crate) mod test_utils {
             buffered_request_body: None,
             body_done_indices: Vec::new(),
             branch_iterations: std::collections::HashMap::new(),
+            grpc_completion: None,
             client_addr: None,
             cluster: None,
             current_filter_id: None,

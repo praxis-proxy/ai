@@ -9,6 +9,7 @@ mod server;
 mod subrequest;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
+pub use praxis_ai_filters::install_pipeline_extensions;
 pub use praxis_core::logging::init_tracing;
 pub use server::{check_root_privilege, fatal, resolve_config_path, run_server, run_server_with_registry};
 pub use subrequest::create_subrequest_client;

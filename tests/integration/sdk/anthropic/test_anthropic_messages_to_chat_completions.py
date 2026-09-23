@@ -79,20 +79,24 @@ class RecordingBackend(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("content-length", "0"))
-        RecordingBackend.bodies.append(json.loads(self.rfile.read(length)))
+        body = json.loads(self.rfile.read(length))
+        RecordingBackend.bodies.append(body)
+        choice = {
+            "index": 0,
+            "message": {"role": "assistant", "content": "4"},
+            "finish_reason": "stop",
+        }
+        if body.get("stop"):
+            # vLLM reports the matched stop string in a choice-level
+            # `stop_reason`; pretend the first sequence was generated.
+            choice["stop_reason"] = body["stop"][0]
         reply = json.dumps(
             {
                 "id": "chatcmpl-stub",
                 "object": "chat.completion",
                 "created": 1_700_000_000,
                 "model": MODEL,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "4"},
-                        "finish_reason": "stop",
-                    }
-                ],
+                "choices": [choice],
                 "usage": {"prompt_tokens": 12, "completion_tokens": 1, "total_tokens": 13},
             }
         ).encode()
@@ -204,6 +208,33 @@ class TestRequestFieldHandling:
         assert "`service_tier` is not supported" in str(excinfo.value)
         assert RecordingBackend.bodies == []
 
+    def test_matched_stop_sequence_is_reported(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            stop_sequences=[","],
+            messages=[{"role": "user", "content": "Count: 1, 2, 3"}],
+        )
+
+        [upstream] = RecordingBackend.bodies
+        assert upstream["stop"] == [","]
+        assert response.stop_reason == "stop_sequence"
+        assert response.stop_sequence == ","
+
+    def test_stop_without_matched_sequence_is_end_turn(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        assert response.stop_reason == "end_turn"
+        assert response.stop_sequence is None
+
     def test_chat_completions_field_whose_output_is_discarded_is_rejected(
         self, anthropic_client
     ):
@@ -219,6 +250,20 @@ class TestRequestFieldHandling:
 
         assert "`moderation` is not supported" in str(excinfo.value)
         assert RecordingBackend.bodies == []
+
+
+class TestResponseUsage:
+    def test_usage_carries_null_output_tokens_details(self, anthropic_client):
+        response = anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        # The pinned Messages schema requires the key; the SDK defaults a missing
+        # key to None too, so check the wire payload actually carried it.
+        assert "output_tokens_details" in response.usage.model_fields_set
+        assert response.usage.output_tokens_details is None
 
 
 if __name__ == "__main__":

@@ -63,7 +63,7 @@ use self::{
     extract::{ExtractError, ExtractionBudget, extract_input_file},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, file_resolve::resolve::content_parts_mut,
+    body_limits::reject_rewritten_body_too_large, content_parts::content_parts_mut,
     openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
 };
 use crate::{classifier::is_responses_create, json_body::serialize_json_body};

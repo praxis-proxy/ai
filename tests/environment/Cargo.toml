@@ -8,7 +8,9 @@ publish = false
 description = "llm-d environment integration tests for Praxis AI"
 
 [features]
-default = ["store-postgres"]
+# The environment tests exercise only the llm-d ext_proc path, so no AI filter
+# group is needed by default.
+default = []
 store-postgres = ["praxis-ai-proxy/store-postgres", "praxis-test-utils/store-postgres"]
 store-sqlite = ["praxis-ai-proxy/store-sqlite", "praxis-test-utils/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]

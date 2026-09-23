@@ -9,6 +9,7 @@
 //! inference routing, prompt enrichment, and token usage handling.
 
 pub mod agentic;
+#[cfg(feature = "aws-sigv4-filter")]
 pub mod aws;
 #[cfg(feature = "azure-ad-filter")]
 pub mod azure;
@@ -22,6 +23,8 @@ pub mod inference;
 pub mod metering;
 #[cfg(feature = "opentelemetry")]
 mod opentelemetry;
+#[cfg(any(feature = "azure-ad-filter", feature = "gcp-adc-filter"))]
+mod pinned_client;
 pub mod prompt_enrich;
 mod register;
 pub mod routing;
@@ -31,6 +34,7 @@ mod token_rate_limit;
 mod token_usage;
 
 pub use agentic::{a2a::A2aFilter, mcp::McpFilter};
+#[cfg(feature = "aws-sigv4-filter")]
 pub use aws::Sigv4SignFilter;
 #[cfg(feature = "azure-ad-filter")]
 pub use azure::AzureAdFilter;
@@ -43,7 +47,7 @@ pub use identity_guard::IdentityHeaderGuardFilter;
 pub use inference::{LlmisvcModelProviderResolverFilter, ModelToHeaderFilter};
 pub use metering::ExternalMeteringFilter;
 pub use prompt_enrich::PromptEnrichFilter;
-pub use register::{build_ai_registry, register_ai_filters};
+pub use register::{build_ai_registry, install_pipeline_extensions, register_ai_filters};
 pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};
 pub use time_to_first_token::TimeToFirstTokenFilter;
 #[cfg(feature = "token-rate-limit-filter")]
@@ -61,8 +65,15 @@ pub(crate) mod test_utils {
     use std::sync::LazyLock;
 
     use http::{HeaderMap, Method, Uri};
-    use praxis_core::id::IdGenerator;
+    use praxis_core::{
+        id::IdGenerator,
+        subrequest::{SubRequestClient, SubRequestConnector},
+    };
     use praxis_filter::{HttpFilterContext, Request, RequestExtensions, Response};
+
+    /// Shared sub-request client for filter unit tests that exercise callouts.
+    static TEST_SUBREQUEST_CLIENT: LazyLock<SubRequestClient> =
+        LazyLock::new(|| SubRequestClient::new(SubRequestConnector::new(4, None)));
 
     /// Deterministic ID generator for tests (seed=0).
     static TEST_ID_GENERATOR: LazyLock<IdGenerator> = LazyLock::new(|| IdGenerator::with_seed(0));
@@ -83,10 +94,29 @@ pub(crate) mod test_utils {
         reason = "test context constructor mirrors all context fields"
     )]
     pub(crate) fn make_filter_context(req: &Request) -> HttpFilterContext<'_> {
+        make_filter_context_with_subrequest(req, None)
+    }
+
+    /// Build a filter context wired to the shared test sub-request client.
+    pub(crate) fn make_filter_context_with_subrequest<'a>(
+        req: &'a Request,
+        client: Option<&'a SubRequestClient>,
+    ) -> HttpFilterContext<'a> {
+        let mut ctx = make_filter_context_inner(req);
+        ctx.subrequest_client = client.or(Some(&TEST_SUBREQUEST_CLIENT));
+        ctx
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test context constructor mirrors all context fields"
+    )]
+    fn make_filter_context_inner(req: &Request) -> HttpFilterContext<'_> {
         HttpFilterContext {
             buffered_request_body: None,
             body_done_indices: Vec::new(),
             branch_iterations: std::collections::HashMap::new(),
+            grpc_completion: None,
             client_addr: None,
             cluster: None,
             current_filter_id: None,

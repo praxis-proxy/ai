@@ -302,7 +302,15 @@ fn unknown_configuration_fields_are_rejected() {
 
 #[test]
 fn header_targets_carrying_auth_or_framing_are_rejected() {
-    for target in ["authorization", "host", "content-length", "cookie", "transfer-encoding"] {
+    for target in [
+        "authorization",
+        "host",
+        "content-length",
+        "content-type",
+        "expect",
+        "cookie",
+        "transfer-encoding",
+    ] {
         let value: serde_yaml::Value =
             serde_yaml::from_str(&format!("headers:\n  application_protocol: {target}\n")).unwrap();
         assert!(
@@ -310,6 +318,68 @@ fn header_targets_carrying_auth_or_framing_are_rejected() {
             "{target} must not be an overwritable classifier target"
         );
     }
+}
+
+#[test]
+fn provider_credential_header_targets_are_rejected() {
+    for target in ["x-api-key", "X-Api-Key", "api-key", "x-goog-api-key", "set-cookie"] {
+        let value: serde_yaml::Value = serde_yaml::from_str(&format!("headers:\n  operation: {target}\n")).unwrap();
+        assert!(
+            OpenaiOperationFilter::from_config(&value).is_err(),
+            "{target} carries credentials and must not be overwritten or stripped by the classifier"
+        );
+    }
+}
+
+#[test]
+fn unrelated_reserved_namespaces_are_rejected() {
+    // The classifier owns only its own two facts. Every other internal
+    // namespace belongs to some other filter, and a matched request would
+    // overwrite it while an unmatched one would strip it.
+    for target in [
+        "x-praxis-route",
+        "x-praxis-ai-format",
+        "x-praxis-responses-mode",
+        "x-mcp-session",
+        "x-a2a-task",
+    ] {
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&format!("headers:\n  application_protocol: {target}\n")).unwrap();
+        assert!(
+            OpenaiOperationFilter::from_config(&value).is_err(),
+            "{target} is not this classifier's to own"
+        );
+    }
+}
+
+#[test]
+fn dedicated_defaults_and_custom_names_remain_allowed() {
+    for config in [
+        "headers:\n  application_protocol: x-praxis-ai-application-protocol\n",
+        "headers:\n  operation: x-praxis-ai-operation\n",
+        // Case-insensitive against the dedicated default.
+        "headers:\n  operation: X-Praxis-AI-Operation\n",
+        // Custom, non-reserved names stay configurable.
+        "headers:\n  application_protocol: x-my-protocol\n  operation: x-my-operation\n",
+    ] {
+        let value: serde_yaml::Value = serde_yaml::from_str(config).unwrap();
+        assert!(
+            OpenaiOperationFilter::from_config(&value).is_ok(),
+            "configuration should remain valid:\n{config}"
+        );
+    }
+}
+
+#[test]
+fn each_field_may_not_claim_the_other_fields_default() {
+    // x-praxis-ai-operation is a reserved internal name that belongs to the
+    // operation output, so the protocol output must not target it.
+    let value: serde_yaml::Value =
+        serde_yaml::from_str("headers:\n  application_protocol: x-praxis-ai-operation\n").unwrap();
+    assert!(
+        OpenaiOperationFilter::from_config(&value).is_err(),
+        "one output must not claim the other's dedicated header"
+    );
 }
 
 #[test]

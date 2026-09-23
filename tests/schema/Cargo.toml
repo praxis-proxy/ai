@@ -8,10 +8,21 @@ readme = "../../README.md"
 publish = false
 
 [features]
-default = ["store-postgres"]
-store-postgres = ["praxis-test-utils/store-postgres"]
-store-sqlite = ["praxis-test-utils/store-sqlite"]
+# Feature passthroughs mirroring praxis-ai-proxy (see its Cargo.toml). The
+# default is `full` so a plain `cargo test -p <crate>` exercises every filter.
+default = ["full"]
+standard = ["praxis-test-utils/standard"]
+openai-responses = ["praxis-test-utils/openai-responses"]
+openai-file-resolve-filter = ["openai-responses", "praxis-test-utils/openai-file-resolve-filter"]
+store = ["openai-responses", "praxis-test-utils/store"]
+store-postgres = ["store", "praxis-test-utils/store-postgres"]
+store-sqlite = ["store", "praxis-test-utils/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
+openai-conversations = ["store", "praxis-test-utils/openai-conversations"]
+openai-compact = ["store", "praxis-test-utils/openai-compact"]
+openai-mcp-tools = ["store", "praxis-test-utils/openai-mcp-tools"]
+openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
+full = ["standard", "openai-all", "store-postgres"]
 praxis-main = ["praxis-test-utils/praxis-main"]
 
 [lints]

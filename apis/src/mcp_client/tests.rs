@@ -266,6 +266,18 @@ fn reserved_internal_headers_stripped_from_mcp_headers() {
     );
 }
 
+#[test]
+fn build_transport_config_bounds_retry_to_three() {
+    let config =
+        build_transport_config_with_forwarded_headers("https://mcp.example/mcp", None, None, &[], None).unwrap();
+    // A policy consulted past its max returns None (no further retry).
+    assert!(
+        config.retry_config.retry(3).is_none(),
+        "the 4th consecutive failed re-dial must not retry"
+    );
+    assert!(config.retry_config.retry(0).is_some(), "the first re-dial is allowed");
+}
+
 // =========================================================================
 // Cookie and forwarded header blocking
 // =========================================================================
@@ -1429,11 +1441,20 @@ async fn list_tools_rejects_oversized_response() {
     // back out-of-band (rmcp discards the transport error) and surfaces the
     // dedicated `ResponseTooLarge` variant, which callers map to HTTP 413 —
     // distinct from the generic 502 a plain `ListTools` failure yields.
+    //
+    // NOTE: tools/list is a ClientRequest, so rmcp routes it through the
+    // streaming post_message_with_max_sse_event_size path. The server returns
+    // JSON (not SSE), so praxis buffers anyway (Blocker 5). The executor
+    // backstop passed to execute_streaming is 2x the binding cap (spec §4.5 F3),
+    // so when praxis buffers and trips on an oversized response, it reports the
+    // 2x limit. This is intentional: the buffered fallback is memory-bounded at
+    // 2x the cap (see subrequest_transport.rs streaming_executor_backstop doc).
     match err {
         McpClientError::ResponseTooLarge { limit, .. } => {
             assert_eq!(
-                limit, MAX_CONTROL_RESPONSE_BYTES,
-                "control-plane tools/list is bounded to the control ceiling"
+                limit,
+                2 * MAX_CONTROL_RESPONSE_BYTES,
+                "buffered fallback in execute_streaming is bounded at 2x the binding cap"
             );
         },
         other => panic!("oversized response should surface as ResponseTooLarge, got: {other:?}"),
@@ -1539,4 +1560,30 @@ async fn list_tools_rejects_oversized_cumulative_pagination() {
         matches!(err, McpClientError::ListingTooLarge { .. }),
         "aggregate overflow should surface as ListingTooLarge, got: {err:?}"
     );
+}
+
+// =========================================================================
+// classify_deadline
+// =========================================================================
+
+#[test]
+fn classify_deadline_maps_size_signal_to_413_else_timeout() {
+    use std::sync::{Arc, OnceLock};
+    let url = parse_display_url("https://mcp.example/mcp");
+
+    // No signal recorded -> generic Timeout.
+    let signal: Arc<OnceLock<subrequest_transport::TransportSignal>> = Arc::new(OnceLock::new());
+    let err = classify_deadline(&signal, &url, Duration::from_secs(1));
+    assert!(matches!(err, McpClientError::Timeout { .. }));
+
+    // Size signal recorded -> 413-classified ResponseTooLarge.
+    let signal: Arc<OnceLock<subrequest_transport::TransportSignal>> = Arc::new(OnceLock::new());
+    assert!(
+        signal
+            .set(subrequest_transport::TransportSignal::ResponseTooLarge { limit: 5 })
+            .is_ok(),
+        "signal OnceLock should be empty"
+    );
+    let err = classify_deadline(&signal, &url, Duration::from_secs(1));
+    assert!(matches!(err, McpClientError::ResponseTooLarge { .. }));
 }

@@ -5,7 +5,8 @@ Configuration examples organized by category.
 ## Running an Example
 
 ```console
-cargo run -p praxis-ai-proxy -- -c examples/configs/openai/responses/full-flow-agentic.yaml
+cargo run -p praxis-ai-proxy --features openai-all,store-sqlite -- \
+  -c examples/configs/openai/responses/full-flow-agentic.yaml
 curl http://localhost:8080/
 ```
 
@@ -89,7 +90,9 @@ before sending requests.
 | [agentic-loop-fixture.yaml](configs/openai/responses/agentic-loop-fixture.yaml) | Minimal agentic loop pipeline for inference fixture replay |
 | [agentic-loop.yaml](configs/openai/responses/agentic-loop.yaml) | Demonstrates the openai_agentic_loop filter with iterative_request_router for step-based model-tool-model looping in the Responses API |
 | [body-size-limits.yaml](configs/openai/responses/body-size-limits.yaml) | Demonstrates how raw request body size is enforced across a chain of OpenAI Responses filters that each buffer the request body |
+| [client-tool-compat-chat-completions.yaml](configs/openai/responses/client-tool-compat-chat-completions.yaml) | Lets a rich Codex-style Responses client (POST /v1/responses with custom, namespace, local shell, and client-executed tool_search tools) reach a function-only Chat Completions backend (POST /v1/chat/completions) by composing openai_client_tool_compat with responses_to_chat_completions in one iterative-router step (GitHub issue #1206) |
 | [client-tool-compat.yaml](configs/openai/responses/client-tool-compat.yaml) | Lets a rich Codex-style Responses client talk to a function-only Responses backend (for example vLLM at POST /v1/responses) without routing through /v1/chat/completions and without executing client-owned tools in Praxis |
+| [codex-http-chat-translation.yaml](configs/openai/responses/codex-http-chat-translation.yaml) | Release-acceptance configuration for GitHub issue #870. A Codex client speaks the OpenAI Responses API over HTTP while Praxis selects a Chat Completions-only provider, translates both request and streaming response, rewrites the provider path, and replaces the client credential |
 | [compact.yaml](configs/openai/responses/compact.yaml) | Demonstrates compaction after rehydrate, file resolve, and document extract so rewritten current-turn content survives history replacement |
 | [doc-extract.yaml](configs/openai/responses/doc-extract.yaml) | Converts `input_file` content parts to `input_text` for inference backends that do not natively support `input_file` (e.g. vLLM, llm-d) |
 | [file-resolve.yaml](configs/openai/responses/file-resolve.yaml) | Resolves `file_id` and `file_url` references in Responses API input by fetching file metadata and content, then inlining base64 content as `file_data` or `image_url` before forwarding |
@@ -99,9 +102,11 @@ before sending requests.
 | [file-search-streaming.yaml](configs/openai/responses/file-search-streaming.yaml) | Demonstrates streaming hosted file_search through the iterative_request_router |
 | [format-routing.yaml](configs/openai/responses/format-routing.yaml) | Routes AI API traffic by request-head operation identity and body format |
 | [full-flow-agentic.yaml](configs/openai/responses/full-flow-agentic.yaml) | Runs the complete Responses API pipeline through an agentic iterative_request_router that executes hosted file_search, web_search, and MCP tool calls in a model-tool-model loop, persisting both buffered and streaming (`stream: true`) responses |
+| [http-passthrough.yaml](configs/openai/responses/http-passthrough.yaml) | The strict-HTTP acceptance test for pinned Codex CLI for GitHub issue #870 drives the proxy over `POST /v1/responses` and any other Responses API paths the client may probe |
 | [irr-terminal-streaming.yaml](configs/openai/responses/irr-terminal-streaming.yaml) | Demonstrates a single-step iterative_request_router pipeline that exposes a native OpenAI Responses SSE body incrementally. `openai_responses_proxy` always advertises the streaming capability and selects Praxis's typed streaming transport automatically for an effective `"stream": true` request; there is no operator opt-in |
 | [mcp-dispatch.yaml](configs/openai/responses/mcp-dispatch.yaml) | Demonstrates the `openai_mcp_dispatch` filter configuration |
 | [mcp-outbound-chain.yaml](configs/openai/responses/mcp-outbound-chain.yaml) | Demonstrates binding an operator `outbound_chain` onto the outbound MCP callout made by `openai_mcp_tool_resolve` (the `tools/list` discovery request) |
+| [mcp-streaming.yaml](configs/openai/responses/mcp-streaming.yaml) | Demonstrates MCP tool calls over the filtered-subrequest transport with SSE streaming support |
 | [mcp-tool-resolve.yaml](configs/openai/responses/mcp-tool-resolve.yaml) | Demonstrates the `openai_mcp_tool_resolve` filter, which resolves MCP tool entries in the Responses API `tools` array into concrete tool definitions by calling `tools/list` on each upstream MCP server |
 | [model-rewrite.yaml](configs/openai/responses/model-rewrite.yaml) | Rewrites or injects the top-level `model` field in Responses API request bodies before forwarding to the inference backend |
 | [rehydrate-fixture.yaml](configs/openai/responses/rehydrate-fixture.yaml) | Minimal native OpenAI Responses pipeline that stores a first turn, rehydrates a stored `previous_response_id` into the outbound `input` history, and proxies to a native /v1/responses backend |

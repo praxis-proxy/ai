@@ -1,5 +1,5 @@
 # Response Store
-# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
+# Requires `--features store-sqlite` because these filters are opt-in.
 #
 # Persists non-streaming Responses API responses to a database
 # and serves stored data via GET endpoints and handles

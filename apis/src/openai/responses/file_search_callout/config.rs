@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use praxis_core::config::ChainRef;
 use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
-use reqwest::Url;
 use serde::Deserialize;
+use url::Url;
 
 use super::client::MAX_CONCURRENT_SEARCHES;
 use crate::{callout_policy::OnFailure, openai::api_client, subrequest::SubRequestClient};

@@ -74,6 +74,7 @@
                 "inference_geo": null,
                 "input_tokens": 21,
                 "output_tokens": 2,
+                "output_tokens_details": null,
                 "server_tool_use": null,
                 "service_tier": null
               }

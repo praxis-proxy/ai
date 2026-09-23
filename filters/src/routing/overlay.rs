@@ -1028,8 +1028,12 @@ async fn watch_loop(
 
 /// Process filesystem events until shutdown is requested.
 #[expect(
+    clippy::allow_attributes,
+    reason = "the lint only fires with some tracing feature sets"
+)]
+#[allow(
     clippy::cognitive_complexity,
-    reason = "complexity is from tokio::select! macro expansion"
+    reason = "tokio::select! and tracing macros expand larger when tracing's `log` feature is on (the store's sqlx enables it)"
 )]
 #[expect(clippy::too_many_arguments, reason = "watcher loop needs all context")]
 async fn run_event_loop(

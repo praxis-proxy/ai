@@ -69,7 +69,6 @@
               ],
               "parallel_tool_calls": true,
               "status": "completed",
-              "tool_choice": "auto",
               "tools": [
                 {
                   "description": "Apply a unified diff to the workspace.",

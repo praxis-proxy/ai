@@ -18,6 +18,8 @@ mod aws_sigv4;
 mod azure_ad;
 mod azure_translation;
 #[cfg(feature = "store-sqlite")]
+mod client_tool_compat_chat_completions;
+#[cfg(feature = "store-sqlite")]
 mod compact;
 mod credential_injection;
 mod external_metering;
@@ -54,6 +56,8 @@ mod openai_embeddings_routing;
 mod openai_file_resolve;
 mod openai_mcp_dispatch;
 mod openai_mcp_outbound_chain;
+#[cfg(feature = "store-sqlite")]
+mod openai_mcp_streaming;
 mod openai_mcp_tool_resolve;
 mod openai_prompts_routing;
 #[cfg(feature = "store-sqlite")]
@@ -66,6 +70,8 @@ mod openai_responses_format;
 mod openai_responses_model_rewrite;
 mod openai_responses_proxy;
 mod openai_responses_validate;
+// The state-ownership example selects the SQLite store backend.
+#[cfg(feature = "store-sqlite")]
 mod openai_state_ownership;
 #[cfg(feature = "store-sqlite")]
 mod openai_stream_events;

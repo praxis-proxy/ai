@@ -1,0 +1,44 @@
+version: 1
+id: responses/client-tool-compat-stream
+description: Rich Codex custom client tool lowered to a private function on a function-only Responses backend, then restored live to a custom_tool_call in the streaming SSE lifecycle (#1159).
+protocol: openai_responses
+example_config: openai/responses/client-tool-compat.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.client_tool_compat.stream_restore
+turns:
+  - name: custom-tool-lower-restore-stream
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          input: Apply the patch.
+          store: false
+          stream: true
+          tools:
+            - type: custom
+              name: apply_patch
+              description: Apply a unified diff to the workspace.
+    expect:
+      client_status: 200
+      client_body_kind: sse
+      upstream_path: /v1/responses
+      upstream_body_kind: json
+      client_sse_events:
+        - response.output_item.added
+        - response.custom_tool_call_input.delta
+        - response.custom_tool_call_input.done
+        - response.output_item.done
+        - response.completed
+      upstream_sse_events:
+        - response.output_item.added
+        - response.function_call_arguments.delta
+        - response.function_call_arguments.done
+        - response.output_item.done
+        - response.completed
