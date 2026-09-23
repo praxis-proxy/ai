@@ -71,3 +71,22 @@ into isolated web-search, OGX file-search, OGX file-resolution, and MCP child
 requests. Praxis core then emits the same `x-request-id` and W3C trace ID with a
 fresh span ID for every outbound hop. No ambient request extensions, provider
 credentials, or MCP authorization assertions are copied into trace fields.
+
+## Token rate limiting
+
+When the experimental `token_rate_limit` filter and the `opentelemetry`
+feature are both enabled, an admitted or denied request also gets a
+request-scoped `token_rate_limit` span. It records these bounded fields:
+
+- `token_rate_limit.rule`: configured rule name.
+- `token_rate_limit.algorithm`: `sliding_window` or `token_bucket`.
+- `token_rate_limit.estimated_cost`: tokens reserved or considered at admission.
+- `token_rate_limit.decision`: `admitted` or `denied`.
+- `token_rate_limit.actual_cost`: provider-reported weighted usage, when it becomes available
+  during response processing.
+
+The span does not contain the authenticated subject, internal budget key,
+prompt, body, model, or other request-specific identity. Valkey
+reconciliation runs asynchronously after response processing; its success or
+failure is exposed through metrics and accounting logs rather than extending
+the request span beyond the response lifecycle.

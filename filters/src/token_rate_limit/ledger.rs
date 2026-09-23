@@ -149,6 +149,8 @@ struct ActiveReservation {
 struct KeyState {
     settled: VecDeque<Usage>,
     active: HashMap<u64, ActiveReservation>,
+    /// Last remaining balance included in [`Ledger::remaining_total`].
+    reported_remaining: u64,
 }
 
 impl KeyState {
@@ -225,6 +227,8 @@ pub(super) struct Ledger {
     next_id: AtomicU64,
     key_count: AtomicUsize,
     active_reservations: AtomicUsize,
+    /// Sum of the last calculated remaining balance for every retained key.
+    remaining_total: Mutex<u128>,
 }
 
 impl Ledger {
@@ -238,6 +242,7 @@ impl Ledger {
             next_id: AtomicU64::new(1),
             key_count: AtomicUsize::new(0),
             active_reservations: AtomicUsize::new(0),
+            remaining_total: Mutex::new(0),
         })
     }
 
@@ -261,6 +266,50 @@ impl Ledger {
         self.key_count.load(Ordering::Relaxed)
     }
 
+    /// Sum of the last calculated remaining balance for retained keys.
+    pub(super) fn remaining_total(&self) -> u64 {
+        let total = match self.remaining_total.lock() {
+            Ok(total) => *total,
+            Err(poisoned) => *poisoned.into_inner(),
+        };
+        u64::try_from(total.min(u128::from(super::MAX_REPORTED_REMAINING))).unwrap_or(super::MAX_REPORTED_REMAINING)
+    }
+
+    /// Add to the exact aggregate; only the exported snapshot is clamped.
+    fn add_remaining(&self, increase: u64) {
+        let mut total = match self.remaining_total.lock() {
+            Ok(total) => total,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *total += u128::from(increase);
+    }
+
+    /// Refresh one key's contribution to [`Self::remaining_total`].
+    fn update_remaining(&self, state: &mut KeyState, now_ms: u64) {
+        let remaining = self
+            .config
+            .budgets
+            .iter()
+            .map(|budget| {
+                budget
+                    .capacity
+                    .saturating_sub(state.usage_in_window(now_ms, budget.window_ms))
+            })
+            .min()
+            .unwrap_or(0);
+        let previous = std::mem::replace(&mut state.reported_remaining, remaining);
+        if remaining >= previous {
+            self.add_remaining(remaining - previous);
+        } else {
+            let decrease = previous - remaining;
+            let mut total = match self.remaining_total.lock() {
+                Ok(total) => total,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *total = total.saturating_sub(u128::from(decrease));
+        }
+    }
+
     /// Reserve an estimate atomically across all configured windows.
     pub(super) fn reserve(&self, key: &str, estimate: u64, now_ms: u64) -> Decision {
         if key.is_empty() || key.len() > self.config.max_key_length || estimate == 0 {
@@ -270,27 +319,36 @@ impl Ledger {
             };
         }
 
-        let state = match self.keys.entry(key.to_owned()) {
-            dashmap::mapref::entry::Entry::Occupied(entry) => Arc::clone(entry.get()),
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                if self
-                    .key_count
-                    .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
-                        (count < self.config.max_keys).then_some(count + 1)
-                    })
-                    .is_err()
-                {
-                    return Decision::Denied {
-                        retry_after_ms: 0,
-                        reason: DenialReason::KeyCapacity,
-                    };
-                }
-                let state = Arc::new(Mutex::new(KeyState::default()));
-                entry.insert(Arc::clone(&state));
-                state
-            },
+        let entry = loop {
+            if let Some(entry) = self.keys.get(key) {
+                break entry;
+            }
+            match self.keys.entry(key.to_owned()) {
+                dashmap::mapref::entry::Entry::Occupied(_) => {},
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    if self
+                        .key_count
+                        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
+                            (count < self.config.max_keys).then_some(count + 1)
+                        })
+                        .is_err()
+                    {
+                        return Decision::Denied {
+                            retry_after_ms: 0,
+                            reason: DenialReason::KeyCapacity,
+                        };
+                    }
+                    let initial_remaining = self.limit();
+                    let state = Arc::new(Mutex::new(KeyState {
+                        reported_remaining: initial_remaining,
+                        ..KeyState::default()
+                    }));
+                    self.add_remaining(initial_remaining);
+                    entry.insert(state);
+                },
+            }
         };
-        let mut state = match state.lock() {
+        let mut state = match entry.value().lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -299,6 +357,7 @@ impl Ledger {
             self.reservations.remove(id);
         }
         self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
+        self.update_remaining(&mut state, now_ms);
 
         let mut max_usage = 0_u64;
         for budget in &self.config.budgets {
@@ -332,8 +391,10 @@ impl Ledger {
                 created_at_ms: now_ms,
             },
         );
+        self.update_remaining(&mut state, now_ms);
         self.reservations.insert(id, key.to_owned());
         drop(state);
+        drop(entry);
         Decision::Admitted(Reservation {
             id,
             estimate,
@@ -370,6 +431,7 @@ impl Ledger {
             self.reservations.remove(&expired_id);
             self.active_reservations.fetch_sub(1, Ordering::Relaxed);
         }
+        self.update_remaining(&mut state, now_ms);
         drop(state);
         Settlement::Applied {
             actual,
@@ -402,7 +464,9 @@ impl Ledger {
                 self.reservations.remove(id);
             }
             self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
+            self.update_remaining(&mut state, now_ms);
             let empty = state.is_empty();
+            let reported_remaining = state.reported_remaining;
             drop(state);
             drop(entry);
             if empty
@@ -418,6 +482,11 @@ impl Ledger {
                     .is_some()
             {
                 self.key_count.fetch_sub(1, Ordering::Relaxed);
+                let mut total = match self.remaining_total.lock() {
+                    Ok(total) => total,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *total = total.saturating_sub(u128::from(reported_remaining));
             }
         }
         orphaned
@@ -436,7 +505,10 @@ impl Ledger {
     reason = "ledger tests intentionally fail fast on impossible fixture states"
 )]
 mod tests {
-    use std::sync::{Arc, Barrier};
+    use std::{
+        sync::{Arc, Barrier, mpsc},
+        time::Duration,
+    };
 
     use super::*;
 
@@ -481,6 +553,39 @@ mod tests {
             .filter(|ok| *ok)
             .count();
         assert_eq!(admitted, 10, "exactly the capacity should be admitted");
+    }
+
+    #[test]
+    fn cleanup_cannot_remove_a_key_while_reserve_holds_its_map_entry() {
+        let ledger = Arc::new(ledger(&[(1_000, 10)]));
+        ledger.keys.insert(
+            "alice".into(),
+            Arc::new(Mutex::new(KeyState {
+                reported_remaining: 10,
+                ..KeyState::default()
+            })),
+        );
+        ledger.key_count.store(1, Ordering::Relaxed);
+        ledger.add_remaining(10);
+
+        // `reserve` keeps this same DashMap entry guard while locking and
+        // changing KeyState, so cleanup must not remove its key in-between.
+        let entry = ledger.keys.get("alice").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let cleanup_ledger = Arc::clone(&ledger);
+        let cleanup = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            cleanup_ledger.cleanup(0, 1);
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(entry);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cleanup.join().unwrap();
+        assert_eq!(ledger.key_count(), 0);
+        assert_eq!(ledger.remaining_total(), 0);
     }
 
     #[test]
@@ -768,5 +873,38 @@ mod tests {
         ));
         assert_eq!(l.active_count(), 0, "the stale sibling must be reaped too");
         assert_eq!(l.reconcile(stale.id, Some(1), 150), Settlement::Noop);
+    }
+
+    #[test]
+    fn remaining_total_sums_latest_balances_across_keys() {
+        let l = ledger(&[(1_000, 100)]);
+        let first = match l.reserve("alice", 40, 0) {
+            Decision::Admitted(reservation) => reservation,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        assert_eq!(l.remaining_total(), 60);
+        assert!(matches!(l.reserve("bob", 25, 0), Decision::Admitted(_)));
+        assert_eq!(l.remaining_total(), 135, "60 for alice plus 75 for bob");
+
+        assert!(matches!(
+            l.reconcile(first.id, Some(10), 0),
+            Settlement::Applied { refund: 30, .. }
+        ));
+        assert_eq!(l.remaining_total(), 165, "alice's refund must update the aggregate");
+
+        l.cleanup(2_000, 8);
+        l.cleanup(3_001, 8);
+        assert_eq!(l.remaining_total(), 0, "evicted idle keys must leave the aggregate");
+    }
+
+    #[test]
+    fn remaining_total_stays_saturated_until_the_exact_sum_falls_below_the_gauge_limit() {
+        let capacity = super::super::token_bucket_ledger::MAX_F64_SAFE_INTEGER;
+        let l = ledger(&[(1_000, capacity)]);
+
+        assert!(matches!(l.reserve("alice", 1, 0), Decision::Admitted(_)));
+        assert_eq!(l.remaining_total(), super::super::MAX_REPORTED_REMAINING);
+        assert!(matches!(l.reserve("bob", 1, 0), Decision::Admitted(_)));
+        assert_eq!(l.remaining_total(), super::super::MAX_REPORTED_REMAINING);
     }
 }

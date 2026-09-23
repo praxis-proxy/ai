@@ -12,6 +12,37 @@ use std::sync::Arc;
 
 use tracing::field::Empty;
 
+/// Request-scoped token-rate-limit span retained until reconciliation.
+pub(crate) struct TokenRateLimitSpan(tracing::Span);
+
+impl TokenRateLimitSpan {
+    /// Record actual weighted token cost once response usage is available.
+    pub(crate) fn record_actual(&self, actual: u64) {
+        self.0.record("token_rate_limit.actual_cost", actual);
+    }
+}
+
+/// Create a bounded per-request span for one token-rate-limit decision.
+///
+/// Rule and algorithm come from bounded configuration. No budget key,
+/// authenticated subject, model, prompt, body, credential, or raw request
+/// identifier is recorded.
+pub(crate) fn token_rate_limit_span(
+    rule: &str,
+    algorithm: &'static str,
+    estimated_cost: u64,
+    decision: &'static str,
+) -> TokenRateLimitSpan {
+    TokenRateLimitSpan(tracing::info_span!(
+        "token_rate_limit",
+        "token_rate_limit.rule" = rule,
+        "token_rate_limit.algorithm" = algorithm,
+        "token_rate_limit.estimated_cost" = estimated_cost,
+        "token_rate_limit.actual_cost" = Empty,
+        "token_rate_limit.decision" = decision,
+    ))
+}
+
 use crate::routing::descriptor::RouteCandidate;
 
 /// Borrowed, validated attributes for a routing decision span.
@@ -170,7 +201,7 @@ pub(crate) fn record_provider_route_selection(
 mod tests {
     use std::sync::Arc;
 
-    use super::{ProviderRouteSelection, RoutingSelection, record_provider_route_selection};
+    use super::{ProviderRouteSelection, RoutingSelection, record_provider_route_selection, token_rate_limit_span};
     use crate::routing::descriptor::{AdmissionState, CapabilityKind, RouteCandidate};
 
     #[test]
@@ -240,6 +271,12 @@ mod tests {
         let fields = ProviderRouteSelection::new(&provider_id, &cluster, &model, "candidate-a", None);
 
         assert_eq!(fields.revision, None);
+    }
+
+    #[test]
+    fn token_rate_limit_span_accepts_its_bounded_decision_and_actual_cost_fields() {
+        let span = token_rate_limit_span("engineering", "sliding_window", 500, "admitted");
+        span.record_actual(120);
     }
 
     // -------------------------------------------------------------------------

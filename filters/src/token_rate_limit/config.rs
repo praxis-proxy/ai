@@ -18,7 +18,7 @@ use serde::Deserialize;
 ///
 /// Experimental: requires the `token-rate-limit-filter` cargo feature,
 /// which is off by default and activates the `experimental` marker.
-/// This filter delivers the agreed M1/M2/M6 milestone scope, but its
+/// This filter delivers the agreed M1/M2/M6/M7 milestone scope, but its
 /// parent proposal is not yet `accepted` and open questions remain
 /// (HA/clustered-Valkey failure modes, and the relationship to
 /// Kuadrant's `TokenRateLimitPolicy` -- see `ai#127`). The
@@ -38,6 +38,44 @@ use serde::Deserialize;
 /// including probes and health checks. Scope rules with explicit
 /// `match:` conditions, or place an identity/auth filter earlier in
 /// the pipeline. Tracked as follow-on integration work in `grid#101`.
+///
+/// Observability is group-level by rule, never by user. Prometheus
+/// `budget_remaining` is the sum of the latest calculated remaining
+/// balances for the rule's retained keys. Because refill/window aging is
+/// evaluated lazily during normal backend operations, it is a snapshot,
+/// not a continuously refreshed balance. Like all Prometheus gauges it is
+/// represented as f64 and saturates at the largest exactly representable
+/// integer (2^53 - 1). Accounting logs and optional
+/// OpenTelemetry spans likewise omit raw subject and bucket-key values.
+/// The Prometheus contract is:
+///
+/// - `praxis_trl_requests_total{rule,result}` (`admitted` or `denied`)
+///
+/// - `praxis_trl_tokens_reserved_total{rule}`
+///
+/// - `praxis_trl_tokens_reconciled_total{rule}`
+///
+/// - `praxis_trl_tokens_refunded_total{rule}`
+///
+/// - `praxis_trl_tokens_overage_total{rule}`
+///
+/// - `praxis_trl_budget_remaining{rule,algorithm}`
+///
+/// - `praxis_trl_reservations_active{rule}`
+///
+/// - `praxis_trl_backend_errors_total{rule,backend}`
+///
+/// The existing `praxis_ai_token_rate_limit_active_keys`,
+/// `praxis_ai_token_rate_limit_reservations_total`, and
+/// `praxis_ai_token_rate_limit_backend_reconciliation_total` operational
+/// metric families remain available. The new names directly replace older
+/// metrics that measured the same events; duplicate compatibility aliases
+/// are intentionally not emitted.
+///
+/// Admission, reconciliation, and backend failures also emit structured
+/// records on the `praxis_ai::token_rate_limit::accounting` tracing target.
+/// These records contain bounded policy and token-count fields only. They are
+/// best-effort operational audit records, not a durable billing source.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TokenRateLimitConfig {
