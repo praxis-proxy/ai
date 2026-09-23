@@ -647,6 +647,16 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "policy-engine")]
+    #[test]
+    fn build_ai_registry_includes_policy_when_enabled() {
+        let registry = build_ai_registry();
+        assert!(
+            registry.available_filters().contains(&"policy"),
+            "the default standard profile preserves the Praxis policy builtin"
+        );
+    }
+
     #[test]
     #[expect(clippy::panic, reason = "the test fixture is compile-time controlled")]
     fn ai_guardrails_defaults_to_empty_outbound_chain() {

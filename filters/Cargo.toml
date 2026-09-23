@@ -15,7 +15,10 @@ name = "praxis_ai_filters"
 [features]
 default = ["standard"]
 # Default-on filters that sit behind a gate so minimal builds can drop them.
-standard = ["aws-sigv4-filter"]
+standard = ["aws-sigv4-filter", "policy-engine"]
+# The `policy` filter from Praxis core. Kept explicit so no-default FIPS builds
+# can omit the policy engine and its pure-Rust cryptography.
+policy-engine = ["praxis-filter/policy-engine"]
 # aws_sigv4_sign: AWS Signature V4 request signing (aws-sigv4).
 aws-sigv4-filter = ["dep:aws-sigv4", "dep:aws-credential-types"]
 # Backwards-compatible alias for the previous default, which built every
