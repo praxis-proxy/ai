@@ -9,8 +9,8 @@ use serde_json::json;
 
 use super::{
     CompressionAlgorithm, ConversationItemRecord, ConversationRecord, PendingApprovalRecord, PgTlsConfig,
-    PostgresResponseStore, ResponseRecord, ResponseStoreRegistry, SqliteResponseStore, SslMode,
-    StoreCompressionConfig, StoreError,
+    PostgresResponseStore, ResponseRecord, ResponseStoreRegistry, SqliteResponseStore, SslMode, StoreCompressionConfig,
+    StoreError,
     trait_def::{ConversationItemStore, ResponseStore},
 };
 use crate::openai::{
@@ -608,7 +608,7 @@ async fn consume_approvals_concurrent_claims_exactly_once() {
     let db_path = dir.path().join("concurrent_consume.db");
     let url = format!("sqlite://{}?mode=rwc", db_path.display());
     let store = Arc::new(
-        SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", None, None)
+        SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", None, None, None)
             .await
             .expect("store creation should succeed"),
     );
@@ -2663,7 +2663,7 @@ async fn sqlite_rejects_table_with_tenant_leaking_unique_constraint() {
     .expect("manual create should succeed");
     pool.close().await;
 
-    let result = SqliteResponseStore::new(&url, "leak_responses", "leak_conversations", None, None).await;
+    let result = SqliteResponseStore::new(&url, "leak_responses", "leak_conversations", None, None, None).await;
     let Err(err) = result else {
         panic!("init should fail on an unexpected unique constraint");
     };
@@ -2710,7 +2710,7 @@ async fn sqlite_rejects_table_with_case_insensitive_collation_on_key() {
     .expect("manual create should succeed");
     pool.close().await;
 
-    let result = SqliteResponseStore::new(&url, "collate_responses", "collate_conversations", None, None).await;
+    let result = SqliteResponseStore::new(&url, "collate_responses", "collate_conversations", None, None, None).await;
     let Err(err) = result else {
         panic!("init should fail on a case-insensitive collation over a primary key column");
     };
@@ -2755,7 +2755,7 @@ async fn sqlite_rejects_table_with_non_text_affinity_key() {
     .expect("manual create should succeed");
     pool.close().await;
 
-    let result = SqliteResponseStore::new(&url, "affinity_responses", "affinity_conversations", None, None).await;
+    let result = SqliteResponseStore::new(&url, "affinity_responses", "affinity_conversations", None, None, None).await;
     let Err(err) = result else {
         panic!("init should fail on a primary key column without TEXT affinity");
     };
@@ -3275,6 +3275,7 @@ impl PgSchemaFixture {
             None,
             &tls,
             None,
+            None,
         ))
         .await;
 
@@ -3693,13 +3694,16 @@ async fn make_pg_store() -> PostgresResponseStore {
 async fn make_pg_compressed_store() -> PostgresResponseStore {
     let url = pg_database_url();
     let suffix = pg_unique_suffix();
+    let tls = PgTlsConfig {
+        ssl_mode: Some(SslMode::Disable),
+        ..PgTlsConfig::default()
+    };
     Box::pin(PostgresResponseStore::new(
         &url,
         &format!("test_responses_{suffix}"),
         &format!("test_conversations_{suffix}"),
         Some(&format!("test_conversation_items_{suffix}")),
-        Some(SslMode::Disable),
-        None,
+        &tls,
         None,
         Some(&zstd_compression()),
     ))
@@ -3735,14 +3739,17 @@ async fn pg_compression_is_backward_compatible_with_plain_rows() {
     let suffix = pg_unique_suffix();
     let responses_table = format!("test_responses_{suffix}");
     let conversations_table = format!("test_conversations_{suffix}");
+    let tls = PgTlsConfig {
+        ssl_mode: Some(SslMode::Disable),
+        ..PgTlsConfig::default()
+    };
 
     let plain = Box::pin(PostgresResponseStore::new(
         &url,
         &responses_table,
         &conversations_table,
         None,
-        Some(SslMode::Disable),
-        None,
+        &tls,
         None,
         None,
     ))
@@ -3757,8 +3764,7 @@ async fn pg_compression_is_backward_compatible_with_plain_rows() {
         &responses_table,
         &conversations_table,
         None,
-        Some(SslMode::Disable),
-        None,
+        &tls,
         None,
         Some(&zstd_compression()),
     ))

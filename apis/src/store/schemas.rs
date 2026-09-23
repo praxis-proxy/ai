@@ -1520,7 +1520,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: None,
         };
-        let ddl = generate_ddl(&tables).expect("valid names should produce DDL");
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).expect("valid names should produce DDL");
         // The pending-approvals table is created just before the version
         // table, which must remain last.
         let approvals_ddl = &ddl[ddl.len() - 2];
@@ -1553,7 +1553,7 @@ mod tests {
             conversations: "test_pending_approvals".to_owned(),
             items: None,
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("collides with conversation table"),
             "should reject collision: {err}"
@@ -1567,7 +1567,7 @@ mod tests {
             conversations: "test_conversations".to_owned(),
             items: Some("test_pending_approvals".to_owned()),
         };
-        let err = generate_ddl(&tables).unwrap_err();
+        let err = generate_ddl(&tables, SqlDialect::Sqlite).unwrap_err();
         assert!(
             err.to_string().contains("collides with items table"),
             "should reject collision: {err}"

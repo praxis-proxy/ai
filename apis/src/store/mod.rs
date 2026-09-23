@@ -7,6 +7,14 @@
 //! backends, and supporting types. Used by AI API filters for persisting
 //! response records and conversation history.
 
+#[cfg_attr(
+    not(any(feature = "store-postgres", feature = "store-sqlite")),
+    expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),
+    allow(
+        dead_code,
+        reason = "codec helpers are unused until a SQL backend feature is enabled"
+    )
+)]
 mod compression;
 #[cfg_attr(
     not(any(feature = "store-postgres", feature = "store-sqlite")),

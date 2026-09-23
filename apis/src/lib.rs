@@ -150,7 +150,7 @@ pub(crate) mod test_utils {
     }
 
     /// Build a stable owner for tests that previously supplied only a tenant.
-    #[cfg(feature = "store-sqlite")]
+    #[cfg(feature = "store")]
     pub(crate) fn test_owner(tenant_id: &str) -> crate::StateOwner {
         crate::StateOwner::from_trusted_parts(tenant_id, "test-issuer", "test-subject")
             .expect("test owner should be valid")

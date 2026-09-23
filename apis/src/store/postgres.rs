@@ -18,9 +18,9 @@ use super::{
     pool::{PoolConfig, apply_pool_config},
     postgres_tls::PgTlsConfig,
     schemas::{
-        ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, TableNames, check_schema,
-        expected_tables, generate_ddl, pending_approvals_table, pg_key_column_folding, schema_version_table,
-        validate_postgres_identifiers, SqlDialect,
+        ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
+        check_schema, expected_tables, generate_ddl, pending_approvals_table, pg_key_column_folding,
+        schema_version_table, validate_postgres_identifiers,
     },
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},

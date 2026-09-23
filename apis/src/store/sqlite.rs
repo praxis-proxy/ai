@@ -14,9 +14,9 @@ use super::{
     compression::{StoreCompressionConfig, decode, run_blocking},
     pool::{PoolConfig, apply_pool_config},
     schemas::{
-        ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, TableNames, check_schema,
-        expected_tables, generate_ddl, pending_approvals_table, schema_version_table, sqlite_key_column_folding,
-        SqlDialect,
+        ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
+        check_schema, expected_tables, generate_ddl, pending_approvals_table, schema_version_table,
+        sqlite_key_column_folding,
     },
     trait_def::{ConversationItemStore, ResponseStore},
     types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
