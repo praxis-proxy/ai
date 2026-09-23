@@ -74,9 +74,17 @@ pub(crate) mod test_utils {
     /// exercise the callout path. Whether a private/loopback destination is then
     /// permitted is governed by the filter's bound outbound pipeline posture, not
     /// this client.
-    static TEST_SUBREQUEST_CLIENT: LazyLock<praxis_core::subrequest::SubRequestClient> = LazyLock::new(|| {
-        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(1, None))
-    });
+    static TEST_SUBREQUEST_CLIENT: LazyLock<praxis_core::subrequest::SubRequestClient> =
+        LazyLock::new(|| praxis_core::subrequest::SubRequestClient::new(connector(1)));
+
+    /// A sub-request connector for tests. The connector builds a rustls
+    /// client config, and rustls needs the process-wide crypto provider (the
+    /// system OpenSSL, installed by the binary at startup) before that; the
+    /// helper installs it, which is a no-op after the first call.
+    pub(crate) fn connector(pool_size: usize) -> praxis_core::subrequest::SubRequestConnector {
+        praxis_tls::provider::install();
+        praxis_core::subrequest::SubRequestConnector::new(pool_size, None)
+    }
 
     /// Build a minimal request for filter unit tests.
     pub(crate) fn make_request(method: Method, path: &str) -> Request {

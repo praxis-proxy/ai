@@ -97,6 +97,7 @@ url = { workspace = true }
 zeroize = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
+praxis-tls = { workspace = true }
 metrics-util = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -76,6 +76,7 @@ utoipa = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
+praxis-tls = { workspace = true }
 allocation-counter = { workspace = true }
 axum = { workspace = true }
 rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }

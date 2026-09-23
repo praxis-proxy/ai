@@ -72,8 +72,16 @@ pub(crate) mod test_utils {
     use praxis_filter::{HttpFilterContext, Request, RequestExtensions, Response};
 
     /// Shared sub-request client for filter unit tests that exercise callouts.
-    static TEST_SUBREQUEST_CLIENT: LazyLock<SubRequestClient> =
-        LazyLock::new(|| SubRequestClient::new(SubRequestConnector::new(4, None)));
+    static TEST_SUBREQUEST_CLIENT: LazyLock<SubRequestClient> = LazyLock::new(|| SubRequestClient::new(connector(4)));
+
+    /// A sub-request connector for tests. The connector builds a rustls
+    /// client config, and rustls needs the process-wide crypto provider (the
+    /// system OpenSSL, installed by the binary at startup) before that; the
+    /// helper installs it, which is a no-op after the first call.
+    pub(crate) fn connector(pool_size: usize) -> SubRequestConnector {
+        praxis_tls::provider::install();
+        SubRequestConnector::new(pool_size, None)
+    }
 
     /// Deterministic ID generator for tests (seed=0).
     static TEST_ID_GENERATOR: LazyLock<IdGenerator> = LazyLock::new(|| IdGenerator::with_seed(0));

@@ -44,6 +44,7 @@ praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }
 praxis-filter = { workspace = true }
 praxis-protocol = { workspace = true }
+praxis-tls = { workspace = true }
 h2 = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
