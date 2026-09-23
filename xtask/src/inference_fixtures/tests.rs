@@ -1339,17 +1339,14 @@ impl LocalProvider {
 
     /// Joins the mock without hanging when the recorder aborted before connect.
     fn finish_if_connected(mut self) -> Option<String> {
-        match self.request.try_recv() {
-            Ok(request) => {
-                if let Some(thread) = self.thread.take() {
-                    drop(thread.join());
-                }
-                Some(request)
-            },
-            Err(_) => {
-                self.thread.take();
-                None
-            },
+        if let Ok(request) = self.request.try_recv() {
+            if let Some(thread) = self.thread.take() {
+                drop(thread.join());
+            }
+            Some(request)
+        } else {
+            self.thread.take();
+            None
         }
     }
 }
