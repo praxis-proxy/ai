@@ -52,13 +52,13 @@ use praxis_filter::{
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(any(feature = "_store-postgres", feature = "store-sqlite"))]
 use secrecy::ExposeSecret as _;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 use tracing::{debug, trace, warn};
 
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 use super::config::revalidate_postgres_host;
 use super::{
     super::{
@@ -69,7 +69,7 @@ use super::{
     config::{ResponseStoreConfig, StorageBackend, validate_config},
     list_input_items,
 };
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 use crate::store::PostgresResponseStore;
 #[cfg(feature = "store-sqlite")]
 use crate::store::SqliteResponseStore;
@@ -125,7 +125,7 @@ impl ResponseStoreFilter {
     /// Build the configured store backend.
     #[expect(clippy::too_many_lines, reason = "tracing macros inflate complexity")]
     #[cfg_attr(
-        not(any(feature = "store-postgres", feature = "store-sqlite")),
+        not(any(feature = "_store-postgres", feature = "store-sqlite")),
         expect(clippy::unused_async, reason = "only the SQL backends await during construction")
     )]
     pub(super) async fn build_store(&self) -> Result<Arc<dyn ResponseStore>, StoreError> {
@@ -150,7 +150,7 @@ impl ResponseStoreFilter {
             StorageBackend::Sqlite => Err(StoreError::Unavailable(
                 "sqlite backend was not compiled; enable the 'store-sqlite' feature".to_owned(),
             )),
-            #[cfg(feature = "store-postgres")]
+            #[cfg(feature = "_store-postgres")]
             StorageBackend::Postgres => {
                 revalidate_postgres_host(&self.config).map_err(|e| {
                     StoreError::Unavailable(format!("postgres host validation failed before connect: {e}"))
@@ -171,9 +171,11 @@ impl ResponseStoreFilter {
                     arc
                 })
             },
-            #[cfg(not(feature = "store-postgres"))]
+            #[cfg(not(feature = "_store-postgres"))]
             StorageBackend::Postgres => Err(StoreError::Unavailable(
-                "postgres backend was not compiled; enable the 'store-postgres' feature".to_owned(),
+                "postgres backend was not compiled; enable the 'store-postgres' or \
+                 'store-postgres-cert-auth' feature"
+                    .to_owned(),
             )),
         }
     }

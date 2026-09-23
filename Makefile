@@ -105,11 +105,12 @@ test-unit:
 
 test-store-features:
 	cargo check -p praxis-ai-proxy
+	cargo check -p praxis-ai-proxy --no-default-features --features openai-responses,store-postgres-cert-auth
 	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
 	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-all
 	@# Lint each opt-in group on its own so a gate leak in a partial feature set
 	@# cannot hide behind the lean and full builds that other targets cover.
-	@for group in openai-responses openai-file-resolve-filter store store-sqlite \
+	@for group in openai-responses openai-file-resolve-filter store store-postgres-cert-auth store-sqlite \
 		openai-conversations openai-compact openai-mcp-tools; do \
 		echo "clippy: standard + $$group"; \
 		cargo clippy -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy --all-targets \
@@ -158,6 +159,8 @@ test-postgres-integration:
 		openai_response_store_postgres \
 		openai_response_store_postgres_mtls \
 		openai_conversations_postgres_mtls $(if $(V),--nocapture)
+	cargo test -p praxis-tests-integration --no-default-features --features store-postgres-cert-auth \
+		--test suite -- --ignored openai_response_store_postgres_mtls $(if $(V),--nocapture)
 
 test-token-rate-limit-valkey-unit:
 	cargo test -p praxis-ai-filters --features token-rate-limit-filter valkey $(_NOCAPTURE)
@@ -274,18 +277,20 @@ coverage-check:
 #   aws-sigv4-filter     the aws-sigv4 crate signs with pure-Rust hmac/sha2
 #   policy-engine        praxis-policy carries its own cryptography (sha2,
 #                        hmac, jsonwebtoken on aws-lc-rs)
-#   store, store-sqlite, store-postgres, openai-conversations, openai-compact
-#                        sqlx enables sqlx-core's `migrate` feature with its
-#                        tokio runtime, and that pulls sha2; store-postgres
-#                        adds sqlx-postgres' md-5/hmac/sha2/rsa (SCRAM)
+#   store-sqlite         bundles SQLite and is not part of the production
+#                        persistence profile
+#   store-postgres       retains SQLx password authentication for the standard
+#                        build; the FIPS build selects store-postgres-cert-auth,
+#                        which omits that crypto and fails closed unless the
+#                        existing certificate-authentication profile is enabled
 #   openai-file-resolve-filter, openai-mcp-tools, azure-ad-filter,
 #   gcp-adc-filter       reqwest's `rustls` feature compiles aws-lc-rs in
 #
-# What remains of the opt-in groups is openai-responses (the Responses API
-# kernel, which adds no crates). The experimental filters stay off for the
-# same reasons they are off in the standard build. FIPS_FEATURES is the
-# single place this is defined; Containerfile.fips (CARGO_FEATURES) mirrors
-# it and must be kept in sync.
+# What remains of the opt-in groups is openai-responses plus its
+# certificate-authenticated PostgreSQL store. The experimental filters stay
+# off for the same reasons they are off in the standard build. FIPS_FEATURES
+# is the single place this is defined; Containerfile.fips (CARGO_FEATURES)
+# mirrors it and must be kept in sync.
 #
 # The FIPS build goes to its own target directory so it never overwrites,
 # or is mistaken for, the standard build.
@@ -317,7 +322,7 @@ coverage-check:
 #
 # See docs/developing/fips.md and docs/developing/getting-started.md.
 
-FIPS_FEATURES           := openai-responses
+FIPS_FEATURES           := openai-responses,store-postgres-cert-auth
 # The same list qualified for a multi-package cargo invocation.
 _COMMA                  := ,
 FIPS_FEATURES_QUALIFIED := $(subst $(_COMMA),$(_COMMA)praxis-ai-proxy/,praxis-ai-proxy/$(FIPS_FEATURES))

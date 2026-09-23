@@ -26,9 +26,10 @@ build to run; the same invocation runs inside the report stage of
    (`ring`, `aws-lc-rs`, `sha2`, `hmac`, ...) in the shipped binary's normal
    dependency graph, resolved for the assessed feature set. `--deps-only`
    stops here; this is what `make lint` runs. Every finding names the ai
-   feature that pulls the crate (the stores through sqlx, the reqwest-based
-   filters, AWS SigV4, the policy engine), so the fix is usually a line in
-   `FIPS_FEATURES`.
+   feature that pulls the crate (the general-purpose SQLx profile, the
+   reqwest-based filters, AWS SigV4, the policy engine), so the fix is usually
+   a line in `FIPS_FEATURES`. The FIPS profile uses SQLx's certificate-only
+   PostgreSQL feature set, which omits its direct cryptographic operations.
 2. **Binary**: links the system `libcrypto.so.3` dynamically, defines no
    symbol of a bundled crypto backend (`ring_core_`, `aws_lc_`, `BORINGSSL_`,
    `OPENSSL_`), imports OpenSSL, carries the cargo-auditable manifest

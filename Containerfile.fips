@@ -14,8 +14,9 @@
 #
 # The FIPS build differs from the published build only in its cargo features:
 # it turns off what is known not to be FIPS compliant yet (the policy engine,
-# AWS SigV4 signing, the response stores and the reqwest-based filters, whose
-# dependencies carry their own cryptography; see the Makefile's FIPS section).
+# AWS SigV4 signing, SQLite and the reqwest-based filters, whose dependencies
+# carry their own cryptography; see the Makefile's FIPS section). PostgreSQL
+# storage uses the certificate-only SQLx profile.
 # CARGO_FEATURES defaults to the Makefile's FIPS_FEATURES; keep the two in
 # sync.
 #
@@ -30,7 +31,7 @@ ARG UBI9_MINIMAL_DIGEST=sha256:8ebe2ad8fdf3cab3e5a53c1edc69194c98209cfadab24b884
 # Red Hat's rust-toolset may trail the workspace's rust-version; the build
 # passes --ignore-rust-version so the toolchain Red Hat ships is what gets
 # exercised. If the tree needs a newer compiler, this step is where it shows.
-ARG CARGO_FEATURES="openai-responses"
+ARG CARGO_FEATURES="openai-responses,store-postgres-cert-auth"
 ARG CARGO_ARGS="--ignore-rust-version"
 
 # ------------------------------------------------------------------------------

@@ -230,6 +230,15 @@ impl PgTlsConfig<'_> {
         database_url: &str,
         pgpassword_present: bool,
     ) -> Result<(), FilterError> {
+        #[cfg(all(feature = "_store-postgres", not(feature = "store-postgres")))]
+        if !self.require_certificate_authentication {
+            return Err(format!(
+                "{filter_name}: this build supports certificate-authenticated PostgreSQL only; \
+                 set 'require_certificate_authentication' to true"
+            )
+            .into());
+        }
+
         validate_postgres_url_tls_file_params(filter_name, database_url)?;
         self.reject_path_traversal(filter_name)?;
 
@@ -403,6 +412,7 @@ mod tests {
         reject_insecure_key_mode(FILTER, 0o600).expect("0600 is owner-only");
     }
 
+    #[cfg(feature = "store-postgres")]
     #[test]
     fn non_compliance_leaves_password_urls_alone() {
         // Without the compliance profile, a password URL with verify-full and no
@@ -418,11 +428,29 @@ mod tests {
             .expect("non-compliance password URL should be allowed");
     }
 
+    #[cfg(all(feature = "_store-postgres", not(feature = "store-postgres")))]
+    #[test]
+    fn certificate_only_build_rejects_non_compliance_profile() {
+        let cfg = PgTlsConfig {
+            ssl_mode: Some(SslMode::VerifyFull),
+            ssl_root_cert: None,
+            ssl_client_cert: None,
+            ssl_client_key: None,
+            require_certificate_authentication: false,
+        };
+        let err = validate_no_env(&cfg, URL).unwrap_err().to_string();
+        assert!(
+            err.contains("supports certificate-authenticated PostgreSQL only")
+                && err.contains("require_certificate_authentication"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn rejects_client_cert_with_unverified_mode() {
         let cfg = PgTlsConfig {
             ssl_mode: Some(SslMode::Require),
-            require_certificate_authentication: false,
+            require_certificate_authentication: true,
             ..compliant()
         };
         let err = validate_no_env(&cfg, URL).unwrap_err().to_string();
@@ -433,7 +461,7 @@ mod tests {
     fn rejects_client_cert_without_key() {
         let cfg = PgTlsConfig {
             ssl_client_key: None,
-            require_certificate_authentication: false,
+            require_certificate_authentication: true,
             ..compliant()
         };
         let err = validate_no_env(&cfg, URL).unwrap_err().to_string();
