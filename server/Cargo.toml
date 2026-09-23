@@ -24,7 +24,11 @@ path = "src/main.rs"
 [features]
 default = ["standard"]
 # Default-on filters that sit behind a gate so minimal builds can drop them.
-standard = ["aws-sigv4-filter"]
+standard = ["aws-sigv4-filter", "policy-engine"]
+# The `policy` filter (Praxis Policy Engine) from praxis core. On by default;
+# off in the FIPS build, since its plugins carry pure-Rust cryptography
+# (aws-lc-rs through jsonwebtoken, sha2, hmac).
+policy-engine = ["praxis-filter/policy-engine", "praxis-protocol/policy-engine"]
 # aws_sigv4_sign: AWS Signature V4 request signing.
 aws-sigv4-filter = ["praxis-ai-filters/aws-sigv4-filter"]
 # Opt-in OpenAI filter groups (see praxis-ai-apis for what each one contains).

@@ -3,6 +3,10 @@
 
 //! Build-time guarantees for policy subrequests.
 
+// The policy registration contract exists only with the policy engine; the
+// FIPS build leaves it out and must still compile every other test.
+#![cfg(feature = "policy-engine")]
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, reason = "integration test")]
