@@ -43,6 +43,7 @@ make lint           # clippy, fmt, dependency, docs, and example checks
 make doc            # rustdoc with -D warnings
 make audit          # cargo audit + cargo deny check
 make container      # build praxis-ai container image
+make container-fips # FIPS runtime image on UBI 9 (see docs/fips.md)
 ```
 
 Run a single test:

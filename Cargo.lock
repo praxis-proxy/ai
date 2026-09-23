@@ -7130,12 +7130,17 @@ dependencies = [
 name = "xtask"
 version = "0.3.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
+ "flate2",
+ "object",
+ "openssl",
  "praxis-ai-apis",
  "praxis-ai-proxy",
  "praxis-proxy-core",
  "praxis-test-utils",
  "quote",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
