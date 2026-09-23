@@ -76,6 +76,7 @@ COPY server server
 COPY integrations integrations
 COPY tests tests
 COPY xtask xtask
+COPY benchmarks benchmarks
 
 ARG CARGO_FEATURES
 ARG CARGO_ARGS
