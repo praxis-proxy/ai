@@ -147,13 +147,13 @@ impl AiGuardrailsFilter {
     /// is no phase-target message, which would otherwise never produce
     /// [`GuardResult::Redact`].
     #[cfg(test)]
-    pub(super) fn with_provider(provider: Box<dyn GuardProvider>, phase: PhaseConfig) -> Self {
-        Self {
+    pub(super) fn with_provider(provider: Box<dyn GuardProvider>, phase: PhaseConfig) -> Result<Self, FilterError> {
+        Ok(Self {
             provider,
             phase,
-            outbound: test_outbound_chain().expect("test outbound chain"),
+            outbound: test_outbound_chain()?,
             callout_timeout: std::time::Duration::from_secs(5),
-        }
+        })
     }
 
     /// Capture downstream identity, nesting, deadline, and the bound chain for a callout.
@@ -387,10 +387,7 @@ fn record_verdict(
             Ok(FilterAction::Continue)
         },
         GuardResult::Block { reason } => Ok(enforce_block(body, reason, phase, phase_label, verdict)),
-        GuardResult::Redact {
-            modified_text,
-            reason,
-        } => {
+        GuardResult::Redact { modified_text, reason } => {
             tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict");
             apply_redaction(body, modified_text, phase)
         },

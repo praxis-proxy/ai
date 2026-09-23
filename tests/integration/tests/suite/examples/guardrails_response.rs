@@ -163,7 +163,10 @@ fn response_guardrails_modified_rewrites_assistant_content() {
         r#"{"model":"test","messages":[{"role":"user","content":"Hello"}]}"#,
     );
 
-    assert_eq!(status, 200, "NeMo 'modified' should keep 200 and forward a rewritten body");
+    assert_eq!(
+        status, 200,
+        "NeMo 'modified' should keep 200 and forward a rewritten body"
+    );
     assert!(
         !body.contains("123-45-6789"),
         "original PII must not reach the client; got: {body}"
