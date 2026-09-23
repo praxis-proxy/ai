@@ -24,6 +24,7 @@ use serde::{
 use serde_json::{Value, value::RawValue};
 
 use crate::{
+    callout_identity::CalloutIdentity,
     callout_policy::OnFailure,
     http_hop::{connection_nominates_header, is_hop_by_hop},
     openai::api_client::resource_url,
@@ -406,6 +407,9 @@ pub(crate) struct FileSearchClientConfig {
     /// Vector-store API base URL (trailing slash stripped).
     pub base_url: String,
 
+    /// Exact configured authority for deferred caller credentials.
+    pub credential_authority: String,
+
     /// Shared sub-request transport driving the outbound chain.
     pub subrequest_client: SubRequestClient,
 
@@ -437,12 +441,18 @@ pub(crate) struct CalloutTransport<'a> {
 
     /// Downstream client attributes forwarded into each sub-request.
     pub downstream: SubrequestRuntime,
+
+    /// Trusted owner and optional caller-scoped credential for this execution.
+    pub identity: &'a CalloutIdentity,
 }
 
 /// Client for vector store search API.
 pub(crate) struct FileSearchClient {
     /// Vector-store API base URL (trailing slash stripped).
     base_url: String,
+
+    /// Exact configured authority for deferred caller credentials.
+    credential_authority: String,
 
     /// Shared sub-request transport driving the outbound chain.
     subrequest_client: SubRequestClient,
@@ -468,6 +478,7 @@ impl FileSearchClient {
     pub fn new(config: FileSearchClientConfig) -> Self {
         Self {
             base_url: config.base_url,
+            credential_authority: config.credential_authority,
             subrequest_client: config.subrequest_client,
             forward_header_names: config.forward_header_names,
             on_failure: config.on_failure,
@@ -545,6 +556,7 @@ impl FileSearchClient {
                     Arc::clone(&admission),
                     &executor,
                     transport.outbound,
+                    transport.identity,
                     &outbound_headers,
                     allow_private,
                 )
@@ -591,6 +603,7 @@ impl FileSearchClient {
         response_admission: Arc<ResponseAdmission>,
         executor: &FilteredSubrequestExecutor,
         outbound: &Arc<FilterPipeline>,
+        identity: &CalloutIdentity,
         outbound_headers: &HeaderMap,
         allow_private: bool,
     ) -> Result<SearchResponse, FileSearchError> {
@@ -604,6 +617,7 @@ impl FileSearchClient {
                 execution_started,
                 executor,
                 outbound,
+                identity,
                 outbound_headers,
                 allow_private,
             )
@@ -729,6 +743,7 @@ impl FileSearchClient {
         execution_started: Instant,
         executor: &FilteredSubrequestExecutor,
         outbound: &Arc<FilterPipeline>,
+        identity: &CalloutIdentity,
         outbound_headers: &HeaderMap,
         allow_private: bool,
     ) -> Result<Bytes, FileSearchError> {
@@ -755,6 +770,9 @@ impl FileSearchClient {
         let mut extensions = RequestExtensions::default();
         extensions.insert(staged);
         extensions.insert(fallback);
+        identity
+            .stage_header_credential_into(&mut extensions, &self.credential_authority, http::header::AUTHORIZATION)
+            .map_err(|_error| request_error(store_id, "vector-store credential staging failed"))?;
 
         self.run_outbound(
             executor,

@@ -57,6 +57,7 @@ const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stable trusted identity used by this example's integration clients.
 const TEST_TENANT: &str = "integration-tenant";
 const TEST_SUBJECT: &str = "integration-user";
+const TEST_OGX_CREDENTIAL: &str = "Bearer integration-ogx-key";
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -66,7 +67,9 @@ const TEST_SUBJECT: &str = "integration-user";
 fn authenticated_request(request: &str) -> String {
     request.replacen(
         "\r\n\r\n",
-        &format!("\r\nx-auth-tenant: {TEST_TENANT}\r\nx-auth-user: {TEST_SUBJECT}\r\n\r\n"),
+        &format!(
+            "\r\nx-auth-tenant: {TEST_TENANT}\r\nx-auth-user: {TEST_SUBJECT}\r\nx-user-ogx-key: {TEST_OGX_CREDENTIAL}\r\n\r\n"
+        ),
         1,
     )
 }
@@ -1282,8 +1285,8 @@ fn full_flow_agentic_file_search_round_trip() {
         search_callouts[0]
             .headers
             .to_lowercase()
-            .contains("authorization: bearer search-key"),
-        "vector store callout should forward the authorization header: {}",
+            .contains("authorization: bearer integration-ogx-key"),
+        "vector store callout should use the scoped OGX credential: {}",
         search_callouts[0].headers,
     );
     let headers = search_callouts[0].headers.to_lowercase();
@@ -1384,7 +1387,7 @@ fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
 }
 
 #[test]
-fn full_flow_agentic_establishes_scoped_web_search_credentials_before_irr() {
+fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
     let path = example_config_path("openai/responses/full-flow-agentic.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("config should be valid YAML");
@@ -1404,7 +1407,13 @@ fn full_flow_agentic_establishes_scoped_web_search_credentials_before_irr() {
         "callout_credentials must capture and strip ingress secrets before IRR"
     );
 
-    let credential = &outer_filters[credentials_index]["credentials"][0];
+    let credentials = outer_filters[credentials_index]["credentials"]
+        .as_sequence()
+        .expect("callout_credentials must declare slots");
+    let credential = credentials
+        .iter()
+        .find(|credential| credential["slot"].as_str() == Some("brave_search"))
+        .expect("web-search slot must be declared");
     assert_eq!(
         credential["slot"].as_str(),
         Some("brave_search"),
@@ -1427,6 +1436,24 @@ fn full_flow_agentic_establishes_scoped_web_search_credentials_before_irr() {
         Some("brave_search"),
         "web search must explicitly consume the established per-user slot"
     );
+
+    let ogx = credentials
+        .iter()
+        .find(|credential| credential["slot"].as_str() == Some("ogx_files"))
+        .expect("OGX slot must be declared");
+    assert_eq!(ogx["source_header"].as_str(), Some("x-user-ogx-key"));
+    let file_resolve = outer_filters
+        .iter()
+        .find(|filter| filter["filter"].as_str() == Some("openai_file_resolve"))
+        .expect("full-flow must contain openai_file_resolve");
+    assert_eq!(file_resolve["user_credential"].as_str(), Some("ogx_files"));
+    let file_search = outer_filters[irr_index]["steps"][0]["filters"]
+        .as_sequence()
+        .expect("IRR inference step should contain filters")
+        .iter()
+        .find(|filter| filter["filter"].as_str() == Some("openai_file_search_callout"))
+        .expect("IRR inference step should contain openai_file_search_callout");
+    assert_eq!(file_search["user_credential"].as_str(), Some("ogx_files"));
 }
 
 #[test]
@@ -1510,10 +1537,14 @@ fn full_flow_agentic_connection_nominated_header_not_forwarded() {
     let search_requests = search.requests();
     let search_callouts: Vec<_> = search_requests.iter().filter(|r| r.method == "POST").collect();
     assert_eq!(search_callouts.len(), 1, "expected one vector store callout");
+    let headers = search_callouts[0].headers.to_lowercase();
     assert!(
-        !search_callouts[0].headers.to_lowercase().contains("authorization"),
-        "connection-nominated authorization must not be forwarded to vector store: {}",
-        search_callouts[0].headers,
+        headers.contains("authorization: bearer integration-ogx-key"),
+        "connection-nominated inference auth must be replaced by the scoped OGX credential: {headers}"
+    );
+    assert!(
+        !headers.contains("authorization: bearer secret"),
+        "connection-nominated inference credential must not reach the vector store: {headers}"
     );
 }
 

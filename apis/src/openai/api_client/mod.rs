@@ -40,6 +40,7 @@ pub(crate) use self::{
     url::{resource_url, validate_base_url},
 };
 use crate::{
+    callout_identity::CalloutIdentity,
     callout_target::AddressPolicy,
     http_hop::{connection_nominates_header, is_hop_by_hop},
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
@@ -313,6 +314,8 @@ impl ApiClient {
             client: self.client.clone(),
             step_timeout: self.timeout,
             runtime,
+            callout_identity: None,
+            credential_authority: None,
         }
     }
 
@@ -424,6 +427,19 @@ impl ApiClient {
         let mut extensions = RequestExtensions::default();
         extensions.insert(staged_upstream);
         extensions.insert(staged_fallback);
+        if let Some(identity) = outbound.callout_identity.as_ref() {
+            let authority = outbound
+                .credential_authority
+                .as_deref()
+                .ok_or_else(|| ApiClientError::Transport {
+                    source: SubRequestError::InvalidRequest("missing configured credential authority".to_owned()),
+                })?;
+            identity
+                .stage_header_credential_into(&mut extensions, authority, http::header::AUTHORIZATION)
+                .map_err(|_error| ApiClientError::Transport {
+                    source: SubRequestError::InvalidRequest("Files API credential staging failed".to_owned()),
+                })?;
+        }
 
         let executor = FilteredSubrequestExecutor::for_callout(
             outbound.client.clone(),
@@ -500,6 +516,19 @@ pub(crate) struct OutboundExecution {
     step_timeout: Duration,
     /// Downstream attributes forwarded into each sub-request.
     runtime: DownstreamRuntime,
+    /// Trusted caller context projected into each child callout.
+    callout_identity: Option<CalloutIdentity>,
+    /// Exact authority for an optional caller-scoped Authorization credential.
+    credential_authority: Option<String>,
+}
+
+impl OutboundExecution {
+    /// Attach the trusted caller context used by configured Files API callouts.
+    pub(crate) fn with_callout_identity(mut self, identity: CalloutIdentity, credential_authority: String) -> Self {
+        self.callout_identity = Some(identity);
+        self.credential_authority = Some(credential_authority);
+        self
+    }
 }
 
 /// Retain the safe response metadata required by callout consumers.

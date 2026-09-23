@@ -6,7 +6,7 @@
 //! staged into the nested filtered-subrequest so the callout carries the caller's identity and a
 //! per-user credential instead of a single shared provider key.
 
-use praxis_filter::{HttpFilterContext, RequestExtensions};
+use praxis_filter::{DeferredCredential, FilterError, HttpFilterContext, PendingCredentials, RequestExtensions};
 use secrecy::{ExposeSecret as _, SecretString};
 
 use crate::{CalloutCredentials, state_owner::StateOwner};
@@ -30,6 +30,58 @@ impl CalloutIdentity {
             child.insert(owner.clone());
         }
     }
+
+    /// Project trusted attribution and, when present, stage the per-user secret as an
+    /// exact-authority deferred credential.
+    ///
+    /// The credential is never placed on the in-chain request. Praxis Core injects it only
+    /// after resolving the destination and drops it on an authority mismatch.
+    pub(crate) fn stage_header_credential_into(
+        &self,
+        child: &mut RequestExtensions,
+        authority: &str,
+        header: http::HeaderName,
+    ) -> Result<(), FilterError> {
+        self.project_owner_into(child);
+        let Some(secret) = self.user_credential.as_ref() else {
+            return Ok(());
+        };
+        let mut pending = PendingCredentials::new();
+        pending.push(DeferredCredential::new(authority, header, secret.expose_secret())?);
+        child.insert(pending);
+        Ok(())
+    }
+}
+
+/// Compute the exact `host:port` authority used by Praxis Core's deferred-credential
+/// matcher from an operator-configured HTTP(S) URL.
+///
+/// Callers invoke this during configuration and retain the result, preventing a malformed
+/// authority from degrading at request time into a silently unauthenticated callout.
+pub(crate) fn credential_authority(filter_name: &str, raw_url: &str) -> Result<String, FilterError> {
+    let url = url::Url::parse(raw_url).map_err(|error| -> FilterError {
+        format!("{filter_name}: target URL is not a valid URL for credential binding: {error}").into()
+    })?;
+    let host = url.host_str().ok_or_else(|| -> FilterError {
+        format!("{filter_name}: target URL has no host for credential binding").into()
+    })?;
+    let port = url.port_or_known_default().ok_or_else(|| -> FilterError {
+        format!(
+            "{filter_name}: target URL scheme `{}` has no known default port for credential binding",
+            url.scheme()
+        )
+        .into()
+    })?;
+    let authority = if host.starts_with('[') || !host.contains(':') {
+        format!("{host}:{port}")
+    } else {
+        format!("[{host}]:{port}")
+    };
+    // Validate against the same parser used by the executor's credential matcher.
+    http::uri::Authority::try_from(authority.as_str()).map_err(|error| -> FilterError {
+        format!("{filter_name}: invalid credential authority `{authority}`: {error}").into()
+    })?;
+    Ok(authority)
 }
 
 /// A required callout-identity component was missing (a security-context failure).
@@ -150,5 +202,36 @@ mod tests {
             Err(CalloutContextMissing::Credential { slot }) => assert_eq!(slot, "brave"),
             other => panic!("empty credential must be rejected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn credential_authority_is_exact_and_uses_scheme_default_port() {
+        assert_eq!(
+            credential_authority("test", "https://ogx.example/v1/files").unwrap(),
+            "ogx.example:443"
+        );
+        assert_eq!(
+            credential_authority("test", "http://[::1]:8321/v1/files").unwrap(),
+            "[::1]:8321"
+        );
+        assert_eq!(
+            credential_authority("test", "https://münich.example/v1/files").unwrap(),
+            "xn--mnich-kva.example:443"
+        );
+    }
+
+    #[test]
+    fn stages_owner_and_exact_authority_credential() {
+        let identity = CalloutIdentity {
+            owner: Some(StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap()),
+            user_credential: Some(SecretString::from("Bearer user-a")),
+        };
+        let mut child = RequestExtensions::default();
+        identity
+            .stage_header_credential_into(&mut child, "ogx.example:443", http::header::AUTHORIZATION)
+            .unwrap();
+
+        assert!(child.get::<StateOwner>().is_some());
+        assert!(child.get::<PendingCredentials>().is_some());
     }
 }

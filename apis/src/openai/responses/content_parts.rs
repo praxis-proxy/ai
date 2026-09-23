@@ -7,6 +7,22 @@
 //! `openai_doc_extract` (which only decodes inline data), so the extraction
 //! filter does not depend on the network-fetching resolver.
 
+/// Return the immutable content parts array for a given input item, if applicable.
+pub(crate) fn content_parts(item: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    match item.get("type").and_then(serde_json::Value::as_str) {
+        Some("message") => item.get("content").and_then(serde_json::Value::as_array),
+        Some("function_call_output") => item.get("output").and_then(serde_json::Value::as_array),
+        Some(_) => None,
+        None => {
+            if item.get("role").and_then(serde_json::Value::as_str).is_some() && item.get("content").is_some() {
+                item.get("content").and_then(serde_json::Value::as_array)
+            } else {
+                None
+            }
+        },
+    }
+}
+
 /// Return the mutable content parts array for a given input item,
 /// if applicable.
 pub(crate) fn content_parts_mut(item: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
