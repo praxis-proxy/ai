@@ -3230,23 +3230,15 @@ fn connector_target_fingerprint_binds_effective_bearer() {
 #[test]
 fn connector_target_fingerprint_survives_assertion_rotation() {
     let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
-    let first_identity = McpCalloutIdentity {
-        owner: owner.clone(),
-        user_credential: None,
-        authorization: Some(SecretString::from("assertion-v1")),
-    };
-    let second_identity = McpCalloutIdentity {
-        owner,
-        user_credential: None,
-        authorization: Some(SecretString::from("assertion-v2")),
-    };
+    let first_identity = McpCalloutIdentity::for_test(owner.clone(), None, Some(SecretString::from("assertion-v1")));
+    let second_identity = McpCalloutIdentity::for_test(owner, None, Some(SecretString::from("assertion-v2")));
     let mut first_entry = json!({
         "connector_id": "trusted",
         "server_url": "https://mcp.example/mcp"
     });
     let mut second_entry = first_entry.clone();
-    bind_owner_context(&mut first_entry, Some(&first_identity.owner));
-    bind_owner_context(&mut second_entry, Some(&second_identity.owner));
+    bind_owner_context(&mut first_entry, Some(first_identity.owner()));
+    bind_owner_context(&mut second_entry, Some(second_identity.owner()));
 
     assert_eq!(
         target_fingerprint(&first_entry),

@@ -1742,9 +1742,9 @@ async fn fetch_tools(
         options
             .connector_identity
             .map(|identity| mcp_client::McpConnectorContext {
-                owner: &identity.owner,
-                bearer: identity.user_credential.as_ref(),
-                assertion: identity.authorization.as_ref(),
+                owner: identity.owner(),
+                bearer: identity.user_credential(),
+                assertion: identity.authorization(),
             })
             .as_ref(),
         options.timeout,

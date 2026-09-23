@@ -4,7 +4,10 @@
 //! Unit tests for the MCP client wrapper.
 
 use std::{
-    sync::{Arc as StdArc, Mutex},
+    sync::{
+        Arc as StdArc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -1121,6 +1124,8 @@ struct CapturedRequestHeaders {
     path: String,
     authorization: Option<String>,
     assertion: Option<String>,
+    tenant: Option<String>,
+    subject: Option<String>,
 }
 
 type CapturedRequests = StdArc<Mutex<Vec<CapturedRequestHeaders>>>;
@@ -1152,6 +1157,14 @@ async fn start_recording_mcp_server() -> (String, tokio_util::sync::Cancellation
                             .map(str::to_owned),
                         assertion: headers
                             .get(crate::callout_authorization::MCP_AUTHORIZED_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        tenant: headers
+                            .get("x-tenant-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        subject: headers
+                            .get("x-user-id")
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_owned),
                     });
@@ -1209,6 +1222,14 @@ async fn start_redirecting_mcp_server() -> (String, tokio_util::sync::Cancellati
                             .get(crate::callout_authorization::MCP_AUTHORIZED_HEADER)
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_owned),
+                        tenant: headers
+                            .get("x-tenant-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        subject: headers
+                            .get("x-user-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
                     });
                     next.run(request).await
                 }
@@ -1229,6 +1250,33 @@ async fn start_redirecting_mcp_server() -> (String, tokio_util::sync::Cancellati
     (format!("http://{addr}/redirect"), ct, captured)
 }
 
+async fn start_failing_initialize_server() -> (String, tokio_util::sync::CancellationToken, StdArc<AtomicUsize>) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let requests = StdArc::new(AtomicUsize::new(0));
+    let observed = StdArc::clone(&requests);
+    let router = axum::Router::new().route(
+        "/mcp",
+        axum::routing::post(move || {
+            let observed = StdArc::clone(&observed);
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+    (format!("http://{addr}/mcp"), ct, requests)
+}
+
 fn assert_scoped_context_on_every_exchange(captured: &CapturedRequests) {
     let captured = captured.lock().unwrap();
     assert!(
@@ -1239,6 +1287,23 @@ fn assert_scoped_context_on_every_exchange(captured: &CapturedRequests) {
         assert_eq!(request.authorization.as_deref(), Some("Bearer per-user-token"));
         assert_eq!(request.assertion.as_deref(), Some("signed-assertion"));
     }
+}
+
+fn owner_projecting_mcp_callout() -> McpCallout {
+    let mut registry = praxis_filter::FilterRegistry::with_builtins();
+    praxis_filter::register_filters!(
+        @register registry,
+        http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
+    );
+    let mut entries: Vec<praxis_filter::FilterEntry> = serde_yaml::from_str(
+        "- filter: state_owner_headers\n  tenant_header: x-tenant-id\n  subject_header: x-user-id\n",
+    )
+    .unwrap();
+    let mut pipeline = praxis_filter::FilterPipeline::build(&mut entries, &registry).unwrap();
+    pipeline.set_allow_private_upstreams(true);
+    McpCallout::fabricated(true)
+        .unwrap()
+        .with_pipeline_for_test(StdArc::new(pipeline))
 }
 
 const INTEGRATION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1320,6 +1385,69 @@ async fn scoped_connector_context_reaches_initialize_and_tools_call_unchanged() 
 }
 
 #[tokio::test]
+async fn two_user_mcp_contexts_are_isolated_across_initialize_and_list() {
+    for suffix in ["a", "b"] {
+        let (url, ct, captured) = start_recording_mcp_server().await;
+        let owner = StateOwner::from_trusted_parts(
+            format!("tenant-{suffix}"),
+            "urn:integration:test",
+            format!("user-{suffix}"),
+        )
+        .unwrap();
+        let bearer = SecretString::from(format!("credential-{suffix}"));
+        let assertion = SecretString::from(format!("assertion-{suffix}"));
+        let context = McpConnectorContext {
+            owner: &owner,
+            bearer: Some(&bearer),
+            assertion: Some(&assertion),
+        };
+
+        list_tools_with_forwarded_headers(
+            &url,
+            None,
+            None,
+            &[],
+            None,
+            Some(&context),
+            INTEGRATION_TIMEOUT,
+            128,
+            &owner_projecting_mcp_callout(),
+        )
+        .await
+        .unwrap();
+        ct.cancel();
+
+        let captured = captured.lock().unwrap();
+        assert!(captured.len() >= 2, "initialize and list must both be observed");
+        let expected_authorization = format!("Bearer credential-{suffix}");
+        let expected_assertion = format!("assertion-{suffix}");
+        let expected_tenant = format!("tenant-{suffix}");
+        let expected_subject = format!("user-{suffix}");
+        for request in captured.iter() {
+            assert_eq!(request.authorization.as_deref(), Some(expected_authorization.as_str()));
+            assert_eq!(request.assertion.as_deref(), Some(expected_assertion.as_str()));
+            assert_eq!(request.tenant.as_deref(), Some(expected_tenant.as_str()));
+            assert_eq!(request.subject.as_deref(), Some(expected_subject.as_str()));
+            let other = if suffix == "a" { "b" } else { "a" };
+            for leaked in [
+                format!("credential-{other}"),
+                format!("assertion-{other}"),
+                format!("tenant-{other}"),
+                format!("user-{other}"),
+            ] {
+                assert!(
+                    request.authorization.as_deref() != Some(leaked.as_str())
+                        && request.assertion.as_deref() != Some(leaked.as_str())
+                        && request.tenant.as_deref() != Some(leaked.as_str())
+                        && request.subject.as_deref() != Some(leaked.as_str()),
+                    "user {suffix} MCP exchange leaked user {other} context"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn direct_url_never_sends_client_shadow_as_ambient_context() {
     let (url, ct, captured) = start_recording_mcp_server().await;
     let client_shadow = serde_json::json!({
@@ -1389,6 +1517,33 @@ async fn scoped_connector_context_is_not_followed_across_redirects() {
     assert!(
         captured.iter().all(|request| request.path != "/mcp"),
         "ambient connector context must never be replayed to a redirected target"
+    );
+}
+
+#[tokio::test]
+async fn failed_initialize_stops_before_service_start_without_background_retries() {
+    let (url, ct, requests) = start_failing_initialize_server().await;
+
+    let result = list_tools(
+        &url,
+        None,
+        None,
+        Duration::from_millis(500),
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    ct.cancel();
+
+    assert!(
+        result.is_err(),
+        "a failed initialize exchange must fail the MCP operation"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "pre-running initialization failure must not leave a worker retrying in the background"
     );
 }
 

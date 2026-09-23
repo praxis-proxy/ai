@@ -122,7 +122,8 @@ pub(crate) struct WebSearchFilterConfig {
     #[serde(default)]
     pub(crate) default_context_size: Option<String>,
 
-    /// Callout timeout in milliseconds.
+    /// Callout timeout in milliseconds. Inside an iterative request router,
+    /// the effective timeout is capped by the router's remaining deadline.
     #[serde(default)]
     pub(crate) timeout_ms: Option<u64>,
 
@@ -200,7 +201,8 @@ pub(crate) struct OpenAiWebSearchConfig {
     #[serde(default)]
     default_context_size: Option<String>,
 
-    /// Callout timeout in milliseconds.
+    /// Callout timeout in milliseconds. Inside an iterative request router,
+    /// the effective timeout is capped by the router's remaining deadline.
     #[serde(default)]
     timeout_ms: Option<u64>,
 

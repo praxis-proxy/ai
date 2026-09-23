@@ -363,6 +363,8 @@ pub(crate) struct McpCallout {
     depth: u8,
     /// Approved request correlation projected into every MCP exchange.
     trace_context: Option<TraceContext>,
+    /// Absolute enclosing IRR deadline shared by initialize/list/call exchanges.
+    parent_deadline: Option<Instant>,
     /// Whether private/loopback MCP destinations are permitted, taken from the
     /// bound pipeline's finalized posture (never a per-filter opt-in).
     allow_private: bool,
@@ -390,10 +392,9 @@ impl McpCallout {
             ctx.request_start,
         );
         let allow_private = pipeline.allow_private_upstreams();
-        let depth = resolve_callout_depth(
-            ctx.extensions.get::<IterationState>().map(IterationState::depth),
-            &ctx.request.headers,
-        );
+        let iteration_state = ctx.extensions.get::<IterationState>();
+        let depth = resolve_callout_depth(iteration_state.map(IterationState::depth), &ctx.request.headers);
+        let parent_deadline = iteration_state.map(IterationState::deadline);
         let trace_context = ctx.extensions.get::<TraceContext>().cloned();
         Some(Self {
             client,
@@ -401,6 +402,7 @@ impl McpCallout {
             pipeline,
             depth,
             trace_context,
+            parent_deadline,
             allow_private,
         })
     }
@@ -408,6 +410,13 @@ impl McpCallout {
     /// Whether private/loopback MCP destinations are permitted for this callout.
     pub(crate) fn allow_private(&self) -> bool {
         self.allow_private
+    }
+
+    /// Bound one MCP transport exchange by the enclosing IRR deadline.
+    fn deadline(&self, now: Instant, step_timeout: Duration) -> Instant {
+        let step_deadline = now.checked_add(step_timeout).unwrap_or(now);
+        self.parent_deadline
+            .map_or(step_deadline, |parent| step_deadline.min(parent))
     }
 
     /// Build a callout backed by a fabricated connector and a bare, empty
@@ -426,8 +435,23 @@ impl McpCallout {
             pipeline,
             depth: 0,
             trace_context: None,
+            parent_deadline: None,
             allow_private,
         })
+    }
+
+    /// Attach an explicit parent deadline to a fabricated test callout.
+    #[cfg(test)]
+    pub(crate) fn with_parent_deadline_for_test(mut self, deadline: Instant) -> Self {
+        self.parent_deadline = Some(deadline);
+        self
+    }
+
+    /// Replace the bare test pipeline with an observable one.
+    #[cfg(test)]
+    pub(crate) fn with_pipeline_for_test(mut self, pipeline: Arc<FilterPipeline>) -> Self {
+        self.pipeline = pipeline;
+        self
     }
 }
 
@@ -619,9 +643,7 @@ impl McpSubrequestClient {
         (FilteredSubrequestExecutor, SubRequest, RequestExtensions, Instant),
         StreamableHttpError<McpTransportError>,
     > {
-        let deadline = Instant::now()
-            .checked_add(self.step_timeout)
-            .ok_or(StreamableHttpError::Client(McpTransportError::Setup))?;
+        let deadline = self.callout.deadline(Instant::now(), self.step_timeout);
         let allow_private = self.callout.allow_private;
         let target = match prepare_url_target(uri, deadline, move |addrs| ssrf_validate(addrs, allow_private)).await {
             Ok(target) => target,
@@ -1759,6 +1781,21 @@ mod tests {
         )
         .expect("deserialize tools/call");
         assert_eq!(client.response_limit(&call), MAX_CONTROL_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn mcp_exchange_deadline_is_capped_by_parent_loop_deadline() {
+        let now = Instant::now();
+        let parent_deadline = now + Duration::from_millis(25);
+        let callout = McpCallout::fabricated(false)
+            .expect("fabricated callout")
+            .with_parent_deadline_for_test(parent_deadline);
+
+        assert_eq!(
+            callout.deadline(now, Duration::from_secs(5)),
+            parent_deadline,
+            "initialize, list, and call exchanges must share the remaining IRR deadline"
+        );
     }
 
     #[tokio::test]

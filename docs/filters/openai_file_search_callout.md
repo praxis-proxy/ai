@@ -20,5 +20,5 @@ The enclosing iterative router owns model re-entry and `openai_agentic_loop` own
 | `max_response_bytes` | integer | no | Maximum response body size in bytes per callout. |
 | `max_total_response_bytes` | integer | no | Maximum cumulative successful response bytes per filter execution. |
 | `max_state_bytes` | integer | no | Maximum combined iterative-router and file-search continuation bytes. The filter's value may differ from the enclosing `iterative_request_router`; the smaller limit wins at runtime. |
-| `timeout_ms` | integer | no | Whole-call timeout in milliseconds. |
+| `timeout_ms` | integer | no | Whole-call timeout in milliseconds. Inside an iterative request router, the effective timeout is capped by the router's remaining deadline. |
 | `vector_store_url` | string | yes | Base URL for the vector store API. |

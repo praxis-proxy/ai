@@ -19,8 +19,11 @@
 # policy. A later policy integration can decide whether the authenticated owner
 # may perform an operation, without changing the storage ownership contract.
 #
-# `single_tenant` is available for isolated development deployments with one
-# shared owner. Multi-user deployments should use `trusted_owner` as below.
+# `single_tenant` is available only when the whole deployment is one trust
+# domain: it assigns every caller the same tenant, issuer, and `shared` subject,
+# so it cannot provide per-user attribution, cache separation, or state
+# isolation. Shared multi-user deployments must use `trusted_owner` as below
+# (or `trusted_headers` when the trusted boundary supplies separate fields).
 
 listeners:
   - name: ai-gateway

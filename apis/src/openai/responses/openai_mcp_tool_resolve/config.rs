@@ -82,7 +82,9 @@ pub(crate) struct McpToolResolveConfig {
     #[serde(default = "default_max_rewritten_body_bytes")]
     pub max_rewritten_body_bytes: usize,
 
-    /// Per-server timeout in milliseconds for `tools/list` calls.
+    /// Per-server timeout in milliseconds for `tools/list` calls. Inside an
+    /// iterative request router, initialize and listing exchanges are capped by
+    /// the router's remaining deadline.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 

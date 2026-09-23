@@ -75,7 +75,9 @@ pub(crate) struct McpDispatchConfig {
     #[serde(default)]
     pub forward_headers: Vec<String>,
 
-    /// Per-call timeout in milliseconds for `tools/call` calls.
+    /// Per-call timeout in milliseconds for `tools/call` calls. Inside an
+    /// iterative request router, every MCP exchange is capped by the router's
+    /// remaining deadline.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 

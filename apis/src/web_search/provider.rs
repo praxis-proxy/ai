@@ -85,7 +85,7 @@ pub(crate) enum SearchOutcome {
 ///   request extensions), so the executor stamps the callout at `depth + 1` and a recursive target remains accountable
 ///   to the IRR depth ceiling instead of resetting the count.
 ///
-/// [`FilteredSubrequestExecutor`]: praxis_filter::FilteredSubrequestExecutor
+/// [`FilteredSubrequestExecutor`]: `praxis_filter::FilteredSubrequestExecutor`
 pub(crate) struct CalloutContext {
     /// Downstream attributes forwarded to the outbound chain.
     runtime: SubrequestRuntime,
@@ -334,7 +334,11 @@ impl SearchClient {
         request: SubRequest,
         identity: &CalloutIdentity,
     ) -> SearchOutcome {
-        let deadline = Instant::now() + self.timeout;
+        // A callout receives at most its configured timeout and never a fresh
+        // budget beyond the enclosing IRR's absolute request deadline. This is
+        // recomputed for every round, so later calls inherit only the time that
+        // remains after prior inference and tool work.
+        let deadline = identity.deadline(Instant::now(), self.timeout);
         let Some((prepared, extensions)) = self.prepare_staged_request(url, request, deadline, identity).await else {
             return SearchOutcome::Failed;
         };
@@ -474,8 +478,7 @@ impl SearchClient {
         // the shared provider key. Both are deferred (never placed on the in-chain
         // request) and injected by the executor only at the resolved, pinned host.
         let secret = identity
-            .user_credential
-            .as_ref()
+            .user_credential()
             .map_or_else(|| self.api_key.expose_secret(), |user| user.expose_secret());
         let credential = DeferredCredential::new(&authority, header, secret)?;
         let mut pending = PendingCredentials::new();
@@ -956,11 +959,7 @@ mod tests {
 
     /// A callout identity with no owner and no per-user credential (shared-key path).
     fn shared_key_identity() -> CalloutIdentity {
-        CalloutIdentity {
-            owner: None,
-            trace_context: None,
-            user_credential: None,
-        }
+        CalloutIdentity::for_test(None, None)
     }
 
     /// A minimal GET `SubRequest` for the `execute_search` callout tests.
@@ -1200,6 +1199,40 @@ mod tests {
         SearchClient::from_config("test", &config, test_subrequest_client()).unwrap()
     }
 
+    #[test]
+    fn callout_deadline_uses_provider_timeout_without_a_parent() {
+        let now = Instant::now();
+        let timeout = Duration::from_secs(5);
+        assert_eq!(
+            shared_key_identity().deadline(now, timeout),
+            now + timeout,
+            "a top-level callout receives its configured timeout"
+        );
+    }
+
+    #[test]
+    fn callout_deadline_preserves_a_shorter_provider_timeout() {
+        let now = Instant::now();
+        let provider_deadline = now + Duration::from_secs(2);
+        let parent_deadline = now + Duration::from_secs(5);
+        assert_eq!(
+            CalloutIdentity::for_test_with_deadline(parent_deadline).deadline(now, Duration::from_secs(2)),
+            provider_deadline,
+            "the parent must not widen a tighter provider timeout"
+        );
+    }
+
+    #[test]
+    fn callout_deadline_is_capped_by_the_remaining_parent_deadline() {
+        let now = Instant::now();
+        let parent_deadline = now + Duration::from_millis(25);
+        assert_eq!(
+            CalloutIdentity::for_test_with_deadline(parent_deadline).deadline(now, Duration::from_secs(5)),
+            parent_deadline,
+            "an IRR callout cannot receive time beyond the router's absolute deadline"
+        );
+    }
+
     /// Build a minimal bound outbound chain for callout tests.
     ///
     /// The chain holds an observable `request_id` builtin, standing in for the
@@ -1210,6 +1243,21 @@ mod tests {
     /// `insecure_options.allow_private_upstreams`.
     fn test_outbound() -> Arc<FilterPipeline> {
         Arc::new(crate::web_search::test_outbound_pipeline().unwrap())
+    }
+
+    fn owner_projecting_outbound() -> Arc<FilterPipeline> {
+        let mut registry = praxis_filter::FilterRegistry::with_builtins();
+        praxis_filter::register_filters!(
+            @register registry,
+            http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
+        );
+        let mut entries: Vec<praxis_filter::FilterEntry> = serde_yaml::from_str(
+            "- filter: state_owner_headers\n  tenant_header: x-tenant-id\n  subject_header: x-user-id\n",
+        )
+        .expect("state-owner projection entry parses");
+        let mut pipeline = FilterPipeline::build(&mut entries, &registry).expect("owner projection pipeline builds");
+        pipeline.set_allow_private_upstreams(true);
+        Arc::new(pipeline)
     }
 
     fn spawn_http_server(listener: TcpListener, status: u16, body: &str) {
@@ -1337,6 +1385,39 @@ mod tests {
         assert!(
             matches!(outcome, SearchOutcome::Failed),
             "a timeout should map to Failed: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_timeout_is_capped_by_the_parent_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut client = test_search_client();
+        client.timeout = Duration::from_secs(2);
+        let parent_deadline = Instant::now() + Duration::from_millis(100);
+        let started = Instant::now();
+        let outcome = client
+            .execute_search(
+                &test_outbound(),
+                CalloutContext::for_test(),
+                &format!("http://{addr}/search"),
+                test_get_request(),
+                &CalloutIdentity::for_test_with_deadline(parent_deadline),
+            )
+            .await;
+
+        assert!(
+            matches!(outcome, SearchOutcome::Failed),
+            "an exhausted parent deadline should map to Failed: {outcome:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the callout must use the 100ms parent remainder, not its fresh 2s timeout"
         );
     }
 
@@ -1606,10 +1687,7 @@ mod tests {
         // Brave client whose SHARED key is "shared-secret".
         let config = brave_config_with_shared_key("shared-secret");
         let client = SearchClient::from_config("test", &config, test_subrequest_client()).unwrap();
-        let identity = CalloutIdentity {
-            user_credential: Some(SecretString::from("per-user-secret".to_owned())),
-            ..shared_key_identity()
-        };
+        let identity = CalloutIdentity::for_test(None, Some(SecretString::from("per-user-secret".to_owned())));
         let url = format!("http://{addr}/res/v1/web/search?q=test&count=5");
         let request = test_get_request();
         let _unused = client
@@ -1630,17 +1708,84 @@ mod tests {
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test performs and compares two complete user-scoped wire exchanges"
+    )]
+    async fn two_user_web_search_contexts_are_isolated() {
+        let outbound = owner_projecting_outbound();
+        let response = json!({
+            "web": {"results": [{"title": "T", "url": "https://e.example", "description": "d"}]}
+        })
+        .to_string();
+        let mut received = Vec::new();
+
+        for suffix in ["a", "b"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let rx = spawn_recording_server(listener, 200, &response);
+            let client = SearchClient::from_config(
+                "test",
+                &brave_config_with_shared_key("shared-secret"),
+                test_subrequest_client(),
+            )
+            .unwrap();
+            let identity = CalloutIdentity::for_test(
+                Some(
+                    crate::StateOwner::from_trusted_parts(
+                        format!("tenant-{suffix}"),
+                        "urn:integration:test",
+                        format!("user-{suffix}"),
+                    )
+                    .unwrap(),
+                ),
+                Some(SecretString::from(format!("credential-{suffix}"))),
+            );
+            let outcome = client
+                .execute_search(
+                    &outbound,
+                    CalloutContext::for_test(),
+                    &format!("http://{addr}/res/v1/web/search?q=test&count=5"),
+                    test_get_request(),
+                    &identity,
+                )
+                .await;
+            assert!(matches!(outcome, SearchOutcome::Results(_)));
+            received.push(String::from_utf8(rx.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap());
+        }
+
+        for (request, suffix) in received.iter().zip(["a", "b"]) {
+            for expected in [
+                format!("x-subscription-token: credential-{suffix}"),
+                format!("x-tenant-id: tenant-{suffix}"),
+                format!("x-user-id: user-{suffix}"),
+            ] {
+                assert!(
+                    request.lines().any(|line| line.eq_ignore_ascii_case(&expected)),
+                    "user {suffix} callout must carry only its scoped context: {request}"
+                );
+            }
+            let other = if suffix == "a" { "b" } else { "a" };
+            assert!(
+                !request.contains(&format!("credential-{other}"))
+                    && !request.contains(&format!("tenant-{other}"))
+                    && !request.contains(&format!("user-{other}")),
+                "user {suffix} callout leaked user {other} context: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn stage_extensions_projects_owner_into_child_extensions() {
         let client = test_client_for(SearchProvider::Brave);
         let url = "http://127.0.0.1:9/res/v1/web/search";
         let target = prepare_url_target(url, Instant::now() + Duration::from_secs(5), |_addrs| Ok(()))
             .await
             .unwrap();
-        let identity = CalloutIdentity {
-            owner: Some(crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap()),
-            trace_context: None,
-            user_credential: None,
-        };
+        let identity = CalloutIdentity::for_test(
+            Some(crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap()),
+            None,
+        );
         let ext = client
             .stage_extensions(&target, url, &identity)
             .expect("staging succeeds");

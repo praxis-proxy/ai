@@ -377,8 +377,15 @@ impl ApiClient {
             });
         }
 
-        // One clock bounds both target preparation and the sub-request.
-        let deadline = Instant::now() + self.timeout;
+        // One clock bounds both target preparation and the sub-request. A
+        // configured Files API callout staged inside an IRR cannot receive a
+        // fresh timeout beyond the router's remaining absolute deadline.
+        let started = Instant::now();
+        let deadline = outbound.callout_identity.as_ref().map_or_else(
+            || started.checked_add(self.timeout).unwrap_or(started),
+            |identity| identity.deadline(started, self.timeout),
+        );
+        let step_timeout = deadline.saturating_duration_since(started);
 
         // Pin the resolved target before dialing: the validation hook runs
         // once on the complete address set, rejecting private or reserved
@@ -446,7 +453,7 @@ impl ApiClient {
             outbound.runtime.runtime(),
             OUTBOUND_CALLOUT_DEPTH,
             max_response_bytes,
-            outbound.step_timeout,
+            outbound.step_timeout.min(step_timeout),
         );
 
         let mut response = match Box::pin(executor.run_classified(&outbound.pipeline, &request, extensions, deadline))
@@ -897,6 +904,38 @@ mod tests {
         assert!(
             matches!(err, ApiClientError::ResponseTooLarge { limit: 8 }),
             "the outbound-chain path should preserve the typed overflow and its limit: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_file_call_is_capped_by_parent_deadline() {
+        let (listener, address) = bind_test_server();
+        slow_body_server(listener);
+        let client = test_client(&format!("http://{address}"));
+        let parent_deadline = Instant::now() + Duration::from_millis(50);
+        let outbound = private_outbound(&client).with_callout_identity(
+            CalloutIdentity::for_test_with_deadline(parent_deadline),
+            address.to_string(),
+        );
+        let started = Instant::now();
+
+        let response = client
+            .get_via_chain(
+                &format!("http://{address}/v1/files/slow/content"),
+                &HeaderMap::new(),
+                1024,
+                &outbound,
+            )
+            .await
+            .expect("the executor represents its local timeout as a buffered response");
+
+        assert_eq!(
+            response.status, 504,
+            "the parent deadline must stop the nested file callout"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the callout must not receive the client's fresh one-second timeout"
         );
     }
 

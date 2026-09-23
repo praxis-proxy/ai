@@ -326,11 +326,8 @@ impl McpDispatchFilter {
         };
         for entry in state.mcp_tool_map.values_mut() {
             bind_forwarded_header_context(entry, &self.forward_headers, headers);
-            bind_owner_context(entry, connector_identity.map(|identity| &identity.owner));
-            bind_credential_context(
-                entry,
-                connector_identity.and_then(|identity| identity.user_credential.as_ref()),
-            );
+            bind_owner_context(entry, connector_identity.map(McpCalloutIdentity::owner));
+            bind_credential_context(entry, connector_identity.and_then(McpCalloutIdentity::user_credential));
         }
     }
 
@@ -1656,9 +1653,9 @@ async fn execute_single_call(
         .then_some(options.connector_identity)
         .flatten()
         .map(|identity| mcp_client::McpConnectorContext {
-            owner: &identity.owner,
-            bearer: identity.user_credential.as_ref(),
-            assertion: identity.authorization.as_ref(),
+            owner: identity.owner(),
+            bearer: identity.user_credential(),
+            assertion: identity.authorization(),
         });
     let (arguments, arguments_string) = match parse_call_arguments(
         tool_call,

@@ -24,7 +24,7 @@ This filter resolves references inside Responses requests; it does not proxy cli
 | `max_resolved_bytes` | integer | no | Maximum total size in bytes of inline file content this filter adds to one request (default 64 MiB). Charged against the *encoded* inline form — base64 `file_data` and `data:` URL `image_url` values — not the raw bytes fetched from the Files API or remote URL, and shared as a single budget across every reference resolved in the request rather than applied per file. A file whose raw content would fit can still be rejected once base64 expansion is counted, and several individually small files can exhaust the budget together. Bounds inline expansion independently of the total rewritten body size (`max_rewritten_body_bytes`). |
 | `max_file_references` | integer | no | Maximum number of distinct content-part / `file_id` pairs to resolve in one request, including rehydrated history. |
 | `on_missing` | `continue` \| `reject` | no | Behavior when a `file_id` reference cannot be fetched. Does not apply to `file_url`: a failed `file_url` fetch is always rejected, regardless of this setting. |
-| `timeout_ms` | integer | no | HTTP timeout in milliseconds for Files API callout requests. |
+| `timeout_ms` | integer | no | HTTP timeout in milliseconds for Files API callout requests. Inside an iterative request router, the effective timeout is capped by the router's remaining deadline. |
 | `file_url` | `resolve` \| `passthrough` | no | Mode for `file_url` content parts in `input_file`. |
 | `allowed_file_url_origins` | string[] | no | Exact origins allowed to resolve to private addresses. Cloud metadata, unspecified, and multicast remain blocked. |
 

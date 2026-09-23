@@ -6,8 +6,11 @@
 //! staged into the nested filtered-subrequest so the callout carries the caller's identity and a
 //! per-user credential instead of a single shared provider key.
 
+use std::time::{Duration, Instant};
+
 use praxis_filter::{
-    DeferredCredential, FilterError, HttpFilterContext, PendingCredentials, RequestExtensions, TraceContext,
+    DeferredCredential, FilterError, HttpFilterContext, IterationState, PendingCredentials, RequestExtensions,
+    TraceContext,
 };
 use secrecy::{ExposeSecret as _, SecretString};
 
@@ -15,18 +18,36 @@ use secrecy::{ExposeSecret as _, SecretString};
 use crate::CalloutAuthorization;
 use crate::{CalloutCredentials, state_owner::StateOwner};
 
-/// Identity + credential resolved for a single callout.
+/// Opaque proof that the protected identity staging contract ran for a callout.
+///
+/// Fields are deliberately private: production consumers can obtain this token
+/// only through [`stage_callout_identity`], so a new callout cannot construct an
+/// unchecked credential/owner pair and silently bypass required-slot handling.
 #[derive(Debug)]
 pub(crate) struct CalloutIdentity {
     /// The caller's trusted subject/tenant attribution, projected into the child subrequest.
-    pub(crate) owner: Option<StateOwner>,
+    owner: Option<StateOwner>,
     /// Approved request correlation projected into the child subrequest.
-    pub(crate) trace_context: Option<TraceContext>,
+    trace_context: Option<TraceContext>,
+    /// Absolute enclosing IRR deadline, when the callout runs inside a router.
+    parent_deadline: Option<Instant>,
     /// The per-user secret to inject, when a credential slot is configured and populated.
-    pub(crate) user_credential: Option<SecretString>,
+    user_credential: Option<SecretString>,
 }
 
 impl CalloutIdentity {
+    /// Borrow the staged per-user credential, when the callout selected one.
+    pub(crate) fn user_credential(&self) -> Option<&SecretString> {
+        self.user_credential.as_ref()
+    }
+
+    /// Bound a configured callout timeout by the enclosing IRR deadline.
+    pub(crate) fn deadline(&self, now: Instant, timeout: Duration) -> Instant {
+        let callout_deadline = now.checked_add(timeout).unwrap_or(now);
+        self.parent_deadline
+            .map_or(callout_deadline, |parent| callout_deadline.min(parent))
+    }
+
     /// Project approved request context into an isolated child request.
     ///
     /// The credential deliberately is not inserted directly: each callout binds
@@ -59,6 +80,31 @@ impl CalloutIdentity {
         pending.push(DeferredCredential::new(authority, header, secret.expose_secret())?);
         child.insert(pending);
         Ok(())
+    }
+
+    /// Construct an identity directly for isolated callout tests.
+    ///
+    /// This constructor is absent from production builds so the protected
+    /// staging contract remains compile-forced there.
+    #[cfg(test)]
+    pub(crate) fn for_test(owner: Option<StateOwner>, user_credential: Option<SecretString>) -> Self {
+        Self {
+            owner,
+            trace_context: None,
+            parent_deadline: None,
+            user_credential,
+        }
+    }
+
+    /// Construct an isolated test identity under an explicit parent deadline.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_deadline(parent_deadline: Instant) -> Self {
+        Self {
+            owner: None,
+            trace_context: None,
+            parent_deadline: Some(parent_deadline),
+            user_credential: None,
+        }
     }
 }
 
@@ -125,11 +171,43 @@ pub(crate) enum McpCalloutContextMissing {
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) struct McpCalloutIdentity {
     /// Trusted owner projected into the filtered child request.
-    pub(crate) owner: StateOwner,
+    owner: StateOwner,
     /// Optional per-user bearer overriding the connector entry's static token.
-    pub(crate) user_credential: Option<SecretString>,
+    user_credential: Option<SecretString>,
     /// Optional opaque assertion injected as fixed `x-mcp-authorized`.
-    pub(crate) authorization: Option<SecretString>,
+    authorization: Option<SecretString>,
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+impl McpCalloutIdentity {
+    /// Borrow the trusted connector owner.
+    pub(crate) fn owner(&self) -> &StateOwner {
+        &self.owner
+    }
+
+    /// Borrow the staged connector bearer, when configured.
+    pub(crate) fn user_credential(&self) -> Option<&SecretString> {
+        self.user_credential.as_ref()
+    }
+
+    /// Borrow the staged authorization assertion, when configured.
+    pub(crate) fn authorization(&self) -> Option<&SecretString> {
+        self.authorization.as_ref()
+    }
+
+    /// Construct connector context directly for isolated tests.
+    #[cfg(all(test, feature = "store-sqlite"))]
+    pub(crate) fn for_test(
+        owner: StateOwner,
+        user_credential: Option<SecretString>,
+        authorization: Option<SecretString>,
+    ) -> Self {
+        Self {
+            owner,
+            user_credential,
+            authorization,
+        }
+    }
 }
 
 #[cfg(feature = "openai-mcp-tools")]
@@ -214,6 +292,7 @@ pub(crate) fn stage_callout_identity(
 ) -> Result<CalloutIdentity, CalloutContextMissing> {
     let owner = ctx.extensions.get::<StateOwner>().cloned();
     let trace_context = ctx.extensions.get::<TraceContext>().cloned();
+    let parent_deadline = ctx.extensions.get::<IterationState>().map(IterationState::deadline);
 
     let user_credential = match slot {
         None => None,
@@ -234,6 +313,7 @@ pub(crate) fn stage_callout_identity(
     Ok(CalloutIdentity {
         owner,
         trace_context,
+        parent_deadline,
         user_credential,
     })
 }
@@ -259,7 +339,11 @@ mod tests {
         let id = stage_callout_identity(&ctx, None).expect("no slot must succeed");
         assert!(id.owner.is_none(), "no state_owner ran, so owner is absent");
         assert!(id.trace_context.is_none(), "no trace_context ran, so tracing is absent");
-        assert!(id.user_credential.is_none(), "no slot configured, so no credential");
+        assert!(
+            id.parent_deadline.is_none(),
+            "no IRR ran, so no parent deadline is present"
+        );
+        assert!(id.user_credential().is_none(), "no slot configured, so no credential");
     }
 
     #[test]
@@ -322,7 +406,7 @@ mod tests {
 
         let id = stage_callout_identity(&ctx, Some("brave")).expect("populated slot resolves");
         assert_eq!(
-            id.user_credential.expect("credential present").expose_secret(),
+            id.user_credential().expect("credential present").expose_secret(),
             "tok-xyz"
         );
     }
@@ -370,11 +454,10 @@ mod tests {
 
     #[test]
     fn stages_owner_and_exact_authority_credential() {
-        let identity = CalloutIdentity {
-            owner: Some(StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap()),
-            trace_context: None,
-            user_credential: Some(SecretString::from("Bearer user-a")),
-        };
+        let identity = CalloutIdentity::for_test(
+            Some(StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap()),
+            Some(SecretString::from("Bearer user-a")),
+        );
         let mut child = RequestExtensions::default();
         identity
             .stage_header_credential_into(&mut child, "ogx.example:443", http::header::AUTHORIZATION)

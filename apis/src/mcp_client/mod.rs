@@ -414,8 +414,9 @@ pub(crate) async fn list_tools_with_forwarded_headers(
     .await;
 
     // Close (not drop) the service on every post-serve exit so no background
-    // worker task is left holding our subrequest executor. (The pre-serve
-    // handshake window remains a parked upstream rmcp gap — see the plan header.)
+    // worker task is left holding our subrequest executor. A pre-serve
+    // initialization failure owns no `RunningService`; dropping the failed
+    // `serve` future drops its transport without starting the service worker.
     if let Some(mut client) = running {
         drop(client.close().await);
     }
@@ -545,8 +546,9 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     .await;
 
     // Close (not drop) the service on every post-serve exit so no background
-    // worker task is left holding our subrequest executor. (The pre-serve
-    // handshake window remains a parked upstream rmcp gap — see the plan header.)
+    // worker task is left holding our subrequest executor. A pre-serve
+    // initialization failure owns no `RunningService`; dropping the failed
+    // `serve` future drops its transport without starting the service worker.
     if let Some(mut client) = running {
         drop(client.close().await);
     }

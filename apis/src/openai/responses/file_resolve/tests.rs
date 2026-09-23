@@ -700,6 +700,84 @@ async fn scoped_credential_arrives_on_file_id_metadata_and_content_requests() {
 }
 
 #[tokio::test]
+async fn two_user_file_id_contexts_are_isolated() {
+    let (files_api_url, requests) = start_recording_files_api_stub();
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
+        "files_api_url: \"{files_api_url}\"\nallow_pre_security_callout: true\nuser_credential: ogx_files\non_missing: reject"
+    ))
+    .unwrap();
+    let filter = FileResolveFilter::from_config_with_outbound(
+        &yaml,
+        crate::subrequest::isolated_client(4),
+        owner_projecting_outbound_pipeline(),
+    )
+    .unwrap();
+
+    for suffix in ["a", "b"] {
+        let req = Box::leak(Box::new(crate::test_utils::make_request(
+            http::Method::POST,
+            "/v1/responses",
+        )));
+        let mut ctx = crate::test_utils::make_filter_context(req);
+        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        let request_body = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_file", "file_id": "file-history"}]
+            }]
+        });
+        let mut credentials = CalloutCredentials::new();
+        credentials.insert(
+            "ogx_files".to_owned(),
+            SecretString::from(format!("Bearer scoped-user-{suffix}")),
+        );
+        ctx.extensions.insert(credentials);
+        ctx.extensions.insert(
+            crate::StateOwner::from_trusted_parts(
+                format!("tenant-{suffix}"),
+                "urn:integration:test",
+                format!("user-{suffix}"),
+            )
+            .unwrap(),
+        );
+        ctx.extensions
+            .insert(ResponsesState::from_request_body(request_body.clone()));
+        let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+
+        assert!(matches!(
+            filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+            FilterAction::Continue
+        ));
+    }
+
+    let captured = (0..4)
+        .map(|_| requests.recv_timeout(Duration::from_secs(1)).unwrap())
+        .collect::<Vec<_>>();
+    for (pair, suffix) in captured.chunks_exact(2).zip(["a", "b"]) {
+        for request in pair {
+            for expected in [
+                format!("authorization: Bearer scoped-user-{suffix}"),
+                format!("x-tenant-id: tenant-{suffix}"),
+                format!("x-user-id: user-{suffix}"),
+            ] {
+                assert!(
+                    request.lines().any(|line| line.eq_ignore_ascii_case(&expected)),
+                    "user {suffix} file callout must carry only its scoped context: {request}"
+                );
+            }
+            let other = if suffix == "a" { "b" } else { "a" };
+            assert!(
+                !request.contains(&format!("scoped-user-{other}"))
+                    && !request.contains(&format!("tenant-{other}"))
+                    && !request.contains(&format!("user-{other}")),
+                "user {suffix} callout leaked user {other} context: {request}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn scoped_file_id_credential_is_not_replayed_to_redirect_authority() {
     let redirect_target = TcpListener::bind("127.0.0.1:0").unwrap();
     redirect_target.set_nonblocking(true).unwrap();
@@ -1046,6 +1124,21 @@ fn private_outbound_pipeline() -> Arc<FilterPipeline> {
     Arc::new(pipeline)
 }
 
+fn owner_projecting_outbound_pipeline() -> Arc<FilterPipeline> {
+    let mut registry = praxis_filter::FilterRegistry::with_builtins();
+    praxis_filter::register_filters!(
+        @register registry,
+        http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
+    );
+    let mut entries: Vec<praxis_filter::FilterEntry> = serde_yaml::from_str(
+        "- filter: state_owner_headers\n  tenant_header: x-tenant-id\n  subject_header: x-user-id\n",
+    )
+    .unwrap();
+    let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+    pipeline.set_allow_private_upstreams(true);
+    Arc::new(pipeline)
+}
+
 /// Build a filter whose `file_id` callouts traverse a private-upstream
 /// outbound chain, mirroring the production chain-binding path against a
 /// loopback Files API stub.
@@ -1109,6 +1202,44 @@ fn start_files_api_stub_requiring_auth(expected: &'static str) -> String {
     });
 
     format!("http://{address}")
+}
+
+fn start_recording_files_api_stub() -> (String, std::sync::mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let raw = String::from_utf8_lossy(&request[..read]).into_owned();
+                tx.send(raw.clone()).unwrap();
+                let path = raw
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap();
+                let (content_type, body): (&str, &[u8]) = if path.ends_with("/content") {
+                    ("text/plain", b"history")
+                } else {
+                    (
+                        "application/json",
+                        br#"{"id":"file-history","filename":"history.txt","content_type":"text/plain","bytes":7}"#,
+                    )
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+            });
+        }
+    });
+    (format!("http://{address}"), rx)
 }
 
 fn serve_file_request_requiring_auth(mut stream: std::net::TcpStream, expected: &str) {
