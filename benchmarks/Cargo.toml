@@ -1,0 +1,26 @@
+[package]
+name = "praxis-ai-benchmarks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "Microbenchmarks for Praxis AI"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+praxis-ai-apis = { workspace = true, features = ["store-all"] }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["postgres", "sqlite", "tls-native-tls"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[[bench]]
+name = "compression"
+path = "store/compression.rs"
+harness = false

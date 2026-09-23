@@ -47,8 +47,8 @@ on:
       run_claude_acceptance:
         description: >-
           Run pinned Claude Code through native Messages and translated Chat
-          paths on a GPU runner. Use this to gather qualification passes; when
-          run_live_vllm is false it skips the complete Responses SDK suite.
+          paths on a GPU runner. When run_live_vllm is false it skips the
+          complete Responses SDK suite.
         required: false
         default: false
         type: boolean
@@ -223,8 +223,8 @@ jobs:
 
       - name: Build Praxis
         run: |
-          cargo build -p praxis-ai-proxy --no-default-features --features store-sqlite
-          cargo build -p praxis-test-utils --example conversations_tenant_proxy --no-default-features --features store-sqlite
+          cargo build -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
+          cargo build -p praxis-test-utils --example conversations_tenant_proxy --no-default-features --features standard,openai-all,store-sqlite
 
       - name: Wait for inference simulator readiness
         run: |
@@ -373,7 +373,7 @@ jobs:
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy --no-default-features --features store-sqlite
+        run: cargo build -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
 
       - name: Wait for vLLM readiness
         uses: ./.github/actions/wait-vllm
@@ -430,11 +430,8 @@ jobs:
   # Parse the Claude Code + vLLM acceptance pin manifest on an ubuntu runner
   # (which ships Python 3.11+ so `tomllib` is available; the GPU AMI ships Python
   # 3.9 and cannot). Exports every pin the GPU acceptance job needs as job
-  # outputs, plus `qualified` (true only when qualification.status == "qualified"
-  # and no exported value contains "TBD"). This never fails: the acceptance job
-  # gates on `qualified`, so the nightly schedule stays green while pins are
-  # pending. Runs on schedule + workflow_dispatch, the only events that can reach
-  # the GPU acceptance job.
+  # outputs. Runs on schedule + workflow_dispatch, the only events that can
+  # reach the GPU acceptance job.
   # ----------------------------------------------------------------------------
 
   pins:
@@ -445,7 +442,6 @@ jobs:
     permissions:
       contents: read
     outputs:
-      qualified: ${{ steps.load.outputs.qualified }}
       claude_url: ${{ steps.load.outputs.claude_url }}
       claude_sha256: ${{ steps.load.outputs.claude_sha256 }}
       claude_version: ${{ steps.load.outputs.claude_version }}
@@ -464,7 +460,7 @@ jobs:
 
           manifest = pathlib.Path("tests/integration/fixtures/claude-code-cli/pin.toml")
           data = tomllib.loads(manifest.read_text())
-          claude, vllm, qual = data["claude_code"], data["vllm"], data["qualification"]
+          claude, vllm = data["claude_code"], data["vllm"]
           exported = {
               "claude_url": claude["url"],
               "claude_sha256": claude["sha256"],
@@ -474,21 +470,9 @@ jobs:
               "vllm_served_model": vllm["served_model_name"],
               "vllm_flags": " ".join(vllm["launch"]["flags"]),
           }
-          unresolved = sorted(key for key, value in exported.items() if "TBD" in value)
-          qualified = qual["status"] == "qualified" and not unresolved
           with open(sys.argv[1], "a", encoding="utf-8") as out:
               for key, value in exported.items():
                   out.write(f"{key}={value}\n")
-              out.write(f"qualified={'true' if qualified else 'false'}\n")
-          # Informational only — never fail here, so scheduled/nightly runs stay
-          # green while qualification is pending; the acceptance job gates on
-          # `qualified` and a `workflow_dispatch` can still run to gather passes.
-          if not qualified:
-              print(
-                  f"::notice::Claude Code acceptance pins not yet qualified "
-                  f"(status={qual['status']!r}, unresolved={unresolved}); the GPU acceptance "
-                  "job stays dormant on the nightly schedule until pin.toml is qualified."
-              )
           PY
 
   # ----------------------------------------------------------------------------
@@ -521,11 +505,11 @@ jobs:
   # job's outputs, since the GPU AMI ships Python 3.9 and cannot parse TOML). It
   # never runs on push / pull_request / merge_group (it needs the GPU runner,
   # started only on schedule / run_live_vllm / an acceptance dispatch / the
-  # vllm-full-suite label), so PR and merge-queue CI stay green. On the nightly
-  # schedule it stays dormant until pin.toml is qualified (needs.pins.qualified);
-  # a `run_claude_acceptance` dispatch runs it regardless to gather qualification
-  # passes. The backend credential is generated per job; the client receives a
-  # distinct gateway credential, so successful inference proves replacement.
+  # vllm-full-suite label), so ordinary PR and merge-queue CI stay green. It runs
+  # on every nightly schedule; `run_claude_acceptance` also provides a focused
+  # manual dispatch. The backend credential is generated per job; the client
+  # receives a distinct gateway credential, so successful inference proves
+  # replacement.
   # ----------------------------------------------------------------------------
 
   vllm-gpu-claude-acceptance:
@@ -535,8 +519,7 @@ jobs:
     # run even when the full suite was skipped (a run_claude_acceptance-only
     # dispatch) or failed (salvage the warm instance), but never on cancellation.
     # It only proceeds when the runner actually started, and only on a
-    # full-suite/acceptance dispatch, a labeled PR, or on the nightly schedule
-    # once qualified.
+    # full-suite/acceptance dispatch, a labeled PR, or the nightly schedule.
     if: |
       !cancelled() &&
       needs.gpu-start-runner.result == 'success' &&
@@ -550,22 +533,19 @@ jobs:
           github.event.action == 'labeled' &&
           github.event.label.name == 'vllm-full-suite'
         ) ||
-        (github.event_name == 'schedule' && needs.pins.outputs.qualified == 'true')
+        github.event_name == 'schedule'
       )
     runs-on: ${{ needs.gpu-start-runner.outputs.label }}
     # Comfortable on the nightly (the full suite already warmed the on-disk HF
-    # cache), but a run_claude_acceptance-only dispatch — the path used to gather
-    # qualification passes — hits a COLD cache and must download ~16GB of
-    # Qwen3-8B before serving. With retries_allowed=0 a slow HF download must not
-    # burn a qualification attempt, so allow headroom (still under the 90-minute
-    # instance budget the full suite uses).
+    # cache), but a run_claude_acceptance-only dispatch hits a COLD cache and
+    # must download ~16GB of Qwen3-8B before serving. Allow enough headroom for
+    # that path (still under the 90-minute instance budget the full suite uses).
     timeout-minutes: 60
     permissions:
       contents: read
     env:
       # Pins resolved by the `pins` job (parsed on ubuntu; the GPU AMI's Python
-      # 3.9 lacks tomllib). Every value is runnable; qualification only flips
-      # pins.qualified via qualification.status.
+      # 3.9 lacks tomllib).
       CLAUDE_URL: ${{ needs.pins.outputs.claude_url }}
       CLAUDE_SHA256: ${{ needs.pins.outputs.claude_sha256 }}
       CLAUDE_VERSION: ${{ needs.pins.outputs.claude_version }}
@@ -598,9 +578,7 @@ jobs:
           set -euo pipefail
           # The `pins` job exports these; guard against a stray TBD reaching the
           # backend (e.g. a partially filled manifest) with a clear, actionable
-          # error rather than an opaque vLLM startup failure. On the nightly
-          # schedule the job is already gated on needs.pins.outputs.qualified, so
-          # this mainly protects run_claude_acceptance dispatches.
+          # error rather than an opaque vLLM startup failure.
           for pin in "$CLAUDE_URL" "$CLAUDE_SHA256" "$CLAUDE_VERSION" "$CLAUDE_PLATFORM" \
                      "$VLLM_IMAGE_PIN" "$VLLM_SERVED_MODEL" "$VLLM_FLAGS"; do
             case "$pin" in
@@ -609,7 +587,7 @@ jobs:
                 exit 1 ;;
               *TBD* )
                 echo "::error::pin.toml still carries an unresolved TBD value ($pin); complete "\
-                     "the qualification in tests/integration/fixtures/claude-code-cli/pin.toml"
+                     "the runtime pins in tests/integration/fixtures/claude-code-cli/pin.toml"
                 exit 1 ;;
             esac
           done
@@ -715,7 +693,7 @@ jobs:
 
       - name: Build Praxis and acceptance test
         run: |
-          cargo build -p praxis-ai-proxy
+          cargo build -p praxis-ai-proxy --features full
           cargo test -p praxis-tests-integration --test suite --no-run
 
       - name: Create restricted network namespace
@@ -868,7 +846,7 @@ jobs:
 
       - name: Upload acceptance diagnostics on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: claude-code-native-vllm-diagnostics
           # The gateway and native secrets are test constants and Praxis does not
@@ -1092,7 +1070,7 @@ jobs:
 
       - name: Build Praxis and Codex acceptance test
         run: |
-          cargo build -p praxis-ai-proxy
+          cargo build -p praxis-ai-proxy --features full
           cargo test -p praxis-tests-integration --test suite --no-run
 
       - name: Create restricted Codex network namespace
@@ -1212,7 +1190,7 @@ jobs:
 
       - name: Upload Codex acceptance diagnostics on failure
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: codex-vllm-gpu-diagnostics
           path: |
@@ -1440,7 +1418,7 @@ jobs:
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy
+        run: cargo build -p praxis-ai-proxy --features full
 
       - name: Wait for vLLM readiness
         run: |
@@ -1676,7 +1654,7 @@ jobs:
 
       - name: Build Praxis
         run: |
-          cargo build -p praxis-ai-proxy
+          cargo build -p praxis-ai-proxy --features full
           cargo build -p praxis-test-utils --example conversations_tenant_proxy
 
       - name: Wait for inference simulator readiness

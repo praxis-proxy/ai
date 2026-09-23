@@ -1,5 +1,5 @@
 # MCP Streaming Callout Transport
-# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
+# Requires `--features openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Demonstrates MCP tool calls over the filtered-subrequest transport with SSE
 # streaming support. The openai_mcp_dispatch filter executes MCP calls against
@@ -48,7 +48,7 @@
 #     }'
 #
 # Build:
-#   cargo build -p praxis-ai-proxy --no-default-features --features store-sqlite
+#   cargo build -p praxis-ai-proxy --features openai-mcp-tools,store-sqlite
 
 listeners:
   - name: ai-gateway

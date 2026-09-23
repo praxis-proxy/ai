@@ -13,11 +13,30 @@ publish = false
 name = "praxis_ai_apis"
 
 [features]
-default = ["store-postgres"]
-store = ["dep:sqlx", "dep:dashmap"]
+default = []
+# Stateful OpenAI Responses subsystem: request state kernel, validation, body
+# rebuild, stream composition, Chat Completions translation filter, document
+# extraction, client-tool compatibility, agentic loop, file search and web
+# search dispatch. Adds no crates; gated because of its size and coupling.
+openai-responses = []
+# openai_file_resolve: downloads referenced files (pinned reqwest client).
+openai-file-resolve-filter = ["openai-responses", "dep:reqwest"]
+# Response and conversation storage (SQL). Implies the Responses kernel it serves.
+store = ["openai-responses", "dep:sqlx", "dep:dashmap", "dep:zstd"]
 store-postgres = ["store", "sqlx/postgres", "sqlx/tls-native-tls"]
 store-sqlite = ["store", "sqlx/sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
+# Locally served Conversations API with JSON Schema item validation and the
+# generated implementation OpenAPI document.
+openai-conversations = ["store", "dep:jsonschema", "dep:utoipa"]
+# Context compaction with tiktoken token estimation.
+openai-compact = ["store", "dep:tiktoken-rs"]
+# MCP tool resolution and dispatch through the rmcp client (approvals persist).
+openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream"]
+# Every OpenAI group, without choosing a store backend.
+openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
+# Every non-experimental opt-in; equals the pre-feature-split capability.
+full = ["openai-all", "store-postgres"]
 praxis-main = []
 
 [lints]
@@ -30,7 +49,8 @@ bytes = { workspace = true }
 dashmap = { workspace = true, optional = true }
 futures = { workspace = true }
 http = { workspace = true }
-jsonschema = { workspace = true }
+jsonschema = { workspace = true, optional = true }
+openssl = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
 praxis-core = { workspace = true }
@@ -39,21 +59,22 @@ praxis-core = { workspace = true }
 # bind_chain for outbound callout chains. Both are off-by-default experimental
 # features in praxis 0.6.0 that carry no extra dependencies.
 praxis-filter = { workspace = true, features = ["iterative-request-router", "chain-binding"] }
-reqwest = { workspace = true }
-rmcp = { workspace = true }
+praxis-tls = { workspace = true }
+reqwest = { workspace = true, optional = true }
+rmcp = { workspace = true, optional = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-sha2 = { workspace = true }
 sqlx = { workspace = true, optional = true }
-sse-stream = { workspace = true }
+sse-stream = { workspace = true, optional = true }
 thiserror = { workspace = true }
-tiktoken-rs = { workspace = true }
+tiktoken-rs = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tracing = { workspace = true }
 url = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }

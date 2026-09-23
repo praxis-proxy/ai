@@ -5,7 +5,8 @@ Configuration examples organized by category.
 ## Running an Example
 
 ```console
-cargo run -p praxis-ai-proxy -- -c examples/configs/openai/responses/full-flow-agentic.yaml
+cargo run -p praxis-ai-proxy --features openai-all,store-sqlite -- \
+  -c examples/configs/openai/responses/full-flow-agentic.yaml
 curl http://localhost:8080/
 ```
 
@@ -63,6 +64,7 @@ before sending requests.
 | [messages-to-openai.yaml](configs/anthropic/messages-to-openai.yaml) | Transforms Anthropic Messages API requests and responses for Chat Completions-compatible inference backends |
 | [request-validate.yaml](configs/anthropic/request-validate.yaml) | Rejects empty, malformed, or non-object JSON request bodies |
 | [unified-gateway.yaml](configs/anthropic/unified-gateway.yaml) | Routes traffic by classifier-promoted headers so a single listener handles Anthropic Messages, OpenAI Chat Completions, and OpenAI Responses requests |
+| [web-search-scoped-credentials.yaml](configs/anthropic/web-search-scoped-credentials.yaml) | A scoped-credentials variant of full-flow-agentic.yaml |
 
 ### Azure
 
@@ -124,6 +126,7 @@ before sending requests.
 | [vllm-agentic-api.yaml](configs/openai/responses/vllm-agentic-api.yaml) | vLLM Agentic API: https://github.com/vllm-project/agentic-api |
 | [web-search-chat-completions-fixture.yaml](configs/openai/responses/web-search-chat-completions-fixture.yaml) | Single-upstream fixture configuration for recording the private Chat Completions function representation of a Responses web_search tool |
 | [web-search-chat-completions.yaml](configs/openai/responses/web-search-chat-completions.yaml) | Accepts OpenAI Responses requests with hosted web search while targeting a backend that only implements /v1/chat/completions |
+| [web-search-scoped-credentials.yaml](configs/openai/responses/web-search-scoped-credentials.yaml) | A scoped-credentials variant of web-search-chat-completions.yaml |
 | [web-search.yaml](configs/openai/responses/web-search.yaml) | Demonstrates the `openai_web_search` filter configuration |
 
 ### Payload Processing

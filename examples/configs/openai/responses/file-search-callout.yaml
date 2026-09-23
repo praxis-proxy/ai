@@ -1,4 +1,5 @@
 # File Search Callout Filter
+# Requires `--features openai-responses` because these filters are opt-in.
 #
 # Demonstrates hosted `file_search` execution under the unified agentic loop
 # (#1046). `openai_agentic_loop` is the sole loop owner: it parses each model

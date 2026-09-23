@@ -5,8 +5,8 @@
 //!
 //! Provides URL construction, SSRF-safe base-URL validation,
 //! resource-ID path-segment encoding, header forwarding, bounded
-//! JSON and byte reads, and normalized error mapping. Used by
-//! [`FilesApiClient`] and vector-store search.
+//! JSON and byte reads, and normalized error mapping. Used by the
+//! `openai_file_resolve` Files API client and vector-store search.
 //!
 //! All requests route through the [`SubRequestClient`] from
 //! praxis-core for connection pooling, TLS, admission control,
@@ -14,7 +14,6 @@
 //!
 //! Each consuming filter retains its own [`ApiClient`] instance.
 //!
-//! [`FilesApiClient`]: super::responses::file_resolve
 //! [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
 
 pub(crate) mod error;
@@ -34,11 +33,14 @@ use praxis_filter::{
     StagedUpstreamFallback, SubrequestRuntime, TlsPeerIdentity,
 };
 
+#[cfg(feature = "openai-responses")]
+pub(crate) use self::url::validate_forward_headers;
 pub(crate) use self::{
     error::ApiClientError,
-    url::{resource_url, validate_base_url, validate_forward_headers},
+    url::{resource_url, validate_base_url},
 };
 use crate::{
+    callout_identity::CalloutIdentity,
     callout_target::AddressPolicy,
     http_hop::{connection_nominates_header, is_hop_by_hop},
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
@@ -312,6 +314,8 @@ impl ApiClient {
             client: self.client.clone(),
             step_timeout: self.timeout,
             runtime,
+            callout_identity: None,
+            credential_authority: None,
         }
     }
 
@@ -423,6 +427,19 @@ impl ApiClient {
         let mut extensions = RequestExtensions::default();
         extensions.insert(staged_upstream);
         extensions.insert(staged_fallback);
+        if let Some(identity) = outbound.callout_identity.as_ref() {
+            let authority = outbound
+                .credential_authority
+                .as_deref()
+                .ok_or_else(|| ApiClientError::Transport {
+                    source: SubRequestError::InvalidRequest("missing configured credential authority".to_owned()),
+                })?;
+            identity
+                .stage_header_credential_into(&mut extensions, authority, http::header::AUTHORIZATION)
+                .map_err(|_error| ApiClientError::Transport {
+                    source: SubRequestError::InvalidRequest("Files API credential staging failed".to_owned()),
+                })?;
+        }
 
         let executor = FilteredSubrequestExecutor::for_callout(
             outbound.client.clone(),
@@ -499,6 +516,19 @@ pub(crate) struct OutboundExecution {
     step_timeout: Duration,
     /// Downstream attributes forwarded into each sub-request.
     runtime: DownstreamRuntime,
+    /// Trusted caller context projected into each child callout.
+    callout_identity: Option<CalloutIdentity>,
+    /// Exact authority for an optional caller-scoped Authorization credential.
+    credential_authority: Option<String>,
+}
+
+impl OutboundExecution {
+    /// Attach the trusted caller context used by configured Files API callouts.
+    pub(crate) fn with_callout_identity(mut self, identity: CalloutIdentity, credential_authority: String) -> Self {
+        self.callout_identity = Some(identity);
+        self.credential_authority = Some(credential_authority);
+        self
+    }
 }
 
 /// Retain the safe response metadata required by callout consumers.
@@ -585,12 +615,10 @@ mod tests {
         }
     }
 
-    use praxis_core::subrequest::SubRequestConnector;
-
     fn test_client(base_url: &str) -> ApiClient {
         ApiClient::new(ApiClientConfig {
             api_base_url: base_url.to_owned(),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
@@ -624,7 +652,7 @@ mod tests {
     fn forward_headers_copies_configured_headers() {
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: "http://ogx:8321".to_owned(),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: vec![
@@ -658,7 +686,7 @@ mod tests {
     fn forward_headers_skips_connection_nominated_fields() {
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: "http://ogx:8321".to_owned(),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: vec![
@@ -969,7 +997,7 @@ mod tests {
 
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: format!("http://{address}"),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: vec![http::header::CONTENT_TYPE],
@@ -1224,7 +1252,7 @@ mod tests {
 
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: format!("http://{addr}"),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(50),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),

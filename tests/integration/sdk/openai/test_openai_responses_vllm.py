@@ -17,7 +17,7 @@ gateway, persistence, tool-loop, and SDK protocol coverage. Tests marked
 ``real_inference`` or ``vllm_compat`` are skipped in simulator mode.
 
 Usage:
-    cargo build -p praxis-ai-proxy
+    cargo build -p praxis-ai-proxy --features full
     uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 """
 
@@ -131,7 +131,7 @@ def _find_binary() -> str:
         if os.path.isfile(candidate):
             return candidate
     raise FileNotFoundError(
-        "praxis-ai binary not found — run `cargo build -p praxis-ai-proxy` first"
+        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full` first"
     )
 
 
@@ -166,6 +166,23 @@ def _patch_store_backend(config: str, db_path: str) -> str:
     return config
 
 
+def _enable_response_store_compression(config: str) -> str:
+    """Append a zstd compression block to the openai_response_store filter."""
+    anchor = (
+        "        responses_table: openai_responses\n"
+        "        conversations_table: openai_conversations\n"
+    )
+    if anchor not in config:
+        raise AssertionError(
+            "response-store filter anchor not found; the example config layout "
+            "changed and _enable_response_store_compression needs updating"
+        )
+    return config.replace(
+        anchor,
+        anchor + "        compression:\n          algorithm: zstd\n          level: 3\n",
+    )
+
+
 def _persist_config(config: str) -> str:
     """Write a generated Praxis config to a temp file and return its path.
 
@@ -191,7 +208,7 @@ def _persist_config(config: str) -> str:
     return path
 
 
-def _write_config(praxis_port: int, db_path: str) -> str:
+def _write_config(praxis_port: int, db_path: str, compression: bool = False) -> str:
     with open(CONFIG_PATH) as f:
         config = f.read()
 
@@ -204,6 +221,8 @@ def _write_config(praxis_port: int, db_path: str) -> str:
     # key keeps the dispatcher inert while letting the binary start.
     config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
     config = _patch_store_backend(config, db_path)
+    if compression:
+        config = _enable_response_store_compression(config)
 
     path = _persist_config(config)
     return path
@@ -1171,6 +1190,45 @@ def praxis_proxy(tmp_path_factory, request):
 
 
 @pytest.fixture(scope="session")
+def compression_proxy(tmp_path_factory, request):
+    """Start a Praxis proxy whose response store has zstd compression enabled."""
+    port = _free_port()
+    db_dir = tmp_path_factory.mktemp("responses-compression")
+    db_path = str(db_dir / "responses.db")
+    config_path = _write_config(port, db_path, compression=True)
+    binary = _find_binary()
+
+    log_path = str(db_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Compression store Praxis logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
 def irr_streaming_proxy(tmp_path_factory, request):
     """Start a Praxis proxy with terminal Responses streaming through IRR."""
     port = _free_port()
@@ -1576,7 +1634,10 @@ def openai_client(praxis_proxy):
     return OpenAI(
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
         api_key="test",
-        default_headers=TRUSTED_OWNER_HEADERS,
+        default_headers={
+            **TRUSTED_OWNER_HEADERS,
+            "x-user-ogx-key": "Bearer test",
+        },
         max_retries=0,
         timeout=300,
     )
@@ -1589,6 +1650,18 @@ def other_owner_openai_client(praxis_proxy):
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
         api_key="test",
         default_headers={**TRUSTED_OWNER_HEADERS, "x-auth-user": "other-test-user"},
+        max_retries=0,
+        timeout=300,
+    )
+
+
+@pytest.fixture(scope="session")
+def compression_openai_client(compression_proxy):
+    """Return an OpenAI client pointed at the compression-enabled proxy."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{compression_proxy}/v1",
+        api_key="test",
+        default_headers=TRUSTED_OWNER_HEADERS,
         max_retries=0,
         timeout=300,
     )
@@ -1695,6 +1768,100 @@ def web_search_chat_streaming_client(web_search_chat_streaming_proxy):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+class TestOpenAIResponsesStoreCompression:
+    """Integration tests for response store with zstd payload compression enabled."""
+
+    def test_compressed_store_and_retrieve(self, compression_openai_client):
+        client = compression_openai_client
+        response = client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: COMPRESSED-OK. /no_think",
+            temperature=0,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        assert response.status == "completed"
+        assert response.id
+
+        retrieved = client.responses.retrieve(response.id)
+
+        assert retrieved.id == response.id
+        assert retrieved.status == "completed"
+        # The full response object survives the compress -> BLOB -> decompress
+        # trip unchanged.
+        assert retrieved.output_text == response.output_text
+        _assert_usage(retrieved.usage)
+
+    def test_compressed_input_items_round_trip(self, compression_openai_client):
+        client = compression_openai_client
+        response = client.responses.create(
+            model=VLLM_MODEL,
+            input=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "The marker is COMPRESSED-INPUT-OK.",
+                        }
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Repeat the marker exactly. /no_think",
+                        }
+                    ],
+                },
+            ],
+            store=True,
+            max_output_tokens=128,
+        )
+
+        # Reading the stored input items back decompresses the `input` column;
+        # the original marker text must be intact.
+        items = client.responses.input_items.list(response.id, order="asc")
+        texts = [
+            block.text
+            for item in items.data
+            if item.type == "message"
+            for block in item.content
+            if block.type == "input_text"
+        ]
+        assert any("COMPRESSED-INPUT-OK" in text for text in texts), texts
+
+    def test_compressed_previous_response_chaining(
+        self, compression_openai_client
+    ):
+        client = compression_openai_client
+        first = client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: FIRST-TURN-OK. /no_think",
+            temperature=0,
+            store=True,
+            max_output_tokens=512,
+        )
+        assert first.status == "completed"
+
+        # Chaining rehydrates first's compressed messages/input on the read
+        # path before the next turn is assembled.
+        second = client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: SECOND-TURN-OK. /no_think",
+            previous_response_id=first.id,
+            temperature=0,
+            store=True,
+            max_output_tokens=512,
+        )
+        assert second.status == "completed"
+        assert second.id != first.id
 
 
 class TestOpenAIResponsesVLLM:

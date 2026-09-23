@@ -100,6 +100,7 @@ macro_rules! chat_completions_operations {
                             request_body: request_body_shape!($body),
                         },
                         spec_path: $path,
+                        #[cfg(feature = "openai-conversations")]
                         owned_contract: None,
                     },
                 },
@@ -303,6 +304,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "openai-conversations")]
     #[test]
     fn registry_proxies_without_inspecting_or_owning_the_contract() {
         assert!(

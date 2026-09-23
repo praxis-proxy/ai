@@ -15,6 +15,7 @@ use std::{
 use praxis_filter::{
     BodyMode, FilterAction, FilterEntry, FilterPipeline, FilterRegistry, HttpFilter, TrustedHeaderMutation,
 };
+use secrecy::SecretString;
 use serde_json::{Value, json};
 
 use super::{
@@ -27,6 +28,7 @@ use super::{
     *,
 };
 use crate::{
+    CalloutCredentials, StateOwner,
     callout_policy::OnFailure,
     openai::responses::state::{FileSearchAssignment, SynthesisKind},
     subrequest::{SubRequestClient, SubRequestError, SubResponse},
@@ -119,6 +121,7 @@ async fn build_config_with_client_shares_connector_circuit_state() {
         subrequest::{SubRequestConnector, SubRequestConnectorOptions, SubRequestError},
     };
 
+    praxis_tls::provider::install();
     let shared = SubRequestClient::with_max_response_bytes(
         SubRequestConnector::with_options(SubRequestConnectorOptions {
             keepalive_pool_size: 4,
@@ -860,26 +863,26 @@ async fn ranking_filters_rewrite_policy_and_safe_path_are_sent_to_vector_store()
 }
 
 #[tokio::test]
-async fn forwarded_credentials_stay_pinned_to_config_upstream_despite_hostile_store_id() {
+async fn scoped_credentials_stay_pinned_to_config_upstream_despite_hostile_store_id() {
     // The vector-store destination is derived solely from operator config
     // (`vector_store_url`); a client/model-controlled `vector_store_id` only fills
     // a single, percent-encoded path segment. A store ID crafted to look like an
-    // alternate authority must not retarget the callout: the forwarded credential
+    // alternate authority must not retarget the callout: the scoped credential
     // has to reach the config-pinned upstream and nowhere else. The 0.5.6 executor
     // pins the `StagedUpstream` derived from the prepared target and re-pins after
     // the request phase, so no chain filter can move the credential either.
     let server = MockServer::json(200, &json!({"data": []}));
     let filter = make_concrete_filter_with_outbound(
         server.port,
-        "on_failure: closed\nforward_headers:\n  - authorization\n",
+        "on_failure: closed\nuser_credential: ogx_files\n",
         test_outbound_pipeline(),
     );
     // A store ID that tries to smuggle in an alternate host authority.
     let hostile_store_id = "vs-a@evil.example.com/steal";
-    let mut ctx = make_context_with_request_headers(
-        Some(one_pending_state(&[hostile_store_id])),
-        &[("authorization", "Bearer super-secret-token")],
-    );
+    let mut ctx = make_context(Some(one_pending_state(&[hostile_store_id])));
+    let mut credentials = CalloutCredentials::new();
+    credentials.insert("ogx_files".to_owned(), SecretString::from("Bearer super-secret-token"));
+    ctx.extensions.insert(credentials);
 
     assert!(matches!(dispatch(&filter, &mut ctx).await, FilterAction::Continue));
     let requests = server.requests();
@@ -891,12 +894,12 @@ async fn forwarded_credentials_stay_pinned_to_config_upstream_despite_hostile_st
     );
     let request = &requests[0];
 
-    // The forwarded credential is present on the callout to the trusted host.
+    // The scoped credential is present on the callout to the trusted host.
     assert!(
         request
             .lines()
             .any(|line| line.eq_ignore_ascii_case("authorization: Bearer super-secret-token")),
-        "forwarded credential must be sent to the configured upstream; got:\n{request}"
+        "scoped credential must be sent to the configured upstream; got:\n{request}"
     );
     // The authority stays the config-derived loopback host: the hostile store ID
     // could not move the credential to `evil.example.com`.
@@ -916,6 +919,205 @@ async fn forwarded_credentials_stay_pinned_to_config_upstream_despite_hostile_st
         request_line.contains("evil%2Eexample%2Ecom%2Fsteal"),
         "store ID must be percent-encoded into one path segment; got:\n{request_line}"
     );
+}
+
+#[tokio::test]
+async fn scoped_credential_is_not_replayed_to_redirect_authority() {
+    let redirect_target = TcpListener::bind("127.0.0.1:0").unwrap();
+    redirect_target.set_nonblocking(true).unwrap();
+    let redirect_address = redirect_target.local_addr().unwrap();
+    let source = TcpListener::bind("127.0.0.1:0").unwrap();
+    let source_port = source.local_addr().unwrap().port();
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = source.accept().unwrap();
+        let request = read_http_request(&mut stream);
+        request_tx.send(request).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 302 Found\r\nLocation: http://{redirect_address}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    let filter = make_concrete_filter(source_port, "user_credential: ogx_files\non_failure: open\n");
+    let mut ctx = make_context(Some(one_pending_state(&["vs-a"])));
+    let mut credentials = CalloutCredentials::new();
+    credentials.insert("ogx_files".to_owned(), SecretString::from("Bearer scoped-user-a"));
+    ctx.extensions.insert(credentials);
+
+    assert!(matches!(dispatch(&filter, &mut ctx).await, FilterAction::Continue));
+    let source_request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(
+        source_request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("authorization: Bearer scoped-user-a")),
+        "credential should reach only the configured source authority"
+    );
+    assert_eq!(
+        redirect_target.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "redirect authority must never receive a replayed request"
+    );
+}
+
+#[tokio::test]
+async fn two_user_scoped_credentials_and_attribution_are_isolated() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_concrete_filter_with_outbound(
+        server.port,
+        "user_credential: ogx_files\n",
+        outbound_pipeline_projecting_owner(),
+    );
+    for suffix in ["a", "b"] {
+        let store = format!("vs-user-{suffix}");
+        let tenant = format!("tenant-{suffix}");
+        let subject = format!("user-{suffix}");
+        let mut ctx = make_context(Some(one_pending_state(&[&store])));
+        let mut credentials = CalloutCredentials::new();
+        credentials.insert(
+            "ogx_files".to_owned(),
+            SecretString::from(format!("Bearer scoped-user-{suffix}")),
+        );
+        ctx.extensions.insert(credentials);
+        ctx.extensions
+            .insert(StateOwner::from_trusted_parts(tenant, "urn:integration:test", subject).unwrap());
+
+        assert!(matches!(dispatch(&filter, &mut ctx).await, FilterAction::Continue));
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        let retained_state = serde_json::to_string(&(
+            &state.request_body,
+            &state.messages,
+            &state.persisted_messages,
+            &state.accumulated_output,
+        ))
+        .unwrap();
+        assert!(
+            !retained_state.contains("scoped-user-"),
+            "credential material must not enter request or persistence state"
+        );
+    }
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one vector-store request per user should be dispatched"
+    );
+    for (request, suffix) in requests.iter().zip(["a", "b"]) {
+        for expected in [
+            format!("authorization: Bearer scoped-user-{suffix}"),
+            format!("x-tenant-id: tenant-{suffix}"),
+            format!("x-user-id: user-{suffix}"),
+        ] {
+            assert!(
+                request.lines().any(|line| line.eq_ignore_ascii_case(&expected)),
+                "user {suffix} callout must carry only its scoped context; got:\n{request}"
+            );
+        }
+        let other = if suffix == "a" { "b" } else { "a" };
+        assert!(
+            !request.contains(&format!("scoped-user-{other}"))
+                && !request.contains(&format!("tenant-{other}"))
+                && !request.contains(&format!("user-{other}")),
+            "user {suffix} callout leaked user {other} context: {request}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_scoped_credential_records_security_failure_even_when_fail_open() {
+    let server = MockServer::json(200, &json!({"data": []}));
+    let filter = make_concrete_filter(server.port, "user_credential: ogx_files\non_failure: open\n");
+    let mut ctx = make_context(Some(one_pending_state(&["vs-user-a"])));
+
+    assert!(matches!(
+        filter.dispatch(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(server.requests().is_empty(), "missing context must stop dispatch");
+    let failure = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.security_failure.as_ref())
+        .expect("security failure should be recorded");
+    assert_eq!(failure.status, 401);
+    assert_eq!(failure.code, MISSING_CALLOUT_CONTEXT);
+}
+
+#[tokio::test]
+async fn initial_streaming_request_missing_credential_rejects_before_first_round() {
+    let filter = make_filter(1, "user_credential: ogx_files\n");
+    let mut ctx = make_context(Some(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "find the launch checklist",
+        "stream": true,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs-a"]}]
+    }))));
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("missing credential must reject before inference, got {action:?}");
+    };
+    assert_eq!(rejection.status, 401);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().expect("JSON error body")).unwrap();
+    assert_eq!(body["error"]["code"], MISSING_CALLOUT_CONTEXT);
+}
+
+#[tokio::test]
+async fn initial_request_with_scoped_credential_passes_preflight() {
+    let filter = make_filter(1, "user_credential: ogx_files\n");
+    let mut ctx = make_context(Some(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": "find the launch checklist",
+        "stream": true,
+        "tools": [{"type": "file_search", "vector_store_ids": ["vs-a"]}]
+    }))));
+    let mut credentials = CalloutCredentials::new();
+    credentials.insert("ogx_files".to_owned(), SecretString::from("Bearer scoped-user-a"));
+    ctx.extensions.insert(credentials);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+}
+
+#[tokio::test]
+async fn initial_request_with_ineligible_file_search_skips_preflight() {
+    for tool_choice in [
+        json!("none"),
+        json!({"type": "function", "name": "lookup"}),
+        json!({
+            "type": "allowed_tools",
+            "mode": "auto",
+            "tools": [{"type": "function", "name": "lookup"}]
+        }),
+    ] {
+        let filter = make_filter(1, "user_credential: ogx_files\n");
+        let mut ctx = make_context(Some(ResponsesState::from_request_body(json!({
+            "model": "gpt-4.1",
+            "input": "find the launch checklist",
+            "tool_choice": tool_choice,
+            "tools": [
+                {"type": "file_search", "vector_store_ids": ["vs-a"]},
+                {"type": "function", "name": "lookup"}
+            ]
+        }))));
+
+        let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+    }
+}
+
+#[test]
+fn missing_scoped_credential_rejects_without_loop_state() {
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&request);
+
+    let action = record_missing_callout_context(&mut ctx, "ogx_files");
+    let FilterAction::Reject(rejection) = action else {
+        panic!("missing loop state must reject directly, got {action:?}");
+    };
+    assert_eq!(rejection.status, 401);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().expect("JSON error body")).unwrap();
+    assert_eq!(body["error"]["code"], MISSING_CALLOUT_CONTEXT);
 }
 
 #[tokio::test]
@@ -1536,9 +1738,7 @@ fn parse_config(yaml: &str) -> Result<ValidatedConfig, FilterError> {
 
 /// A default sub-request client for config-parsing tests that never dials.
 fn test_subrequest_client() -> SubRequestClient {
-    use praxis_core::subrequest::SubRequestConnector;
-
-    SubRequestClient::new(SubRequestConnector::new(4, None))
+    crate::subrequest::isolated_client(4)
 }
 
 /// An outbound pipeline that permits loopback/private upstreams so tests can
@@ -1573,6 +1773,23 @@ fn outbound_pipeline_stamping_header(name: &str, value: &str) -> Arc<FilterPipel
         .expect("headers filter entry parses"),
     ];
     let mut pipeline = FilterPipeline::build(&mut entries, &registry).expect("headers pipeline builds");
+    pipeline.set_allow_private_upstreams(true);
+    Arc::new(pipeline)
+}
+
+/// Outbound chain used to prove the projected owner is materialized only on the
+/// vector-store child request.
+fn outbound_pipeline_projecting_owner() -> Arc<FilterPipeline> {
+    let mut registry = FilterRegistry::with_builtins();
+    praxis_filter::register_filters!(
+        @register registry,
+        http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
+    );
+    let mut entries: Vec<FilterEntry> = vec![
+        serde_yaml::from_str("filter: state_owner_headers\ntenant_header: x-tenant-id\nsubject_header: x-user-id\n")
+            .expect("state-owner projection entry parses"),
+    ];
+    let mut pipeline = FilterPipeline::build(&mut entries, &registry).expect("owner projection pipeline builds");
     pipeline.set_allow_private_upstreams(true);
     Arc::new(pipeline)
 }
@@ -1621,6 +1838,7 @@ fn make_concrete_filter_with_outbound(
     let validated = build_config_with_client(&raw, test_subrequest_client()).unwrap();
     let client = FileSearchClient::new(FileSearchClientConfig {
         base_url: format!("http://127.0.0.1:{port}"),
+        credential_authority: format!("127.0.0.1:{port}"),
         subrequest_client: validated.subrequest_client,
         forward_header_names: validated.forward_header_names,
         on_failure: validated.on_failure,
@@ -1633,6 +1851,7 @@ fn make_concrete_filter_with_outbound(
         outbound,
         max_state_bytes: validated.max_state_bytes,
         on_failure: validated.on_failure,
+        user_credential_slot: validated.user_credential,
     }
 }
 

@@ -12,14 +12,9 @@
 #
 # The GPU acceptance job (`vllm-gpu-claude-acceptance`) reuses the ephemeral EC2
 # GPU runner and the Qwen3-8B weights the full suite already warmed on-disk. A
-# lightweight `pins` job parses this manifest and exports `qualified` (true only
-# when `qualification.status == "qualified"` and no exported value contains
-# "TBD"); the acceptance job stays dormant on the nightly schedule until that
-# flips, so PR/merge-queue/nightly CI stay green while qualification is pending.
-# Every launch value below is runnable as-is — only `qualification.status`
-# (pending) keeps the job dormant. `model_revision` is recorded for
-# reproducibility at qualification and is intentionally NOT a launch flag, so a
-# `workflow_dispatch` qualification run can execute before the revision is known.
+# lightweight `pins` job parses this manifest and exports its runtime values.
+# The acceptance job runs nightly and can also be dispatched independently.
+# `model_revision` is documentary and intentionally NOT a launch flag.
 
 [claude_code]
 # Version substring asserted from `claude --version`. Keep in sync with
@@ -129,11 +124,3 @@ flags = [
 # documented nonfatal 404.
 [startup_matrix]
 allowed_prefixes = ["/v1/messages", "/v1/chat/completions", "/v1/models", "/health"]
-
-[qualification]
-# Before CI runs this test once (no retry), select a model that passes at least
-# 20 consecutive qualification runs of the full acceptance flow without retries.
-# Record the passing model's served name, image digest, and revision above.
-consecutive_passes_required = 20
-retries_allowed = 0
-status = "pending"

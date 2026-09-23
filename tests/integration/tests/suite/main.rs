@@ -51,6 +51,8 @@ mod examples;
 mod failure_mode;
 mod guardrails;
 mod harness;
+// Several replayed scenarios run examples backed by the SQLite response store.
+#[cfg(feature = "store-sqlite")]
 mod inference_fixtures;
 mod mcp;
 mod mcp_broker;

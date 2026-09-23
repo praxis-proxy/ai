@@ -39,6 +39,11 @@ const CIRCUIT_IDLE_THRESHOLD: Duration = Duration::from_secs(600); // 10 min
 /// [`SubRequestConnector::new`]: praxis_core::subrequest::SubRequestConnector::new
 #[must_use]
 pub fn create_subrequest_client(config: &Config) -> SubRequestClient {
+    // Constructing the connector builds a rustls client configuration. Keep
+    // provider installation at this boundary so library callers and test
+    // executables are safe even when they do not enter through `main`.
+    crate::install_crypto_provider();
+
     let pool_size = config
         .runtime
         .subrequest_pool_size
@@ -171,6 +176,7 @@ runtime:
         );
     }
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn client_aware_factories_accept_configured_client() {
         use std::collections::HashMap;

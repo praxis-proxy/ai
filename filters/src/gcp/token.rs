@@ -103,7 +103,7 @@ pub(super) async fn fetch_pinned(
     };
 
     let url = metadata_token_url(metadata_host, service_account, scope);
-    let client = praxis_ai_apis::callout_target::build_pinned_reqwest_client(
+    let client = crate::pinned_client::build_pinned_reqwest_client(
         "gcp_adc",
         &url,
         praxis_ai_apis::callout_target::AddressPolicy::AllowPrivate,

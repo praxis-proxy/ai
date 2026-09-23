@@ -16,6 +16,7 @@ use praxis_filter::Rejection;
 /// Build a non-streaming OpenAI API error JSON body.
 ///
 /// Produces `{"error":{"message":"<msg>","type":"<code>","param":null,"code":"<code>"}}`.
+#[cfg(feature = "openai-responses")]
 pub(crate) fn responses_error_body(code: &str, message: &str) -> Bytes {
     responses_error_body_with_code(code, code, message)
 }
@@ -46,11 +47,13 @@ fn responses_error_body_with_code(error_type: &str, code: &str, message: &str) -
 /// `stream_events` logical-stream terminal error, or a dispatch filter that
 /// finalizes the stream directly). Pre-commitment rejections use the JSON
 /// envelope via [`responses_error_rejection`] instead.
+#[cfg(feature = "openai-responses")]
 pub(crate) fn responses_error_sse_payload(code: &str, message: &str) -> serde_json::Value {
     responses_error_sse_payload_at_sequence(code, message, 0)
 }
 
 /// Build the JSON payload for an SSE error at a logical-stream sequence.
+#[cfg(feature = "openai-responses")]
 fn responses_error_sse_payload_at_sequence(code: &str, message: &str, sequence_number: u64) -> serde_json::Value {
     serde_json::json!({
         "type": "error",
@@ -103,6 +106,7 @@ pub(crate) fn responses_error_rejection_with_code(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn error_body_has_correct_shape() {
         let body = responses_error_body("invalid_request_error", "bad input");
@@ -141,6 +145,7 @@ mod tests {
         assert!(body["error"]["param"].is_null(), "param should be null");
     }
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn error_body_escapes_special_characters() {
         let body = responses_error_body("server_error", "line1\nline2\"quoted\"");
@@ -152,6 +157,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn sse_payload_matches_pinned_response_error_event_schema() {
         let payload = responses_error_sse_payload("rate_limit_exceeded", "slow down");

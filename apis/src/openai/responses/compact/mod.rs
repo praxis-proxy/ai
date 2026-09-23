@@ -56,7 +56,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
-use super::{error::responses_error_rejection, state::ResponsesState};
+use super::{error::responses_error_rejection, is_explicit_compact_request, state::ResponsesState};
 use crate::{
     callout_policy::OnFailure,
     state_owner::{StateOwner, require_state_owner},
@@ -82,9 +82,7 @@ user preferences, and important context. The summary \
 will replace the full conversation history, so it must \
 capture everything needed to continue coherently.";
 
-/// Default prefix prepended to the summary when translating
-/// compaction items to backend-compatible messages.
-pub const DEFAULT_SUMMARY_PREFIX: &str = "[Previous conversation summary]\n\n";
+pub use crate::openai::translation::chat_completions::DEFAULT_SUMMARY_PREFIX;
 
 // -----------------------------------------------------------------------------
 // CompactionParams
@@ -174,7 +172,7 @@ impl CompactFilter {
     ///
     /// Returns [`FilterError`] if config validation fails.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+        let client = subrequest::isolated_client(4);
         Self::build(config, client)
     }
 
@@ -535,11 +533,6 @@ fn previous_usage_total(state: &ResponsesState) -> Option<u64> {
         "token count from prior response"
     );
     Some(total)
-}
-
-/// Check whether this is an explicit `POST /v1/responses/compact` request.
-pub(super) fn is_explicit_compact_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.request.method == http::Method::POST && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
 }
 
 /// Check whether this is an OpenAI Responses API request.

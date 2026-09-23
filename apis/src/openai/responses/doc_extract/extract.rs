@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tracing::debug;
 
 use super::config::{DocExtractConfig, OnUnsupported, is_text_safe_mime};
-use crate::openai::responses::file_resolve::resolve::infer_mime_from_filename;
+use crate::openai::responses::content_parts::infer_mime_from_filename;
 
 /// Errors that can occur during document extraction.
 #[derive(Debug, Clone)]

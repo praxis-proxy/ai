@@ -10,15 +10,16 @@ use std::{
 };
 
 use bytes::Bytes;
+use secrecy::SecretString;
 use serde_json::json;
 
 use super::*;
 use crate::{
+    CalloutCredentials,
     openai::{
         api_client::{ApiClient, ApiClientConfig},
         responses::state::ResponsesState,
     },
-    subrequest::SubRequestClient,
 };
 
 // -----------------------------------------------------------------------------
@@ -611,6 +612,154 @@ async fn resolves_history_when_current_input_has_no_file_id() {
 }
 
 #[tokio::test]
+async fn missing_scoped_credential_rejects_before_file_id_dispatch() {
+    let files_api_url = start_files_api_stub();
+    let filter = make_filter_with_outbound_from_yaml(&format!(
+        "files_api_url: \"{files_api_url}\"\nallow_pre_security_callout: true\nuser_credential: ogx_files\non_missing: continue"
+    ));
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let request_body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-history"}]
+        }]
+    });
+    ctx.extensions
+        .insert(ResponsesState::from_request_body(request_body.clone()));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("missing slot must reject directly, got {action:?}");
+    };
+    assert_eq!(rejection.status, 401);
+    let rejection_body: serde_json::Value =
+        serde_json::from_slice(rejection.body.as_ref().expect("JSON error body")).unwrap();
+    assert_eq!(rejection_body["error"]["code"], MISSING_CALLOUT_CONTEXT);
+    assert_eq!(
+        body,
+        Some(Bytes::from(serde_json::to_vec(&request_body).unwrap())),
+        "missing security context must stop before rewriting or dispatch"
+    );
+}
+
+#[tokio::test]
+async fn scoped_credential_arrives_on_file_id_metadata_and_content_requests() {
+    let files_api_url = start_files_api_stub_requiring_auth("Bearer scoped-user-a");
+    let filter = make_filter_with_outbound_from_yaml(&format!(
+        "files_api_url: \"{files_api_url}\"\nallow_pre_security_callout: true\nuser_credential: ogx_files\non_missing: reject"
+    ));
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let request_body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-history"}]
+        }]
+    });
+    let mut credentials = CalloutCredentials::new();
+    credentials.insert("ogx_files".to_owned(), SecretString::from("Bearer scoped-user-a"));
+    ctx.extensions.insert(credentials);
+    ctx.extensions
+        .insert(ResponsesState::from_request_body(request_body.clone()));
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let rewritten: serde_json::Value = serde_json::from_slice(body.as_ref().unwrap()).unwrap();
+    assert_eq!(rewritten["input"][0]["content"][0]["file_data"], "aGlzdG9yeQ==");
+    assert!(
+        !String::from_utf8_lossy(body.as_ref().unwrap()).contains("scoped-user-a"),
+        "credential material must not enter the rewritten inference body"
+    );
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let retained_state = serde_json::to_string(&(
+        &state.request_body,
+        &state.messages,
+        &state.persisted_messages,
+        &state.accumulated_output,
+    ))
+    .unwrap();
+    assert!(
+        !retained_state.contains("scoped-user-a"),
+        "credential material must not enter request or persistence state"
+    );
+}
+
+#[tokio::test]
+async fn scoped_file_id_credential_is_not_replayed_to_redirect_authority() {
+    let redirect_target = TcpListener::bind("127.0.0.1:0").unwrap();
+    redirect_target.set_nonblocking(true).unwrap();
+    let redirect_address = redirect_target.local_addr().unwrap();
+    let source = TcpListener::bind("127.0.0.1:0").unwrap();
+    let source_address = source.local_addr().unwrap();
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut stream, _) = source.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let read = stream.read(&mut request).unwrap();
+        request_tx
+            .send(String::from_utf8_lossy(&request[..read]).into_owned())
+            .unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 302 Found\r\nLocation: http://{redirect_address}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    let filter = make_filter_with_outbound_from_yaml(&format!(
+        "files_api_url: \"http://{source_address}\"\nallow_pre_security_callout: true\nuser_credential: ogx_files\non_missing: continue"
+    ));
+    let req = Box::leak(Box::new(crate::test_utils::make_request(
+        http::Method::POST,
+        "/v1/responses",
+    )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let request_body = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-history"}]
+        }]
+    });
+    let mut credentials = CalloutCredentials::new();
+    credentials.insert("ogx_files".to_owned(), SecretString::from("Bearer scoped-user-a"));
+    ctx.extensions.insert(credentials);
+    let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
+
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let source_request = request_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(
+        source_request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("authorization: Bearer scoped-user-a")),
+        "credential should reach only the configured Files API authority"
+    );
+    assert_eq!(
+        redirect_target.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "redirect authority must never receive a replayed request"
+    );
+}
+
+#[tokio::test]
 async fn mirrored_history_has_independent_inline_budget() {
     let files_api_url = start_files_api_stub();
     let client = make_client_for_url_with_max(&files_api_url, 16);
@@ -910,7 +1059,7 @@ fn make_filter_with_outbound_for_url(files_api_url: &str) -> Box<dyn HttpFilter>
 /// filter YAML.
 fn make_filter_with_outbound_from_yaml(yaml_str: &str) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(yaml_str).unwrap();
-    let client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+    let client = crate::subrequest::isolated_client(4);
     FileResolveFilter::from_config_with_outbound(&yaml, client, private_outbound_pipeline()).unwrap()
 }
 
@@ -921,7 +1070,7 @@ fn make_client() -> FilesApiClient {
 fn make_client_for_url_with_max(files_api_url: &str, max_resolved_bytes: usize) -> FilesApiClient {
     let api = ApiClient::new(ApiClientConfig {
         api_base_url: files_api_url.to_owned(),
-        client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+        client: crate::subrequest::isolated_client(4),
         timeout: Duration::from_secs(5),
         max_response_bytes: 1_048_576,
         forward_header_names: vec![],
@@ -947,6 +1096,55 @@ fn start_files_api_stub() -> String {
     });
 
     format!("http://{address}")
+}
+
+fn start_files_api_stub_requiring_auth(expected: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            std::thread::spawn(move || serve_file_request_requiring_auth(stream, expected));
+        }
+    });
+
+    format!("http://{address}")
+}
+
+fn serve_file_request_requiring_auth(mut stream: std::net::TcpStream, expected: &str) {
+    let mut request = [0_u8; 4096];
+    let read = stream.read(&mut request).unwrap();
+    let request = String::from_utf8_lossy(&request[..read]);
+    let expected_header = format!("authorization: {expected}");
+    if !request.lines().any(|line| line.eq_ignore_ascii_case(&expected_header)) {
+        let body = br#"{"error":"missing scoped credential"}"#;
+        let headers = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        return;
+    }
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap();
+    let (content_type, body): (&str, &[u8]) = if path.ends_with("/content") {
+        ("text/plain", b"history")
+    } else {
+        (
+            "application/json",
+            br#"{"id":"file-history","filename":"history.txt","content_type":"text/plain","bytes":7}"#,
+        )
+    };
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).unwrap();
+    stream.write_all(body).unwrap();
 }
 
 fn serve_file_request(mut stream: std::net::TcpStream) {

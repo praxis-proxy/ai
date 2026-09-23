@@ -160,20 +160,16 @@ host-side veth address, which Praxis then binds) to launch the client inside a
 restricted Linux network namespace that can reach only Praxis, proving it cannot
 bypass the proxy.
 
-**Pins and qualification.** The pinned Claude Code version and launch flags, the
-vLLM image digest, served model, and startup request matrix live in
+**Pins and scheduled acceptance.** The pinned Claude Code version and launch
+flags, the vLLM image digest, served model, and startup request matrix live in
 [`tests/integration/fixtures/claude-code-cli/pin.toml`](../tests/integration/fixtures/claude-code-cli/pin.toml).
-The `claude-code-native-vllm` job in
+The `vllm-gpu-claude-acceptance` job in
 [`.github/workflows/vllm-integration.yaml`](../.github/workflows/vllm-integration.yaml)
 runs both tests sequentially against one shared vLLM container, each exactly once
-(no retry), on `workflow_dispatch` only, so PR and merge-queue CI stay green
-while qualification is pending. Before it can run, a model must pass the
-consecutive qualification runs recorded in the manifest, the
-`TBD-at-qualification` pins (served model, image digest, revision, Claude Code
-archive url + sha256) must be filled in, and the manifest `status` set to
-`qualified`; the job also requires the `VLLM_API_KEY` repository secret. Until
-then it fails fast with an explanatory error rather than running against
-unqualified pins.
+(no retry), on every nightly GPU run. It can also run independently through the
+`run_claude_acceptance` workflow-dispatch input. Runtime pins must be complete;
+the job fails fast with an explanatory error if any required value is empty or
+still contains `TBD`.
 
 ## Passthrough to Anthropic API
 

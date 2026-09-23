@@ -30,12 +30,14 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 - [Run Codex or Claude Code through Praxis and vLLM](developing/cli-vllm-through-praxis.md)
 - [Adding filters](developing/adding-filters.md)
 - [Type design](developing/type-design.md)
+- [FIPS tooling](developing/fips.md)
 - [Project management](developing/project-management.md)
 - [Proposal process](https://github.com/praxis-proxy/enhancements)
 
 ## Operations and releases
 
 - [Release process](release.md)
+- [FIPS 140-3](fips.md)
 - [Migrating to 0.2.0](migrating-to-0.2.md)
 - [Security policy](../SECURITY.md)
 - [Contributing](../CONTRIBUTING.md)
