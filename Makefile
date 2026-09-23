@@ -17,7 +17,9 @@ INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-f
 # Features for `make release`; `full` matches the published container image.
 PRAXIS_AI_FEATURES ?= full
 # Crates that must never enter the default (standard) praxis-ai-proxy graph.
-DEFAULT_GRAPH_DENY := sqlx sqlx-core libsqlite3-sys openssl-sys native-tls rmcp sse-stream \
+# openssl-sys is not on the list: praxis performs all cryptography through the
+# system OpenSSL, so its bindings are part of every build by design.
+DEFAULT_GRAPH_DENY := sqlx sqlx-core libsqlite3-sys native-tls rmcp sse-stream \
 	jsonschema utoipa tiktoken-rs reqwest serde_json_path tonic prost
 # Upper bound on crates (name@version, normal + build edges, host target) in the
 # default graph. Linux hosts measure about 424, macOS about 428.

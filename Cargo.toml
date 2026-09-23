@@ -107,10 +107,12 @@ praxis-ai-filters = { version = "0.3.0", path = "filters", default-features = fa
 praxis-ai-apis = { version = "0.3.0", path = "apis", default-features = false }
 praxis-ai-build-support = { version = "0.3.0", path = "server/build_support" }
 
-# Pingora (temporary fork)
-pingora-core = { version = "0.9.0", package = "quixotic-plecostomus-core", features = ["rustls"] }
-pingora-http = { version = "0.9.0", package = "quixotic-plecostomus-http" }
-pingora-proxy = { version = "0.9.0", package = "quixotic-plecostomus-proxy", features = ["rustls"] }
+# Pingora (temporary fork), at the version praxis builds against; two versions
+# of the fork in one graph do not share types, and the older one carries its
+# own rustls provider.
+pingora-core = { version = "0.10.0", package = "quixotic-plecostomus-core", features = ["rustls"] }
+pingora-http = { version = "0.10.0", package = "quixotic-plecostomus-http" }
+pingora-proxy = { version = "0.10.0", package = "quixotic-plecostomus-proxy", features = ["rustls"] }
 arc-swap = "1.9.2"
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
@@ -309,3 +311,14 @@ bare_urls = "deny"
 invalid_html_tags = "deny"
 missing_crate_level_docs = "deny"
 private_doc_tests = "allow"
+
+# Temporary: the praxis crates at the head of praxis-proxy/praxis#1254, the
+# FIPS work (all crypto through the system OpenSSL, PRAXIS_REQUIRE_FIPS), until
+# a praxis release carries it. Remove this section and bump the versions above
+# when that release is published.
+[patch.crates-io]
+praxis-proxy = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
+praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
+praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
+praxis-proxy-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
+praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
