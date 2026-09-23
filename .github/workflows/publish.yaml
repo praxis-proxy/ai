@@ -51,7 +51,7 @@ jobs:
 
   container-fips:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
@@ -66,11 +66,35 @@ jobs:
           # The restored target/ would otherwise be swept into the build context.
           cache-target: "false"
 
+      - name: Set up Go (builds Red Hat's scanner)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6.0.0
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Build Red Hat's scanner (check-payload) at the pinned revision
+        run: make fips-scanner
+
+      - name: Download the OpenShift CLI the scanner insists on (pinned, checksum-verified)
+        run: make fips-oc
+
       - name: Point podman at Red Hat's signature store (Ubuntu's podman has no entry for it)
         run: make fips-signature-store
 
       - name: Verify the Red Hat base images are signed by Red Hat
         run: make fips-verify-image
+
+      - name: Build on UBI 9 with Red Hat's toolchain and print the compliance report
+        run: make fips-check
+
+      - name: Build the FIPS runtime image for verification
+        run: make container-fips
+
+      - name: Run the image once (validates its built-in config with the system OpenSSL)
+        run: make fips-smoke
+
+      - name: Scan the image with check-payload (warnings fatal)
+        run: make fips-scan
 
       - name: Log in to GHCR
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
