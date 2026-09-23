@@ -46,7 +46,7 @@ endif
 	build-fips release-fips check-fips lint-fips test-fips \
 	container-fips container-fips-run \
 	fips-check fips-check-ubi fips-deps fips-report fips-signature-store fips-verify-image \
-	fips-oc fips-scan fips-scanner fips-smoke
+	fips-image-ref fips-oc fips-scan fips-scanner fips-smoke
 
 # -------------------------------------------------------------------
 # All
@@ -450,6 +450,9 @@ fips-signature-store:
 fips-verify-image: | require-podman
 	$(XTASK_FIPS) fips verify-image --pinned-in Containerfile.fips $(FIPS_UBI9_IMAGE)
 	$(XTASK_FIPS) fips verify-image --pinned-in Containerfile.fips $(FIPS_UBI9_MINIMAL_IMAGE)
+
+fips-image-ref:
+	@printf '%s\n' '$(FIPS_IMAGE_REF)'
 
 container-fips: fips-verify-image
 	podman build -f Containerfile.fips --target runtime $(FIPS_BUILD_ARGS) \
