@@ -54,6 +54,16 @@ pub(crate) struct ConnectorConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpToolResolveConfig {
+    /// Optional per-user bearer slot from `callout_credentials`. Must match the
+    /// corresponding `openai_mcp_dispatch` setting.
+    #[serde(default)]
+    pub user_credential: Option<String>,
+
+    /// Optional opaque assertion slot from `callout_authorization`. Must match
+    /// the corresponding `openai_mcp_dispatch` setting.
+    #[serde(default)]
+    pub authorization_assertion: Option<String>,
+
     /// Trusted request headers forwarded to connector-backed MCP `initialize`
     /// and `tools/list` requests.
     /// No request headers are forwarded by default. Credential headers such as
@@ -129,6 +139,8 @@ fn default_max_tools() -> usize {
 pub(crate) fn build_config(mut cfg: McpToolResolveConfig) -> Result<McpToolResolveConfig, FilterError> {
     crate::openai::api_client::validate_forward_headers("openai_mcp_tool_resolve", &mut cfg.forward_headers)?;
     reject_mcp_sensitive_forward_headers(&cfg.forward_headers)?;
+    validate_context_slot("user_credential", cfg.user_credential.as_deref())?;
+    validate_context_slot("authorization_assertion", cfg.authorization_assertion.as_deref())?;
     validate_size_limit(
         "openai_mcp_tool_resolve",
         "max_rewritten_body_bytes",
@@ -145,6 +157,16 @@ pub(crate) fn build_config(mut cfg: McpToolResolveConfig) -> Result<McpToolResol
     }
     validate_connectors(&cfg.connectors)?;
     Ok(cfg)
+}
+
+/// Validate one optional request-scoped context slot name.
+fn validate_context_slot(field: &str, slot: Option<&str>) -> Result<(), FilterError> {
+    if let Some(slot) = slot
+        && (slot.is_empty() || slot.len() > 128)
+    {
+        return Err(format!("openai_mcp_tool_resolve: {field} must be 1..=128 bytes").into());
+    }
+    Ok(())
 }
 
 /// Reject ambient credentials and protocol-controlled fields at MCP's

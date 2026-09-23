@@ -9,6 +9,8 @@
 use praxis_filter::{DeferredCredential, FilterError, HttpFilterContext, PendingCredentials, RequestExtensions};
 use secrecy::{ExposeSecret as _, SecretString};
 
+#[cfg(feature = "openai-mcp-tools")]
+use crate::CalloutAuthorization;
 use crate::{CalloutCredentials, state_owner::StateOwner};
 
 /// Identity + credential resolved for a single callout.
@@ -93,6 +95,100 @@ pub(crate) enum CalloutContextMissing {
         /// The configured slot id that resolved to no usable secret.
         slot: String,
     },
+}
+
+/// Required configured-connector context missing before MCP dispatch.
+#[derive(Debug)]
+#[cfg(feature = "openai-mcp-tools")]
+pub(crate) enum McpCalloutContextMissing {
+    /// Trusted owner attribution is absent.
+    Owner,
+    /// Per-user bearer slot is absent.
+    Credential,
+    /// Opaque authorization-assertion slot is absent.
+    Authorization,
+}
+
+/// Trusted context staged for one configured MCP connector callout.
+///
+/// Secrets remain request-scoped and are exposed only while the RMCP transport
+/// constructs destination-bound headers. This value is never serialized into
+/// the MCP tool map or deferred connector state.
+#[derive(Clone)]
+#[cfg(feature = "openai-mcp-tools")]
+pub(crate) struct McpCalloutIdentity {
+    /// Trusted owner projected into the filtered child request.
+    pub(crate) owner: StateOwner,
+    /// Optional per-user bearer overriding the connector entry's static token.
+    pub(crate) user_credential: Option<SecretString>,
+    /// Optional opaque assertion injected as fixed `x-mcp-authorized`.
+    pub(crate) authorization: Option<SecretString>,
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+impl std::fmt::Debug for McpCalloutIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpCalloutIdentity")
+            .field("owner", &self.owner)
+            .field("user_credential", &self.user_credential.as_ref().map(|_| "[REDACTED]"))
+            .field("authorization", &self.authorization.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+/// Stage the context required by configured MCP connectors.
+///
+/// Existing static-only connector configurations pass both slots as `None`.
+/// When trusted owner attribution is available it is still projected into the
+/// connector subrequest; when no owner is available, the prior context-free
+/// behavior is preserved. Configuring either request-scoped slot makes trusted
+/// owner attribution mandatory and makes that slot fail closed.
+#[cfg(feature = "openai-mcp-tools")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "owner plus two optional fail-closed slots are staged together"
+)]
+pub(crate) fn stage_mcp_callout_identity(
+    ctx: &HttpFilterContext<'_>,
+    credential_slot: Option<&str>,
+    authorization_slot: Option<&str>,
+) -> Result<Option<McpCalloutIdentity>, McpCalloutContextMissing> {
+    let owner = ctx.extensions.get::<StateOwner>().cloned();
+    if credential_slot.is_none() && authorization_slot.is_none() {
+        return Ok(owner.map(|owner| McpCalloutIdentity {
+            owner,
+            user_credential: None,
+            authorization: None,
+        }));
+    }
+    let owner = owner.ok_or(McpCalloutContextMissing::Owner)?;
+    let user_credential = match credential_slot {
+        Some(slot) => Some(
+            ctx.extensions
+                .get::<CalloutCredentials>()
+                .and_then(|credentials| credentials.get(slot))
+                .filter(|secret| !secret.expose_secret().is_empty())
+                .cloned()
+                .ok_or(McpCalloutContextMissing::Credential)?,
+        ),
+        None => None,
+    };
+    let authorization = match authorization_slot {
+        Some(slot) => Some(
+            ctx.extensions
+                .get::<CalloutAuthorization>()
+                .and_then(|assertion| assertion.get(slot))
+                .filter(|secret| !secret.expose_secret().is_empty())
+                .cloned()
+                .ok_or(McpCalloutContextMissing::Authorization)?,
+        ),
+        None => None,
+    };
+    Ok(Some(McpCalloutIdentity {
+        owner,
+        user_credential,
+        authorization,
+    }))
 }
 
 /// Resolve the caller's owner and (optionally) a per-user credential for a callout.
@@ -234,5 +330,77 @@ mod tests {
 
         assert!(child.get::<StateOwner>().is_some());
         assert!(child.get::<PendingCredentials>().is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "openai-mcp-tools")]
+    fn mcp_without_slots_projects_available_owner() {
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = make_filter_context(&req);
+        ctx.extensions
+            .insert(StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").expect("valid owner"));
+
+        let id = stage_mcp_callout_identity(&ctx, None, None)
+            .expect("owner-only MCP identity must stage")
+            .expect("available owner must produce MCP identity");
+
+        assert_eq!(id.owner.tenant_id(), "tenant-a");
+        assert_eq!(id.owner.issuer(), "issuer-a");
+        assert_eq!(id.owner.subject(), "subject-a");
+        assert!(id.user_credential.is_none());
+        assert!(id.authorization.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "openai-mcp-tools")]
+    fn mcp_without_slots_or_owner_preserves_context_free_behavior() {
+        let req = make_request(Method::POST, "/v1/responses");
+        let ctx = make_filter_context(&req);
+
+        assert!(
+            stage_mcp_callout_identity(&ctx, None, None)
+                .expect("unconfigured MCP context must not fail")
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "openai-mcp-tools")]
+    fn mcp_configured_slot_requires_owner() {
+        let req = make_request(Method::POST, "/v1/responses");
+        let ctx = make_filter_context(&req);
+
+        assert!(matches!(
+            stage_mcp_callout_identity(&ctx, Some("mcp_gateway"), None),
+            Err(McpCalloutContextMissing::Owner)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "openai-mcp-tools")]
+    fn mcp_configured_credential_must_be_populated() {
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = make_filter_context(&req);
+        ctx.extensions
+            .insert(StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").expect("valid owner"));
+
+        assert!(matches!(
+            stage_mcp_callout_identity(&ctx, Some("mcp_gateway"), None),
+            Err(McpCalloutContextMissing::Credential)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "openai-mcp-tools")]
+    fn mcp_configured_assertion_must_be_populated() {
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = make_filter_context(&req);
+        ctx.extensions
+            .insert(StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").expect("valid owner"));
+
+        assert!(matches!(
+            stage_mcp_callout_identity(&ctx, None, Some("mcp_gateway")),
+            Err(McpCalloutContextMissing::Authorization)
+        ));
     }
 }

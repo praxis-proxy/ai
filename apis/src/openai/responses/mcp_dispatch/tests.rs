@@ -7,6 +7,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use bytes::Bytes;
 use praxis_filter::FilterAction;
+use secrecy::SecretString;
 use serde_json::json;
 
 use super::{
@@ -17,19 +18,20 @@ use super::{
     prepare_response_round, process_call_result, resolve_tool_entry, result_payload_limit,
 };
 use crate::{
+    callout_identity::McpCalloutIdentity,
     openai::responses::{
         DEFAULT_TENANT_ID,
         mcp_classify::{ApprovalPolicy, parse_approval_policy, requires_approval},
         mcp_dispatch::{
             approval::{
-                ApprovalError, ResolvedApproval, bind_forwarded_header_context, build_approved_tool_call,
-                build_denial_message, extract_approval_responses, is_approval_response, parse_approval_response,
-                resolve_approval, target_fingerprint,
+                ApprovalError, ResolvedApproval, bind_credential_context, bind_forwarded_header_context,
+                bind_owner_context, build_approved_tool_call, build_denial_message, extract_approval_responses,
+                is_approval_response, owner_fingerprint, parse_approval_response, resolve_approval, target_fingerprint,
             },
             config::{McpDispatchConfig, build_config},
         },
         openai_mcp_tool_resolve::{McpToolIndex, encode_function_name},
-        state::{DeferredMcpConnector, McpApprovalState, ResponsesState},
+        state::{DeferredMcpConnector, McpApprovalState, McpConnectorContextPolicy, ResponsesState},
     },
     store::{PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore},
     test_utils::{make_filter_context, make_owned_filter_context, make_request},
@@ -95,6 +97,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         timeout,
         forwarded_header_names: &[],
         forwarded_headers: None,
+        connector_identity: None,
     }
 }
 
@@ -1440,6 +1443,11 @@ fn make_dispatch_filter() -> Box<dyn praxis_filter::HttpFilter> {
     McpDispatchFilter::from_config(&yaml).unwrap()
 }
 
+fn make_scoped_dispatch_filter() -> Box<dyn praxis_filter::HttpFilter> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("authorization_assertion: mcp_gateway").unwrap();
+    McpDispatchFilter::from_config(&yaml).unwrap()
+}
+
 /// A dispatch filter whose bound outbound pipeline permits private/loopback
 /// upstreams, mirroring a deployment with `insecure_options.allow_private_upstreams`.
 ///
@@ -1720,6 +1728,126 @@ async fn on_request_no_mcp_calls_returns_continue() {
     ctx.extensions.insert(ResponsesState::default());
     let result = filter.on_request(&mut ctx).await.unwrap();
     assert!(matches!(result, FilterAction::Continue));
+}
+
+#[tokio::test]
+async fn configured_deferred_connector_missing_assertion_records_security_failure_before_dispatch() {
+    let filter = make_scoped_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let search = json!({"type": "tool_search_call", "id": "tsc_1", "status": "completed"});
+    ctx.extensions.insert(ResponsesState {
+        mcp_connector_context_policy: McpConnectorContextPolicy::new(None, Some("mcp_gateway")),
+        deferred_mcp: vec![DeferredMcpConnector {
+            authorization: None,
+            allowed_tools: None,
+            connector_id: "corp_drive".to_owned(),
+            headers: None,
+            max_rewritten_body_bytes: 67_108_864,
+            max_tools: 128,
+            require_approval: None,
+            server_label: "drive".to_owned(),
+            server_url: "https://mcp.example/mcp".to_owned(),
+            timeout: std::time::Duration::from_secs(1),
+        }],
+        tool_search_calls: vec![search.clone()],
+        accumulated_output: vec![search.clone()],
+        response_object: json!({"output": [search]}),
+        ..ResponsesState::default()
+    });
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let failure = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.security_failure.as_ref())
+        .expect("missing assertion should record a security terminal");
+    assert_eq!(failure.status, 401);
+    assert_eq!(failure.code, "missing_callout_context");
+}
+
+#[tokio::test]
+async fn configured_connector_call_missing_assertion_records_security_failure_before_dispatch() {
+    let filter = make_scoped_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let mut tool_map = HashMap::new();
+    tool_map.insert(
+        ("drive".to_owned(), "search".to_owned()),
+        json!({
+            "connector_id": "corp_drive",
+            "server_label": "drive",
+            "server_url": "https://mcp.example/mcp",
+            "name": "search"
+        }),
+    );
+    ctx.extensions.insert(ResponsesState {
+        mcp_connector_context_policy: McpConnectorContextPolicy::new(None, Some("mcp_gateway")),
+        mcp_tool_map: tool_map,
+        tool_calls: vec![json!({
+            "type": "function_call",
+            "name": encode_function_name("drive", "search"),
+            "call_id": "call_1",
+            "arguments": "{}"
+        })],
+        ..ResponsesState::default()
+    });
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let failure = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.security_failure.as_ref())
+        .expect("missing assertion should record a security terminal");
+    assert_eq!(failure.status, 401);
+    assert_eq!(failure.code, "missing_callout_context");
+}
+
+#[tokio::test]
+async fn connector_call_rejects_dispatch_context_policy_mismatch_before_dispatch() {
+    let filter = make_scoped_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let mut tool_map = HashMap::new();
+    tool_map.insert(
+        ("drive".to_owned(), "search".to_owned()),
+        json!({
+            "connector_id": "corp_drive",
+            "server_label": "drive",
+            "server_url": "https://mcp.example/mcp",
+            "name": "search"
+        }),
+    );
+    ctx.extensions.insert(ResponsesState {
+        mcp_connector_context_policy: McpConnectorContextPolicy::new(Some("different_bearer"), None),
+        mcp_tool_map: tool_map,
+        tool_calls: vec![json!({
+            "type": "function_call",
+            "name": encode_function_name("drive", "search"),
+            "call_id": "call_1",
+            "arguments": "{}"
+        })],
+        ..ResponsesState::default()
+    });
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let failure = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .and_then(|state| state.security_failure.as_ref())
+        .expect("a mismatched resolver/dispatch policy should record a security terminal");
+    assert_eq!(failure.status, 401);
+    assert_eq!(failure.code, "missing_callout_context");
+    assert!(failure.message.contains("does not match tool resolution"));
 }
 
 #[tokio::test]
@@ -3062,6 +3190,83 @@ fn target_fingerprint_fails_closed_on_case_insensitive_duplicate_headers() {
         target_fingerprint(&reversed).is_empty(),
         "case-insensitive duplicate header names must fail closed"
     );
+}
+
+#[test]
+fn connector_target_fingerprint_binds_full_owner_tuple() {
+    let owner_a = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "same-subject").unwrap();
+    let owner_b = crate::StateOwner::from_trusted_parts("tenant-b", "issuer-a", "same-subject").unwrap();
+    let owner_c = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-b", "same-subject").unwrap();
+    assert_ne!(owner_fingerprint(&owner_a), owner_fingerprint(&owner_b));
+    assert_ne!(owner_fingerprint(&owner_a), owner_fingerprint(&owner_c));
+
+    let mut entry_a = json!({
+        "connector_id": "trusted",
+        "server_url": "https://mcp.example/mcp"
+    });
+    let mut entry_b = entry_a.clone();
+    bind_owner_context(&mut entry_a, Some(&owner_a));
+    bind_owner_context(&mut entry_b, Some(&owner_b));
+    assert_ne!(target_fingerprint(&entry_a), target_fingerprint(&entry_b));
+}
+
+#[test]
+fn connector_target_fingerprint_binds_effective_bearer() {
+    let mut entry_a = json!({
+        "connector_id": "trusted",
+        "server_url": "https://mcp.example/mcp"
+    });
+    let mut entry_b = entry_a.clone();
+    let bearer_a = SecretString::from("bearer-a");
+    let bearer_b = SecretString::from("bearer-b");
+    bind_credential_context(&mut entry_a, Some(&bearer_a));
+    bind_credential_context(&mut entry_b, Some(&bearer_b));
+
+    assert_ne!(target_fingerprint(&entry_a), target_fingerprint(&entry_b));
+    assert!(!entry_a.to_string().contains("bearer-a"));
+    assert!(!entry_b.to_string().contains("bearer-b"));
+}
+
+#[test]
+fn connector_target_fingerprint_survives_assertion_rotation() {
+    let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let first_identity = McpCalloutIdentity {
+        owner: owner.clone(),
+        user_credential: None,
+        authorization: Some(SecretString::from("assertion-v1")),
+    };
+    let second_identity = McpCalloutIdentity {
+        owner,
+        user_credential: None,
+        authorization: Some(SecretString::from("assertion-v2")),
+    };
+    let mut first_entry = json!({
+        "connector_id": "trusted",
+        "server_url": "https://mcp.example/mcp"
+    });
+    let mut second_entry = first_entry.clone();
+    bind_owner_context(&mut first_entry, Some(&first_identity.owner));
+    bind_owner_context(&mut second_entry, Some(&second_identity.owner));
+
+    assert_eq!(
+        target_fingerprint(&first_entry),
+        target_fingerprint(&second_entry),
+        "raw rotating assertions must never enter the approval target fingerprint"
+    );
+}
+
+#[test]
+fn direct_url_target_never_retains_owner_fingerprint() {
+    let owner = crate::StateOwner::from_trusted_parts("tenant", "issuer", "subject").unwrap();
+    let mut entry = json!({
+        "server_url": "https://mcp.example/mcp",
+        "_praxis_owner_fingerprint": "forged",
+        "_praxis_credential_fingerprint": "forged"
+    });
+    bind_owner_context(&mut entry, Some(&owner));
+    bind_credential_context(&mut entry, Some(&SecretString::from("bearer")));
+    assert!(entry.get("_praxis_owner_fingerprint").is_none());
+    assert!(entry.get("_praxis_credential_fingerprint").is_none());
 }
 
 #[test]

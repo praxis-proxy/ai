@@ -326,6 +326,17 @@ filter_chains:
             source_header: x-user-brave-key
           - slot: ogx_files
             source_header: x-user-ogx-key
+          - slot: mcp_gateway
+            source_header: x-user-mcp-key
+
+      - filter: callout_authorization
+        # Opaque connector authorization is deliberately separate from
+        # credentials. The trusted boundary MUST unconditionally delete any
+        # client-supplied x-mcp-authorized value and then set the verified,
+        # short-lived assertion for this request. Praxis forwards it unchanged
+        # only to configured connector_id destinations; the MCP Gateway makes
+        # the actual authorization decision.
+        assertion_slot: mcp_gateway
 
       # Emit the normalized owner in the contract expected by OGX and by the
       # explicitly configured downstream callouts below. Raw x-auth-* inputs
@@ -395,6 +406,8 @@ filter_chains:
         on_unsupported: continue
 
       - filter: openai_mcp_tool_resolve
+        user_credential: mcp_gateway
+        authorization_assertion: mcp_gateway
         forward_headers:
           - x-tenant-id
           - x-user-id
@@ -548,6 +561,8 @@ filter_chains:
               # MCP calls prepared and classified by the loop owner. Inert
               # until the model emits an MCP tool call.
               - filter: openai_mcp_dispatch
+                user_credential: mcp_gateway
+                authorization_assertion: mcp_gateway
                 forward_headers:
                   - x-tenant-id
                   - x-user-id

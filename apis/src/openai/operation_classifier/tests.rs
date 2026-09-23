@@ -322,7 +322,14 @@ fn header_targets_carrying_auth_or_framing_are_rejected() {
 
 #[test]
 fn provider_credential_header_targets_are_rejected() {
-    for target in ["x-api-key", "X-Api-Key", "api-key", "x-goog-api-key", "set-cookie"] {
+    for target in [
+        "x-api-key",
+        "X-Api-Key",
+        "api-key",
+        "x-goog-api-key",
+        "x-mcp-authorized",
+        "set-cookie",
+    ] {
         let value: serde_yaml::Value = serde_yaml::from_str(&format!("headers:\n  operation: {target}\n")).unwrap();
         assert!(
             OpenaiOperationFilter::from_config(&value).is_err(),

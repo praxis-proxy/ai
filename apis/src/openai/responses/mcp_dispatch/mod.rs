@@ -31,6 +31,8 @@
 mod approval;
 mod config;
 
+pub(crate) use approval::{OWNER_FINGERPRINT, owner_fingerprint};
+
 #[cfg(test)]
 #[cfg(feature = "store-sqlite")]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -63,9 +65,9 @@ use tracing::{debug, warn};
 
 use self::{
     approval::{
-        ApprovalError, ResolvedApproval, bind_forwarded_header_context, build_approved_tool_call, build_denial_message,
-        extract_approval_responses, is_approval_response, parse_approval_response, resolve_approval,
-        target_fingerprint,
+        ApprovalError, ResolvedApproval, bind_credential_context, bind_forwarded_header_context, bind_owner_context,
+        build_approved_tool_call, build_denial_message, extract_approval_responses, is_approval_response,
+        parse_approval_response, resolve_approval, target_fingerprint,
     },
     config::{MIN_RETAINED_RESULT_BYTES, McpDispatchConfig, build_config, require_inline_outbound_chain},
 };
@@ -77,10 +79,11 @@ use super::{
         McpToolIndex, McpToolMatch, consume_pending_list_tools_failure,
         discover_deferred_connectors_with_forwarded_headers, has_pending_deferred_discovery, resolve_error_action,
     },
-    state::{DispatchFailure, McpApprovalState, ResponsesState},
+    state::{DispatchFailure, McpApprovalState, McpConnectorContextPolicy, ResponsesState},
 };
 use crate::{
     callout_headers::effective_body_callout_headers,
+    callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
     json_body::serialized_len,
     mcp_client,
     state_owner::StateOwner,
@@ -144,6 +147,10 @@ pub(super) fn is_connector_tool_entry(entry: &serde_json::Value) -> bool {
 /// receive ambient request headers. Credential headers are rejected; use the
 /// MCP tool entry's dedicated `authorization` field for per-target credentials.
 pub struct McpDispatchFilter {
+    /// Optional per-user bearer slot required for configured connectors.
+    user_credential_slot: Option<String>,
+    /// Optional opaque assertion slot required for configured connectors.
+    authorization_assertion_slot: Option<String>,
     /// Bound outbound pipeline the `tools/call` and deferred `tools/list`
     /// callouts dial through.
     ///
@@ -240,6 +247,8 @@ impl McpDispatchFilter {
     /// Assemble the filter from a validated config and a bound outbound pipeline.
     fn assemble(validated: &McpDispatchConfig, outbound_pipeline: Arc<FilterPipeline>) -> Box<dyn HttpFilter> {
         Box::new(Self {
+            user_credential_slot: validated.user_credential.clone(),
+            authorization_assertion_slot: validated.authorization_assertion.clone(),
             outbound_pipeline,
             forward_headers: validated
                 .forward_headers
@@ -271,6 +280,7 @@ impl McpDispatchFilter {
         tool_index: &McpToolIndex<'_>,
         forwarded_headers: &http::HeaderMap,
         callout: &mcp_client::McpCallout,
+        connector_identity: Option<&McpCalloutIdentity>,
     ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
         debug!(
             count = mcp_calls.len(),
@@ -287,6 +297,7 @@ impl McpDispatchFilter {
             timeout: self.timeout,
             forwarded_header_names: &self.forward_headers,
             forwarded_headers: Some(forwarded_headers),
+            connector_identity,
         };
         execute_mcp_calls(mcp_calls, tool_index, options, callout).await
     }
@@ -304,12 +315,22 @@ impl McpDispatchFilter {
     }
 
     /// Bind connector approvals to the ambient headers this request will send.
-    fn bind_request_forwarded_header_context(&self, ctx: &mut HttpFilterContext<'_>, headers: &http::HeaderMap) {
+    fn bind_request_forwarded_header_context(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        headers: &http::HeaderMap,
+        connector_identity: Option<&McpCalloutIdentity>,
+    ) {
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
             return;
         };
         for entry in state.mcp_tool_map.values_mut() {
             bind_forwarded_header_context(entry, &self.forward_headers, headers);
+            bind_owner_context(entry, connector_identity.map(|identity| &identity.owner));
+            bind_credential_context(
+                entry,
+                connector_identity.and_then(|identity| identity.user_credential.as_ref()),
+            );
         }
     }
 
@@ -784,7 +805,56 @@ impl HttpFilter for McpDispatchFilter {
         }
         ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
         let forwarded_headers = self.forwarded_headers(ctx);
-        self.bind_request_forwarded_header_context(ctx, &forwarded_headers);
+
+        // Approval resume runs before the approved call is injected into
+        // `tool_calls`, so stage connector identity from the resolved tool map
+        // itself. This binds pending approvals to the effective per-user bearer
+        // without retaining the raw credential. Direct URL-only requests never
+        // stage or bind ambient connector context.
+        let has_connector_state = ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
+            !state.deferred_mcp.is_empty() || state.mcp_tool_map.values().any(is_connector_tool_entry)
+        });
+        let dispatch_context_policy = McpConnectorContextPolicy::new(
+            self.user_credential_slot.as_deref(),
+            self.authorization_assertion_slot.as_deref(),
+        );
+        if has_connector_state
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(|state| state.mcp_connector_context_policy != dispatch_context_policy)
+        {
+            if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                state.record_security_failure(DispatchFailure {
+                    status: 401,
+                    code: "missing_callout_context",
+                    message: "MCP connector context policy does not match tool resolution".to_owned(),
+                });
+            }
+            return Ok(FilterAction::Continue);
+        }
+        let connector_identity = if has_connector_state {
+            match stage_mcp_callout_identity(
+                ctx,
+                self.user_credential_slot.as_deref(),
+                self.authorization_assertion_slot.as_deref(),
+            ) {
+                Ok(identity) => identity,
+                Err(_missing) => {
+                    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                        state.record_security_failure(DispatchFailure {
+                            status: 401,
+                            code: "missing_callout_context",
+                            message: "required MCP connector context is missing".to_owned(),
+                        });
+                    }
+                    return Ok(FilterAction::Continue);
+                },
+            }
+        } else {
+            None
+        };
+        self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref());
 
         // Resume approvals from the previous turn before executing any calls.
         // On approval this injects a function-call-shaped tool call that the
@@ -801,6 +871,16 @@ impl HttpFilter for McpDispatchFilter {
         if !needs_discovery && (state.tool_calls.is_empty() || state.mcp_tool_map.is_empty()) {
             return Ok(FilterAction::Continue);
         }
+
+        let has_connector_calls = state.tool_calls.iter().any(|call| {
+            let Some(name) = call.get("name").and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            let index = McpToolIndex::new(&state.mcp_tool_map);
+            matches!(index.get(name), Some(McpToolMatch::Unique { entry, .. }) if is_connector_tool_entry(entry))
+        });
+        let needs_connector_context = needs_discovery || has_connector_calls;
+        debug_assert!(!needs_connector_context || has_connector_state);
 
         // Capture the parent transport and downstream attributes once, pairing
         // them with the bound outbound pipeline. Both deferred `tools/list`
@@ -824,8 +904,15 @@ impl HttpFilter for McpDispatchFilter {
                 .as_ref()
                 .filter(|bytes| !bytes.is_empty())
                 .map_or(fallback.as_slice(), |bytes| bytes.as_ref());
-            let action =
-                discover_pending_connectors(ctx, bytes, &self.forward_headers, &forwarded_headers, &callout).await?;
+            let action = discover_pending_connectors(
+                ctx,
+                bytes,
+                &self.forward_headers,
+                &forwarded_headers,
+                &callout,
+                connector_identity.as_ref(),
+            )
+            .await?;
             if !matches!(action, FilterAction::Continue) {
                 return Ok(action);
             }
@@ -845,7 +932,14 @@ impl HttpFilter for McpDispatchFilter {
         }
 
         let results = match self
-            .execute_pending_calls(state, &mcp_calls, &tool_index, &forwarded_headers, &callout)
+            .execute_pending_calls(
+                state,
+                &mcp_calls,
+                &tool_index,
+                &forwarded_headers,
+                &callout,
+                connector_identity.as_ref(),
+            )
             .await
         {
             Ok(results) => results,
@@ -858,19 +952,30 @@ impl HttpFilter for McpDispatchFilter {
 }
 
 /// Load deferred connector tools when a hosted `tool_search_call` is pending.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "deferred discovery needs request state, trusted headers, executor, and scoped identity"
+)]
 async fn discover_pending_connectors(
     ctx: &mut HttpFilterContext<'_>,
     body: &[u8],
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: &http::HeaderMap,
     callout: &mcp_client::McpCallout,
+    connector_identity: Option<&McpCalloutIdentity>,
 ) -> Result<FilterAction, FilterError> {
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
         warn!("ResponsesState missing when discovering deferred MCP connectors");
         return Ok(FilterAction::Continue);
     };
-    match discover_deferred_connectors_with_forwarded_headers(state, forwarded_header_names, forwarded_headers, callout)
-        .await
+    match discover_deferred_connectors_with_forwarded_headers(
+        state,
+        forwarded_header_names,
+        forwarded_headers,
+        callout,
+        connector_identity,
+    )
+    .await
     {
         Ok(()) => Ok(FilterAction::Continue),
         Err(err) => {
@@ -1298,6 +1403,8 @@ struct McpExecutionOptions<'a> {
     forwarded_header_names: &'a [http::HeaderName],
     /// Trusted request headers selected by operator configuration.
     forwarded_headers: Option<&'a http::HeaderMap>,
+    /// Request-scoped context injected only for configured connector entries.
+    connector_identity: Option<&'a McpCalloutIdentity>,
 }
 
 /// Execute MCP tool calls — concurrently when `parallel` is true,
@@ -1542,6 +1649,14 @@ async fn execute_single_call(
     let forwarded_headers = is_connector_tool_entry(entry)
         .then_some(options.forwarded_headers)
         .flatten();
+    let connector_context = is_connector_tool_entry(entry)
+        .then_some(options.connector_identity)
+        .flatten()
+        .map(|identity| mcp_client::McpConnectorContext {
+            owner: &identity.owner,
+            bearer: identity.user_credential.as_ref(),
+            assertion: identity.authorization.as_ref(),
+        });
     let (arguments, arguments_string) = match parse_call_arguments(
         tool_call,
         call_id,
@@ -1581,6 +1696,7 @@ async fn execute_single_call(
         authorization,
         options.forwarded_header_names,
         forwarded_headers,
+        connector_context.as_ref(),
         original_tool_name,
         arguments,
         options.timeout,

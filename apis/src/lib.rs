@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod azure;
+mod callout_authorization;
 mod callout_credentials;
 pub mod callout_headers;
 mod callout_identity;
@@ -33,6 +34,7 @@ pub mod subrequest;
 pub mod token_cache;
 pub(crate) mod web_search;
 
+pub use callout_authorization::{CalloutAuthorization, CalloutAuthorizationFilter};
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
 pub use state_owner::{StateOwner, StateOwnerError, StateOwnerFilter, project_state_owner};
 pub use state_owner_headers::StateOwnerHeadersFilter;

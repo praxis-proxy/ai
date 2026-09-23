@@ -51,6 +51,7 @@ use rmcp::{
 use sse_stream::{Error as SseError, Sse};
 
 use super::{McpClientError, McpDisplayUrl};
+use crate::StateOwner;
 
 /// Wire byte ceiling for a control-plane MCP response.
 ///
@@ -479,6 +480,8 @@ pub(crate) struct McpSubrequestClient {
     stream_cumulative_cap: usize,
     /// Per-exchange duration ceiling.
     step_timeout: Duration,
+    /// Trusted owner projected only for configured connector exchanges.
+    owner: Option<StateOwner>,
     /// Out-of-band record of a typed classification observed on a callout.
     ///
     /// `rmcp` discards the typed [`McpTransportError`] on failure, so a
@@ -498,12 +501,13 @@ impl McpSubrequestClient {
     ///
     /// No `tools/call` result flows over this transport, so every response is
     /// bounded to [`MAX_CONTROL_RESPONSE_BYTES`] before deserialization.
-    pub(crate) fn control(callout: McpCallout, step_timeout: Duration) -> Self {
+    pub(crate) fn control(callout: McpCallout, step_timeout: Duration, owner: Option<StateOwner>) -> Self {
         Self::with_wire_cap(
             callout,
             step_timeout,
             MAX_CONTROL_RESPONSE_BYTES,
             crate::mcp_client::MAX_LISTING_RESPONSE_BYTES.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            owner,
         )
     }
 
@@ -516,13 +520,19 @@ impl McpSubrequestClient {
     /// `step_timeout` bounds each individual HTTP exchange; the `callout` carries
     /// the parent transport and the bound outbound pipeline whose finalized
     /// posture decides whether loopback destinations are permitted.
-    pub(crate) fn for_tool(callout: McpCallout, step_timeout: Duration, max_result_bytes: usize) -> Self {
+    pub(crate) fn for_tool(
+        callout: McpCallout,
+        step_timeout: Duration,
+        max_result_bytes: usize,
+        owner: Option<StateOwner>,
+    ) -> Self {
         let wire = tool_result_wire_cap(max_result_bytes);
         Self::with_wire_cap(
             callout,
             step_timeout,
             wire,
             wire.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            owner,
         )
     }
 
@@ -533,12 +543,14 @@ impl McpSubrequestClient {
         step_timeout: Duration,
         tool_result_bytes: usize,
         stream_cumulative_cap: usize,
+        owner: Option<StateOwner>,
     ) -> Self {
         Self {
             callout,
             tool_result_bytes,
             step_timeout,
             stream_cumulative_cap,
+            owner,
             signal: Arc::new(OnceLock::new()),
         }
     }
@@ -637,6 +649,9 @@ impl McpSubrequestClient {
         let mut extensions = RequestExtensions::default();
         extensions.insert(staged);
         extensions.insert(fallback);
+        if let Some(owner) = self.owner.as_ref() {
+            extensions.insert(owner.clone());
+        }
 
         let executor = FilteredSubrequestExecutor::for_callout(
             self.callout.client.clone(),
@@ -1706,6 +1721,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             2048,
+            None,
         );
         let call: ClientJsonRpcMessage = serde_json::from_str(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
@@ -1724,6 +1740,7 @@ mod tests {
         let client = McpSubrequestClient::control(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
+            None,
         );
         let call: ClientJsonRpcMessage = serde_json::from_str(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
@@ -1919,6 +1936,7 @@ mod tests {
         let client = McpSubrequestClient::control(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(1),
+            None,
         );
         // per-event GET cap == the client's tool-result wire cap, which for the
         // control client is the 1 MiB control ceiling.
@@ -1938,6 +1956,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(1),
             max_result_bytes,
+            None,
         );
         let expected_wire = tool_result_wire_cap(max_result_bytes);
         assert_eq!(client.wire_cap(), expected_wire);
@@ -1966,6 +1985,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             1024,
+            None,
         )
     }
 
