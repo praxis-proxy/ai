@@ -70,6 +70,7 @@ pub enum OnMissing {
 /// This is a security signal: the [`OnMissing`] policy must never be widened to absorb a
 /// failure carrying this code (see the invariant on [`OnMissing`]). Anthropic consumers, which
 /// have no error-code field, map the same condition to error type `authentication_error`.
+#[cfg(any(feature = "openai-responses", test))]
 pub(crate) const MISSING_CALLOUT_CONTEXT: &str = "missing_callout_context";
 
 // -----------------------------------------------------------------------------

@@ -753,6 +753,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "openai-responses")]
     #[test]
     fn openai_config_threads_user_credential_through_into_shared() {
         // Locks that `into_shared` does not drop the slot id on the OpenAI path.
