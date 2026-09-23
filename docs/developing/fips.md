@@ -29,11 +29,13 @@ build to run; the same invocation runs inside the report stage of
    (`ring`, `aws-lc-rs`, `sha2`, `hmac`, ...) in the shipped binary's normal
    dependency graph, resolved for the assessed feature set. `--deps-only`
    stops here; this is what `make lint` runs. Every finding names the ai
-   feature that pulls the crate (the stores through sqlx, the reqwest-based
-   filters, the policy engine), so the fix is usually a line in
+   feature that pulls the crate (the general-purpose SQLx profile, the
+   reqwest-based filters, the policy engine), so the fix is usually a line in
    `FIPS_FEATURES`. A `sha2` or `hmac` finding that names `aws-sigv4` means
    the crate escaped `dev-dependencies`: `aws_sigv4_sign` signs through
-   OpenSSL and only tests against it.
+   OpenSSL and only tests against it. The FIPS profile uses SQLx's
+   certificate-only PostgreSQL feature set, which omits its direct
+   cryptographic operations.
 2. **Binary**: links the system `libcrypto.so.3` dynamically, defines no
    symbol of a bundled crypto backend (`ring_core_`, `aws_lc_`, `BORINGSSL_`,
    `OPENSSL_`), imports OpenSSL, carries the cargo-auditable manifest

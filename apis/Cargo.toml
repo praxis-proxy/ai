@@ -26,7 +26,11 @@ openai-file-resolve-filter = ["openai-responses"]
 # Response and conversation storage. The SQL backends live in praxis-ai-store-backends
 # so a build without a backend carries no SQL client or crypto.
 store = ["openai-responses", "praxis-ai-store/compression"]
-store-postgres = ["store", "dep:praxis-ai-store-backends", "praxis-ai-store-backends/postgres"]
+# Internal implementation marker shared by both PostgreSQL profiles. Do not
+# enable directly; select one of the public features below.
+_store-postgres = ["store", "dep:praxis-ai-store-backends"]
+store-postgres = ["_store-postgres", "praxis-ai-store-backends/postgres"]
+store-postgres-cert-auth = ["_store-postgres", "praxis-ai-store-backends/postgres-cert-auth"]
 store-sqlite = ["store", "dep:praxis-ai-store-backends", "praxis-ai-store-backends/sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 # Locally served Conversations API with JSON Schema item validation and the

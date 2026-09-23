@@ -18,7 +18,14 @@ name = "praxis_ai_store_backends"
 # The SQL client crypto (sqlx TLS) is compiled in only when a backend is
 # selected. A consumer that omits this crate ships no SQL crypto at all.
 default = ["all"]
-postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/tls-native-tls"]
+# Internal implementation marker shared by both PostgreSQL profiles. Do not
+# enable directly; select one of the public features below.
+_postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/tls-native-tls"]
+# General-purpose PostgreSQL profile: preserves password authentication.
+postgres = ["_postgres", "sqlx/postgres-password-auth"]
+# Certificate-only PostgreSQL profile: omits SQLx password-authentication
+# crypto and requires `require_certificate_authentication: true` at runtime.
+postgres-cert-auth = ["_postgres"]
 sqlite = ["dep:sqlx", "sqlx/sqlite"]
 all = ["postgres", "sqlite"]
 

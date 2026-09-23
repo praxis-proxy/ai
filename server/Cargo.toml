@@ -41,6 +41,7 @@ openai-file-resolve-filter = ["openai-responses", "praxis-ai-filters/openai-file
 # Response store support; installs the response store pipeline extension.
 store = ["openai-responses", "praxis-ai-filters/store"]
 store-postgres = ["store", "praxis-ai-filters/store-postgres"]
+store-postgres-cert-auth = ["store", "praxis-ai-filters/store-postgres-cert-auth"]
 store-sqlite = ["store", "praxis-ai-filters/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 openai-conversations = ["store", "praxis-ai-filters/openai-conversations"]
