@@ -18,8 +18,8 @@ use std::{
 
 use async_trait::async_trait;
 use metrics::counter;
+use praxis_ai_apis::hash::Sha256;
 use redis::aio::MultiplexedConnection;
-use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 
 use super::{
@@ -797,12 +797,12 @@ impl ValkeyTokenRateLimitBackend {
     fn key_parts(&self, key: &str) -> [String; 7] {
         let mut digest = Sha256::new();
         digest.update(self.namespace.as_bytes());
-        digest.update([0]);
+        digest.update(&[0]);
         digest.update(self.rule.as_bytes());
-        digest.update([0]);
+        digest.update(&[0]);
         digest.update(key.as_bytes());
         let hash = digest
-            .finalize()
+            .finish()
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
@@ -1138,14 +1138,14 @@ impl ValkeyTokenBucketBackend {
     fn key_parts(&self, key: &str) -> [String; 6] {
         let mut digest = Sha256::new();
         digest.update(self.namespace.as_bytes());
-        digest.update([0]);
+        digest.update(&[0]);
         digest.update(b"token_bucket");
-        digest.update([0]);
+        digest.update(&[0]);
         digest.update(self.rule.as_bytes());
-        digest.update([0]);
+        digest.update(&[0]);
         digest.update(key.as_bytes());
         let hash = digest
-            .finalize()
+            .finish()
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();

@@ -22,9 +22,9 @@ use std::{
     collections::{HashMap, HashSet},
 };
 
-use sha2::{Digest as _, Sha256};
-
-use crate::{openai::responses::openai_mcp_tool_resolve::encode_function_name, store::PendingApprovalRecord};
+use crate::{
+    hash::Sha256, openai::responses::openai_mcp_tool_resolve::encode_function_name, store::PendingApprovalRecord,
+};
 
 // -----------------------------------------------------------------------------
 // Approval Response Round Trip
@@ -290,7 +290,7 @@ pub(crate) fn target_fingerprint(entry: &serde_json::Value) -> String {
             hash_segment(&mut hasher, &scalar_bytes(headers.get(key)));
         }
     }
-    hex_digest(hasher.finalize())
+    hex_digest(hasher.finish())
 }
 
 /// Bind a connector tool-map entry to the exact ambient headers used for calls.
@@ -328,7 +328,7 @@ fn forwarded_header_fingerprint(configured_names: &[http::HeaderName], headers: 
             hash_segment(&mut hasher, value.as_bytes());
         }
     }
-    hex_digest(hasher.finalize())
+    hex_digest(hasher.finish())
 }
 
 /// Encode a SHA-256 digest as lowercase hexadecimal.
@@ -345,7 +345,7 @@ fn hex_digest(digest: impl AsRef<[u8]>) -> String {
 /// Length-framed update so adjacent fields cannot be confused by content that
 /// happens to look like a delimiter.
 fn hash_segment(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
 }
 

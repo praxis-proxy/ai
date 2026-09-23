@@ -4,8 +4,9 @@
 //! Anthropic Messages to Chat Completions-compatible request transformation.
 
 use serde_json::{Map, Value, json};
-use sha2::{Digest as _, Sha256};
 use tracing::warn;
+
+use crate::hash::{self, Sha256};
 
 // -----------------------------------------------------------------------------
 // Request Transformation
@@ -736,8 +737,7 @@ fn map_metadata(chat: &mut Map<String, Value>, metadata: Option<Value>) {
     if let Some(Value::Object(mut metadata)) = metadata
         && let Some(user_id) = take_string(&mut metadata, "user_id")
     {
-        let digest = Sha256::digest(user_id.as_bytes());
-        let hex = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+        let hex = hash::hex(&Sha256::digest(user_id.as_bytes()));
         chat.insert("safety_identifier".to_owned(), Value::String(hex));
     }
 }
@@ -1459,12 +1459,10 @@ mod tests {
         let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
-        let expected: String = Sha256::digest(b"user-1")
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        // SHA-256 of "user-1", as `sha256sum` prints it.
+        let expected = "c6c289e49e9c05b2145860387b73bcb18df43fb09a1e4a4a9713c76c88bb541b";
         assert_eq!(expected.len(), 64, "digest fits the 64-character limit");
-        assert_eq!(parsed["safety_identifier"], expected.as_str(), "user_id hashed");
+        assert_eq!(parsed["safety_identifier"], expected, "user_id hashed");
         assert!(
             parsed.get("metadata").is_none(),
             "Anthropic metadata must not reach a Chat Completions backend"
