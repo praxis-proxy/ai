@@ -136,6 +136,7 @@ fn register_gcp_filters(registry: &mut FilterRegistry) {
 fn register_general_ai_filters(registry: &mut FilterRegistry) {
     register_state_owner(registry);
     register_state_owner_headers(registry);
+    register_callout_credentials(registry);
     #[cfg(feature = "http-callout-filter")]
     praxis_filter::register_filters!(
         @register registry,
@@ -307,6 +308,20 @@ fn register_state_owner_headers(registry: &mut FilterRegistry) {
             praxis_filter::SecurityClass::Security,
         )
         .unwrap_or_else(|_| panic!("duplicate filter name: 'state_owner_headers'"));
+}
+
+/// Register the per-user callout credential capture filter as security-critical.
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_callout_credentials(registry: &mut FilterRegistry) {
+    registry
+        .register_with_class(
+            "callout_credentials",
+            praxis_filter::FilterFactory::Http(std::sync::Arc::new(
+                praxis_ai_apis::CalloutCredentialsFilter::from_config,
+            )),
+            praxis_filter::SecurityClass::Security,
+        )
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'callout_credentials'"));
 }
 
 /// Register OpenAI Responses API filters.
@@ -613,6 +628,7 @@ mod tests {
             "llmisvc_model_provider_resolver",
             "state_owner",
             "state_owner_headers",
+            "callout_credentials",
             "openai_responses_format",
             "openai_responses_model_rewrite",
             "openai_tool_parse",
@@ -741,6 +757,7 @@ provider:
         assert!(registry.is_security_filter("credential_inject"));
         #[cfg(feature = "aws-sigv4-filter")]
         assert!(registry.is_security_filter("aws_sigv4_sign"));
+        assert!(registry.is_security_filter("callout_credentials"));
         #[cfg(feature = "azure-ad-filter")]
         assert!(registry.is_security_filter("azure_ad"));
         #[cfg(feature = "gcp-adc-filter")]

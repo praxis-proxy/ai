@@ -26,13 +26,15 @@ use std::{
 };
 
 use praxis_test_utils::{
-    StatefulCapturingBackend, example_config_path, free_port, http_send, json_post, parse_body, parse_status,
-    patch_yaml, start_proxy,
+    StatefulCapturingBackend, example_config_path, free_port, http_send, parse_body, parse_status, patch_yaml,
+    start_proxy,
 };
 use serde_json::{Value, json};
 
 const EXAMPLE: &str = "anthropic/full-flow-agentic.yaml";
 const TOOL_USE_ID: &str = "toolu_web_search_01";
+const USER_SEARCH_HEADER: &str = "x-user-you-key";
+const USER_SEARCH_CREDENTIAL: &str = "test-user-search-key";
 
 // -----------------------------------------------------------------------------
 // SSE builders (native Anthropic Messages lifecycle)
@@ -520,6 +522,12 @@ fn messages_web_search_round_trip_re_enters_the_model() {
 
     let requests = model.requests();
     assert_eq!(requests.len(), 2, "model should receive two Messages requests");
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.headers.to_ascii_lowercase().contains(USER_SEARCH_HEADER)),
+        "the trusted credential source header must be stripped before inference"
+    );
     assert_eq!(requests[0].uri, "/v1/messages");
     assert_eq!(requests[1].uri, "/v1/messages");
     let second: Value = serde_json::from_str(&requests[1].body).expect("second model request JSON");
@@ -539,12 +547,9 @@ fn messages_web_search_round_trip_re_enters_the_model() {
     );
     assert_eq!(search.request_count(), 1);
     assert_eq!(search.last_json()["query"], "potato");
-    assert!(
-        search
-            .last_request()
-            .to_ascii_lowercase()
-            .contains("x-api-key: test-key")
-    );
+    let search_request = search.last_request().to_ascii_lowercase();
+    assert!(search_request.contains("x-api-key: test-user-search-key"));
+    assert!(!search_request.contains("x-api-key: test-key"));
 }
 
 /// #958: the Messages web-search provider callout is dispatched through the
@@ -651,6 +656,7 @@ fn caller_anthropic_headers_are_preserved_across_model_reentry() {
         "/v1/messages",
         &body,
         &[
+            (USER_SEARCH_HEADER, USER_SEARCH_CREDENTIAL),
             ("anthropic-version", "2024-01-01"),
             ("anthropic-beta", "test-beta-2026-01-01"),
         ],
@@ -1637,10 +1643,15 @@ fn json_post_with_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> S
         "POST {path} HTTP/1.1\r\n\
          Host: localhost\r\n\
          Content-Type: application/json\r\n\
+         Connection: close\r\n\
          Content-Length: {}\r\n\
          {extra}\
          \r\n\
          {body}",
         body.len(),
     )
+}
+
+fn json_post(path: &str, body: &str) -> String {
+    json_post_with_headers(path, body, &[(USER_SEARCH_HEADER, USER_SEARCH_CREDENTIAL)])
 }

@@ -38,17 +38,25 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
     BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    HttpFilterContext, IterationState, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use super::state::{
-    ResponsesState, consumed_builtin_tool_calls_before_current_round, current_round_tool_call_admissions,
+use super::{
+    error::responses_error_rejection,
+    state::{
+        DispatchFailure, ResponsesState, consumed_builtin_tool_calls_before_current_round,
+        current_round_tool_call_admissions,
+    },
 };
-use crate::web_search::{
-    CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
-    SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
+use crate::{
+    callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
+    callout_policy::MISSING_CALLOUT_CONTEXT,
+    web_search::{
+        CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
+        SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -134,6 +142,10 @@ pub struct WebSearchFilter {
     max_calls_per_round: usize,
     /// Prebuilt outbound filter chain each provider request executes through.
     outbound: Arc<FilterPipeline>,
+    /// Configured callout-credential slot id (non-secret). When set, each provider
+    /// request uses the caller's per-user secret from this slot instead of the
+    /// shared `api_key`; a missing/empty slot value fails the response closed.
+    user_credential_slot: Option<String>,
 }
 
 impl WebSearchFilter {
@@ -223,6 +235,7 @@ impl WebSearchFilter {
             default_context_size: validated.default_context_size,
             max_calls_per_round,
             outbound,
+            user_credential_slot: validated.user_credential,
         }))
     }
 
@@ -266,18 +279,24 @@ impl WebSearchFilter {
     /// A provider failure never rejects the Response. The model instead
     /// receives a truthful `failed` `web_search_call` plus a bounded failure
     /// message — bridged as a backend-valid `function_call`/`function_call_output`
-    /// pair — so the agentic loop can continue.
+    /// pair — so the agentic loop can continue. Uses the batch-resolved caller
+    /// identity for provider credential staging and owner attribution.
     ///
     /// The call's identities carry its position within the pending queue, which
     /// keeps the synthetic bridge `call_id` unique even when the hosted source
     /// ids collide or are absent (issue #808).
     ///
     /// Returns how many queries were dispatched.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "threads the batch-resolved caller identity into the provider search"
+    )]
     async fn execute_single_search(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         prepared: PreparedCall<'_>,
         context_size: SearchContextSize,
+        identity: &CalloutIdentity,
         query_cap: usize,
     ) -> usize {
         let PreparedCall { ids, queries, action } = prepared;
@@ -292,7 +311,7 @@ impl WebSearchFilter {
             let callout = CalloutContext::from_filter_context(ctx);
             match self
                 .search_client
-                .search(&self.outbound, callout, query, Some(context_size))
+                .search(&self.outbound, callout, query, Some(context_size), identity)
                 .await
             {
                 SearchOutcome::Results(mut query_results) => results.append(&mut query_results),
@@ -313,6 +332,57 @@ impl WebSearchFilter {
         dispatched
     }
 
+    /// Fail closed with a 401 when the initial request declares an eligible hosted
+    /// web-search tool but the required per-user credential is absent, before the
+    /// first inference round runs.
+    ///
+    /// The re-entry check in [`Self::resolve_batch_identity`] runs only after the
+    /// model emits a `web_search` call; under terminal streaming that is after HTTP
+    /// 200 has committed — too late to fail closed, and it leaks the first round's
+    /// output. This round-0 preflight closes that gap for both streaming and
+    /// buffered transports. The identity is re-derived at re-entry from the same
+    /// context, so this only proves presence and discards its result.
+    fn preflight_managed_credential(&self, ctx: &HttpFilterContext<'_>) -> Result<(), Rejection> {
+        match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
+            Ok(_identity) => Ok(()),
+            Err(CalloutContextMissing::Credential { slot }) => Err(responses_error_rejection(
+                401,
+                MISSING_CALLOUT_CONTEXT,
+                &format!("web search requires the '{slot}' per-user credential, which was not provided"),
+            )),
+        }
+    }
+
+    /// Resolve the caller's identity once for the whole batch, recording a fail-closed
+    /// 401 security failure and returning `None` when a required per-user credential is absent.
+    fn resolve_batch_identity(&self, ctx: &mut HttpFilterContext<'_>) -> Option<CalloutIdentity> {
+        match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
+            Ok(identity) => Some(identity),
+            Err(CalloutContextMissing::Credential { slot }) => {
+                if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                    state.record_security_failure(DispatchFailure {
+                        status: 401,
+                        code: MISSING_CALLOUT_CONTEXT,
+                        message: format!(
+                            "web search requires the '{slot}' per-user credential, which was not provided"
+                        ),
+                    });
+                }
+                None
+            },
+        }
+    }
+
+    /// Update cumulative execution count and clear the pending queue after dispatch.
+    fn finalize_pending_searches(ctx: &mut HttpFilterContext<'_>, dispatched: usize) {
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.web_search_calls_executed = state
+                .web_search_calls_executed
+                .saturating_add(u32::try_from(dispatched).unwrap_or(u32::MAX));
+            state.web_search_calls.clear();
+        }
+    }
+
     /// Execute admitted web search `calls` within the batch budgets, then
     /// update the cumulative execution count and clear the pending queue.
     ///
@@ -323,6 +393,13 @@ impl WebSearchFilter {
     /// ordered admission pass, which forces local completion without another
     /// model round.
     async fn execute_pending_searches(&self, ctx: &mut HttpFilterContext<'_>, batch: PendingSearchBatch<'_>) -> bool {
+        // A missing per-user credential recorded a write-once security failure in
+        // `resolve_batch_identity`. The agentic loop consults `security_failure.take()`
+        // before any pending-queue logic, so it 401s before this queue is read again;
+        // leaving `web_search_calls` un-cleared here is intentional, not a leak.
+        let Some(identity) = self.resolve_batch_identity(ctx) else {
+            return false;
+        };
         let mut calls_dispatched = 0_usize;
         let mut queries_dispatched = 0_usize;
         let mut tool_limit_exceeded = false;
@@ -335,7 +412,7 @@ impl WebSearchFilter {
                 continue;
             };
             let dispatched = self
-                .execute_single_search(ctx, prepared, batch.context_size, query_cap)
+                .execute_single_search(ctx, prepared, batch.context_size, &identity, query_cap)
                 .await;
             if dispatched > 0 {
                 calls_dispatched = calls_dispatched.saturating_add(1);
@@ -343,12 +420,7 @@ impl WebSearchFilter {
             }
         }
 
-        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
-            state.web_search_calls_executed = state
-                .web_search_calls_executed
-                .saturating_add(u32::try_from(calls_dispatched).unwrap_or(u32::MAX));
-            state.web_search_calls.clear();
-        }
+        Self::finalize_pending_searches(ctx, calls_dispatched);
         tool_limit_exceeded
     }
 }
@@ -422,6 +494,19 @@ impl HttpFilter for WebSearchFilter {
             return Ok(FilterAction::Continue);
         };
 
+        // Round-0 credential preflight. When the initial request declares a hosted
+        // web-search tool that could run under the effective `tool_choice` and a
+        // per-user credential slot is configured, resolve it now so a missing
+        // credential fails closed BEFORE any inference round runs — the re-entry
+        // check would otherwise fire only after streaming has committed HTTP 200.
+        if self.user_credential_slot.is_some()
+            && is_initial_request(ctx)
+            && request_declares_eligible_web_search(state)
+            && let Err(rejection) = self.preflight_managed_credential(ctx)
+        {
+            return Ok(FilterAction::Reject(rejection));
+        }
+
         if state.web_search_calls.is_empty() {
             return Ok(FilterAction::Continue);
         }
@@ -480,6 +565,46 @@ impl HttpFilter for WebSearchFilter {
 /// Return the response fan-out cap this dispatcher published for the owner.
 pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
     ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
+}
+
+/// Whether this is the initial client request (model round 0), not an IRR re-entry.
+///
+/// The credential preflight applies only to the fresh request: on re-entry the
+/// pending-queue path already resolves and fail-closes the credential.
+fn is_initial_request(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<IterationState>()
+        .is_none_or(|state| state.iteration() == 0)
+}
+
+/// Whether the initial request declares a hosted web-search tool that could run
+/// under the effective `tool_choice`, so a per-user credential preflight applies.
+fn request_declares_eligible_web_search(state: &ResponsesState) -> bool {
+    let declares = state.tools.iter().any(|tool| {
+        tool.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_web_search_tool_type)
+    });
+    declares && tool_choice_permits_web_search(&state.tool_choice)
+}
+
+/// Whether `tool_choice` leaves a hosted web-search tool eligible to run this turn.
+///
+/// `"none"` forbids all tools; an object forcing a single non-web-search tool
+/// (e.g. `{"type": "function", ...}`) also excludes it. Every other shape —
+/// `"auto"`, `"required"`, an object forcing a web-search tool, `allowed_tools`,
+/// or an absent/unknown choice — keeps web search eligible. Being conservatively
+/// eligible is safe: the re-entry check still fails closed if the callout runs.
+fn tool_choice_permits_web_search(tool_choice: &Value) -> bool {
+    match tool_choice {
+        Value::String(keyword) => keyword != "none",
+        Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
+            Some(kind) if is_web_search_tool_type(kind) => true,
+            Some("allowed_tools") | None => true,
+            Some(_) => false,
+        },
+        _ => true,
+    }
 }
 
 /// Borrowed inputs for one request-side web-search dispatch batch.

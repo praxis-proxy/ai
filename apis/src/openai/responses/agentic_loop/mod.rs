@@ -313,6 +313,13 @@ impl HttpFilter for AgenticLoopFilter {
             return Ok(FilterAction::Continue);
         };
 
+        // A locally-detected security-context failure (missing/invalid per-user callout
+        // credential) is converted here FIRST, so a security terminal preempts a generic
+        // dispatch terminal for the same round.
+        if let Some(failure) = state.security_failure.take() {
+            return convert_dispatch_failure(ctx, state, &failure);
+        }
+
         // A request-phase dispatcher (e.g. `openai_file_search_callout`) that failed
         // records a shared terminal outcome instead of committing a second terminal
         // response. The sole loop owner converts it here — before preparing another

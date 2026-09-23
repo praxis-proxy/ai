@@ -24,7 +24,12 @@
 # the proxy against the configured provider, so the model only needs to emit
 # `WebSearch` tool-use blocks; the loop performs the search and re-enters.
 #
-# Requires WEB_SEARCH_API_KEY. The Messages backend listens on 127.0.0.1:8000.
+# Requires WEB_SEARCH_API_KEY for the provider configuration. The trusted
+# authentication boundary must also delete any client-supplied
+# `x-user-you-key` header and set exactly one authenticated per-user value.
+# `callout_credentials` strips that ingress header before inference and carries
+# the secret through IRR in the `you_search` slot. The Messages backend listens
+# on 127.0.0.1:8000.
 #
 # Run the deterministic model mock:
 #   cargo run -p praxis-test-utils --example anthropic_messages_web_search_mock
@@ -36,6 +41,7 @@
 # Streaming request (incremental terminal answer):
 #   curl -N http://127.0.0.1:8080/v1/messages \
 #     -H 'content-type: application/json' \
+#     -H "x-user-you-key: $USER_WEB_SEARCH_API_KEY" \
 #     -d '{"model":"openai/gpt-oss-20b","max_tokens":1024,"stream":true,"messages":[{"role":"user","content":"Use web search to look up potato, then summarize in one sentence."}],"tools":[{"name":"WebSearch","description":"Search the web","input_schema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}'
 #
 # Buffered request (single final JSON object): send the same body with
@@ -49,6 +55,13 @@ listeners:
 filter_chains:
   - name: full-flow-agentic
     filters:
+      - filter: callout_credentials
+        # This filter establishes typed request context and strips the source
+        # header; the trusted boundary remains responsible for its provenance.
+        credentials:
+          - slot: you_search
+            source_header: x-user-you-key
+
       - filter: anthropic_messages_format
         on_invalid: reject
       - filter: anthropic_validate
@@ -62,6 +75,9 @@ filter_chains:
               - filter: anthropic_web_search
                 provider: you
                 api_key: ${WEB_SEARCH_API_KEY}
+                # Require the per-user key captured before IRR. The secret is
+                # injected only at the exact resolved provider authority.
+                user_credential: you_search
                 default_context_size: medium
                 timeout_ms: 10000
                 terminal_streaming: true

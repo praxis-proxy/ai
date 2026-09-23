@@ -15,6 +15,14 @@
 #
 #   0. state_owner maps deployment-specific trusted ingress headers into one
 #      normalized tenant/issuer/subject context for owner-aware filters.
+#      callout_credentials captures the per-user Brave provider key from the
+#      trusted x-user-brave-key ingress header into the `brave_search` slot and
+#      strips the source header before inference or IRR processing. The trusted
+#      boundary MUST unconditionally delete-then-set that source header on every
+#      request; append-on-success is insufficient because this filter cannot
+#      authenticate header provenance. The IRR carries the resulting typed
+#      request extension across iterations, while openai_web_search explicitly
+#      selects the slot for its exact-authority provider callout.
 #      state_owner_headers then projects that context as x-tenant-id and
 #      x-user-id for OGX and explicitly allowlisted callouts. The raw ingress
 #      names are stripped, and the projection is repeated inside the IRR step
@@ -238,9 +246,12 @@
 #   websocat -H="Authorization: Bearer $OPENAI_API_KEY" \
 #     ws://localhost:8080/v1/responses
 #
-# Web search requires a provider API key. Set WEB_SEARCH_API_KEY in the
-# environment before starting the proxy; openai_web_search stays inert
-# until the model emits a web_search_call.
+# Web search requires the trusted boundary to provide x-user-brave-key. The
+# WEB_SEARCH_API_KEY field remains required by the provider configuration, so
+# set it before starting the proxy; when `user_credential: brave_search` is
+# configured, a missing per-user slot fails closed instead of falling back to
+# that shared key. openai_web_search stays inert until the model emits a
+# web_search_call.
 #
 # Listener and cluster transport timeouts are intentionally omitted.
 # Configured downstream read and upstream idle/read/write timeouts remain
@@ -303,6 +314,15 @@ filter_chains:
           static: urn:example:gateway
         subject:
           header: x-auth-user
+
+      - filter: callout_credentials
+        # The trusted authentication boundary must delete any client-supplied
+        # instance and then set exactly one authenticated value on every
+        # request. This filter establishes typed request context and strips the
+        # ingress header; it does not authenticate the header's provenance.
+        credentials:
+          - slot: brave_search
+            source_header: x-user-brave-key
 
       # Emit the normalized owner in the contract expected by OGX and by the
       # explicitly configured downstream callouts below. Raw x-auth-* inputs
@@ -503,6 +523,10 @@ filter_chains:
               - filter: openai_web_search
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
+                # Require the per-user key captured by the outer
+                # callout_credentials filter. The secret is injected only at
+                # the exact resolved provider authority.
+                user_credential: brave_search
                 max_calls_per_round: 32
                 # Each provider callout executes through this outbound chain; the
                 # filtered-subrequest executor enforces destination authority,

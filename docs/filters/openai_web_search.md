@@ -16,6 +16,7 @@ Each provider request is executed through the shared filtered-subrequest executo
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `provider` | `brave` \| `tavily` \| `you` | yes | Search backend provider. |
+| `user_credential` | string | no | Optional callout-credential slot id (see [`WebSearchFilterConfig::user_credential`]). |
 | `api_key` | string (secret) | yes | API key for the search provider (supports `${ENV_VAR}`). Wrapped in [`SecretString`] to prevent accidental logging. |
 | `default_context_size` | string | no | Default search context size when the client omits it. |
 | `timeout_ms` | integer | no | Callout timeout in milliseconds. |
