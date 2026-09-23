@@ -278,7 +278,10 @@ fn nemo_guardrails_modified_forwards_redacted_body() {
         "original PII must not reach the upstream; got: {body}"
     );
     let parsed: serde_json::Value = serde_json::from_str(&body).expect("upstream should echo valid JSON");
-    let messages = parsed.get("messages").and_then(|v| v.as_array()).expect("messages should be an array");
+    let messages = parsed
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .expect("messages should be an array");
     assert_eq!(
         messages.first().and_then(|m| m.get("content")),
         Some(&serde_json::json!("Be helpful")),

@@ -614,8 +614,8 @@ impl GuardProvider for AlwaysRedactProvider {
 
 #[tokio::test]
 async fn on_request_body_modified_without_user_message_fails_closed() {
-    let filter = AiGuardrailsFilter::with_provider(Box::new(AlwaysRedactProvider), PhaseConfig::default())
-        .expect("test filter");
+    let filter =
+        AiGuardrailsFilter::with_provider(Box::new(AlwaysRedactProvider), PhaseConfig::default()).expect("test filter");
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let mut body = Some(bytes::Bytes::from_static(
