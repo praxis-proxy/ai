@@ -4,17 +4,6 @@ version = 4
 
 [[package]]
 name = "ahash"
-version = "0.7.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891477e0c6a8957309ee5c45a6368af3ae14bb510732d2684ffa19af310920f9"
-dependencies = [
- "getrandom 0.2.17",
- "once_cell",
- "version_check",
-]
-
-[[package]]
-name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
@@ -115,7 +104,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -126,7 +115,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1428,7 +1417,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1550,7 +1539,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf5efcf77a4da27927d3ab0509dec5b0954bb3bc59da5a1de9e52642ebd4cdf9"
 dependencies = [
- "ahash 0.8.12",
+ "ahash",
  "num_cpus",
  "parking_lot",
  "seize",
@@ -1830,9 +1819,6 @@ name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
-dependencies = [
- "ahash 0.7.8",
-]
 
 [[package]]
 name = "hashbrown"
@@ -2412,7 +2398,7 @@ version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6a806f80c1f5560431009ce5ec29b59d38f950e0cd7db5f1b8925e6d8104e21"
 dependencies = [
- "ahash 0.8.12",
+ "ahash",
  "bytecount",
  "data-encoding",
  "email_address",
@@ -2449,7 +2435,7 @@ version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a05cd404c5ff6e2731dbbf7e290a27417750acfb59e329560a1d0af384c93fb0"
 dependencies = [
- "ahash 0.8.12",
+ "ahash",
  "bytecount",
  "fraction",
  "getrandom 0.3.4",
@@ -3002,7 +2988,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3456,7 +3442,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
- "sse-stream",
+ "sse-stream 0.3.0",
  "tempfile",
  "thiserror",
  "tiktoken-rs",
@@ -4072,7 +4058,7 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -4142,7 +4128,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb5cd191fad9142d096efc97c64715db73db4adb60c38ebdf22f5b54cd6ea712"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "prost",
  "prost-build",
  "prost-types",
@@ -4294,7 +4280,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4303,7 +4289,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "350fc5dba8abe580c7e087282174e5a2ecc686b525e8ff57cdb60496c5127ed9"
 dependencies = [
- "ahash 0.8.12",
+ "ahash",
  "arrayvec 0.7.8",
  "async-trait",
  "blake2",
@@ -4339,7 +4325,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6715c22a92bc566fd9384790c2d1abfb9354de8f1a0dcf1f7256e0c3a2d6ad82"
 dependencies = [
- "ahash 0.8.12",
+ "ahash",
  "async-trait",
  "brotli",
  "bstr",
@@ -4425,11 +4411,11 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c73254f0b48aa956769c2f76f6464774fbf13f0b27cbbf3b64b5f3e2960d261c"
 dependencies = [
- "ahash 0.8.12",
+ "ahash",
  "arrayvec 0.7.8",
  "async-channel",
  "flurry",
- "hashbrown 0.12.3",
+ "hashbrown 0.17.1",
  "log",
  "parking_lot",
  "rand 0.10.3",
@@ -4709,7 +4695,7 @@ version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3b4a92fac7e28c27de3ad26df2ecb9e652f227b258e845af034052e5b22c96c"
 dependencies = [
- "ahash 0.8.12",
+ "ahash",
  "fluent-uri",
  "getrandom 0.3.4",
  "hashbrown 0.17.1",
@@ -4858,7 +4844,7 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
- "sse-stream",
+ "sse-stream 0.2.6",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -4950,7 +4936,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5031,7 +5017,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5522,7 +5508,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5697,6 +5683,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sse-stream"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d385160fc0fba84f7b9cc8ef3263e410d0e3ca7ab4927f1356df33145ace69a4"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "memchr",
+ "pin-project-lite",
+ "simdutf8",
+ "thiserror",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5712,7 +5714,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5874,7 +5876,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5883,7 +5885,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8c27177b12a6399ffc08b98f76f7c9a1f4fe9fc967c784c5a071fa8d93cf7e1"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6710,7 +6712,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
