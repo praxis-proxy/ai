@@ -1870,9 +1870,10 @@ fn build_output_items(
     };
 
     let message = choice.get("message");
+    let chat_completion_id = obj.get("id").and_then(Value::as_str);
     if let Some(reasoning_item) = extract_reasoning_item(
         message,
-        reasoning_item_id(&context.response_id),
+        reasoning_item_id(&context.response_id, chat_completion_id),
         status,
         &context.reasoning_options,
     )? {

@@ -2125,7 +2125,7 @@ async fn vllm_reasoning_content_is_extracted_end_to_end() {
     assert!(matches!(body_action, FilterAction::Continue));
     let translated: serde_json::Value = serde_json::from_slice(response_body.as_deref().unwrap()).unwrap();
     assert_eq!(translated["output"][0]["type"], "reasoning");
-    assert_eq!(translated["output"][0]["id"], "rs_resp_reasoning_1");
+    assert_eq!(translated["output"][0]["id"], "rs_resp_reasoning_1_chatcmpl_1");
     assert_eq!(translated["output"][0]["content"][0]["type"], "reasoning_text");
     assert_eq!(translated["output"][0]["content"][0]["text"], "2 plus 2 is 4.");
     assert_eq!(translated["output"][0]["summary"], json!([]));

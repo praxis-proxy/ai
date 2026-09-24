@@ -2544,12 +2544,48 @@ mod tests {
 
         let output = mapped["output"].as_array().unwrap();
         assert_eq!(output[0]["type"], "reasoning");
-        assert_eq!(output[0]["id"], "rs_abc");
+        assert_eq!(output[0]["id"], "rs_abc_chatcmpl-r");
         assert_eq!(output[0]["summary"], json!([]));
         assert_eq!(output[0]["content"][0]["type"], "reasoning_text");
         assert_eq!(output[0]["content"][0]["text"], "step by step");
         assert_eq!(output[1]["type"], "message");
         assert_eq!(output[1]["content"][0]["text"], "the answer");
+    }
+
+    #[test]
+    fn agentic_rounds_produce_distinct_reasoning_item_ids() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context = vllm_context(&request);
+
+        let mut round_one = vllm_reasoning_response(json!("first round cot"));
+        round_one["id"] = json!("chatcmpl-round-1");
+        let mut round_two = vllm_reasoning_response(json!("second round cot"));
+        round_two["id"] = json!("chatcmpl-round-2");
+
+        let first = super::chat_completions::chat_response_to_response_resource(&round_one, &context).unwrap();
+        let second = super::chat_completions::chat_response_to_response_resource(&round_two, &context).unwrap();
+
+        let first_id = first["output"][0]["id"].as_str().unwrap();
+        let second_id = second["output"][0]["id"].as_str().unwrap();
+
+        assert_eq!(first_id, "rs_abc_chatcmpl-round-1");
+        assert_eq!(second_id, "rs_abc_chatcmpl-round-2");
+        assert_ne!(
+            first_id, second_id,
+            "each agentic round must mint a distinct reasoning item id"
+        );
+    }
+
+    #[test]
+    fn reasoning_item_id_falls_back_when_chat_response_omits_id() {
+        let request = json!({"model": "m", "input": "hi"});
+        let context = vllm_context(&request);
+        let mut response = vllm_reasoning_response(json!("no id cot"));
+        response.as_object_mut().unwrap().remove("id");
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["output"][0]["id"], "rs_abc");
     }
 
     #[test]

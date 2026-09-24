@@ -177,9 +177,12 @@ pub(crate) fn validate_requested_reasoning(
     Ok(())
 }
 
-/// Build a stable reasoning output item id.
-pub(crate) fn reasoning_item_id(response_id: &str) -> String {
-    format!("rs_{response_id}")
+/// Build a reasoning output item id that stays unique across agentic rounds.
+pub(crate) fn reasoning_item_id(response_id: &str, chat_completion_id: Option<&str>) -> String {
+    match chat_completion_id.filter(|id| !id.is_empty()) {
+        Some(chat_id) => format!("rs_{response_id}_{chat_id}"),
+        None => format!("rs_{response_id}"),
+    }
 }
 
 /// Build a `Responses` reasoning output item from a Chat Completions message.
