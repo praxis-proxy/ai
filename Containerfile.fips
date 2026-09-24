@@ -14,8 +14,8 @@
 #
 # The FIPS build differs from the published build only in its cargo features:
 # it turns off what is known not to be FIPS compliant yet (the policy engine,
-# AWS SigV4 signing, the response stores and the reqwest-based filters, whose
-# dependencies carry their own cryptography; see the Makefile's FIPS section).
+# the response stores and the reqwest-based filters, whose dependencies carry
+# their own cryptography; see the Makefile's FIPS section).
 # CARGO_FEATURES defaults to the Makefile's FIPS_FEATURES; keep the two in
 # sync.
 #

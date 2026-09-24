@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
+// Portions Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+//
+// The URI path normalization, the percent-encoding set, the excluded-header
+// list and the canonical request assembly are ported from aws-sigv4 1.5.3
+// and aws-smithy-http 0.64.0 (Apache-2.0), modified to compute SHA-256 and
+// HMAC-SHA256 through the system OpenSSL instead of the sha2/hmac crates.
 
 //! AWS Signature Version 4 (`SigV4`), header-based, on the system OpenSSL.
 //!
