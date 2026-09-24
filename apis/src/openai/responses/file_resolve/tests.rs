@@ -61,12 +61,17 @@ fn from_config_unknown_field_rejected() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn body_access_is_read_write() {
+fn bound_body_access_is_read_write() {
     let filter = make_filter();
     assert_eq!(
         filter.request_body_access(),
+        BodyAccess::None,
+        "file_resolve should not run before an upstream is bound"
+    );
+    assert_eq!(
+        filter.bound_upstream_request_body_access(),
         BodyAccess::ReadWrite,
-        "file_resolve must have read-write body access"
+        "file_resolve must have post-binding read-write body access"
     );
 }
 

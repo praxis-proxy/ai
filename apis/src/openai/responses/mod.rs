@@ -14,8 +14,9 @@
 //! discriminator is a Responses request rather than unknown JSON. A
 //! `GET /v1/responses` `WebSocket` upgrade is classified from the method,
 //! path, and upgrade headers without inferring body-derived facts.
-//! Create requests with `background=true` are rejected because Praxis does not
-//! implement the asynchronous Responses lifecycle.
+//! `background` is preserved as routing metadata. Gateway-owned validation
+//! rejects unsupported `background=true` after logical provider binding, while
+//! provider-owned passthrough keeps the field intact.
 //! Promotes classification facts to configurable headers, durable
 //! metadata, and filter results for routing. Does not mutate the
 //! request body.
@@ -111,6 +112,8 @@ use std::io;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(feature = "openai-responses")]
+use praxis_filter::BoundUpstreamBodyOutcome;
 use praxis_filter::{
     BodyAccess, BodyMode, ErrorResponseFormatterHandle, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     body::MAX_JSON_BODY_BYTES, builtins::http::payload_processing::OnInvalidBehavior, parse_filter_config,
@@ -125,6 +128,26 @@ use crate::{
     },
     promotion::is_promotable_value,
 };
+
+/// Reduce an ordinary request-body action to the bound-upstream body's
+/// deliberately narrow continue-or-reject contract.
+///
+/// The bound phase runs after the complete request body has been buffered, so
+/// `Release` and `BodyDone` both mean that processing may continue. Terminal
+/// responses are invalid at this lifecycle point; callers that need one must
+/// stash the required state and emit it from their later header hook.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn bound_body_outcome(action: FilterAction) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+    match action {
+        FilterAction::Continue | FilterAction::Release | FilterAction::BodyDone => {
+            Ok(BoundUpstreamBodyOutcome::Continue)
+        },
+        FilterAction::Reject(rejection) => Ok(BoundUpstreamBodyOutcome::Reject(rejection)),
+        FilterAction::TerminalResponse(_) | FilterAction::StreamingTerminalResponse(_) => {
+            Err("terminal response is invalid during bound-upstream body processing".into())
+        },
+    }
+}
 
 /// Count compact JSON bytes without retaining the serialized representation.
 ///
@@ -319,10 +342,6 @@ impl HttpFilter for ResponsesFormatFilter {
             return Ok(action);
         }
 
-        if let Some(action) = handle_unsupported_background(&classified) {
-            return Ok(action);
-        }
-
         let mode = if websocket_handshake {
             None
         } else {
@@ -414,22 +433,6 @@ fn handle_invalid_format(format: AiRequestFormat, config: &ResponsesFormatConfig
             )))
         },
     }
-}
-
-/// Reject Responses create requests that request background execution.
-///
-/// Praxis does not implement the asynchronous Responses lifecycle
-/// (schedule, poll, cancel), so `background=true` is rejected uniformly
-/// before routing or upstream contact with an OpenAI-shaped 400.
-fn handle_unsupported_background(classified: &ClassifiedRequest) -> Option<FilterAction> {
-    if classified.format == AiRequestFormat::Responses && classified.background == Some(true) {
-        return Some(FilterAction::Reject(error::responses_error_rejection(
-            400,
-            "invalid_request_error",
-            "background mode is not supported",
-        )));
-    }
-    None
 }
 
 /// Determine the routing mode for a Responses API request.

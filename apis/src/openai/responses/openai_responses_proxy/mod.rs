@@ -70,10 +70,9 @@ use crate::{classifier::is_responses_create, json_body::SerializedJson};
 ///
 /// Non-null `prompt` template references are rejected unless the load balancer
 /// selected a cluster declaring `application_protocol: openai_responses` and
-/// `application_provider: openai`. Because cluster selection happens during
-/// the request-header phase, a pipeline that uses OpenAI-managed prompts must
-/// order this filter after its router and load balancer. Missing or different
-/// application metadata fails closed.
+/// `application_provider: openai`. The check runs in the selected-upstream body
+/// phase, after routing has frozen that application metadata. Missing or
+/// different application metadata fails closed.
 ///
 /// This filter always advertises the Praxis streaming capability. When the
 /// effective outbound body contains `"stream": true` it selects Praxis's

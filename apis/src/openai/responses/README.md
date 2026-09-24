@@ -33,20 +33,20 @@ Body-phase columns show `Access / Mode` when the hook is implemented.
 |--------|:------------:|:-----------------:|:--------------:|:------------------:|
 | `openai_agentic_loop` | ✓ | ReadOnly / StreamBuffer | — | ReadWrite / Stream |
 | `openai_client_tool_compat` | — | ReadOnly / Stream | — | ReadWrite / Stream |
-| `openai_doc_extract` | — | ReadWrite / StreamBuffer | — | — |
-| `openai_file_resolve` | — | ReadWrite / StreamBuffer | — | — |
+| `openai_doc_extract` | — | None / StreamBuffer | — | — |
+| `openai_file_resolve` | — | None / StreamBuffer | — | — |
 | `openai_file_search_callout` | — | ReadOnly / StreamBuffer | — | — |
 | `openai_mcp_dispatch` | ✓ | ReadOnly / StreamBuffer | — | — |
-| `openai_mcp_tool_resolve` | ✓ | ReadWrite / StreamBuffer | — | — |
-| `openai_response_store` | ✓ | ReadOnly / Stream | ✓ | ReadOnly / Stream |
+| `openai_mcp_tool_resolve` | ✓ | None / StreamBuffer | — | — |
+| `openai_response_store` | ✓ | None / StreamBuffer | ✓ | ReadOnly / Stream |
 | `openai_responses_compact` | — | ReadOnly / StreamBuffer | — | — |
 | `openai_responses_format` | — | ReadOnly / StreamBuffer | — | — |
 | `openai_responses_model_rewrite` | ✓ | ReadWrite / StreamBuffer | — | — |
-| `openai_responses_proxy` | ✓ | ReadWrite / StreamBuffer | — | — |
-| `openai_responses_rehydrate` | — | ReadOnly / StreamBuffer | ✓ | ReadWrite / Stream |
+| `openai_responses_proxy` | — | — | — | — |
+| `openai_responses_rehydrate` | — | None / StreamBuffer | ✓ | ReadWrite / Stream |
 | `openai_responses_request` | — | ReadOnly / StreamBuffer | — | — |
-| `openai_responses_validate` | — | ReadOnly / StreamBuffer | — | ReadOnly / Stream |
+| `openai_responses_validate` | — | None / StreamBuffer | — | ReadOnly / Stream |
 | `openai_stream_events` | ✓ | ReadOnly / Stream | ✓ | ReadWrite / Stream |
 | `openai_tool_parse` | ✓ | ReadOnly / StreamBuffer | — | — |
 | `openai_web_search` | — | ReadOnly / StreamBuffer | — | — |
-| `responses_to_chat_completions` | — | ReadWrite / StreamBuffer | ✓ | ReadWrite / Stream |
+| `responses_to_chat_completions` | — | — | ✓ | ReadWrite / Stream |

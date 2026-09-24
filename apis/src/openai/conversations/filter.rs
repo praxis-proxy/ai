@@ -13,7 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
@@ -26,7 +26,7 @@ use tracing::{debug, trace, warn};
 #[cfg(feature = "store-postgres")]
 use super::config::revalidate_postgres_host;
 use super::{
-    config::{ConversationsConfig, StorageBackend, validate_config},
+    config::{ConversationsConfig, RequestBodyPhase, StorageBackend, validate_config},
     handlers,
     routes::{APPLICATION_PROTOCOL, ConversationOperation, match_route},
 };
@@ -35,7 +35,10 @@ use crate::store::PostgresResponseStore;
 #[cfg(feature = "store-sqlite")]
 use crate::store::SqliteResponseStore;
 use crate::{
-    openai::{operation_classifier::OpenAiOperationMatch, responses::state::ResponsesState},
+    openai::{
+        operation_classifier::OpenAiOperationMatch,
+        responses::{bound_body_outcome, state::ResponsesState},
+    },
     operation::Transport,
     state_owner::{StateOwner, require_state_owner},
     store::{ConversationItemStore, StoreError},
@@ -98,6 +101,22 @@ fn capture_append_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterAct
     ctx.extensions
         .insert(CapturedAppendOwner(require_state_owner(ctx)?.clone()));
     Ok(())
+}
+
+/// Capture the immutable owner after managed-provider validation has published
+/// the canonical conversation ID.
+///
+/// Header hooks run before the bound-body phase, so append-back is not eligible
+/// when the Conversations filter first sees a Responses request. The validator
+/// calls this helper after publishing the canonical ID; provider-owned traffic
+/// skips both filters and therefore never arms local append-back.
+pub(crate) fn capture_validated_append_owner(ctx: &mut HttpFilterContext<'_>) {
+    if !should_append_back(ctx) || ctx.extensions.get::<CapturedAppendOwner>().is_some() {
+        return;
+    }
+    if let Some(owner) = ctx.extensions.get::<StateOwner>().cloned() {
+        ctx.extensions.insert(CapturedAppendOwner(owner));
+    }
 }
 
 impl OpenaiConversationsFilter {
@@ -502,7 +521,17 @@ impl HttpFilter for OpenaiConversationsFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        match self.config.request_body_phase {
+            RequestBodyPhase::PreRead => BodyAccess::ReadOnly,
+            RequestBodyPhase::BoundUpstream => BodyAccess::None,
+        }
+    }
+
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        match self.config.request_body_phase {
+            RequestBodyPhase::PreRead => BodyAccess::None,
+            RequestBodyPhase::BoundUpstream => BodyAccess::ReadOnly,
+        }
     }
 
     fn response_body_access(&self) -> BodyAccess {
@@ -600,6 +629,15 @@ impl HttpFilter for OpenaiConversationsFilter {
             bytes,
         ))
         .await
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 
     #[expect(

@@ -270,14 +270,12 @@ async fn prompt_template_is_rejected_without_selected_openai_upstream() {
     let original = Bytes::from_static(br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123","variables":{"name":"Ada"}}}"#);
     let mut body = Some(original.clone());
 
-    let body_action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(body_action, FilterAction::Continue),
-        "prompt detection should complete before upstream validation"
-    );
-    let action = filter.on_request(&mut ctx).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
         panic!("a prompt template must fail closed for a backend without the capability");
     };
     assert_eq!(rejection.status, 400, "unsupported prompt must return HTTP 400");
@@ -309,15 +307,13 @@ async fn prompt_template_in_canonical_state_is_rejected_by_default() {
     })));
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"rewritten"}"#));
 
-    let body_action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(body_action, FilterAction::Continue),
-        "canonical prompt detection should complete before upstream validation"
-    );
-    let action = filter.on_request(&mut ctx).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(&action, FilterAction::Reject(rejection) if rejection.status == 400),
+        matches!(&action, SelectedUpstreamBodyOutcome::Reject(rejection) if rejection.status == 400),
         "canonical state must remain authoritative even when the current bytes omit prompt"
     );
 }
@@ -330,15 +326,14 @@ async fn null_prompt_is_allowed_by_default() {
     let original = Bytes::from_static(br#"{"model":"gpt-4.1","input":"hello","prompt":null}"#);
     let mut body = Some(original.clone());
 
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "a null prompt should remain a valid passthrough request"
-    );
-    assert!(
-        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
-        "a null prompt must not require an OpenAI upstream"
     );
     assert_eq!(
         body.as_deref(),
@@ -444,15 +439,6 @@ async fn openai_responses_metadata_preserves_prompt_template_passthrough_body() 
     );
     let mut body = Some(original.clone());
 
-    let action = pipeline
-        .execute_http_request_body(&mut ctx, &mut body, true)
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "OpenAI prompt passthrough body detection should continue"
-    );
     assert!(
         matches!(
             pipeline.execute_http_request(&mut ctx).await.unwrap(),
@@ -474,6 +460,14 @@ async fn openai_responses_metadata_preserves_prompt_template_passthrough_body() 
         ctx.upstream.as_ref().unwrap().address.as_ref(),
         "127.0.0.1:443",
         "endpoint identity remains independent from application capability"
+    );
+    let action = pipeline
+        .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "an upstream declared as OpenAI Responses must allow prompt templates"
     );
     assert_eq!(
         body.as_deref(),
@@ -498,21 +492,20 @@ async fn openai_responses_metadata_preserves_prompt_template_in_rebuilt_state() 
         br#"{"model":"gpt-4.1","input":"hello","prompt":{"id":"pmpt_123","variables":{"name":"Ada"}}}"#,
     ));
 
-    let action = pipeline
-        .execute_http_request_body(&mut ctx, &mut body, true)
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "state-backed OpenAI prompt detection should continue"
-    );
     assert!(
         matches!(
             pipeline.execute_http_request(&mut ctx).await.unwrap(),
             FilterAction::Continue
         ),
         "an upstream declared as OpenAI Responses must allow a rebuilt prompt request"
+    );
+    let action = pipeline
+        .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "state-backed OpenAI prompt processing should continue"
     );
     let rebuilt: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     assert_eq!(
@@ -538,17 +531,19 @@ async fn prompt_template_requires_openai_responses_protocol_and_provider() {
         let mut ctx = make_filter_context(&req);
         let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123"}}"#));
 
-        let body_action = pipeline
-            .execute_http_request_body(&mut ctx, &mut body, true)
-            .await
-            .unwrap();
-        assert!(
-            matches!(body_action, FilterAction::Continue),
-            "prompt detection should complete before provider validation"
-        );
         assert!(
             matches!(
                 pipeline.execute_http_request(&mut ctx).await.unwrap(),
+                FilterAction::Continue
+            ),
+            "routing should select the declared backend"
+        );
+        assert!(
+            matches!(
+                pipeline
+                    .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
+                    .await
+                    .unwrap(),
                 FilterAction::Reject(_)
             ),
             "prompt templates require exact OpenAI Responses protocol and provider metadata"
@@ -563,15 +558,6 @@ async fn routed_openai_responses_pipeline_allows_prompt_template_for_non_openai_
     let mut ctx = make_filter_context(&req);
     let original = Bytes::from_static(br#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123"}}"#);
     let mut body = Some(original.clone());
-
-    let body_action = pipeline
-        .execute_http_request_body(&mut ctx, &mut body, true)
-        .await
-        .unwrap();
-    assert!(
-        matches!(body_action, FilterAction::Continue),
-        "the assembled pipeline must continue after processing the complete request body"
-    );
 
     let request_action = pipeline.execute_http_request(&mut ctx).await.unwrap();
     assert!(
@@ -596,6 +582,14 @@ async fn routed_openai_responses_pipeline_allows_prompt_template_for_non_openai_
         ctx.selected_application_provider(),
         Some("openai"),
         "the selected cluster must declare the OpenAI provider"
+    );
+    let body_action = pipeline
+        .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+    assert!(
+        matches!(body_action, FilterAction::Continue),
+        "the selected-upstream body phase must allow the OpenAI prompt"
     );
     assert_eq!(
         body.as_deref(),

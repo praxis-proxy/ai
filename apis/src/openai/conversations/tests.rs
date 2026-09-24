@@ -3538,9 +3538,25 @@ async fn delete_item_returns_updated_conversation() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn filter_request_body_access_is_read_only() {
+fn filter_request_body_access_defaults_to_pre_read() {
     let filter = build_test_filter();
     assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::None);
+}
+
+#[test]
+fn filter_request_body_access_can_run_in_bound_upstream_phase() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        request_body_phase: bound_upstream
+        "#,
+    )
+    .unwrap();
+    let filter = OpenaiConversationsFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.request_body_access(), BodyAccess::None);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
 }
 
 // -----------------------------------------------------------------------------

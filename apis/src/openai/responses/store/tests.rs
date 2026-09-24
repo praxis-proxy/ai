@@ -281,12 +281,17 @@ fn response_body_access_is_read_only() {
 }
 
 #[test]
-fn request_body_access_is_read_only() {
+fn bound_request_body_access_is_read_only() {
     let filter = make_filter();
     assert_eq!(
         filter.request_body_access(),
+        BodyAccess::None,
+        "store setup should not run before an upstream is bound"
+    );
+    assert_eq!(
+        filter.bound_upstream_request_body_access(),
         BodyAccess::ReadOnly,
-        "request body access should be ReadOnly so the store is registered before rehydrate"
+        "bound request body access should be ReadOnly so the store is registered before rehydrate"
     );
 }
 
@@ -1727,11 +1732,20 @@ async fn pipeline_persists_after_format_request_body_classification() {
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
 - filter: openai_responses_format
+- filter: router
+  routes:
+    - path_prefix: "/"
+      cluster: test-backend
 - filter: openai_response_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
   conversations_table: test_conversations
+- filter: load_balancer
+  cluster_source: bound_upstream
+  clusters:
+    - name: test-backend
+      endpoints: ["127.0.0.1:3001"]
 "#
     ))
     .unwrap();
@@ -1759,6 +1773,7 @@ async fn pipeline_persists_after_format_request_body_classification() {
         Some("openai_responses"),
         "format classifier should write metadata before store filter runs"
     );
+    ctx.buffered_request_body = request_body.clone();
 
     let request_action = pipeline.execute_http_request(&mut ctx).await.unwrap();
     assert!(
@@ -1930,11 +1945,20 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
 - filter: openai_responses_format
+- filter: router
+  routes:
+    - path_prefix: "/"
+      cluster: test-backend
 - filter: openai_response_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
   conversations_table: test_conversations
+- filter: load_balancer
+  cluster_source: bound_upstream
+  clusters:
+    - name: test-backend
+      endpoints: ["127.0.0.1:3001"]
 "#
     ))
     .unwrap();
@@ -1963,6 +1987,7 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
         Some("true"),
         "format classifier should detect stream=true"
     );
+    ctx.buffered_request_body = request_body.clone();
 
     let request_action = pipeline.execute_http_request(&mut ctx).await.unwrap();
     assert!(
@@ -2046,11 +2071,20 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
 - filter: openai_responses_format
+- filter: router
+  routes:
+    - path_prefix: "/"
+      cluster: test-backend
 - filter: openai_response_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
   conversations_table: test_conversations
+- filter: load_balancer
+  cluster_source: bound_upstream
+  clusters:
+    - name: test-backend
+      endpoints: ["127.0.0.1:3001"]
 "#
     ))
     .unwrap();
@@ -2078,6 +2112,7 @@ async fn pipeline_non_responses_post_does_not_open_sqlite_store() {
         Some("openai_chat_completions"),
         "format classifier should mark Chat Completions traffic"
     );
+    ctx.buffered_request_body = request_body.clone();
 
     let request_action = pipeline.execute_http_request(&mut ctx).await.unwrap();
     assert!(
@@ -2125,12 +2160,21 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
 - filter: openai_responses_format
+- filter: router
+  routes:
+    - path_prefix: "/"
+      cluster: test-backend
 - filter: openai_response_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
   conversations_table: test_conversations
 - filter: openai_responses_rehydrate
+- filter: load_balancer
+  cluster_source: bound_upstream
+  clusters:
+    - name: test-backend
+      endpoints: ["127.0.0.1:3001"]
 "#
     ))
     .unwrap();
@@ -2156,6 +2200,7 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
         matches!(request_body_action, FilterAction::Release),
         "request body phase should classify, register the store, and rehydrate"
     );
+    ctx.buffered_request_body = request_body.clone();
 
     let request_action = pipeline.execute_http_request(&mut ctx).await.unwrap();
     assert!(
@@ -2255,12 +2300,21 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
 - filter: openai_responses_format
+- filter: router
+  routes:
+    - path_prefix: "/"
+      cluster: test-backend
 - filter: openai_response_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
   conversations_table: test_conversations
 - filter: openai_responses_rehydrate
+- filter: load_balancer
+  cluster_source: bound_upstream
+  clusters:
+    - name: test-backend
+      endpoints: ["127.0.0.1:3001"]
 "#
     ))
     .unwrap();
@@ -2286,6 +2340,7 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
         matches!(request_body_action, FilterAction::Release),
         "request body phase should classify, register the store, and rehydrate"
     );
+    ctx.buffered_request_body = request_body.clone();
 
     let request_action = pipeline.execute_http_request(&mut ctx).await.unwrap();
     assert!(

@@ -584,9 +584,12 @@ async fn prompt_template_is_rejected_before_chat_translation() {
     let original = Bytes::from(serde_json::to_vec(&request_body).unwrap());
     let mut body = Some(original.clone());
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
         panic!("a prompt template must not be silently dropped during Chat translation");
     };
     assert_eq!(rejection.status, 400, "prompt translation rejection must be HTTP 400");
@@ -900,10 +903,13 @@ async fn lowered_request_body_tools_translate_over_canonical_rich_tools() {
     context.extensions.insert(state);
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "lowered function tools must translate successfully, not reject as UnsupportedToolType"
     );
     let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
@@ -938,9 +944,12 @@ async fn lowered_request_body_tool_choice_translates_over_canonical() {
     context.extensions.insert(state);
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
     let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     assert_eq!(
         translated["tool_choice"], "required",
@@ -976,9 +985,12 @@ async fn non_compat_state_translation_is_golden_unchanged() {
     })));
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
     let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     assert_eq!(
         translated["tools"],
@@ -1674,10 +1686,10 @@ async fn buffered_file_search_echo_uses_hosted_tools_after_backend_lowering() {
         br#"{"model":"chat-only-model","input":"find revenue"}"#,
     ));
     let request_action = filter
-        .on_request_body(&mut context, &mut request_body, true)
+        .on_selected_upstream_request_body(&mut context, &mut request_body)
         .await
         .unwrap();
-    assert!(matches!(request_action, FilterAction::Continue));
+    assert!(matches!(request_action, SelectedUpstreamBodyOutcome::Continue));
 
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.headers.insert(

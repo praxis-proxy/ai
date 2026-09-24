@@ -132,12 +132,17 @@ fn from_config_zero_max_content_bytes_rejected() {
 // -- Body access tests --------------------------------------------------------
 
 #[test]
-fn body_access_is_read_write() {
+fn bound_body_access_is_read_write() {
     let filter = make_filter();
     assert_eq!(
         filter.request_body_access(),
+        BodyAccess::None,
+        "doc_extract should not run before an upstream is bound"
+    );
+    assert_eq!(
+        filter.bound_upstream_request_body_access(),
         BodyAccess::ReadWrite,
-        "doc_extract needs ReadWrite to rewrite the body"
+        "doc_extract needs ReadWrite after binding to rewrite the body"
     );
 }
 

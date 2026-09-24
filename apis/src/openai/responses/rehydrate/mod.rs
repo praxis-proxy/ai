@@ -34,7 +34,7 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use praxis_filter::{
-    EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    BoundUpstreamBodyOutcome, EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
@@ -44,7 +44,7 @@ use tracing::{debug, trace, warn};
 #[cfg(feature = "openai-mcp-tools")]
 use super::mcp_dispatch::{OWNER_FINGERPRINT, owner_fingerprint};
 use super::{
-    DEFAULT_STORE_NAME, append_stored_input_items, canonical_openresponses_replay_item,
+    DEFAULT_STORE_NAME, append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
     error::responses_error_rejection, extract_conversation_id, state::ResponsesState,
 };
 use crate::{
@@ -183,7 +183,7 @@ impl HttpFilter for RehydrateFilter {
         "openai_responses_rehydrate"
     }
 
-    fn request_body_access(&self) -> BodyAccess {
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadOnly
     }
 
@@ -235,6 +235,15 @@ impl HttpFilter for RehydrateFilter {
         }
 
         self.rehydrate(ctx, body).await
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
