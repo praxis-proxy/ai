@@ -2142,6 +2142,11 @@ fn build_usage_from_value(usage: Option<&Value>) -> Value {
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let cache_write_tokens = usage
+        .and_then(|usage| usage.get("prompt_tokens_details"))
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let reasoning_tokens = usage
         .and_then(|usage| usage.get("completion_tokens_details"))
         .and_then(|details| details.get("reasoning_tokens"))
@@ -2151,7 +2156,8 @@ fn build_usage_from_value(usage: Option<&Value>) -> Value {
     json!({
         "input_tokens": input_tokens,
         "input_tokens_details": {
-            "cached_tokens": cached_tokens
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens
         },
         "output_tokens": output_tokens,
         "output_tokens_details": {

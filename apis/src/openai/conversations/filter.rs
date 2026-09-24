@@ -4,6 +4,9 @@
 //! [`OpenaiConversationsFilter`] handles all `/v1/conversations`
 //! endpoints locally via `FilterAction::Reject`, backed by the
 //! `ConversationItemStore` trait.
+//!
+//! The `openai_operation` filter must run earlier in the same chain. Its typed
+//! match is the sole runtime authority for Conversations dispatch.
 
 use std::sync::Arc;
 
@@ -25,14 +28,15 @@ use super::config::revalidate_postgres_host;
 use super::{
     config::{ConversationsConfig, StorageBackend, validate_config},
     handlers,
-    routes::{self, ConversationOperation, MatchedConversationRoute},
+    routes::{APPLICATION_PROTOCOL, ConversationOperation, match_route},
 };
 #[cfg(feature = "store-postgres")]
 use crate::store::PostgresResponseStore;
 #[cfg(feature = "store-sqlite")]
 use crate::store::SqliteResponseStore;
 use crate::{
-    openai::responses::state::ResponsesState,
+    openai::{operation_classifier::OpenAiOperationMatch, responses::state::ResponsesState},
+    operation::Transport,
     state_owner::{StateOwner, require_state_owner},
     store::{ConversationItemStore, StoreError},
 };
@@ -45,16 +49,18 @@ use crate::{
 ///
 /// All matched requests are served from the local store and never
 /// forwarded upstream. Unmatched paths pass through as `Continue`.
+/// `openai_operation` must precede this filter in the same chain.
 ///
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_conversations
-/// backend: postgres
-/// database_url: postgres://praxis:password@db.example.com/praxis
-/// conversations_table: conversations
-/// items_table: conversation_items
-/// allow_private_database_url: true
+/// - filter: openai_operation
+/// - filter: openai_conversations
+///   backend: postgres
+///   database_url: postgres://praxis:password@db.example.com/praxis
+///   conversations_table: conversations
+///   items_table: conversation_items
+///   allow_private_database_url: true
 /// ```
 pub struct OpenaiConversationsFilter {
     /// Filter configuration (backend, database URL, table names).
@@ -287,29 +293,91 @@ impl OpenaiConversationsFilter {
         let mut state = ctx
             .remove_filter_state::<ConversationRequestState>()
             .unwrap_or_default();
+        // The body hook only lends this chunk, while dispatch happens after
+        // the request-header phase. `Bytes::clone` retains the shared buffer
+        // across that ownership boundary without copying its payload.
         state.deferred_body = Some(body.cloned().unwrap_or_default());
         ctx.insert_filter_state(state);
         FilterAction::Release
     }
 
-    /// Dispatch a matched POST body to the appropriate local handler.
-    async fn handle_post_route(
+    /// Drop a body captured during pre-read when header classification shows
+    /// that this filter will not handle the request locally.
+    fn discard_request_state(ctx: &mut HttpFilterContext<'_>) {
+        drop(ctx.remove_filter_state::<ConversationRequestState>());
+    }
+
+    /// Recover a matched parameter from the immutable original request path.
+    fn path_parameter<'a>(
+        ctx: &'a HttpFilterContext<'_>,
+        matched: &OpenAiOperationMatch,
+        name: &str,
+    ) -> Option<&'a str> {
+        matched.path_parameters.get(ctx.request.uri.path(), name)
+    }
+
+    /// Resolve and validate the Conversations operation from generic classifier state.
+    fn matched_operation(
+        ctx: &HttpFilterContext<'_>,
+    ) -> Result<Option<(OpenAiOperationMatch, ConversationOperation)>, FilterError> {
+        let Some(matched) = ctx.extensions.get::<OpenAiOperationMatch>().copied() else {
+            return Ok(None);
+        };
+        if matched.application_protocol != APPLICATION_PROTOCOL {
+            return Ok(None);
+        }
+        let operation = ConversationOperation::from_operation_id(matched.operation_id).ok_or_else(|| {
+            FilterError::from(format!(
+                "openai_conversations: unknown operation ID {:?}",
+                matched.operation_id
+            ))
+        })?;
+        Self::validate_operation_match(matched, operation)?;
+        Ok(Some((matched, operation)))
+    }
+
+    /// Validate that generic classifier metadata describes the registry operation.
+    fn validate_operation_match(
+        matched: OpenAiOperationMatch,
+        operation: ConversationOperation,
+    ) -> Result<(), FilterError> {
+        let expected_body = operation.request_body();
+        if matched.application_protocol != operation.application_protocol() {
+            return Err(FilterError::from(format!(
+                "openai_conversations: operation {operation:?} belongs to a different generic protocol"
+            )));
+        }
+        if matched.operation_id != operation.operation_id() || matched.transport != Transport::Http {
+            return Err(FilterError::from(format!(
+                "openai_conversations: inconsistent generic identity for operation {operation:?}"
+            )));
+        }
+        if matched.request_body != expected_body {
+            return Err(FilterError::from(format!(
+                "openai_conversations: impossible operation/body combination for {operation:?}: {:?}",
+                matched.request_body
+            )));
+        }
+        Ok(())
+    }
+
+    /// Dispatch a matched body to the appropriate local handler.
+    async fn handle_body_operation(
         ctx: &HttpFilterContext<'_>,
         store: &dyn ConversationItemStore,
-        route: &MatchedConversationRoute<'_>,
+        matched: OpenAiOperationMatch,
+        operation: ConversationOperation,
         body: &[u8],
     ) -> Result<FilterAction, FilterError> {
-        match route.spec.operation {
+        match operation {
             ConversationOperation::CreateConversation => handlers::handle_create_conversation(ctx, store, body).await,
             ConversationOperation::UpdateConversation => {
-                let id = route
-                    .conversation_id()
+                let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched update route missing id"))?;
                 handlers::handle_update_conversation(ctx, store, id, body).await
             },
             ConversationOperation::CreateConversationItems => {
-                let id = route
-                    .conversation_id()
+                let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched item create route missing id"))?;
                 handlers::handle_create_items(ctx, store, id, body).await
             },
@@ -318,8 +386,7 @@ impl OpenaiConversationsFilter {
             | ConversationOperation::ListConversationItems
             | ConversationOperation::GetConversationItem
             | ConversationOperation::DeleteConversationItem => Err(FilterError::from(format!(
-                "openai_conversations: handle_post_route called for non-body operation {:?}",
-                route.spec.operation
+                "openai_conversations: body dispatch called for bodyless operation {operation:?}"
             ))),
         }
     }
@@ -329,7 +396,8 @@ impl OpenaiConversationsFilter {
     async fn begin_body_operation(
         &self,
         ctx: &mut HttpFilterContext<'_>,
-        route: &MatchedConversationRoute<'_>,
+        matched: OpenAiOperationMatch,
+        operation: ConversationOperation,
     ) -> Result<FilterAction, FilterError> {
         ctx.set_request_body_mode(BodyMode::StreamBuffer {
             max_bytes: Some(MAX_JSON_BODY_BYTES),
@@ -340,7 +408,14 @@ impl OpenaiConversationsFilter {
         let Some(store) = self.get_or_init_store().await else {
             return Ok(FilterAction::Reject(reject_store_unavailable()));
         };
-        Box::pin(Self::handle_post_route(ctx, store.as_ref(), route, &body)).await
+        Box::pin(Self::handle_body_operation(
+            ctx,
+            store.as_ref(),
+            matched,
+            operation,
+            &body,
+        ))
+        .await
     }
 
     /// Dispatch a bodyless conversation operation to its local handler.
@@ -348,45 +423,40 @@ impl OpenaiConversationsFilter {
     async fn dispatch_read_operation(
         &self,
         ctx: &HttpFilterContext<'_>,
-        route: &MatchedConversationRoute<'_>,
+        matched: OpenAiOperationMatch,
+        operation: ConversationOperation,
     ) -> Result<FilterAction, FilterError> {
-        match route.spec.operation {
+        match operation {
             ConversationOperation::GetConversation => {
-                let id = route
-                    .conversation_id()
+                let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched get route missing id"))?;
                 let store = self.require_store().await?;
                 handlers::handle_get_conversation(ctx, store.as_ref(), id).await
             },
             ConversationOperation::ListConversationItems => {
-                let id = route
-                    .conversation_id()
+                let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched list route missing id"))?;
                 let store = self.require_store().await?;
                 handlers::handle_list_items(ctx, store.as_ref(), id).await
             },
             ConversationOperation::GetConversationItem => {
-                let id = route
-                    .conversation_id()
+                let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing id"))?;
-                let item_id = route
-                    .item_id()
+                let item_id = Self::path_parameter(ctx, &matched, "item_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing item id"))?;
                 let store = self.require_store().await?;
                 handlers::handle_get_item(ctx, store.as_ref(), id, item_id).await
             },
             ConversationOperation::DeleteConversation => {
-                let id = route
-                    .conversation_id()
+                let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched delete route missing id"))?;
                 let store = self.require_store().await?;
                 handlers::handle_delete_conversation(ctx, store.as_ref(), id).await
             },
             ConversationOperation::DeleteConversationItem => {
-                let id = route
-                    .conversation_id()
+                let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched delete item route missing id"))?;
-                let item_id = route.item_id().ok_or_else(|| {
+                let item_id = Self::path_parameter(ctx, &matched, "item_id").ok_or_else(|| {
                     FilterError::from("openai_conversations: matched delete item route missing item id")
                 })?;
                 let store = self.require_store().await?;
@@ -395,8 +465,7 @@ impl OpenaiConversationsFilter {
             ConversationOperation::CreateConversation
             | ConversationOperation::UpdateConversation
             | ConversationOperation::CreateConversationItems => Err(FilterError::from(format!(
-                "openai_conversations: dispatch_read_operation called for body operation {:?}",
-                route.spec.operation
+                "openai_conversations: bodyless dispatch called for body operation {operation:?}"
             ))),
         }
     }
@@ -458,21 +527,37 @@ impl HttpFilter for OpenaiConversationsFilter {
         if let Err(action) = capture_append_owner(ctx) {
             return Ok(action);
         }
-        let Some(route) = routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path()) else {
+        let Some((matched, operation)) = Self::matched_operation(ctx)? else {
+            // The body hook runs before the request-head classifier during
+            // StreamBuffer pre-read, so it may have retained a body for a
+            // request that turns out to belong to another protocol. Release
+            // that handle before allowing an unrelated request upstream.
+            Self::discard_request_state(ctx);
+            if match_route(ctx.request.method.as_str(), ctx.request.uri.path()).is_some() {
+                // Conversations is a proxy-owned API. A missing classifier
+                // match means the dependency was absent, ordered later, or
+                // skipped by conditions (including an open failure mode), so
+                // forwarding here would silently bypass local handling.
+                return Ok(FilterAction::Reject(reject_classifier_unavailable()));
+            }
             if should_append_back(ctx) {
                 drop(self.get_or_init_store().await);
             }
             return Ok(FilterAction::Continue);
         };
 
-        // The shared operation registry is the single source of truth for
-        // whether this operation carries a request body: body-carrying
-        // operations arm buffering, everything else dispatches from the head.
-        // Both dispatch paths are boxed so this hook's own frame stays small.
-        if route.spec.has_request_body() {
-            return Box::pin(self.begin_body_operation(ctx, &route)).await;
+        // The classifier publishes registry body metadata. Pair it with the
+        // typed operation so corrupt or manually fabricated extension state
+        // fails closed instead of selecting the wrong dispatch phase.
+        if matched.request_body.is_present() {
+            Box::pin(self.begin_body_operation(ctx, matched, operation)).await
+        } else {
+            // Bodyless local operations never consume a deferred body. They
+            // terminate locally, but clearing the state keeps this invariant
+            // explicit and avoids retaining it through response handling.
+            Self::discard_request_state(ctx);
+            Box::pin(self.dispatch_read_operation(ctx, matched, operation)).await
         }
-        Box::pin(self.dispatch_read_operation(ctx, &route)).await
     }
 
     async fn on_request_body(
@@ -481,31 +566,40 @@ impl HttpFilter for OpenaiConversationsFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream || ctx.request.method != http::Method::POST {
-            return Ok(FilterAction::Continue);
-        }
-        if let Err(action) = capture_append_owner(ctx) {
-            return Ok(action);
-        }
-
-        let empty: &[u8] = &[];
-        let bytes = body.as_ref().map_or(empty, |b| b.as_ref());
-
-        let Some(route) = routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path()) else {
-            return Ok(FilterAction::Continue);
-        };
-        if !route.spec.has_request_body() {
+        if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
 
+        // StreamBuffer pre-reading runs before request-header filters. At that
+        // point the classifier has not published an operation yet, so retain
+        // the completed bytes without trying to infer identity from the URI.
         if !Self::request_filters_ran(ctx) {
             return Ok(Self::defer_body_until_request_filters(ctx, body.as_ref()));
         }
 
+        if let Err(action) = capture_append_owner(ctx) {
+            return Ok(action);
+        }
+        let Some((matched, operation)) = Self::matched_operation(ctx)? else {
+            return Ok(FilterAction::Continue);
+        };
+        if !matched.request_body.is_present() {
+            return Ok(FilterAction::Continue);
+        }
+
+        let empty: &[u8] = &[];
+        let bytes = body.as_ref().map_or(empty, |b| b.as_ref());
         let Some(store) = self.get_or_init_store().await else {
             return Ok(FilterAction::Reject(reject_store_unavailable()));
         };
-        Box::pin(Self::handle_post_route(ctx, store.as_ref(), &route, bytes)).await
+        Box::pin(Self::handle_body_operation(
+            ctx,
+            store.as_ref(),
+            matched,
+            operation,
+            bytes,
+        ))
+        .await
     }
 
     #[expect(
@@ -723,6 +817,19 @@ fn reject_store_unavailable() -> Rejection {
         .with_body(serde_json::to_vec(&body).unwrap_or_default())
 }
 
+/// Build a 500 rejection when the required operation classifier did not run.
+fn reject_classifier_unavailable() -> Rejection {
+    let body = serde_json::json!({
+        "error": {
+            "message": "Internal server error.",
+            "type": "server_error",
+        }
+    });
+    Rejection::status(500)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_vec(&body).unwrap_or_default())
+}
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
@@ -747,5 +854,14 @@ mod tests {
             .find(|(k, _)| k == "content-type")
             .map(|(_, v)| v.as_str());
         assert_eq!(ct, Some("application/json"), "should set application/json content-type");
+    }
+
+    #[test]
+    fn reject_classifier_unavailable_returns_500_server_error() {
+        let rejection = reject_classifier_unavailable();
+        assert_eq!(rejection.status, 500);
+        let body: Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["message"], "Internal server error.");
     }
 }

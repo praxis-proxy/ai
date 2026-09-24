@@ -46,7 +46,7 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 ///
 /// Declared beside the registry that owns it, so registering a protocol
 /// never edits a shared list.
-const APPLICATION_PROTOCOL: ApplicationProtocol = ApplicationProtocol::new("openai_conversations");
+pub(crate) const APPLICATION_PROTOCOL: ApplicationProtocol = ApplicationProtocol::new("openai_conversations");
 
 /// Static metadata for one Conversations operation.
 #[derive(Clone, Copy)]
@@ -227,6 +227,41 @@ macro_rules! conversation_operations {
             )+
         }
 
+        #[cfg(feature = "openai-conversations")]
+        impl ConversationOperation {
+            /// Application protocol that owns every Conversations operation.
+            pub(crate) const fn application_protocol(self) -> ApplicationProtocol {
+                APPLICATION_PROTOCOL
+            }
+
+            /// Resolve a stable operation ID to its registry operation.
+            ///
+            /// The mapping is generated from the same declarations as the
+            /// operation registry, so classifier consumers do not need a
+            /// protocol-specific request extension or a second hand-written
+            /// operation table.
+            pub(crate) fn from_operation_id(operation_id: &str) -> Option<Self> {
+                match operation_id {
+                    $($operation_id => Some(Self::$operation),)+
+                    _ => None,
+                }
+            }
+
+            /// Stable registry operation ID without rescanning the registry.
+            pub(crate) const fn operation_id(self) -> &'static str {
+                match self {
+                    $(Self::$operation => $operation_id,)+
+                }
+            }
+
+            /// Registry request-body shape without rescanning the registry.
+            pub(crate) const fn request_body(self) -> RequestBody {
+                match self {
+                    $(Self::$operation => contract_request_body!($contract_kind $contract),)+
+                }
+            }
+        }
+
         /// All Conversations operations recognized by the local filter.
         pub const OPERATION_SPECS: &[ConversationOperationSpec] = &[
             $(
@@ -398,14 +433,10 @@ pub(crate) struct MatchedConversationRoute<'a> {
     /// Matched operation metadata.
     pub spec: &'static ConversationOperationSpec,
     /// Borrowed path parameters, captured by the shared matcher.
-    #[cfg_attr(
-        not(feature = "openai-conversations"),
-        expect(dead_code, reason = "path parameters are read only by the Conversations filter")
-    )]
-    params: RouteParams<'a>,
+    pub(crate) params: RouteParams<'a>,
 }
 
-#[cfg(feature = "openai-conversations")]
+#[cfg(all(test, feature = "openai-conversations"))]
 impl<'a> MatchedConversationRoute<'a> {
     /// Return the borrowed conversation ID path segment.
     pub(crate) fn conversation_id(&self) -> Option<&'a str> {
@@ -507,6 +538,17 @@ mod tests {
         // Conversations is served locally, so Praxis owns each externally
         // visible contract and generates it into the implementation document.
         assert!(OPERATION_SPECS.iter().all(|spec| spec.owns_contract()));
+    }
+
+    #[test]
+    fn operation_ids_resolve_to_declared_operations() {
+        for spec in OPERATION_SPECS {
+            assert_eq!(
+                ConversationOperation::from_operation_id(spec.operation.operation_id()),
+                Some(spec.operation)
+            );
+        }
+        assert_eq!(ConversationOperation::from_operation_id("unknown"), None);
     }
 
     #[test]

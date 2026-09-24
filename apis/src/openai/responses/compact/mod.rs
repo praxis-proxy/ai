@@ -777,6 +777,11 @@ fn map_chat_usage(usage: &Value) -> Value {
         .and_then(|d| d.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let cache_write_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let reasoning_tokens = usage
         .get("completion_tokens_details")
         .and_then(|d| d.get("reasoning_tokens"))
@@ -788,7 +793,7 @@ fn map_chat_usage(usage: &Value) -> Value {
         .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
     serde_json::json!({
         "input_tokens": input_tokens,
-        "input_tokens_details": {"cached_tokens": cached_tokens, "cache_write_tokens": 0},
+        "input_tokens_details": {"cached_tokens": cached_tokens, "cache_write_tokens": cache_write_tokens},
         "output_tokens": output_tokens,
         "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
         "total_tokens": total,
