@@ -157,6 +157,58 @@
   .narr b{color:var(--accent)}
   .narr .rounds{color:var(--ink-dim);font-size:11px;margin-left:6px}
 
+  /* ---- on-the-wire payloads (example request / response per scenario) ---- */
+  .wire{margin:14px 0 2px;border:1px solid var(--stroke-lit);border-radius:10px;
+    background:linear-gradient(180deg,#0c1319,#0a1015);box-shadow:0 12px 30px rgba(0,0,0,.28);overflow:hidden}
+  .wire .wh{display:flex;align-items:center;gap:10px;padding:11px 15px;border-bottom:1px solid var(--stroke);
+    cursor:pointer;user-select:none}
+  .wire.collapsed .wh{border-bottom:none}
+  .wire .wh .wt{font-size:10.5px;letter-spacing:2px;color:var(--ink-dim);text-transform:uppercase}
+  .wire .wh .wsub{color:var(--ink-faint);font-size:11px;letter-spacing:.3px}
+  .wire .wh:hover .wt{color:var(--ink)}
+  .wire .wh:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  .wire .wh .caret{margin-left:auto;color:var(--ink-faint);transition:transform .16s}
+  .wire.collapsed .caret{transform:rotate(-90deg)}
+  .wire.collapsed .wbody{display:none}
+  .wire .wbody{display:grid;grid-template-columns:1fr 1fr;gap:0}
+  .wire .pane{padding:13px 15px;min-width:0}
+  .wire .pane.req{border-right:1px solid var(--stroke)}
+  .wire .plabel{display:flex;align-items:center;gap:9px;margin-bottom:8px}
+  .wire .plabel .tag{font-size:9px;letter-spacing:1.6px;text-transform:uppercase;border-radius:5px;padding:2px 8px;
+    border:1px solid var(--stroke-lit);color:var(--ink-faint)}
+  .wire .plabel .tag.rq{color:var(--accent);border-color:var(--accent)}
+  .wire .plabel .tag.rs{color:var(--ok);border-color:var(--ok)}
+  .wire .reqline{font-size:12px;color:var(--ink);word-break:break-all}
+  .wire .reqline .mth{color:var(--accent);font-weight:600}
+  .wire .status{font-size:12px}
+  .wire .status.ok{color:var(--ok)} .wire .status.warn{color:var(--c-dispatch)} .wire .status.info{color:var(--c-backend)}
+  .wire .copy{margin-left:auto;appearance:none;cursor:pointer;font-family:var(--mono);font-size:9px;letter-spacing:.8px;
+    text-transform:uppercase;color:var(--ink-faint);background:transparent;border:1px solid var(--stroke-lit);
+    border-radius:5px;padding:2px 8px;transition:.14s}
+  .wire .copy:hover{color:var(--ink);border-color:var(--accent)}
+  .wire .copy:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .wire .copy.done{color:var(--ok);border-color:var(--ok)}
+  .wire .hdrs{margin:7px 0 0;font-size:10.5px;color:var(--ink-faint);line-height:1.55;word-break:break-all}
+  .wire .hdrs .hn{color:var(--ink-dim)}
+  .wire pre{margin:9px 0 0;padding:11px 12px;background:rgba(0,0,0,.34);border:1px solid var(--stroke);border-radius:8px;
+    overflow:auto;max-height:380px;font-family:var(--mono);font-size:11px;line-height:1.55;color:var(--ink-dim);
+    white-space:pre;tab-size:2}
+  .wire .wfoot{grid-column:1/-1;padding:11px 15px;border-top:1px solid var(--stroke);font-size:10.5px;
+    color:var(--ink-faint);line-height:1.55}
+  .wire .wfoot .note b{color:var(--ink-dim)}
+  .wire .wfoot .prov{margin-top:6px;opacity:.85}
+  .wire .wfoot .prov code{color:var(--accent);background:rgba(79,209,224,.07);border:1px solid var(--stroke);
+    border-radius:4px;padding:1px 5px;margin-right:5px;font-size:9.5px}
+  .wire .empty{grid-column:1/-1;padding:22px 16px;color:var(--ink-faint);font-size:11.5px;text-align:center;line-height:1.6}
+  /* JSON + SSE token highlight (shared with pre blocks) */
+  .tk-key{color:var(--c-identity)} .tk-str{color:var(--ok)} .tk-num{color:var(--c-classification)}
+  .tk-bool{color:var(--c-irr)} .tk-nul{color:var(--ink-faint)} .tk-pun{color:var(--ink-faint)}
+  .sse-evt{color:var(--accent)} .sse-key{color:var(--ink-faint)}
+  @media(max-width:820px){
+    .wire .wbody{grid-template-columns:1fr}
+    .wire .pane.req{border-right:none;border-bottom:1px solid var(--stroke)}
+  }
+
   /* ---- layout: flow + right rail ---- */
   .layout{display:grid;grid-template-columns:1fr 320px;gap:22px;margin-top:18px;align-items:start}
   .rail{position:sticky;top:16px;display:flex;flex-direction:column;gap:16px}
@@ -372,6 +424,15 @@
   </div>
 
   <p class="narr" id="narr" role="status" aria-live="polite"></p>
+
+  <section class="wire" id="wire" aria-label="Example request and response for the selected scenario">
+    <div class="wh" id="wireToggle" role="button" tabindex="0" aria-expanded="true" aria-controls="wireBody">
+      <span class="wt">On the wire</span>
+      <span class="wsub" id="wireSub">example request &amp; response — pick a scenario</span>
+      <span class="caret" aria-hidden="true">▾</span>
+    </div>
+    <div class="wbody" id="wireBody"></div>
+  </section>
 
   <div class="layout">
     <!-- ============ FLOW COLUMN ============ -->
@@ -590,6 +651,301 @@ const SCEN_META = {
   S9:{narr:"<b>WebSocket.</b> A GET /v1/responses handshake with Upgrade:websocket takes the bypass branch and routes to inference-backend.",clusters:["inference-backend"],services:[]},
   S10:{narr:"<b>Non-Responses body.</b> A Chat/Anthropic/unclassified body posted to /v1/responses is not classified openai_responses, runs the bypass carrier, and gets a route-miss 404.",clusters:[],services:[]},
   S11:{narr:"<b>Dedicated services.</b> /v1/prompts | /v1/embeddings | /v1/files | /v1/vector_stores take the bypass branch and route by path_prefix to their backend cluster.",clusters:["prompts-api","embeddings-api","files-api","vector-stores-backend"],services:["Files API","Vector store"]}
+};
+
+/* ============================================================================
+   WIRE — example request + response payloads per scenario (embedded from the
+   repo's integration fixtures/tests; keyed to full-flow-agentic.yaml). Update
+   alongside PIPELINE whenever the request/response shapes change. Bodies are
+   representative and trimmed for teaching, but structurally faithful to the
+   OpenAI Responses API shapes this gateway emits.
+   ========================================================================= */
+const WIRE = {
+  "S1": {
+    "reqMethod": "POST",
+    "reqPath": "/v1/responses",
+    "reqHeaders": [
+      "Content-Type: application/json"
+    ],
+    "reqBody": "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"Hello, world!\"\n}",
+    "resStatus": "200 OK",
+    "resKind": "json",
+    "resHeaders": [
+      "content-type: application/json",
+      "x-request-id: req_d1561f573ba741d7adf74a0ad57445f0"
+    ],
+    "resBody": "{\n  \"id\": \"resp_abc123\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": null,\n  \"store\": true,\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"instructions\": null,\n  \"max_output_tokens\": null,\n  \"output\": [\n    {\n      \"id\": \"msg_001\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hello! How can I help you today?\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"parallel_tool_calls\": true,\n  \"temperature\": 1.0,\n  \"tool_choice\": \"auto\",\n  \"tools\": [],\n  \"top_p\": 1.0,\n  \"truncation\": \"disabled\",\n  \"metadata\": {},\n  \"usage\": {\n    \"input_tokens\": 17,\n    \"input_tokens_details\": {\n      \"cache_write_tokens\": 0,\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 9,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 26\n  }\n}",
+    "notes": "Bare stateful create: store defaults to true (an implicit stateful marker per the config header comment), so the response echoes store:true, is looped through the IRR, and is persisted by openai_response_store to SQLite for later GET /v1/responses/{id}. Only Content-Type is needed on ingress. previous_response_id is null on a fresh turn.",
+    "provenance": [
+      "examples/configs/openai/responses/full-flow-agentic.yaml:202-205",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:192-198",
+      "tests/integration/fixtures/inference/recordings/openai/responses/native-basic-nonstream.json:51-144",
+      "tests/integration/tests/suite/examples/openai_response_store.rs:20,48-78"
+    ]
+  },
+  "S2": {
+    "reqMethod": "POST",
+    "reqPath": "/v1/responses",
+    "reqHeaders": [
+      "Content-Type: application/json",
+      "Accept: text/event-stream"
+    ],
+    "reqBody": "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"Hello\",\n  \"stream\": true\n}",
+    "resStatus": "200 OK",
+    "resKind": "sse",
+    "resHeaders": [
+      "Content-Type: text/event-stream",
+      "Cache-Control: no-cache"
+    ],
+    "resBody": "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_a1b2c3d4e5f60718\",\"object\":\"response\",\"created_at\":1730902147,\"status\":\"in_progress\",\"background\":false,\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"gpt-4.1\",\"output\":[],\"parallel_tool_calls\":true,\"previous_response_id\":null,\"store\":true,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":\"auto\",\"tools\":[],\"top_p\":1.0,\"truncation\":\"disabled\",\"metadata\":{},\"usage\":null}}\n\nevent: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1,\"response\":{\"id\":\"resp_a1b2c3d4e5f60718\",\"object\":\"response\",\"created_at\":1730902147,\"status\":\"in_progress\",\"background\":false,\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"gpt-4.1\",\"output\":[],\"parallel_tool_calls\":true,\"previous_response_id\":null,\"store\":true,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":\"auto\",\"tools\":[],\"top_p\":1.0,\"truncation\":\"disabled\",\"metadata\":{},\"usage\":null}}\n\nevent: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_a1b2c3d4e5f60718\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\nevent: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"sequence_number\":3,\"item_id\":\"msg_a1b2c3d4e5f60718\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":4,\"item_id\":\"msg_a1b2c3d4e5f60718\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hi\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":5,\"item_id\":\"msg_a1b2c3d4e5f60718\",\"output_index\":0,\"content_index\":0,\"delta\":\" there\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":6,\"item_id\":\"msg_a1b2c3d4e5f60718\",\"output_index\":0,\"content_index\":0,\"delta\":\"!\"}\n\nevent: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"sequence_number\":7,\"item_id\":\"msg_a1b2c3d4e5f60718\",\"output_index\":0,\"content_index\":0,\"text\":\"Hi there!\"}\n\nevent: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"sequence_number\":8,\"item_id\":\"msg_a1b2c3d4e5f60718\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"Hi there!\",\"annotations\":[]}}\n\nevent: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":9,\"output_index\":0,\"item\":{\"id\":\"msg_a1b2c3d4e5f60718\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi there!\",\"annotations\":[]}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":10,\"response\":{\"id\":\"resp_a1b2c3d4e5f60718\",\"object\":\"response\",\"created_at\":1730902147,\"completed_at\":1730902148,\"status\":\"completed\",\"background\":false,\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"gpt-4.1\",\"output\":[{\"id\":\"msg_a1b2c3d4e5f60718\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi there!\",\"annotations\":[]}]}],\"parallel_tool_calls\":true,\"previous_response_id\":null,\"store\":true,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":\"auto\",\"tools\":[],\"top_p\":1.0,\"truncation\":\"disabled\",\"metadata\":{},\"usage\":{\"input_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":4,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":13}}}\n\n",
+    "notes": "Full native Responses SSE lifecycle composed by openai_stream_events inside the IRR: response.created/in_progress carry an in_progress response with empty output[], the message item streams through output_item.added -> content_part.added -> several output_text.delta -> output_text.done -> content_part.done -> output_item.done, and the terminal response.completed carries the fully assembled response object (status completed, output[], usage). sequence_number is monotonic and integer on every frame; the client stream ends on response.completed with no trailing data: [DONE] (client fixtures set done:false). store defaults to true so this streamed resource is accumulated into response_object and persisted pre-IRR, retrievable via GET /v1/responses/{id}. Bare create: only Content-Type (plus Accept for SSE) is relevant; no credential/trace headers apply.",
+    "provenance": [
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:372-455 (exact request {\"model\":\"gpt-4.1\",\"input\":\"Hello\",\"stream\":true} against THIS config; native SSE lifecycle, resp id + created_at + model in terminal, store-default persistence + retrieval)",
+      "tests/integration/fixtures/inference/recordings/synthetic/responses/chat-basic-stream.json:50-113 (full client lifecycle with sequence_number on every frame, two output_text.delta, output_text.done/content_part.done/output_item.done ordering, usage detail shape, done:false = no [DONE])",
+      "tests/integration/fixtures/inference/recordings/openai/responses/native-basic-stream.json:54-107 (native OpenAI lifecycle frame shapes: message item content[], content_part output_text part, terminal response object with usage)",
+      "tests/integration/tests/suite/examples/openai_stream_events.rs:63-157 (openai_stream_events composes ONE lifecycle + populates response_object for SQLite persistence; asserts content-type text/event-stream and response.completed present)",
+      "tests/integration/sdk/openai/test_openai_responses_vllm.py:255-293,2540-2556 (SDK stream contract: response.created first, monotonic integer sequence_number, content_part.added/done + output_item.added/done + output_text.done present, deltas concatenate to terminal output_text, terminal completed carries usage)",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:207-210,513-660 (streaming create curl example; IRR step with openai_stream_events + openai_responses_proxy typed streaming; store PRE-IRR persists accumulated response_object)"
+    ]
+  },
+  "S3": {
+    "reqMethod": "POST",
+    "reqPath": "/v1/responses",
+    "reqHeaders": [
+      "Content-Type: application/json"
+    ],
+    "reqBody": "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"Hello, world!\",\n  \"store\": false\n}",
+    "resStatus": "200 OK",
+    "resKind": "json",
+    "resHeaders": [
+      "content-type: application/json",
+      "x-request-id: req_d1561f573ba741d7adf74a0ad57445f0"
+    ],
+    "resBody": "{\n  \"id\": \"resp_def456\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": null,\n  \"store\": false,\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"instructions\": null,\n  \"max_output_tokens\": null,\n  \"output\": [\n    {\n      \"id\": \"msg_002\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hello! How can I help you today?\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"parallel_tool_calls\": true,\n  \"temperature\": 1.0,\n  \"tool_choice\": \"auto\",\n  \"tools\": [],\n  \"top_p\": 1.0,\n  \"truncation\": \"disabled\",\n  \"metadata\": {},\n  \"usage\": {\n    \"input_tokens\": 17,\n    \"input_tokens_details\": {\n      \"cache_write_tokens\": 0,\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 9,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 26\n  }\n}",
+    "notes": "Same shape as S1 but the body sets store:false and carries no other stateful marker, so the object echoes store:false and is NOT persisted. A subsequent GET /v1/responses/resp_def456 returns 404 (test_stateless_request asserts NotFound). The native recording is itself a store:false turn, grounding the echoed field.",
+    "provenance": [
+      "examples/configs/openai/responses/full-flow-agentic.yaml:212-215",
+      "tests/integration/fixtures/inference/recordings/openai/responses/native-basic-nonstream.json:30-39,100",
+      "tests/integration/sdk/openai/test_openai_responses_vllm.py:1658-1677"
+    ]
+  },
+  "S4": {
+    "reqMethod": "POST",
+    "reqPath": "/v1/responses",
+    "reqHeaders": [
+      "Content-Type: application/json",
+      "x-auth-tenant: acme",
+      "x-auth-user: user_42"
+    ],
+    "reqBody": "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"What did I just ask?\",\n  \"previous_response_id\": \"resp_abc123\"\n}",
+    "resStatus": "200 OK",
+    "resKind": "json",
+    "resHeaders": [
+      "content-type: application/json",
+      "x-request-id: req_a72c0f9e4b8d4f1e9c2a1b3d5e6f7a80"
+    ],
+    "resBody": "{\n  \"id\": \"resp_ghi789\",\n  \"object\": \"response\",\n  \"created_at\": 1010,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": \"resp_abc123\",\n  \"store\": true,\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"instructions\": null,\n  \"max_output_tokens\": null,\n  \"output\": [\n    {\n      \"id\": \"msg_003\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"You just asked: \\\"Hello, world!\\\"\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"parallel_tool_calls\": true,\n  \"temperature\": 1.0,\n  \"tool_choice\": \"auto\",\n  \"tools\": [],\n  \"top_p\": 1.0,\n  \"truncation\": \"disabled\",\n  \"metadata\": {},\n  \"usage\": {\n    \"input_tokens\": 24,\n    \"input_tokens_details\": {\n      \"cache_write_tokens\": 0,\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 8,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 32\n  }\n}",
+    "notes": "Multi-turn continuation. previous_response_id is a stateful marker: openai_responses_rehydrate loads resp_abc123's stored history (owner-scoped by x-auth-tenant/x-auth-user) and prepends it into the upstream input array, stripping previous_response_id from the outbound body so the backend echoes null. The rehydrate filter then restores the caller's previous_response_id (resp_abc123) into the returned object (issue #932), so the client always sees the id it sent.",
+    "provenance": [
+      "examples/configs/openai/responses/full-flow-agentic.yaml:217-220",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:60-72",
+      "tests/integration/tests/suite/examples/rehydrate.rs:66-88",
+      "tests/integration/sdk/openai/test_openai_responses_vllm.py:1913-1960",
+      "tests/integration/sdk/openai/test_openai_responses_vllm.py:1962-2021"
+    ]
+  },
+  "S5": {
+    "reqMethod": "POST",
+    "reqPath": "/v1/responses",
+    "reqHeaders": [
+      "Content-Type: application/json",
+      "x-user-ogx-key: Bearer integration-ogx-key",
+      "x-auth-tenant: integration-tenant",
+      "x-auth-user: integration-user",
+      "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    ],
+    "reqBody": "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"What does the README say about deployment?\",\n  \"include\": [\n    \"file_search_call.results\"\n  ],\n  \"tools\": [\n    {\n      \"type\": \"file_search\",\n      \"vector_store_ids\": [\n        \"vs_abc123\"\n      ]\n    }\n  ]\n}",
+    "resStatus": "200 OK",
+    "resKind": "json",
+    "resHeaders": [
+      "Content-Type: application/json"
+    ],
+    "resBody": "{\n  \"id\": \"resp_final\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"id\": \"fs_1\",\n      \"type\": \"file_search_call\",\n      \"status\": \"completed\",\n      \"queries\": [\n        \"deployment instructions\"\n      ],\n      \"results\": [\n        {\n          \"file_id\": \"file-readme\",\n          \"filename\": \"README.md\",\n          \"score\": 0.92,\n          \"content\": [\n            {\n              \"type\": \"text\",\n              \"text\": \"Deploy the gateway by building the container image with `make container`, then run it behind an auth boundary.\"\n            }\n          ],\n          \"attributes\": null\n        }\n      ]\n    },\n    {\n      \"id\": \"msg_final\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Deploy by building the container image and running it.\",\n          \"annotations\": [\n            {\n              \"type\": \"file_citation\",\n              \"file_id\": \"file-readme\",\n              \"filename\": \"README.md\",\n              \"index\": 54\n            }\n          ]\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 30,\n    \"output_tokens\": 12,\n    \"total_tokens\": 42\n  }\n}",
+    "notes": "Buffered final composed object after a 2-round model->tool->model loop. Round 1: model emits a pending file_search_call (id fs_1, status \"searching\", queries). openai_file_search_callout POSTs a vector-store query to 127.0.0.1:3002 with body {\"query\":\"deployment instructions\",\"rewrite_query\":false}, authenticating with the ogx_files slot (Authorization: Bearer integration-ogx-key captured from x-user-ogx-key) and projected x-tenant-id/x-user-id headers; it reconciles results in place. Round 2: model composes the answer with a <|file-readme|> marker; the citation rewriter strips the marker (popping the preceding space) and appends a file_citation annotation at cleaned-text index 54. openai_agentic_loop publishes action=done. results[] appears only because include:[\"file_search_call.results\"] was requested (otherwise stripped). usage aggregates both rounds (10+20 / 5+7 / 15+27).",
+    "provenance": [
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:1190-1305",
+      "tests/integration/tests/suite/examples/file_search_callout.rs:37-146",
+      "apis/src/openai/responses/file_search_callout/citations.rs:158-213",
+      "apis/src/openai/include.rs:206-224",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:586-608"
+    ]
+  },
+  "S6": {
+    "reqMethod": "POST",
+    "reqPath": "/v1/responses",
+    "reqHeaders": [
+      "Content-Type: application/json",
+      "x-auth-tenant: acme",
+      "x-auth-user: user_42",
+      "x-user-mcp-key: mcp-user-secret-7f3a2c",
+      "x-mcp-authorized: mcpa_eyJ0ZW5hbnQiOiJhY21lIiwic3ViIjoidXNlcl80MiJ9.opaque-short-lived-assertion"
+    ],
+    "reqBody": "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"What is the weather in SF?\",\n  \"tools\": [\n    {\n      \"type\": \"mcp\",\n      \"server_label\": \"weather\",\n      \"connector_id\": \"trusted-mcp\",\n      \"allowed_tools\": [\n        \"get_weather\"\n      ],\n      \"require_approval\": \"never\"\n    }\n  ]\n}",
+    "resStatus": "200 OK",
+    "resKind": "json",
+    "resHeaders": [
+      "Content-Type: application/json"
+    ],
+    "resBody": "{\n  \"id\": \"resp_2\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"id\": \"mcpl_9f2c1a7b3d4e5f60\",\n      \"type\": \"mcp_list_tools\",\n      \"server_label\": \"weather\",\n      \"tools\": [\n        {\n          \"name\": \"get_weather\",\n          \"description\": \"Get the weather for a location\",\n          \"input_schema\": {\n            \"type\": \"object\",\n            \"properties\": {\n              \"location\": {\n                \"type\": \"string\"\n              }\n            },\n            \"required\": [\n              \"location\"\n            ],\n            \"additionalProperties\": false\n          }\n        }\n      ]\n    },\n    {\n      \"type\": \"function_call\",\n      \"id\": \"fc_1\",\n      \"call_id\": \"call_abc\",\n      \"name\": \"weather__get_weather\",\n      \"arguments\": \"{\\\"location\\\":\\\"SF\\\"}\",\n      \"status\": \"completed\"\n    },\n    {\n      \"type\": \"mcp_call\",\n      \"id\": \"call_abc\",\n      \"approval_request_id\": null,\n      \"server_label\": \"weather\",\n      \"name\": \"get_weather\",\n      \"arguments\": \"{\\\"location\\\":\\\"SF\\\"}\",\n      \"output\": \"mock result for get_weather\"\n    },\n    {\n      \"type\": \"message\",\n      \"id\": \"msg_2\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"The weather in SF is 72F and sunny.\"\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 30,\n    \"output_tokens\": 11,\n    \"total_tokens\": 41\n  }\n}",
+    "notes": "Distinctive shape: a two-phase agentic loop composed into one buffered Responses object. openai_mcp_tool_resolve first resolves connector_id 'trusted-mcp' to server_url http://127.0.0.1:8001/mcp, calls tools/list, and seeds one mcp_list_tools item (server_label is the client label 'weather', not the connector id; tools carry input_schema not inputSchema). The model then emits a function_call (name prefixed 'weather__get_weather'); openai_mcp_dispatch executes it against the same connector and appends the mcp_call record (name is the bare 'get_weather', server_label 'weather', id = the call_id, approval_request_id null since require_approval:never, output = the tool result). openai_agentic_loop signals loop, a second inference round returns the assistant message, then done. The mcp_gateway credential (x-user-mcp-key) and authorization assertion (x-mcp-authorized) are forwarded ONLY to the configured connector_id target, never to an arbitrary client server_url; the buffered terminal keeps the last round's backend response id (resp_2) and sums usage across both rounds (30/11/41).",
+    "provenance": [
+      "examples/configs/openai/responses/full-flow-agentic.yaml:88-93",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:415-426",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:326-347",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:570-579",
+      "tests/integration/tests/suite/examples/openai_agentic_loop.rs:438-536",
+      "tests/integration/tests/suite/examples/openai_agentic_loop.rs:1270-1318",
+      "tests/integration/tests/suite/examples/openai_agentic_loop.rs:2106-2264",
+      "tests/integration/tests/suite/examples/openai_agentic_loop.rs:6813-6819",
+      "tests/integration/tests/suite/examples/openai_mcp_streaming.rs:56-137",
+      "apis/src/openai/responses/openai_mcp_tool_resolve/mod.rs:2606-2635",
+      "apis/src/openai/responses/openai_mcp_tool_resolve/mod.rs:2705-2715",
+      "apis/src/openai/responses/mcp_dispatch/mod.rs:1774-1816",
+      "apis/src/openai/responses/mcp_dispatch/mod.rs:1630-1716"
+    ]
+  },
+  "S7": {
+    "reqMethod": "POST",
+    "reqPath": "/v1/responses",
+    "reqHeaders": [
+      "Content-Type: application/json",
+      "x-auth-tenant: acme",
+      "x-auth-user: alice",
+      "x-user-brave-key: alice-brave-secret"
+    ],
+    "reqBody": "{\n  \"model\": \"gpt-4.1\",\n  \"input\": \"What are the latest headlines about the Toronto Raptors?\",\n  \"tools\": [\n    {\n      \"type\": \"web_search\"\n    }\n  ]\n}",
+    "resStatus": "200 OK",
+    "resKind": "json",
+    "resHeaders": [
+      "Content-Type: application/json"
+    ],
+    "resBody": "{\n  \"id\": \"resp_0a1b2c3d4e5f60718293a4b5c6\",\n  \"object\": \"response\",\n  \"created_at\": 1783307880,\n  \"status\": \"completed\",\n  \"error\": null,\n  \"incomplete_details\": null,\n  \"model\": \"gpt-4.1\",\n  \"previous_response_id\": null,\n  \"output\": [\n    {\n      \"type\": \"web_search_call\",\n      \"id\": \"ws_68a1f0c2d1348190a7c3e5f102\",\n      \"status\": \"completed\",\n      \"action\": {\n        \"type\": \"search\",\n        \"query\": \"latest Toronto Raptors headlines\"\n      }\n    },\n    {\n      \"type\": \"message\",\n      \"id\": \"msg_68a1f0c3a2b48190b4d6f70213\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"The Raptors are finalizing their rotation ahead of the season opener, with Scottie Barnes expected to take on a larger playmaking role, and the team added frontcourt depth in a roster move this week.\",\n          \"annotations\": [\n            {\n              \"type\": \"url_citation\",\n              \"url\": \"https://www.nba.com/raptors/news\",\n              \"title\": \"Toronto Raptors News | NBA.com\",\n              \"start_index\": 0,\n              \"end_index\": 132\n            },\n            {\n              \"type\": \"url_citation\",\n              \"url\": \"https://www.sportsnet.ca/nba/toronto-raptors/\",\n              \"title\": \"Toronto Raptors - Sportsnet\",\n              \"start_index\": 134,\n              \"end_index\": 195\n            }\n          ]\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 318,\n    \"input_tokens_details\": {\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 96,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 414\n  }\n}",
+    "notes": "Final composed Responses object after the agentic loop: output[] holds a completed web_search_call (action.type=search + query) followed by the assistant message whose output_text carries url_citation annotations. openai_web_search executes the model-emitted web_search_call via Brave using the per-user brave_search slot captured from x-user-brave-key by callout_credentials; the slot is required (user_credential: brave_search) so a missing key fails closed with 401 missing_callout_context before any provider callout. action.sources is omitted because the request did not set include:[\"web_search_call.action.sources\"]. openai_agentic_loop is the sole transition authority and finalizes with action=done once no further tool calls remain.",
+    "provenance": [
+      "examples/configs/openai/responses/full-flow-agentic.yaml:552-566",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:326-337",
+      "apis/src/openai/responses/web_search/mod.rs:819-856",
+      "apis/src/openai/responses/file_search_callout/citations.rs:507-512",
+      "apis/src/openai/responses/file_search_callout/citations.rs:563",
+      "tests/integration/fixtures/agentic_api/web_search_nonstreaming.json:25-83",
+      "tests/integration/fixtures/inference/recordings/synthetic/responses/chat-web-search.json:63-92",
+      "tests/integration/tests/suite/examples/web_search_scoped_credentials.rs:139-175",
+      "tests/integration/tests/suite/examples/web_search_scoped_credentials.rs:225-245"
+    ]
+  },
+  "S8": {
+    "reqMethod": "GET",
+    "reqPath": "/v1/responses/resp_abc123",
+    "reqHeaders": [
+      "Host: localhost:8080",
+      "Accept: application/json",
+      "x-auth-tenant: acme",
+      "x-auth-user: alice"
+    ],
+    "reqBody": "",
+    "resStatus": "200 OK",
+    "resKind": "json",
+    "resHeaders": [
+      "Content-Type: application/json"
+    ],
+    "resBody": "{\n  \"id\": \"resp_abc123\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hi there\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 9,\n    \"input_tokens_details\": {\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 4,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 13\n  }\n}",
+    "notes": "openai_response_store runs PRE-IRR and short-circuits GET /v1/responses/{id} with the persisted response_object served verbatim as application/json; rehydrate, the bypass carrier, all callouts, and the IRR agentic loop never execute. Owner-scoped lookup keys on the state_owner context (x-auth-tenant/x-auth-user), so the object is returned identically whether it was originally created buffered or accumulated from a stream:true lifecycle.",
+    "provenance": [
+      "apis/src/openai/responses/store/filter.rs:838-844 (GET handled in on_request before IRR)",
+      "apis/src/openai/responses/store/filter.rs:1040-1047 (returns record.response_object verbatim, content-type application/json, status 200)",
+      "apis/src/openai/responses/store/filter.rs:1034-1037 (owner-scoped via require_state_owner)",
+      "tests/integration/tests/suite/examples/openai_response_store.rs:20 (RESPONSE_JSON stored shape), 164-168 (GET returns stored id/model at 200)",
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:33 (FIRST_RESPONSE_JSON completed shape), 441-452 (GET stored streamed resource, status/output asserted)",
+      "tests/integration/tests/suite/codex_http.rs:1105-1114 (OpenResponses usage: input_tokens_details.cached_tokens + output_tokens_details.reasoning_tokens required)",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:59-66,184-185 (openai_response_store persists PRE-IRR; GET served pre-IRR), 244-245 (retrieve curl example)"
+    ]
+  },
+  "S9": {
+    "reqMethod": "GET",
+    "reqPath": "/v1/responses",
+    "reqHeaders": [
+      "Host: localhost:8080",
+      "x-auth-tenant: acme",
+      "x-auth-user: alice",
+      "Connection: Upgrade",
+      "Upgrade: websocket",
+      "Sec-WebSocket-Version: 13",
+      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="
+    ],
+    "reqBody": "",
+    "resStatus": "101 Switching Protocols",
+    "resKind": "handshake",
+    "resHeaders": [
+      "Upgrade: websocket",
+      "Connection: Upgrade",
+      "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+    ],
+    "resBody": "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+    "notes": "A GET /v1/responses carrying Upgrade: websocket takes the bypass branch: the bypass carrier's unless-gate only skips POST + x-praxis-ai-format:openai_responses, so this GET runs the carrier, whose /v1/responses route matches on the Upgrade header (routes cannot match on HTTP method) and forwards to inference-backend. The IRR is never entered because it buffers responses and cannot handle 101 upgrades. The Sec-WebSocket-Accept is the RFC 6455 SHA-1 of the client key; after 101 the tunnel is bidirectional and the backend streams response.create-style Responses events.",
+    "provenance": [
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:1107-1127 (exact WS request head: Connection/Upgrade/Sec-WebSocket-Version:13/Sec-WebSocket-Key + x-auth-* headers)",
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:909-916 (handshake returns SWITCHING_PROTOCOLS), 944-957 (backend receives GET /v1/responses + headers)",
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:1142-1167 (WS handshake reaches inference-backend via non-IRR bypass; IRR cannot handle 101)",
+      "tests/integration/fixtures/openai/responses/websocket-codex-0.144.1.json:15-19 (WS response.create client kind and Responses event schema)",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:96-119 (bypass branch owns non-create/WS traffic), 445-475 (headers carrier unless-gate + /v1/responses route matching upgrade: websocket -> inference-backend), 247-261 (WebSocket takes bypass, not IRR)"
+    ]
+  },
+  "S10": {
+    "reqMethod": "POST",
+    "reqPath": "/v1/responses",
+    "reqHeaders": [
+      "Content-Type: application/json",
+      "x-auth-tenant: integration-tenant",
+      "x-auth-user: integration-user"
+    ],
+    "reqBody": "{\n  \"model\": \"gpt-4.1\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Hello\"\n    }\n  ]\n}",
+    "resStatus": "404 Not Found",
+    "resKind": "none",
+    "resHeaders": [
+      "Connection: close"
+    ],
+    "resBody": "",
+    "notes": "A Chat Completions body ({model,messages}) posted to /v1/responses is NOT classified openai_responses by openai_responses_format, so the bypass carrier's `unless` allow-list does not skip it: it runs the carrier and enters the bypass router. That router only exposes /v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores, and a /v1/responses route gated on `upgrade: websocket`. A plain POST /v1/responses carries no Upgrade header, so nothing matches and the router rejects with a bare 404. The route-miss body is EMPTY (no JSON error envelope): the praxis router emits Rejection::status(404) with body:None, and the protocol layer writes the header with no content-length and Connection: close. resKind is `none` (not `json`) because there is truthfully no body. Discrimination lives here PRE-IRR because the IRR strips x-praxis-* headers from its sub-request, so the IRR step router (path-only) could never re-classify Responses-vs-Chat.",
+    "provenance": [
+      "examples/configs/openai/responses/full-flow-agentic.yaml:445-471 (bypass carrier `unless` gate + bypass router: no route matches a non-Responses POST /v1/responses)",
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:299-329 (full_flow_chat_completions_body_on_responses_path_does_not_reach_backend asserts status 404)",
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:331-361 (Anthropic Messages body variant also 404 via the same structural allow-list)",
+      "~/.cargo/registry/.../praxis-proxy-filter-0.6.0/src/builtins/http/traffic_management/router/mod.rs:514 (route-miss => Rejection::status(404), body:None) [praxis core dep]",
+      "~/.cargo/registry/.../praxis-proxy-protocol-0.6.0/src/http/pingora/convert.rs:150-171 (send_rejection: no content-length when body absent, keepalive disabled) [praxis core dep]"
+    ]
+  },
+  "S11": {
+    "reqMethod": "POST",
+    "reqPath": "/v1/embeddings",
+    "reqHeaders": [
+      "Content-Type: application/json",
+      "x-auth-tenant: integration-tenant",
+      "x-auth-user: integration-user"
+    ],
+    "reqBody": "{\n  \"model\": \"text-embedding-3-small\",\n  \"input\": \"The quick brown fox\"\n}",
+    "resStatus": "200 OK",
+    "resKind": "json",
+    "resHeaders": [
+      "Content-Type: application/json"
+    ],
+    "resBody": "{\n  \"object\": \"list\",\n  \"data\": [\n    {\n      \"object\": \"embedding\",\n      \"index\": 0,\n      \"embedding\": [\n        0.0023064255,\n        -0.009327292,\n        0.015797347,\n        -0.0079056\n      ]\n    }\n  ],\n  \"model\": \"text-embedding-3-small\",\n  \"usage\": {\n    \"prompt_tokens\": 5,\n    \"total_tokens\": 5\n  }\n}",
+    "notes": "POST /v1/embeddings matches the bypass router's path_prefix `/v1/embeddings` -> cluster embeddings-api (127.0.0.1:9997) and rejoins at `terminal`, so it is forwarded straight upstream and NEVER enters the IRR. The gateway forwards the embeddings backend's response verbatim (bypass branch), so the exact embedding object shape is produced by the upstream embeddings-api, not the gateway. The `embedding` vector is truncated to four floats for brevity (real vectors are 1536-dim for text-embedding-3-small). The other dedicated services take the same bypass branch by path_prefix and likewise skip the IRR: /v1/prompts -> prompts-api (127.0.0.1:9998), /v1/files -> files-api (127.0.0.1:9999), /v1/vector_stores -> vector-stores-backend (127.0.0.1:3002). NOTE: no repo fixture emits a real embeddings JSON object (the embeddings-routing functional test returns the marker string \"embeddings-api\"); this is the minimal truthful OpenAI embeddings shape.",
+    "provenance": [
+      "examples/configs/openai/responses/full-flow-agentic.yaml:458-501 (bypass router path_prefix /v1/embeddings -> embeddings-api; load_balancer endpoint 127.0.0.1:9997; also /v1/prompts:9998, /v1/files:9999, /v1/vector_stores:3002)",
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:1324-1352 (full_flow_agentic_non_responses_path_bypasses_irr proves a dedicated-service path bypasses the IRR and the bypass branch forwards the backend response verbatim)",
+      "tests/integration/tests/suite/examples/openai_embeddings_routing.rs:14-60 (embeddings routing functional test; backend returns marker string, no JSON embeddings fixture exists)"
+    ]
+  }
 };
 
 /* group → color + label */
@@ -927,6 +1283,137 @@ function attachTooltipRaw(node,title,rows){
 }
 
 /* ============================================================================
+   ON THE WIRE — render example request/response payloads for a scenario.
+   Self-contained JSON + SSE highlighter (no dependencies).
+   ========================================================================= */
+function hlJson(json){
+  // Tokenize raw JSON, wrapping each token in a colored span (text escaped).
+  const re=/("(?:\\.|[^"\\])*")(?=\s*:)|("(?:\\.|[^"\\])*")|(true|false)|(null)|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|([{}\[\],:])/g;
+  let out="",last=0,m;
+  while((m=re.exec(json))){
+    out+=escapeHtml(json.slice(last,m.index));
+    let cls="tk-pun";
+    if(m[1]!==undefined)cls="tk-key";
+    else if(m[2]!==undefined)cls="tk-str";
+    else if(m[3]!==undefined)cls="tk-bool";
+    else if(m[4]!==undefined)cls="tk-nul";
+    else if(m[5]!==undefined)cls="tk-num";
+    out+='<span class="'+cls+'">'+escapeHtml(m[0])+'</span>';
+    last=re.lastIndex;
+  }
+  out+=escapeHtml(json.slice(last));
+  return out;
+}
+function hlSse(src){
+  return src.split("\n").map(line=>{
+    if(line.startsWith("event:"))return '<span class="sse-evt">'+escapeHtml(line)+'</span>';
+    if(line.startsWith("data:")){
+      const rest=line.slice(5).trim();
+      if(rest.startsWith("{")||rest.startsWith("["))return '<span class="sse-key">data:</span> '+hlJson(rest);
+      return '<span class="sse-key">data:</span> '+escapeHtml(rest);
+    }
+    return escapeHtml(line);
+  }).join("\n");
+}
+function hlHandshake(src){
+  return src.split("\n").map(line=>{
+    if(/^HTTP\//.test(line))return '<span class="sse-evt">'+escapeHtml(line)+'</span>';
+    const i=line.indexOf(":");
+    if(i>0)return '<span class="sse-key">'+escapeHtml(line.slice(0,i))+'</span>'+escapeHtml(line.slice(i));
+    return escapeHtml(line);
+  }).join("\n");
+}
+function hlBody(src,kind){
+  if(!src)return "";
+  if(kind==="sse")return hlSse(src);
+  if(kind==="handshake")return hlHandshake(src);
+  return hlJson(src);
+}
+function statusClass(st){return /^2/.test(st)?"ok":/^1/.test(st)?"info":"warn";}
+function headerLines(arr){
+  if(!arr||!arr.length)return "";
+  return arr.map(h=>{
+    const i=h.indexOf(":");
+    return i>0?'<span class="hn">'+escapeHtml(h.slice(0,i))+':</span>'+escapeHtml(h.slice(i+1)):escapeHtml(h);
+  }).join("<br>");
+}
+function makeCopy(text){
+  const b=el("button","copy");b.type="button";b.textContent="copy";
+  b.addEventListener("click",()=>{
+    const ok=()=>{b.textContent="copied";b.classList.add("done");setTimeout(()=>{b.textContent="copy";b.classList.remove("done");},1400);};
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(ok).catch(()=>{});}
+    else{try{const ta=document.createElement("textarea");ta.value=text;document.body.appendChild(ta);ta.select();document.execCommand("copy");ta.remove();ok();}catch(e){}}
+  });
+  return b;
+}
+function renderWire(scen){
+  const wrap=document.getElementById("wireBody");
+  const sub=document.getElementById("wireSub");
+  wrap.innerHTML="";
+  const w=WIRE[scen];
+  const sdef=PIPELINE.scenarios.find(s=>s.id===scen);
+  if(!w){
+    sub.textContent=scen==="overview"?"example request & response — pick a scenario":"no example captured for this scenario";
+    const e=el("div","empty");
+    e.innerHTML=scen==="overview"
+      ? "Select a scenario chip above to inspect the exact <b>request</b> it sends and the <b>response</b> the gateway returns."
+      : "No example payload is recorded for this scenario.";
+    wrap.appendChild(e);
+    return;
+  }
+  sub.textContent=(sdef?sdef.label:scen)+" — example request & response";
+
+  // request pane
+  const rq=el("div","pane req");
+  const rql=el("div","plabel");
+  rql.appendChild(Object.assign(el("span","tag rq"),{textContent:"request"}));
+  if(w.reqBody)rql.appendChild(makeCopy(w.reqBody));
+  rq.appendChild(rql);
+  const line=el("div","reqline");
+  line.innerHTML='<span class="mth">'+escapeHtml(w.reqMethod)+'</span> '+escapeHtml(w.reqPath);
+  rq.appendChild(line);
+  if(w.reqHeaders&&w.reqHeaders.length){const h=el("div","hdrs");h.innerHTML=headerLines(w.reqHeaders);rq.appendChild(h);}
+  if(w.reqBody){const pre=el("pre");pre.innerHTML=hlBody(w.reqBody,"json");rq.appendChild(pre);}
+  else{const none=el("div","hdrs");none.innerHTML="<span class='hn'>(no request body)</span>";rq.appendChild(none);}
+  wrap.appendChild(rq);
+
+  // response pane
+  const rs=el("div","pane rs");
+  const rsl=el("div","plabel");
+  rsl.appendChild(Object.assign(el("span","tag rs"),{textContent:"response"}));
+  if(w.resBody&&w.resKind!=="none")rsl.appendChild(makeCopy(w.resBody));
+  rs.appendChild(rsl);
+  const st=el("div","status "+statusClass(w.resStatus));
+  st.textContent=w.resStatus+(w.resKind==="sse"?"  ·  text/event-stream":w.resKind==="handshake"?"  ·  upgrade":"");
+  rs.appendChild(st);
+  if(w.resHeaders&&w.resHeaders.length){const h=el("div","hdrs");h.innerHTML=headerLines(w.resHeaders);rs.appendChild(h);}
+  if(w.resBody){const pre=el("pre");pre.innerHTML=hlBody(w.resBody,w.resKind);rs.appendChild(pre);}
+  wrap.appendChild(rs);
+
+  // footer: note + provenance
+  if(w.notes||(w.provenance&&w.provenance.length)){
+    const foot=el("div","wfoot");
+    if(w.notes){const n=el("div","note");n.innerHTML="<b>Note.</b> "+escapeHtml(w.notes);foot.appendChild(n);}
+    if(w.provenance&&w.provenance.length){
+      const p=el("div","prov");
+      p.innerHTML="Grounded in: "+w.provenance.map(x=>"<code>"+escapeHtml(x)+"</code>").join("");
+      foot.appendChild(p);
+    }
+    wrap.appendChild(foot);
+  }
+}
+/* collapse toggle for the wire panel */
+(function wireToggle(){
+  const sec=document.getElementById("wire"),tog=document.getElementById("wireToggle");
+  function flip(){
+    const collapsed=sec.classList.toggle("collapsed");
+    tog.setAttribute("aria-expanded",collapsed?"false":"true");
+  }
+  tog.addEventListener("click",flip);
+  tog.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();flip();}});
+})();
+
+/* ============================================================================
    SCENARIO ENGINE — single source of truth drives highlight + tooltip + caps
    ========================================================================= */
 const body=document.body;
@@ -956,6 +1443,9 @@ function applyScenario(scen){
     narrHtml+=" <span class='rounds'>· "+escapeHtml(sdef.request)+" · loop rounds: "+escapeHtml(String(sdef.loopRounds))+"</span>";
   }
   document.getElementById("narr").innerHTML=narrHtml;
+
+  // example request/response payloads for this scenario
+  renderWire(scen);
 
   // cards
   document.querySelectorAll(".card.flt").forEach(card=>{
