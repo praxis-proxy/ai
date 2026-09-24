@@ -335,15 +335,14 @@ filter_chains:
             source_header: x-user-ogx-key
           - slot: mcp_gateway
             source_header: x-user-mcp-key
-
-      - filter: callout_authorization
-        # Opaque connector authorization is deliberately separate from
-        # credentials. The trusted boundary MUST unconditionally delete any
-        # client-supplied x-mcp-authorized value and then set the verified,
-        # short-lived assertion for this request. Praxis forwards it unchanged
-        # only to configured connector_id destinations; the MCP Gateway makes
-        # the actual authorization decision.
-        assertion_slot: mcp_gateway
+        assertions:
+          # The same establishing filter keeps assertions in a separate typed
+          # slot map. The trusted boundary MUST delete any client-supplied
+          # x-mcp-authorized value and then set the verified, short-lived
+          # assertion. Praxis forwards it unchanged only to configured
+          # connector_id destinations; the MCP Gateway decides authorization.
+          - slot: mcp_gateway
+            source_header: x-mcp-authorized
 
       # Emit the normalized owner in the contract expected by OGX and by the
       # explicitly configured downstream callouts below. Raw x-auth-* inputs

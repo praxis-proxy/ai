@@ -408,7 +408,7 @@ fn connector_context_overrides_client_shadow_and_static_bearer() {
     assert_eq!(
         config
             .custom_headers
-            .get(&crate::callout_authorization::MCP_AUTHORIZED_HEADER)
+            .get(&crate::callout_credentials::MCP_AUTHORIZED_HEADER)
             .unwrap(),
         "signed-assertion"
     );
@@ -453,14 +453,14 @@ fn rotated_assertion_injects_latest_value_without_changing_other_context() {
     assert_eq!(
         first
             .custom_headers
-            .get(&crate::callout_authorization::MCP_AUTHORIZED_HEADER)
+            .get(&crate::callout_credentials::MCP_AUTHORIZED_HEADER)
             .unwrap(),
         "assertion-v1"
     );
     assert_eq!(
         second
             .custom_headers
-            .get(&crate::callout_authorization::MCP_AUTHORIZED_HEADER)
+            .get(&crate::callout_credentials::MCP_AUTHORIZED_HEADER)
             .unwrap(),
         "assertion-v2"
     );
@@ -479,7 +479,7 @@ fn direct_url_context_none_never_forwards_client_assertion() {
     assert!(
         !config
             .custom_headers
-            .contains_key(&crate::callout_authorization::MCP_AUTHORIZED_HEADER)
+            .contains_key(&crate::callout_credentials::MCP_AUTHORIZED_HEADER)
     );
 }
 
@@ -1156,7 +1156,7 @@ async fn start_recording_mcp_server() -> (String, tokio_util::sync::Cancellation
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_owned),
                         assertion: headers
-                            .get(crate::callout_authorization::MCP_AUTHORIZED_HEADER)
+                            .get(crate::callout_credentials::MCP_AUTHORIZED_HEADER)
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_owned),
                         tenant: headers
@@ -1219,7 +1219,7 @@ async fn start_redirecting_mcp_server() -> (String, tokio_util::sync::Cancellati
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_owned),
                         assertion: headers
-                            .get(crate::callout_authorization::MCP_AUTHORIZED_HEADER)
+                            .get(crate::callout_credentials::MCP_AUTHORIZED_HEADER)
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_owned),
                         tenant: headers

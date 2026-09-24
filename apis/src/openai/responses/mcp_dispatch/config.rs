@@ -46,7 +46,7 @@ pub(crate) struct McpDispatchConfig {
     #[serde(default)]
     pub user_credential: Option<String>,
 
-    /// Optional opaque assertion slot from `callout_authorization`. Must match
+    /// Optional opaque assertion slot from `callout_credentials.assertions`. Must match
     /// the corresponding `openai_mcp_tool_resolve` setting.
     #[serde(default)]
     pub authorization_assertion: Option<String>,

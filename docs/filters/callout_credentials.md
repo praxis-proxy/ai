@@ -3,7 +3,7 @@
 
 # `callout_credentials`
 
-Establishing filter that captures per-user callout credentials from ingress headers.
+Establishing filter that captures typed per-user callout secrets from ingress headers.
 
 ## Configuration Notes
 
@@ -15,9 +15,12 @@ Place this filter once in the outer request chain, before body pre-read callouts
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `credentials` | RawSlot[] | yes | Per-user credential slots to capture from ingress headers. |
+| `credentials` | RawSlot[] | no | Per-user credential slots to capture from ingress headers. |
 | `credentials[].slot` | string | yes | Config-static slot identifier. |
 | `credentials[].source_header` | string | yes | Ingress header name to read the per-user secret from. |
+| `assertions` | RawSlot[] | no | Opaque authorization-assertion slots to capture from trusted ingress headers. |
+| `assertions[].slot` | string | yes | Config-static slot identifier. |
+| `assertions[].source_header` | string | yes | Ingress header name to read the per-user secret from. |
 
 ## Example
 
@@ -26,4 +29,7 @@ Place this filter once in the outer request chain, before body pre-read callouts
   credentials:
     - slot: brave_search
       source_header: x-user-brave-key
+  assertions:
+    - slot: mcp_gateway
+      source_header: x-mcp-authorized
 ```
