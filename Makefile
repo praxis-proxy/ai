@@ -299,7 +299,8 @@ coverage-check:
 #                          active in the test processes (needs fips.so)
 #   make container-fips    FIPS runtime image on UBI 9 (Red Hat toolchain,
 #                          signature-verified base images)
-#   make fips-check        build on UBI 9 and print the compliance report
+#   make fips-check        build on UBI 9, run the crypto unit tests on the
+#                          FIPS provider, print the compliance report
 #   make fips-report       the same report against the local FIPS build
 #   make fips-deps         dependency graph only (seconds, no build; also
 #                          runs under `make lint`, so a PR cannot reintroduce
@@ -448,16 +449,22 @@ test-fips:
 # among them) has to come from the FIPS provider. The variable reaches the
 # test binaries through cargo's runner, not cargo itself, whose libgit2
 # cannot run under that property; for the same reason only the lib and bin
-# unit tests run (the e2e test target spawns cargo). Needs the host's fips
-# module (Fedora and RHEL ship /usr/lib64/ossl-modules/fips.so); it is a
-# developer check, only a FIPS-mode host proves a deployment (docs/fips.md).
+# unit tests run (the e2e test target spawns cargo). A missing or wrong
+# OPENSSL_CONF is silently ignored by OpenSSL, so the run also sets
+# PRAXIS_TEST_FIPS_PROVIDER, on cargo itself so it reaches the test binaries
+# whatever the runner does: the apis and filters test processes then assert
+# that the provider reports FIPS and refuses MD5, and fail otherwise. Needs
+# the host's fips module (Fedora and RHEL ship /usr/lib64/ossl-modules/fips.so);
+# the same tests run inside the UBI 9 report stage (make fips-check), and
+# only a FIPS-mode host proves a deployment (docs/fips.md).
+FIPS_PROVIDER_CNF       := $(CURDIR)/xtask/assets/fips/fips-provider.cnf
 test-fips-provider:
-	@OPENSSL_CONF=$(CURDIR)/xtask/assets/fips/fips-provider.cnf openssl list -providers 2>/dev/null | grep -q '^  fips$$' \
-		|| { echo "no OpenSSL FIPS provider on this host: 'OPENSSL_CONF=xtask/assets/fips/fips-provider.cnf openssl list -providers' does not list fips"; exit 1; }
-	cargo test --target-dir $(FIPS_TARGET_DIR) --no-default-features --lib --bins \
+	@OPENSSL_CONF=$(FIPS_PROVIDER_CNF) openssl list -providers 2>/dev/null | grep -q '^  fips$$' \
+		|| { echo "no OpenSSL FIPS provider on this host: 'OPENSSL_CONF=$(FIPS_PROVIDER_CNF) openssl list -providers' does not list fips"; exit 1; }
+	PRAXIS_TEST_FIPS_PROVIDER=1 cargo test --target-dir $(FIPS_TARGET_DIR) --no-default-features --lib --bins \
 		-p praxis-ai-proxy -p praxis-ai-filters -p praxis-ai-apis \
 		--features $(FIPS_FEATURES_QUALIFIED) \
-		--config 'target."cfg(all())".runner=["env","OPENSSL_CONF=$(CURDIR)/xtask/assets/fips/fips-provider.cnf"]' \
+		--config 'target."cfg(all())".runner=["env","OPENSSL_CONF=$(FIPS_PROVIDER_CNF)"]' \
 		$(_NOCAPTURE)
 
 # podman finds Red Hat's detached image signatures through its registries.d
@@ -621,6 +628,7 @@ help:
 	@echo "  check-fips           cargo check of the FIPS build"
 	@echo "  lint-fips            clippy (all targets) + rustfmt check for the FIPS feature set"
 	@echo "  test-fips            unit tests resolved as the FIPS build (no defaults, FIPS_FEATURES on the binary)"
+	@echo "  test-fips-provider   the same unit tests with the RHEL FIPS provider active and asserted in each test process (needs fips.so)"
 	@echo "  container-fips       FIPS runtime image on UBI 9 (Red Hat toolchain, signature-verified bases)"
 	@echo "  container-fips-run   run the FIPS image in foreground (host network)"
 	@echo "  fips-check           build on UBI 9 and print the compliance report (fails while findings remain)"

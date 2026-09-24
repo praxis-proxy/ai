@@ -14,6 +14,8 @@
 //! module on a FIPS host, and it reports the library's refusal instead of
 //! panicking so a signing failure fails closed at the request.
 
+use std::fmt;
+
 use openssl::{
     error::ErrorStack,
     hash::{Hasher, MessageDigest},
@@ -91,6 +93,36 @@ impl Default for Sha256 {
     }
 }
 
+/// Why an HMAC could not be computed.
+#[derive(Debug)]
+pub enum HmacError {
+    /// OpenSSL refused the key or the algorithm (its error stack).
+    OpenSsl(ErrorStack),
+    /// OpenSSL returned a tag of the wrong length, which no SHA-256
+    /// implementation does; reported rather than truncated.
+    TagLength(usize),
+}
+
+impl fmt::Display for HmacError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OpenSsl(e) => write!(f, "{e}"),
+            Self::TagLength(len) => write!(
+                f,
+                "OpenSSL returned an HMAC-SHA256 tag of {len} bytes, expected {SHA256_LEN}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HmacError {}
+
+impl From<ErrorStack> for HmacError {
+    fn from(e: ErrorStack) -> Self {
+        Self::OpenSsl(e)
+    }
+}
+
 /// HMAC-SHA256 (RFC 2104 with SHA-256) through OpenSSL's EVP signing API.
 ///
 /// The key is wrapped in an `EVP_PKEY` and the MAC is computed with
@@ -108,17 +140,15 @@ impl HmacSha256 {
     ///
     /// # Errors
     ///
-    /// Returns the OpenSSL error stack if the provider refuses the key or
-    /// cannot supply HMAC-SHA256. The error carries no key material.
-    pub fn mac(key: &[u8], data: &[u8]) -> Result<[u8; SHA256_LEN], ErrorStack> {
+    /// Returns [`HmacError`] if the provider refuses the key or cannot supply
+    /// HMAC-SHA256. The error carries no key material.
+    pub fn mac(key: &[u8], data: &[u8]) -> Result<[u8; SHA256_LEN], HmacError> {
         let key = PKey::hmac(key)?;
         let mut signer = Signer::new(MessageDigest::sha256(), &key)?;
         let mut out = [0; SHA256_LEN];
         let written = signer.sign_oneshot(&mut out, data)?;
         if written != SHA256_LEN {
-            // Cannot happen for SHA-256; treat it as the library misbehaving
-            // rather than returning a truncated tag.
-            return Err(ErrorStack::get());
+            return Err(HmacError::TagLength(written));
         }
         Ok(out)
     }
@@ -194,6 +224,33 @@ mod tests {
             ),
             RFC4231_CASE6,
             "case 6: key longer than the block size is hashed first"
+        );
+    }
+
+    /// With `PRAXIS_TEST_FIPS_PROVIDER` set (`make test-fips-provider`, the
+    /// UBI report stage), this process must be running on the FIPS
+    /// provider: OpenSSL's default properties select FIPS algorithms, MD5
+    /// does not exist, and the HMAC still works. Without the variable the
+    /// test does nothing, so a plain `cargo test` never claims FIPS.
+    #[test]
+    fn fips_provider_is_active_when_the_run_requires_it() {
+        if std::env::var_os("PRAXIS_TEST_FIPS_PROVIDER").is_none() {
+            return;
+        }
+        praxis_tls::provider::install();
+        assert!(
+            praxis_tls::provider::status().provider_fips,
+            "PRAXIS_TEST_FIPS_PROVIDER is set but OpenSSL does not report FIPS-approved default properties: \
+             the FIPS provider is not active in this process (is OPENSSL_CONF reaching the test binary?)"
+        );
+        assert!(
+            openssl::hash::hash(MessageDigest::md5(), b"abc").is_err(),
+            "MD5 must be refused under the FIPS provider"
+        );
+        assert_eq!(
+            hex(&HmacSha256::mac(b"Jefe", b"what do ya want for nothing?").expect("mac under the FIPS provider")),
+            RFC4231_CASE2,
+            "HMAC-SHA256 through the FIPS provider"
         );
     }
 

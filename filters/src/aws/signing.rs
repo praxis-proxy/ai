@@ -724,6 +724,25 @@ mod tests {
         assert!(!err.contains("SESSIONTOKENVALUE"), "no session token in {err}");
     }
 
+    /// With `PRAXIS_TEST_FIPS_PROVIDER` set, this test process must be on
+    /// the FIPS provider (the apis crate checks the same in its own process;
+    /// provider state is per process). Does nothing otherwise.
+    #[test]
+    fn fips_provider_is_active_when_the_run_requires_it() {
+        if std::env::var_os("PRAXIS_TEST_FIPS_PROVIDER").is_none() {
+            return;
+        }
+        praxis_tls::provider::install();
+        assert!(
+            praxis_tls::provider::status().provider_fips,
+            "PRAXIS_TEST_FIPS_PROVIDER is set but OpenSSL does not report FIPS-approved default properties"
+        );
+        let scope = scope();
+        let key =
+            signing_key("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", &scope).expect("HMAC under the FIPS provider");
+        assert_eq!(key.len(), 32, "a signing key is derived through the FIPS provider");
+    }
+
     // -- Differential tests against aws-sigv4 -----------------------------------
 
     /// The signing path this module replaced: `aws-sigv4` with the settings

@@ -8,8 +8,9 @@
 #
 #   builder   builds the FIPS feature set of praxis-ai with Red Hat's own
 #             Rust toolchain and OpenSSL (make container-fips, make fips-check)
-#   report    runs `cargo xtask fips report` on that binary and keeps the
-#             result (make fips-check)
+#   report    runs the crypto unit tests on the FIPS provider and
+#             `cargo xtask fips report` on that binary, and keeps the
+#             results (make fips-check)
 #   runtime   the shippable image on ubi9/ubi-minimal (make container-fips)
 #
 # The FIPS build differs from the published build only in its cargo features:
@@ -123,6 +124,24 @@ FROM builder AS report
 ARG CARGO_FEATURES
 ARG CARGO_ARGS
 
+# The digest and signing tests of the apis and filters crates (`hash::`,
+# `aws::`), run on the FIPS provider that UBI ships: OPENSSL_CONF reaches the
+# test binaries through cargo's runner (cargo's own libgit2 cannot run under
+# it), and PRAXIS_TEST_FIPS_PROVIDER makes each test process assert that the
+# provider reports FIPS and refuses MD5, so a run that never reached the
+# provider fails. Release profile, to share the builder's compiled crates.
+# The rest of the unit tests run in the standard CI (`make test-fips`).
+RUN --mount=type=cache,id=praxis-ai-fips-registry,target=/cargo/registry \
+    --mount=type=cache,id=praxis-ai-fips-target,target=/src/target \
+    { features="praxis-ai-proxy/$(printf '%s' "${CARGO_FEATURES}" | sed 's#,#,praxis-ai-proxy/#g')"; \
+      PRAXIS_TEST_FIPS_PROVIDER=1 cargo test --release --locked --lib \
+        -p praxis-ai-proxy -p praxis-ai-filters -p praxis-ai-apis \
+        --no-default-features --features "${features}" ${CARGO_ARGS} \
+        --config 'target."cfg(all())".runner=["env","OPENSSL_CONF=/src/xtask/assets/fips/fips-provider.cnf"]' \
+        -- hash:: aws:: > /fips/tests.txt 2>&1; \
+      echo $? > /fips/tests-status; } \
+    ; true
+
 RUN --mount=type=cache,id=praxis-ai-fips-registry,target=/cargo/registry \
     --mount=type=cache,id=praxis-ai-fips-target,target=/src/target \
     { cargo run --quiet --locked -p xtask --no-default-features ${CARGO_ARGS} -- \
@@ -130,7 +149,7 @@ RUN --mount=type=cache,id=praxis-ai-fips-registry,target=/cargo/registry \
       echo $? > /fips/status; } \
     ; true
 
-CMD ["sh", "-c", "cat /fips/report.txt; exit $(cat /fips/status)"]
+CMD ["sh", "-c", "cat /fips/tests.txt /fips/report.txt; test \"$(cat /fips/tests-status)\" -eq 0 && exit $(cat /fips/status); echo 'crypto unit tests on the FIPS provider failed (see above)'; exit 1"]
 
 # ------------------------------------------------------------------------------
 # Stage 3: runtime

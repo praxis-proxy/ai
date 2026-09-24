@@ -501,8 +501,9 @@ mod tests {
         // independently three ways before overriding the doc's value here:
         // (1) a from-scratch Python `hashlib`/`hmac` HMAC-SHA256 chain over
         // exactly that CanonicalRequest/StringToSign, (2) AWS's own
-        // `botocore` `S3SigV4Auth` Python SDK signer, and (3) this crate
-        // (`aws-sigv4` 1.5.1) — all three independently produce
+        // `botocore` `S3SigV4Auth` Python SDK signer, and (3) the `aws-sigv4`
+        // crate, which the differential test in `signing.rs` keeps this
+        // signer aligned with — all three independently produce
         // `67fe34c8...`, not `f0e8bdb8...`. Do not "fix" this back to the
         // doc's value without re-deriving it yourself.
         let credentials = Credentials::new(
@@ -542,10 +543,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "33 lines; three over limit due to two header-presence assertions"
-    )]
     fn sign_headers_includes_security_token_for_temporary_credentials() {
         let credentials = Credentials::new(
             "ASIAEXAMPLE",
@@ -579,10 +576,7 @@ mod tests {
         let has_content_sha256 = headers
             .iter()
             .any(|(name, _)| name.as_str().eq_ignore_ascii_case("x-amz-content-sha256"));
-        assert!(
-            has_content_sha256,
-            "x-amz-content-sha256 must be present given PayloadChecksumKind::XAmzSha256"
-        );
+        assert!(has_content_sha256, "x-amz-content-sha256 is always emitted");
     }
 
     /// Builds a filter directly from known-good credentials, bypassing
