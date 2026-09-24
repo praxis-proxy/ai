@@ -22,6 +22,10 @@ mod echo;
 mod filter_docs;
 mod fips;
 #[cfg(feature = "dev")]
+mod flow_graph;
+#[cfg(feature = "dev")]
+mod flow_visualizer;
+#[cfg(feature = "dev")]
 mod inference_fixtures;
 #[cfg(feature = "dev")]
 mod lint_deps;
@@ -125,6 +129,11 @@ enum Command {
     #[cfg(feature = "dev")]
     SyncInferenceReadme(sync_inference_readme::Args),
 
+    /// Verify (and later regenerate) the checked-in flow-visualizer HTML
+    /// against the config it documents.
+    #[cfg(feature = "dev")]
+    SyncFlowVisualizers(flow_visualizer::Args),
+
     /// Generate per-filter documentation under `docs/filters/`.
     #[cfg(feature = "dev")]
     GenerateFilterDocs(filter_docs::GenerateArgs),
@@ -207,6 +216,7 @@ fn run_dev(command: Command) {
         Command::OpenresponsesCoverage(args) => openresponses_coverage::run(&args),
         Command::RecordInference(args) => inference_fixtures::run_record(args),
         Command::SyncInferenceReadme(args) => sync_inference_readme::run(&args),
+        Command::SyncFlowVisualizers(args) => flow_visualizer::run(&args),
         Command::SyncResponsesReadme(args) => sync_responses_readme::run(&args),
         Command::Fips(args) => fips::run(args),
     }

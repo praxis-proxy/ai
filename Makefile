@@ -278,6 +278,7 @@ lint-xtask:
 	cargo xtask sync-example-readme
 	cargo xtask sync-inference-readme
 	cargo xtask sync-responses-readme
+	cargo xtask sync-flow-visualizers
 	cargo xtask check-inference
 	cargo xtask check-responses-registry
 	cargo xtask check-chat-completions-registry
