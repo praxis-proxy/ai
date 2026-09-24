@@ -8,6 +8,11 @@
 //! Vertex serves Claude through the Anthropic Messages wire format but
 //! with a dialect seam on each side of the request. This filter closes
 //! both so a single client-facing model id can route to either backend:
+//! requests whose model does not start with the configured `model_prefix`
+//! pass through unchanged, so this filter can share an Anthropic chain with
+//! other suppliers. Matching requests receive the internal
+//! `x-praxis-ai-vertex-route: vertex` marker for the router; the marker must
+//! be removed before forwarding upstream.
 //!
 //! **Request** — the body's `model` moves into the URL
 //! (`…/publishers/anthropic/models/{model}:rawPredict`,
