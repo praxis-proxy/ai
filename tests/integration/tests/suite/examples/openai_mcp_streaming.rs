@@ -478,6 +478,22 @@ fn get_common_stream_and_delete_cleanup_route_through_outbound_chain() {
     // GET common stream: opened, session-scoped, AND routed through the filtered
     // outbound chain. The mcp_dispatch session's outbound chain stamps
     // x-mcp-client via its `headers` filter; a correctly routed GET carries it.
+    // The rmcp worker opens this eager GET stream asynchronously and the mock
+    // records connections on separate threads, so poll rather than snapshotting
+    // once (same reason the DELETE below polls).
+    let saw_chain_get = wait_for_recorded(&mcp, |reqs| {
+        reqs.iter().any(|r| {
+            r.http_method == "GET"
+                && r.headers
+                    .iter()
+                    .any(|(k, v)| k == "x-mcp-client" && v == "praxis-ai-gateway")
+        })
+    });
+    assert!(
+        saw_chain_get,
+        "the mcp_dispatch session's eager GET common stream must route through the \
+         filtered outbound chain and carry x-mcp-client (within 5s)"
+    );
     let reqs = mcp.received_requests();
     let chain_get = reqs
         .iter()
@@ -487,10 +503,7 @@ fn get_common_stream_and_delete_cleanup_route_through_outbound_chain() {
                     .iter()
                     .any(|(k, v)| k == "x-mcp-client" && v == "praxis-ai-gateway")
         })
-        .expect(
-            "the mcp_dispatch session's eager GET common stream must route through the \
-             filtered outbound chain and carry x-mcp-client",
-        );
+        .expect("GET with x-mcp-client should be present after wait_for_recorded returned true");
     assert!(
         chain_get
             .headers
