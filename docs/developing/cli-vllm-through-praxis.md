@@ -51,7 +51,36 @@ vllm serve Qwen/Qwen3-8B \
   --api-key "$VLLM_API_KEY"
 ```
 
-Use `VLLM_URL=http://127.0.0.1:8000` for that server.
+The same server can be run from the official
+[`vllm/vllm-openai`](https://hub.docker.com/r/vllm/vllm-openai) image. Its
+entrypoint already starts the server, so the arguments are the `vllm serve`
+flags used above, and vLLM reads the backend key from `VLLM_API_KEY` in the
+container environment instead of the command line:
+
+```console
+export VLLM_API_KEY="$(openssl rand -hex 32)"
+docker run --rm --name vllm \
+  --gpus all \
+  --ipc=host \
+  -p 8000:8000 \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -e VLLM_API_KEY \
+  docker.io/vllm/vllm-openai:latest \
+  --model Qwen/Qwen3-8B \
+  --served-model-name qwen3-8b \
+  --max-model-len 16384 \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes \
+  --reasoning-parser deepseek_r1
+```
+
+With Podman, replace `--gpus all` with `--device nvidia.com/gpu=all` and leave
+the rest unchanged. Pin a released tag rather than `latest` for reproducible
+behavior; the on-demand GPU endpoint workflow uses `v0.29.0-cu129`. The first
+run downloads a multi-gigabyte image plus the model weights, and the Hugging
+Face cache mount keeps the weights for later runs.
+
+Use `VLLM_URL=http://127.0.0.1:8000` for either local server.
 
 ## 2. Point a Praxis example at vLLM
 
