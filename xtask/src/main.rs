@@ -53,6 +53,8 @@ mod sync_example_readme;
 mod sync_inference_readme;
 #[cfg(feature = "dev")]
 mod sync_responses_readme;
+#[cfg(feature = "dev")]
+mod visualize_config;
 
 use clap::{Parser, Subcommand};
 
@@ -135,6 +137,11 @@ enum Command {
     /// against the config it documents.
     #[cfg(feature = "dev")]
     SyncFlowVisualizers(flow_visualizer::Args),
+
+    /// Render an arbitrary Praxis config as a self-contained, offline HTML
+    /// document (structure from the parser, semantics only for known filters).
+    #[cfg(feature = "dev")]
+    VisualizeConfig(visualize_config::Args),
 
     /// Generate per-filter documentation under `docs/filters/`.
     #[cfg(feature = "dev")]
@@ -219,6 +226,7 @@ fn run_dev(command: Command) {
         Command::RecordInference(args) => inference_fixtures::run_record(args),
         Command::SyncInferenceReadme(args) => sync_inference_readme::run(&args),
         Command::SyncFlowVisualizers(args) => flow_visualizer::run(&args),
+        Command::VisualizeConfig(args) => visualize_config::run(&args),
         Command::SyncResponsesReadme(args) => sync_responses_readme::run(&args),
         Command::Fips(args) => fips::run(args),
     }

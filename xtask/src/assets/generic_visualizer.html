@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+  Praxis config flow visualizer  —  GENERIC TEMPLATE (machine-generated output)
+  ----------------------------------------------------------------------------
+  This is the shell that `cargo xtask visualize-config <path> --output <out>`
+  fills to render ANY Praxis configuration as a self-contained, offline HTML
+  document. The generator embeds one JSON "document model" (the placeholder in
+  the script below) that is extracted from the config through the pinned
+  praxis_core parser — the same parser the proxy itself uses — so the topology
+  shown (listeners, clusters, and the ordered, IRR-flattened filter chains) is
+  mechanically inferred, never hand-authored.
+
+  Two things are deliberately separated and labelled:
+    * STRUCTURE is always from the parser.
+    * SEMANTICS (the one-line "what it does" description on each filter) is only
+      shown for filters THIS repository defines. Filters with no known
+      definition are labelled "semantics unavailable" and their raw (redacted)
+      configuration is shown as-is. The generator never fabricates behavior.
+
+  Sensitive-looking config values are redacted to «redacted» before embedding.
+
+  Offline by construction: inline CSS + vanilla JS only, zero network use. The
+  file picker / drag-and-drop below re-renders a different config by loading
+  another document-model JSON produced by the SAME CLI (see the --json flag) —
+  it never parses YAML in the browser, so there is no second, drift-prone
+  parser. Extracting structure from YAML remains the CLI's job; see
+  docs/developing/flow-visualizers.md.
+
+  This raw template is not meant to be opened directly (the model placeholder in
+  the script is not valid JS until substituted); open a generated output instead.
+  ============================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Praxis config · flow</title>
+<style>
+  :root{
+    --bg:#070a0d; --bg2:#0b1116; --bg3:#111a22;
+    --fg:#e6edf3; --fg-dim:#9fb0bf; --fg-faint:#6b7d8c;
+    --line:#22303b; --line2:#2f4150;
+    --accent:#7cc5f2; --accent2:#79e0cf;
+    --warn:#f2a838; --danger:#f4713b; --ok:#12b184;
+    --code-bg:#0a1218;
+    --radius:10px;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--fg); font-family:var(--sans);
+    line-height:1.5; font-size:15px; padding:0 0 4rem;
+  }
+  a{color:var(--accent)}
+  header.top{
+    position:sticky; top:0; z-index:5; background:linear-gradient(180deg,#0a1016,#070a0dcc);
+    border-bottom:1px solid var(--line); backdrop-filter:blur(6px);
+    padding:.9rem 1.4rem; display:flex; flex-wrap:wrap; gap:.6rem 1.2rem; align-items:baseline;
+  }
+  header.top h1{font-size:1.05rem; margin:0; font-weight:650; letter-spacing:.2px}
+  header.top .src{font-family:var(--mono); font-size:.82rem; color:var(--fg-dim); word-break:break-all}
+  header.top .spacer{flex:1 1 auto}
+  .loader{display:flex; align-items:center; gap:.5rem; font-size:.8rem; color:var(--fg-dim)}
+  .loader label{cursor:pointer; border:1px dashed var(--line2); border-radius:8px; padding:.28rem .6rem; color:var(--fg-dim)}
+  .loader label:hover{border-color:var(--accent); color:var(--fg)}
+  .loader input{display:none}
+  main{max-width:1080px; margin:0 auto; padding:1.4rem}
+  .drop-hint{
+    display:none; position:fixed; inset:0; z-index:20; align-items:center; justify-content:center;
+    background:#070a0dd0; font-size:1.3rem; color:var(--accent); border:3px dashed var(--accent);
+  }
+  body.dragging .drop-hint{display:flex}
+  .note{font-size:.85rem; color:var(--fg-dim); margin:.2rem 0 1.4rem}
+  .err{color:var(--danger); font-family:var(--mono); font-size:.85rem; white-space:pre-wrap}
+  section.block{margin:0 0 1.8rem}
+  h2.sec{
+    font-size:.78rem; text-transform:uppercase; letter-spacing:.14em; color:var(--fg-faint);
+    margin:0 0 .7rem; border-bottom:1px solid var(--line); padding-bottom:.35rem; font-weight:650;
+  }
+  .grid{display:grid; gap:.7rem}
+  .card{background:var(--bg2); border:1px solid var(--line); border-radius:var(--radius); padding:.8rem .95rem}
+  .card.filter{border-left:3px solid var(--line2)}
+  .card.filter.known{border-left-color:var(--accent2)}
+  .card.filter.unknown{border-left-color:var(--warn)}
+  .card.filter.nested{margin-left:1.6rem; background:var(--bg3)}
+  .fhead{display:flex; flex-wrap:wrap; gap:.5rem .7rem; align-items:baseline}
+  .ord{font-family:var(--mono); font-size:.78rem; color:var(--fg-faint); min-width:2.2em}
+  .ftype{font-family:var(--mono); font-weight:600; font-size:.95rem; color:var(--fg)}
+  .fname{font-size:.82rem; color:var(--fg-dim)}
+  .badge{font-size:.68rem; text-transform:uppercase; letter-spacing:.08em; padding:.1rem .45rem; border-radius:999px; border:1px solid var(--line2); color:var(--fg-dim)}
+  .badge.known{color:var(--ok); border-color:#12b18455}
+  .badge.unknown{color:var(--warn); border-color:#f2a83855}
+  .badge.step{color:var(--accent); border-color:#7cc5f255}
+  .desc{margin:.55rem 0 0; color:var(--fg); font-size:.9rem}
+  .desc.unavailable{color:var(--fg-faint); font-style:italic}
+  .kv{display:grid; grid-template-columns:max-content 1fr; gap:.15rem .8rem; margin:.5rem 0 0; font-size:.85rem}
+  .kv dt{color:var(--fg-faint); font-family:var(--mono); font-size:.8rem}
+  .kv dd{margin:0; color:var(--fg-dim); font-family:var(--mono); font-size:.8rem; word-break:break-word}
+  details.cfg{margin:.55rem 0 0}
+  details.cfg summary{cursor:pointer; color:var(--fg-dim); font-size:.8rem; user-select:none}
+  details.cfg summary:hover{color:var(--fg)}
+  pre.json{
+    background:var(--code-bg); border:1px solid var(--line); border-radius:8px;
+    padding:.65rem .8rem; overflow:auto; font-family:var(--mono); font-size:.78rem;
+    color:var(--fg-dim); margin:.5rem 0 0; max-height:26rem;
+  }
+  pre.json .redacted{color:var(--danger)}
+  .empty{color:var(--fg-faint); font-style:italic; font-size:.85rem}
+  .legend{display:flex; flex-wrap:wrap; gap:.5rem 1rem; font-size:.78rem; color:var(--fg-dim); margin:.2rem 0 1.4rem}
+  .legend .swatch{display:inline-block; width:.8rem; height:.8rem; border-radius:3px; vertical-align:middle; margin-right:.35rem}
+  footer{max-width:1080px; margin:2rem auto 0; padding:1rem 1.4rem 0; border-top:1px solid var(--line); color:var(--fg-faint); font-size:.78rem}
+</style>
+</head>
+<body>
+<div class="drop-hint">Drop a Praxis config document-model (.json)…</div>
+<header class="top">
+  <h1>Praxis config flow</h1>
+  <span class="src" id="src"></span>
+  <span class="spacer"></span>
+  <span class="loader">
+    <label>Load model .json<input type="file" id="file" accept="application/json,.json"></label>
+  </span>
+</header>
+<main id="app"></main>
+<footer>
+  Structure parsed by <code>praxis_core</code>; semantics shown only for filters this repository defines.
+  Generated by <code>cargo xtask visualize-config</code>. Offline &amp; self-contained.
+</footer>
+<script>
+'use strict';
+
+// The embedded document model. The generator replaces the placeholder on the
+// next line with the extracted model JSON; the raw template is not meant to be
+// opened directly (open the generated output instead).
+const MODEL = @@MODEL@@;
+
+// -- tiny DOM helpers (all text via textContent → no HTML injection) ----------
+function el(tag, cls, text){
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+}
+function section(title){
+  const s = el('section', 'block');
+  s.appendChild(el('h2', 'sec', title));
+  return s;
+}
+function kvRow(dl, key, value){
+  dl.appendChild(el('dt', null, key));
+  dl.appendChild(el('dd', null, value));
+}
+
+// Pretty-print JSON into a <pre>, marking the redaction sentinel in red.
+const REDACTED = '«redacted»';
+function jsonBlock(value){
+  const pre = el('pre', 'json');
+  const text = JSON.stringify(value, null, 2);
+  let i = 0;
+  while (i < text.length){
+    const at = text.indexOf(REDACTED, i);
+    if (at < 0){ pre.appendChild(document.createTextNode(text.slice(i))); break; }
+    if (at > i) pre.appendChild(document.createTextNode(text.slice(i, at)));
+    pre.appendChild(el('span', 'redacted', REDACTED));
+    i = at + REDACTED.length;
+  }
+  return pre;
+}
+function isEmpty(v){
+  if (v == null) return true;
+  if (Array.isArray(v)) return v.length === 0;
+  if (typeof v === 'object') return Object.keys(v).length === 0;
+  return false;
+}
+
+// -- renderers ----------------------------------------------------------------
+function renderListeners(model){
+  const s = section('Listeners');
+  if (!model.listeners || !model.listeners.length){ s.appendChild(el('p', 'empty', 'No listeners declared.')); return s; }
+  const grid = el('div', 'grid');
+  for (const l of model.listeners){
+    const c = el('div', 'card');
+    const h = el('div', 'fhead');
+    h.appendChild(el('span', 'ftype', l.name || '(unnamed)'));
+    h.appendChild(el('span', 'fname', (l.protocol || '?') + '  ' + (l.address || '')));
+    c.appendChild(h);
+    const dl = el('dl', 'kv');
+    kvRow(dl, 'filter_chains', (l.filter_chains || []).join(', ') || '(none)');
+    c.appendChild(dl);
+    grid.appendChild(c);
+  }
+  s.appendChild(grid);
+  return s;
+}
+
+function renderClusters(model){
+  const s = section('Clusters (top-level)');
+  if (!model.clusters || !model.clusters.length){
+    s.appendChild(el('p', 'empty', 'No top-level clusters. (Clusters may be declared inline inside load_balancer filters — see the pipeline.)'));
+    return s;
+  }
+  const grid = el('div', 'grid');
+  for (const cl of model.clusters){
+    const c = el('div', 'card');
+    c.appendChild(el('div', 'ftype', cl.name));
+    if (!isEmpty(cl.endpoints)) c.appendChild(jsonBlock(cl.endpoints));
+    grid.appendChild(c);
+  }
+  s.appendChild(grid);
+  return s;
+}
+
+function renderFilter(f){
+  const known = !!f.known;
+  const c = el('div', 'card filter ' + (known ? 'known' : 'unknown') + (f.depth ? ' nested' : ''));
+  const h = el('div', 'fhead');
+  h.appendChild(el('span', 'ord', '#' + f.order));
+  h.appendChild(el('span', 'ftype', f.filter_type || '(unknown)'));
+  if (f.name) h.appendChild(el('span', 'fname', '→ ' + f.name));
+  if (f.irr_step) h.appendChild(el('span', 'badge step', 'IRR step: ' + f.irr_step));
+  h.appendChild(el('span', 'badge ' + (known ? 'known' : 'unknown'), known ? 'known' : 'semantics unavailable'));
+  c.appendChild(h);
+
+  if (known && f.description){
+    c.appendChild(el('p', 'desc', f.description));
+  } else if (!known){
+    c.appendChild(el('p', 'desc unavailable', 'No definition found in this repository — structure shown, behavior not described.'));
+  }
+
+  if (!isEmpty(f.conditions) || !isEmpty(f.branch_chains)){
+    const dl = el('dl', 'kv');
+    if (!isEmpty(f.conditions)) kvRow(dl, 'conditions', JSON.stringify(f.conditions));
+    if (!isEmpty(f.branch_chains)) kvRow(dl, 'branch_chains', f.branch_chains.length + ' branch chain(s)');
+    c.appendChild(dl);
+  }
+
+  if (!isEmpty(f.config)){
+    const d = el('details', 'cfg');
+    d.appendChild(el('summary', null, 'configuration (redacted)'));
+    d.appendChild(jsonBlock(f.config));
+    c.appendChild(d);
+  }
+  return c;
+}
+
+function renderChain(chain){
+  const s = section('Filter chain · ' + chain.name);
+  if (!chain.filters || !chain.filters.length){ s.appendChild(el('p', 'empty', 'Empty chain.')); return s; }
+  const grid = el('div', 'grid');
+  for (const f of chain.filters) grid.appendChild(renderFilter(f));
+  s.appendChild(grid);
+  return s;
+}
+
+function renderGlobals(model){
+  const parts = [];
+  for (const key of ['insecure_options', 'runtime']){
+    if (isEmpty(model[key])) continue;
+    const s = section(key);
+    s.appendChild(jsonBlock(model[key]));
+    parts.push(s);
+  }
+  return parts;
+}
+
+function renderLegend(){
+  const l = el('div', 'legend');
+  const add = (color, label) => {
+    const span = el('span');
+    const sw = el('span', 'swatch');
+    sw.style.background = color;
+    span.appendChild(sw);
+    span.appendChild(document.createTextNode(label));
+    l.appendChild(span);
+  };
+  add('var(--accent2)', 'known filter (semantics shown)');
+  add('var(--warn)', 'unknown filter (semantics unavailable)');
+  add('var(--danger)', 'redacted value');
+  return l;
+}
+
+function render(model){
+  document.getElementById('src').textContent = model.source || '(embedded model)';
+  document.title = 'Praxis config · ' + (model.source || 'flow');
+  const app = document.getElementById('app');
+  app.textContent = '';
+  const chains = model.chains || [];
+  const filterCount = chains.reduce((n, c) => n + ((c.filters || []).length), 0);
+  const summary = el('p', 'note', chains.length + ' filter chain(s), ' + filterCount + ' filter node(s) after IRR flattening.');
+  app.appendChild(summary);
+  app.appendChild(renderLegend());
+  app.appendChild(renderListeners(model));
+  app.appendChild(renderClusters(model));
+  for (const chain of chains) app.appendChild(renderChain(chain));
+  for (const g of renderGlobals(model)) app.appendChild(g);
+}
+
+// -- load another model (drag/drop or picker); JSON only, never YAML ----------
+function looksLikeModel(v){ return v && typeof v === 'object' && Array.isArray(v.chains); }
+function loadText(text){
+  let parsed;
+  try { parsed = JSON.parse(text); }
+  catch (e){ showError('Not valid JSON: ' + e.message); return; }
+  if (!looksLikeModel(parsed)){ showError('This JSON is not a Praxis config document-model (missing a "chains" array). Produce one with `cargo xtask visualize-config --json`.'); return; }
+  render(parsed);
+}
+function showError(msg){
+  const app = document.getElementById('app');
+  app.textContent = '';
+  const s = section('Could not load model');
+  s.appendChild(el('pre', 'err', msg));
+  app.appendChild(s);
+}
+function readFile(file){
+  if (!file) return;
+  const r = new FileReader();
+  r.onload = () => loadText(String(r.result));
+  r.readAsText(file);
+}
+function wireLoaders(){
+  const input = document.getElementById('file');
+  if (input) input.addEventListener('change', (ev) => readFile(ev.target.files && ev.target.files[0]));
+  const stop = (ev) => { ev.preventDefault(); ev.stopPropagation(); };
+  window.addEventListener('dragenter', (ev) => { stop(ev); document.body.classList.add('dragging'); });
+  window.addEventListener('dragover', stop);
+  window.addEventListener('dragleave', (ev) => { stop(ev); if (ev.relatedTarget === null) document.body.classList.remove('dragging'); });
+  window.addEventListener('drop', (ev) => {
+    stop(ev); document.body.classList.remove('dragging');
+    readFile(ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0]);
+  });
+}
+
+wireLoaders();
+render(MODEL);
+</script>
+</body>
+</html>
