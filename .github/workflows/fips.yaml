@@ -9,6 +9,8 @@ name: FIPS
 # own scanner, openshift/check-payload at its Rust-support revision, against
 # the runtime image with warnings fatal. Runs on every pull request and push
 # to main so a change that breaks FIPS compliance never reaches a release.
+# Also runs on merge_group: ubi-image is a required merge-queue check, so it
+# must report on the queue ref or the queue times out waiting for it.
 #
 # Everything runs through the Makefile targets developers use locally (see
 # docs/developing/fips.md), with podman: Red Hat's image signatures can only
@@ -21,6 +23,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+  merge_group:
     branches: [main]
   workflow_dispatch:
 
