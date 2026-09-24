@@ -50,9 +50,9 @@ Praxis AI targets FIPS 140-3 on Red Hat Enterprise Linux by performing all
 cryptography in the RHEL OpenSSL FIPS provider. The published build
 (`make release`, `make container`) enables every non-experimental filter.
 The FIPS build turns off what is known not to be compliant yet (the policy
-engine, AWS SigV4 signing, the response stores and the reqwest-based
-filters; the Makefile's FIPS section says why for each), so nobody has to
-know which features to pick. The feature set is defined once, as
+engine, the response stores and the reqwest-based filters; the Makefile's
+FIPS section says why for each), so nobody has to know which features to
+pick. The feature set is defined once, as
 `FIPS_FEATURES` in the `Makefile`:
 
 ```console

@@ -19,6 +19,7 @@ build to run; the same invocation runs inside the report stage of
 | `cargo xtask fips verify-image REFERENCE` | `fips-verify-image` (run by `container-fips` and `fips-check` first) | Refuses any base image that is not digest-pinned, from `registry.access.redhat.com`, and signed by Red Hat's release key. |
 | `cargo xtask fips signature-store [--install]` | `fips-signature-store` | Whether podman's `registries.d` names Red Hat's signature store, without which every Red Hat image looks unsigned; `--install` adds the bundled entry for the current user on hosts whose podman packaging ships none (Debian, Ubuntu, GitHub's runners). CI runs it before `fips-verify-image`. |
 | `check-payload scan image ...` | `fips-scanner`, `fips-oc`, `fips-scan` | Red Hat's own scanner at a pinned revision, run against the FIPS image with warnings fatal: the actual gate. |
+| `cargo test ... --config 'target."cfg(all())".runner=["env","OPENSSL_CONF=xtask/assets/fips/fips-provider.cnf"]'` | `test-fips-provider` | The FIPS feature set's unit tests with the RHEL FIPS provider active (`fips=yes` default properties) in every test process, so the digests and MACs the code computes, `aws_sigv4_sign`'s HMAC-SHA256 included, have to come from the provider. The runner sets the variable on the test binaries only: cargo itself (its libgit2) cannot run under it, which is also why only lib and bin unit tests run. Needs the host's `fips.so`. |
 
 ## What the report checks
 

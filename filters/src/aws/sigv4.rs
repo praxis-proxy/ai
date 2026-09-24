@@ -45,17 +45,24 @@
 //! this filter already uses internally, with no change to the signing
 //! or request-handling code.
 //!
-//! # FIPS considerations
+//! # Cryptography and FIPS
 //!
-//! Signing uses the [`aws-sigv4`](https://docs.rs/aws-sigv4) crate,
-//! which computes HMAC-SHA256 via the pure-Rust `hmac`/`sha2`
-//! (`RustCrypto`) crates, not `aws-lc-rs`. This repository's TLS layer
-//! uses `aws-lc-rs` (which has a FIPS-140-3-validated build mode), but
-//! that does not extend to this filter's signing computation, which
-//! goes through a different, non-FIPS-validated code path. There is
-//! currently no `aws-lc-rs`-backed alternative to `aws-sigv4` upstream.
-//! If FIPS-validated request signing becomes a hard requirement, this
-//! filter will need revisiting; it is not addressed here.
+//! The signature (SHA-256 of the body and of the canonical request,
+//! HMAC-SHA256 key derivation and signing) is computed by the system
+//! OpenSSL through [`praxis_ai_apis::hash`], like every other digest
+//! praxis-ai computes. In the FIPS build on a FIPS-mode RHEL host that
+//! library is the validated module (see `docs/fips.md`), so request
+//! signing runs inside the same boundary as TLS; on any other host it
+//! is OpenSSL's default provider. This filter never selects or enables
+//! a provider itself.
+//!
+//! The protocol part of `SigV4` (canonical request, string to sign,
+//! credential scope) lives in [`super::signing`] rather than in the
+//! [`aws-sigv4`](https://docs.rs/aws-sigv4) crate, because that crate
+//! computes its HMAC with the pure-Rust `hmac`/`sha2` crates and offers
+//! no way to substitute them, and the FIPS build refuses a binary that
+//! links either. `aws-sigv4` remains a development dependency: the
+//! signer's tests compare every header it produces against it.
 //!
 //! # YAML config
 //!
@@ -76,6 +83,8 @@ use aws_credential_types::Credentials;
 use http::{HeaderName, HeaderValue};
 use praxis_filter::FilterError;
 use serde::Deserialize;
+
+use super::signing;
 
 /// Default cap on buffered request-body bytes used for payload hashing.
 const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -99,18 +108,17 @@ const MAX_ALLOWED_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// test below) and independently of async credential resolution.
 ///
 /// `uri` must already be fully encoded (`SigV4` does not re-encode it).
+/// The `x-amz-content-sha256` header is always produced: Bedrock (and
+/// most non-S3 AWS services) require it on the wire.
 ///
 /// # Errors
 ///
-/// Returns [`FilterError`] if the signing library rejects the inputs
-/// (e.g. an invalid header name/value, or a malformed URI).
+/// Returns [`FilterError`] if the signer rejects the inputs (an invalid
+/// header name/value, a malformed URI) or OpenSSL refuses the HMAC. The
+/// error names the offending input, never key material.
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is a distinct, independently-testable piece of the signature"
-)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "31 lines; one over limit due to the settings/params/sign/collect sequence"
 )]
 pub(crate) fn sign_headers<'a>(
     credentials: &Credentials,
@@ -122,46 +130,11 @@ pub(crate) fn sign_headers<'a>(
     headers: impl Iterator<Item = (&'a str, &'a str)>,
     body: &'a [u8],
 ) -> Result<Vec<(HeaderName, HeaderValue)>, FilterError> {
-    use aws_sigv4::{
-        http_request::{PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign},
-        sign::v4,
-    };
-
-    let identity = credentials.clone().into();
-
-    let mut signing_settings = SigningSettings::default();
-    // Bedrock (and most non-S3 AWS services) require the literal
-    // x-amz-content-sha256 header on the wire; aws-sigv4 defaults to
-    // omitting it, so this must be set explicitly.
-    signing_settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-
-    let signing_params = v4::SigningParams::builder()
-        .identity(&identity)
-        .region(region)
-        .name(service)
-        .time(time)
-        .settings(signing_settings)
-        .build()
-        .map_err(|e| FilterError::from(format!("aws_sigv4_sign: invalid signing params: {e}")))?
-        .into();
-
-    let signable_request = SignableRequest::new(method, uri, headers, SignableBody::Bytes(body))
+    let request = signing::SignableRequest::new(method, uri, headers, body)
         .map_err(|e| FilterError::from(format!("aws_sigv4_sign: invalid signable request: {e}")))?;
-
-    let (instructions, _signature) = sign(signable_request, &signing_params)
-        .map_err(|e| FilterError::from(format!("aws_sigv4_sign: signing failed: {e}")))?
-        .into_parts();
-
-    instructions
-        .headers()
-        .map(|(name, value)| {
-            let header_name = HeaderName::try_from(name)
-                .map_err(|e| FilterError::from(format!("aws_sigv4_sign: invalid header name '{name}': {e}")))?;
-            let header_value = HeaderValue::try_from(value)
-                .map_err(|e| FilterError::from(format!("aws_sigv4_sign: invalid header value for '{name}': {e}")))?;
-            Ok((header_name, header_value))
-        })
-        .collect()
+    let scope = signing::SigningScope { region, service, time };
+    signing::sign(&request, credentials, &scope)
+        .map_err(|e| FilterError::from(format!("aws_sigv4_sign: signing failed: {e}")))
 }
 
 // -----------------------------------------------------------------------------
