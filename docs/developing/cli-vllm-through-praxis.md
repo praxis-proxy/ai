@@ -166,13 +166,25 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL="$VLLM_MODEL"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$VLLM_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$VLLM_MODEL"
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+# Required if you select Claude Code's auto permission mode with this backend.
+export CLAUDE_CODE_AUTO_MODE_SERVER=0
 
 claude --model "$VLLM_MODEL"
+# To exercise client-classified auto mode explicitly:
+# claude --permission-mode auto --model "$VLLM_MODEL"
 ```
 
 `GATEWAY_AUTH_PASSWORD` and `VLLM_API_KEY` must be present in the environment of
-the Praxis process. The other variables configure Claude Code. When finished,
-stop local Praxis and cancel the on-demand endpoint workflow:
+the Praxis process. The other variables configure Claude Code.
+
+Praxis and vLLM do not implement Anthropic's server-side auto-mode classifier
+protocol. `CLAUDE_CODE_AUTO_MODE_SERVER=0` makes Claude Code initiate the
+classifier model requests through Praxis instead. This setting only affects
+Claude Code's `auto` permission mode; the classifier still consumes model
+inference and is not an on-device check. Do not set it to `1` for this setup.
+See [Anthropic's auto-mode classifier documentation](https://code.claude.com/docs/en/auto-mode-classifier-billing).
+
+When finished, stop local Praxis and cancel the on-demand endpoint workflow:
 
 ```console
 kill "$PRAXIS_PID"
