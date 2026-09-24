@@ -49,8 +49,9 @@ http-callout-filter = ["experimental", "dep:serde_json_path"]
 azure-ad-filter = ["experimental"]
 # Experimental: the gcp_adc (Application Default Credentials) upstream
 # authentication filter. Work in progress; the config surface may change.
-# Activates the `experimental` marker.
-gcp-adc-filter = ["experimental"]
+# Activates the `experimental` marker. `jsonwebtoken` signs the service-
+# account `JWT` assertion for `source: key_file`.
+gcp-adc-filter = ["experimental", "dep:jsonwebtoken"]
 # Experimental: the anthropic_messages_to_vertexai_anthropic (Anthropic Messages
 # to Vertex AI rawPredict) translation filter. Work in progress; the config
 # surface may change. Activates the `experimental` marker.
@@ -98,6 +99,7 @@ praxis-filter = { workspace = true, features = ["chain-binding"] }
 praxis-tls = { workspace = true }
 redis = { workspace = true, optional = true }
 rand = { workspace = true }
+jsonwebtoken = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
