@@ -52,6 +52,7 @@ before sending requests.
 | [token-rate-limit-mixed-algorithms.yaml](configs/token-rate-limit-mixed-algorithms.yaml) | Extends token-rate-limit.yaml with per-rule algorithm choice (ai#789 / praxis#551): each rule in `rules:` independently picks sliding_window or token_bucket, matched by a static header value. team-alpha gets an exact trailing-window budget; team-beta gets a continuously-refilling bucket |
 | [token-rate-limit.yaml](configs/token-rate-limit.yaml) | Reserves an estimated token cost at admission time and reconciles that reservation against actual provider-reported usage once the response completes |
 | [token-usage-headers.yaml](configs/token-usage-headers.yaml) | Inject Praxis-Token-Input, Praxis-Token-Output, and Praxis-Token-Total headers into downstream responses when token counts are available in filter metadata |
+| [vertex-anthropic.yaml](configs/vertex-anthropic.yaml) | Production note: replace the static credential_injection below with the experimental `gcp_adc` filter (source: key_file) so the gateway mints short-lived OAuth tokens from a service-account key instead of a static value, and point the cluster at aiplatform.googleapis.com:443 with tls.sni likewise |
 
 ### Anthropic
 

@@ -11,10 +11,10 @@ mod protocol;
 mod validate;
 mod web_search;
 mod wire;
-
 pub use messages_format::AnthropicMessagesFormatFilter;
 pub use messages_to_chat_completions::AnthropicMessagesToChatCompletionsFilter;
 pub use messages_to_chat_completions_stream::AnthropicMessagesToChatCompletionsStreamFilter;
 pub use protocol::AnthropicMessagesProtocolFilter;
 pub use validate::AnthropicValidateFilter;
 pub use web_search::AnthropicWebSearchFilter;
+pub(crate) use wire::{error_body, invalid_request_rejection};

@@ -61,6 +61,12 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_web_search`](openai_web_search.md) | Web search filter for model-driven `web_search_call` dispatch. |
 | [`responses_to_chat_completions`](responses_to_chat_completions.md) | Translates canonical Responses create requests for a Chat Completions backend. |
 
+### Vertex
+
+| Filter | Description |
+|--------|-------------|
+| [`vertex`](vertex.md) | Translates Anthropic Messages requests to Vertex AI `rawPredict` and Vertex responses back to the Anthropic dialect. |
+
 ## Cross-Provider Filters (praxis-ai-filters)
 
 ### Agentic

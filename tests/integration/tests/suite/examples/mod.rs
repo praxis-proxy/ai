@@ -96,6 +96,7 @@ mod token_counting;
 mod token_rate_limit;
 mod token_usage_headers;
 mod vector_stores_routing;
+mod vertex_anthropic;
 mod vllm_agentic_api;
 mod web_search;
 mod web_search_chat_completions;
