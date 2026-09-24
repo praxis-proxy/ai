@@ -1406,22 +1406,12 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         credentials_index < irr_index,
         "callout_credentials must capture and strip ingress secrets before IRR"
     );
-    let authorization_index = outer_filters
-        .iter()
-        .position(|filter| filter["filter"].as_str() == Some("callout_authorization"))
-        .expect("full-flow must establish the MCP assertion");
-    assert!(
-        authorization_index < irr_index,
-        "callout_authorization must capture and strip its assertion before IRR"
-    );
-    assert_eq!(
-        outer_filters[authorization_index]["assertion_slot"].as_str(),
-        Some("mcp_gateway")
-    );
-
     let credentials = outer_filters[credentials_index]["credentials"]
         .as_sequence()
         .expect("callout_credentials must declare slots");
+    let assertions = outer_filters[credentials_index]["assertions"]
+        .as_sequence()
+        .expect("callout_credentials must declare typed assertion slots");
     let credential = credentials
         .iter()
         .find(|credential| credential["slot"].as_str() == Some("brave_search"))
@@ -1442,6 +1432,17 @@ fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
         .expect("MCP gateway slot must be declared");
     assert_eq!(mcp_credential["slot"].as_str(), Some("mcp_gateway"));
     assert_eq!(mcp_credential["source_header"].as_str(), Some("x-user-mcp-key"));
+    let mcp_assertion = assertions
+        .iter()
+        .find(|assertion| assertion["slot"].as_str() == Some("mcp_gateway"))
+        .expect("MCP gateway assertion slot must be declared");
+    assert_eq!(mcp_assertion["source_header"].as_str(), Some("x-mcp-authorized"));
+    assert!(
+        outer_filters
+            .iter()
+            .all(|filter| filter["filter"].as_str() != Some("callout_authorization")),
+        "the centralized callout_credentials filter must own all secret establishment"
+    );
 
     let web_search = outer_filters[irr_index]["steps"][0]["filters"]
         .as_sequence()

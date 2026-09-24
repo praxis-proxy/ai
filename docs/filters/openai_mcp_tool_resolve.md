@@ -20,7 +20,7 @@ On successful discovery, one `mcp_list_tools` output item per resolved server (i
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `user_credential` | string | no | Optional per-user bearer slot from `callout_credentials`. Must match the corresponding `openai_mcp_dispatch` setting. |
-| `authorization_assertion` | string | no | Optional opaque assertion slot from `callout_authorization`. Must match the corresponding `openai_mcp_dispatch` setting. |
+| `authorization_assertion` | string | no | Optional opaque assertion slot from `callout_credentials.assertions`. Must match the corresponding `openai_mcp_dispatch` setting. |
 | `forward_headers` | string[] | no | Trusted request headers forwarded to connector-backed MCP `initialize` and `tools/list` requests. No request headers are forwarded by default. Credential headers such as `authorization` are rejected because MCP destinations are client-selected; use the MCP tool entry's dedicated `authorization` field instead. Direct, client-selected `server_url` targets never receive ambient request headers. |
 | `max_rewritten_body_bytes` | integer | no | Maximum size in bytes of the request body this filter *produces* after expanding `mcp` tool entries into `function` entries. Raw request body size is governed by the pipeline's `body_limits`, not this field. This bounds only the post-expansion body, which can grow larger than the raw input. |
 | `timeout_ms` | integer | no | Per-server timeout in milliseconds for `tools/list` calls. Inside an iterative request router, initialize and listing exchanges are capped by the router's remaining deadline. |

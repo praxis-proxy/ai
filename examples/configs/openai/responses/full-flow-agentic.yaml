@@ -26,7 +26,7 @@
 #      header provenance. The IRR carries the resulting typed request extension
 #      across iterations, while each callout explicitly selects its slot for its
 #      exact-authority provider destination.
-#      state_owner_headers then projects that context as x-tenant-id and
+#      project_state_owner_headers then projects that context as x-tenant-id and
 #      x-user-id for OGX and explicitly allowlisted callouts. The raw ingress
 #      names are stripped, and the projection is repeated inside the IRR step
 #      because it owns a separate destination request lifecycle.
@@ -335,20 +335,19 @@ filter_chains:
             source_header: x-user-ogx-key
           - slot: mcp_gateway
             source_header: x-user-mcp-key
-
-      - filter: callout_authorization
-        # Opaque connector authorization is deliberately separate from
-        # credentials. The trusted boundary MUST unconditionally delete any
-        # client-supplied x-mcp-authorized value and then set the verified,
-        # short-lived assertion for this request. Praxis forwards it unchanged
-        # only to configured connector_id destinations; the MCP Gateway makes
-        # the actual authorization decision.
-        assertion_slot: mcp_gateway
+        assertions:
+          # The same establishing filter keeps assertions in a separate typed
+          # slot map. The trusted boundary MUST delete any client-supplied
+          # x-mcp-authorized value and then set the verified, short-lived
+          # assertion. Praxis forwards it unchanged only to configured
+          # connector_id destinations; the MCP Gateway decides authorization.
+          - slot: mcp_gateway
+            source_header: x-mcp-authorized
 
       # Emit the normalized owner in the contract expected by OGX and by the
       # explicitly configured downstream callouts below. Raw x-auth-* inputs
       # are stripped and never used directly as destination assertions.
-      - filter: state_owner_headers
+      - filter: project_state_owner_headers
         tenant_header: x-tenant-id
         subject_header: x-user-id
 
@@ -395,7 +394,7 @@ filter_chains:
         outbound_chain:
           name: files-api-outbound
           filters:
-            - filter: state_owner_headers
+            - filter: project_state_owner_headers
               tenant_header: x-tenant-id
               subject_header: x-user-id
             - filter: headers
@@ -530,7 +529,7 @@ filter_chains:
               # the normalized StateOwner extension into each IRR step; this
               # strips any still-uncommitted raw ingress identity headers and
               # recreates only the OGX/callout contract.
-              - filter: state_owner_headers
+              - filter: project_state_owner_headers
                 tenant_header: x-tenant-id
                 subject_header: x-user-id
 
@@ -591,7 +590,7 @@ filter_chains:
                 outbound_chain:
                   name: vector-store-outbound
                   filters:
-                    - filter: state_owner_headers
+                    - filter: project_state_owner_headers
                       tenant_header: x-tenant-id
                       subject_header: x-user-id
                     - filter: headers

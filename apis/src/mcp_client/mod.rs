@@ -722,7 +722,7 @@ fn inject_connector_assertion(
     };
     let value = http::HeaderValue::from_str(assertion.expose_secret())
         .map_err(|_invalid| McpClientError::InvalidAuthorization)?;
-    header_map.insert(crate::callout_authorization::MCP_AUTHORIZED_HEADER, value);
+    header_map.insert(crate::callout_credentials::MCP_AUTHORIZED_HEADER, value);
     Ok(())
 }
 

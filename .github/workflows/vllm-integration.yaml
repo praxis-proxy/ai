@@ -47,8 +47,9 @@ on:
       run_claude_acceptance:
         description: >-
           Run pinned Claude Code through native Messages and translated Chat
-          paths on a GPU runner. When run_live_vllm is false it skips the
-          complete Responses SDK suite.
+          paths under acceptEdits and client-classified auto mode on a GPU
+          runner. When run_live_vllm is false it skips the complete Responses
+          SDK suite.
         required: false
         default: false
         type: boolean
@@ -480,16 +481,19 @@ jobs:
   # (issue #1025)
   #
   # A pinned real Claude Code executable completes a deterministic coding task
-  # against a pinned real vLLM backend over two Praxis paths, run sequentially
-  # against one shared vLLM container:
+  # against a pinned real vLLM backend over two Praxis paths and two permission
+  # modes, producing four scenarios run sequentially against one shared vLLM
+  # container:
   #   - NATIVE: Anthropic Messages traffic (/v1/messages,
   #     /v1/messages/count_tokens, /v1/models) is forwarded straight to vLLM's
   #     native Anthropic surface — with NO translation.
   #   - TRANSFORMED: Anthropic Messages traffic is translated into OpenAI Chat
   #     Completions (anthropic_messages_to_chat_completions) and forwarded to
   #     vLLM's /v1/chat/completions surface.
-  # The two runs are sequential (not parallel) so they never contend for the
-  # runner's CPU while a model is generating.
+  # Each path runs under the deterministic acceptEdits baseline and under auto
+  # mode with CLAUDE_CODE_AUTO_MODE_SERVER=0. The four runs are sequential (not
+  # parallel) so they never contend for the runner's CPU while a model is
+  # generating.
   #
   # Runs on the SAME ephemeral EC2 GPU runner as the full suite (machulav
   # v2.3.9 registers a non-ephemeral runner, so a second job runs on the same
@@ -770,7 +774,7 @@ jobs:
         id: claude_test_binary
         run: |
           set -uo pipefail
-          # Locate the already-built suite binary without recompiling; both
+          # Locate the already-built suite binary without recompiling; all four
           # acceptance runs below reuse it. Parse cargo's JSON with python3
           # (stdlib `json`, 3.9-safe) rather than jq, which the GPU AMI may lack.
           TEST_BIN=$(cargo test -p praxis-tests-integration --test suite --no-run \
@@ -826,13 +830,52 @@ jobs:
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-transformed.log"
           exit "${PIPESTATUS[0]}"
 
+      - name: Run Claude Code auto-mode native-vLLM acceptance test (once, no retry)
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_CLAUDE_CODE_NETNS: ${{ env.NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.200.0.1
+          PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          # No tools are preapproved in this scenario. Claude Code must issue
+          # its client-side classifier requests through Praxis before Edit and
+          # Bash can complete; the Rust harness pins AUTO_MODE_SERVER=0.
+          sudo --preserve-env=PRAXIS_TEST_CLAUDE_CODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_CLAUDE_CODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            claude_code_vllm::pinned_claude_code_auto_mode_drives_native_vllm_through_full_flow \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-auto-native.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Run Claude Code auto-mode transformed-vLLM acceptance test (once, no retry)
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_CLAUDE_CODE_NETNS: ${{ env.NS }}
+          PRAXIS_TEST_LISTEN_ADDRESS: 10.200.0.1
+          PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE: "1"
+          PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION: "1"
+        run: |
+          set -uo pipefail
+          # The same client-classified auto-mode flow, with Praxis translating
+          # every inference request to vLLM's Chat Completions surface.
+          sudo --preserve-env=PRAXIS_TEST_CLAUDE_CODE_BIN,PRAXIS_TEST_VLLM_BASE_URL,PRAXIS_TEST_VLLM_MODEL,VLLM_API_KEY,PRAXIS_TEST_CLAUDE_CODE_NETNS,PRAXIS_TEST_LISTEN_ADDRESS,PRAXIS_TEST_CLAUDE_CODE_REQUIRE_LIVE,PRAXIS_TEST_REQUIRE_EGRESS_ISOLATION \
+            "$TEST_BIN" \
+            claude_code_vllm::pinned_claude_code_auto_mode_drives_transformed_vllm_through_full_flow \
+            --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-auto-transformed.log"
+          exit "${PIPESTATUS[0]}"
+
       - name: Acceptance log tail on failure
         if: failure()
         run: |
           # Interleaved client and Praxis diagnostics for each run. The gateway
           # and native secrets are test constants, and Praxis does not emit auth
           # headers at the default log level, so these logs are safe to surface.
-          for log in acceptance-native acceptance-transformed; do
+          for log in acceptance-native acceptance-transformed acceptance-auto-native acceptance-auto-transformed; do
             echo "=== $log ==="
             tail -n 400 "$RUNNER_TEMP/$log.log" 2>/dev/null || echo "no $log log captured"
           done
@@ -848,13 +891,15 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: claude-code-native-vllm-diagnostics
+          name: claude-code-vllm-diagnostics
           # The gateway and native secrets are test constants and Praxis does not
           # emit auth headers at the default log level, so these logs are safe to
           # retain.
           path: |
             ${{ runner.temp }}/acceptance-native.log
             ${{ runner.temp }}/acceptance-transformed.log
+            ${{ runner.temp }}/acceptance-auto-native.log
+            ${{ runner.temp }}/acceptance-auto-transformed.log
             ${{ runner.temp }}/vllm.log
           if-no-files-found: ignore
           retention-days: 7

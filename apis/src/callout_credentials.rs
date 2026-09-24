@@ -1,10 +1,10 @@
-//! Per-user callout credentials captured at the trust boundary.
+//! Per-user callout secrets captured at the trust boundary.
 //!
 //! The `CalloutCredentialsFilter` establishing filter reads
-//! configured ingress headers, stores their values here as [`SecretString`] slots keyed by a
-//! config-static slot id, and strips the ingress headers so they never reach an upstream.
-//! Callout adapters read a slot through `stage_callout_identity`
-//! and stage a per-user credential into the nested subrequest instead of a shared provider key.
+//! configured ingress headers, stores their values here as typed [`SecretString`] slots keyed by a
+//! config-static slot id, and strips the ingress headers so they never reach an upstream. Callout
+//! adapters read credential slots through `stage_callout_identity`; MCP additionally reads an
+//! assertion slot and injects it only into configured connector requests.
 //!
 //! # YAML
 //!
@@ -13,6 +13,9 @@
 //!   credentials:
 //!     - slot: brave_search
 //!       source_header: x-user-brave-key
+//!   assertions:
+//!     - slot: mcp_gateway
+//!       source_header: x-mcp-authorized
 //! ```
 
 use std::{
@@ -31,10 +34,15 @@ use serde::Deserialize;
 
 use crate::state_owner::reject_owner;
 
-/// Maximum number of credential slots one filter instance may declare.
+/// Maximum number of secret slots one filter instance may declare.
 const MAX_SLOTS: usize = 32;
 /// Maximum byte length of a slot id.
 const MAX_SLOT_ID_BYTES: usize = 128;
+/// Maximum authorization assertion size accepted from the trusted boundary.
+const MAX_ASSERTION_BYTES: usize = 4_096;
+
+/// Fixed trusted-boundary MCP assertion header.
+pub(crate) const MCP_AUTHORIZED_HEADER: HeaderName = HeaderName::from_static("x-mcp-authorized");
 
 /// Routing/trust namespaces that must never be sourced from a client-supplied header.
 const RESERVED_SOURCE_PREFIXES: &[&str] = &["x-praxis-", "x-mcp-", "x-ext-", "x-a2a-"];
@@ -54,7 +62,11 @@ struct RawSlot {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     /// Per-user credential slots to capture from ingress headers.
+    #[serde(default)]
     credentials: Vec<RawSlot>,
+    /// Opaque authorization-assertion slots to capture from trusted ingress headers.
+    #[serde(default)]
+    assertions: Vec<RawSlot>,
 }
 
 /// A validated per-user credential slot: config-static id + the ingress header it is read from.
@@ -66,7 +78,7 @@ struct CredentialSlot {
     header: HeaderName,
 }
 
-/// Establishing filter that captures per-user callout credentials from ingress headers.
+/// Establishing filter that captures typed per-user callout secrets from ingress headers.
 ///
 /// SECURITY: every configured `source_header` is trusted-boundary-owned input. The
 /// authentication boundary that terminates ingress MUST unconditionally delete and
@@ -86,7 +98,9 @@ struct CredentialSlot {
 #[derive(Debug)]
 pub struct CalloutCredentialsFilter {
     /// Validated credential slots.
-    slots: Vec<CredentialSlot>,
+    credential_slots: Vec<CredentialSlot>,
+    /// Validated authorization-assertion slots.
+    assertion_slots: Vec<CredentialSlot>,
 }
 
 impl CalloutCredentialsFilter {
@@ -94,24 +108,31 @@ impl CalloutCredentialsFilter {
     ///
     /// # Errors
     /// Returns [`FilterError`] when the config has unknown fields, no slots, more than
-    /// `MAX_SLOTS` slots, a duplicate slot id or source header, an oversized slot id, or a
-    /// source header that is reserved, hop-by-hop, framing, or uses an internal-trust prefix.
+    /// `MAX_SLOTS` slots, a duplicate slot id or source header, an oversized slot id, or an
+    /// unsafe source header. Assertion sources are deliberately restricted to
+    /// `x-mcp-authorized`.
     pub fn from_config(value: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let raw: RawConfig = parse_filter_config("callout_credentials", value)?;
 
-        if raw.credentials.is_empty() {
-            return Err("callout_credentials: at least one credential is required".into());
+        let slot_count = raw.credentials.len().saturating_add(raw.assertions.len());
+        if slot_count == 0 {
+            return Err("callout_credentials: at least one credential or assertion is required".into());
         }
-        if raw.credentials.len() > MAX_SLOTS {
-            return Err(format!("callout_credentials: too many credentials (max {MAX_SLOTS})").into());
+        if slot_count > MAX_SLOTS {
+            return Err(format!("callout_credentials: too many secret slots (max {MAX_SLOTS})").into());
         }
 
-        let slots = validate_slots(&raw.credentials)?;
-        Ok(Box::new(Self { slots }))
+        let credential_slots = validate_slots(&raw.credentials, SlotKind::Credential)?;
+        let assertion_slots = validate_slots(&raw.assertions, SlotKind::Assertion)?;
+        reject_duplicate_source_headers(&credential_slots, &assertion_slots)?;
+        Ok(Box::new(Self {
+            credential_slots,
+            assertion_slots,
+        }))
     }
 
-    /// Build the request-scoped credential map from the effective header view.
-    fn collect_credentials(
+    /// Build the request-scoped secret maps from the effective header view.
+    fn collect_secrets(
         &self,
         ctx: &HttpFilterContext<'_>,
         body_phase: bool,
@@ -122,8 +143,19 @@ impl CalloutCredentialsFilter {
             Cow::Borrowed(&ctx.request.headers)
         };
         let mut credentials = CalloutCredentials::new();
-        for slot in &self.slots {
-            match read_singular_slot(&view, &slot.header) {
+        self.collect_credential_slots(&view, &mut credentials)?;
+        self.collect_assertion_slots(&view, &mut credentials)?;
+        Ok(credentials)
+    }
+
+    /// Capture destination credentials without exposing assertion slots to generic consumers.
+    fn collect_credential_slots(
+        &self,
+        view: &http::HeaderMap,
+        credentials: &mut CalloutCredentials,
+    ) -> Result<(), FilterAction> {
+        for slot in &self.credential_slots {
+            match read_singular_slot(view, &slot.header) {
                 SlotValue::Single(value) => {
                     credentials.insert(slot.id.clone(), SecretString::from(value));
                 },
@@ -140,13 +172,44 @@ impl CalloutCredentialsFilter {
                 },
             }
         }
-        Ok(credentials)
+        Ok(())
+    }
+
+    /// Capture connector assertions into their dedicated typed map.
+    fn collect_assertion_slots(
+        &self,
+        view: &http::HeaderMap,
+        credentials: &mut CalloutCredentials,
+    ) -> Result<(), FilterAction> {
+        for slot in &self.assertion_slots {
+            match read_singular_slot(view, &slot.header) {
+                SlotValue::Single(value) if value.len() <= MAX_ASSERTION_BYTES => {
+                    credentials.insert_assertion(slot.id.clone(), SecretString::from(value));
+                },
+                SlotValue::Single(_) => {
+                    return Err(reject_owner(
+                        400,
+                        "callout_authorization_too_large",
+                        "x-mcp-authorized exceeds the 4096-byte limit",
+                    ));
+                },
+                SlotValue::Missing => {},
+                SlotValue::Duplicate => {
+                    return Err(reject_owner(
+                        400,
+                        "duplicate_callout_authorization",
+                        "x-mcp-authorized must appear exactly once",
+                    ));
+                },
+            }
+        }
+        Ok(())
     }
 
     /// Strip every configured source header via the lifecycle-appropriate channel.
     fn queue_header_removal(&self, ctx: &mut HttpFilterContext<'_>, body_phase: bool) {
         let ordered = body_phase && !ctx.pre_read_mutations.is_empty();
-        for slot in &self.slots {
+        for slot in self.credential_slots.iter().chain(&self.assertion_slots) {
             ctx.request_headers_to_remove.push(slot.header.clone());
             if ordered {
                 ctx.pre_read_mutations
@@ -161,7 +224,7 @@ impl CalloutCredentialsFilter {
             self.queue_header_removal(ctx, body_phase);
             return FilterAction::Continue;
         }
-        let credentials = match self.collect_credentials(ctx, body_phase) {
+        let credentials = match self.collect_secrets(ctx, body_phase) {
             Ok(credentials) => credentials,
             Err(action) => return action,
         };
@@ -200,8 +263,17 @@ impl HttpFilter for CalloutCredentialsFilter {
     }
 }
 
+/// The security meaning of a configured secret slot.
+#[derive(Clone, Copy)]
+enum SlotKind {
+    /// A destination-bound callout credential.
+    Credential,
+    /// An opaque MCP Gateway authorization assertion.
+    Assertion,
+}
+
 /// Validate raw slots into `CredentialSlot`s, rejecting duplicates and unsafe headers.
-fn validate_slots(raw: &[RawSlot]) -> Result<Vec<CredentialSlot>, FilterError> {
+fn validate_slots(raw: &[RawSlot], kind: SlotKind) -> Result<Vec<CredentialSlot>, FilterError> {
     let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
     let mut seen_headers: BTreeSet<String> = BTreeSet::new();
     let mut slots = Vec::with_capacity(raw.len());
@@ -213,7 +285,10 @@ fn validate_slots(raw: &[RawSlot]) -> Result<Vec<CredentialSlot>, FilterError> {
         if !seen_ids.insert(slot.slot.as_str()) {
             return Err(format!("callout_credentials: duplicate slot `{}`", slot.slot).into());
         }
-        let header = parse_source_header(&slot.source_header)?;
+        let header = match kind {
+            SlotKind::Credential => parse_credential_source_header(&slot.source_header)?,
+            SlotKind::Assertion => parse_assertion_source_header(&slot.source_header)?,
+        };
         if !seen_headers.insert(header.as_str().to_owned()) {
             return Err(format!("callout_credentials: duplicate source header `{}`", header.as_str()).into());
         }
@@ -226,9 +301,45 @@ fn validate_slots(raw: &[RawSlot]) -> Result<Vec<CredentialSlot>, FilterError> {
     Ok(slots)
 }
 
+/// Reject one ingress source assigned to more than one secret kind.
+fn reject_duplicate_source_headers(
+    credential_slots: &[CredentialSlot],
+    assertion_slots: &[CredentialSlot],
+) -> Result<(), FilterError> {
+    let credential_headers: BTreeSet<&str> = credential_slots.iter().map(|slot| slot.header.as_str()).collect();
+    if let Some(duplicate) = assertion_slots
+        .iter()
+        .map(|slot| slot.header.as_str())
+        .find(|header| credential_headers.contains(header))
+    {
+        return Err(format!("callout_credentials: duplicate source header `{duplicate}`").into());
+    }
+    Ok(())
+}
+
 /// Validate a configured source header: parseable, not reserved/framing/hop-by-hop, not
-/// routing-prefixed. Mirrors `state_owner_headers::parse_projection_header`.
-fn parse_source_header(raw: &str) -> Result<HeaderName, FilterError> {
+/// routing-prefixed. Mirrors `project_state_owner_headers::parse_projection_header`.
+fn parse_credential_source_header(raw: &str) -> Result<HeaderName, FilterError> {
+    let name = parse_safe_header(raw)?;
+    let lower = name.as_str();
+    if RESERVED_SOURCE_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+        return Err(format!("callout_credentials: source header `{lower}` uses an internal-trust prefix").into());
+    }
+    Ok(name)
+}
+
+/// Validate an assertion source. Keeping the fixed wire name prevents an
+/// assertion slot from becoming an ambient arbitrary-header forwarding path.
+fn parse_assertion_source_header(raw: &str) -> Result<HeaderName, FilterError> {
+    let name = parse_safe_header(raw)?;
+    if name != MCP_AUTHORIZED_HEADER {
+        return Err("callout_credentials: assertion source_header must be `x-mcp-authorized`".into());
+    }
+    Ok(name)
+}
+
+/// Parse a non-routing, non-framing request header.
+fn parse_safe_header(raw: &str) -> Result<HeaderName, FilterError> {
     if raw.is_empty() {
         return Err("callout_credentials: source header must not be empty".into());
     }
@@ -243,9 +354,6 @@ fn parse_source_header(raw: &str) -> Result<HeaderName, FilterError> {
     }
     if praxis_core::reserved_headers::is_reserved(lower) {
         return Err(format!("callout_credentials: source header `{lower}` is reserved").into());
-    }
-    if RESERVED_SOURCE_PREFIXES.iter().any(|p| lower.starts_with(p)) {
-        return Err(format!("callout_credentials: source header `{lower}` uses an internal-trust prefix").into());
     }
     Ok(name)
 }
@@ -273,14 +381,17 @@ fn read_singular_slot(headers: &http::HeaderMap, header: &HeaderName) -> SlotVal
     }
 }
 
-/// Request-scoped map of per-user callout credentials, keyed by config-static slot id.
+/// Request-scoped maps of per-user callout credentials and authorization assertions.
 ///
 /// Inserted into `RequestExtensions` by the `callout_credentials` filter. Slot ids are safe to
-/// log (they come from static config); slot values are secret and never rendered.
+/// log (they come from static config); slot values are secret and never rendered. Keeping the two
+/// maps distinct prevents a generic credential consumer from reading an MCP assertion.
 #[derive(Default, Clone)]
 pub struct CalloutCredentials {
-    /// Secret values keyed by config-static slot id.
-    slots: BTreeMap<String, SecretString>,
+    /// Destination credential values keyed by config-static slot id.
+    credential_slots: BTreeMap<String, SecretString>,
+    /// MCP authorization assertions keyed by config-static slot id.
+    assertion_slots: BTreeMap<String, SecretString>,
 }
 
 impl CalloutCredentials {
@@ -291,29 +402,41 @@ impl CalloutCredentials {
 
     /// Store a secret under `slot`, replacing any prior value for that slot.
     pub fn insert(&mut self, slot: String, value: SecretString) {
-        self.slots.insert(slot, value);
+        self.credential_slots.insert(slot, value);
     }
 
     /// Look up the secret staged for `slot`, if any.
     pub fn get(&self, slot: &str) -> Option<&SecretString> {
-        self.slots.get(slot)
+        self.credential_slots.get(slot)
+    }
+
+    /// Store an authorization assertion under `slot`.
+    pub(crate) fn insert_assertion(&mut self, slot: String, value: SecretString) {
+        self.assertion_slots.insert(slot, value);
+    }
+
+    /// Look up the authorization assertion staged for `slot`, if any.
+    #[cfg(any(test, feature = "openai-mcp-tools"))]
+    pub(crate) fn get_assertion(&self, slot: &str) -> Option<&SecretString> {
+        self.assertion_slots.get(slot)
     }
 
     /// True when no slots are populated.
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.credential_slots.is_empty() && self.assertion_slots.is_empty()
     }
 
     /// Number of populated slots.
     pub fn len(&self) -> usize {
-        self.slots.len()
+        self.credential_slots.len().saturating_add(self.assertion_slots.len())
     }
 }
 
 impl std::fmt::Debug for CalloutCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CalloutCredentials")
-            .field("slots", &self.slots.keys().collect::<Vec<_>>())
+            .field("credential_slots", &self.credential_slots.keys().collect::<Vec<_>>())
+            .field("assertion_slots", &self.assertion_slots.keys().collect::<Vec<_>>())
             .field("values", &"[REDACTED]")
             .finish()
     }
@@ -336,6 +459,14 @@ mod config_tests {
     }
 
     #[test]
+    fn accepts_credential_and_assertion_with_the_same_logical_slot() {
+        let f = cfg(
+            "credentials:\n  - slot: mcp_gateway\n    source_header: x-user-mcp-key\nassertions:\n  - slot: mcp_gateway\n    source_header: x-mcp-authorized\n",
+        );
+        assert!(f.is_ok(), "typed slots may share a logical id: {:?}", f.err());
+    }
+
+    #[test]
     fn rejects_unknown_field() {
         let f = cfg("credentials:\n  - slot: a\n    source_header: x-user-a\nbogus: 1\n");
         assert!(f.is_err(), "an unknown top-level field must be rejected");
@@ -344,8 +475,8 @@ mod config_tests {
     #[test]
     fn rejects_empty_slots() {
         assert!(
-            cfg("credentials: []\n").is_err(),
-            "at least one credential slot is required"
+            cfg("credentials: []\nassertions: []\n").is_err(),
+            "at least one credential or assertion slot is required"
         );
     }
 
@@ -402,6 +533,18 @@ mod config_tests {
     }
 
     #[test]
+    fn assertion_source_is_fixed_to_mcp_authorized() {
+        assert!(
+            cfg("assertions:\n  - slot: mcp_gateway\n    source_header: x-mcp-authorized\n").is_ok(),
+            "the fixed trusted MCP assertion source must be accepted"
+        );
+        assert!(
+            cfg("assertions:\n  - slot: mcp_gateway\n    source_header: x-user-assertion\n").is_err(),
+            "assertions must not become arbitrary forwarded header slots"
+        );
+    }
+
+    #[test]
     fn rejects_oversized_slot_id() {
         let big = "x".repeat(MAX_SLOT_ID_BYTES + 1);
         let f = cfg(&format!("credentials:\n  - slot: {big}\n    source_header: x-user-a\n"));
@@ -430,13 +573,19 @@ mod tests {
     fn debug_redacts_secret_values_but_lists_slot_names() {
         let mut creds = CalloutCredentials::new();
         creds.insert("brave".to_owned(), SecretString::from("super-secret"));
+        creds.insert_assertion("mcp_gateway".to_owned(), SecretString::from("never-print-me"));
         let rendered = format!("{creds:?}");
         assert!(rendered.contains("brave"), "slot name should be visible: {rendered}");
+        assert!(
+            rendered.contains("mcp_gateway"),
+            "assertion slot should be visible: {rendered}"
+        );
         assert!(rendered.contains("REDACTED"), "must mark redaction: {rendered}");
         assert!(
             !rendered.contains("super-secret"),
             "secret value must never appear in Debug: {rendered}"
         );
+        assert!(!rendered.contains("never-print-me"));
     }
 
     #[test]
@@ -459,9 +608,24 @@ mod runtime_tests {
     /// Make a filter with one slot for testing.
     fn make_filter() -> CalloutCredentialsFilter {
         CalloutCredentialsFilter {
-            slots: vec![CredentialSlot {
+            credential_slots: vec![CredentialSlot {
                 id: "brave".to_owned(),
                 header: HeaderName::from_static("x-user-brave-key"),
+            }],
+            assertion_slots: Vec::new(),
+        }
+    }
+
+    /// Make one combined credential + MCP assertion filter.
+    fn make_mcp_filter() -> CalloutCredentialsFilter {
+        CalloutCredentialsFilter {
+            credential_slots: vec![CredentialSlot {
+                id: "mcp_gateway".to_owned(),
+                header: HeaderName::from_static("x-user-mcp-key"),
+            }],
+            assertion_slots: vec![CredentialSlot {
+                id: "mcp_gateway".to_owned(),
+                header: MCP_AUTHORIZED_HEADER,
             }],
         }
     }
@@ -511,6 +675,43 @@ mod runtime_tests {
             ctx.request_headers_to_remove.iter().any(|n| n == "x-user-brave-key"),
             "the source header is still stripped even when absent-valued"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_optional_assertion_is_unpopulated_and_stripped() {
+        let filter = make_mcp_filter();
+        let request = make_request(Method::POST, "/v1/responses");
+        let mut ctx = make_filter_context(&request);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.extensions
+                .get::<CalloutCredentials>()
+                .is_none_or(|secrets| secrets.get_assertion("mcp_gateway").is_none())
+        );
+        assert!(ctx.request_headers_to_remove.contains(&MCP_AUTHORIZED_HEADER));
+    }
+
+    #[tokio::test]
+    async fn empty_assertion_is_unpopulated_and_stripped() {
+        let filter = make_mcp_filter();
+        let mut request = make_request(Method::POST, "/v1/responses");
+        request
+            .headers
+            .insert(MCP_AUTHORIZED_HEADER, HeaderValue::from_static(""));
+        let mut ctx = make_filter_context(&request);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.extensions
+                .get::<CalloutCredentials>()
+                .is_none_or(|secrets| secrets.get_assertion("mcp_gateway").is_none())
+        );
+        assert!(ctx.request_headers_to_remove.contains(&MCP_AUTHORIZED_HEADER));
     }
 
     #[tokio::test]
@@ -584,5 +785,67 @@ mod runtime_tests {
 
         let creds = ctx.extensions.get::<CalloutCredentials>().unwrap();
         assert_eq!(creds.get("brave").unwrap().expose_secret(), "tok-xyz");
+    }
+
+    #[tokio::test]
+    async fn installs_typed_mcp_secrets_and_strips_both_sources() {
+        let filter = make_mcp_filter();
+        let mut request = make_request(Method::POST, "/v1/responses");
+        request
+            .headers
+            .insert("x-user-mcp-key", HeaderValue::from_static("user-token"));
+        request
+            .headers
+            .insert(MCP_AUTHORIZED_HEADER, HeaderValue::from_static("signed-assertion"));
+        let mut ctx = make_filter_context(&request);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        let secrets = ctx.extensions.get::<CalloutCredentials>().unwrap();
+        assert_eq!(secrets.get("mcp_gateway").unwrap().expose_secret(), "user-token");
+        assert_eq!(
+            secrets.get_assertion("mcp_gateway").unwrap().expose_secret(),
+            "signed-assertion"
+        );
+        assert!(
+            ctx.request_headers_to_remove
+                .contains(&HeaderName::from_static("x-user-mcp-key"))
+        );
+        assert!(ctx.request_headers_to_remove.contains(&MCP_AUTHORIZED_HEADER));
+    }
+
+    #[tokio::test]
+    async fn duplicate_assertion_is_rejected() {
+        let filter = make_mcp_filter();
+        let mut request = make_request(Method::POST, "/v1/responses");
+        request
+            .headers
+            .append(MCP_AUTHORIZED_HEADER, HeaderValue::from_static("one"));
+        request
+            .headers
+            .append(MCP_AUTHORIZED_HEADER, HeaderValue::from_static("two"));
+        let mut ctx = make_filter_context(&request);
+
+        assert!(matches!(
+            filter.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Reject(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_assertion_is_rejected() {
+        let filter = make_mcp_filter();
+        let mut request = make_request(Method::POST, "/v1/responses");
+        request.headers.insert(
+            MCP_AUTHORIZED_HEADER,
+            HeaderValue::from_bytes(&vec![b'a'; MAX_ASSERTION_BYTES + 1]).unwrap(),
+        );
+        let mut ctx = make_filter_context(&request);
+
+        assert!(matches!(
+            filter.on_request(&mut ctx).await.unwrap(),
+            FilterAction::Reject(_)
+        ));
     }
 }

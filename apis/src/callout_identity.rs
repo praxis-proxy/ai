@@ -14,8 +14,6 @@ use praxis_filter::{
 };
 use secrecy::{ExposeSecret as _, SecretString};
 
-#[cfg(feature = "openai-mcp-tools")]
-use crate::CalloutAuthorization;
 use crate::{CalloutCredentials, state_owner::StateOwner};
 
 /// Opaque proof that the protected identity staging contract ran for a callout.
@@ -261,8 +259,8 @@ pub(crate) fn stage_mcp_callout_identity(
     let authorization = match authorization_slot {
         Some(slot) => Some(
             ctx.extensions
-                .get::<CalloutAuthorization>()
-                .and_then(|assertion| assertion.get(slot))
+                .get::<CalloutCredentials>()
+                .and_then(|credentials| credentials.get_assertion(slot))
                 .filter(|secret| !secret.expose_secret().is_empty())
                 .cloned()
                 .ok_or(McpCalloutContextMissing::Authorization)?,
@@ -537,5 +535,25 @@ mod tests {
             stage_mcp_callout_identity(&ctx, None, Some("mcp_gateway")),
             Err(McpCalloutContextMissing::Authorization)
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "openai-mcp-tools")]
+    fn mcp_reads_credential_and_assertion_from_one_typed_context() {
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = make_filter_context(&req);
+        ctx.extensions
+            .insert(StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").expect("valid owner"));
+        let mut secrets = CalloutCredentials::new();
+        secrets.insert("mcp_gateway".to_owned(), SecretString::from("user-token"));
+        secrets.insert_assertion("mcp_gateway".to_owned(), SecretString::from("signed-assertion"));
+        ctx.extensions.insert(secrets);
+
+        let identity = stage_mcp_callout_identity(&ctx, Some("mcp_gateway"), Some("mcp_gateway"))
+            .expect("combined context must stage")
+            .expect("configured MCP context must be present");
+
+        assert_eq!(identity.user_credential().unwrap().expose_secret(), "user-token");
+        assert_eq!(identity.authorization().unwrap().expose_secret(), "signed-assertion");
     }
 }

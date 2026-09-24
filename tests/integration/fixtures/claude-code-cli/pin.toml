@@ -6,9 +6,10 @@
 # reproducibility-critical: the test proves a pinned real Claude Code executable
 # completes a deterministic coding task against a pinned real vLLM backend on two
 # Praxis paths — one NATIVE (Anthropic Messages forwarded unchanged) and one
-# TRANSFORMED (Anthropic Messages translated into OpenAI Chat Completions). One
-# vLLM container serves both surfaces (`/v1/messages` natively AND
-# `/v1/chat/completions`), so both flows share this single pinned model.
+# TRANSFORMED (Anthropic Messages translated into OpenAI Chat Completions) —
+# under both the deterministic acceptEdits baseline and client-initiated auto
+# mode. One vLLM container serves both surfaces (`/v1/messages` natively AND
+# `/v1/chat/completions`), so all four scenarios share this single pinned model.
 #
 # The GPU acceptance job (`vllm-gpu-claude-acceptance`) reuses the ephemeral EC2
 # GPU runner and the Qwen3-8B weights the full suite already warmed on-disk. A
@@ -34,19 +35,24 @@ url = "https://downloads.claude.ai/claude-code-releases/2.1.278/linux-x64/claude
 # SHA-256 of the downloaded executable; CI verifies this before running.
 sha256 = "5c4735937844e84f8a93306e841a5b0e12252909b07870f789b190468da147ab"
 
-# Pinned launch flags (excluding `-p`, the prompt, `--model`, `--allowedTools`,
-# and `--mcp-config`, which the test supplies from the workspace). Keep in sync
-# with LAUNCH_FLAGS in claude_code_vllm.rs. Re-validate every flag against the
-# pinned executable during qualification.
+# Pinned launch setup (excluding `-p`, the prompt, `--model`, and
+# `--mcp-config`, which the test supplies from the workspace). Keep in sync with
+# PermissionScenario and LAUNCH_FLAGS in claude_code_vllm.rs. Re-validate every
+# value against the pinned executable when its version changes.
 [claude_code.launch]
-allowed_tools = [
+exposed_tools = [
   "Read",
   "Edit",
-  # The live model can spell the required verify invocation in multiple valid
-  # ways. Bash is the only shell tool exposed to the temporary, egress-isolated
-  # acceptance workspace, so approve it without command-shape coupling.
   "Bash",
 ]
+# The baseline preapproves all exposed tools. The auto-mode scenarios preapprove
+# none, so Edit and Bash must pass through Claude Code's classifier.
+baseline_permission_mode = "acceptEdits"
+baseline_allowed_tools = ["Read", "Edit", "Bash"]
+auto_permission_mode = "auto"
+# Praxis/vLLM does not implement Anthropic's server-side classifier protocol.
+# Force Claude Code to initiate classifier model requests through Praxis.
+auto_mode_server = "0"
 # Claude Code 2.1.278 otherwise asks for 32K output tokens. Pin its supported
 # environment overrides to the real vLLM window so the request is valid without
 # overcommitting the 24GB GPU. The acceptance task needs only short tool calls
@@ -57,7 +63,6 @@ max_output_tokens = 2048
 # the separate 2K output cap above.
 max_context_tokens = 32768
 flags = [
-  "--permission-mode", "acceptEdits",
   "--tools", "Read,Edit,Bash",
   "--strict-mcp-config",
   "--output-format", "stream-json",

@@ -112,21 +112,28 @@ gracefully because it treats native token counting as best-effort.
 [`tests/integration/tests/suite/claude_code_vllm.rs`](../tests/integration/tests/suite/claude_code_vllm.rs)
 proves the full flow end to end on both paths: a pinned real Claude Code
 executable completes a deterministic multi-step coding task through Praxis
-against a real vLLM backend, once with the native passthrough config and once
-with the translation config.
+against a real vLLM backend with the native passthrough and translation configs.
+Each path runs under two permission scenarios, producing four independent GPU
+acceptance cases:
+
+- `acceptEdits`, with the task's Read, Edit, and Bash tools preapproved, is the
+  deterministic harness baseline.
+- `auto`, with no tools preapproved and `CLAUDE_CODE_AUTO_MODE_SERVER=0`, forces
+  Claude Code to initiate the classifier model requests through Praxis before
+  it can Edit the file or run Bash.
 
 ```text
 native      Claude Code ─► Praxis (messages-native-vllm.yaml)    ─► vLLM /v1/messages
 transformed Claude Code ─► Praxis (messages-to-openai-vllm.yaml) ─► vLLM /v1/chat/completions
 ```
 
-Each test asserts only what a live run uniquely proves: the client completes the
-task through Praxis against a real backend — a non-timed-out, successful exit,
-the exact uppercase-derived output file, a harness-owned verification marker
-written only when the task's `verify.sh` confirms the compare, and a non-empty
-final summary in the client's stream-json output. Wire fidelity is proven
-deterministically against controlled fake backends, not observed in the live
-run:
+Each scenario asserts only what a live run uniquely proves: the client completes
+the task through Praxis against a real backend — a non-timed-out, successful
+exit, the exact uppercase-derived output file, a harness-owned verification
+marker written only when the task's `verify.sh` confirms the compare, and a
+non-empty final summary in the client's stream-json output. Wire fidelity is
+proven deterministically against controlled fake backends, not observed in the
+live run:
 
 - Native passthrough (no `chat/completions` reshaping, the exact served model on
   every inference body), credential isolation, and native token counting in
@@ -160,16 +167,27 @@ host-side veth address, which Praxis then binds) to launch the client inside a
 restricted Linux network namespace that can reach only Praxis, proving it cannot
 bypass the proxy.
 
+**Auto-mode classifier limitation.** Praxis and vLLM do not implement
+Anthropic's server-side auto-mode classifier protocol (`safeguards` and
+`safeguard_results`). Do not enable that mode with
+`CLAUDE_CODE_AUTO_MODE_SERVER=1`, and do not rely on Claude Code's server-side
+default when using this backend. Set `CLAUDE_CODE_AUTO_MODE_SERVER=0` so Claude
+Code sends its additional classifier inference requests through Praxis. In
+Anthropic's terminology this is the "local" classifier path, but classification
+still uses model requests; it is not an on-device classifier. See
+[Auto mode classifier billing](https://code.claude.com/docs/en/auto-mode-classifier-billing)
+for the client behavior and billing distinction.
+
 **Pins and scheduled acceptance.** The pinned Claude Code version and launch
-flags, the vLLM image digest, served model, and startup request matrix live in
+setup, the vLLM image digest, served model, and startup request matrix live in
 [`tests/integration/fixtures/claude-code-cli/pin.toml`](../tests/integration/fixtures/claude-code-cli/pin.toml).
 The `vllm-gpu-claude-acceptance` job in
 [`.github/workflows/vllm-integration.yaml`](../.github/workflows/vllm-integration.yaml)
-runs both tests sequentially against one shared vLLM container, each exactly once
-(no retry), on every nightly GPU run. It can also run independently through the
-`run_claude_acceptance` workflow-dispatch input. Runtime pins must be complete;
-the job fails fast with an explanatory error if any required value is empty or
-still contains `TBD`.
+runs all four scenarios sequentially against one shared vLLM container, each
+exactly once (no retry), on every nightly GPU run. It can also run independently
+through the `run_claude_acceptance` workflow-dispatch input. Runtime pins must be
+complete; the job fails fast with an explanatory error if any required value is
+empty or still contains `TBD`.
 
 ## Passthrough to Anthropic API
 

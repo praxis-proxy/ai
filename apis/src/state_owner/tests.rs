@@ -10,7 +10,7 @@ use praxis_filter::{FilterAction, RequestExtensions, TrustedHeaderMutation};
 
 use super::{StateOwner, StateOwnerFilter};
 use crate::{
-    StateOwnerHeadersFilter,
+    ProjectStateOwnerHeadersFilter,
     callout_headers::effective_body_callout_headers,
     project_state_owner,
     test_utils::{make_filter_context, make_request},
@@ -64,7 +64,7 @@ subject_header: x-user-id
 issuer_header: x-identity-issuer",
     )
     .unwrap();
-    StateOwnerHeadersFilter::from_config(&yaml).unwrap()
+    ProjectStateOwnerHeadersFilter::from_config(&yaml).unwrap()
 }
 
 fn mapped_request(tenant: &str, subject: &str) -> praxis_filter::Request {
@@ -287,7 +287,7 @@ fn projection_configuration_rejects_invalid_or_ambiguous_headers() {
     ] {
         let value: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
         assert!(
-            StateOwnerHeadersFilter::from_config(&value).is_err(),
+            ProjectStateOwnerHeadersFilter::from_config(&value).is_err(),
             "should reject {yaml}"
         );
     }

@@ -5542,7 +5542,7 @@ fn load_unified_dispatch_config(
     // requires for the loopback provider callout — no test-time injection needed.
     let yaml = yaml.replacen(
         "      - filter: state_owner\n        mode: single_tenant\n        tenant_id: default\n",
-        "      - filter: state_owner\n        mode: trusted_headers\n        tenant: {header: x-tenant-id}\n        issuer: {static: urn:test}\n        subject: {static: test-user}\n      - filter: state_owner_headers\n        tenant_header: x-tenant-id\n        subject_header: x-user-id\n",
+        "      - filter: state_owner\n        mode: trusted_headers\n        tenant: {header: x-tenant-id}\n        issuer: {static: urn:test}\n        subject: {static: test-user}\n      - filter: project_state_owner_headers\n        tenant_header: x-tenant-id\n        subject_header: x-user-id\n",
         1,
     );
     // Retarget MCP resolution and dispatch at the in-test loopback MCP server.
@@ -5559,7 +5559,7 @@ fn load_unified_dispatch_config(
     );
     let yaml = yaml.replacen(
         "              - filter: openai_mcp_dispatch\n",
-        "              - filter: state_owner_headers\n                tenant_header: x-tenant-id\n                subject_header: x-user-id\n              - filter: openai_mcp_dispatch\n                forward_headers: [x-tenant-id]\n",
+        "              - filter: project_state_owner_headers\n                tenant_header: x-tenant-id\n                subject_header: x-user-id\n              - filter: openai_mcp_dispatch\n                forward_headers: [x-tenant-id]\n",
         1,
     );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse unified dispatch config")

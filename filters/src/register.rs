@@ -135,9 +135,8 @@ fn register_gcp_filters(registry: &mut FilterRegistry) {
 /// Register general-purpose AI filters.
 fn register_general_ai_filters(registry: &mut FilterRegistry) {
     register_state_owner(registry);
-    register_state_owner_headers(registry);
+    register_project_state_owner_headers(registry);
     register_callout_credentials(registry);
-    register_callout_authorization(registry);
     #[cfg(feature = "http-callout-filter")]
     praxis_filter::register_filters!(
         @register registry,
@@ -299,16 +298,16 @@ fn register_state_owner(registry: &mut FilterRegistry) {
 
 /// Register the destination-bound state-owner header projection as security-critical.
 #[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
-fn register_state_owner_headers(registry: &mut FilterRegistry) {
+fn register_project_state_owner_headers(registry: &mut FilterRegistry) {
     registry
         .register_with_class(
-            "state_owner_headers",
+            "project_state_owner_headers",
             praxis_filter::FilterFactory::Http(std::sync::Arc::new(
-                praxis_ai_apis::StateOwnerHeadersFilter::from_config,
+                praxis_ai_apis::ProjectStateOwnerHeadersFilter::from_config,
             )),
             praxis_filter::SecurityClass::Security,
         )
-        .unwrap_or_else(|_| panic!("duplicate filter name: 'state_owner_headers'"));
+        .unwrap_or_else(|_| panic!("duplicate filter name: 'project_state_owner_headers'"));
 }
 
 /// Register the per-user callout credential capture filter as security-critical.
@@ -323,20 +322,6 @@ fn register_callout_credentials(registry: &mut FilterRegistry) {
             praxis_filter::SecurityClass::Security,
         )
         .unwrap_or_else(|_| panic!("duplicate filter name: 'callout_credentials'"));
-}
-
-/// Register the trusted MCP authorization assertion filter as security-critical.
-#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
-fn register_callout_authorization(registry: &mut FilterRegistry) {
-    registry
-        .register_with_class(
-            "callout_authorization",
-            praxis_filter::FilterFactory::Http(std::sync::Arc::new(
-                praxis_ai_apis::CalloutAuthorizationFilter::from_config,
-            )),
-            praxis_filter::SecurityClass::Security,
-        )
-        .unwrap_or_else(|_| panic!("duplicate filter name: 'callout_authorization'"));
 }
 
 /// Register OpenAI Responses API filters.
@@ -642,9 +627,8 @@ mod tests {
             "identity_header_guard",
             "llmisvc_model_provider_resolver",
             "state_owner",
-            "state_owner_headers",
+            "project_state_owner_headers",
             "callout_credentials",
-            "callout_authorization",
             "openai_responses_format",
             "openai_responses_model_rewrite",
             "openai_tool_parse",
@@ -784,7 +768,6 @@ provider:
         #[cfg(feature = "aws-sigv4-filter")]
         assert!(registry.is_security_filter("aws_sigv4_sign"));
         assert!(registry.is_security_filter("callout_credentials"));
-        assert!(registry.is_security_filter("callout_authorization"));
         #[cfg(feature = "azure-ad-filter")]
         assert!(registry.is_security_filter("azure_ad"));
         #[cfg(feature = "gcp-adc-filter")]

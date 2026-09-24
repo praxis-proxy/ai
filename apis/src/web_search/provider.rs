@@ -1249,10 +1249,10 @@ mod tests {
         let mut registry = praxis_filter::FilterRegistry::with_builtins();
         praxis_filter::register_filters!(
             @register registry,
-            http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
+            http "project_state_owner_headers" => crate::ProjectStateOwnerHeadersFilter::from_config
         );
         let mut entries: Vec<praxis_filter::FilterEntry> = serde_yaml::from_str(
-            "- filter: state_owner_headers\n  tenant_header: x-tenant-id\n  subject_header: x-user-id\n",
+            "- filter: project_state_owner_headers\n  tenant_header: x-tenant-id\n  subject_header: x-user-id\n",
         )
         .expect("state-owner projection entry parses");
         let mut pipeline = FilterPipeline::build(&mut entries, &registry).expect("owner projection pipeline builds");
