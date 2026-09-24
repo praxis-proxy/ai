@@ -40,4 +40,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     # Temporary: until v0.5.2 is published on crates.io
     "https://github.com/praxis-proxy/praxis",
+    # Temporary: until the certificate-only SQLx feature boundaries are
+    # available in an upstream release.
+    "https://github.com/leseb/sqlx",
 ]
