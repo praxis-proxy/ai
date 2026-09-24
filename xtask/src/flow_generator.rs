@@ -531,6 +531,17 @@ mod tests {
     }
 
     #[test]
+    fn reports_malformed_sidecar_filters_not_a_sequence() {
+        let mut side = sidecar();
+        // A malformed sidecar whose pipeline.filters is a mapping, not the
+        // required sequence, must fail cleanly rather than panic or silently
+        // render an empty pipeline.
+        *side.get_mut("pipeline").and_then(|p| p.get_mut("filters")).unwrap() = Value::Mapping(Mapping::new());
+        let errors = render(&graph(), "c", &side, TEMPLATE, &[]).expect_err("malformed filters must fail");
+        assert!(errors.iter().any(|e| e.contains("not a sequence")), "got {errors:?}");
+    }
+
+    #[test]
     fn reports_knob_drift() {
         let config = "listeners:\n  - name: l\n    address: 127.0.0.1:8080\n    filter_chains: [c]\n\
             filter_chains:\n  - name: c\n    filters:\n      - filter: trace_context\n\

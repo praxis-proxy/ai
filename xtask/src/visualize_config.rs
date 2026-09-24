@@ -400,4 +400,64 @@ mod tests {
         let second = build_model("min", &graph, &descriptions);
         assert_eq!(first, second, "model construction must be deterministic");
     }
+
+    #[test]
+    fn embedded_model_round_trips_through_html_escaping() {
+        // A filter config value carrying the exact characters that could
+        // prematurely close the <script> element or open an HTML comment.
+        let yaml = "listeners:\n  - name: l\n    address: 127.0.0.1:8080\n    filter_chains: [c]\nfilter_chains:\n  - name: c\n    filters:\n      - filter: trace_context\n        note: \"</script><!-- a & b -->\"\n";
+        let graph = FlowGraph::from_yaml_str(yaml).expect("valid config");
+        let model = build_model("safe", &graph, &BTreeMap::new());
+        let html = embed(TEMPLATE, &model).expect("embeds");
+
+        // The injected model neither introduces a second closing tag nor leaves
+        // the placeholder behind: the literal "</script>" was neutralized.
+        assert_eq!(
+            html.matches("</script>").count(),
+            1,
+            "only the template's own closing tag survives"
+        );
+        assert!(!html.contains(MODEL_PLACEHOLDER), "placeholder consumed");
+
+        // Recover the embedded model text and prove it round-trips: reversing
+        // the HTML escaping yields JSON that parses back to exactly the model.
+        let marker = "const MODEL = ";
+        let start = html.find(marker).expect("model assignment present") + marker.len();
+        let tail = html.get(start..).expect("model tail");
+        let end = tail.find(";\n").expect("assignment terminator");
+        let embedded = tail.get(..end).expect("model text");
+        let unescaped = embedded
+            .replace("\\u003c", "<")
+            .replace("\\u003e", ">")
+            .replace("\\u0026", "&");
+        let parsed: Json = serde_json::from_str(&unescaped).expect("embedded model is valid JSON");
+        assert_eq!(parsed, model, "the embedded model round-trips losslessly");
+    }
+
+    #[test]
+    fn arbitrary_config_with_branches_surfaces_branch_topology() {
+        let yaml = "listeners:\n  - name: l\n    address: 127.0.0.1:8080\n    filter_chains: [c]\nfilter_chains:\n  - name: c\n    filters:\n      - filter: headers\n        branch_chains:\n          - name: bypass\n            rejoin: terminal\n            chains:\n              - name: bypass-chain\n                filters:\n                  - filter: trace_context\n      - filter: state_owner\n";
+        let graph = FlowGraph::from_yaml_str(yaml).expect("branched config parses");
+        let model = build_model("branched", &graph, &BTreeMap::new());
+
+        // The branch topology is surfaced on the carrier node...
+        let carrier = find_filter(&model, "c", "headers").expect("carrier present");
+        let branches = carrier
+            .get("branch_chains")
+            .and_then(Json::as_array)
+            .expect("branch_chains array");
+        assert_eq!(branches.len(), 1, "the branch chain is surfaced on the carrier node");
+
+        // ...but the branch's inner filter is captured as data, not hoisted:
+        // the chain still lists exactly the two declared top-level filters.
+        let chain = model
+            .get("chains")
+            .and_then(Json::as_array)
+            .expect("chains array")
+            .iter()
+            .find(|c| c.get("name").and_then(Json::as_str) == Some("c"))
+            .expect("chain c present");
+        let filters = chain.get("filters").and_then(Json::as_array).expect("filters array");
+        assert_eq!(filters.len(), 2, "branch inner filters are not hoisted into the chain");
+    }
 }

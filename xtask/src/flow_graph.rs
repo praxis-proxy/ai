@@ -452,4 +452,52 @@ mod tests {
         assert_eq!(nodes[0].filter_type, "state_owner");
         assert_eq!(nodes[1].filter_type, "trace_context");
     }
+
+    #[test]
+    fn removing_a_filter_changes_node_count_and_order() {
+        let before = FlowGraph::from_yaml_str(&minimal_config(&["trace_context", "state_owner", "trace_context"]))
+            .expect("valid config");
+        let after =
+            FlowGraph::from_yaml_str(&minimal_config(&["trace_context", "trace_context"])).expect("valid config");
+        assert_eq!(before.flatten_chain("c").expect("chain").len(), 3);
+        let after_nodes = after.flatten_chain("c").expect("chain");
+        assert_eq!(after_nodes.len(), 2, "removing the middle filter drops one node");
+        assert_eq!(
+            after_nodes[1].filter_type, "trace_context",
+            "the survivor shifts up into its slot"
+        );
+    }
+
+    /// A config whose first filter carries a branch chain, exactly as the
+    /// full-flow carrier does. Used to prove branch topology is captured
+    /// verbatim on the node without being flattened into the main chain the way
+    /// IRR inference steps are.
+    const BRANCHED_CONFIG: &str = "listeners:\n  - name: l\n    address: 127.0.0.1:8080\n    filter_chains: [c]\nfilter_chains:\n  - name: c\n    filters:\n      - filter: headers\n        branch_chains:\n          - name: bypass\n            rejoin: terminal\n            chains:\n              - name: bypass-chain\n                filters:\n                  - filter: trace_context\n      - filter: state_owner\n";
+
+    #[test]
+    fn branch_chains_are_captured_without_being_flattened() {
+        let graph = FlowGraph::from_yaml_str(BRANCHED_CONFIG).expect("branched config parses");
+        let nodes = graph.flatten_chain("c").expect("chain");
+
+        // Only the two declared main-chain filters are flattened; the branch's
+        // inner trace_context is NOT hoisted inline (unlike IRR steps).
+        assert_eq!(nodes.len(), 2, "branch chains are not flattened into the main chain");
+        assert_eq!(nodes[0].filter_type, "headers");
+        assert_eq!(nodes[1].filter_type, "state_owner");
+
+        // ...but the full branch topology (name and inner filter) is recorded
+        // verbatim on the carrier node, and the unbranched filter has none.
+        let branches = nodes[0].branch_chains.as_array().expect("branch_chains is an array");
+        assert_eq!(branches.len(), 1, "the single branch chain is recorded");
+        let branch_text = serde_json::to_string(&nodes[0].branch_chains).expect("serializes");
+        assert!(branch_text.contains("bypass"), "branch name preserved: {branch_text}");
+        assert!(
+            branch_text.contains("trace_context"),
+            "branch inner filter preserved: {branch_text}"
+        );
+        assert!(
+            nodes[1].branch_chains.as_array().is_some_and(Vec::is_empty),
+            "the unbranched filter records no branch chains"
+        );
+    }
 }
