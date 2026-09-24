@@ -7,7 +7,9 @@
 # and streaming (`stream: true`) responses. This is the single config an
 # operator would deploy for a Responses API gateway that must serve the
 # full agentic loop, the Conversations API, and the dedicated
-# prompts/embeddings/files/vector_stores services behind one listener.
+# prompts/embeddings/files/vector_stores services behind one listener. The
+# request trace is continued through every nested web-search, OGX, and MCP
+# callout with a fresh span ID per hop.
 #
 # Pre-IRR filters run once on the client request to set up shared state
 # (ResponsesState) which persists across all IRR iterations via extension
@@ -15,14 +17,15 @@
 #
 #   0. state_owner maps deployment-specific trusted ingress headers into one
 #      normalized tenant/issuer/subject context for owner-aware filters.
-#      callout_credentials captures the per-user Brave provider key from the
-#      trusted x-user-brave-key ingress header into the `brave_search` slot and
-#      strips the source header before inference or IRR processing. The trusted
-#      boundary MUST unconditionally delete-then-set that source header on every
-#      request; append-on-success is insufficient because this filter cannot
-#      authenticate header provenance. The IRR carries the resulting typed
-#      request extension across iterations, while openai_web_search explicitly
-#      selects the slot for its exact-authority provider callout.
+#      callout_credentials captures per-user Brave and OGX provider keys from
+#      trusted x-user-brave-key and x-user-ogx-key ingress headers into the
+#      `brave_search` and `ogx_files` slots, then strips both source headers
+#      before inference or IRR processing. The trusted boundary MUST
+#      unconditionally delete-then-set those source headers on every request;
+#      append-on-success is insufficient because this filter cannot authenticate
+#      header provenance. The IRR carries the resulting typed request extension
+#      across iterations, while each callout explicitly selects its slot for its
+#      exact-authority provider destination.
 #      state_owner_headers then projects that context as x-tenant-id and
 #      x-user-id for OGX and explicitly allowlisted callouts. The raw ingress
 #      names are stripped, and the projection is repeated inside the IRR step
@@ -304,6 +307,11 @@ listeners:
 filter_chains:
   - name: full-flow-agentic-pipeline
     filters:
+      - filter: trace_context
+        # Establish typed correlation before IRR snapshots request extensions.
+        # Child callouts retain this request/trace identity while Praxis core
+        # creates a fresh span ID for each outbound hop.
+
       - filter: state_owner
         # These source names are deployment-specific. The authentication
         # boundary must overwrite them and prevent clients from bypassing it.
@@ -323,6 +331,19 @@ filter_chains:
         credentials:
           - slot: brave_search
             source_header: x-user-brave-key
+          - slot: ogx_files
+            source_header: x-user-ogx-key
+          - slot: mcp_gateway
+            source_header: x-user-mcp-key
+
+      - filter: callout_authorization
+        # Opaque connector authorization is deliberately separate from
+        # credentials. The trusted boundary MUST unconditionally delete any
+        # client-supplied x-mcp-authorized value and then set the verified,
+        # short-lived assertion for this request. Praxis forwards it unchanged
+        # only to configured connector_id destinations; the MCP Gateway makes
+        # the actual authorization decision.
+        assertion_slot: mcp_gateway
 
       # Emit the normalized owner in the contract expected by OGX and by the
       # explicitly configured downstream callouts below. Raw x-auth-* inputs
@@ -362,6 +383,10 @@ filter_chains:
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
+        # Require the caller-scoped OGX credential captured above. It is
+        # injected only on configured file_id callouts; file_url downloads
+        # remain on the separate credential-free resolver.
+        user_credential: ogx_files
         allow_pre_security_callout: true
         # file_id callouts run through this outbound filter chain via the
         # filtered subrequest executor. SSRF protection for files_api_url
@@ -370,12 +395,14 @@ filter_chains:
         outbound_chain:
           name: files-api-outbound
           filters:
+            - filter: state_owner_headers
+              tenant_header: x-tenant-id
+              subject_header: x-user-id
             - filter: headers
               request_set:
                 - name: x-file-callout
                   value: file-resolve
         forward_headers:
-          - authorization
           - x-tenant-id
           - x-user-id
         on_missing: reject
@@ -386,6 +413,8 @@ filter_chains:
         on_unsupported: continue
 
       - filter: openai_mcp_tool_resolve
+        user_credential: mcp_gateway
+        authorization_assertion: mcp_gateway
         forward_headers:
           - x-tenant-id
           - x-user-id
@@ -539,6 +568,8 @@ filter_chains:
               # MCP calls prepared and classified by the loop owner. Inert
               # until the model emits an MCP tool call.
               - filter: openai_mcp_dispatch
+                user_credential: mcp_gateway
+                authorization_assertion: mcp_gateway
                 forward_headers:
                   - x-tenant-id
                   - x-user-id
@@ -554,11 +585,15 @@ filter_chains:
               # so it is inert unless the model emits a hosted file_search_call.
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:3002
+                user_credential: ogx_files
                 # Cross-cutting outbound chain every vector-store sub-request runs
                 # through; the destination comes from vector_store_url.
                 outbound_chain:
                   name: vector-store-outbound
                   filters:
+                    - filter: state_owner_headers
+                      tenant_header: x-tenant-id
+                      subject_header: x-user-id
                     - filter: headers
                       request_set:
                         - name: X-Vector-Store-Client
@@ -569,7 +604,6 @@ filter_chains:
                 max_state_bytes: 136314880
                 on_failure: closed
                 forward_headers:
-                  - authorization
                   - x-tenant-id
                   - x-user-id
               # Sole loop owner: parses each model response, records the

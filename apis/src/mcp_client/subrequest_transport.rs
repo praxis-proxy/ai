@@ -36,7 +36,7 @@ use praxis_core::{
 use praxis_filter::{
     BodyMode, CalloutOutcome, CalloutResponse, ChainBindingContext, FilterEntry, FilterError, FilterPipeline,
     FilterRegistry, FilteredSubrequestExecutor, HttpFilterContext, IterationState, RequestExtensions, StagedUpstream,
-    StagedUpstreamFallback, StreamingResponseBody, SubRequest, SubResponse, SubrequestRuntime,
+    StagedUpstreamFallback, StreamingResponseBody, SubRequest, SubResponse, SubrequestRuntime, TraceContext,
 };
 use rmcp::{
     model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage},
@@ -51,6 +51,7 @@ use rmcp::{
 use sse_stream::{Error as SseError, Sse};
 
 use super::{McpClientError, McpDisplayUrl};
+use crate::StateOwner;
 
 /// Wire byte ceiling for a control-plane MCP response.
 ///
@@ -360,6 +361,10 @@ pub(crate) struct McpCallout {
     pipeline: Arc<FilterPipeline>,
     /// Sub-request nesting depth for callouts issued from this context.
     depth: u8,
+    /// Approved request correlation projected into every MCP exchange.
+    trace_context: Option<TraceContext>,
+    /// Absolute enclosing IRR deadline shared by initialize/list/call exchanges.
+    parent_deadline: Option<Instant>,
     /// Whether private/loopback MCP destinations are permitted, taken from the
     /// bound pipeline's finalized posture (never a per-filter opt-in).
     allow_private: bool,
@@ -387,15 +392,17 @@ impl McpCallout {
             ctx.request_start,
         );
         let allow_private = pipeline.allow_private_upstreams();
-        let depth = resolve_callout_depth(
-            ctx.extensions.get::<IterationState>().map(IterationState::depth),
-            &ctx.request.headers,
-        );
+        let iteration_state = ctx.extensions.get::<IterationState>();
+        let depth = resolve_callout_depth(iteration_state.map(IterationState::depth), &ctx.request.headers);
+        let parent_deadline = iteration_state.map(IterationState::deadline);
+        let trace_context = ctx.extensions.get::<TraceContext>().cloned();
         Some(Self {
             client,
             downstream,
             pipeline,
             depth,
+            trace_context,
+            parent_deadline,
             allow_private,
         })
     }
@@ -403,6 +410,13 @@ impl McpCallout {
     /// Whether private/loopback MCP destinations are permitted for this callout.
     pub(crate) fn allow_private(&self) -> bool {
         self.allow_private
+    }
+
+    /// Bound one MCP transport exchange by the enclosing IRR deadline.
+    fn deadline(&self, now: Instant, step_timeout: Duration) -> Instant {
+        let step_deadline = now.checked_add(step_timeout).unwrap_or(now);
+        self.parent_deadline
+            .map_or(step_deadline, |parent| step_deadline.min(parent))
     }
 
     /// Build a callout backed by a fabricated connector and a bare, empty
@@ -420,8 +434,24 @@ impl McpCallout {
             downstream: SubrequestRuntime::new(None, false, None, Instant::now()),
             pipeline,
             depth: 0,
+            trace_context: None,
+            parent_deadline: None,
             allow_private,
         })
+    }
+
+    /// Attach an explicit parent deadline to a fabricated test callout.
+    #[cfg(test)]
+    pub(crate) fn with_parent_deadline_for_test(mut self, deadline: Instant) -> Self {
+        self.parent_deadline = Some(deadline);
+        self
+    }
+
+    /// Replace the bare test pipeline with an observable one.
+    #[cfg(test)]
+    pub(crate) fn with_pipeline_for_test(mut self, pipeline: Arc<FilterPipeline>) -> Self {
+        self.pipeline = pipeline;
+        self
     }
 }
 
@@ -479,6 +509,8 @@ pub(crate) struct McpSubrequestClient {
     stream_cumulative_cap: usize,
     /// Per-exchange duration ceiling.
     step_timeout: Duration,
+    /// Trusted owner projected only for configured connector exchanges.
+    owner: Option<StateOwner>,
     /// Out-of-band record of a typed classification observed on a callout.
     ///
     /// `rmcp` discards the typed [`McpTransportError`] on failure, so a
@@ -498,12 +530,13 @@ impl McpSubrequestClient {
     ///
     /// No `tools/call` result flows over this transport, so every response is
     /// bounded to [`MAX_CONTROL_RESPONSE_BYTES`] before deserialization.
-    pub(crate) fn control(callout: McpCallout, step_timeout: Duration) -> Self {
+    pub(crate) fn control(callout: McpCallout, step_timeout: Duration, owner: Option<StateOwner>) -> Self {
         Self::with_wire_cap(
             callout,
             step_timeout,
             MAX_CONTROL_RESPONSE_BYTES,
             crate::mcp_client::MAX_LISTING_RESPONSE_BYTES.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            owner,
         )
     }
 
@@ -516,13 +549,19 @@ impl McpSubrequestClient {
     /// `step_timeout` bounds each individual HTTP exchange; the `callout` carries
     /// the parent transport and the bound outbound pipeline whose finalized
     /// posture decides whether loopback destinations are permitted.
-    pub(crate) fn for_tool(callout: McpCallout, step_timeout: Duration, max_result_bytes: usize) -> Self {
+    pub(crate) fn for_tool(
+        callout: McpCallout,
+        step_timeout: Duration,
+        max_result_bytes: usize,
+        owner: Option<StateOwner>,
+    ) -> Self {
         let wire = tool_result_wire_cap(max_result_bytes);
         Self::with_wire_cap(
             callout,
             step_timeout,
             wire,
             wire.saturating_add(MAX_CONTROL_RESPONSE_BYTES),
+            owner,
         )
     }
 
@@ -533,12 +572,14 @@ impl McpSubrequestClient {
         step_timeout: Duration,
         tool_result_bytes: usize,
         stream_cumulative_cap: usize,
+        owner: Option<StateOwner>,
     ) -> Self {
         Self {
             callout,
             tool_result_bytes,
             step_timeout,
             stream_cumulative_cap,
+            owner,
             signal: Arc::new(OnceLock::new()),
         }
     }
@@ -602,9 +643,7 @@ impl McpSubrequestClient {
         (FilteredSubrequestExecutor, SubRequest, RequestExtensions, Instant),
         StreamableHttpError<McpTransportError>,
     > {
-        let deadline = Instant::now()
-            .checked_add(self.step_timeout)
-            .ok_or(StreamableHttpError::Client(McpTransportError::Setup))?;
+        let deadline = self.callout.deadline(Instant::now(), self.step_timeout);
         let allow_private = self.callout.allow_private;
         let target = match prepare_url_target(uri, deadline, move |addrs| ssrf_validate(addrs, allow_private)).await {
             Ok(target) => target,
@@ -637,6 +676,12 @@ impl McpSubrequestClient {
         let mut extensions = RequestExtensions::default();
         extensions.insert(staged);
         extensions.insert(fallback);
+        if let Some(owner) = self.owner.as_ref() {
+            extensions.insert(owner.clone());
+        }
+        if let Some(trace_context) = self.callout.trace_context.as_ref() {
+            extensions.insert(trace_context.clone());
+        }
 
         let executor = FilteredSubrequestExecutor::for_callout(
             self.callout.client.clone(),
@@ -1583,7 +1628,11 @@ fn parse_buffered_sse_terminal(body: &[u8]) -> Option<ServerJsonRpcMessage> {
 mod tests {
     use std::net::SocketAddr;
 
+    use http::HeaderValue;
+    use praxis_filter::builtins::TraceContextFilter;
+
     use super::*;
+    use crate::test_utils::{make_filter_context, make_request};
 
     // -- Reserved-header hygiene (codex finding: reserved MCP session header) ---
 
@@ -1706,6 +1755,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             2048,
+            None,
         );
         let call: ClientJsonRpcMessage = serde_json::from_str(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
@@ -1724,12 +1774,74 @@ mod tests {
         let client = McpSubrequestClient::control(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
+            None,
         );
         let call: ClientJsonRpcMessage = serde_json::from_str(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
         )
         .expect("deserialize tools/call");
         assert_eq!(client.response_limit(&call), MAX_CONTROL_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn mcp_exchange_deadline_is_capped_by_parent_loop_deadline() {
+        let now = Instant::now();
+        let parent_deadline = now + Duration::from_millis(25);
+        let callout = McpCallout::fabricated(false)
+            .expect("fabricated callout")
+            .with_parent_deadline_for_test(parent_deadline);
+
+        assert_eq!(
+            callout.deadline(now, Duration::from_secs(5)),
+            parent_deadline,
+            "initialize, list, and call exchanges must share the remaining IRR deadline"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test establishes trusted parent context and inspects one staged MCP exchange"
+    )]
+    async fn mcp_projects_trace_context_into_every_prepared_exchange() {
+        let mut request = make_request(Method::POST, "/v1/responses");
+        request
+            .headers
+            .insert("x-request-id", HeaderValue::from_static("request-parent"));
+        request.headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        let mut context = make_filter_context(&request);
+        let filter = TraceContextFilter::from_config(&serde_yaml::from_str("{}").expect("valid config"))
+            .expect("trace_context filter");
+        let _action = filter
+            .on_request(&mut context)
+            .await
+            .expect("trace context established");
+        let parent = context
+            .extensions
+            .get::<TraceContext>()
+            .expect("typed trace context")
+            .clone();
+        let pipeline = build_bare_outbound_pipeline(true).expect("outbound pipeline");
+        let callout = McpCallout::from_context(&context, pipeline).expect("MCP callout context");
+        let client = McpSubrequestClient::control(callout, Duration::from_secs(5), None);
+
+        let (_executor, _request, extensions, _deadline) = client
+            .prepare_staged_request(
+                Method::POST,
+                "http://127.0.0.1:8321/mcp",
+                Bytes::new(),
+                HeaderMap::new(),
+                MAX_CONTROL_RESPONSE_BYTES,
+            )
+            .await
+            .expect("request prepares without dialing");
+        let projected = extensions.get::<TraceContext>().expect("trace context projected");
+        assert_eq!(projected.request_id(), parent.request_id());
+        assert_eq!(projected.trace_id(), parent.trace_id());
+        assert_eq!(projected.flags(), parent.flags());
     }
 
     // -- SSRF hook (codex finding: chain propagates real posture) --------------
@@ -1919,6 +2031,7 @@ mod tests {
         let client = McpSubrequestClient::control(
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(1),
+            None,
         );
         // per-event GET cap == the client's tool-result wire cap, which for the
         // control client is the 1 MiB control ceiling.
@@ -1938,6 +2051,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(1),
             max_result_bytes,
+            None,
         );
         let expected_wire = tool_result_wire_cap(max_result_bytes);
         assert_eq!(client.wire_cap(), expected_wire);
@@ -1966,6 +2080,7 @@ mod tests {
             McpCallout::fabricated(false).expect("fabricated callout"),
             Duration::from_secs(5),
             1024,
+            None,
         )
     }
 

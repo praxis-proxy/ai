@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 use super::resolve_url::NormalizedOrigin;
 use crate::{
+    callout_identity::credential_authority,
     callout_policy::OnMissing,
     openai::{api_client, responses::body_limits::validate_size_limit},
 };
@@ -86,6 +87,12 @@ pub(crate) struct FileResolveConfig {
     /// Example: `http://files-api:8321`
     pub files_api_url: String,
 
+    /// Optional callout-credential slot. When configured, Files API `file_id`
+    /// requests use that caller-scoped value as their `Authorization` header.
+    /// Client-controlled `file_url` fetches never use this credential.
+    #[serde(default)]
+    pub user_credential: Option<String>,
+
     /// Headers to forward from the original request to the
     /// Files API for authentication and tenant isolation. No
     /// downstream headers are forwarded by default.
@@ -129,7 +136,9 @@ pub(crate) struct FileResolveConfig {
     #[serde(default)]
     pub on_missing: OnMissing,
 
-    /// HTTP timeout in milliseconds for Files API callout requests.
+    /// HTTP timeout in milliseconds for Files API callout requests. Inside an
+    /// iterative request router, the effective timeout is capped by the
+    /// router's remaining deadline.
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 
@@ -193,7 +202,24 @@ pub(crate) fn validate_config(mut cfg: FileResolveConfig) -> Result<FileResolveC
     // target is pinned (`prepare_url_target`) and at connect time
     // (`build_peer`), so the config-time private-IP gate is disabled here.
     api_client::validate_base_url("openai_file_resolve", &cfg.files_api_url, true)?;
+    if cfg.user_credential.as_ref().is_some_and(String::is_empty) {
+        return Err("openai_file_resolve: user_credential must not be empty".into());
+    }
+    if cfg.user_credential.is_some() {
+        credential_authority("openai_file_resolve", &cfg.files_api_url)?;
+    }
     api_client::validate_forward_headers("openai_file_resolve", &mut cfg.forward_headers)?;
+    if cfg.user_credential.is_some()
+        && cfg
+            .forward_headers
+            .iter()
+            .any(|name| name == http::header::AUTHORIZATION.as_str())
+    {
+        return Err(
+            "openai_file_resolve: forward_headers must not include authorization when user_credential is configured"
+                .into(),
+        );
+    }
     validate_limits(&cfg)?;
     validate_pre_security_callout(&cfg)?;
     validate_file_url_config(&cfg)?;
@@ -478,6 +504,7 @@ timeout_ms: 300001"#;
             outbound_chain: default_outbound_chain(),
             allow_pre_security_callout: true,
             files_api_url: "http://files-api:8321".to_owned(),
+            user_credential: None,
             forward_headers: Vec::new(),
             max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
             max_resolved_bytes: MAX_JSON_BODY_BYTES,
@@ -488,6 +515,28 @@ timeout_ms: 300001"#;
             allowed_file_url_origins: Vec::new(),
         };
         assert!(validate_config(cfg).is_ok(), "valid config should pass validation");
+    }
+
+    #[test]
+    fn user_credential_requires_nonempty_slot_and_valid_exact_authority() {
+        let cfg: FileResolveConfig = serde_yaml::from_str(
+            "files_api_url: https://ogx.example:8443\nallow_pre_security_callout: true\nuser_credential: ogx_files\n",
+        )
+        .unwrap();
+        let validated = validate_config(cfg).unwrap();
+        assert_eq!(validated.user_credential.as_deref(), Some("ogx_files"));
+
+        let empty: FileResolveConfig = serde_yaml::from_str(
+            "files_api_url: https://ogx.example\nallow_pre_security_callout: true\nuser_credential: ''\n",
+        )
+        .unwrap();
+        assert!(validate_config(empty).is_err());
+
+        let ambient_authorization: FileResolveConfig = serde_yaml::from_str(
+            "files_api_url: https://ogx.example\nallow_pre_security_callout: true\nuser_credential: ogx_files\nforward_headers: [authorization]\n",
+        )
+        .unwrap();
+        assert!(validate_config(ambient_authorization).is_err());
     }
 
     #[test]

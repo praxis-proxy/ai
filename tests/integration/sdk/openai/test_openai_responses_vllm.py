@@ -1433,7 +1433,10 @@ def openai_client(praxis_proxy):
     return OpenAI(
         base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
         api_key="test",
-        default_headers=TRUSTED_OWNER_HEADERS,
+        default_headers={
+            **TRUSTED_OWNER_HEADERS,
+            "x-user-ogx-key": "Bearer test",
+        },
         max_retries=0,
         timeout=300,
     )

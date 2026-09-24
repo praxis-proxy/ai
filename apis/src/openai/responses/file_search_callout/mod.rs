@@ -48,7 +48,8 @@ use self::{
 };
 use crate::{
     callout_headers::effective_body_callout_headers,
-    callout_policy::OnFailure,
+    callout_identity::{CalloutContextMissing, stage_callout_identity},
+    callout_policy::{MISSING_CALLOUT_CONTEXT, OnFailure},
     http_hop::connection_nominates_header,
     openai::{
         responses::{
@@ -105,6 +106,9 @@ pub struct FileSearchCalloutFilter {
 
     /// Whether a failed callout rejects or produces an incomplete result.
     on_failure: OnFailure,
+
+    /// Optional caller-scoped credential slot required before dispatch.
+    user_credential_slot: Option<String>,
 }
 
 impl FileSearchCalloutFilter {
@@ -138,6 +142,7 @@ impl FileSearchCalloutFilter {
     fn build(validated: ValidatedConfig, outbound: Arc<FilterPipeline>) -> Box<dyn HttpFilter> {
         let client = FileSearchClient::new(FileSearchClientConfig {
             base_url: validated.base_url,
+            credential_authority: validated.credential_authority,
             subrequest_client: validated.subrequest_client,
             forward_header_names: validated.forward_header_names,
             on_failure: validated.on_failure,
@@ -151,6 +156,7 @@ impl FileSearchCalloutFilter {
             outbound,
             max_state_bytes: validated.max_state_bytes,
             on_failure: validated.on_failure,
+            user_credential_slot: validated.user_credential,
         })
     }
 
@@ -332,6 +338,19 @@ impl FileSearchCalloutFilter {
         })
     }
 
+    /// Fail closed before the first inference round when a hosted file-search
+    /// tool may run but its required per-user credential is absent.
+    fn preflight_managed_credential(&self, ctx: &HttpFilterContext<'_>) -> Result<(), praxis_filter::Rejection> {
+        match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
+            Ok(_identity) => Ok(()),
+            Err(CalloutContextMissing::Credential { slot }) => Err(responses_error_rejection(
+                401,
+                MISSING_CALLOUT_CONTEXT,
+                &format!("file search requires the '{slot}' per-user credential, which was not provided"),
+            )),
+        }
+    }
+
     /// Execute the file-search calls the loop owner assigned this round.
     ///
     /// Runs once at request-body EOS on IRR re-entry, before
@@ -351,6 +370,12 @@ impl FileSearchCalloutFilter {
         if assignments.is_empty() {
             return Ok(FilterAction::Continue);
         }
+        let identity = match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
+            Ok(identity) => identity,
+            Err(CalloutContextMissing::Credential { slot }) => {
+                return Ok(record_missing_callout_context(ctx, &slot));
+            },
+        };
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             return Ok(FilterAction::Continue);
         };
@@ -369,6 +394,7 @@ impl FileSearchCalloutFilter {
         let transport = CalloutTransport {
             outbound: &self.outbound,
             downstream,
+            identity: &identity,
         };
         let batch = self.execute_plan(&plan, &hdrs, &transport).await;
         if let Some(failure) = self.dispatch_failure(&batch) {
@@ -392,6 +418,23 @@ impl FileSearchCalloutFilter {
             state.dispatch_failure = Some(continuation_state_dispatch_failure());
         }
         Ok(FilterAction::Continue)
+    }
+}
+
+/// Record a write-once security-context terminal before vector-store dispatch.
+/// The direct rejection is a defensive fallback for nonstandard pipelines
+/// without an agentic-loop state owner.
+fn record_missing_callout_context(ctx: &mut HttpFilterContext<'_>, slot: &str) -> FilterAction {
+    let message = format!("file search requires the '{slot}' per-user credential, which was not provided");
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.record_security_failure(DispatchFailure {
+            status: 401,
+            code: MISSING_CALLOUT_CONTEXT,
+            message,
+        });
+        FilterAction::Continue
+    } else {
+        FilterAction::Reject(responses_error_rejection(401, MISSING_CALLOUT_CONTEXT, &message))
     }
 }
 
@@ -464,6 +507,19 @@ impl HttpFilter for FileSearchCalloutFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
+        // On a fresh streaming request, waiting until a model-emitted assignment
+        // would discover a missing credential only after HTTP 200 and first-round
+        // output have committed. Preflight while a truthful 401 is still possible.
+        if self.user_credential_slot.is_some()
+            && is_initial_request(ctx)
+            && ctx
+                .extensions
+                .get::<ResponsesState>()
+                .is_some_and(request_declares_eligible_file_search)
+            && let Err(rejection) = self.preflight_managed_credential(ctx)
+        {
+            return Ok(FilterAction::Reject(rejection));
+        }
         // Lower a hosted file_search tool into a private function before dispatch
         // so a native `/v1/responses` backend that cannot consume hosted tools
         // still runs the search. This mutates only the outbound body; the hosted
@@ -532,6 +588,35 @@ fn request_body_has_hosted_file_search(state: &ResponsesState) -> bool {
 /// True for a hosted `{"type":"file_search"}` tool declaration.
 fn is_hosted_file_search_tool(tool: &Value) -> bool {
     tool.get("type").and_then(Value::as_str) == Some("file_search")
+}
+
+/// Whether this is the initial client request rather than an IRR continuation.
+fn is_initial_request(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<IterationState>()
+        .is_none_or(|state| state.iteration() == 0)
+}
+
+/// Whether the request declares hosted file search and its effective tool choice
+/// allows that tool to run during the first inference round.
+fn request_declares_eligible_file_search(state: &ResponsesState) -> bool {
+    state.tools.iter().any(is_hosted_file_search_tool) && tool_choice_permits_file_search(&state.tool_choice)
+}
+
+/// Whether `tool_choice` leaves hosted file search eligible for this round.
+fn tool_choice_permits_file_search(tool_choice: &Value) -> bool {
+    match tool_choice {
+        Value::String(keyword) => keyword != "none",
+        Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
+            Some("file_search") | None => true,
+            Some("allowed_tools") => choice
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_none_or(|tools| tools.iter().any(is_hosted_file_search_tool)),
+            Some(_) => false,
+        },
+        _ => true,
+    }
 }
 
 /// Replace every hosted `file_search` entry in the outbound `tools` with the

@@ -11,7 +11,9 @@ use serde::Deserialize;
 use url::Url;
 
 use super::client::MAX_CONCURRENT_SEARCHES;
-use crate::{callout_policy::OnFailure, openai::api_client, subrequest::SubRequestClient};
+use crate::{
+    callout_identity::credential_authority, callout_policy::OnFailure, openai::api_client, subrequest::SubRequestClient,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -71,6 +73,11 @@ pub(crate) struct FileSearchFilterConfig {
     #[serde(default = "default_outbound_chain")]
     pub outbound_chain: ChainRef,
 
+    /// Optional callout-credential slot. When configured, every vector-store
+    /// request uses that caller-scoped value as its `Authorization` header.
+    #[serde(default)]
+    pub user_credential: Option<String>,
+
     /// Behaviour when a vector-store callout fails.
     pub on_failure: Option<OnFailure>,
 
@@ -91,7 +98,8 @@ pub(crate) struct FileSearchFilterConfig {
     /// `iterative_request_router`; the smaller limit wins at runtime.
     pub max_state_bytes: Option<usize>,
 
-    /// Whole-call timeout in milliseconds.
+    /// Whole-call timeout in milliseconds. Inside an iterative request router,
+    /// the effective timeout is capped by the router's remaining deadline.
     pub timeout_ms: Option<u64>,
 
     /// Base URL for the vector store API.
@@ -118,6 +126,12 @@ pub(crate) struct ValidatedConfig {
     /// Vector-store API base URL (trailing slash stripped).
     pub base_url: String,
 
+    /// Exact authority to which a caller-scoped credential may be injected.
+    pub credential_authority: String,
+
+    /// Optional caller-scoped credential slot required by this callout.
+    pub user_credential: Option<String>,
+
     /// Shared sub-request transport driving the outbound chain.
     pub subrequest_client: SubRequestClient,
 
@@ -142,11 +156,16 @@ pub(crate) struct ValidatedConfig {
 
 /// Build validated config from filter config with a shared sub-request
 /// client.
+#[expect(clippy::too_many_lines, reason = "linear validation and config construction")]
 pub(crate) fn build_config_with_client(
     cfg: &FileSearchFilterConfig,
     client: SubRequestClient,
 ) -> Result<ValidatedConfig, FilterError> {
     let base_url = parse_vector_store_url(&cfg.vector_store_url)?;
+    let credential_authority = credential_authority("openai_file_search_callout", &base_url)?;
+    if cfg.user_credential.as_ref().is_some_and(String::is_empty) {
+        return Err("openai_file_search_callout: user_credential must not be empty".into());
+    }
     let on_failure = cfg.on_failure.unwrap_or(OnFailure::Closed);
     let (max_response_bytes, max_total_response_bytes) =
         response_limits(cfg.max_response_bytes, cfg.max_total_response_bytes)?;
@@ -154,6 +173,16 @@ pub(crate) fn build_config_with_client(
     let timeout_ms = validated_timeout(cfg.timeout_ms)?;
     let mut forward_headers = cfg.forward_headers.clone();
     api_client::validate_forward_headers("openai_file_search_callout", &mut forward_headers)?;
+    if cfg.user_credential.is_some()
+        && forward_headers
+            .iter()
+            .any(|name| name == http::header::AUTHORIZATION.as_str())
+    {
+        return Err(
+            "openai_file_search_callout: forward_headers must not include authorization when user_credential is configured"
+                .into(),
+        );
+    }
     let forward_header_names = forward_headers
         .iter()
         .filter_map(|name| http::HeaderName::from_bytes(name.as_bytes()).ok())
@@ -161,6 +190,8 @@ pub(crate) fn build_config_with_client(
 
     Ok(ValidatedConfig {
         base_url,
+        credential_authority,
+        user_credential: cfg.user_credential.clone(),
         subrequest_client: client,
         forward_header_names,
         on_failure,
@@ -324,5 +355,23 @@ mod tests {
         );
         // The default must satisfy the inline-only requirement enforced at build.
         require_inline_outbound_chain(&cfg.outbound_chain).unwrap();
+    }
+
+    #[test]
+    fn config_accepts_user_credential_and_validates_exact_authority() {
+        let cfg: FileSearchFilterConfig =
+            serde_yaml::from_str("vector_store_url: https://ogx.example:8443\nuser_credential: ogx_files\n").unwrap();
+        let validated = build_config_with_client(&cfg, crate::subrequest::isolated_client(1)).unwrap();
+        assert_eq!(validated.user_credential.as_deref(), Some("ogx_files"));
+        assert_eq!(validated.credential_authority, "ogx.example:8443");
+    }
+
+    #[test]
+    fn config_rejects_ambient_authorization_with_user_credential() {
+        let cfg: FileSearchFilterConfig = serde_yaml::from_str(
+            "vector_store_url: https://ogx.example\nuser_credential: ogx_files\nforward_headers: [authorization]\n",
+        )
+        .unwrap();
+        assert!(build_config_with_client(&cfg, crate::subrequest::isolated_client(1)).is_err());
     }
 }
