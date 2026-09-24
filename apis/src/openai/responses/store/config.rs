@@ -10,7 +10,10 @@ use serde::Deserialize;
 
 #[cfg(feature = "store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
-use crate::store::{PoolConfig, SslMode, StoreCompressionConfig, validate_table_identifier};
+use crate::{
+    openai::RequestBodyPhase,
+    store::{PoolConfig, SslMode, StoreCompressionConfig, validate_table_identifier},
+};
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_response_store";
@@ -40,6 +43,11 @@ pub(crate) enum StorageBackend {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResponseStoreConfig {
+    /// Request-body lifecycle. Defaults to `pre_read`; use `bound_upstream`
+    /// only after an unconditional binding router.
+    #[serde(default)]
+    pub request_body_phase: RequestBodyPhase,
+
     /// Storage backend to use.
     pub backend: StorageBackend,
 

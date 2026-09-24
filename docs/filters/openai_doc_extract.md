@@ -9,6 +9,7 @@ Converts `input_file` content parts to `input_text` for backends that do not sup
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
+| `request_body_phase` | `pre_read` \| `bound_upstream` | no | Request-body lifecycle. Defaults to `pre_read`; use `bound_upstream` only after an unconditional binding router. |
 | `allow_pre_security_callout` | bool | no | Acknowledge that `StreamBuffer` body processing runs before header-phase security filters.  Must be `true`. |
 | `max_rewritten_body_bytes` | integer | no | Maximum size in bytes of the request body this filter *produces* after converting `input_file` parts to `input_text` (default 64 MiB). Raw request body size is governed by the pipeline's `body_limits`, not this field. |
 | `max_content_bytes` | integer | no | Maximum decoded content bytes per file (default 10 MiB). |

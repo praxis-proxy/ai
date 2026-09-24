@@ -17,6 +17,19 @@ fn default_config_parses() {
 }
 
 #[test]
+fn body_phase_defaults_to_pre_read_and_can_bind_upstream() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::None);
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str("request_body_phase: bound_upstream").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.request_body_access(), BodyAccess::None);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
+}
+
+#[test]
 fn config_with_custom_timeout() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_ms: 10000").unwrap();
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();

@@ -281,18 +281,33 @@ fn response_body_access_is_read_only() {
 }
 
 #[test]
-fn bound_request_body_access_is_read_only() {
+fn request_body_phase_defaults_to_pre_read_and_can_bind_upstream() {
     let filter = make_filter();
     assert_eq!(
         filter.request_body_access(),
-        BodyAccess::None,
-        "store setup should not run before an upstream is bound"
+        BodyAccess::ReadOnly,
+        "legacy pipelines should retain pre-read store setup"
     );
     assert_eq!(
         filter.bound_upstream_request_body_access(),
-        BodyAccess::ReadOnly,
-        "bound request body access should be ReadOnly so the store is registered before rehydrate"
+        BodyAccess::None,
+        "legacy pipelines should not require a bound upstream"
     );
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+request_body_phase: bound_upstream
+backend: sqlite
+database_url: "sqlite::memory:"
+responses_table: test_responses
+conversations_table: test_conversations
+"#,
+    )
+    .unwrap();
+    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
+    let filter = ResponseStoreFilter::new(cfg);
+    assert_eq!(filter.request_body_access(), BodyAccess::None);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
 }
 
 #[test]

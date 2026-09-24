@@ -61,18 +61,26 @@ fn from_config_unknown_field_rejected() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn bound_body_access_is_read_write() {
+fn body_phase_defaults_to_pre_read_and_can_bind_upstream() {
     let filter = make_filter();
     assert_eq!(
         filter.request_body_access(),
-        BodyAccess::None,
-        "file_resolve should not run before an upstream is bound"
+        BodyAccess::ReadWrite,
+        "legacy pipelines should retain pre-read file resolution"
     );
     assert_eq!(
         filter.bound_upstream_request_body_access(),
-        BodyAccess::ReadWrite,
-        "file_resolve must have post-binding read-write body access"
+        BodyAccess::None,
+        "legacy pipelines should not require a bound upstream"
     );
+
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "files_api_url: http://files-api:8321\nallow_pre_security_callout: true\nrequest_body_phase: bound_upstream",
+    )
+    .unwrap();
+    let filter = FileResolveFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.request_body_access(), BodyAccess::None);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
 }
 
 #[test]

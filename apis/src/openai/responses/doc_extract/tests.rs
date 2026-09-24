@@ -13,12 +13,16 @@ use super::{
     extract::{ExtractError, ExtractionBudget, extract_input_file, parse_data_uri},
     *,
 };
-use crate::test_utils::{make_filter_context, make_request};
+use crate::{
+    openai::RequestBodyPhase,
+    test_utils::{make_filter_context, make_request},
+};
 
 // -- Helpers ------------------------------------------------------------------
 
 fn make_filter() -> DocExtractFilter {
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: 10_485_760,
@@ -31,6 +35,7 @@ fn make_filter() -> DocExtractFilter {
 
 fn make_filter_reject() -> DocExtractFilter {
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: 10_485_760,
@@ -132,18 +137,24 @@ fn from_config_zero_max_content_bytes_rejected() {
 // -- Body access tests --------------------------------------------------------
 
 #[test]
-fn bound_body_access_is_read_write() {
+fn body_phase_defaults_to_pre_read_and_can_bind_upstream() {
     let filter = make_filter();
     assert_eq!(
         filter.request_body_access(),
-        BodyAccess::None,
-        "doc_extract should not run before an upstream is bound"
+        BodyAccess::ReadWrite,
+        "legacy pipelines should retain pre-read document extraction"
     );
     assert_eq!(
         filter.bound_upstream_request_body_access(),
-        BodyAccess::ReadWrite,
-        "doc_extract needs ReadWrite after binding to rewrite the body"
+        BodyAccess::None,
+        "legacy pipelines should not require a bound upstream"
     );
+
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("allow_pre_security_callout: true\nrequest_body_phase: bound_upstream").unwrap();
+    let filter = DocExtractFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.request_body_access(), BodyAccess::None);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
 }
 
 #[test]
@@ -490,6 +501,7 @@ async fn unsupported_format_continue_leaves_input_file() {
 #[test]
 fn non_text_data_uri_skips_without_decoding() {
     let mut budget = ExtractionBudget::new(&DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: 10_485_760,
@@ -711,6 +723,7 @@ async fn persisted_history_does_not_double_count_references() {
     use super::super::state::ResponsesState;
 
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: 10_485_760,
@@ -862,6 +875,7 @@ fn sync_state_leaves_original_input_untouched() {
 #[tokio::test]
 async fn rejects_when_too_many_file_references() {
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: 10_485_760,
@@ -893,6 +907,7 @@ async fn rejects_when_too_many_file_references() {
 #[tokio::test]
 async fn rejects_oversized_base64_before_decode() {
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: 10,
@@ -929,6 +944,7 @@ async fn rejects_oversized_base64_before_decode() {
 #[test]
 fn base64_precheck_does_not_reject_at_exact_limit() {
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: 3,
@@ -952,6 +968,7 @@ fn base64_precheck_does_not_reject_at_exact_limit() {
 fn filename_prefix_counted_in_content_limit() {
     let limit: usize = 100;
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: limit,
@@ -980,6 +997,7 @@ fn filename_prefix_counted_in_content_limit() {
 fn filename_prefix_fits_within_content_limit() {
     let limit: usize = 100;
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: limit,
@@ -1187,6 +1205,7 @@ fn from_config_exceeds_max_content_bytes_rejected() {
 #[test]
 fn malformed_base64_returns_decode_error() {
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: 10_485_760,
@@ -1213,6 +1232,7 @@ fn malformed_base64_returns_decode_error() {
 #[test]
 fn invalid_utf8_continue_skips() {
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: 10_485_760,
@@ -1242,6 +1262,7 @@ fn invalid_utf8_continue_skips() {
 #[test]
 fn invalid_utf8_reject_returns_unsupported() {
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: 10_485_760,
@@ -1269,6 +1290,7 @@ fn invalid_utf8_reject_returns_unsupported() {
 #[test]
 fn aggregate_text_bytes_overflow_rejected() {
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: MAX_JSON_BODY_BYTES,
         max_content_bytes: 10_485_760,
@@ -1351,6 +1373,7 @@ async fn rejects_when_state_body_exceeds_max_rewritten_body_bytes() {
     use super::super::state::ResponsesState;
 
     let cfg = DocExtractConfig {
+        request_body_phase: RequestBodyPhase::default(),
         allow_pre_security_callout: true,
         max_rewritten_body_bytes: 200,
         max_content_bytes: 10_485_760,

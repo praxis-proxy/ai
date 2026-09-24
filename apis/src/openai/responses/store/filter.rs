@@ -803,8 +803,14 @@ impl HttpFilter for ResponseStoreFilter {
         "openai_response_store"
     }
 
+    fn request_body_access(&self) -> BodyAccess {
+        self.config.request_body_phase.pre_read_access(BodyAccess::ReadOnly)
+    }
+
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadOnly
+        self.config
+            .request_body_phase
+            .bound_upstream_access(BodyAccess::ReadOnly)
     }
 
     fn request_body_mode(&self) -> BodyMode {

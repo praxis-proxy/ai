@@ -16,6 +16,14 @@ pub(crate) mod error_response_formatter;
 pub(crate) mod include;
 mod operation;
 pub(crate) mod operation_classifier;
+#[cfg(any(
+    feature = "openai-conversations",
+    feature = "openai-file-resolve-filter",
+    feature = "openai-mcp-tools",
+    feature = "openai-responses",
+    feature = "store"
+))]
+mod request_body_phase;
 pub(crate) mod responses;
 pub(crate) mod sse;
 #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
@@ -36,6 +44,14 @@ pub use conversations::{
 pub use conversations::{OpenaiConversationsFilter, implementation_openapi_json as conversations_openapi_json};
 pub use operation::OpenAiOperationSpec;
 pub use operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter};
+#[cfg(any(
+    feature = "openai-conversations",
+    feature = "openai-file-resolve-filter",
+    feature = "openai-mcp-tools",
+    feature = "openai-responses",
+    feature = "store"
+))]
+pub(crate) use request_body_phase::RequestBodyPhase;
 #[cfg(feature = "openai-compact")]
 pub use responses::CompactFilter;
 #[cfg(feature = "openai-file-resolve-filter")]

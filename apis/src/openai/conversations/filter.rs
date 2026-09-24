@@ -26,7 +26,7 @@ use tracing::{debug, trace, warn};
 #[cfg(feature = "store-postgres")]
 use super::config::revalidate_postgres_host;
 use super::{
-    config::{ConversationsConfig, RequestBodyPhase, StorageBackend, validate_config},
+    config::{ConversationsConfig, StorageBackend, validate_config},
     handlers,
     routes::{APPLICATION_PROTOCOL, ConversationOperation, match_route},
 };
@@ -521,17 +521,13 @@ impl HttpFilter for OpenaiConversationsFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        match self.config.request_body_phase {
-            RequestBodyPhase::PreRead => BodyAccess::ReadOnly,
-            RequestBodyPhase::BoundUpstream => BodyAccess::None,
-        }
+        self.config.request_body_phase.pre_read_access(BodyAccess::ReadOnly)
     }
 
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        match self.config.request_body_phase {
-            RequestBodyPhase::PreRead => BodyAccess::None,
-            RequestBodyPhase::BoundUpstream => BodyAccess::ReadOnly,
-        }
+        self.config
+            .request_body_phase
+            .bound_upstream_access(BodyAccess::ReadOnly)
     }
 
     fn response_body_access(&self) -> BodyAccess {

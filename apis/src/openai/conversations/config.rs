@@ -10,7 +10,10 @@ use serde::Deserialize;
 
 #[cfg(feature = "store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_set_identifiers};
-use crate::store::{PoolConfig, SslMode, validate_table_identifier};
+use crate::{
+    openai::RequestBodyPhase,
+    store::{PoolConfig, SslMode, validate_table_identifier},
+};
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_conversations";
@@ -28,18 +31,6 @@ pub(crate) enum StorageBackend {
 
     /// `PostgreSQL` backend. Enabled by default through `store-postgres`.
     Postgres,
-}
-
-/// Request-body lifecycle used for body-bearing Conversations operations.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RequestBodyPhase {
-    /// Read the body before header-phase routing, preserving standalone use.
-    #[default]
-    PreRead,
-
-    /// Read the body after the logical upstream has been bound.
-    BoundUpstream,
 }
 
 // -----------------------------------------------------------------------------

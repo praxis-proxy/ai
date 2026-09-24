@@ -11,7 +11,7 @@ use super::resolve_url::NormalizedOrigin;
 use crate::{
     callout_identity::credential_authority,
     callout_policy::OnMissing,
-    openai::{api_client, responses::body_limits::validate_size_limit},
+    openai::{RequestBodyPhase, api_client, responses::body_limits::validate_size_limit},
 };
 
 /// Default HTTP timeout for Files API callout requests (30 000 ms).
@@ -44,6 +44,11 @@ pub(crate) enum FileUrlMode {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileResolveConfig {
+    /// Request-body lifecycle. Defaults to `pre_read`; use `bound_upstream`
+    /// only after an unconditional binding router.
+    #[serde(default)]
+    pub request_body_phase: RequestBodyPhase,
+
     /// Outbound filter chain applied to configured Files API
     /// (`file_id`) metadata and content requests.
     ///
@@ -501,6 +506,7 @@ timeout_ms: 300001"#;
     #[test]
     fn valid_config_passes() {
         let cfg = FileResolveConfig {
+            request_body_phase: RequestBodyPhase::default(),
             outbound_chain: default_outbound_chain(),
             allow_pre_security_callout: true,
             files_api_url: "http://files-api:8321".to_owned(),

@@ -114,8 +114,14 @@ impl HttpFilter for DocExtractFilter {
         "openai_doc_extract"
     }
 
+    fn request_body_access(&self) -> BodyAccess {
+        self.config.request_body_phase.pre_read_access(BodyAccess::ReadWrite)
+    }
+
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        BodyAccess::ReadWrite
+        self.config
+            .request_body_phase
+            .bound_upstream_access(BodyAccess::ReadWrite)
     }
 
     fn request_body_mode(&self) -> BodyMode {

@@ -19,6 +19,7 @@ On successful discovery, one `mcp_list_tools` output item per resolved server (i
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
+| `request_body_phase` | `pre_read` \| `bound_upstream` | no | Request-body lifecycle. Defaults to `pre_read`; use `bound_upstream` only after an unconditional binding router. |
 | `user_credential` | string | no | Optional per-user bearer slot from `callout_credentials`. Must match the corresponding `openai_mcp_dispatch` setting. |
 | `authorization_assertion` | string | no | Optional opaque assertion slot from `callout_credentials.assertions`. Must match the corresponding `openai_mcp_dispatch` setting. |
 | `forward_headers` | string[] | no | Trusted request headers forwarded to connector-backed MCP `initialize` and `tools/list` requests. No request headers are forwarded by default. Credential headers such as `authorization` are rejected because MCP destinations are client-selected; use the MCP tool entry's dedicated `authorization` field instead. Direct, client-selected `server_url` targets never receive ambient request headers. |
