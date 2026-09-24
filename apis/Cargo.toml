@@ -23,7 +23,14 @@ openai-responses = []
 openai-file-resolve-filter = ["openai-responses", "dep:reqwest"]
 # Response and conversation storage (SQL). Implies the Responses kernel it serves.
 store = ["openai-responses", "dep:sqlx", "dep:dashmap", "dep:zstd"]
-store-postgres = ["store", "sqlx/postgres", "sqlx/tls-native-tls"]
+# Internal implementation marker shared by both PostgreSQL profiles. Do not
+# enable directly; select one of the public features below.
+_store-postgres = ["store", "sqlx/postgres", "sqlx/tls-native-tls"]
+# General-purpose PostgreSQL profile: preserves password authentication.
+store-postgres = ["_store-postgres", "sqlx/postgres-password-auth"]
+# Certificate-only PostgreSQL profile: omits SQLx password-authentication
+# crypto and requires `require_certificate_authentication: true` at runtime.
+store-postgres-cert-auth = ["_store-postgres"]
 store-sqlite = ["store", "sqlx/sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 # Locally served Conversations API with JSON Schema item validation and the

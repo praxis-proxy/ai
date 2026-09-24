@@ -282,11 +282,13 @@ fn workspace_root() -> PathBuf {
 mod tests {
     use super::*;
 
+    const FIPS_FEATURES: &str = "openai-responses,store-postgres-cert-auth";
+
     /// A context for the FIPS feature set.
     fn fips_context() -> Context {
         Context {
             root: PathBuf::from("."),
-            features: Some("openai-responses".to_owned()),
+            features: Some(FIPS_FEATURES.to_owned()),
             offline: true,
         }
     }
@@ -296,13 +298,13 @@ mod tests {
         let context = fips_context();
         assert_eq!(
             context.feature_flags(),
-            ["--no-default-features", "--features", "openai-responses"],
+            ["--no-default-features", "--features", FIPS_FEATURES],
             "the FIPS build is built without defaults"
         );
         assert_eq!(context.cargo_flags(), ["--offline"], "offline was requested");
         assert_eq!(
             context.feature_label(),
-            "features: openai-responses (no defaults)",
+            format!("features: {FIPS_FEATURES} (no defaults)"),
             "the label names the features"
         );
         let default = Context {

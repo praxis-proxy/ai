@@ -16,6 +16,7 @@ openai-responses = ["praxis-ai-proxy/openai-responses", "praxis-test-utils/opena
 openai-file-resolve-filter = ["openai-responses", "praxis-ai-proxy/openai-file-resolve-filter", "praxis-test-utils/openai-file-resolve-filter"]
 store = ["openai-responses", "praxis-ai-proxy/store", "praxis-test-utils/store"]
 store-postgres = ["store", "praxis-ai-proxy/store-postgres", "praxis-test-utils/store-postgres", "sqlx/postgres", "sqlx/tls-native-tls"]
+store-postgres-cert-auth = ["store", "praxis-ai-proxy/store-postgres-cert-auth", "praxis-test-utils/store-postgres-cert-auth", "sqlx/postgres", "sqlx/tls-native-tls"]
 store-sqlite = ["store", "praxis-ai-proxy/store-sqlite", "praxis-test-utils/store-sqlite", "sqlx/sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 openai-conversations = ["store", "praxis-ai-proxy/openai-conversations", "praxis-test-utils/openai-conversations"]

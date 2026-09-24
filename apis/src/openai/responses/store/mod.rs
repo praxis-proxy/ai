@@ -21,7 +21,7 @@ pub use input_items::{InputItemPage, ListParams, Order, list_input_items};
 pub use self::filter::ResponseStoreFilter;
 
 #[cfg(test)]
-#[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(all(feature = "_store-postgres", feature = "store-sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,

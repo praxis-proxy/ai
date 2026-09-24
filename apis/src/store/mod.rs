@@ -8,7 +8,7 @@
 //! response records and conversation history.
 
 #[cfg_attr(
-    not(any(feature = "store-postgres", feature = "store-sqlite")),
+    not(any(feature = "_store-postgres", feature = "store-sqlite")),
     expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),
     allow(
         dead_code,
@@ -17,7 +17,7 @@
 )]
 mod compression;
 #[cfg_attr(
-    not(any(feature = "store-postgres", feature = "store-sqlite")),
+    not(any(feature = "_store-postgres", feature = "store-sqlite")),
     expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),
     allow(
         dead_code,
@@ -25,14 +25,14 @@ mod compression;
     )
 )]
 mod pool;
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 mod postgres;
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 mod postgres_tls;
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 pub(crate) mod postgres_url;
 #[cfg_attr(
-    not(any(feature = "store-postgres", feature = "store-sqlite")),
+    not(any(feature = "_store-postgres", feature = "store-sqlite")),
     expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module"),
     allow(
         dead_code,
@@ -47,7 +47,7 @@ mod trait_def;
 mod types;
 
 #[cfg(test)]
-#[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(all(feature = "_store-postgres", feature = "store-sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,
@@ -64,14 +64,14 @@ use std::sync::Arc;
 use dashmap::{DashMap, mapref::entry::Entry};
 /// Validate response-store table identifiers.
 pub(crate) use schemas::validate_identifier as validate_table_identifier;
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 pub(crate) use schemas::validate_postgres_table_identifiers;
-#[cfg(all(feature = "store-postgres", feature = "openai-conversations"))]
+#[cfg(all(feature = "_store-postgres", feature = "openai-conversations"))]
 pub(crate) use schemas::validate_postgres_table_set_identifiers;
 
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 pub use self::postgres::PostgresResponseStore;
-#[cfg(feature = "store-postgres")]
+#[cfg(feature = "_store-postgres")]
 pub use self::postgres_tls::PgTlsConfig;
 #[cfg(feature = "store-sqlite")]
 pub use self::sqlite::SqliteResponseStore;

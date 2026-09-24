@@ -22,11 +22,12 @@ to be FIPS compliant yet, so nobody has to know which features to pick:
 | | Standard | FIPS |
 |---|---|---|
 | Make targets | `release`, `container` | `release-fips`, `container-fips` |
-| Cargo features | `full` | `openai-responses` |
+| Cargo features | `full` | `openai-responses,store-postgres-cert-auth` |
 | Responses API kernel (`openai_responses_*`, `responses_to_chat_completions`, agentic loop, file and web search dispatch) | yes | yes |
 | `aws_sigv4_sign` filter | yes | no: the `aws-sigv4` crate signs with pure-Rust `hmac`/`sha2` |
 | `policy` filter (policy engine) | yes | no: its dependencies carry their own cryptography |
-| Response store (`store-postgres`), Conversations API, context compaction, MCP tools | yes | no: `sqlx` pulls `sha2` for migration checksums, and PostgreSQL authentication is pure Rust |
+| PostgreSQL Responses store | yes | yes: certificate-only SQLx profile through system OpenSSL |
+| SQLite store, Conversations API, context compaction, MCP tools | yes | no: their additional dependency boundaries have not been cleared for this profile |
 | `openai_file_resolve`, `azure_ad`, `gcp_adc`, MCP tool dispatch | `full` / experimental | no: `reqwest` bundles its own TLS provider (`aws-lc-rs`) |
 | Base image | Alpine, praxis-ai built with upstream Rust | `ubi9/ubi-minimal`, praxis-ai built with Red Hat's `rust-toolset` on `ubi9/ubi`, both pinned by digest and signature-verified |
 | OpenSSL | Alpine's, dynamically linked | UBI's, dynamically linked (`openssl-libs` and `openssl-fips-provider-so`), the validated module on a FIPS host |
@@ -45,6 +46,12 @@ crates performing security-relevant cryptography in the image are the rustls
 protocol engine and the OpenSSL bindings that delegate every primitive to the
 system library; the rest of the crypto-adjacent crates in the image are
 listed in the exemption table at the end of this page.
+
+The certificate-only store currently pins SQLx to commit `6736b97d` from a
+temporary fork. That commit makes migrations, PostgreSQL password
+authentication, and advisory-lock string hashing independently optional.
+The pin can return to an upstream release after [transact-rs/sqlx#4417],
+[transact-rs/sqlx#4420], and [transact-rs/sqlx#4421] land and are released.
 
 ## Host prerequisites
 
@@ -164,10 +171,15 @@ Every crypto-adjacent component in the FIPS image, and why it is compliant:
 | subtle, zeroize, secrecy | constant-time comparison, wiping, secret wrappers | helpers |
 | policy engine (`policy` filter) | JWT, OAuth, Valkey builtins carry aws-lc, sha2 and hmac | not in the FIPS build |
 | `aws_sigv4_sign` filter | the `aws-sigv4` crate's hmac/sha2 | not in the FIPS build |
-| response stores, Conversations, compaction, MCP tools | sqlx's sha2 (migration checksums), sqlx-postgres' md-5/hmac/sha2/hkdf/rsa (SCRAM) | not in the FIPS build |
+| PostgreSQL Responses store | SQL transport and client-certificate authentication | compliant through system OpenSSL; migrations, password authentication, and advisory-lock hashing are not compiled |
+| SQLite store, Conversations, compaction, MCP tools | additional database or request-client dependencies | not in the FIPS build |
 | `openai_file_resolve`, `azure_ad`, `gcp_adc`, MCP tool dispatch | reqwest's bundled rustls provider (aws-lc-rs) | not in the FIPS build |
 | `basic_auth` filter (praxis core) | password hashing through OpenSSL's SHA-256 (EVP) | compliant; experimental in praxis-ai and off in every build unless enabled |
 | sha2, rcgen, aws-lc-rs | test utilities, fixtures and xtask | development only, absent from the shipped binary and its manifest |
+
+[transact-rs/sqlx#4417]: https://github.com/transact-rs/sqlx/pull/4417
+[transact-rs/sqlx#4420]: https://github.com/transact-rs/sqlx/pull/4420
+[transact-rs/sqlx#4421]: https://github.com/transact-rs/sqlx/issues/4421
 
 The report and Red Hat's scanner both confirm the last row on every build:
 the embedded crate manifest lists none of the denied crates, and the binary
