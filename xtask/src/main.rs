@@ -22,6 +22,8 @@ mod echo;
 mod filter_docs;
 mod fips;
 #[cfg(feature = "dev")]
+mod flow_generator;
+#[cfg(feature = "dev")]
 mod flow_graph;
 #[cfg(feature = "dev")]
 mod flow_visualizer;
