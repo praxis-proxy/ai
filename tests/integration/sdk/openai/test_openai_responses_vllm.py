@@ -7020,6 +7020,149 @@ class TestFileResolveOutboundChain:
         )
 
 
+# ---------------------------------------------------------------------------
+# Model rewrite on Chat Completions
+# ---------------------------------------------------------------------------
+
+MODEL_REWRITE_CONFIG_PATH = "examples/configs/openai/responses/model-rewrite.yaml"
+
+# The client-facing name the alias table maps onto the real backend model.
+# Matches the shipped example's "codex-*" wildcard alias.
+MODEL_REWRITE_CLIENT_MODEL = "codex-mini-2026-06-24"
+
+
+def _write_model_rewrite_config(praxis_port: int, backend_endpoint: str) -> str:
+    """Patch the shipped model-rewrite example for the selected backend.
+
+    Substituting the backend model name for the example's `llama-3.3-70b`
+    updates the alias target, the `default_model`, and the router's
+    `x-praxis-ai-effective-model` match in one pass, so the rewritten model
+    is both what the backend receives and what selects the cluster. All
+    three example clusters point at the one backend under test.
+    """
+    with open(MODEL_REWRITE_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    for placeholder in ("127.0.0.1:3001", "127.0.0.1:3002", "127.0.0.1:3003"):
+        config = config.replace(placeholder, backend_endpoint)
+    config = config.replace("llama-3.3-70b", VLLM_MODEL)
+
+    return _persist_config(config)
+
+
+@pytest.fixture(scope="session")
+def model_rewrite_proxy(tmp_path_factory, request, backend_endpoint):
+    """Start a Praxis proxy with the shipped model-rewrite pipeline."""
+    port = _free_port()
+    config_path = _write_model_rewrite_config(port, backend_endpoint)
+    binary = _find_binary()
+
+    log_dir = tmp_path_factory.mktemp("model-rewrite")
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Model rewrite proxy logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def model_rewrite_client(model_rewrite_proxy):
+    """Return an OpenAI client pointed at the model-rewrite proxy."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{model_rewrite_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+class TestModelRewriteChatCompletionsVLLM:
+    """openai_responses_model_rewrite applied to POST /v1/chat/completions.
+
+    A gateway advertises one client-facing model name while the selected
+    backend requires its own. The filter rewrites the top-level `model`
+    before the request leaves the proxy, so the backend never sees the
+    client-facing name and never 404s on an unknown model.
+    """
+
+    def test_chat_completions_alias_rewritten_for_backend(
+        self, model_rewrite_client
+    ):
+        completion = model_rewrite_client.chat.completions.create(
+            model=MODEL_REWRITE_CLIENT_MODEL,
+            messages=[{"role": "user", "content": "Say hi."}],
+            max_tokens=16,
+        )
+
+        assert completion.model == VLLM_MODEL, (
+            f"backend should report the rewritten model, got {completion.model!r}"
+        )
+        assert completion.choices, "backend should return at least one choice"
+
+    def test_chat_completions_streaming_alias_rewritten_for_backend(
+        self, model_rewrite_client
+    ):
+        stream = model_rewrite_client.chat.completions.create(
+            model=MODEL_REWRITE_CLIENT_MODEL,
+            messages=[{"role": "user", "content": "Say hi."}],
+            max_tokens=16,
+            stream=True,
+        )
+
+        models = set()
+        chunks = 0
+        for chunk in stream:
+            chunks += 1
+            if chunk.model:
+                models.add(chunk.model)
+
+        assert chunks, "streamed chat completion should yield at least one chunk"
+        assert models == {VLLM_MODEL}, (
+            f"every chunk should report the rewritten model, got {models!r}"
+        )
+
+    def test_chat_completions_default_model_injected(self, model_rewrite_proxy):
+        """A request with no `model` picks up the configured default_model.
+
+        The SDK requires `model`, so this drives the raw HTTP endpoint.
+        """
+        response = httpx.post(
+            f"http://127.0.0.1:{model_rewrite_proxy}/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Say hi."}],
+                "max_tokens": 16,
+            },
+            timeout=300.0,
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["model"] == VLLM_MODEL, response.text
+
+
 if __name__ == "__main__":
     sys.exit(
         pytest.main(

@@ -30,6 +30,11 @@ use serde::Deserialize;
 /// Quote wildcard alias keys in YAML, such as `"gpt-4.1-*"`, so `*` is
 /// parsed as a literal character rather than YAML alias syntax. The examples
 /// quote all alias keys for consistency.
+///
+/// One alias table serves both create endpoints: the filter rewrites
+/// `POST /v1/responses` and `POST /v1/chat/completions` request bodies and
+/// leaves every other path untouched. The filter name keeps its
+/// `openai_responses_` prefix for config compatibility.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ModelRewriteConfig {

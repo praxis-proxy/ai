@@ -102,7 +102,69 @@ fn example_config_qwen_alias_routes_to_qwen_backend() {
 }
 
 #[test]
-fn example_config_non_responses_routes_to_default() {
+fn example_config_chat_completions_alias_routes_to_qwen_backend() {
+    let llama_guard = start_backend_with_shutdown("llama-backend");
+    let qwen_guard = start_backend_with_shutdown("qwen-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "openai/responses/model-rewrite.yaml",
+        proxy_port,
+        HashMap::from([
+            ("127.0.0.1:3001", llama_guard.port()),
+            ("127.0.0.1:3002", qwen_guard.port()),
+            ("127.0.0.1:3003", default_guard.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"model":"gpt-4.1-mini","messages":[{"role":"user","content":"Route to qwen"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", body));
+
+    assert_eq!(parse_status(&raw), 200, "chat completions alias should route successfully");
+    assert_eq!(
+        parse_body(&raw),
+        "qwen-backend",
+        "gpt-4.1-mini on chat completions should route to qwen-backend via effective model header"
+    );
+}
+
+#[test]
+fn example_config_chat_completions_default_model_routes_to_llama_backend() {
+    let llama_guard = start_backend_with_shutdown("llama-backend");
+    let qwen_guard = start_backend_with_shutdown("qwen-backend");
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+
+    let config = load_example_config(
+        "openai/responses/model-rewrite.yaml",
+        proxy_port,
+        HashMap::from([
+            ("127.0.0.1:3001", llama_guard.port()),
+            ("127.0.0.1:3002", qwen_guard.port()),
+            ("127.0.0.1:3003", default_guard.port()),
+        ]),
+    );
+    let proxy = start_proxy(&config);
+
+    let body = r#"{"messages":[{"role":"user","content":"No model specified"}]}"#;
+    let raw = http_send(proxy.addr(), &json_post("/v1/chat/completions", body));
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "chat completions default injection should succeed"
+    );
+    assert_eq!(
+        parse_body(&raw),
+        "llama-backend",
+        "default_model llama-3.3-70b should route chat completions to llama-backend"
+    );
+}
+
+#[test]
+fn example_config_unaliased_chat_completions_routes_to_default() {
     let llama_guard = start_backend_with_shutdown("llama-backend");
     let qwen_guard = start_backend_with_shutdown("qwen-backend");
     let default_guard = start_backend_with_shutdown("default-backend");
@@ -126,6 +188,6 @@ fn example_config_non_responses_routes_to_default() {
     assert_eq!(
         parse_body(&raw),
         "default-backend",
-        "non-responses traffic should route to default"
+        "an unaliased model leaves the effective model unchanged, so routing falls through to default"
     );
 }
