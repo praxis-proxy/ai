@@ -9,6 +9,7 @@ mod test_utils;
 pub use test_utils::load_example_config;
 
 mod agentic_routing;
+#[cfg(feature = "store-sqlite")]
 mod anthropic_full_flow_agentic;
 mod anthropic_messages;
 mod anthropic_messages_native_vllm;

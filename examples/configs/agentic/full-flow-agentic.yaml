@@ -1,4 +1,4 @@
-# Responses API Full Flow — Unified Agentic Gateway
+# OpenAI Responses + Anthropic Messages — Unified Agentic Gateway
 # Requires `--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Runs the complete Responses API pipeline through an agentic
@@ -308,6 +308,19 @@ filter_chains:
         # Child callouts retain this request/trace identity while Praxis core
         # creates a fresh span ID for each outbound hop.
 
+      - filter: anthropic_messages_format
+        on_invalid: reject
+        conditions:
+          - when:
+              path: "/v1/messages"
+              methods: [POST]
+
+      - filter: anthropic_validate
+        conditions:
+          - when:
+              path: "/v1/messages"
+              methods: [POST]
+
       - filter: state_owner
         # These source names are deployment-specific. The authentication
         # boundary must overwrite them and prevent clients from bypassing it.
@@ -327,6 +340,8 @@ filter_chains:
         credentials:
           - slot: brave_search
             source_header: x-user-brave-key
+          - slot: you_search
+            source_header: x-user-you-key
           - slot: ogx_files
             source_header: x-user-ogx-key
           - slot: mcp_gateway
@@ -351,6 +366,9 @@ filter_chains:
       - filter: openai_operation
 
       - filter: openai_responses_format
+        conditions:
+          - unless:
+              path: "/v1/messages"
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -367,6 +385,8 @@ filter_chains:
       # policy with another trusted routing fact.
       - filter: router
         routes:
+          - path: "/v1/messages"
+            cluster: "messages-backend"
           - path_prefix: "/v1/prompts"
             cluster: "prompts-api"
           - path_prefix: "/v1/embeddings"
@@ -495,12 +515,16 @@ filter_chains:
           - unless:
               bound_upstream:
                 application_provider: openai
+          - unless:
+              path: "/v1/messages"
 
       - filter: openai_tool_parse
         conditions:
           - unless:
               bound_upstream:
                 application_provider: openai
+          - unless:
+              path: "/v1/messages"
 
       - filter: openai_conversations
         backend: sqlite
@@ -511,6 +535,8 @@ filter_chains:
           - unless:
               bound_upstream:
                 application_provider: openai
+          - unless:
+              path: "/v1/messages"
 
       - filter: openai_response_store
         backend: sqlite
@@ -524,12 +550,16 @@ filter_chains:
           - unless:
               bound_upstream:
                 application_provider: openai
+          - unless:
+              path: "/v1/messages"
 
       - filter: openai_responses_rehydrate
         conditions:
           - unless:
               bound_upstream:
                 application_provider: openai
+          - unless:
+              path: "/v1/messages"
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
@@ -556,6 +586,8 @@ filter_chains:
           - unless:
               bound_upstream:
                 application_provider: openai
+          - unless:
+              path: "/v1/messages"
 
       - filter: openai_doc_extract
         allow_pre_security_callout: true
@@ -564,6 +596,8 @@ filter_chains:
           - unless:
               bound_upstream:
                 application_provider: openai
+          - unless:
+              path: "/v1/messages"
 
       - filter: openai_mcp_tool_resolve
         user_credential: mcp_gateway
@@ -581,6 +615,8 @@ filter_chains:
           - unless:
               bound_upstream:
                 application_provider: openai
+          - unless:
+              path: "/v1/messages"
 
       # The router needs a /v1/responses prefix route so managed GET/DELETE
       # resource endpoints can reach the local store. That prefix also binds
@@ -628,6 +664,19 @@ filter_chains:
         steps:
           - name: inference
             filters:
+              # Anthropic Messages and OpenAI Responses share the same frozen
+              # binding and IRR, while retaining protocol-specific loop owners.
+              - filter: anthropic_web_search
+                conditions:
+                  - when:
+                      path: "/v1/messages"
+                provider: you
+                api_key: ${WEB_SEARCH_API_KEY}
+                user_credential: you_search
+                default_context_size: medium
+                timeout_ms: 10000
+                terminal_streaming: true
+
               # Re-project inside the destination-owned subrequest. Core moves
               # the normalized StateOwner extension into each IRR step; this
               # strips any still-uncommitted raw ingress identity headers and
@@ -656,6 +705,9 @@ filter_chains:
               # (600) >= converter stream_timeout_secs (300). These apply on the
               # native path too and stay within the IRR's byte/time caps above.
               - filter: openai_stream_events
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
                 max_buffer_bytes: 67108864
                 max_events: 200000
                 timeout_secs: 600
@@ -664,6 +716,9 @@ filter_chains:
               # web_search_call assignments prepared by the loop owner. Inert
               # until the model emits a web_search_call.
               - filter: openai_web_search
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
                 # Require the per-user key captured by the outer
@@ -675,6 +730,9 @@ filter_chains:
               # MCP calls prepared and classified by the loop owner. Inert
               # until the model emits an MCP tool call.
               - filter: openai_mcp_dispatch
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
                 user_credential: mcp_gateway
                 authorization_assertion: mcp_gateway
                 forward_headers:
@@ -691,6 +749,9 @@ filter_chains:
               # response body and never decides whether another round runs,
               # so it is inert unless the model emits a hosted file_search_call.
               - filter: openai_file_search_callout
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
                 vector_store_url: http://127.0.0.1:3002
                 user_credential: ogx_files
                 # Every vector-store sub-request runs through the filtered
@@ -715,13 +776,25 @@ filter_chains:
               # single continuation signal (action=loop|done). max_infer_iters
               # must stay below the IRR max_iterations safety cap (7 + 1 = 8).
               - filter: openai_agentic_loop
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
                 max_infer_iters: 7
               # Protocol adapters run after the load balancer publishes the
               # selected cluster's typed application metadata.
               - filter: headers
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
                 request_set:
                   - name: Content-Type
                     value: application/json
+              - filter: anthropic_messages_protocol
+                conditions:
+                  - when:
+                      path: "/v1/messages"
+                default_version: "2023-06-01"
+
               # Select an endpoint from the request-level binding and publish
               # exchange-local application metadata. Every selected_upstream
               # condition below reads this fresh selection, so the matching
@@ -743,6 +816,12 @@ filter_chains:
                       application_provider: vllm
                     endpoints:
                       - "127.0.0.1:3001"
+                  - name: "messages-backend"
+                    http:
+                      application_protocol: anthropic_messages
+                      application_provider: vllm
+                    endpoints:
+                      - "127.0.0.1:8000"
 
               # ---- Protocol-adaptive body builders (run AFTER selection) ----
               # Exactly one branch fires, chosen by the selected upstream's
@@ -757,6 +836,8 @@ filter_chains:
                   - when:
                       selected_upstream:
                         application_protocol: openai_responses
+                  - unless:
+                      path: "/v1/messages"
 
               # Chat Completions upstream: translate the canonical Responses
               # request into Chat Completions on the request path, and
@@ -797,6 +878,10 @@ filter_chains:
                       path_prefix: "/v1/responses"
                       methods: [POST]
             on_result:
+              - filter: anthropic_web_search
+                key: action
+                value: loop
+                next: inference
               # openai_agentic_loop is the sole loop authority (issue #1046):
               # it parses each model response, records assignments for the
               # request-phase dispatchers (web_search, mcp_dispatch,

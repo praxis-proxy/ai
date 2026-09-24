@@ -36,7 +36,7 @@ configuration.
   with a real `thinking` source record, preserving it in `source_records` while
   replaying only the visible Anthropic response text.
 - `codex/responses-basic.json` replays one OpenAI Responses turn through
-  `examples/configs/openai/responses/full-flow-agentic.yaml` and verifies the response
+  `examples/configs/agentic/full-flow-agentic.yaml` and verifies the response
   can be read back from the response store.
 
 ## Fixture schema

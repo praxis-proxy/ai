@@ -51,7 +51,7 @@ OGX_BASE_URL = os.environ.get("OGX_BASE_URL", "http://127.0.0.1:8321")
 PRAXIS_AI_BIN = os.environ.get("PRAXIS_AI_BIN")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 REQUIRE_LIVE_WEB_SEARCH = os.environ.get("PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH") == "1"
-CONFIG_PATH = "examples/configs/openai/responses/full-flow-agentic.yaml"
+CONFIG_PATH = "examples/configs/agentic/full-flow-agentic.yaml"
 AGENTIC_CONFIG_PATH = "examples/configs/openai/responses/agentic-loop.yaml"
 IRR_STREAMING_CONFIG_PATH = (
     "examples/configs/openai/responses/irr-terminal-streaming.yaml"
