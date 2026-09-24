@@ -330,6 +330,11 @@ fn build_pingora_server(
     server
 }
 
+/// Address of the first configured listener.
+///
+/// # Panics
+///
+/// Panics if `config.listeners` is empty.
 fn first_listener_address(config: &Config) -> String {
     config
         .listeners
