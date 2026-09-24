@@ -99,7 +99,7 @@ fn load_full_flow_config_with_db(
     db: &TempSqlite,
     port_map: &HashMap<&str, u16>,
 ) -> praxis_core::config::Config {
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("agentic/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml
@@ -119,7 +119,7 @@ fn load_full_flow_agentic_config(
     port_map: &HashMap<&str, u16>,
 ) -> (praxis_core::config::Config, TempSqlite) {
     let db = TempSqlite::new("full_flow_agentic");
-    let path = example_config_path("openai/responses/full-flow-agentic.yaml");
+    let path = example_config_path("agentic/full-flow-agentic.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let yaml = yaml
         .replace("sqlite://responses.db?mode=rwc", db.url())
@@ -141,7 +141,7 @@ async fn full_flow_resolves_rehydrated_files_before_proxy() {
     let proxy_port = free_port();
     let db = TempSqlite::new("full_flow_file_resolve");
 
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("agentic/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let patched = patch_yaml(
         &yaml
@@ -462,7 +462,7 @@ async fn full_flow_previous_response_id_rebuilds_body_with_history() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_prev");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("agentic/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -543,7 +543,7 @@ async fn full_flow_previous_response_id_restored_in_client_response() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_prev_restore");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("agentic/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -617,7 +617,7 @@ async fn full_flow_previous_response_id_restored_in_streaming_response() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_prev_restore_stream");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("agentic/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -704,7 +704,7 @@ async fn full_flow_encoded_response_passes_through_untouched() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_encoded_passthrough");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("agentic/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -787,7 +787,7 @@ async fn full_flow_response_with_validators_drops_stale_validator_on_rewrite() {
     let proxy_port = free_port();
 
     let db = TempSqlite::new("full_flow_validators_passthrough");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("agentic/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml.replace("${WEB_SEARCH_API_KEY}", "test-key");
     let patched = patch_yaml(
@@ -1357,7 +1357,7 @@ fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
     // assign: file_search, web_search, and MCP. Guard the inference step's
     // filter set so a future edit cannot silently drop a dispatcher and leave
     // the loop owner assigning calls no filter will execute.
-    let path = example_config_path("openai/responses/full-flow-agentic.yaml");
+    let path = example_config_path("agentic/full-flow-agentic.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("config should be valid YAML");
     let irr = config["filter_chains"][0]["filters"]
@@ -1652,7 +1652,7 @@ fn ws_full_flow_config(
     ports: &HashMap<&str, u16>,
 ) -> (praxis_core::config::Config, TempSqlite) {
     let db = TempSqlite::new(test_name);
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("agentic/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = yaml
         .replace("sqlite://responses.db?mode=rwc", db.url())

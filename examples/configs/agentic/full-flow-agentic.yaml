@@ -1,15 +1,14 @@
-# Responses API Full Flow — Unified Agentic Gateway
-# Requires `--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite` because these filters are opt-in.
+# OpenAI Responses + Anthropic Messages — Unified Agentic Gateway
+# Requires `--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite`
+# because these OpenAI filters and SQLite are opt-in.
 #
-# Runs the complete Responses API pipeline through an agentic
-# iterative_request_router that executes hosted file_search, web_search,
-# and MCP tool calls in a model-tool-model loop, persisting both buffered
-# and streaming (`stream: true`) responses. This is the single config an
-# operator would deploy for a Responses API gateway that must serve the
-# full agentic loop, the Conversations API, and the dedicated
-# prompts/embeddings/files/vector_stores services behind one listener. The
-# request trace is continued through every nested web-search, OGX, and MCP
-# callout with a fresh span ID per hop.
+# Runs OpenAI Responses and Anthropic Messages through one agentic
+# iterative_request_router, preserving each API's buffered and streaming
+# lifecycle while sharing one listener and one frozen logical-upstream binding.
+# The OpenAI path executes hosted file_search, web_search, and MCP calls; the
+# Anthropic path executes managed WebSearch calls. The request trace is
+# continued through every nested search, OGX, and MCP callout with a fresh
+# span ID per hop.
 #
 # Pre-IRR filters run once on the client request to set up shared state
 # (ResponsesState) which persists across all IRR iterations via extension
@@ -17,10 +16,9 @@
 #
 #   0. state_owner maps deployment-specific trusted ingress headers into one
 #      normalized tenant/issuer/subject context for owner-aware filters.
-#      callout_credentials captures per-user Brave and OGX provider keys from
-#      trusted x-user-brave-key and x-user-ogx-key ingress headers into the
-#      `brave_search` and `ogx_files` slots, then strips both source headers
-#      before inference or IRR processing. The trusted boundary MUST
+#      callout_credentials captures per-user Brave, You.com, OGX, and MCP
+#      provider keys from trusted ingress headers into typed slots, then strips
+#      the source headers before inference or IRR processing. The trusted boundary MUST
 #      unconditionally delete-then-set those source headers on every request;
 #      append-on-success is insufficient because this filter cannot authenticate
 #      header provenance. The IRR carries the resulting typed request extension
@@ -116,10 +114,9 @@
 #      bypass, the `/v1/responses` route matches on the WebSocket
 #      `Upgrade` header (routes cannot match on HTTP method), so a WS
 #      handshake reaches the backend while a non-Responses body gets a
-#      route-miss (404). The bypass router/load_balancer live INSIDE the
-#      branch: a top-level router or load_balancer cannot coexist with an
-#      IRR in the same chain, and the branch rejoins at `terminal` so its
-#      selected cluster is forwarded upstream directly.
+#      route-miss (404). The top-level router freezes a logical binding;
+#      the branch consumes it with a bound-upstream load balancer and rejoins
+#      at `terminal` so its selected cluster is forwarded directly.
 #
 #   11. The iterative_request_router owns the agentic loop for classified
 #      openai_responses create requests. openai_responses_proxy rebuilds
@@ -131,21 +128,18 @@
 #      completed function_call, web_search_call, file_search_call, and MCP
 #      items, records the assignment each request-phase dispatcher must
 #      execute next, and publishes the single loop/done decision. Because
-#      the IRR is the terminal filter, all backend routing for create
-#      requests lives inside the IRR step. That step router is path-only:
-#      the IRR strips every x-praxis-* reserved-prefix header from its
-#      sub-request before the step runs, so it cannot route on
-#      x-praxis-ai-format. Responses-vs-Chat discrimination therefore
-#      happens PRE-IRR at the bypass carrier (step 10); only a classified
-#      openai_responses create request reaches this step.
+#      the IRR is terminal, its load balancer consumes the logical binding
+#      selected before the IRR. Responses-vs-Chat discrimination happens
+#      PRE-IRR at the bypass carrier (step 10); only a classified OpenAI
+#      Responses create or Anthropic Messages request enters the shared step.
 #
 # IRR inference filter chain (canonical #1046 order):
 #   Request phase (forward):
 #     openai_stream_events → openai_web_search → openai_mcp_dispatch
 #       → openai_file_search_callout → openai_agentic_loop
-#       → headers → router → load_balancer → openai_responses_proxy
+#       → headers → load_balancer → openai_responses_proxy
 #   Response phase (reverse):
-#     openai_responses_proxy → load_balancer → router → headers
+#     openai_responses_proxy → load_balancer → headers
 #       → openai_agentic_loop → (dispatchers have no response phase)
 #       → openai_stream_events
 #   The proxy's request-body hook still participates in the pipeline body
@@ -252,12 +246,12 @@
 #   websocat -H="Authorization: Bearer $OPENAI_API_KEY" \
 #     ws://localhost:8080/v1/responses
 #
-# Web search requires the trusted boundary to provide x-user-brave-key. The
-# WEB_SEARCH_API_KEY field remains required by the provider configuration, so
-# set it before starting the proxy; when `user_credential: brave_search` is
-# configured, a missing per-user slot fails closed instead of falling back to
-# that shared key. openai_web_search stays inert until the model emits a
-# web_search_call.
+# Web search requires the trusted boundary to provide x-user-brave-key for
+# OpenAI Responses or x-user-you-key for Anthropic Messages. The
+# WEB_SEARCH_API_KEY field remains required by the provider configuration, but
+# a missing per-user slot fails closed instead of falling back to that shared
+# key. Each web-search filter stays inert until the model emits its matching
+# hosted tool call.
 #
 # Listener and cluster transport timeouts are intentionally omitted.
 # Configured downstream read and upstream idle/read/write timeouts remain
@@ -272,7 +266,7 @@
 #     inference-backend clusters below. The canonical IRR ordering already
 #     permits `prompt.id` once both capabilities are declared; endpoint
 #     identity does not participate in the trust decision.
-#   - Add this headers filter inside the IRR step after the router to
+#   - Add this headers filter inside the IRR step before the load balancer to
 #     replace the downstream Host:
 #
 #       - filter: headers
@@ -303,7 +297,7 @@
 #   cargo build -p praxis-ai-proxy --features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite
 
 listeners:
-  - name: ai-gateway
+  - name: unified-agentic-gateway
     address: "127.0.0.1:8080"
     filter_chains: [full-flow-agentic-pipeline]
 
@@ -314,6 +308,19 @@ filter_chains:
         # Establish typed correlation before IRR snapshots request extensions.
         # Child callouts retain this request/trace identity while Praxis core
         # creates a fresh span ID for each outbound hop.
+
+      - filter: anthropic_messages_format
+        on_invalid: reject
+        conditions:
+          - when:
+              path: "/v1/messages"
+              methods: [POST]
+
+      - filter: anthropic_validate
+        conditions:
+          - when:
+              path: "/v1/messages"
+              methods: [POST]
 
       - filter: state_owner
         # These source names are deployment-specific. The authentication
@@ -334,6 +341,8 @@ filter_chains:
         credentials:
           - slot: brave_search
             source_header: x-user-brave-key
+          - slot: you_search
+            source_header: x-user-you-key
           - slot: ogx_files
             source_header: x-user-ogx-key
           - slot: mcp_gateway
@@ -358,12 +367,18 @@ filter_chains:
       - filter: openai_operation
 
       - filter: openai_conversations
+        conditions:
+          - unless:
+              path: "/v1/messages"
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         conversations_table: openai_conversations
         items_table: openai_conversation_items
 
       - filter: openai_responses_format
+        conditions:
+          - unless:
+              path: "/v1/messages"
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -372,10 +387,19 @@ filter_chains:
           mode: x-praxis-responses-mode
 
       - filter: openai_responses_validate
+        conditions:
+          - unless:
+              path: "/v1/messages"
 
       - filter: openai_tool_parse
+        conditions:
+          - unless:
+              path: "/v1/messages"
 
       - filter: openai_response_store
+        conditions:
+          - unless:
+              path: "/v1/messages"
         backend: sqlite
         # In-memory:
         #   database_url: "sqlite::memory:"
@@ -385,8 +409,14 @@ filter_chains:
         conversations_table: openai_conversations
 
       - filter: openai_responses_rehydrate
+        conditions:
+          - unless:
+              path: "/v1/messages"
 
       - filter: openai_file_resolve
+        conditions:
+          - unless:
+              path: "/v1/messages"
         files_api_url: "http://127.0.0.1:9999"
         # Require the caller-scoped OGX credential captured above. It is
         # injected only on configured file_id callouts; file_url downloads
@@ -414,12 +444,18 @@ filter_chains:
         timeout_ms: 10000
 
       - filter: openai_doc_extract
+        conditions:
+          - unless:
+              path: "/v1/messages"
         allow_pre_security_callout: true
         on_unsupported: continue
 
       - filter: openai_mcp_tool_resolve
         user_credential: mcp_gateway
         authorization_assertion: mcp_gateway
+        conditions:
+          - unless:
+              path: "/v1/messages"
         forward_headers:
           - x-tenant-id
           - x-user-id
@@ -430,23 +466,38 @@ filter_chains:
           - id: trusted-mcp
             server_url: http://127.0.0.1:8001/mcp
 
+      # Bind the request to one logical application upstream before choosing
+      # either direct dispatch or the shared agentic IRR. PR #1251 freezes this
+      # binding for every IRR iteration.
+      - filter: router
+        routes:
+          - path: "/v1/messages"
+            cluster: "messages-backend"
+          - path_prefix: "/v1/prompts"
+            cluster: "prompts-api"
+          - path_prefix: "/v1/embeddings"
+            cluster: "embeddings-api"
+          - path_prefix: "/v1/files"
+            cluster: "files-api"
+          - path: "/v1/responses"
+            cluster: "inference-backend"
+          - path_prefix: "/v1/vector_stores"
+            cluster: "vector-stores-backend"
+
       # Bypass gateway: a no-op carrier that runs for everything EXCEPT a
       # classified `POST /v1/responses` create request. When it runs, its
       # unconditional branch routes the request directly (WebSocket
       # upgrades, /v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores)
       # and rejoins at `terminal`, forwarding the selected cluster upstream
-      # without entering the IRR. The router and load_balancer live inside
-      # the branch because a top-level router/load_balancer cannot coexist
-      # with the IRR below. The `unless` condition skips this carrier only
+      # without entering the IRR. The branch load balancer consumes the
+      # binding published by the top-level router. The `unless` condition
+      # skips this carrier only
       # for `POST /v1/responses` bearing x-praxis-ai-format:
       # openai_responses, so create requests fall through to the IRR while a
       # non-Responses body on /v1/responses (Chat Completions, Anthropic
       # Messages, or unclassified) still runs the carrier and gets a
       # route-miss (404). Discrimination lives here because the IRR strips
-      # x-praxis-* headers from its sub-request; inside the branch the
-      # /v1/responses route matches the WebSocket Upgrade header (routes
-      # cannot match on HTTP method), so a WS handshake reaches the backend
-      # while a non-Responses body does not.
+      # x-praxis-* headers from its sub-request.
       - filter: headers
         conditions:
           - unless:
@@ -454,34 +505,26 @@ filter_chains:
               methods: [POST]
               headers:
                 x-praxis-ai-format: "openai_responses"
+          - unless:
+              path: "/v1/messages"
+              methods: [POST]
+              headers:
+                x-praxis-ai-format: "anthropic_messages"
         branch_chains:
           - name: bypass-irr
             rejoin: terminal
             chains:
               - name: bypass-chain
                 filters:
-                  - filter: router
-                    routes:
-                      - path_prefix: "/v1/prompts"
-                        cluster: "prompts-api"
-                      - path_prefix: "/v1/embeddings"
-                        cluster: "embeddings-api"
-                      - path_prefix: "/v1/files"
-                        cluster: "files-api"
-                      # WebSocket handshakes are GET /v1/responses with an
-                      # Upgrade header. Routes cannot match on HTTP method, so
-                      # the Upgrade header discriminates: a WS handshake routes
-                      # to the backend, while a non-Responses body posted to
-                      # /v1/responses carries no Upgrade header and gets a
-                      # route-miss (404) here instead of reaching the backend.
-                      - path: "/v1/responses"
-                        headers:
-                          upgrade: "websocket"
-                        cluster: "inference-backend"
-                      - path_prefix: "/v1/vector_stores"
-                        cluster: "vector-stores-backend"
                   - filter: load_balancer
+                    cluster_source: bound_upstream
                     clusters:
+                      # The Messages path normally falls through to the IRR.
+                      # Keep it in the bypass catalog as well so every
+                      # statically reachable path can serve its frozen binding.
+                      - name: "messages-backend"
+                        endpoints:
+                          - "127.0.0.1:8000"
                       - name: "prompts-api"
                         endpoints:
                           - "127.0.0.1:9998"
@@ -531,6 +574,21 @@ filter_chains:
         steps:
           - name: inference
             filters:
+              - filter: anthropic_web_search
+                conditions:
+                  - when:
+                      path: "/v1/messages"
+                provider: you
+                api_key: ${WEB_SEARCH_API_KEY}
+                user_credential: you_search
+                default_context_size: medium
+                timeout_ms: 10000
+                terminal_streaming: true
+                outbound_chain:
+                  name: anthropic-web-search-outbound
+                  filters:
+                    - filter: request_id
+
               # Re-project inside the destination-owned subrequest. Core moves
               # the normalized StateOwner extension into each IRR step; this
               # strips any still-uncommitted raw ingress identity headers and
@@ -550,11 +608,17 @@ filter_chains:
               # fails closed with a 500 on an effective stream:true request
               # when it is absent.
               - filter: openai_stream_events
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
 
               # Request-phase dispatcher: runs first on re-entry to execute
               # web_search_call assignments prepared by the loop owner. Inert
               # until the model emits a web_search_call.
               - filter: openai_web_search
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
                 # Require the per-user key captured by the outer
@@ -575,6 +639,9 @@ filter_chains:
               - filter: openai_mcp_dispatch
                 user_credential: mcp_gateway
                 authorization_assertion: mcp_gateway
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
                 forward_headers:
                   - x-tenant-id
                   - x-user-id
@@ -589,6 +656,9 @@ filter_chains:
               # response body and never decides whether another round runs,
               # so it is inert unless the model emits a hosted file_search_call.
               - filter: openai_file_search_callout
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
                 vector_store_url: http://127.0.0.1:3002
                 user_credential: ogx_files
                 # Cross-cutting outbound chain every vector-store sub-request runs
@@ -616,22 +686,24 @@ filter_chains:
               # single continuation signal (action=loop|done). max_infer_iters
               # must stay below the IRR max_iterations safety cap (7 + 1 = 8).
               - filter: openai_agentic_loop
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
                 max_infer_iters: 7
               - filter: headers
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
                 request_set:
                   - name: Content-Type
                     value: application/json
-              # Path-only routing. The x-praxis-ai-format header cannot be
-              # matched here: the IRR strips every x-praxis-* reserved-prefix
-              # header from the sub-request before this step's router runs, so
-              # a header match would always miss (404). Responses-vs-Chat
-              # discrimination therefore happens PRE-IRR at the bypass carrier
-              # (only a classified openai_responses POST reaches this step).
-              - filter: router
-                routes:
-                  - path: "/v1/responses"
-                    cluster: "inference-backend"
+              - filter: anthropic_messages_protocol
+                conditions:
+                  - when:
+                      path: "/v1/messages"
+                default_version: "2023-06-01"
               - filter: load_balancer
+                cluster_source: bound_upstream
                 clusters:
                   - name: "inference-backend"
                     # Optional provider capability. Uncomment only when this
@@ -643,13 +715,39 @@ filter_chains:
                     #   application_provider: openai
                     endpoints:
                       - "127.0.0.1:3001"
+                  - name: "messages-backend"
+                    endpoints:
+                      - "127.0.0.1:8000"
+                  # These clusters normally terminate in the direct-dispatch
+                  # branch above. Re-declaring them here gives the control-flow
+                  # validator a complete bound-cluster catalog for the
+                  # conditional branch fall-through path.
+                  - name: "prompts-api"
+                    endpoints:
+                      - "127.0.0.1:9998"
+                  - name: "embeddings-api"
+                    endpoints:
+                      - "127.0.0.1:9997"
+                  - name: "files-api"
+                    endpoints:
+                      - "127.0.0.1:9999"
+                  - name: "vector-stores-backend"
+                    endpoints:
+                      - "127.0.0.1:3002"
               # Selects typed streaming automatically when the effective
               # outbound body carries `"stream": true`; otherwise buffers.
               # Its request hook runs after load-balancer selection. Prompt
               # templates fail closed unless the selected cluster enables both
               # optional application declarations above.
               - filter: openai_responses_proxy
+                conditions:
+                  - unless:
+                      path: "/v1/messages"
             on_result:
+              - filter: anthropic_web_search
+                key: action
+                value: loop
+                next: inference
               # openai_agentic_loop is the sole loop authority (issue #1046):
               # it parses each model response, records assignments for the
               # request-phase dispatchers (web_search, mcp_dispatch,
