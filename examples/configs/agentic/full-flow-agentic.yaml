@@ -33,7 +33,9 @@
 #      enforcement before it is exposed as a multi-owner state service.
 #
 #   0. openai_operation publishes the typed registry match consumed by
-#      openai_conversations. It must remain earlier in this filter chain.
+#      openai_conversations. Its operation-result branch also sends a validated
+#      Responses WebSocket handshake directly upstream before body-oriented
+#      filters run. It must remain earlier in this filter chain.
 #
 #   1. openai_conversations handles CRUD for the Conversations API
 #      (/v1/conversations) and sets has_conversation metadata when a
@@ -97,26 +99,25 @@
 #      branch_chains bypass) routes everything EXCEPT a classified
 #      `POST /v1/responses` create request directly to a backend. The IRR
 #      below fully owns the sub-request lifecycle, which is incompatible
-#      with WebSocket upgrades and with the dedicated
-#      prompts/embeddings/files/vector_stores services — so those, plus
-#      `GET /v1/responses` WebSocket handshakes, take the bypass branch.
+#      with the dedicated prompts/embeddings/files/vector_stores services, so
+#      those take the bypass branch. Validated `GET /v1/responses` WebSocket
+#      handshakes have already taken openai_operation's direct branch.
 #      The carrier's `unless` condition skips it only when the request is
 #      `POST /v1/responses` AND classified as x-praxis-ai-format:
 #      openai_responses, so genuine create requests fall through to the
 #      IRR while a Chat Completions or Anthropic Messages body posted to
-#      /v1/responses (or a GET WebSocket handshake) still runs the
-#      carrier. The `unless` gate is a positive allow-list of one format:
+#      /v1/responses still runs the carrier. The `unless` gate is a positive
+#      allow-list of one format:
 #      any body that is NOT classified openai_responses (Chat Completions,
 #      Anthropic Messages, or any future/unclassified format) runs the
 #      carrier and gets a route-miss (404) — no per-format reject rule is
 #      needed. Discrimination lives here, PRE-IRR, because the IRR strips
-#      x-praxis-* headers from its sub-request (see step 11). Inside the
-#      bypass, the `/v1/responses` route matches on the WebSocket
-#      `Upgrade` header (routes cannot match on HTTP method), so a WS
-#      handshake reaches the backend while a non-Responses body gets a
-#      route-miss (404). The top-level router freezes a logical binding;
-#      the branch consumes it with a bound-upstream load balancer and rejoins
-#      at `terminal` so its selected cluster is forwarded directly.
+#      x-praxis-* headers from its sub-request (see step 11). There is no
+#      `/v1/responses` bypass route: anything not selected by the typed
+#      WebSocket operation branch or admitted to the IRR gets a route-miss
+#      (404). The top-level router freezes a logical binding; the branch
+#      consumes it with a bound-upstream load balancer and rejoins at `terminal`
+#      so its selected cluster is forwarded directly.
 #
 #   11. The iterative_request_router owns the agentic loop for classified
 #      openai_responses create requests. openai_responses_proxy rebuilds
@@ -242,7 +243,7 @@
 #   curl http://localhost:8080/v1/responses/<response-id>
 #
 #   # Responses WebSocket (requires a WebSocket-capable backend) —
-#   # takes the bypass branch, never the IRR
+#   # takes openai_operation's direct branch, never the IRR
 #   websocat -H="Authorization: Bearer $OPENAI_API_KEY" \
 #     ws://localhost:8080/v1/responses
 #
@@ -258,11 +259,11 @@
 # active after a 101 upgrade and can terminate long-lived WebSockets.
 #
 # Direct OpenAI upstream variant:
-#   - Replace the local inference-backend endpoint with api.openai.com:443
-#     and configure tls.sni: api.openai.com (in BOTH the bypass branch's
-#     load_balancer and the IRR step's load_balancer).
+#   - Replace the local inference-backend endpoint with api.openai.com:443 and
+#     configure tls.sni: api.openai.com in all three declarations: the
+#     WebSocket branch, the bypass binding catalog, and the IRR step.
 #   - Uncomment the `http.application_protocol: openai_responses` and
-#     `http.application_provider: openai` declarations on BOTH
+#     `http.application_provider: openai` declarations on all three
 #     inference-backend clusters below. The canonical IRR ordering already
 #     permits `prompt.id` once both capabilities are declared; endpoint
 #     identity does not participate in the trust decision.
@@ -363,8 +364,31 @@ filter_chains:
         tenant_header: x-tenant-id
         subject_header: x-user-id
 
-      # Publishes the typed operation consumed by openai_conversations.
+      # Publishes the typed operation consumed by openai_conversations and
+      # sends a validated Responses WebSocket handshake directly upstream.
       - filter: openai_operation
+        branch_chains:
+          - name: responses-websocket
+            on_result:
+              filter: openai_operation
+              key: operation_id
+              result: praxis_createResponseWebSocket
+            rejoin: terminal
+            chains:
+              - name: responses-websocket-direct
+                filters:
+                  - filter: router
+                    routes:
+                      - path: "/v1/responses"
+                        cluster: "inference-backend"
+                  - filter: load_balancer
+                    clusters:
+                      - name: "inference-backend"
+                        # http:
+                        #   application_protocol: openai_responses
+                        #   application_provider: openai
+                        endpoints:
+                          - "127.0.0.1:3001"
 
       - filter: openai_conversations
         conditions:
@@ -486,8 +510,8 @@ filter_chains:
 
       # Bypass gateway: a no-op carrier that runs for everything EXCEPT a
       # classified `POST /v1/responses` create request. When it runs, its
-      # unconditional branch routes the request directly (WebSocket
-      # upgrades, /v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores)
+      # unconditional branch routes dedicated service requests directly
+      # (/v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores)
       # and rejoins at `terminal`, forwarding the selected cluster upstream
       # without entering the IRR. The branch load balancer consumes the
       # binding published by the top-level router. The `unless` condition
@@ -516,6 +540,21 @@ filter_chains:
             chains:
               - name: bypass-chain
                 filters:
+                  # Re-apply the direct-route allow-list before consuming the
+                  # frozen top-level binding. The typed operation branch above
+                  # has already dispatched valid WebSocket handshakes, so no
+                  # /v1/responses route belongs here: non-Responses bodies and
+                  # unsupported methods must get the router's 404 route miss.
+                  - filter: router
+                    routes:
+                      - path_prefix: "/v1/prompts"
+                        cluster: "prompts-api"
+                      - path_prefix: "/v1/embeddings"
+                        cluster: "embeddings-api"
+                      - path_prefix: "/v1/files"
+                        cluster: "files-api"
+                      - path_prefix: "/v1/vector_stores"
+                        cluster: "vector-stores-backend"
                   - filter: load_balancer
                     cluster_source: bound_upstream
                     clusters:
