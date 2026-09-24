@@ -41,7 +41,7 @@ pub use gemini::OpenaiChatCompletionsToVertexaiGeminiFilter;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use http::HeaderName;
+use http::{HeaderName, HeaderValue};
 use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
 };
@@ -74,6 +74,11 @@ const STATUS_KEY: &str = "vertex.response_status";
 
 /// `anthropic-beta` header name, for the beta-flag allowlist.
 const ANTHROPIC_BETA: HeaderName = HeaderName::from_static("anthropic-beta");
+/// Internal route marker read by the unified router. Client-supplied
+/// `x-praxis-*` headers are rejected at the protocol boundary.
+pub const ROUTE_HEADER: HeaderName = HeaderName::from_static("x-praxis-ai-vertex-route");
+/// Route marker value emitted for requests handled by the Vertex supplier.
+const ROUTE_VALUE: HeaderValue = HeaderValue::from_static("vertex");
 
 /// Translates Anthropic Messages requests to Vertex AI `rawPredict` and
 /// Vertex responses back to the Anthropic dialect.
@@ -181,8 +186,7 @@ impl HttpFilter for VertexFilter {
         true
     }
 
-    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        self.filter_beta_flags(ctx);
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
 
@@ -203,13 +207,16 @@ impl HttpFilter for VertexFilter {
             return Ok(FilterAction::Continue);
         };
         match transform_request(bytes, operation, &self.config) {
-            Ok(transformed) => {
+            Ok(Some(transformed)) => {
+                self.filter_beta_flags(ctx);
                 debug!(
                     model = %transformed.user_model,
                     path = %transformed.path,
                     "translated Anthropic request to Vertex rawPredict"
                 );
                 ctx.rewritten_path = Some(transformed.path);
+                ctx.request_headers_to_set
+                    .push((ROUTE_HEADER.clone(), ROUTE_VALUE.clone()));
                 // Marks "this request was transformed"; response-side
                 // transforms only run for marked requests. Set here (not
                 // in on_request) because the pre-read body phase may run
@@ -218,6 +225,7 @@ impl HttpFilter for VertexFilter {
                 ctx.set_metadata(MODEL_KEY, transformed.user_model);
                 *body = Some(Bytes::from(transformed.body));
             },
+            Ok(None) => return Ok(FilterAction::Continue),
             Err(error) => return Ok(FilterAction::Reject(invalid_request_rejection(&error.to_string()))),
         }
         Ok(FilterAction::Continue)
@@ -416,10 +424,10 @@ mod tests {
         ctx: &mut HttpFilterContext<'_>,
         body: Bytes,
     ) -> Result<FilterAction, FilterError> {
-        debug_assert!(matches!(filter.on_request(ctx).await?, FilterAction::Continue));
         let mut body = Some(body);
         let action = filter.on_request_body(ctx, &mut body, true).await?;
         ctx.buffered_request_body = body;
+        debug_assert!(matches!(filter.on_request(ctx).await?, FilterAction::Continue));
         Ok(action)
     }
 
@@ -442,6 +450,30 @@ mod tests {
         assert!(body.get("model").is_none());
         assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
         assert_eq!(ctx.get_metadata(MODEL_KEY), Some("vertex/claude-sonnet-4-5"));
+        assert!(
+            ctx.request_headers_to_set
+                .iter()
+                .any(|(name, value)| name == ROUTE_HEADER && value == ROUTE_VALUE)
+        );
+    }
+
+    #[tokio::test]
+    async fn non_vertex_model_passes_through_without_route_marker() {
+        let filter = filter("project: demo");
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let original = Bytes::from_static(
+            br#"{"model":"claude-sonnet-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+
+        let action = run_request_body(filter.as_ref(), &mut ctx, original.clone())
+            .await
+            .unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(ctx.buffered_request_body.as_ref(), Some(&original));
+        assert!(ctx.rewritten_path.is_none());
+        assert!(ctx.get_metadata(OPERATION_KEY).is_none());
+        assert!(!ctx.request_headers_to_set.iter().any(|(name, _)| name == ROUTE_HEADER));
     }
 
     #[tokio::test]
@@ -537,13 +569,16 @@ mod tests {
         );
         let mut ctx = make_filter_context(&request);
 
-        filter.on_request(&mut ctx).await.unwrap();
+        run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
+            .await
+            .unwrap();
         assert!(ctx.request_headers_to_remove.is_empty());
-        assert_eq!(ctx.request_headers_to_set.len(), 1);
-        assert_eq!(
-            ctx.request_headers_to_set[0].1.to_str().unwrap(),
-            "context-1m-2025-08-07"
-        );
+        let beta_header = ctx
+            .request_headers_to_set
+            .iter()
+            .find(|(name, _)| name == ANTHROPIC_BETA)
+            .unwrap();
+        assert_eq!(beta_header.1.to_str().unwrap(), "context-1m-2025-08-07");
     }
 
     #[tokio::test]
@@ -556,9 +591,15 @@ mod tests {
         );
         let mut ctx = make_filter_context(&request);
 
-        filter.on_request(&mut ctx).await.unwrap();
+        run_request_body(filter.as_ref(), &mut ctx, messages_body(r#""max_tokens":8"#))
+            .await
+            .unwrap();
         assert_eq!(ctx.request_headers_to_remove.len(), 1);
-        assert!(ctx.request_headers_to_set.is_empty());
+        assert!(
+            ctx.request_headers_to_set
+                .iter()
+                .all(|(name, _)| name != ANTHROPIC_BETA)
+        );
     }
 
     #[tokio::test]
@@ -571,8 +612,16 @@ mod tests {
         );
         let mut ctx = make_filter_context(&request);
 
-        filter.on_request(&mut ctx).await.unwrap();
-        assert!(ctx.request_headers_to_set.is_empty() && ctx.request_headers_to_remove.is_empty());
+        let body = Bytes::from_static(
+            br#"{"model":"claude-sonnet-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+        run_request_body(filter.as_ref(), &mut ctx, body).await.unwrap();
+        assert!(
+            ctx.request_headers_to_set
+                .iter()
+                .all(|(name, _)| name != ANTHROPIC_BETA)
+        );
+        assert!(ctx.request_headers_to_remove.iter().all(|name| name != ANTHROPIC_BETA));
     }
 
     #[tokio::test]

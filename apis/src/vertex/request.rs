@@ -115,7 +115,7 @@ pub(crate) fn transform_request(
     body: &[u8],
     operation: Operation,
     cfg: &VertexConfig,
-) -> Result<TransformedRequest, RequestError> {
+) -> Result<Option<TransformedRequest>, RequestError> {
     let mut value: Value =
         serde_json::from_slice(body).map_err(|error| RequestError::InvalidJson(error.to_string()))?;
     let obj = value
@@ -127,6 +127,9 @@ pub(crate) fn transform_request(
         .and_then(Value::as_str)
         .ok_or(RequestError::MissingModel)?
         .to_owned();
+    if !user_model.starts_with(&cfg.model_prefix) {
+        return Ok(None);
+    }
     let publisher = publisher_model(&user_model, &cfg.model_prefix);
     validate_publisher_model(publisher)?;
 
@@ -145,7 +148,7 @@ pub(crate) fn transform_request(
 
     let body = serde_json::to_vec(&value)
         .map_err(|error| RequestError::InvalidJson(format!("re-serializing the request failed: {error}")))?;
-    Ok(TransformedRequest { body, path, user_model })
+    Ok(Some(TransformedRequest { body, path, user_model }))
 }
 
 /// Rewrite the Messages body in place and build its `rawPredict` path.
@@ -206,7 +209,9 @@ mod tests {
     #[test]
     fn messages_move_model_to_url_and_inject_version() {
         let body = json!({"model": "vertex/claude-sonnet-4-5", "max_tokens": 8, "messages": []}).to_string();
-        let out = transform_request(body.as_bytes(), Operation::Messages, &cfg()).unwrap();
+        let out = transform_request(body.as_bytes(), Operation::Messages, &cfg())
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             out.path,
@@ -224,10 +229,10 @@ mod tests {
 
     #[test]
     fn stream_flag_selects_stream_verb() {
-        let body = json!({"model": "claude-sonnet-4-5", "stream": true, "messages": []}).to_string();
+        let body = json!({"model": "vertex/claude-sonnet-4-5", "stream": true, "messages": []}).to_string();
         let out = transform_request(body.as_bytes(), Operation::Messages, &cfg()).unwrap();
+        let out = out.unwrap();
         assert!(out.path.ends_with(":streamRawPredict"), "got {}", out.path);
-        // Unprefixed models pass through to the publisher id unchanged.
         assert!(
             out.path.contains("models/claude-sonnet-4-5@20250929"),
             "got {}",
@@ -236,9 +241,21 @@ mod tests {
     }
 
     #[test]
+    fn non_vertex_models_are_not_transformed() {
+        let body = json!({"model": "claude-sonnet-5", "messages": []}).to_string();
+        assert!(
+            transform_request(body.as_bytes(), Operation::Messages, &cfg())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn count_tokens_keeps_model_in_body() {
         let body = json!({"model": "vertex/claude-sonnet-4-5", "messages": []}).to_string();
-        let out = transform_request(body.as_bytes(), Operation::CountTokens, &cfg()).unwrap();
+        let out = transform_request(body.as_bytes(), Operation::CountTokens, &cfg())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             out.path,
             "/v1/projects/demo-project/locations/global/publishers/anthropic/models/count-tokens:rawPredict"
