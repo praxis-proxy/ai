@@ -1783,11 +1783,13 @@ fn outbound_pipeline_projecting_owner() -> Arc<FilterPipeline> {
     let mut registry = FilterRegistry::with_builtins();
     praxis_filter::register_filters!(
         @register registry,
-        http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
+        http "project_state_owner_headers" => crate::ProjectStateOwnerHeadersFilter::from_config
     );
     let mut entries: Vec<FilterEntry> = vec![
-        serde_yaml::from_str("filter: state_owner_headers\ntenant_header: x-tenant-id\nsubject_header: x-user-id\n")
-            .expect("state-owner projection entry parses"),
+        serde_yaml::from_str(
+            "filter: project_state_owner_headers\ntenant_header: x-tenant-id\nsubject_header: x-user-id\n",
+        )
+        .expect("state-owner projection entry parses"),
     ];
     let mut pipeline = FilterPipeline::build(&mut entries, &registry).expect("owner projection pipeline builds");
     pipeline.set_allow_private_upstreams(true);

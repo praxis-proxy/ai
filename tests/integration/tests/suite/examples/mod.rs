@@ -77,6 +77,7 @@ mod openai_state_ownership;
 #[cfg(feature = "store-sqlite")]
 mod openai_stream_events;
 mod openai_tool_parse;
+mod project_state_owner_headers;
 mod prompt_enrichment;
 mod provider_route;
 #[cfg(feature = "store-sqlite")]
@@ -88,7 +89,6 @@ mod responses_to_chat_completions;
 mod responses_to_chat_completions_conformance;
 #[cfg(feature = "store-sqlite")]
 mod session_replay;
-mod state_owner_headers;
 mod time_to_first_token;
 mod token_count;
 mod token_counting;

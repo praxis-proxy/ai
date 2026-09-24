@@ -7,10 +7,10 @@ use std::collections::HashMap;
 
 use praxis_test_utils::{free_port, http_send, parse_body, parse_status, start_header_echo_backend};
 
-const EXAMPLE: &str = "state-owner-headers.yaml";
+const EXAMPLE: &str = "project-state-owner-headers.yaml";
 
 #[test]
-fn state_owner_headers_config_parses() {
+fn project_state_owner_headers_config_parses() {
     let config = super::load_example_config(EXAMPLE, 29930, HashMap::from([("127.0.0.1:3000", 29931_u16)]));
 
     assert_eq!(config.listeners.len(), 1, "should have one listener");
@@ -18,7 +18,7 @@ fn state_owner_headers_config_parses() {
 }
 
 #[test]
-fn state_owner_headers_replaces_ingress_assertions_with_ogx_contract() {
+fn project_state_owner_headers_replaces_ingress_assertions_with_ogx_contract() {
     let backend_guard = start_header_echo_backend();
     let proxy_port = free_port();
     let config = super::load_example_config(
@@ -66,7 +66,7 @@ fn state_owner_headers_replaces_ingress_assertions_with_ogx_contract() {
 }
 
 #[test]
-fn state_owner_headers_fails_closed_when_identity_is_missing() {
+fn project_state_owner_headers_fails_closed_when_identity_is_missing() {
     let backend_guard = start_header_echo_backend();
     let proxy_port = free_port();
     let config = super::load_example_config(
