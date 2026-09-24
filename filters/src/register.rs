@@ -323,6 +323,10 @@ fn register_vertex_filters(registry: &mut FilterRegistry) {
         @register registry,
         http "openai_chat_completions_to_vertexai_gemini" => praxis_ai_apis::vertex::OpenaiChatCompletionsToVertexaiGeminiFilter::from_config
     );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "vertex" => praxis_ai_apis::vertex::VertexFilter::from_config
+    );
 }
 
 /// Register OpenAI Responses API request-path filters.

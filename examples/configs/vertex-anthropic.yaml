@@ -1,0 +1,54 @@
+# Vertex AI dialect translation (Anthropic Messages -> rawPredict)
+#
+# Rewrites Anthropic Messages requests into Vertex AI rawPredict form:
+# the body model moves into the URL path (:rawPredict /
+# :streamRawPredict), anthropic_version is injected, and responses are
+# translated back (user-facing model id restored, Google error
+# envelopes mapped to Anthropic error types).
+#
+# Production note: replace the static credential_injection below with
+# the experimental `gcp_adc` filter (source: key_file) so the gateway
+# mints short-lived OAuth tokens from a service-account key instead of
+# a static value, and point the cluster at
+# aiplatform.googleapis.com:443 with tls.sni likewise.
+#
+# This example is fully self-contained and proxies to a local backend
+# so it can be exercised without GCP credentials.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/vertex-anthropic.yaml
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - vertex
+
+filter_chains:
+  - name: vertex
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: vertex
+      - filter: vertex
+        project: my-gcp-project
+        # location: global          # default; use a regional location for data residency
+        # model_prefix: "vertex/"   # user-facing ids are stripped to publisher ids
+        # model_pin: "@20250929"    # pin snapshots so upgrades are deliberate
+        # beta_allowlist: [context-1m-2025-08-07]
+      - filter: credential_injection
+        clusters:
+          - name: vertex
+            header: Authorization
+            header_prefix: "Bearer "
+            value: "ya29.example-static-token"
+            strip_client_credential: true
+      - filter: load_balancer
+        clusters:
+          - name: vertex
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend
