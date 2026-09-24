@@ -252,8 +252,8 @@ fn nemo_guardrails_block_rejects_with_403() {
     );
 }
 
-/// `NeMo` returns `"modified"` → proxy rewrites the last user message with the
-/// masked text and forwards it to the upstream.
+/// `NeMo` returns `"modified"` → proxy rewrites each modified user message
+/// with the masked text and forwards the conversation to the upstream.
 #[test]
 fn nemo_guardrails_modified_forwards_redacted_body() {
     let backend = start_echo_backend();
@@ -272,7 +272,7 @@ fn nemo_guardrails_modified_forwards_redacted_body() {
         r#"{"model":"test","messages":[{"role":"system","content":"Be helpful"},{"role":"user","content":"My SSN is 123-45-6789"}]}"#,
     );
 
-    assert_eq!(status, 200, "NeMo 'modified' should forward to upstream");
+    assert_eq!(status, 200, "NeMo 'modified' should forward to upstream; body: {body}");
     assert!(
         !body.contains("123-45-6789"),
         "original PII must not reach the upstream; got: {body}"
@@ -290,8 +290,52 @@ fn nemo_guardrails_modified_forwards_redacted_body() {
     assert_eq!(
         messages.get(1).and_then(|m| m.get("content")),
         Some(&serde_json::json!("My SSN is [REDACTED]")),
-        "last user message should be replaced with NeMo content"
+        "user message should be replaced with NeMo content"
     );
+}
+
+/// `NeMo` returns `"modified"` for every user turn → proxy rewrites all of
+/// them, not only the last user message.
+#[test]
+fn nemo_guardrails_modified_rewrites_all_user_messages() {
+    let backend = start_echo_backend();
+    let nemo = StatefulCapturingBackend::new(vec![
+        (
+            200,
+            r#"{"status":"modified","content":"My mail is <EMAIL>","rail":"pii"}"#.to_owned(),
+        ),
+        (
+            200,
+            r#"{"status":"modified","content":"my credit card is <CREDIT-CARD>","rail":"pii"}"#.to_owned(),
+        ),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = load_example_config(
+        "nemo-guardrails.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", nemo.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_post(
+        proxy.addr(),
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"My mail is xxx@gmail.com"},{"role":"assistant","content":"No."},{"role":"user","content":"my credit card is 1234-5678-92211"}]}"#,
+    );
+
+    assert_eq!(status, 200, "NeMo 'modified' should forward to upstream; body: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("upstream should echo valid JSON");
+    assert_eq!(
+        parsed.get("messages"),
+        Some(&serde_json::json!([
+            {"role":"user","content":"My mail is <EMAIL>"},
+            {"role":"assistant","content":"No."},
+            {"role":"user","content":"my credit card is <CREDIT-CARD>"}
+        ])),
+        "every modified user turn should be rewritten; got: {body}"
+    );
+    assert_eq!(nemo.requests().len(), 2, "each user turn should be checked");
 }
 
 /// `NeMo` returns an unknown status → proxy fails closed

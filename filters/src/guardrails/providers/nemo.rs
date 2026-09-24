@@ -20,7 +20,7 @@ use praxis_filter::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult};
+use super::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult, MessageRedaction};
 
 /// Default timeout for `NeMo` HTTP calls (10 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -194,33 +194,8 @@ impl GuardProvider for NemoProvider {
         if indices.is_empty() {
             return Ok(GuardResult::Pass);
         }
-        if indices.len() > self.max_message_checks as usize {
-            return Err(format!(
-                "ai_guardrails (nemo): conversation has {} target messages, exceeding max_message_checks ({})",
-                indices.len(),
-                self.max_message_checks
-            )
-            .into());
-        }
-
-        let mut pending_redact = None;
-        for end in indices {
-            runtime
-                .deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| -> FilterError {
-                    "ai_guardrails (nemo): overall evaluation deadline exceeded".into()
-                })?;
-            let messages = messages
-                .get(..=end)
-                .ok_or_else(|| -> FilterError { "ai_guardrails (nemo): invalid message index".into() })?;
-            match apply_slice_result(pending_redact, self.check_messages(messages, phase, runtime).await?) {
-                Ok(pending) => pending_redact = pending,
-                Err(block) => return Ok(block),
-            }
-        }
-
-        Ok(pending_redact.unwrap_or(GuardResult::Pass))
+        ensure_check_limit(indices.len(), self.max_message_checks)?;
+        self.evaluate_prefixes(messages, indices, phase, runtime).await
     }
 }
 
@@ -229,6 +204,28 @@ impl GuardProvider for NemoProvider {
     reason = "separates construction from the async callout path"
 )]
 impl NemoProvider {
+    /// Evaluate each target prefix, accumulating `modified` replacements.
+    async fn evaluate_prefixes(
+        &self,
+        messages: Vec<serde_json::Value>,
+        indices: Vec<usize>,
+        phase: GuardPhase,
+        runtime: &GuardCalloutRuntime<'_>,
+    ) -> Result<GuardResult, FilterError> {
+        let mut pending_redact = None;
+        for end in indices {
+            ensure_deadline_remaining(runtime.deadline)?;
+            let prefix = messages
+                .get(..=end)
+                .ok_or_else(|| -> FilterError { "ai_guardrails (nemo): invalid message index".into() })?;
+            match apply_slice_result(pending_redact, self.check_messages(prefix, phase, runtime).await?, end) {
+                Ok(pending) => pending_redact = pending,
+                Err(block) => return Ok(block),
+            }
+        }
+        Ok(pending_redact.unwrap_or(GuardResult::Pass))
+    }
+
     /// POST one message slice to `/v1/checks` through the outbound chain.
     async fn check_messages(
         &self,
@@ -319,18 +316,67 @@ fn validate_guardrails_config(config: &NemoConfig) -> Result<(), FilterError> {
     Ok(())
 }
 
+/// Reject conversations that would exceed the configured per-request check cap.
+fn ensure_check_limit(count: usize, max_message_checks: u32) -> Result<(), FilterError> {
+    if count > max_message_checks as usize {
+        return Err(format!(
+            "ai_guardrails (nemo): conversation has {count} target messages, exceeding max_message_checks ({max_message_checks})"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Fail closed if the overall evaluation deadline has already elapsed.
+fn ensure_deadline_remaining(deadline: Instant) -> Result<(), FilterError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .map(|_| ())
+        .ok_or_else(|| "ai_guardrails (nemo): overall evaluation deadline exceeded".into())
+}
+
 /// Combine a per-slice verdict into the running evaluation state.
 ///
-/// `blocked` fails fast. `modified` is retained but later slices are still
-/// checked so a subsequent `blocked` verdict is not missed.
+/// `blocked` fails fast. `modified` replacements are accumulated so every
+/// redacted turn is rewritten. Later slices are still checked so a subsequent
+/// `blocked` verdict is not missed.
 fn apply_slice_result(
     pending_redact: Option<GuardResult>,
     result: GuardResult,
+    message_index: usize,
 ) -> Result<Option<GuardResult>, GuardResult> {
     match result {
         GuardResult::Pass => Ok(pending_redact),
         block @ GuardResult::Block { .. } => Err(block),
-        redact @ GuardResult::Redact { .. } => Ok(Some(redact)),
+        GuardResult::Redact {
+            mut replacements,
+            reason,
+        } => {
+            for replacement in &mut replacements {
+                replacement.index = message_index;
+            }
+            Ok(Some(merge_redact(pending_redact, replacements, reason)))
+        },
+    }
+}
+
+/// Append `extra` replacements onto any pending `modified` verdict.
+fn merge_redact(pending: Option<GuardResult>, extra: Vec<MessageRedaction>, reason: String) -> GuardResult {
+    match pending {
+        Some(GuardResult::Redact {
+            replacements: mut existing,
+            ..
+        }) => {
+            existing.extend(extra);
+            GuardResult::Redact {
+                replacements: existing,
+                reason,
+            }
+        },
+        None | Some(GuardResult::Pass | GuardResult::Block { .. }) => GuardResult::Redact {
+            replacements: extra,
+            reason,
+        },
     }
 }
 
@@ -436,10 +482,11 @@ fn map_nemo_response(nemo: NemoResponse) -> Result<GuardResult, FilterError> {
         "blocked" => Ok(GuardResult::Block {
             reason: rail.unwrap_or_default(),
         }),
-        "modified" => Ok(GuardResult::Redact {
-            modified_text: content,
-            reason: rail.unwrap_or_else(|| "modified".to_owned()),
-        }),
+        "modified" => Ok(GuardResult::redact_message(
+            0,
+            content,
+            rail.unwrap_or_else(|| "modified".to_owned()),
+        )),
         other => Err(format!("ai_guardrails (nemo): unknown status '{other}'").into()),
     }
 }
@@ -548,33 +595,42 @@ guardrails:
 
     #[test]
     fn apply_slice_result_modified_then_blocked_fails_fast_on_blocked() {
-        let modified = GuardResult::Redact {
-            modified_text: "masked".into(),
-            reason: "pii".into(),
-        };
+        let modified = GuardResult::redact_message(1, "masked".into(), "pii".into());
         let blocked = GuardResult::Block {
             reason: "toxicity".into(),
         };
 
-        let pending = apply_slice_result(None, modified.clone()).unwrap();
-        assert_eq!(pending, Some(modified));
-        assert_eq!(apply_slice_result(pending, blocked.clone()).unwrap_err(), blocked);
+        let pending = apply_slice_result(None, modified, 1).unwrap();
+        assert_eq!(
+            pending,
+            Some(GuardResult::redact_message(1, "masked".into(), "pii".into()))
+        );
+        assert_eq!(apply_slice_result(pending, blocked.clone(), 3).unwrap_err(), blocked);
     }
 
     #[test]
-    fn apply_slice_result_keeps_latest_modified_verdict() {
-        let first = GuardResult::Redact {
-            modified_text: "first".into(),
-            reason: "pii".into(),
-        };
-        let second = GuardResult::Redact {
-            modified_text: "second".into(),
-            reason: "pii".into(),
-        };
+    fn apply_slice_result_accumulates_modified_replacements() {
+        let first = GuardResult::redact_message(0, "first".into(), "pii".into());
+        let second = GuardResult::redact_message(0, "second".into(), "pii".into());
 
-        let pending = apply_slice_result(None, first).unwrap();
-        let pending = apply_slice_result(pending, GuardResult::Pass).unwrap();
-        assert_eq!(apply_slice_result(pending, second.clone()).unwrap(), Some(second));
+        let pending = apply_slice_result(None, first, 1).unwrap();
+        let pending = apply_slice_result(pending, GuardResult::Pass, 2).unwrap();
+        assert_eq!(
+            apply_slice_result(pending, second, 3).unwrap(),
+            Some(GuardResult::Redact {
+                replacements: vec![
+                    MessageRedaction {
+                        index: 1,
+                        modified_text: "first".into(),
+                    },
+                    MessageRedaction {
+                        index: 3,
+                        modified_text: "second".into(),
+                    },
+                ],
+                reason: "pii".into(),
+            })
+        );
     }
 
     #[test]
@@ -622,10 +678,7 @@ guardrails:
         };
         assert_eq!(
             map_nemo_response(resp).unwrap(),
-            GuardResult::Redact {
-                modified_text: "masked text".to_string(),
-                reason: "pii".to_string(),
-            }
+            GuardResult::redact_message(0, "masked text".to_string(), "pii".to_string())
         );
     }
 

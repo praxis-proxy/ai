@@ -44,6 +44,16 @@ impl fmt::Display for GuardPhase {
 // GuardResult
 // -----------------------------------------------------------------------------
 
+/// One rewritten chat message produced by a `modified` provider verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRedaction {
+    /// Index into the extracted `messages` array (request) or
+    /// `choices[].message` array (response).
+    pub index: usize,
+    /// Provider-rewritten text for this message.
+    pub modified_text: String,
+}
+
 /// Normalized verdict from an external guardrail provider evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuardResult {
@@ -56,8 +66,8 @@ pub enum GuardResult {
     },
     /// Content contains sensitive data — forward with masked text.
     Redact {
-        /// Provider-rewritten text with sensitive data masked.
-        modified_text: String,
+        /// Per-message replacements to apply to the buffered body.
+        replacements: Vec<MessageRedaction>,
         /// Human-readable redaction reason from the provider.
         reason: String,
     },
@@ -72,6 +82,14 @@ impl GuardResult {
             Self::Pass => "passed",
             Self::Block { .. } => "blocked",
             Self::Redact { .. } => "redacted",
+        }
+    }
+
+    /// Build a `modified` verdict that rewrites a single extracted message.
+    pub fn redact_message(index: usize, modified_text: String, reason: String) -> Self {
+        Self::Redact {
+            replacements: vec![MessageRedaction { index, modified_text }],
+            reason,
         }
     }
 }
@@ -140,11 +158,7 @@ mod tests {
         assert_eq!(GuardResult::Pass.status_label(), "passed");
         assert_eq!(GuardResult::Block { reason: "test".into() }.status_label(), "blocked");
         assert_eq!(
-            GuardResult::Redact {
-                modified_text: "***".into(),
-                reason: "pii".into()
-            }
-            .status_label(),
+            GuardResult::redact_message(0, "***".into(), "pii".into()).status_label(),
             "redacted"
         );
     }

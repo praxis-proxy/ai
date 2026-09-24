@@ -81,7 +81,7 @@ impl Backend {
 
         spawn_tcp_server(move |mut stream| {
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let _headers = read_until_headers_complete(&mut stream);
+            let _request = read_full_request(&mut stream);
 
             let mut resp = format!(
                 "HTTP/1.1 {status} {reason}\r\n\
@@ -114,7 +114,10 @@ impl Backend {
 
         spawn_tcp_server_with_shutdown(move |mut stream| {
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            let _headers = read_until_headers_complete(&mut stream);
+            // Drain headers and body before responding. Closing with an unread
+            // POST body becomes a TCP RST, which fails NeMo callouts (especially
+            // on Windows) instead of delivering the mocked `/v1/checks` JSON.
+            let _request = read_full_request(&mut stream);
 
             let mut resp = format!(
                 "HTTP/1.1 {status} {reason}\r\n\

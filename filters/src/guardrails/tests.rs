@@ -45,10 +45,31 @@ phase:
 
 /// Mount a JSON `/v1/checks` response on `mock_server`.
 async fn mount_nemo_checks_response(mock_server: &wiremock::MockServer, body: serde_json::Value) {
-    use wiremock::{Mock, ResponseTemplate, matchers::method};
+    mount_nemo_checks_responses(mock_server, vec![body]).await;
+}
+
+/// Mount sequential JSON `/v1/checks` responses, one per callout.
+async fn mount_nemo_checks_responses(mock_server: &wiremock::MockServer, bodies: Vec<serde_json::Value>) {
+    use std::sync::Mutex;
+
+    use wiremock::{Mock, Request, Respond, ResponseTemplate, matchers::method};
+
+    struct SequentialJson(Mutex<std::vec::IntoIter<serde_json::Value>>);
+
+    impl Respond for SequentialJson {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            let body = self
+                .0
+                .lock()
+                .expect("sequence mutex")
+                .next()
+                .expect("unexpected extra NeMo call");
+            ResponseTemplate::new(200).set_body_json(body)
+        }
+    }
 
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .respond_with(SequentialJson(Mutex::new(bodies.into_iter())))
         .mount(mock_server)
         .await;
 }
@@ -112,32 +133,51 @@ fn json_str<'a>(value: &'a serde_json::Value, pointer: &str) -> Option<&'a str> 
     value.pointer(pointer).and_then(serde_json::Value::as_str)
 }
 
-/// Assert request-phase redaction recorded `redacted` and rewrote only the last user message.
-fn assert_request_last_user_redacted(ctx: &HttpFilterContext<'_>, body: &bytes::Bytes) {
+/// Assert request-phase redaction recorded `redacted` and rewrote every listed user turn.
+fn assert_request_users_redacted(ctx: &HttpFilterContext<'_>, body: &bytes::Bytes, expected_messages: &[(&str, &str)]) {
     assert_eq!(
         ctx.filter_results.get("ai_guardrails").and_then(|r| r.get("status")),
         Some("redacted")
     );
+    assert_no_injected_content_length(ctx);
+    assert_forwarded_messages(body, expected_messages);
+}
+
+/// Assert the filter did not inject a `content-length` header.
+fn assert_no_injected_content_length(ctx: &HttpFilterContext<'_>) {
     assert!(
         ctx.extra_request_headers
             .iter()
             .all(|(k, _)| k.as_ref() != "content-length"),
         "filter must not set content-length (core handles framing)"
     );
+}
+
+/// Assert the forwarded request body matches `expected_messages` in order.
+fn assert_forwarded_messages(body: &bytes::Bytes, expected_messages: &[(&str, &str)]) {
     let forwarded: serde_json::Value = serde_json::from_slice(body).expect("forwarded JSON");
     assert_eq!(
         json_str(&forwarded, "/model"),
         Some("test"),
         "non-message fields should be preserved"
     );
-    assert_eq!(json_str(&forwarded, "/messages/0/content"), Some("Be helpful"));
-    assert_eq!(json_str(&forwarded, "/messages/1/content"), Some("first"));
-    assert_eq!(json_str(&forwarded, "/messages/2/content"), Some("ok"));
-    assert_eq!(
-        json_str(&forwarded, "/messages/3/content"),
-        Some("masked text"),
-        "only the last user message content should be replaced"
-    );
+    let messages = forwarded
+        .get("messages")
+        .and_then(|value| value.as_array())
+        .expect("messages should be an array");
+    assert_eq!(messages.len(), expected_messages.len());
+    for (index, (role, content)) in expected_messages.iter().enumerate() {
+        assert_eq!(
+            messages.get(index).and_then(|message| json_str(message, "/role")),
+            Some(*role),
+            "message {index} role"
+        );
+        assert_eq!(
+            messages.get(index).and_then(|message| json_str(message, "/content")),
+            Some(*content),
+            "message {index} content"
+        );
+    }
 }
 
 /// Assert response-phase redaction rewrote assistant `content` and stayed valid JSON.
@@ -575,9 +615,12 @@ async fn on_request_body_modified_rewrites_last_user_message() {
     use wiremock::MockServer;
 
     let mock_server = MockServer::start().await;
-    mount_nemo_checks_response(
+    mount_nemo_checks_responses(
         &mock_server,
-        serde_json::json!({"status": "modified", "content": "masked text", "rail": "pii"}),
+        vec![
+            serde_json::json!({"status": "passed", "content": "first"}),
+            serde_json::json!({"status": "modified", "content": "masked text", "rail": "pii"}),
+        ],
     )
     .await;
 
@@ -590,7 +633,50 @@ async fn on_request_body_modified_rewrites_last_user_message() {
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, praxis_filter::FilterAction::Continue));
-    assert_request_last_user_redacted(&ctx, body.as_ref().expect("forwarded body"));
+    assert_request_users_redacted(
+        &ctx,
+        body.as_ref().expect("forwarded body"),
+        &[
+            ("system", "Be helpful"),
+            ("user", "first"),
+            ("assistant", "ok"),
+            ("user", "masked text"),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_modified_rewrites_all_user_messages() {
+    use wiremock::MockServer;
+
+    let mock_server = MockServer::start().await;
+    mount_nemo_checks_responses(
+        &mock_server,
+        vec![
+            serde_json::json!({"status": "modified", "content": "My mail is <EMAIL>", "rail": "pii"}),
+            serde_json::json!({"status": "modified", "content": "my credit card is <CREDIT-CARD>", "rail": "pii"}),
+        ],
+    )
+    .await;
+
+    let filter = nemo_filter(&format!("{}/v1/checks", mock_server.uri()));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"model":"test","messages":[{"role":"user","content":"My mail is xxx@gmail.com"},{"role":"assistant","content":"No."},{"role":"user","content":"my credit card is 1234-5678-92211"}]}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    assert_request_users_redacted(
+        &ctx,
+        body.as_ref().expect("forwarded body"),
+        &[
+            ("user", "My mail is <EMAIL>"),
+            ("assistant", "No."),
+            ("user", "my credit card is <CREDIT-CARD>"),
+        ],
+    );
 }
 
 /// Provider that always returns [`GuardResult::Redact`] so the rewrite
@@ -606,7 +692,7 @@ impl GuardProvider for AlwaysRedactProvider {
         _runtime: &GuardCalloutRuntime<'_>,
     ) -> Result<GuardResult, praxis_filter::FilterError> {
         Ok(GuardResult::Redact {
-            modified_text: "masked".into(),
+            replacements: Vec::new(),
             reason: "pii".into(),
         })
     }
