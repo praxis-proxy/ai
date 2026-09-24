@@ -78,7 +78,7 @@ praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }
 # spiffe: enables the peer_identity_trust security builtin, required as the first
 # filter of every provider_route chain (and by the shipped provider-route.yaml
-# example). Off-by-default experimental feature in praxis 0.6.0 (no extra deps).
+# example). Off-by-default experimental feature in praxis 0.7.0 (no extra deps).
 praxis-filter = { workspace = true, features = ["spiffe"] }
 praxis-protocol = { workspace = true, features = ["admin-api", "config-reload"] }
 praxis-tls = { workspace = true }

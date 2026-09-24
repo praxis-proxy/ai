@@ -101,11 +101,11 @@ zstd = "0.14.0"
 # Policy Engine) and the pure-Rust cryptography its plugins carry; praxis-ai
 # forwards that engine through its own `policy-engine` feature instead, on by
 # default and off in the FIPS build (see FIPS_FEATURES in the Makefile).
-praxis-core = { version = "0.6.0", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.6.0", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
-praxis-protocol = { version = "0.6.0", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.6.0", package = "praxis-proxy-tls" }
-praxis = { version = "0.6.0", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
+praxis-core = { version = "0.7.0", package = "praxis-proxy-core" }
+praxis-filter = { version = "0.7.0", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
+praxis-protocol = { version = "0.7.0", package = "praxis-proxy-protocol" }
+praxis-tls = { version = "0.7.0", package = "praxis-proxy-tls" }
+praxis = { version = "0.7.0", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer
@@ -321,14 +321,3 @@ bare_urls = "deny"
 invalid_html_tags = "deny"
 missing_crate_level_docs = "deny"
 private_doc_tests = "allow"
-
-# Temporary: the praxis crates at the head of praxis-proxy/praxis#1254, the
-# FIPS work (all crypto through the system OpenSSL, PRAXIS_REQUIRE_FIPS), until
-# a praxis release carries it. Remove this section and bump the versions above
-# when that release is published.
-[patch.crates-io]
-praxis-proxy = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
-praxis-proxy-core = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
-praxis-proxy-filter = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
-praxis-proxy-protocol = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
-praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis", rev = "cb5371ed88613d6eaa53b303b934f4f9318cb027" }
