@@ -1,5 +1,6 @@
 version: 1
 scope:
+  - chat_completions_to_bedrock_converse
   - messages_to_chat_completions
   - messages_native_passthrough
   - responses_agentic_loop
@@ -7,6 +8,24 @@ scope:
   - responses_to_chat_completions
   - responses_client_tool_compat
 features:
+  - id: bedrock.converse.request.text
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: bedrock.converse.response.text
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.request.minimal
     scopes:
       - messages_to_chat_completions

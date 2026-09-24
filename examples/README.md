@@ -72,6 +72,12 @@ before sending requests.
 | ------ | ------------- |
 | [chat-completions-to-openai.yaml](configs/azure/chat-completions-to-openai.yaml) | Proxies standard Chat Completions requests to an Azure OpenAI deployment |
 
+### Bedrock
+
+| File | Description |
+| ------ | ------------- |
+| [chat-completions-to-converse.yaml](configs/bedrock/chat-completions-to-converse.yaml) | Accepts OpenAI Chat Completions requests and transparently forwards them to AWS Bedrock Converse, translating both the request and response bodies on the fly |
+
 ### Inference
 
 | File | Description |

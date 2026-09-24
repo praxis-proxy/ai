@@ -1,0 +1,134 @@
+{
+  "version": 1,
+  "scenario_id": "bedrock/basic-nonstream",
+  "protocol": "openai_chat_completions",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-bedrock-model",
+    "source_id": "controlled-bedrock-converse-nonstream"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "chatcmpl-bedrock": "chatcmpl-recorded-0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": "What is the capital of France?",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-bedrock-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": "Paris is the capital of France.",
+                    "refusal": null,
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0001",
+              "model": "synthetic-bedrock-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 7,
+                "prompt_tokens": 12,
+                "total_tokens": 19
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/model/synthetic-bedrock-model/converse",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": [
+                    {
+                      "text": "What is the capital of France?"
+                    }
+                  ],
+                  "role": "user"
+                }
+              ]
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "output": {
+                "message": {
+                  "content": [
+                    {
+                      "text": "Paris is the capital of France."
+                    }
+                  ],
+                  "role": "assistant"
+                }
+              },
+              "stopReason": "end_turn",
+              "usage": {
+                "inputTokens": 12,
+                "outputTokens": 7,
+                "totalTokens": 19
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

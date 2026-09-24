@@ -110,6 +110,11 @@ fn register_agentic_filters(registry: &mut FilterRegistry) {
 #[cfg(feature = "aws-sigv4-filter")]
 fn register_aws_filters(registry: &mut FilterRegistry) {
     register_routing_security_filter(registry, "aws_sigv4_sign", Sigv4SignFilter::from_config);
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_chat_completions_to_bedrock_converse" =>
+            praxis_ai_apis::bedrock::OpenaiChatCompletionsToBedrockConverseFilter::from_config
+    );
 }
 
 /// Register Azure-specific filters.

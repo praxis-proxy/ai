@@ -432,7 +432,9 @@ fn is_replay_contained_filter(filter_type: &str) -> bool {
             | "openai_responses_rehydrate"
             | "openai_stream_events"
             | "openai_tool_parse"
+            | "openai_chat_completions_to_bedrock_converse"
             | "responses_to_chat_completions"
+            | "aws_sigv4_sign"
             | "router"
             | "load_balancer"
     )
@@ -539,6 +541,7 @@ fn contain_replay_external_value(value: &mut serde_yaml::Value) -> Result<(), Fi
 
 /// Contains file-backed fields and one dynamically nested database target.
 fn contain_replay_external_mapping(mapping: &mut serde_yaml::Mapping) -> Result<(), FixtureError> {
+    contain_sigv4_credentials(mapping);
     if mapping
         .iter()
         .any(|(key, value)| key.as_str().is_some_and(is_file_resource_key) && !matches!(value, serde_yaml::Value::Null))
@@ -565,6 +568,28 @@ fn contain_replay_external_mapping(mapping: &mut serde_yaml::Mapping) -> Result<
     validate_replay_database_target(backend.as_deref(), database_url)?;
     mapping.insert(database_key, serde_yaml::Value::String("sqlite::memory:".to_owned()));
     Ok(())
+}
+
+/// Redirect `SigV4`'s credential lookups to deterministic, non-secret Cargo
+/// process variables during offline replay. The signer performs no callout;
+/// its output credential headers are removed by fixture header policy.
+fn contain_sigv4_credentials(mapping: &mut serde_yaml::Mapping) {
+    let is_signer = mapping.iter().any(|(key, value)| {
+        key.as_str().is_some_and(|key| key == "filter") && value.as_str().is_some_and(|value| value == "aws_sigv4_sign")
+    });
+    if !is_signer {
+        return;
+    }
+
+    for (field, process_var) in [
+        ("access_key_env_var", "CARGO_PKG_NAME"),
+        ("secret_key_env_var", "CARGO_MANIFEST_DIR"),
+    ] {
+        mapping.insert(
+            serde_yaml::Value::String(field.to_owned()),
+            serde_yaml::Value::String(process_var.to_owned()),
+        );
+    }
 }
 
 /// Recognizes config fields whose values are loaded from the local filesystem.

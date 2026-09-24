@@ -18,6 +18,7 @@ mod aws_sigv4;
 #[cfg(feature = "azure-ad-filter")]
 mod azure_ad;
 mod azure_translation;
+mod bedrock;
 #[cfg(feature = "store-sqlite")]
 mod client_tool_compat_chat_completions;
 #[cfg(feature = "store-sqlite")]

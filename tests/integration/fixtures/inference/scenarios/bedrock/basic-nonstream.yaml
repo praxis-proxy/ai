@@ -1,0 +1,32 @@
+version: 1
+id: bedrock/basic-nonstream
+description: OpenAI Chat Completions translated to and from Bedrock Converse.
+protocol: openai_chat_completions
+example_config: bedrock/chat-completions-to-converse.yaml
+upstream_authority: 127.0.0.1:3000
+features:
+  - bedrock.converse.request.text
+  - bedrock.converse.response.text
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/chat/completions
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          messages:
+            - role: user
+              content: What is the capital of France?
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /model/synthetic-bedrock-model/converse
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

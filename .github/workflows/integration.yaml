@@ -143,6 +143,15 @@ jobs:
           PRAXIS_TEST_CLAUDE_CODE_BIN: claude
         run: make test-integration
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Build Praxis for SDK tests
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Bedrock Converse OpenAI SDK tests
+        run: uv run tests/integration/sdk/openai/test_bedrock_converse_chat_completions.py -s
+
       - name: Environment tests
         run: make test-environment
 
