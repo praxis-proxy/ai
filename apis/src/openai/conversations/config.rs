@@ -348,6 +348,10 @@ mod backend_availability_tests {
             .err()
             .expect("unavailable PostgreSQL backend must fail during construction");
 
-        assert!(error.to_string().contains("'store-postgres' feature"), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("'store-postgres'") && message.contains("'store-postgres-cert-auth'"),
+            "{error}"
+        );
     }
 }
