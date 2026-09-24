@@ -2220,6 +2220,23 @@ fn two_tool_rounds_accumulate_output_and_usage() {
         "model backend should receive exactly three requests"
     );
 
+    // Session reuse (#1019): both dispatch rounds target the same MCP server, so
+    // they share one initialized session. The server therefore sees a single
+    // dispatch handshake covering both tools/call rounds; the only other
+    // initialize/tools/list pair comes from tool discovery
+    // (openai_mcp_tool_resolve), which runs once. Without session reuse each round
+    // would re-handshake, yielding initialize == 3.
+    assert_eq!(
+        mcp.method_count("initialize"),
+        2,
+        "one discovery handshake + one reused dispatch handshake across both rounds"
+    );
+    assert_eq!(
+        mcp.method_count("tools/list"),
+        1,
+        "tool discovery lists the server once"
+    );
+
     // Both tools executed exactly once.
     assert_eq!(mcp.method_count("tools/call"), 2, "exactly two MCP tool calls total");
     assert_eq!(

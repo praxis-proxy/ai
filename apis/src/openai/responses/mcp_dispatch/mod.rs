@@ -281,6 +281,7 @@ impl McpDispatchFilter {
         forwarded_headers: &http::HeaderMap,
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
+        session_pool: &mcp_client::McpSessionPool,
     ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
         debug!(
             count = mcp_calls.len(),
@@ -298,6 +299,7 @@ impl McpDispatchFilter {
             forwarded_header_names: &self.forward_headers,
             forwarded_headers: Some(forwarded_headers),
             connector_identity,
+            session_pool,
         };
         execute_mcp_calls(mcp_calls, tool_index, options, callout).await
     }
@@ -853,6 +855,16 @@ impl HttpFilter for McpDispatchFilter {
         };
         self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref());
 
+        // Fetch (or lazily create) the per-execution MCP session pool. It lives
+        // in the request's threaded `RequestExtensions`, so this same pool is
+        // shared across every agentic round and dropped — cancelling every idle
+        // session — when the request completes, is cancelled, or the pipeline is
+        // reloaded. The handle is a cheap `Arc` clone threaded into each call.
+        let session_pool = ctx
+            .extensions
+            .get_or_insert_with(mcp_client::McpSessionPool::new)
+            .clone();
+
         // Resume approvals from the previous turn before executing any calls.
         // On approval this injects a function-call-shaped tool call that the
         // dispatch machinery below runs; on denial it appends a
@@ -939,6 +951,7 @@ impl HttpFilter for McpDispatchFilter {
                 &forwarded_headers,
                 &callout,
                 connector_identity.as_ref(),
+                &session_pool,
             )
             .await
         {
@@ -1320,6 +1333,24 @@ fn result_payload_limit(retained_result_limit: usize) -> usize {
     retained_result_limit / RESULT_PAYLOAD_OWNER_COUNT
 }
 
+/// Compose the session-pool reuse key from the target's security fingerprint and
+/// the effective per-call payload limit (#1019).
+///
+/// `open_tool_session` bakes the payload limit into a session's transport
+/// permanently, and the limit shrinks as the batch's executable-call count grows
+/// (see [`admitted_result_limits`]). Folding it into the key means a later round
+/// whose limit differs lands on a different key and never reuses a session that
+/// would enforce the wrong response-size ceiling. The empty fingerprint is a
+/// fail-closed sentinel for an ambiguous identity: it stays empty so the caller
+/// (`call_tool_with_forwarded_headers`) never pools or reuses such a target.
+fn pool_session_key(fingerprint: String, payload_limit: usize) -> String {
+    if fingerprint.is_empty() {
+        fingerprint
+    } else {
+        format!("{fingerprint}:{payload_limit}")
+    }
+}
+
 /// Result of executing a single MCP tool call.
 #[derive(Debug)]
 struct McpCallResult {
@@ -1405,6 +1436,8 @@ struct McpExecutionOptions<'a> {
     forwarded_headers: Option<&'a http::HeaderMap>,
     /// Request-scoped context injected only for configured connector entries.
     connector_identity: Option<&'a McpCalloutIdentity>,
+    /// Per-execution pool of initialized MCP sessions reused across rounds.
+    session_pool: &'a mcp_client::McpSessionPool,
 }
 
 /// Execute MCP tool calls — concurrently when `parallel` is true,
@@ -1690,7 +1723,12 @@ async fn execute_single_call(
         ));
     }
 
+    // Key the reusable session on the target's validated server + credential/
+    // header identity *and* the effective payload limit (#1019); see
+    // [`pool_session_key`].
+    let session_key = pool_session_key(target_fingerprint(entry), payload_limit);
     let result = mcp_client::call_tool_with_forwarded_headers(
+        Some((options.session_pool, &session_key)),
         server_url,
         headers,
         authorization,

@@ -11,7 +11,10 @@ use std::{
     time::Duration,
 };
 
-use super::*;
+use super::{
+    session_pool::{MAX_IDLE_PER_KEY, MAX_TOTAL_IDLE},
+    *,
+};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1277,6 +1280,143 @@ async fn start_failing_initialize_server() -> (String, tokio_util::sync::Cancell
     (format!("http://{addr}/mcp"), ct, requests)
 }
 
+/// Ordered log of the JSON-RPC methods observed by a recording server, used to
+/// prove how many `initialize` handshakes and `tools/call` requests the session
+/// pool actually issued.
+type ObservedMethods = StdArc<Mutex<Vec<String>>>;
+
+/// Extract the JSON-RPC `method` from a request body, if present. Notifications,
+/// requests, and responses all carry it; DELETE/GET frames with no JSON body
+/// yield `None`.
+fn jsonrpc_method(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+/// Count how many times `method` appears in a recording server's method log.
+fn method_count(methods: &ObservedMethods, method: &str) -> usize {
+    methods
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|seen| seen.as_str() == method)
+        .count()
+}
+
+/// A real rmcp server that records the JSON-RPC method of every POST it receives
+/// so a test can assert the handshake/`tools/call` counts a pooled execution
+/// produced.
+async fn start_method_recording_mcp_server() -> (String, tokio_util::sync::CancellationToken, ObservedMethods) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+    let service: StreamableHttpService<TestMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(TestMcpServer::new()), StdArc::default(), config);
+
+    let methods: ObservedMethods = StdArc::default();
+    let record = StdArc::clone(&methods);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let record = StdArc::clone(&record);
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap_or_default();
+                    if let Some(method) = jsonrpc_method(&bytes) {
+                        record.lock().unwrap().push(method);
+                    }
+                    let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+
+    (format!("http://{addr}/mcp"), ct, methods)
+}
+
+/// A real rmcp server that records methods and rejects the *second* `tools/call`
+/// it ever receives with a 500. The first call (round 1) succeeds and pools the
+/// session; the second call (the round-2 reuse attempt) fails. A 500 (unlike a
+/// 404 `SessionExpired`) is not transparently reinitialized by rmcp, so it
+/// exercises the pool's at-most-once policy: the reused session is evicted and
+/// the error surfaced *without* a fresh retry, so the server never sees a third
+/// `tools/call`. JSON-response mode leaves the server stateless (no
+/// `Mcp-Session-Id`), so the reuse attempt is distinguished by call ordinal
+/// rather than by session identity.
+async fn start_second_call_rejecting_mcp_server() -> (String, tokio_util::sync::CancellationToken, ObservedMethods) {
+    use axum::response::IntoResponse as _;
+
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+    let service: StreamableHttpService<TestMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(TestMcpServer::new()), StdArc::default(), config);
+
+    let methods: ObservedMethods = StdArc::default();
+    let record = StdArc::clone(&methods);
+    let tool_calls = StdArc::new(AtomicUsize::new(0));
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let record = StdArc::clone(&record);
+                let tool_calls = StdArc::clone(&tool_calls);
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap_or_default();
+                    let method = jsonrpc_method(&bytes);
+                    if let Some(method) = &method {
+                        record.lock().unwrap().push(method.clone());
+                    }
+                    // Reject exactly the second tools/call (the round-2 reuse attempt).
+                    // The corrected pool never retries it, so no third call arrives.
+                    if method.as_deref() == Some("tools/call") && tool_calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                        return http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                    let request = axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes));
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+
+    (format!("http://{addr}/mcp"), ct, methods)
+}
+
 fn assert_scoped_context_on_every_exchange(captured: &CapturedRequests) {
     let captured = captured.lock().unwrap();
     assert!(
@@ -1357,6 +1497,7 @@ async fn scoped_connector_context_reaches_initialize_and_tools_call_unchanged() 
     };
 
     let result = call_tool_with_forwarded_headers(
+        None,
         &url,
         None,
         Some("static-token"),
@@ -1813,6 +1954,301 @@ async fn call_tool_timeout() {
     let err = result.expect_err("should time out");
     let msg = err.to_string();
     assert!(msg.contains("timed out"), "error should mention timeout: {msg}");
+}
+
+// =========================================================================
+// Session pooling / reuse (#1019)
+// =========================================================================
+
+/// Two `tools/call`s for the same identity across consecutive rounds share one
+/// initialized session: exactly one `initialize` handshake, two `tools/call`s.
+#[tokio::test]
+async fn pooled_session_reused_across_rounds_runs_single_initialize() {
+    let (url, ct, methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    for message in ["round-1", "round-2"] {
+        let result = call_tool_with_forwarded_headers(
+            Some((&pool, "identity-shared")),
+            &url,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "echo",
+            serde_json::json!({ "message": message }),
+            INTEGRATION_TIMEOUT,
+            TEST_MAX_RESULT_BYTES,
+            &callout,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result
+                .content
+                .first()
+                .and_then(|c| c.as_text())
+                .map(|t| t.text.as_str()),
+            Some(message),
+            "each pooled round must return its own result"
+        );
+    }
+    ct.cancel();
+
+    assert_eq!(
+        method_count(&methods, "initialize"),
+        1,
+        "reusing a warm session must run the handshake only once"
+    );
+    assert_eq!(
+        method_count(&methods, "tools/call"),
+        2,
+        "each round still issues its own tools/call"
+    );
+}
+
+/// Sessions never cross security contexts: two calls with different identity
+/// keys (same endpoint) each open their own session, so each runs its own
+/// `initialize`.
+#[tokio::test]
+async fn distinct_identity_keys_never_reuse_a_session() {
+    let (url, ct, methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    for key in ["identity-a", "identity-b"] {
+        call_tool_with_forwarded_headers(
+            Some((&pool, key)),
+            &url,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "echo",
+            serde_json::json!({ "message": key }),
+            INTEGRATION_TIMEOUT,
+            TEST_MAX_RESULT_BYTES,
+            &callout,
+        )
+        .await
+        .unwrap();
+    }
+    ct.cancel();
+
+    assert_eq!(
+        method_count(&methods, "initialize"),
+        2,
+        "different identities must each run their own handshake"
+    );
+    assert_eq!(method_count(&methods, "tools/call"), 2);
+}
+
+/// The empty-fingerprint sentinel is a fail-closed ambiguous identity: it must
+/// never reuse or retain a session, so repeated calls each re-handshake.
+#[tokio::test]
+async fn empty_fingerprint_never_pools_a_session() {
+    let (url, ct, methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    for _ in 0..2 {
+        call_tool_with_forwarded_headers(
+            Some((&pool, "")),
+            &url,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            "echo",
+            serde_json::json!({ "message": "x" }),
+            INTEGRATION_TIMEOUT,
+            TEST_MAX_RESULT_BYTES,
+            &callout,
+        )
+        .await
+        .unwrap();
+    }
+    ct.cancel();
+
+    assert_eq!(
+        method_count(&methods, "initialize"),
+        2,
+        "an ambiguous (empty) fingerprint must never reuse a session"
+    );
+    assert!(
+        pool.checkout("").is_none(),
+        "the empty-fingerprint sentinel must never retain a session"
+    );
+}
+
+/// A reused session whose `tools/call` fails is evicted and the error surfaced
+/// **without** a fresh retry. This is the at-most-once guarantee: an ambiguous
+/// failure (here a 5xx, whose delivery is unknown) must never re-execute the tool
+/// on a new session, or a non-idempotent tool could run twice. Because there is
+/// no second attempt, one logical call also cannot exceed its single `timeout`
+/// budget or open a second session.
+#[tokio::test]
+async fn reused_session_failure_evicts_without_retry() {
+    let (url, ct, methods) = start_second_call_rejecting_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    // Round 1: fresh session, clean call -> returned to the pool.
+    let first = call_tool_with_forwarded_headers(
+        Some((&pool, "identity-shared")),
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({ "message": "round-1" }),
+        INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
+        &callout,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first.content.first().and_then(|c| c.as_text()).map(|t| t.text.as_str()),
+        Some("round-1")
+    );
+
+    // Round 2: the reused session's tools/call is rejected. The pool evicts the
+    // session and propagates the error; it does NOT reinitialize and retry.
+    let second = call_tool_with_forwarded_headers(
+        Some((&pool, "identity-shared")),
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        "echo",
+        serde_json::json!({ "message": "round-2" }),
+        INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
+        &callout,
+    )
+    .await;
+    assert!(
+        second.is_err(),
+        "a failed reused call must surface the error, not silently retry: {second:?}"
+    );
+    ct.cancel();
+
+    assert_eq!(
+        method_count(&methods, "initialize"),
+        1,
+        "the failed reused session must not be reinitialized (no fresh fallback)"
+    );
+    assert_eq!(
+        method_count(&methods, "tools/call"),
+        2,
+        "at-most-once: round 1 (ok) + round 2 reuse attempt (rejected), never a third retry"
+    );
+    assert!(
+        pool.checkout("identity-shared").is_none(),
+        "a failed reused session must be evicted, not returned to the pool"
+    );
+}
+
+/// Open one real, initialized session against `url` for direct pool bookkeeping
+/// tests (the fast paths that only touch `checkin`/`checkout`, not a full call).
+async fn open_pooled_session(url: &str, callout: &McpCallout) -> PooledSession {
+    open_tool_session(
+        url,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
+        callout,
+        &parse_display_url(url),
+    )
+    .await
+    .unwrap()
+}
+
+/// Count the idle sessions the pool retains under `key`, draining it.
+fn drain_key(pool: &McpSessionPool, key: &str) -> usize {
+    let mut count = 0;
+    while pool.checkout(key).is_some() {
+        count += 1;
+    }
+    count
+}
+
+/// Checking a session back out empties its stack and removes the key, so a later
+/// checkout for the same identity finds nothing warm and opens fresh.
+#[tokio::test]
+async fn checkout_removes_emptied_key() {
+    let (url, ct, _methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    pool.checkin("k".to_owned(), open_pooled_session(&url, &callout).await);
+    assert!(
+        pool.checkout("k").is_some(),
+        "the single warm session must check out once"
+    );
+    assert!(
+        pool.checkout("k").is_none(),
+        "the emptied key must be removed, so a second checkout finds nothing"
+    );
+    ct.cancel();
+}
+
+/// More check-ins for one identity than [`MAX_IDLE_PER_KEY`] (a within-round
+/// parallel fan-out to one server) retain only the cap; the extras are dropped.
+#[tokio::test]
+async fn checkin_bounds_idle_sessions_per_key() {
+    let (url, ct, _methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    for _ in 0..(MAX_IDLE_PER_KEY + 3) {
+        pool.checkin("k".to_owned(), open_pooled_session(&url, &callout).await);
+    }
+    assert_eq!(
+        drain_key(&pool, "k"),
+        MAX_IDLE_PER_KEY,
+        "a single identity must retain at most MAX_IDLE_PER_KEY warm sessions"
+    );
+    ct.cancel();
+}
+
+/// A pathological fan-out across many identities cannot retain more than
+/// [`MAX_TOTAL_IDLE`] live sessions for the request's lifetime; check-ins past the
+/// global ceiling are dropped even when no single key is at its own cap.
+#[tokio::test]
+async fn checkin_bounds_total_idle_sessions_across_keys() {
+    let (url, ct, _methods) = start_method_recording_mcp_server().await;
+    let pool = McpSessionPool::new();
+    let callout = McpCallout::fabricated(true).unwrap();
+
+    // Spread MAX_TOTAL_IDLE + 1 sessions over enough keys that the per-key cap
+    // (MAX_IDLE_PER_KEY) never fires first, so only the global ceiling can bound
+    // the total. The final check-in must be dropped by the global cap.
+    let keys = MAX_TOTAL_IDLE / MAX_IDLE_PER_KEY + 1;
+    for i in 0..=MAX_TOTAL_IDLE {
+        let key = format!("k{}", i % keys);
+        pool.checkin(key, open_pooled_session(&url, &callout).await);
+    }
+
+    let retained: usize = (0..keys).map(|i| drain_key(&pool, &format!("k{i}"))).sum();
+    assert_eq!(
+        retained, MAX_TOTAL_IDLE,
+        "the pool must retain at most MAX_TOTAL_IDLE warm sessions across all keys"
+    );
+    ct.cancel();
 }
 
 #[derive(Debug, Clone)]

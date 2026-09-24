@@ -15,7 +15,7 @@ use super::{
     content_blocks_to_output, execute_mcp_calls, execute_single_call, extract_arguments, extract_call_id,
     extract_mcp_tool_calls, find_by_encoded_name, is_connector_tool_entry, is_mcp_tool_call,
     mcp_call_ids_are_unique_and_new, normalize_arguments, parse_call_arguments, partition_calls_by_approval,
-    prepare_response_round, process_call_result, resolve_tool_entry, result_payload_limit,
+    pool_session_key, prepare_response_round, process_call_result, resolve_tool_entry, result_payload_limit,
 };
 use crate::{
     callout_identity::McpCalloutIdentity,
@@ -68,6 +68,36 @@ fn rejected_calls_do_not_dilute_admitted_result_allowance() {
 }
 
 #[test]
+fn pool_session_key_folds_payload_limit_and_preserves_empty_sentinel() {
+    // A round with a different per-call payload limit (e.g. because its batch has
+    // a different executable-call count) must produce a different pool key, so a
+    // session that baked in the old limit is never reused (#1019).
+    let fingerprint = target_fingerprint(&weather_entry());
+    let round_a = pool_session_key(fingerprint.clone(), 262_144);
+    let round_b = pool_session_key(fingerprint.clone(), 131_072);
+    assert_ne!(round_a, round_b, "distinct payload limits must key distinct sessions");
+    assert!(
+        round_a.starts_with(&fingerprint) && round_a.ends_with("262144"),
+        "the key must combine the identity fingerprint and the effective limit: {round_a}"
+    );
+
+    // The same identity + same limit is stable, so consecutive rounds reuse the
+    // session.
+    assert_eq!(
+        pool_session_key(fingerprint.clone(), 262_144),
+        round_a,
+        "identical identity and limit must produce an identical, reusable key"
+    );
+
+    // The empty fail-closed sentinel stays empty so an ambiguous identity is never
+    // pooled, regardless of limit.
+    assert!(
+        pool_session_key(String::new(), 262_144).is_empty(),
+        "the empty-fingerprint sentinel must never become poolable"
+    );
+}
+
+#[test]
 fn mcp_call_ids_must_be_present_nonempty_and_unique() {
     let distinct = vec![json!({"call_id": "call_1"}), json!({"call_id": "call_2"})];
     assert!(mcp_call_ids_are_unique_and_new(&call_refs(&distinct), &[]));
@@ -89,6 +119,9 @@ fn mcp_call_ids_must_be_present_nonempty_and_unique() {
 }
 
 fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecutionOptions<'static> {
+    // These tests dial unreachable/loopback targets so no call ever succeeds and
+    // nothing is ever pooled; a shared empty pool is inert here.
+    static POOL: std::sync::OnceLock<crate::mcp_client::McpSessionPool> = std::sync::OnceLock::new();
     McpExecutionOptions {
         parallel,
         max_parallel_calls: 8,
@@ -98,6 +131,7 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         forwarded_header_names: &[],
         forwarded_headers: None,
         connector_identity: None,
+        session_pool: POOL.get_or_init(crate::mcp_client::McpSessionPool::new),
     }
 }
 
