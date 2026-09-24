@@ -330,6 +330,15 @@ fn build_pingora_server(
     server
 }
 
+fn first_listener_address(config: &Config) -> String {
+    config
+        .listeners
+        .first()
+        .expect("config must have at least one listener")
+        .address
+        .clone()
+}
+
 /// Build a [`ProxyGuard`] by spawning a Pingora server that
 /// shuts down when the guard is dropped.
 fn spawn_proxy_server(
@@ -337,12 +346,7 @@ fn spawn_proxy_server(
     registry: &FilterRegistry,
     client: &praxis_core::subrequest::SubRequestClient,
 ) -> ProxyGuard {
-    let addr = config
-        .listeners
-        .first()
-        .expect("config must have at least one listener")
-        .address
-        .clone();
+    let addr = first_listener_address(config);
     let server = build_pingora_server(config, registry, client);
 
     let notify = Arc::new(Notify::new());
