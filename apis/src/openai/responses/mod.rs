@@ -25,24 +25,38 @@
 //! extract additional fields without rejecting provider-owned parameter
 //! combinations.
 
+#[cfg(feature = "openai-responses")]
 pub(crate) mod agentic_loop;
+#[cfg(feature = "openai-responses")]
 mod body_limits;
+#[cfg(feature = "openai-compact")]
 pub(crate) mod compact;
 mod config;
+#[cfg(feature = "openai-responses")]
+pub(crate) mod content_parts;
+#[cfg(feature = "openai-responses")]
 pub(crate) mod doc_extract;
 pub(crate) mod error;
+#[cfg(feature = "openai-file-resolve-filter")]
 pub(crate) mod file_resolve;
 /// Executes hosted file-search calls against an OGX vector store API.
+#[cfg(feature = "openai-responses")]
 pub(crate) mod file_search_callout;
+#[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_classify;
+#[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_dispatch;
 pub(crate) mod model_rewrite;
 /// Lowers rich client-owned tools to private functions for a function-only
 /// Responses backend and restores the typed items on the response (#1131).
+#[cfg(feature = "openai-responses")]
 pub(crate) mod openai_client_tool_compat;
+#[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod openai_mcp_tool_resolve;
+#[cfg(feature = "openai-responses")]
 pub(crate) mod openai_responses_proxy;
 pub(crate) mod openai_tool_parse;
+#[cfg(feature = "openai-responses")]
 pub(crate) mod responses_to_chat_completions;
 #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
 #[allow(
@@ -50,19 +64,30 @@ pub(crate) mod responses_to_chat_completions;
     reason = "the Responses operation registry is consumed by the openai_operation classifier"
 )]
 pub(crate) mod routes;
+#[cfg(feature = "openai-responses")]
 pub(crate) mod state;
+#[cfg(feature = "store")]
 pub(crate) mod store;
+#[cfg(feature = "openai-responses")]
 pub(crate) mod stream_events;
+#[cfg(feature = "openai-responses")]
 pub(crate) mod usage;
 
+#[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
+#[cfg(feature = "openai-file-resolve-filter")]
 pub use file_resolve::FileResolveFilter;
+#[cfg(feature = "openai-responses")]
 pub use file_search_callout::FileSearchCalloutFilter;
+#[cfg(feature = "openai-mcp-tools")]
 pub use mcp_dispatch::McpDispatchFilter;
 pub use model_rewrite::ModelRewriteFilter;
+#[cfg(feature = "openai-responses")]
 pub use openai_client_tool_compat::ClientToolCompatFilter;
+#[cfg(feature = "openai-mcp-tools")]
 pub use openai_mcp_tool_resolve::McpToolResolveFilter;
 pub use openai_tool_parse::ToolParseFilter;
+#[cfg(feature = "store")]
 pub use store::ResponseStoreFilter;
 
 #[cfg(test)]
@@ -80,7 +105,9 @@ pub use store::ResponseStoreFilter;
 )]
 mod tests;
 
-use std::{borrow::Cow, io};
+use std::borrow::Cow;
+#[cfg(feature = "openai-responses")]
+use std::io;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -102,6 +129,7 @@ use crate::{
 /// Count compact JSON bytes without retaining the serialized representation.
 ///
 /// Returns `Ok(None)` as soon as serialization would exceed `max_bytes`.
+#[cfg(feature = "openai-responses")]
 pub(crate) fn bounded_json_size<T: serde::Serialize + ?Sized>(
     value: &T,
     max_bytes: usize,
@@ -120,6 +148,7 @@ pub(crate) fn bounded_json_size<T: serde::Serialize + ?Sized>(
 }
 
 /// JSON writer that counts bytes and stops at a fixed ceiling.
+#[cfg(feature = "openai-responses")]
 struct BoundedJsonCounter {
     /// Bytes accepted so far.
     bytes: usize,
@@ -129,6 +158,7 @@ struct BoundedJsonCounter {
     max_bytes: usize,
 }
 
+#[cfg(feature = "openai-responses")]
 impl io::Write for BoundedJsonCounter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let Some(next_bytes) = self.bytes.checked_add(buf.len()) else {
@@ -154,11 +184,15 @@ impl io::Write for BoundedJsonCounter {
 
 /// Default store name used when registering the response store in the
 /// per-request registry.
+#[cfg(feature = "store")]
 pub(crate) const DEFAULT_STORE_NAME: &str = "default";
 
 /// Legacy test tenant value retained for fixture compatibility.
 #[cfg(test)]
-#[cfg(feature = "store-sqlite")]
+#[cfg(all(
+    feature = "store-sqlite",
+    any(feature = "openai-conversations", feature = "openai-mcp-tools")
+))]
 pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 
 // -----------------------------------------------------------------------------
@@ -587,6 +621,7 @@ fn promote_boolean_results(
 /// Hosted-tool output items remain available in persisted history, but
 /// `OpenResponses` backends do not accept them in a subsequent request. Old
 /// stored rows without the defaulted `type` field are normalized.
+#[cfg(feature = "store")]
 pub(crate) fn canonical_openresponses_replay_item(item: &serde_json::Value) -> Option<serde_json::Value> {
     if matches!(
         item.get("type").and_then(serde_json::Value::as_str),
@@ -602,6 +637,7 @@ pub(crate) fn canonical_openresponses_replay_item(item: &serde_json::Value) -> O
 }
 
 /// Resolve a schema-defaulted input item type from its distinguishing fields.
+#[cfg(feature = "store")]
 fn defaulted_openresponses_item_type(object: &serde_json::Map<String, serde_json::Value>) -> Option<&'static str> {
     if object.get("type").is_some_and(|item_type| !item_type.is_null()) {
         return None;
@@ -628,6 +664,7 @@ fn defaulted_openresponses_item_type(object: &serde_json::Map<String, serde_json
 // -----------------------------------------------------------------------------
 
 /// Only a successfully terminated stream may authorize external side effects.
+#[cfg(feature = "openai-responses")]
 pub(crate) fn streamed_round_is_dispatchable(ctx: &HttpFilterContext<'_>, state: &state::ResponsesState) -> bool {
     state.request_body.get("stream").and_then(serde_json::Value::as_bool) != Some(true)
         || (ctx.get_metadata("responses.stream_completion") == Some("terminal")
@@ -648,6 +685,7 @@ pub(crate) fn streamed_round_is_dispatchable(ctx: &HttpFilterContext<'_>, state:
 /// on the owner's result set. This also covers the oversized `web_search` batch
 /// (the owner records `action="loop"` before `web_search` caps the batch and
 /// records the terminal error).
+#[cfg(feature = "openai-responses")]
 pub(crate) fn fs_arm_stream_stop(ctx: &mut HttpFilterContext<'_>) {
     let results = ctx.filter_results.entry("openai_agentic_loop").or_default();
     drop(results.set("action", "done"));
@@ -658,6 +696,7 @@ pub(crate) fn fs_arm_stream_stop(ctx: &mut HttpFilterContext<'_>) {
 /// pre-existing parse/timeout error's `code`/`message`/`skip_persist` — the
 /// first, most-specific failure wins — but ALWAYS arms the two-layer stop, even
 /// on a pre-existing error, so a stale `action="loop"` cannot survive (#313 P1).
+#[cfg(feature = "openai-responses")]
 pub(crate) fn fs_end_stream_with_error_ctx(ctx: &mut HttpFilterContext<'_>, code: &str, message: &str) {
     if ctx.get_metadata("responses.stream_error_code").is_none() {
         ctx.set_metadata("responses.stream_error_code", code);
@@ -672,6 +711,7 @@ pub(crate) fn fs_end_stream_with_error_ctx(ctx: &mut HttpFilterContext<'_>, code
 /// Accepts both string and object forms:
 /// - `"conversation": "conv_abc"`
 /// - `"conversation": {"id": "conv_abc"}`
+#[cfg(feature = "openai-responses")]
 pub(crate) fn extract_conversation_id(body: &serde_json::Value) -> Option<String> {
     body.get("conversation").and_then(|c| {
         c.as_str()
@@ -681,6 +721,7 @@ pub(crate) fn extract_conversation_id(body: &serde_json::Value) -> Option<String
 }
 
 /// Append stored response input as valid Responses API item params.
+#[cfg(feature = "store")]
 pub(crate) fn append_stored_input_items(messages: &mut Vec<serde_json::Value>, input: serde_json::Value) {
     match input {
         serde_json::Value::Null => {},
@@ -690,7 +731,17 @@ pub(crate) fn append_stored_input_items(messages: &mut Vec<serde_json::Value>, i
     }
 }
 
+/// Check whether this is an explicit `POST /v1/responses/compact` request.
+///
+/// Shared by the store filter (best-effort store init) and the compaction
+/// filter, so neither optional filter depends on the other.
+#[cfg(feature = "store")]
+pub(crate) fn is_explicit_compact_request(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.request.method == http::Method::POST && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
+}
+
 /// Build a Responses API user message item from string input.
+#[cfg(feature = "store")]
 pub(crate) fn user_message_item(text: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "message",
@@ -699,12 +750,20 @@ pub(crate) fn user_message_item(text: &str) -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "store")]
 pub(crate) mod rehydrate;
+#[cfg(feature = "openai-responses")]
 pub(crate) mod validate;
+#[cfg(feature = "openai-responses")]
 pub(crate) mod web_search;
 
+#[cfg(feature = "openai-responses")]
 pub use agentic_loop::AgenticLoopFilter;
+#[cfg(feature = "openai-compact")]
 pub use compact::CompactFilter;
+#[cfg(feature = "store")]
 pub use rehydrate::RehydrateFilter;
+#[cfg(feature = "openai-responses")]
 pub use validate::OpenaiResponsesValidateFilter;
+#[cfg(feature = "openai-responses")]
 pub use web_search::WebSearchFilter;

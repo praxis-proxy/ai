@@ -18,6 +18,16 @@ use tracing::debug;
 
 use crate::callout_target::{AddressPolicy, validate_http_target, validate_resolved_addrs};
 
+/// Build an isolated client after installing the process-wide crypto provider.
+///
+/// Constructing a connector creates a rustls client configuration, so provider
+/// installation must happen at this boundary rather than relying on a binary
+/// entry point having run first.
+pub(crate) fn isolated_client(pool_size: usize) -> SubRequestClient {
+    praxis_tls::provider::install();
+    SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(pool_size, None))
+}
+
 /// Parsed URL components needed to resolve and execute a request.
 #[derive(Debug)]
 struct ParsedUrl {
@@ -286,12 +296,11 @@ mod tests {
 
     use bytes::Bytes;
     use http::HeaderMap;
-    use praxis_core::subrequest::SubRequestConnector;
 
     use super::*;
 
     fn test_client() -> SubRequestClient {
-        SubRequestClient::new(SubRequestConnector::new(4, None))
+        isolated_client(4)
     }
 
     fn empty_request() -> SubRequest {

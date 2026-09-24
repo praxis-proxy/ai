@@ -11,7 +11,7 @@ use std::{
 };
 
 use praxis_test_utils::{
-    free_port, http_get, http_send, json_post, load_example_config, parse_body, parse_status,
+    StatefulCapturingBackend, free_port, http_get, http_send, json_post, load_example_config, parse_body, parse_status,
     start_backend_with_shutdown, start_capturing_backend, start_proxy, start_stateful_backend,
 };
 
@@ -405,13 +405,128 @@ fn example_config_forwards_headers_to_files_api() {
     );
 }
 
+#[test]
+fn two_user_scoped_context_is_captured_before_file_id_pre_read() {
+    let files_api_port = start_files_api_stub_scoped_context_required();
+    let inference_guard =
+        StatefulCapturingBackend::new(vec![(200, "{}".to_owned()), (200, "{}".to_owned())]).start_with_shutdown();
+    let default_guard = start_backend_with_shutdown("default-backend");
+    let proxy_port = free_port();
+    let yaml = format!(
+        r#"
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:{proxy_port}"
+    filter_chains: [file-resolve-pipeline]
+
+filter_chains:
+  - name: file-resolve-pipeline
+    filters:
+      - filter: state_owner
+        mode: trusted_headers
+        tenant:
+          header: x-auth-tenant
+        issuer:
+          static: urn:integration:test
+        subject:
+          header: x-auth-user
+      - filter: callout_credentials
+        credentials:
+          - slot: ogx_files
+            source_header: x-user-ogx-key
+      - filter: openai_responses_format
+        on_invalid: continue
+        headers:
+          format: x-praxis-ai-format
+          model: x-praxis-ai-model
+      - filter: openai_file_resolve
+        files_api_url: "http://127.0.0.1:{files_api_port}"
+        allow_pre_security_callout: true
+        user_credential: ogx_files
+        outbound_chain:
+          name: files-api-outbound
+          filters:
+            - filter: project_state_owner_headers
+              tenant_header: x-tenant-id
+              subject_header: x-user-id
+            - filter: headers
+              request_set:
+                - name: x-file-callout
+                  value: file-resolve
+        on_missing: reject
+      - filter: router
+        routes:
+          - path: "/v1/responses"
+            cluster: inference
+          - path_prefix: "/"
+            cluster: default
+      - filter: load_balancer
+        clusters:
+          - name: inference
+            endpoints: ["127.0.0.1:{}"]
+          - name: default
+            endpoints: ["127.0.0.1:{}"]
+
+insecure_options:
+  allow_private_endpoints: true
+  allow_private_upstreams: true
+"#,
+        inference_guard.port(),
+        default_guard.port()
+    );
+    let config = praxis_core::config::Config::from_yaml(&yaml).expect("config should parse");
+    let proxy = start_proxy(&config);
+    let body = r#"{
+        "model":"gpt-4.1",
+        "input":[{"type":"message","role":"user","content":[
+          {"type":"input_file","file_id":"test-file-123"}
+        ]}]
+    }"#;
+    for suffix in ["a", "b"] {
+        let request = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nx-auth-tenant: tenant-{suffix}\r\nx-auth-user: user-{suffix}\r\nx-user-ogx-key: Bearer scoped-user-{suffix}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let raw = http_send(proxy.addr(), &request);
+        assert_eq!(
+            parse_status(&raw),
+            200,
+            "scoped file_id resolution failed for user {suffix}: {raw}"
+        );
+    }
+
+    let inference_requests: Vec<_> = inference_guard
+        .requests()
+        .into_iter()
+        .filter(|request| request.method == "POST")
+        .collect();
+    assert_eq!(inference_requests.len(), 2, "both users should reach inference");
+    for request in inference_requests {
+        let headers = request.headers.to_ascii_lowercase();
+        assert!(
+            !headers.contains("x-user-ogx-key")
+                && !headers.contains("scoped-user-a")
+                && !headers.contains("scoped-user-b"),
+            "credential material must be stripped before inference: {headers}"
+        );
+    }
+}
+
 fn start_files_api_stub_auth_required() -> u16 {
+    start_files_api_stub_with_auth_requirements(false)
+}
+
+fn start_files_api_stub_scoped_context_required() -> u16 {
+    start_files_api_stub_with_auth_requirements(true)
+}
+
+fn start_files_api_stub_with_auth_requirements(require_scoped_context: bool) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            std::thread::spawn(move || handle_files_api_request_auth(stream));
+            std::thread::spawn(move || handle_files_api_request_auth(stream, require_scoped_context));
         }
     });
 
@@ -431,7 +546,7 @@ pub(super) fn start_files_api_stub() -> u16 {
     port
 }
 
-fn handle_files_api_request_auth(mut stream: std::net::TcpStream) {
+fn handle_files_api_request_auth(mut stream: std::net::TcpStream, require_scoped_context: bool) {
     stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
 
     let mut data = Vec::new();
@@ -447,9 +562,35 @@ fn handle_files_api_request_auth(mut stream: std::net::TcpStream) {
     }
 
     let raw = String::from_utf8_lossy(&data);
-    let has_auth = raw
+    if raw
         .lines()
-        .any(|line| line.to_ascii_lowercase().starts_with("authorization:"));
+        .any(|line| line.to_ascii_lowercase().starts_with("x-user-ogx-key:"))
+    {
+        let body = br#"{"error":"credential source header leaked"}"#;
+        let header = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _sent = stream.write_all(header.as_bytes());
+        let _sent = stream.write_all(body);
+        return;
+    }
+    let lowercase = raw.to_ascii_lowercase();
+    let has_auth = if require_scoped_context {
+        ["a", "b"].iter().any(|suffix| {
+            lowercase
+                .lines()
+                .any(|line| line == format!("authorization: bearer scoped-user-{suffix}"))
+                && lowercase
+                    .lines()
+                    .any(|line| line == format!("x-tenant-id: tenant-{suffix}"))
+                && lowercase
+                    .lines()
+                    .any(|line| line == format!("x-user-id: user-{suffix}"))
+        })
+    } else {
+        lowercase.lines().any(|line| line.starts_with("authorization:"))
+    };
     if !has_auth {
         let body = br#"{"error":"unauthorized"}"#;
         let header = format!(
@@ -787,6 +928,10 @@ listeners:
 filter_chains:
   - name: file-resolve-pipeline
     filters:
+      - filter: callout_credentials
+        credentials:
+          - slot: ogx_files
+            source_header: x-user-ogx-key
       - filter: openai_responses_format
         on_invalid: continue
         headers:
@@ -796,6 +941,7 @@ filter_chains:
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:{files_api_port}"
         allow_pre_security_callout: true
+        user_credential: ogx_files
         outbound_chain:
           name: files-api-outbound
           filters:
@@ -806,8 +952,6 @@ filter_chains:
         file_url: resolve
         allowed_file_url_origins:
           - "http://127.0.0.1:{file_url_port}"
-        forward_headers:
-          - authorization
         on_missing: reject
         timeout_ms: 10000
 
@@ -856,7 +1000,7 @@ insecure_options:
         "POST /v1/responses HTTP/1.1\r\n\
          Host: localhost\r\n\
          Content-Type: application/json\r\n\
-         Authorization: Bearer test-token\r\n\
+         x-user-ogx-key: Bearer scoped-user-a\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n\
          {body}",
@@ -867,7 +1011,7 @@ insecure_options:
     assert_eq!(
         parse_status(&raw),
         200,
-        "request should succeed: Files API gets Authorization, file URL stub does not"
+        "request should succeed: Files API gets scoped Authorization, file URL stub does not"
     );
 
     let captured: serde_json::Value =

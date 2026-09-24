@@ -5,11 +5,18 @@ name: Publish
 # ------------------------------------------------------------------------------
 
 on:
+  schedule:
+    - cron: "0 5 * * *"
   workflow_dispatch:
+    inputs:
+      commit:
+        description: Optional commit SHA to build - defaults to the dispatch ref's commit if not provided.
+        required: false
+        type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ inputs.commit || github.sha }}
+  cancel-in-progress: false
 
 permissions: {}
 
@@ -27,12 +34,130 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.commit || github.sha }}
           persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - name: Publish container image
-        uses: praxis-proxy/conventions/.github/actions/ghcr-publish@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
-          image-name: ${{ github.repository }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          context: git
+          tags: |
+            type=sha
+            type=ref,event=branch
+            type=raw,value=nightly,enable=${{ github.event_name == 'schedule' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push container image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Containerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ----------------------------------------------------------------------------
+  # FIPS Container Build & Publish
+  # ----------------------------------------------------------------------------
+
+  # The same tags with a -fips suffix, built from Containerfile.fips on UBI 9.
+  # The pinned Red Hat base images are verified to be signed by Red Hat before
+  # the build (podman is the only client that can check those signatures, and
+  # Ubuntu's podman ships no registries.d entry for Red Hat's store, so the job
+  # installs the bundled one first). The shared ghcr-publish action cannot be
+  # used here: its tag set has no suffix, so it would overwrite the standard
+  # image's tags.
+
+  container-fips:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          persist-credentials: false
+
+      - name: Set up Rust (for the Red Hat image verification)
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        with:
+          # The restored target/ would otherwise be swept into the build context.
+          cache-target: "false"
+
+      - name: Set up Go (builds Red Hat's scanner)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v6.0.0
+        with:
+          go-version: "1.26"
+          cache: false
+
+      - name: Build Red Hat's scanner (check-payload) at the pinned revision
+        run: make fips-scanner
+
+      - name: Download the OpenShift CLI the scanner insists on (pinned, checksum-verified)
+        run: make fips-oc
+
+      - name: Point podman at Red Hat's signature store (Ubuntu's podman has no entry for it)
+        run: make fips-signature-store
+
+      - name: Verify the Red Hat base images are signed by Red Hat
+        run: make fips-verify-image
+
+      - name: Build on UBI 9 with Red Hat's toolchain and print the compliance report
+        run: make fips-check
+
+      - name: Build the FIPS runtime image for verification
+        run: make container-fips
+
+      - name: Run the image once (validates its built-in config with the system OpenSSL)
+        run: make fips-smoke
+
+      - name: Scan the image with check-payload (warnings fatal)
+        run: make fips-scan
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | podman login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=false
+            suffix=-fips
+          tags: |
+            type=sha
+            type=ref,event=branch
+            type=raw,value=nightly,enable=${{ github.event_name == 'schedule' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Tag and push the scanned FIPS image
+        env:
+          PUBLISHED_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          source_image=$(make -s fips-image-ref)
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            podman tag "$source_image" "$tag"
+            podman push "$tag"
+          done <<< "$PUBLISHED_TAGS"

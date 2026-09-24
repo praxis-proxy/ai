@@ -61,6 +61,19 @@ pub enum OnMissing {
 }
 
 // -----------------------------------------------------------------------------
+// Security-context terminal
+// -----------------------------------------------------------------------------
+
+/// Well-known OpenAI error code for a locally-detected missing/invalid per-user callout
+/// credential (the "security-context failure" terminal). The HTTP status is always 401.
+///
+/// This is a security signal: the [`OnMissing`] policy must never be widened to absorb a
+/// failure carrying this code (see the invariant on [`OnMissing`]). Anthropic consumers, which
+/// have no error-code field, map the same condition to error type `authentication_error`.
+#[cfg(any(feature = "openai-responses", test))]
+pub(crate) const MISSING_CALLOUT_CONTEXT: &str = "missing_callout_context";
+
+// -----------------------------------------------------------------------------
 // CalloutSettings
 // -----------------------------------------------------------------------------
 
@@ -232,5 +245,14 @@ mod tests {
         assert!(serde_yaml::from_str::<OnFailure>("reject").is_err());
         assert!(serde_yaml::from_str::<OnMissing>("open").is_err());
         assert!(serde_yaml::from_str::<OnMissing>("closed").is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Security-context terminal
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn missing_callout_context_code_is_stable() {
+        assert_eq!(MISSING_CALLOUT_CONTEXT, "missing_callout_context");
     }
 }

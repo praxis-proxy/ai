@@ -179,6 +179,58 @@ fn emit_status_uses_valid_key() {
         "status should be stored with underscore-separated key"
     );
 }
+
+#[test]
+fn parse_search_request_prefers_current_field_and_rejects_invalid_current_field() {
+    let both = serde_json::json!({
+        "action": {"query": "legacy", "queries": ["current one", "current two"]}
+    });
+    let current = parse_search_request(&both, "ws_both", 0).unwrap();
+    assert_eq!(current.queries, ["current one", "current two"]);
+    assert_eq!(
+        current.action,
+        serde_json::json!({"type": "search", "queries": ["current one", "current two"]})
+    );
+
+    let legacy = serde_json::json!({"action": {"query": "legacy"}});
+    let legacy = parse_search_request(&legacy, "ws_legacy", 0).unwrap();
+    assert_eq!(legacy.queries, ["legacy"]);
+    assert_eq!(legacy.action, serde_json::json!({"type": "search", "query": "legacy"}));
+
+    // The OpenAI schema puts no `minItems` on `queries` and still permits the
+    // deprecated `query`, so an empty array carries no queries to prefer and
+    // must not discard a usable legacy query.
+    let empty_current = serde_json::json!({"action": {"query": "legacy", "queries": []}});
+    let empty_current = parse_search_request(&empty_current, "ws_empty", 0).unwrap();
+    assert_eq!(
+        empty_current.queries,
+        ["legacy"],
+        "an empty queries array falls back to the deprecated query"
+    );
+    assert_eq!(
+        empty_current.action,
+        serde_json::json!({"type": "search", "query": "legacy"}),
+        "the fallback reports the legacy action shape it actually dispatched"
+    );
+
+    let empty_without_legacy = serde_json::json!({"action": {"queries": []}});
+    assert!(
+        parse_search_request(&empty_without_legacy, "ws_empty_only", 0).is_none(),
+        "an empty queries array with no legacy query leaves nothing to dispatch"
+    );
+
+    let invalid_current = serde_json::json!({"action": {"query": "legacy", "queries": [42]}});
+    assert!(
+        parse_search_request(&invalid_current, "ws_invalid", 0).is_none(),
+        "a non-string queries member must not fall back to query"
+    );
+
+    let non_array_current = serde_json::json!({"action": {"query": "legacy", "queries": "rust"}});
+    assert!(
+        parse_search_request(&non_array_current, "ws_non_array", 0).is_none(),
+        "a non-array queries field must not fall back to query"
+    );
+}
 // -----------------------------------------------------------------------------
 // Response ownership
 // -----------------------------------------------------------------------------
@@ -405,6 +457,95 @@ async fn on_request_body_executes_search_and_populates_state() {
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0]["type"], "url");
     assert_eq!(sources[0]["url"], "https://rust-lang.org");
+}
+
+#[tokio::test]
+async fn on_request_body_executes_current_queries_without_duplicating_legacy_query() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_search_responses(listener, vec![(200, brave_ok_body()), (200, brave_ok_body())]);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test"}));
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_queries",
+        "action": {
+            "type": "search",
+            "query": "first query",
+            "queries": ["first query", "second query"]
+        }
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a call carrying both field shapes is dispatched inline, not short-circuited"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.web_search_calls_executed, 1, "one hosted action was dispatched");
+    let output = &state.accumulated_output[0];
+    assert_eq!(
+        output["action"]["queries"],
+        serde_json::json!(["first query", "second query"])
+    );
+    assert!(
+        output["action"].get("query").is_none(),
+        "current output must not retain deprecated query"
+    );
+    let bridge = state
+        .messages
+        .iter()
+        .find(|message| message["type"] == "function_call")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(bridge["arguments"].as_str().unwrap()).unwrap(),
+        serde_json::json!({"queries": ["first query", "second query"]})
+    );
+}
+
+#[tokio::test]
+async fn on_request_body_falls_back_to_legacy_query_when_queries_is_empty() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_brave_mock(listener);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test"}));
+    state.web_search_calls = vec![serde_json::json!({
+        "type": "web_search_call",
+        "id": "ws_empty_queries",
+        "action": {"type": "search", "query": "legacy query", "queries": []}
+    })];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "the legacy fallback dispatches inline, not short-circuited"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.web_search_calls_executed, 1,
+        "an empty queries array still dispatches the deprecated query"
+    );
+    assert_eq!(state.accumulated_output[0]["status"], "completed");
+    assert_ne!(
+        state.messages.last().unwrap()["output"],
+        MISSING_QUERY_OUTPUT,
+        "a usable legacy query is never reported as a missing query"
+    );
 }
 
 #[tokio::test]
@@ -885,7 +1026,13 @@ async fn web_search_continuation_serializes_backend_valid_input() {
 
 #[test]
 fn build_output_item_completed_with_sources_included() {
-    let item = build_output_item("ws_123", "completed", "test query", &[], true);
+    let item = build_output_item(
+        "ws_123",
+        "completed",
+        serde_json::json!({"type": "search", "query": "test query"}),
+        &[],
+        true,
+    );
     assert_eq!(item["type"], "web_search_call");
     assert_eq!(item["id"], "ws_123");
     assert_eq!(item["status"], "completed");
@@ -902,7 +1049,13 @@ fn build_output_item_omits_sources_when_not_included() {
         url: "https://rust-lang.org".into(),
         snippet: "Systems".into(),
     }];
-    let item = build_output_item("ws_123", "completed", "test query", &results, false);
+    let item = build_output_item(
+        "ws_123",
+        "completed",
+        serde_json::json!({"type": "search", "query": "test query"}),
+        &results,
+        false,
+    );
     assert_eq!(item["action"]["type"], "search");
     assert_eq!(item["action"]["query"], "test query");
     assert!(
@@ -925,7 +1078,13 @@ fn build_output_item_with_results() {
             snippet: "Packages".into(),
         },
     ];
-    let item = build_output_item("ws_123", "completed", "search query", &results, true);
+    let item = build_output_item(
+        "ws_123",
+        "completed",
+        serde_json::json!({"type": "search", "query": "search query"}),
+        &results,
+        true,
+    );
     assert!(item.get("sources").is_none(), "no top-level sources");
     let sources = item["action"]["sources"].as_array().unwrap();
     assert_eq!(sources.len(), 2);
@@ -938,7 +1097,12 @@ fn build_output_item_with_results() {
 
 #[test]
 fn build_tool_result_messages_empty() {
-    let [call, output] = build_tool_result_messages("ws_123", "completed", "rust", &[]);
+    let [call, output] = build_tool_result_messages(
+        "ws_123",
+        &serde_json::json!({"type": "search", "query": "rust"}),
+        &[],
+        None,
+    );
     assert_eq!(
         call["type"], "function_call",
         "continuation bridge is a backend-valid function_call/function_call_output pair, never a hosted web_search_call"
@@ -959,7 +1123,12 @@ fn build_tool_result_messages_with_results() {
         url: "https://example.com".into(),
         snippet: "A description".into(),
     }];
-    let [call, output] = build_tool_result_messages("ws_123", "completed", "example query", &results);
+    let [call, output] = build_tool_result_messages(
+        "ws_123",
+        &serde_json::json!({"type": "search", "query": "example query"}),
+        &results,
+        None,
+    );
     assert_eq!(call["type"], "function_call");
     assert_eq!(call["arguments"], r#"{"query":"example query"}"#);
     assert_eq!(output["type"], "function_call_output");
@@ -979,7 +1148,7 @@ fn bridge_call_id_is_bounded_for_unbounded_source_id() {
     // OpenAI web-search ids have no maximum length, but a synthetic function
     // call_id must stay within the OpenResponses 64-char limit.
     let long_source = format!("ws_{}", "a".repeat(4096));
-    let id = bridge_call_id(&long_source, "rust language", 0);
+    let id = bridge_call_id(&long_source, &["rust language"], 0);
     assert!(
         id.len() <= 64,
         "bridge call_id must be <= 64 chars for an unbounded source id, got {}: {id}",
@@ -990,9 +1159,25 @@ fn bridge_call_id_is_bounded_for_unbounded_source_id() {
 #[test]
 fn bridge_call_id_is_deterministic() {
     assert_eq!(
-        bridge_call_id("ws_1", "rust", 0),
-        bridge_call_id("ws_1", "rust", 0),
+        bridge_call_id("ws_1", &["rust"], 0),
+        bridge_call_id("ws_1", &["rust"], 0),
         "identical inputs must yield the same bridge call_id"
+    );
+}
+
+#[test]
+fn bridge_call_id_covers_every_query() {
+    // A multi-query call hashes all of its queries, so two calls agreeing on
+    // the first query but differing later still get distinct identities.
+    assert_ne!(
+        bridge_call_id("ws_1", &["rust", "cargo"], 0),
+        bridge_call_id("ws_1", &["rust", "rustup"], 0),
+        "a differing trailing query must change the bridge call_id"
+    );
+    assert_ne!(
+        bridge_call_id("ws_1", &["ab", "c"], 0),
+        bridge_call_id("ws_1", &["a", "bc"], 0),
+        "query boundaries must not be lost to concatenation"
     );
 }
 
@@ -1001,8 +1186,8 @@ fn bridge_call_id_is_unique_for_duplicate_source_ids() {
     // Two calls in one turn sharing a source id must not collide, or their
     // function_call_output pairs would be ambiguous.
     assert_ne!(
-        bridge_call_id("ws_dup", "rust", 0),
-        bridge_call_id("ws_dup", "rust", 1),
+        bridge_call_id("ws_dup", &["rust"], 0),
+        bridge_call_id("ws_dup", &["rust"], 1),
         "duplicate source ids must produce distinct bridge call_ids per index"
     );
 }
@@ -1012,15 +1197,20 @@ fn bridge_call_id_is_unique_for_absent_source_ids() {
     // Absent ids collapse to the "ws_unknown" fallback; the call index still
     // disambiguates each bridge.
     assert_ne!(
-        bridge_call_id("ws_unknown", "rust", 0),
-        bridge_call_id("ws_unknown", "rust", 1),
+        bridge_call_id("ws_unknown", &["rust"], 0),
+        bridge_call_id("ws_unknown", &["rust"], 1),
         "absent source ids must still produce distinct bridge call_ids per index"
     );
 }
 
 #[test]
-fn build_failed_tool_result_messages_carry_bounded_notice() {
-    let [call, output] = build_failed_tool_result_messages("ws_123", "rust");
+fn build_tool_result_messages_failed_carry_bounded_notice() {
+    let [call, output] = build_tool_result_messages(
+        "ws_123",
+        &serde_json::json!({"type": "search", "query": "rust"}),
+        &[],
+        Some(SEARCH_UNAVAILABLE),
+    );
     assert_eq!(
         call["type"], "function_call",
         "failure bridge is a backend-valid function_call/function_call_output pair, never a hosted web_search_call"
@@ -1101,7 +1291,12 @@ fn upsert_output_item_replaces_missing_id_placeholders_independently() {
 fn build_tool_result_messages_incomplete_reports_not_performed() {
     // A non-dispatched call (over-budget or missing query) must not be
     // misrepresented to the model as a completed search with no results.
-    let [call, output] = build_tool_result_messages("ws_123", "incomplete", "rust", &[]);
+    let [call, output] = build_tool_result_messages(
+        "ws_123",
+        &serde_json::json!({"type": "search", "query": "rust"}),
+        &[],
+        Some(NOT_PERFORMED_OUTPUT),
+    );
     assert_eq!(call["type"], "function_call");
     assert_eq!(call["call_id"], "ws_123");
     assert_eq!(output["type"], "function_call_output");
@@ -1134,6 +1329,11 @@ fn format_search_results_multiple() {
 
 /// Brave mock that serves every connection and counts dispatched requests.
 fn spawn_counting_brave_mock(listener: std::net::TcpListener) -> Arc<std::sync::atomic::AtomicUsize> {
+    spawn_counting_body_mock(listener, brave_ok_body())
+}
+
+/// Counting mock that answers every connection with the same `body`.
+fn spawn_counting_body_mock(listener: std::net::TcpListener, body: String) -> Arc<std::sync::atomic::AtomicUsize> {
     use std::{
         io::{Read as _, Write as _},
         sync::{
@@ -1143,16 +1343,6 @@ fn spawn_counting_brave_mock(listener: std::net::TcpListener) -> Arc<std::sync::
     };
     let counter = Arc::new(AtomicUsize::new(0));
     let thread_counter = Arc::clone(&counter);
-    let body = serde_json::json!({
-        "web": {
-            "results": [{
-                "title": "Rust Lang",
-                "url": "https://rust-lang.org",
-                "description": "Systems programming language"
-            }]
-        }
-    })
-    .to_string();
     std::thread::spawn(move || {
         while let Ok((mut stream, _)) = listener.accept() {
             let mut buf = [0_u8; 4096];
@@ -1195,23 +1385,13 @@ fn find_bridge_output<'a>(messages: &'a [Value], query: &str) -> Option<&'a Valu
 }
 
 #[test]
-fn remaining_budget_uses_server_cap_without_max_tool_calls() {
-    let state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
-    assert_eq!(
-        remaining_web_search_budget(&state),
-        MAX_WEB_SEARCH_CALLS_PER_CONTINUATION,
-        "omitting max_tool_calls falls back to the server hard cap"
-    );
-}
-
-#[test]
-fn remaining_budget_caps_large_max_tool_calls_at_server_cap() {
+fn remaining_budget_keeps_large_max_tool_calls_uncapped() {
     let state =
         ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x", "max_tool_calls": 1000}));
     assert_eq!(
         remaining_web_search_budget(&state),
-        MAX_WEB_SEARCH_CALLS_PER_CONTINUATION,
-        "a large client budget is still bounded by the server cap"
+        1000,
+        "the tool-call budget is not intersected with the query fan-out cap"
     );
 }
 
@@ -1541,5 +1721,601 @@ async fn on_request_body_without_max_tool_calls_dispatches_all_under_cap() {
             .iter()
             .all(|item| item["status"] == "completed"),
         "all searches completed under the server cap"
+    );
+}
+
+#[tokio::test]
+async fn missing_required_credential_records_security_failure() {
+    // Filter requires the caller's per-user "brave" slot; ctx has NO credentials.
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("provider: brave\napi_key: fallback-key\nuser_credential: brave").unwrap();
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState {
+        web_search_calls: vec![serde_json::json!({
+            "id": "ws_1",
+            "action": {"type": "search", "query": "hello"}
+        })],
+        ..ResponsesState::default()
+    });
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    let failure = state.security_failure.as_ref().expect("security failure recorded");
+    assert_eq!(failure.status, 401);
+    assert_eq!(failure.code, "missing_callout_context");
+    assert_eq!(state.web_search_calls_executed, 0, "no provider request dispatched");
+}
+
+// -----------------------------------------------------------------------------
+// Round-0 credential preflight
+//
+// On the initial client request (no web_search_calls yet) the filter must fail
+// closed with a 401 BEFORE any inference round when a hosted web-search tool is
+// declared, could run under the effective `tool_choice`, and the required
+// per-user credential is absent. Under terminal streaming the re-entry check
+// fires only after HTTP 200 has committed, so the preflight is the only place a
+// truthful 401 can be returned for a streaming request.
+// -----------------------------------------------------------------------------
+
+/// Build a web-search filter that requires the caller's per-user "brave" slot.
+fn scoped_web_search_filter() -> Box<dyn HttpFilter> {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("provider: brave\napi_key: fallback-key\nuser_credential: brave").unwrap();
+    WebSearchFilter::from_config(&yaml).unwrap()
+}
+
+/// Run `on_request_body` for a fresh initial request built from `body`, with no
+/// pending `web_search_calls`, returning the resulting action.
+async fn run_initial_request(filter: &dyn HttpFilter, body: Value) -> FilterAction {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(ResponsesState::from_request_body(body));
+    filter.on_request_body(&mut ctx, &mut None, true).await.unwrap()
+}
+
+#[tokio::test]
+async fn initial_streaming_request_missing_credential_rejects_before_first_round() {
+    // A fresh streaming request that declares web_search but omits the required
+    // per-user credential must be rejected with a 401 before any round runs; the
+    // re-entry check is unreachable once the stream has committed HTTP 200.
+    let filter = scoped_web_search_filter();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "search for cats",
+            "stream": true,
+            "tools": [{"type": "web_search"}]
+        }),
+    )
+    .await;
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected a fail-closed rejection, got {action:?}");
+    };
+    assert_eq!(
+        rejection.status, 401,
+        "missing per-user credential must fail closed with 401"
+    );
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        body["error"]["code"], "missing_callout_context",
+        "rejection must carry the missing_callout_context code"
+    );
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("brave"),
+        "rejection message should name the missing slot"
+    );
+}
+
+#[tokio::test]
+async fn initial_request_with_populated_credential_passes_preflight() {
+    // The credential is present, so the preflight succeeds; with no pending
+    // web_search_calls the filter simply continues without rejecting.
+    let filter = scoped_web_search_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut creds = crate::CalloutCredentials::new();
+    creds.insert("brave".to_owned(), secrecy::SecretString::from("tok-xyz"));
+    ctx.extensions.insert(creds);
+    ctx.extensions
+        .insert(ResponsesState::from_request_body(serde_json::json!({
+            "model": "gpt-4o",
+            "input": "search for cats",
+            "stream": true,
+            "tools": [{"type": "web_search"}]
+        })));
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a populated credential must pass the preflight, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn initial_request_tool_choice_none_skips_preflight() {
+    // `tool_choice: "none"` forbids all tools, so web search cannot run and no
+    // credential is required even though the tool is declared.
+    let filter = scoped_web_search_filter();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "tool_choice": "none",
+            "tools": [{"type": "web_search"}]
+        }),
+    )
+    .await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "tool_choice=none disables web search, so no credential preflight applies, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn initial_request_tool_choice_forces_other_tool_skips_preflight() {
+    // Forcing a non-web-search tool means web search cannot run this turn.
+    let filter = scoped_web_search_filter();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "tool_choice": {"type": "function", "name": "get_weather"},
+            "tools": [{"type": "web_search"}, {"type": "function", "name": "get_weather"}]
+        }),
+    )
+    .await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "forcing a different tool skips the web-search credential preflight, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn initial_request_without_web_search_tool_skips_preflight() {
+    // No hosted web-search tool is declared, so the preflight never applies.
+    let filter = scoped_web_search_filter();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "tools": [{"type": "function", "name": "get_weather"}]
+        }),
+    )
+    .await;
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "no declared web-search tool means no credential preflight, got {action:?}"
+    );
+}
+
+#[tokio::test]
+async fn initial_request_tool_choice_forces_web_search_rejects() {
+    // An object `tool_choice` that forces the hosted web-search tool keeps it
+    // eligible, so a missing credential still fails closed at round 0.
+    let filter = scoped_web_search_filter();
+    let action = run_initial_request(
+        filter.as_ref(),
+        serde_json::json!({
+            "model": "gpt-4o",
+            "input": "search for cats",
+            "tool_choice": {"type": "web_search"},
+            "tools": [{"type": "web_search"}]
+        }),
+    )
+    .await;
+    let FilterAction::Reject(rejection) = action else {
+        panic!("forcing web_search with a missing credential must reject, got {action:?}");
+    };
+    assert_eq!(rejection.status, 401, "forced web search without a credential must 401");
+}
+
+// -----------------------------------------------------------------------------
+// Query fan-out: one call, several queries
+// -----------------------------------------------------------------------------
+
+/// Build a pending call carrying the current multi-query `action.queries` form.
+fn web_search_queries_call(id: &str, queries: &[&str]) -> Value {
+    serde_json::json!({
+        "type": "web_search_call",
+        "id": id,
+        "action": {"type": "search", "queries": queries}
+    })
+}
+
+/// Find the `function_call_output` bridged for a multi-query call.
+fn find_queries_bridge_output<'a>(messages: &'a [Value], queries: &[&str]) -> Option<&'a Value> {
+    let needle = serde_json::json!({ "queries": queries }).to_string();
+    let call_id = messages.iter().find_map(|m| {
+        (m["type"] == "function_call" && m["arguments"] == needle)
+            .then(|| m["call_id"].as_str())
+            .flatten()
+    })?;
+    messages
+        .iter()
+        .find(|m| m["type"] == "function_call_output" && m["call_id"] == call_id)
+}
+
+#[tokio::test]
+async fn multi_query_call_costs_one_tool_call_unit() {
+    // `max_tool_calls` counts logical built-in tool calls: a single
+    // `web_search_call` carrying three queries fits in a budget of one, while
+    // still issuing one provider request per query.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = spawn_counting_brave_mock(listener);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let queries = ["first", "second", "third"];
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test", "max_tool_calls": 1});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![web_search_queries_call("ws_multi", &queries)];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a multi-query call within the tool-call budget is dispatched, not short-circuited"
+    );
+
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "every query in the call reaches the provider"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.web_search_calls_executed, 1,
+        "a multi-query call consumes exactly one tool-call unit"
+    );
+    assert_eq!(state.accumulated_output.len(), 1);
+    assert_eq!(
+        state.accumulated_output[0]["status"], "completed",
+        "all queries dispatched, so the call is complete"
+    );
+    assert!(
+        !state.deferred_tool_limit_completion,
+        "a single call must not exhaust max_tool_calls: 1"
+    );
+    let bridge = find_queries_bridge_output(&state.messages, &queries).expect("multi-query bridge present");
+    assert!(
+        bridge["output"].as_str().unwrap().contains("Rust Lang"),
+        "the bridge carries the gathered results"
+    );
+}
+
+#[tokio::test]
+async fn query_cap_bounds_the_whole_batch_and_keeps_partial_results() {
+    // The fan-out cap is spent across the batch, not per call: the client omits
+    // max_tool_calls, so this cap alone bounds the (paid) provider requests one
+    // continuation may issue. A first call consumes nearly all of it, the next
+    // call is clipped mid-way and keeps the results it did obtain — mirroring
+    // the file-search clipped-fan-out rule — and the last call reaches the
+    // provider not at all.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = spawn_counting_brave_mock(listener);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let owned: Vec<String> = (0..MAX_WEB_SEARCH_QUERIES_PER_CONTINUATION - 1)
+        .map(|index| format!("q{index}"))
+        .collect();
+    let bulk: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let clipped = ["clipped in", "clipped out", "also clipped out"];
+    let starved = ["never reached", "nor this one"];
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![
+        web_search_queries_call("ws_bulk", &bulk),
+        web_search_queries_call("ws_clipped", &clipped),
+        web_search_queries_call("ws_starved", &starved),
+    ];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a batch bounded by the fan-out cap still continues the request"
+    );
+
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        MAX_WEB_SEARCH_QUERIES_PER_CONTINUATION,
+        "the fan-out cap bounds the provider requests the whole batch may issue"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.web_search_calls_executed, 2,
+        "only the calls that reached the provider count as dispatched tool calls"
+    );
+    assert_eq!(
+        state.accumulated_output[0]["status"], "completed",
+        "the first call fit inside the cap"
+    );
+    assert_eq!(
+        state.accumulated_output[1]["status"], "incomplete",
+        "a call whose queries were clipped is incomplete"
+    );
+    assert_eq!(
+        state.accumulated_output[2]["status"], "incomplete",
+        "a call left with no query allowance is incomplete"
+    );
+    for messages in [&state.messages, &state.persisted_messages] {
+        let bridge = find_queries_bridge_output(messages, &clipped).expect("clipped bridge present");
+        assert!(
+            bridge["output"].as_str().unwrap().contains("Rust Lang"),
+            "a clipped call bridges the results it did gather, not a not-performed notice"
+        );
+        let bridge = find_queries_bridge_output(messages, &starved).expect("starved bridge present");
+        assert_eq!(
+            bridge["output"], "Web search not performed.",
+            "an undispatched call must not fabricate results"
+        );
+    }
+}
+
+#[tokio::test]
+async fn query_cap_boundary_keeps_zero_result_successes_truthful() {
+    // Both sides of the fan-out cap, with every query answered by an empty
+    // result set: a call that exactly fills the cap is dispatched whole and
+    // reports the successful no-results search, while one query past the cap is
+    // clipped and must still say the searches ran rather than claiming nothing
+    // was performed.
+    async fn dispatch(n_queries: usize) -> (usize, String, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let empty_body = serde_json::json!({"web": {"results": []}}).to_string();
+        let count = spawn_counting_body_mock(listener, empty_body);
+
+        let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+        let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let owned: Vec<String> = (0..n_queries).map(|index| format!("q{index}")).collect();
+        let queries: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let mut state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "test"}));
+        state.web_search_calls = vec![web_search_queries_call("ws_cap_boundary", &queries)];
+        ctx.extensions.insert(state);
+
+        let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "dispatching {n_queries} queries must not short-circuit the request"
+        );
+
+        let state = ctx.extensions.get::<ResponsesState>().unwrap();
+        let status = state.accumulated_output[0]["status"].as_str().unwrap().to_owned();
+        let bridge = find_queries_bridge_output(&state.messages, &queries).expect("bridge present");
+        let output = bridge["output"].as_str().unwrap().to_owned();
+        (count.load(std::sync::atomic::Ordering::SeqCst), status, output)
+    }
+
+    let cap = MAX_WEB_SEARCH_QUERIES_PER_CONTINUATION;
+    assert_eq!(
+        dispatch(cap).await,
+        (cap, "completed".to_owned(), NO_RESULTS_OUTPUT.to_owned()),
+        "a call filling the cap exactly is dispatched whole, and empty result sets are successes"
+    );
+    assert_eq!(
+        dispatch(cap + 1).await,
+        (cap, "incomplete".to_owned(), PARTIAL_CLIPPED_OUTPUT.to_owned()),
+        "one query past the cap clips the call, which still reached the provider {cap} times"
+    );
+}
+
+#[tokio::test]
+async fn provider_failure_after_success_keeps_partial_results() {
+    // The first query succeeds and the second fails: the call keeps the results
+    // it gathered and is reported incomplete rather than failed.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_search_responses(listener, vec![(200, brave_ok_body()), (503, String::new())]);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let queries = ["works", "breaks", "never dispatched"];
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![web_search_queries_call("ws_partial", &queries)];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a provider failure must never reject the Response"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.web_search_calls_executed, 1);
+    assert_eq!(
+        state.accumulated_output[0]["status"], "incomplete",
+        "a partially answered call is incomplete, not failed"
+    );
+    let bridge = find_queries_bridge_output(&state.messages, &queries).expect("partial bridge present");
+    assert!(
+        bridge["output"].as_str().unwrap().contains("Rust Lang"),
+        "results from the successful query survive the later failure"
+    );
+    assert_ne!(
+        bridge["output"], "Web search unavailable.",
+        "a call that gathered results must not report a bare unavailable notice"
+    );
+}
+
+#[tokio::test]
+async fn all_queries_failing_reports_failed_call() {
+    // No query returned anything, so the call stays `failed` with the bounded
+    // unavailable notice. The mock would answer a second callout successfully,
+    // so any result content here proves the first failure did not stop the
+    // fan-out and spend a further (paid) provider request.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    spawn_search_responses(listener, vec![(503, String::new()), (200, brave_ok_body())]);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let queries = ["breaks", "never dispatched"];
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![web_search_queries_call("ws_all_fail", &queries)];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a provider failure is reported to the model, not surfaced as a rejected request"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.accumulated_output[0]["status"], "failed",
+        "a call that gathered nothing is failed, not incomplete"
+    );
+    let bridge = find_queries_bridge_output(&state.messages, &queries).expect("failed bridge present");
+    assert_eq!(
+        bridge["output"], "Web search unavailable.",
+        "the first provider failure ends the call's fan-out"
+    );
+}
+
+#[tokio::test]
+async fn zero_result_success_before_failure_is_not_reported_as_failed() {
+    // The first query succeeds with no rows and the second fails. Judging the
+    // call by its empty result set alone would report it `failed` with the
+    // unavailable notice, hiding the fact that a query did run and found
+    // nothing.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let empty_body = serde_json::json!({"web": {"results": []}}).to_string();
+    spawn_search_responses(listener, vec![(200, empty_body), (503, String::new())]);
+
+    let yaml = make_filter_yaml_with_base_url("brave", "test-key", &format!("http://{addr}"));
+    let filter = WebSearchFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let queries = ["finds nothing", "breaks"];
+    let body = serde_json::json!({"model": "gpt-4o", "input": "test"});
+    let mut state = ResponsesState::from_request_body(body);
+    state.web_search_calls = vec![web_search_queries_call("ws_zero_then_fail", &queries)];
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a partially failed call is reported to the model, not surfaced as a rejected request"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.accumulated_output[0]["status"], "incomplete",
+        "a query that ran and found nothing is a success, so the call is incomplete rather than failed"
+    );
+    let bridge = find_queries_bridge_output(&state.messages, &queries).expect("partial bridge present");
+    assert_eq!(
+        bridge["output"], PARTIAL_UNAVAILABLE_OUTPUT,
+        "the notice reports the partial dispatch, not a call that never reached the provider"
+    );
+}
+
+#[test]
+fn status_and_notice_separates_zero_result_successes_from_non_execution() {
+    // `successful` counts queries the provider answered, including those that
+    // answered with no rows, so each cause below is reported on its own terms.
+    let cases = [
+        (
+            (0, 2, 2),
+            ("failed", Some(SEARCH_UNAVAILABLE)),
+            "no query was ever answered",
+        ),
+        (
+            (1, 3, 3),
+            ("incomplete", Some(PARTIAL_UNAVAILABLE_OUTPUT)),
+            "short of both bounds, so a query was lost to a provider failure",
+        ),
+        (
+            (2, 5, 2),
+            ("incomplete", Some(PARTIAL_CLIPPED_OUTPUT)),
+            "stopped exactly at the cap with queries left, so the batch budget clipped it",
+        ),
+        (
+            (3, 3, 5),
+            ("completed", None),
+            "every query was answered well inside the cap",
+        ),
+        (
+            (2, 2, 2),
+            ("completed", None),
+            "a cap met exactly by the last query clipped nothing",
+        ),
+    ];
+
+    for ((successful, n_queries, query_cap), expected, reason) in cases {
+        assert_eq!(
+            status_and_notice(successful, n_queries, query_cap),
+            expected,
+            "{successful} of {n_queries} queries under a cap of {query_cap}: {reason}"
+        );
+    }
+}
+
+#[test]
+fn remaining_budget_leaves_calls_unbounded_without_max_tool_calls() {
+    let state = ResponsesState::from_request_body(serde_json::json!({"model": "gpt-4o", "input": "x"}));
+    assert_eq!(
+        remaining_web_search_budget(&state),
+        usize::MAX,
+        "omitting max_tool_calls leaves the tool-call dimension to max_calls_per_round"
+    );
+}
+
+#[test]
+fn build_tool_result_messages_incomplete_with_results_keeps_them() {
+    let results = vec![SearchResult {
+        title: "Rust Lang".to_owned(),
+        url: "https://rust-lang.org".to_owned(),
+        snippet: "Systems programming language".to_owned(),
+    }];
+    let action = serde_json::json!({"type": "search", "queries": ["a", "b"]});
+    let messages = build_tool_result_messages("ws_partial", &action, &results, Some(PARTIAL_UNAVAILABLE_OUTPUT));
+    let output = messages[1]["output"].as_str().unwrap();
+    assert!(
+        output.contains("Rust Lang"),
+        "a partial call keeps the rows it gathered before the provider failed"
+    );
+    assert!(
+        output.contains(PARTIAL_UNAVAILABLE_OUTPUT),
+        "the partial notice is appended so the model knows the rows are incomplete"
     );
 }

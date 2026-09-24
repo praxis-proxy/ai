@@ -11,26 +11,31 @@
 
 pub mod anthropic;
 pub mod azure;
+mod callout_credentials;
 pub mod callout_headers;
+mod callout_identity;
 pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
+pub mod hash;
 pub mod http_hop;
 pub mod json_body;
+#[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_client;
 pub mod openai;
 pub mod operation;
+mod project_state_owner_headers;
 pub mod promotion;
 mod state_owner;
-mod state_owner_headers;
 #[cfg(feature = "store")]
 pub mod store;
 pub mod subrequest;
 pub mod token_cache;
 pub(crate) mod web_search;
 
+pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
+pub use project_state_owner_headers::ProjectStateOwnerHeadersFilter;
 pub use state_owner::{StateOwner, StateOwnerError, StateOwnerFilter, project_state_owner};
-pub use state_owner_headers::StateOwnerHeadersFilter;
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -69,9 +74,17 @@ pub(crate) mod test_utils {
     /// exercise the callout path. Whether a private/loopback destination is then
     /// permitted is governed by the filter's bound outbound pipeline posture, not
     /// this client.
-    static TEST_SUBREQUEST_CLIENT: LazyLock<praxis_core::subrequest::SubRequestClient> = LazyLock::new(|| {
-        praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(1, None))
-    });
+    static TEST_SUBREQUEST_CLIENT: LazyLock<praxis_core::subrequest::SubRequestClient> =
+        LazyLock::new(|| praxis_core::subrequest::SubRequestClient::new(connector(1)));
+
+    /// A sub-request connector for tests. The connector builds a rustls
+    /// client config, and rustls needs the process-wide crypto provider (the
+    /// system OpenSSL, installed by the binary at startup) before that; the
+    /// helper installs it, which is a no-op after the first call.
+    pub(crate) fn connector(pool_size: usize) -> praxis_core::subrequest::SubRequestConnector {
+        praxis_tls::provider::install();
+        praxis_core::subrequest::SubRequestConnector::new(pool_size, None)
+    }
 
     /// Build a minimal request for filter unit tests.
     pub(crate) fn make_request(method: Method, path: &str) -> Request {
@@ -149,7 +162,7 @@ pub(crate) mod test_utils {
     }
 
     /// Build a stable owner for tests that previously supplied only a tenant.
-    #[cfg(feature = "store-sqlite")]
+    #[cfg(feature = "store")]
     pub(crate) fn test_owner(tenant_id: &str) -> crate::StateOwner {
         crate::StateOwner::from_trusted_parts(tenant_id, "test-issuer", "test-subject")
             .expect("test owner should be valid")
@@ -176,7 +189,7 @@ pub(crate) mod test_utils {
         );
         praxis_filter::register_filters!(
             @register registry,
-            http "state_owner_headers" => crate::StateOwnerHeadersFilter::from_config
+            http "project_state_owner_headers" => crate::ProjectStateOwnerHeadersFilter::from_config
         );
         praxis_filter::register_filters!(
             @register registry,

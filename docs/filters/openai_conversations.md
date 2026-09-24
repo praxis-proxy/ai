@@ -7,7 +7,7 @@ Handles all `/v1/conversations` endpoints locally.
 
 ## Configuration Notes
 
-All matched requests are served from the local store and never forwarded upstream. Unmatched paths pass through as `Continue`.
+All matched requests are served from the local store and never forwarded upstream. Unmatched paths pass through as `Continue`. `openai_operation` must precede this filter in the same chain.
 
 ## Configuration
 
@@ -28,10 +28,11 @@ All matched requests are served from the local store and never forwarded upstrea
 ## Example
 
 ```yaml
-filter: openai_conversations
-backend: postgres
-database_url: postgres://praxis:password@db.example.com/praxis
-conversations_table: conversations
-items_table: conversation_items
-allow_private_database_url: true
+- filter: openai_operation
+- filter: openai_conversations
+  backend: postgres
+  database_url: postgres://praxis:password@db.example.com/praxis
+  conversations_table: conversations
+  items_table: conversation_items
+  allow_private_database_url: true
 ```

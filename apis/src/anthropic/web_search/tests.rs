@@ -13,10 +13,20 @@ use praxis_filter::{
     BodyAccess, BodyMode, FilterAction, HttpFilter, HttpFilterContext, Request, Response, StreamTerminationCause,
     SubRequestResponseMode,
 };
+use secrecy::{ExposeSecret as _, SecretString};
 use serde_json::{Value, json};
 
 use super::*;
-use crate::test_utils::{make_filter_context, make_request, make_response};
+use crate::{
+    CalloutCredentials,
+    callout_identity::CalloutIdentity,
+    test_utils::{make_filter_context, make_request, make_response},
+};
+
+/// A callout identity with no owner and no per-user credential (shared-key path).
+fn shared_key_identity() -> CalloutIdentity {
+    CalloutIdentity::for_test(None, None)
+}
 
 fn test_filter() -> Box<dyn HttpFilter> {
     let config = serde_yaml::from_str(
@@ -56,7 +66,7 @@ outbound_chain: web_search_outbound
     .unwrap();
     let config: WebSearchFilterConfig = parse_filter_config(FILTER_NAME, &config).unwrap();
     let validated = build_config(FILTER_NAME, &config).unwrap();
-    let client = crate::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+    let client = crate::subrequest::isolated_client(4);
     let search_client = SearchClient::from_config(FILTER_NAME, &validated, client).unwrap();
     // Bind a minimal builtin-only outbound chain; the executor seeds the staged
     // upstream from the search client and still enforces SSRF/TLS/Host, and
@@ -68,7 +78,15 @@ outbound_chain: web_search_outbound
         terminal_streaming: validated.terminal_streaming,
         search_client,
         outbound: Arc::new(outbound),
+        user_credential_slot: validated.user_credential,
     }
+}
+
+/// A filter that requires the given per-user credential slot for its callout.
+fn filter_requiring_slot(slot: &str) -> AnthropicWebSearchFilter {
+    let mut filter = test_filter_impl_with_base_url("http://127.0.0.1:1");
+    filter.user_credential_slot = Some(slot.to_owned());
+    filter
 }
 
 struct SearchStub {
@@ -614,7 +632,7 @@ async fn pending_search_executes_and_appends_tool_result() {
     let pending = pending_search("potato");
 
     let outcome = filter
-        .execute_pending_search(CalloutContext::for_test(), &pending)
+        .execute_pending_search(CalloutContext::for_test(), &pending, &shared_key_identity())
         .await;
     let mut rebuilt = base_request();
     append_search_turns(&mut rebuilt, assistant_content("potato"), pending, &outcome).unwrap();
@@ -657,7 +675,7 @@ async fn provider_failure_appends_is_error_tool_result() {
     let pending = pending_search("potato");
 
     let outcome = filter
-        .execute_pending_search(CalloutContext::for_test(), &pending)
+        .execute_pending_search(CalloutContext::for_test(), &pending, &shared_key_identity())
         .await;
     assert!(
         matches!(&outcome, SearchOutcome::Failed),
@@ -684,7 +702,7 @@ async fn empty_results_appends_no_results_tool_result() {
     let pending = pending_search("potato");
 
     let outcome = filter
-        .execute_pending_search(CalloutContext::for_test(), &pending)
+        .execute_pending_search(CalloutContext::for_test(), &pending, &shared_key_identity())
         .await;
     assert!(
         matches!(&outcome, SearchOutcome::Results(results) if results.is_empty()),
@@ -1434,4 +1452,270 @@ fn reentry_from_state_prefers_iteration_ceiling_over_deadline() {
         Reentry::IterationCeiling,
         "the iteration ceiling takes precedence over an elapsed deadline"
     );
+}
+
+#[test]
+fn missing_required_credential_rejects_with_authentication_error() {
+    let filter = filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let ctx = make_filter_context(&request);
+
+    let rejection = filter
+        .resolve_callout_identity(&ctx)
+        .expect_err("a configured-but-missing slot must fail closed");
+
+    assert_eq!(rejection.status, 401);
+    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert!(
+        body["error"].get("code").is_none(),
+        "the Anthropic error envelope carries no code field"
+    );
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("brave"),
+        "the message names the missing slot id"
+    );
+}
+
+#[test]
+fn present_required_credential_resolves_to_per_user_secret() {
+    let filter = filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut creds = CalloutCredentials::new();
+    creds.insert("brave".to_owned(), SecretString::from("user-secret"));
+    ctx.extensions.insert(creds);
+
+    let identity = filter
+        .resolve_callout_identity(&ctx)
+        .expect("a populated required slot resolves");
+
+    assert_eq!(
+        identity
+            .user_credential()
+            .expect("per-user secret present")
+            .expose_secret(),
+        "user-secret"
+    );
+}
+
+#[test]
+fn absent_slot_resolves_without_a_credential() {
+    let filter = test_filter_impl_with_base_url("http://127.0.0.1:1");
+    let request = make_request(Method::POST, "/v1/messages");
+    let ctx = make_filter_context(&request);
+
+    let identity = filter
+        .resolve_callout_identity(&ctx)
+        .expect("no configured slot resolves without a credential");
+
+    assert!(
+        identity.user_credential().is_none(),
+        "no slot configured means no per-user credential is selected"
+    );
+}
+
+/// A terminal-streaming filter requiring the given per-user credential slot.
+fn streaming_filter_requiring_slot(slot: &str) -> AnthropicWebSearchFilter {
+    let mut filter = filter_requiring_slot(slot);
+    filter.terminal_streaming = true;
+    filter
+}
+
+/// A managed `WebSearch` request body with the given `stream` flag.
+fn managed_web_search_request(stream: bool) -> Bytes {
+    Bytes::from(
+        json!({
+            "model": "test",
+            "max_tokens": 32,
+            "stream": stream,
+            "tools": [{"name": "WebSearch", "description": "Search the web", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "search"}]
+        })
+        .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn streaming_missing_credential_rejects_before_first_inference_stream() {
+    // Under terminal streaming the callout credential was formerly first checked
+    // at re-entry, after round 0 may have already committed HTTP 200 — too late to
+    // fail closed. A managed-WebSearch `stream: true` request with a required-but-
+    // missing slot must be rejected with 401 before the first inference stream, so
+    // no backend round or provider callout ever runs.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    // No CalloutCredentials inserted: the required `brave` slot is absent.
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(managed_web_search_request(true));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("a missing per-user credential must fail closed before the first inference stream");
+    };
+    assert_eq!(rejection.status, 401);
+    let rejection_body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
+    assert_eq!(rejection_body["type"], "error");
+    assert_eq!(rejection_body["error"]["type"], "authentication_error");
+    assert!(
+        rejection_body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("brave")),
+        "the message names the missing slot id"
+    );
+    // Zero backend/provider calls: a preflight rejection terminates the request
+    // phase before the streaming transport is selected, so no inference stream
+    // began and no callout was dispatched.
+    assert_eq!(
+        ctx.subrequest_response_mode(),
+        SubRequestResponseMode::Buffered,
+        "a preflight rejection must not select the streaming transport"
+    );
+}
+
+#[tokio::test]
+async fn streaming_with_present_credential_accepts_and_selects_streaming_transport() {
+    // The preflight must not false-reject a valid request: with the required slot
+    // populated (threaded into the round-0 context by the outer callout_credentials
+    // filter), a managed-WebSearch `stream: true` request is accepted and selects
+    // the streaming transport for the terminal response.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut creds = CalloutCredentials::new();
+    creds.insert("brave".to_owned(), SecretString::from("user-secret"));
+    ctx.extensions.insert(creds);
+    let mut body = Some(managed_web_search_request(true));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a populated required slot must pass the preflight and continue"
+    );
+    assert_eq!(
+        ctx.subrequest_response_mode(),
+        SubRequestResponseMode::Streaming,
+        "an accepted effective streaming request must select the streaming transport"
+    );
+}
+
+#[tokio::test]
+async fn streaming_without_managed_tool_skips_credential_preflight() {
+    // The preflight is scoped to requests that declare the managed `WebSearch`
+    // tool. A configured slot must not over-reject a `stream: true` request that
+    // asks for no web search (no callout will run), even with no credential set.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"test","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a request without the managed WebSearch tool must skip the credential preflight"
+    );
+}
+
+/// A managed `WebSearch` request body with an explicit `tool_choice`.
+fn managed_web_search_request_with_tool_choice(stream: bool, tool_choice: Value) -> Bytes {
+    Bytes::from(
+        json!({
+            "model": "test",
+            "max_tokens": 32,
+            "stream": stream,
+            "tool_choice": tool_choice,
+            "tools": [{"name": "WebSearch", "description": "Search the web", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "search"}]
+        })
+        .to_string(),
+    )
+}
+
+#[tokio::test]
+async fn preflight_skips_when_tool_choice_disables_tools() {
+    // `tool_choice: {"type": "none"}` forbids the model from calling any tool, so
+    // the managed WebSearch callout can never fire this turn. Demanding the
+    // per-user credential here would falsely reject a legitimate request; the
+    // preflight must be skipped even though the tool is declared and no slot is set.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(managed_web_search_request_with_tool_choice(
+        true,
+        json!({"type": "none"}),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "tool_choice none makes WebSearch ineligible; the preflight must not reject"
+    );
+}
+
+#[tokio::test]
+async fn preflight_skips_when_tool_choice_names_a_different_tool() {
+    // `tool_choice: {"type": "tool", "name": X}` forces exactly tool X. When X is
+    // not the managed WebSearch tool, the callout can never fire, so the preflight
+    // must be skipped rather than reject on the missing slot.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(managed_web_search_request_with_tool_choice(
+        true,
+        json!({"type": "tool", "name": "Calculator"}),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a tool_choice naming a different tool makes WebSearch ineligible; no reject"
+    );
+}
+
+#[tokio::test]
+async fn preflight_rejects_when_tool_choice_names_web_search() {
+    // `tool_choice: {"type": "tool", "name": "WebSearch"}` forces the managed tool,
+    // so a missing per-user credential must still fail closed with 401.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(managed_web_search_request_with_tool_choice(
+        true,
+        json!({"type": "tool", "name": "WebSearch"}),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("tool_choice selecting WebSearch with a missing slot must fail closed");
+    };
+    assert_eq!(rejection.status, 401);
+}
+
+#[tokio::test]
+async fn preflight_rejects_when_tool_choice_requires_any_tool() {
+    // `tool_choice: {"type": "any"}` lets the model pick any declared tool, WebSearch
+    // included, so the managed callout may fire and the missing slot must fail closed.
+    let filter = streaming_filter_requiring_slot("brave");
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(managed_web_search_request_with_tool_choice(
+        true,
+        json!({"type": "any"}),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("tool_choice any keeps WebSearch eligible; a missing slot must fail closed");
+    };
+    assert_eq!(rejection.status, 401);
 }

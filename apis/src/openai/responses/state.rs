@@ -270,8 +270,16 @@ pub(crate) enum McpApprovalState {
     #[default]
     None,
     /// Return approval requests after a sibling dispatcher finishes re-entry.
+    #[cfg_attr(
+        all(not(test), not(feature = "openai-mcp-tools")),
+        expect(dead_code, reason = "only MCP dispatch defers approval responses")
+    )]
     ApprovalPendingThenReturn,
     /// Execute ungated siblings, then return the pending approval response.
+    #[cfg_attr(
+        not(feature = "openai-mcp-tools"),
+        expect(dead_code, reason = "only MCP dispatch defers approval responses")
+    )]
     ExecuteUngatedThenReturn,
 }
 
@@ -380,7 +388,21 @@ pub(crate) struct ResponsesState {
     /// definitions from the internally resolved endpoint. Holds the
     /// pipeline-local URL and credentials; never serialized to the
     /// inference backend, client responses, or persisted records.
+    #[cfg_attr(
+        all(not(test), not(feature = "openai-mcp-tools")),
+        expect(dead_code, reason = "deferred connectors are consumed only by MCP dispatch")
+    )]
     pub deferred_mcp: Vec<DeferredMcpConnector>,
+
+    /// Slot policy under which configured MCP connector state was resolved.
+    ///
+    /// `openai_mcp_tool_resolve` records this while building MCP state.
+    /// `openai_mcp_dispatch` compares it with its own configuration before
+    /// issuing a configured-connector callout, preventing discovery and
+    /// execution from silently using different request-scoped credential or
+    /// authorization slots. Direct `server_url` entries ignore this field.
+    #[cfg(feature = "openai-mcp-tools")]
+    pub mcp_connector_context_policy: McpConnectorContextPolicy,
 
     /// Maximum number of built-in tool invocations.
     ///
@@ -444,6 +466,10 @@ pub(crate) struct ResponsesState {
 
     /// Whether tool calls may execute concurrently within an
     /// iteration. Defaults to `true` per the API spec.
+    #[cfg_attr(
+        all(not(test), not(feature = "openai-mcp-tools")),
+        expect(dead_code, reason = "only MCP dispatch schedules concurrent tool calls")
+    )]
     pub parallel_tool_calls: bool,
 
     /// Full message history to persist for future rehydration.
@@ -460,6 +486,7 @@ pub(crate) struct ResponsesState {
     /// persisted as the authoritative record for correlating a later
     /// `mcp_approval_response`. Consent provenance lives here and in the
     /// store, never in the (client-influenced) conversation history.
+    #[cfg(feature = "store")]
     pub pending_approvals: Vec<crate::store::PendingApprovalRecord>,
 
     /// Whether the store filter armed persistence for this exchange.
@@ -475,6 +502,10 @@ pub(crate) struct ResponsesState {
     /// `response_conditions`-gated store filter, a non-2xx status, etc.); that
     /// narrower residual is unsupported for approval pipelines and still fails
     /// closed at resume.
+    #[cfg_attr(
+        all(not(test), not(feature = "store")),
+        expect(dead_code, reason = "read only by the store, rehydrate, and MCP approval paths")
+    )]
     pub store_persist_armed: bool,
 
     /// Whether the streaming `previous_response_id` wire rewrite was armed.
@@ -671,6 +702,12 @@ pub(crate) struct ResponsesState {
     /// dispatcher from becoming a second terminal-response owner (see
     /// [`DispatchFailure`]).
     pub dispatch_failure: Option<DispatchFailure>,
+
+    /// A locally-detected security-context failure (e.g. a missing/invalid required per-user
+    /// callout credential). Write-once via [`ResponsesState::record_security_failure`]; the
+    /// agentic loop converts it into a terminal 401 BEFORE any generic [`Self::dispatch_failure`],
+    /// so a security terminal always preempts a generic dispatch terminal.
+    pub security_failure: Option<DispatchFailure>,
 }
 
 /// Which client-visible lifecycle milestones a locally generated output item has
@@ -754,10 +791,38 @@ pub(crate) struct DeferredMcpConnector {
 
     /// Configured MCP endpoint URL. Never written to backend requests,
     /// client-visible responses, logs, or persisted response state.
+    #[cfg_attr(
+        not(feature = "openai-mcp-tools"),
+        expect(dead_code, reason = "only MCP dispatch dials deferred connectors")
+    )]
     pub server_url: String,
 
     /// Per-server timeout for the deferred `tools/list` call.
     pub timeout: Duration,
+}
+
+/// Request-scoped slot policy bound to configured MCP connector state.
+///
+/// This contains slot identifiers only, never credential or assertion values.
+#[cfg(feature = "openai-mcp-tools")]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct McpConnectorContextPolicy {
+    /// Per-user bearer slot configured on the resolver.
+    credential_slot: Option<String>,
+
+    /// Opaque authorization-assertion slot configured on the resolver.
+    authorization_slot: Option<String>,
+}
+
+#[cfg(feature = "openai-mcp-tools")]
+impl McpConnectorContextPolicy {
+    /// Snapshot a filter's configured connector-context slots.
+    pub(crate) fn new(credential_slot: Option<&str>, authorization_slot: Option<&str>) -> Self {
+        Self {
+            credential_slot: credential_slot.map(str::to_owned),
+            authorization_slot: authorization_slot.map(str::to_owned),
+        }
+    }
 }
 
 impl fmt::Debug for DeferredMcpConnector {
@@ -804,6 +869,8 @@ impl Default for ResponsesState {
             input: Vec::new(),
             iteration: 0,
             deferred_mcp: Vec::new(),
+            #[cfg(feature = "openai-mcp-tools")]
+            mcp_connector_context_policy: McpConnectorContextPolicy::default(),
             max_tool_calls: None,
             mcp_approval_state: McpApprovalState::None,
             deferred_tool_limit_completion: false,
@@ -815,6 +882,7 @@ impl Default for ResponsesState {
             provider_history_len: 0,
             parallel_tool_calls: true,
             persisted_messages: Vec::new(),
+            #[cfg(feature = "store")]
             pending_approvals: Vec::new(),
             store_persist_armed: false,
             previous_response_id_stream_restore_armed: false,
@@ -843,6 +911,7 @@ impl Default for ResponsesState {
             pending_local_tool_synthesis: Vec::new(),
             provider_streamed_terminal_ids: BTreeSet::new(),
             dispatch_failure: None,
+            security_failure: None,
         }
     }
 }
@@ -875,6 +944,13 @@ impl ResponsesState {
             accumulated_output: Vec::new(),
             pending_local_tool_synthesis: Vec::new(),
             ..Default::default()
+        }
+    }
+
+    /// Record the first security-context failure; later calls are ignored (first wins).
+    pub(crate) fn record_security_failure(&mut self, failure: DispatchFailure) {
+        if self.security_failure.is_none() {
+            self.security_failure = Some(failure);
         }
     }
 
@@ -2014,6 +2090,28 @@ mod tests {
         };
         assert_eq!(rejection.status, 502, "size overflow returns a server error");
         assert!(body.is_none(), "no body is written on a finalize failure");
+    }
+
+    #[test]
+    fn record_security_failure_is_write_once() {
+        let mut state = ResponsesState::default();
+        assert!(state.security_failure.is_none(), "security failure must start unset");
+
+        state.record_security_failure(DispatchFailure {
+            status: 401,
+            code: "missing_callout_context",
+            message: "first".to_owned(),
+        });
+        state.record_security_failure(DispatchFailure {
+            status: 500,
+            code: "other",
+            message: "second".to_owned(),
+        });
+
+        let f = state.security_failure.as_ref().expect("recorded");
+        assert_eq!(f.status, 401);
+        assert_eq!(f.code, "missing_callout_context");
+        assert_eq!(f.message, "first", "first failure wins (write-once)");
     }
 
     #[test]

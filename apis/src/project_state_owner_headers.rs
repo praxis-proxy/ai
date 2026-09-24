@@ -15,10 +15,10 @@ use serde::Deserialize;
 
 use crate::state_owner::{StateOwner, StateOwnerIngressHeaders, reject_owner};
 
-/// Configuration for [`StateOwnerHeadersFilter`].
+/// Configuration for [`ProjectStateOwnerHeadersFilter`].
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StateOwnerHeadersConfig {
+struct ProjectStateOwnerHeadersConfig {
     /// Header receiving the stable tenant namespace.
     tenant_header: String,
     /// Header receiving the stable subject identifier.
@@ -40,7 +40,7 @@ struct StateOwnerHeadersConfig {
 /// # OGX YAML configuration
 ///
 /// ```yaml
-/// filter: state_owner_headers
+/// filter: project_state_owner_headers
 /// tenant_header: x-tenant-id
 /// subject_header: x-user-id
 /// ```
@@ -50,12 +50,12 @@ struct StateOwnerHeadersConfig {
 /// # Issuer YAML configuration
 ///
 /// ```yaml
-/// filter: state_owner_headers
+/// filter: project_state_owner_headers
 /// tenant_header: x-service-tenant
 /// subject_header: x-service-user
 /// issuer_header: x-service-issuer
 /// ```
-pub struct StateOwnerHeadersFilter {
+pub struct ProjectStateOwnerHeadersFilter {
     /// Header receiving the stable tenant namespace.
     tenant_header: HeaderName,
     /// Header receiving the stable subject identifier.
@@ -64,7 +64,7 @@ pub struct StateOwnerHeadersFilter {
     issuer_header: Option<HeaderName>,
 }
 
-impl StateOwnerHeadersFilter {
+impl ProjectStateOwnerHeadersFilter {
     /// Parse and validate destination header mappings.
     ///
     /// # Errors
@@ -72,7 +72,7 @@ impl StateOwnerHeadersFilter {
     /// Returns [`FilterError`] when a name is empty, invalid, unsafe for an
     /// end-to-end identity assertion, or reused for multiple components.
     pub fn from_config(value: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let config: StateOwnerHeadersConfig = parse_filter_config("state_owner_headers", value)?;
+        let config: ProjectStateOwnerHeadersConfig = parse_filter_config("project_state_owner_headers", value)?;
         let tenant_header = parse_projection_header("tenant_header", &config.tenant_header)?;
         let subject_header = parse_projection_header("subject_header", &config.subject_header)?;
         let issuer_header = config
@@ -151,17 +151,20 @@ fn strip_ingress_headers(ctx: &mut HttpFilterContext<'_>, ordered: bool) {
 /// Parse an end-to-end header name used for destination identity projection.
 fn parse_projection_header(field: &str, header: &str) -> Result<HeaderName, FilterError> {
     if header.is_empty() {
-        return Err(format!("state_owner_headers: '{field}' must not be empty").into());
+        return Err(format!("project_state_owner_headers: '{field}' must not be empty").into());
     }
-    let header = HeaderName::from_bytes(header.as_bytes())
-        .map_err(|error| -> FilterError { format!("state_owner_headers: invalid '{field}': {error}").into() })?;
+    let header = HeaderName::from_bytes(header.as_bytes()).map_err(|error| -> FilterError {
+        format!("project_state_owner_headers: invalid '{field}': {error}").into()
+    })?;
     let name = header.as_str();
     if name == http::header::HOST.as_str()
         || name == http::header::CONTENT_LENGTH.as_str()
         || praxis_core::reserved_headers::HOP_BY_HOP_HEADERS.contains(&name)
         || praxis_core::reserved_headers::is_reserved(name)
     {
-        return Err(format!("state_owner_headers: '{field}' must name a non-routing, end-to-end header").into());
+        return Err(
+            format!("project_state_owner_headers: '{field}' must name a non-routing, end-to-end header").into(),
+        );
     }
     Ok(header)
 }
@@ -175,7 +178,7 @@ fn ensure_distinct_projection_headers(
     let mut seen = std::collections::HashSet::with_capacity(3);
     for header in [Some(tenant), Some(subject), issuer].into_iter().flatten() {
         if !seen.insert(header) {
-            return Err("state_owner_headers: output header names must be distinct".into());
+            return Err("project_state_owner_headers: output header names must be distinct".into());
         }
     }
     Ok(())
@@ -202,9 +205,9 @@ fn queue_projection(ctx: &mut HttpFilterContext<'_>, header: &HeaderName, value:
 }
 
 #[async_trait]
-impl HttpFilter for StateOwnerHeadersFilter {
+impl HttpFilter for ProjectStateOwnerHeadersFilter {
     fn name(&self) -> &'static str {
-        "state_owner_headers"
+        "project_state_owner_headers"
     }
 
     fn request_body_access(&self) -> BodyAccess {

@@ -25,9 +25,9 @@ use std::{
 
 use arc_swap::ArcSwap;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+use praxis_ai_apis::hash::Sha256;
 use praxis_filter::FilterError;
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -430,7 +430,7 @@ impl RouteSnapshot {
         content: &[u8],
         expected_scope: Option<&ExpectedOverlayScope>,
     ) -> Result<Self, FilterError> {
-        let content_hash: [u8; 32] = Sha256::digest(content).into();
+        let content_hash = Sha256::digest(content);
 
         let value: serde_json::Value = serde_json::from_slice(content)
             .map_err(|e| FilterError::from(format!("routing: overlay parse error: {e}")))?;
@@ -706,7 +706,7 @@ fn compute_semantic_digest(overlay_value: &serde_json::Value) -> Result<String, 
     let semantic_value = serde_json::Value::Object(semantic);
     let canonical = serde_json_canonicalizer::to_vec(&semantic_value)
         .map_err(|e| FilterError::from(format!("routing: canonicalization error: {e}")))?;
-    let digest: [u8; 32] = Sha256::digest(&canonical).into();
+    let digest = Sha256::digest(&canonical);
     let mut hex = String::with_capacity(64);
     for b in &digest {
         let _unused = write!(hex, "{b:02x}");
@@ -1028,8 +1028,12 @@ async fn watch_loop(
 
 /// Process filesystem events until shutdown is requested.
 #[expect(
+    clippy::allow_attributes,
+    reason = "the lint only fires with some tracing feature sets"
+)]
+#[allow(
     clippy::cognitive_complexity,
-    reason = "complexity is from tokio::select! macro expansion"
+    reason = "tokio::select! and tracing macros expand larger when tracing's `log` feature is on (the store's sqlx enables it)"
 )]
 #[expect(clippy::too_many_arguments, reason = "watcher loop needs all context")]
 async fn run_event_loop(
@@ -1069,7 +1073,7 @@ fn handle_overlay_reload(
     };
 
     let current = snapshot.load();
-    let content_hash: [u8; 32] = Sha256::digest(&content).into();
+    let content_hash = Sha256::digest(&content);
     if content_hash == current.content_hash {
         tracing::debug!("intelligent_route: overlay snapshot is unchanged");
         return;
@@ -1974,7 +1978,7 @@ mod tests {
             "network": overlay_obj["network"],
         });
         let canonical = serde_json_canonicalizer::to_vec(&semantic).unwrap();
-        let digest: [u8; 32] = Sha256::digest(&canonical).into();
+        let digest = Sha256::digest(&canonical);
         let mut hex = String::with_capacity(64);
         for b in &digest {
             let _unused = std::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}"));

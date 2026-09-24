@@ -307,7 +307,7 @@ async fn store_persist_armed_survives_rehydrate_from_conversation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_validates_during_cold_request_body_pre_read() {
     let (db_url, db_path) = temp_sqlite_url("rehydrate_cold_pre_read");
-    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None)
+    let seeded_store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None, None)
         .await
         .unwrap();
     seeded_store
@@ -670,6 +670,12 @@ async fn extracts_mcp_tools_from_previous_response() {
         state.previous_tools[0]["server_url"], "http://10.0.0.5:8080/mcp",
         "server_url should be preserved for cache matching"
     );
+    #[cfg(feature = "openai-mcp-tools")]
+    assert_eq!(
+        state.previous_tools[0][OWNER_FINGERPRINT],
+        owner_fingerprint(&crate::test_utils::test_owner("default")),
+        "cache-only listing should bind to the full trusted owner tuple"
+    );
 }
 
 #[tokio::test]
@@ -825,6 +831,30 @@ async fn deduplicates_mcp_tools_independent_of_tool_order() {
         1,
         "ResponsesState should not retain duplicate MCP listings"
     );
+}
+
+#[test]
+fn retains_private_mcp_targets_with_identical_tool_names() {
+    let a = "https://a.example/mcp";
+    let b = "https://b.example/mcp";
+    let record = ResponseRecord {
+        id: "resp_targets".to_owned(),
+        owner: crate::test_utils::test_owner("default"),
+        created_at: 1000,
+        model: "gpt-4.1".to_owned(),
+        response_object: json!({
+            "output": [{"type": "mcp_list_tools", "server_label": "weather", "tools": [{"name": "shared_tool"}]}]
+        }),
+        input: json!("Hi"),
+        messages: json!([
+            {"type": "praxis_mcp_cached_listing", "server_label": "weather", "server_url": a, "tools": [{"name": "shared_tool"}]},
+            {"type": "praxis_mcp_cached_listing", "server_label": "weather", "server_url": b, "tools": [{"name": "shared_tool"}]}
+        ]),
+    };
+    let listings = collect_mcp_tool_listings(&record);
+    assert!(listings.iter().any(|item| item["server_url"] == a));
+    assert!(listings.iter().any(|item| item["server_url"] == b));
+    assert!(listings.iter().all(|item| item["tools"][0]["name"] == "shared_tool"));
 }
 
 #[tokio::test]

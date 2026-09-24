@@ -2930,6 +2930,42 @@ async fn dispatch_failure_streaming_emits_sse_error_frame() {
     );
 }
 
+/// A locally-detected security-context failure preempts a generic dispatch failure:
+/// the loop owner converts `security_failure` BEFORE `dispatch_failure`, so the client
+/// sees the 401 security terminal, never the 502 dispatch terminal.
+#[tokio::test]
+async fn security_failure_preempts_dispatch_failure() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    let mut state = ResponsesState::from_request_body(json!({"model": "gpt-4o", "input": "test"}));
+    state.record_security_failure(DispatchFailure {
+        status: 401,
+        code: "missing_callout_context",
+        message: "no creds".to_owned(),
+    });
+    state.dispatch_failure = Some(DispatchFailure {
+        status: 502,
+        code: "server_error",
+        message: "bad gateway".to_owned(),
+    });
+    ctx.extensions.insert(state);
+
+    let action = filter.on_request_body(&mut ctx, &mut None, true).await.unwrap();
+
+    let FilterAction::Reject(response) = action else {
+        panic!("a recorded security failure must reject before the next inference call");
+    };
+    assert_eq!(
+        response.status, 401,
+        "security terminal preempts the 502 dispatch terminal"
+    );
+    let body: Value = serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "missing_callout_context");
+    assert_eq!(body["error"]["message"], "no creds");
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------

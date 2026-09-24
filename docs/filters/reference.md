@@ -32,8 +32,9 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
+| [`callout_credentials`](callout_credentials.md) | Establishing filter that captures typed per-user callout secrets from ingress headers. |
+| [`project_state_owner_headers`](project_state_owner_headers.md) | Projects a normalized [`StateOwner`] into destination-specific HTTP headers. |
 | [`state_owner`](state_owner.md) | Establishes a normalized [`StateOwner`] from trusted identity sources. |
-| [`state_owner_headers`](state_owner_headers.md) | Projects a normalized [`StateOwner`] into destination-specific HTTP headers. |
 
 ### OpenAI
 

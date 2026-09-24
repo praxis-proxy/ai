@@ -1,5 +1,5 @@
 # Rehydrate Fixture (native Responses continuation)
-# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
+# Requires `--features store-sqlite` because these filters are opt-in.
 #
 # Minimal native OpenAI Responses pipeline that stores a first turn,
 # rehydrates a stored `previous_response_id` into the outbound `input`
@@ -24,7 +24,7 @@
 # `on_request`.
 #
 # Build:
-#   cargo build -p praxis-ai-proxy
+#   cargo build -p praxis-ai-proxy --features store-sqlite
 
 listeners:
   - name: ai-gateway

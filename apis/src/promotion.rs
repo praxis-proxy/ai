@@ -77,6 +77,7 @@ fn is_credential_header_lowercase(name: &str) -> bool {
             | "x-api-key"
             | "api-key"
             | "x-goog-api-key"
+            | "x-mcp-authorized"
     )
 }
 
@@ -458,6 +459,7 @@ mod tests {
             "x-api-key",
             "api-key",
             "x-goog-api-key",
+            "x-mcp-authorized",
             "www-authenticate",
         ] {
             assert!(

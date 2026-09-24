@@ -3,6 +3,10 @@
 
 //! Build-time guarantees for policy subrequests.
 
+// The policy registration contract exists only with the policy engine; the
+// FIPS build leaves it out and must still compile every other test.
+#![cfg(feature = "policy-engine")]
+
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, reason = "integration test")]
@@ -23,10 +27,17 @@ filter_chains:
       - filter: policy_registration_probe
 "#;
 
+    /// The proxy's shared client, built on the crypto provider the binary
+    /// installs at startup (the connector needs it before it can exist).
+    fn client(config: &Config) -> praxis_core::subrequest::SubRequestClient {
+        praxis_ai::install_crypto_provider();
+        praxis_ai::create_subrequest_client(config)
+    }
+
     #[test]
     fn resolving_pipelines_registers_policy_connector_before_filter_construction() {
         let config = Config::from_yaml(CONFIG).expect("the test config must parse");
-        let client = praxis_ai::create_subrequest_client(&config);
+        let client = client(&config);
         let expected_connector = client.connector().clone();
         let mut registry = FilterRegistry::with_builtins();
         registry

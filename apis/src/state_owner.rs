@@ -132,7 +132,7 @@ impl std::error::Error for StateOwnerError {}
 /// Filtered subrequests inherit no parent extensions by default. A callout
 /// whose configured destination is authorized to receive identity can use
 /// this helper while assembling the child [`RequestExtensions`], then place
-/// `state_owner_headers` in that outbound chain to choose the wire names.
+/// `project_state_owner_headers` in that outbound chain to choose the wire names.
 /// Raw credentials and inbound headers are intentionally not copied.
 ///
 /// Returns `true` when an owner was present and projected.
@@ -151,6 +151,7 @@ pub fn project_state_owner(parent: &RequestExtensions, child: &mut RequestExtens
 ///
 /// Request-driven persisted-state filters fail closed when the security filter
 /// is absent or incorrectly ordered.
+#[cfg(feature = "store")]
 pub(crate) fn require_state_owner<'a>(ctx: &'a HttpFilterContext<'_>) -> Result<&'a StateOwner, FilterAction> {
     ctx.extensions.get::<StateOwner>().ok_or_else(|| {
         log_owner_decision("deny", "request_context", "missing_owner");
@@ -284,9 +285,13 @@ fn ensure_distinct_component_headers(sources: [&OwnerComponentSource; 3]) -> Res
 /// This filter validates and strips consumed headers; it does not authenticate
 /// their producer. In `trusted_headers` mode each component must select exactly
 /// one `header` or `static` source, and component header names must be distinct.
+/// `single_tenant` assigns the same tenant, issuer, and `shared` subject to every
+/// request. It is suitable only when the whole deployment is one trust domain;
+/// it cannot provide per-user attribution, cache separation, or state isolation.
+/// Shared multi-user deployments must use `trusted_owner` or `trusted_headers`.
 /// Agentic routers can snapshot request headers before the parent protocol
 /// commits body-phase removals, so each destination-owned IRR step must begin
-/// with `state_owner_headers`; it consumes the carried transport metadata,
+/// with `project_state_owner_headers`; it consumes the carried transport metadata,
 /// strips the raw ingress names in the child, and emits only configured outputs.
 ///
 /// # Versioned-assertion YAML configuration

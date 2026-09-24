@@ -75,6 +75,11 @@ make release
 ./target/release/praxis-ai
 ```
 
+`make release` builds the `full` feature set. A plain
+`cargo build -p praxis-ai-proxy` builds the smaller `standard` set, which
+leaves out the stateful OpenAI filter groups and their dependencies; see
+[Cargo features](docs/features.md#cargo-features).
+
 Then check that it is running:
 
 ```console
@@ -118,7 +123,9 @@ docker pull ghcr.io/praxis-proxy/ai:0.2
 ```
 
 Podman can pull the same OCI image. See the [quickstart] for a source build
-and the [release documentation] for image contents and tagging.
+and the [release documentation] for image contents and tagging. A FIPS 140-3
+build for Red Hat Enterprise Linux hosts is published under the same tags
+with a `-fips` suffix; see [FIPS 140-3](docs/fips.md).
 
 ## Contributing
 

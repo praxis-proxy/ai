@@ -274,7 +274,7 @@ impl praxis_filter::HttpFilter for AzureAdFilter {
         let fetched = self
             .cache
             .get_or_refresh(|| async {
-                let client = praxis_ai_apis::callout_target::build_pinned_reqwest_client(
+                let client = crate::pinned_client::build_pinned_reqwest_client(
                     "azure_ad",
                     &self.token_url,
                     self.address_policy,

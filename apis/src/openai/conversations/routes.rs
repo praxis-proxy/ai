@@ -5,7 +5,9 @@
 
 use std::ops::Deref;
 
+#[cfg(feature = "openai-conversations")]
 use serde_json::Value;
+#[cfg(feature = "openai-conversations")]
 use utoipa::{
     PartialSchema,
     openapi::{
@@ -14,19 +16,22 @@ use utoipa::{
     },
 };
 
+#[cfg(feature = "openai-conversations")]
 use super::contracts::{
     ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
     CreateConversationRequest, DeletedConversationResource, ItemOrder, UpdateConversationRequest,
 };
-use crate::{
-    openai::{
-        include::IncludeField,
-        operation::{
-            MediaTypeSpec, OpenAiOperationSpec, OwnedOperationContract, ParameterLocation, ParameterSpec,
-            RequestBodySpec, ResponseSpec, schema_binding,
-        },
-        responses::store::DEFAULT_PAGE_LIMIT,
+#[cfg(feature = "openai-conversations")]
+use crate::openai::{
+    include::IncludeField,
+    operation::{
+        MediaTypeSpec, OwnedOperationContract, ParameterLocation, ParameterSpec, RequestBodySpec, ResponseSpec,
+        schema_binding,
     },
+    responses::store::DEFAULT_PAGE_LIMIT,
+};
+use crate::{
+    openai::operation::OpenAiOperationSpec,
     operation::{
         ApplicationProtocol, HandlingMode, HttpMethod, OperationEntry, OperationSpec, RequestBody, RouteParams,
         Transport, match_operation,
@@ -34,13 +39,14 @@ use crate::{
 };
 
 /// JSON media type used by all Conversations bodies.
+#[cfg(feature = "openai-conversations")]
 const JSON_CONTENT_TYPE: &str = "application/json";
 
 /// Application protocol these operations belong to.
 ///
 /// Declared beside the registry that owns it, so registering a protocol
 /// never edits a shared list.
-const APPLICATION_PROTOCOL: ApplicationProtocol = ApplicationProtocol::new("openai_conversations");
+pub(crate) const APPLICATION_PROTOCOL: ApplicationProtocol = ApplicationProtocol::new("openai_conversations");
 
 /// Static metadata for one Conversations operation.
 #[derive(Clone, Copy)]
@@ -66,6 +72,7 @@ impl OperationEntry for ConversationOperationSpec {
 }
 
 /// Convert a registry request declaration into an optional schema binding.
+#[cfg(feature = "openai-conversations")]
 macro_rules! request_binding {
     ([none]) => {
         None
@@ -85,6 +92,7 @@ macro_rules! request_binding {
 }
 
 /// Convert a registry contract declaration into optional owned metadata.
+#[cfg(feature = "openai-conversations")]
 #[expect(
     unused_macro_rules,
     reason = "non-owning form is part of the registry API but current Conversations operations are all local"
@@ -130,7 +138,7 @@ macro_rules! request_body_shape {
 
 /// Derive the runtime request-body shape from an operation contract declaration.
 ///
-/// Reads the same `request:` token as [`operation_contract`], so the body shape
+/// Reads the same `request:` token as `operation_contract!`, so the body shape
 /// and the generated contract cannot drift apart.
 #[expect(
     unused_macro_rules,
@@ -146,6 +154,7 @@ macro_rules! contract_request_body {
 }
 
 /// Declare a required string path parameter.
+#[cfg(feature = "openai-conversations")]
 macro_rules! path_parameter {
     ($name:literal, $description:literal) => {
         ParameterSpec::new(
@@ -163,6 +172,7 @@ macro_rules! path_parameter {
 /// The `$schema:ty` form derives the schema from a type's [`PartialSchema`]
 /// impl. The `schema_fn = $path` form takes an explicit schema constructor for
 /// parameters whose emitted contract must match the official reference exactly.
+#[cfg(feature = "openai-conversations")]
 macro_rules! query_parameter {
     ($name:literal, $schema:ty, $description:literal) => {
         ParameterSpec::new(
@@ -185,6 +195,7 @@ macro_rules! query_parameter {
 /// `minimum: 0` and omit the default, so the schema is hand-built to match the
 /// pinned OpenAI contract exactly. The default mirrors the runtime page size in
 /// [`DEFAULT_PAGE_LIMIT`], keeping the contract and handler in lockstep.
+#[cfg(feature = "openai-conversations")]
 fn list_items_limit_schema() -> RefOr<Schema> {
     RefOr::T(Schema::Object(
         ObjectBuilder::new()
@@ -216,6 +227,41 @@ macro_rules! conversation_operations {
             )+
         }
 
+        #[cfg(feature = "openai-conversations")]
+        impl ConversationOperation {
+            /// Application protocol that owns every Conversations operation.
+            pub(crate) const fn application_protocol(self) -> ApplicationProtocol {
+                APPLICATION_PROTOCOL
+            }
+
+            /// Resolve a stable operation ID to its registry operation.
+            ///
+            /// The mapping is generated from the same declarations as the
+            /// operation registry, so classifier consumers do not need a
+            /// protocol-specific request extension or a second hand-written
+            /// operation table.
+            pub(crate) fn from_operation_id(operation_id: &str) -> Option<Self> {
+                match operation_id {
+                    $($operation_id => Some(Self::$operation),)+
+                    _ => None,
+                }
+            }
+
+            /// Stable registry operation ID without rescanning the registry.
+            pub(crate) const fn operation_id(self) -> &'static str {
+                match self {
+                    $(Self::$operation => $operation_id,)+
+                }
+            }
+
+            /// Registry request-body shape without rescanning the registry.
+            pub(crate) const fn request_body(self) -> RequestBody {
+                match self {
+                    $(Self::$operation => contract_request_body!($contract_kind $contract),)+
+                }
+            }
+        }
+
         /// All Conversations operations recognized by the local filter.
         pub const OPERATION_SPECS: &[ConversationOperationSpec] = &[
             $(
@@ -232,6 +278,7 @@ macro_rules! conversation_operations {
                             request_body: contract_request_body!($contract_kind $contract),
                         },
                         spec_path: $path,
+                        #[cfg(feature = "openai-conversations")]
                         owned_contract: operation_contract!($contract_kind $contract),
                     },
                 },
@@ -386,9 +433,10 @@ pub(crate) struct MatchedConversationRoute<'a> {
     /// Matched operation metadata.
     pub spec: &'static ConversationOperationSpec,
     /// Borrowed path parameters, captured by the shared matcher.
-    params: RouteParams<'a>,
+    pub(crate) params: RouteParams<'a>,
 }
 
+#[cfg(all(test, feature = "openai-conversations"))]
 impl<'a> MatchedConversationRoute<'a> {
     /// Return the borrowed conversation ID path segment.
     pub(crate) fn conversation_id(&self) -> Option<&'a str> {
@@ -419,6 +467,7 @@ pub(crate) fn match_route<'a>(method: &str, path: &'a str) -> Option<MatchedConv
 }
 
 #[cfg(test)]
+#[cfg(feature = "openai-conversations")]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {
@@ -489,6 +538,17 @@ mod tests {
         // Conversations is served locally, so Praxis owns each externally
         // visible contract and generates it into the implementation document.
         assert!(OPERATION_SPECS.iter().all(|spec| spec.owns_contract()));
+    }
+
+    #[test]
+    fn operation_ids_resolve_to_declared_operations() {
+        for spec in OPERATION_SPECS {
+            assert_eq!(
+                ConversationOperation::from_operation_id(spec.operation.operation_id()),
+                Some(spec.operation)
+            );
+        }
+        assert_eq!(ConversationOperation::from_operation_id("unknown"), None);
     }
 
     #[test]

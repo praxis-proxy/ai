@@ -64,3 +64,10 @@ Praxis core owns the complete HTTP span lifetime and transport boundaries at
 both the edge and the provider-local listener. Praxis AI records only the
 semantic decisions it makes at each hop. This prevents duplicate request
 roots, conflicting trace propagation, and multiple exporter runtimes.
+
+Agentic callouts follow the same ownership rule. When a listener enables the
+core `trace_context` filter, Praxis AI projects only its typed `TraceContext`
+into isolated web-search, OGX file-search, OGX file-resolution, and MCP child
+requests. Praxis core then emits the same `x-request-id` and W3C trace ID with a
+fresh span ID for every outbound hop. No ambient request extensions, provider
+credentials, or MCP authorization assertions are copied into trace fields.

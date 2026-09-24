@@ -56,7 +56,7 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
-use super::{error::responses_error_rejection, state::ResponsesState};
+use super::{error::responses_error_rejection, is_explicit_compact_request, state::ResponsesState};
 use crate::{
     callout_policy::OnFailure,
     state_owner::{StateOwner, require_state_owner},
@@ -82,9 +82,7 @@ user preferences, and important context. The summary \
 will replace the full conversation history, so it must \
 capture everything needed to continue coherently.";
 
-/// Default prefix prepended to the summary when translating
-/// compaction items to backend-compatible messages.
-pub const DEFAULT_SUMMARY_PREFIX: &str = "[Previous conversation summary]\n\n";
+pub use crate::openai::translation::chat_completions::DEFAULT_SUMMARY_PREFIX;
 
 // -----------------------------------------------------------------------------
 // CompactionParams
@@ -174,7 +172,7 @@ impl CompactFilter {
     ///
     /// Returns [`FilterError`] if config validation fails.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let client = SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None));
+        let client = subrequest::isolated_client(4);
         Self::build(config, client)
     }
 
@@ -537,11 +535,6 @@ fn previous_usage_total(state: &ResponsesState) -> Option<u64> {
     Some(total)
 }
 
-/// Check whether this is an explicit `POST /v1/responses/compact` request.
-pub(super) fn is_explicit_compact_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.request.method == http::Method::POST && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
-}
-
 /// Check whether this is an OpenAI Responses API request.
 fn is_responses_request(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
@@ -784,6 +777,11 @@ fn map_chat_usage(usage: &Value) -> Value {
         .and_then(|d| d.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let cache_write_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let reasoning_tokens = usage
         .get("completion_tokens_details")
         .and_then(|d| d.get("reasoning_tokens"))
@@ -795,7 +793,7 @@ fn map_chat_usage(usage: &Value) -> Value {
         .unwrap_or_else(|| input_tokens.saturating_add(output_tokens));
     serde_json::json!({
         "input_tokens": input_tokens,
-        "input_tokens_details": {"cached_tokens": cached_tokens, "cache_write_tokens": 0},
+        "input_tokens_details": {"cached_tokens": cached_tokens, "cache_write_tokens": cache_write_tokens},
         "output_tokens": output_tokens,
         "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
         "total_tokens": total,

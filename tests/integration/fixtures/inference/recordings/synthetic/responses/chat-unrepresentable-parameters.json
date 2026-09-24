@@ -6,7 +6,7 @@
     "kind": "synthetic",
     "provider": "synthetic",
     "model": "synthetic-unrepresentable-parameters-model",
-    "source_id": "controlled-unrepresentable-truncation"
+    "source_id": "controlled-unrepresentable-parameters"
   },
   "normalization": {
     "version": 1,
@@ -48,6 +48,71 @@
               "error": {
                 "code": "invalid_request_error",
                 "message": "Responses `truncation` has no Chat Completions representation: got \"auto\", this adapter supports only `truncation` \"disabled\"",
+                "param": null,
+                "type": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
+      "name": "prompt-template",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "Say hello to Ada.",
+              "model": "synthetic-unrepresentable-parameters-model",
+              "prompt": {
+                "id": "pmpt_123",
+                "variables": {
+                  "name": "Ada"
+                }
+              },
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "code": "invalid_request_error",
+                "message": "Responses `prompt` has no Chat Completions representation: got object, this adapter supports only `prompt` null",
                 "param": null,
                 "type": "invalid_request_error"
               }

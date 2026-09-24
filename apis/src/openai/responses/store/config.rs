@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 #[cfg(feature = "store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
-use crate::store::{PoolConfig, SslMode, validate_table_identifier};
+use crate::store::{PoolConfig, SslMode, StoreCompressionConfig, validate_table_identifier};
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_response_store";
@@ -123,6 +123,14 @@ pub(crate) struct ResponseStoreConfig {
     /// `idle_timeout = 600s`, `acquire_timeout = 30s`).
     #[serde(default)]
     pub pool: Option<PoolConfig>,
+
+    /// Optional payload compression for stored JSON columns.
+    ///
+    /// When omitted, payloads are stored uncompressed. Reads
+    /// auto-detect the format, so enabling compression keeps existing
+    /// uncompressed records readable.
+    #[serde(default)]
+    pub compression: Option<StoreCompressionConfig>,
 }
 
 #[cfg(feature = "store-postgres")]
@@ -159,6 +167,9 @@ pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterErr
     }
     if let Some(pool) = &cfg.pool {
         pool.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
+    }
+    if let Some(compression) = &cfg.compression {
+        compression.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
     }
     match cfg.backend {
         StorageBackend::Sqlite => {

@@ -1,4 +1,5 @@
 # Responses File Search with a Chat Completions Backend
+# Requires `--features openai-responses` because these filters are opt-in.
 #
 # Accepts finite OpenAI Responses requests with hosted file search while
 # targeting a backend that only implements /v1/chat/completions. The

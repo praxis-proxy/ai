@@ -62,7 +62,11 @@ pub(crate) struct TransformResult {
 
 /// Transform a Chat Completions-compatible response body into Anthropic
 /// Messages format.
-pub(crate) fn transform_response(body: &[u8], request_model: &str) -> Result<TransformResult, String> {
+pub(crate) fn transform_response(
+    body: &[u8],
+    request_model: &str,
+    stop_sequences: &[String],
+) -> Result<TransformResult, String> {
     let value: Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
 
     let Some(obj) = value.as_object() else {
@@ -76,7 +80,7 @@ pub(crate) fn transform_response(body: &[u8], request_model: &str) -> Result<Tra
 
     let model = obj.get("model").and_then(Value::as_str).unwrap_or(request_model);
 
-    let (stop_reason, original_finish_reason) = map_finish_reason(obj);
+    let (stop_reason, original_finish_reason, stop_sequence) = map_finish_reason(obj, stop_sequences);
     let response = MessageResponse {
         content: build_content_blocks(obj)?,
         container: None,
@@ -85,7 +89,7 @@ pub(crate) fn transform_response(body: &[u8], request_model: &str) -> Result<Tra
         role: RESPONSE_ROLE,
         stop_details: None,
         stop_reason,
-        stop_sequence: None,
+        stop_sequence,
         r#type: RESPONSE_TYPE,
         usage: build_usage(obj),
     };
@@ -208,25 +212,33 @@ fn extract_tool_call_blocks<'a>(message: Option<&'a Value>, blocks: &mut Vec<Con
 
 /// Map Chat Completions `finish_reason` to Anthropic `stop_reason`.
 ///
-/// Returns `(anthropic_stop_reason, original_finish_reason)`.
+/// Returns `(anthropic_stop_reason, original_finish_reason, matched_stop_sequence)`.
 /// The `content_filter` to `end_turn` mapping is lossy; the
 /// original is preserved so callers can store it in metadata.
-fn map_finish_reason(obj: &Map<String, Value>) -> (String, String) {
-    let finish_reason = obj
-        .get("choices")
-        .and_then(Value::as_array)
-        .and_then(|c| c.first())
+///
+/// `finish_reason: stop` covers both a natural stop and a stop sequence.
+/// vLLM disambiguates through a choice-level `stop_reason` holding the
+/// matched stop string; only a client-provided sequence is reported back,
+/// since a server-side stop string or integer stop token id is not one.
+fn map_finish_reason<'a>(obj: &'a Map<String, Value>, stop_sequences: &[String]) -> (String, String, Option<&'a str>) {
+    let choice = obj.get("choices").and_then(Value::as_array).and_then(|c| c.first());
+    let finish_reason = choice
         .and_then(|c| c.get("finish_reason"))
         .and_then(Value::as_str)
         .unwrap_or("stop");
+    let stop_sequence = choice
+        .and_then(|c| c.get("stop_reason"))
+        .and_then(Value::as_str)
+        .filter(|matched| stop_sequences.iter().any(|sequence| sequence == matched));
 
     let mapped = match finish_reason {
         "tool_calls" => "tool_use",
         "length" => "max_tokens",
+        "stop" if stop_sequence.is_some() => "stop_sequence",
         _ => "end_turn",
     };
 
-    (mapped.to_owned(), finish_reason.to_owned())
+    (mapped.to_owned(), finish_reason.to_owned(), stop_sequence)
 }
 
 // -----------------------------------------------------------------------------
@@ -415,7 +427,7 @@ mod tests {
     #[test]
     fn basic_text_response() {
         let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Hello!"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        let tr = transform_response(body, "gpt-4").unwrap();
+        let tr = transform_response(body, "gpt-4", &[]).unwrap();
         let result = tr.body;
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
@@ -449,7 +461,7 @@ mod tests {
     #[test]
     fn tool_calls_response() {
         let body = br#"{"id":"chatcmpl-2","model":"gpt-4","choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"NYC\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":20,"completion_tokens":15}}"#;
-        let tr = transform_response(body, "gpt-4").unwrap();
+        let tr = transform_response(body, "gpt-4", &[]).unwrap();
         let result = tr.body;
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
@@ -464,9 +476,44 @@ mod tests {
     }
 
     #[test]
+    fn matched_stop_sequence_is_reported() {
+        let body = br#"{"id":"chatcmpl-7","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Count: 1"},"finish_reason":"stop","stop_reason":","}],"usage":{"prompt_tokens":20,"completion_tokens":4}}"#;
+        let tr = transform_response(body, "gpt-4", &[",".to_owned()]).unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        assert_eq!(parsed["stop_reason"], "stop_sequence", "matched stop → stop_sequence");
+        assert_eq!(parsed["stop_sequence"], ",", "matched value is reported");
+        assert_eq!(tr.original_finish_reason, "stop", "original finish reason preserved");
+    }
+
+    #[test]
+    fn stop_reason_outside_client_sequences_stays_end_turn() {
+        for stop_reason in [r#""</s>""#, "128009"] {
+            let body = format!(
+                r#"{{"id":"chatcmpl-8","model":"gpt-4","choices":[{{"message":{{"role":"assistant","content":"Hi"}},"finish_reason":"stop","stop_reason":{stop_reason}}}],"usage":{{"prompt_tokens":1,"completion_tokens":1}}}}"#
+            );
+            let tr = transform_response(body.as_bytes(), "gpt-4", &[",".to_owned()]).unwrap();
+            let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+            assert_eq!(parsed["stop_reason"], "end_turn", "stop_reason {stop_reason}");
+            assert!(parsed["stop_sequence"].is_null(), "stop_reason {stop_reason}");
+        }
+    }
+
+    #[test]
+    fn stop_without_backend_signal_stays_end_turn() {
+        let body = br#"{"id":"chatcmpl-9","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+        let tr = transform_response(body, "gpt-4", &[",".to_owned()]).unwrap();
+        let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
+
+        assert_eq!(parsed["stop_reason"], "end_turn", "no signal → end_turn");
+        assert!(parsed["stop_sequence"].is_null(), "no signal → null stop_sequence");
+    }
+
+    #[test]
     fn length_finish_reason() {
         let body = br#"{"id":"chatcmpl-3","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"truncated..."},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":100}}"#;
-        let tr = transform_response(body, "gpt-4").unwrap();
+        let tr = transform_response(body, "gpt-4", &[]).unwrap();
         let result = tr.body;
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
@@ -476,7 +523,7 @@ mod tests {
     #[test]
     fn cached_tokens_in_usage() {
         let body = br#"{"id":"chatcmpl-4","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":80}}}"#;
-        let tr = transform_response(body, "gpt-4").unwrap();
+        let tr = transform_response(body, "gpt-4", &[]).unwrap();
         let result = tr.body;
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
@@ -505,7 +552,7 @@ mod tests {
         // sums input_tokens + cache_read_input_tokens must recover the original
         // prompt_tokens total, not double-count the cached portion.
         let body = br#"{"id":"chatcmpl-5","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":80}}}"#;
-        let tr = transform_response(body, "gpt-4").unwrap();
+        let tr = transform_response(body, "gpt-4", &[]).unwrap();
         let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
 
         let input_tokens = parsed["usage"]["input_tokens"].as_u64().unwrap();
@@ -520,7 +567,7 @@ mod tests {
     #[test]
     fn no_cached_tokens_leaves_input_tokens_unchanged() {
         let body = br#"{"id":"chatcmpl-6","model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":5}}"#;
-        let tr = transform_response(body, "gpt-4").unwrap();
+        let tr = transform_response(body, "gpt-4", &[]).unwrap();
         let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
 
         assert_eq!(
@@ -532,14 +579,14 @@ mod tests {
 
     #[test]
     fn transform_response_non_json_body() {
-        let result = transform_response(b"not json at all", "gpt-4");
+        let result = transform_response(b"not json at all", "gpt-4", &[]);
         let err = result.err().unwrap();
         assert!(err.contains("invalid JSON"), "error should mention invalid JSON: {err}");
     }
 
     #[test]
     fn transform_response_json_array_body() {
-        let result = transform_response(b"[1,2,3]", "gpt-4");
+        let result = transform_response(b"[1,2,3]", "gpt-4", &[]);
         let err = result.err().unwrap();
         assert!(
             err.contains("not a JSON object"),
@@ -550,7 +597,7 @@ mod tests {
     #[test]
     fn missing_id_generates_msg_prefixed_id() {
         let body = br#"{"model":"gpt-4","choices":[{"message":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#;
-        let tr = transform_response(body, "gpt-4").unwrap();
+        let tr = transform_response(body, "gpt-4", &[]).unwrap();
         let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
 
         let id = parsed["id"].as_str().unwrap();
@@ -564,7 +611,7 @@ mod tests {
     fn empty_choices_produces_empty_content() {
         let body =
             br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":0}}"#;
-        let tr = transform_response(body, "gpt-4").unwrap();
+        let tr = transform_response(body, "gpt-4", &[]).unwrap();
         let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
 
         assert!(
@@ -576,7 +623,7 @@ mod tests {
     #[test]
     fn empty_string_content_produces_no_text_block() {
         let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":0}}"#;
-        let tr = transform_response(body, "gpt-4").unwrap();
+        let tr = transform_response(body, "gpt-4", &[]).unwrap();
         let parsed: Value = serde_json::from_slice(&tr.body).unwrap();
 
         assert!(
@@ -588,7 +635,7 @@ mod tests {
     #[test]
     fn invalid_tool_call_arguments_fail_transformation() {
         let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"not{json"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        let error = transform_response(body, "gpt-4").err().unwrap();
+        let error = transform_response(body, "gpt-4", &[]).err().unwrap();
 
         assert!(
             error.contains("invalid tool call arguments"),
@@ -619,7 +666,7 @@ mod tests {
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5}
             });
             let encoded = serde_json::to_vec(&body).unwrap();
-            let error = transform_response(&encoded, "gpt-4").err().unwrap();
+            let error = transform_response(&encoded, "gpt-4", &[]).err().unwrap();
 
             assert!(
                 error.contains("invalid tool call arguments"),
@@ -631,7 +678,7 @@ mod tests {
     #[test]
     fn missing_tool_call_arguments_field_fails_transformation() {
         let body = br#"{"id":"chatcmpl-1","model":"gpt-4","choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_time"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        let error = transform_response(body, "gpt-4").err().unwrap();
+        let error = transform_response(body, "gpt-4", &[]).err().unwrap();
 
         assert!(
             error.contains("tool call arguments must be a JSON-encoded object string"),

@@ -187,6 +187,51 @@ fn text_path_emits_canonical_sequence() {
 }
 
 #[test]
+fn streaming_translation_handles_nonzero_zero_and_absent_cache_write_counts() {
+    // 1. Nonzero cache_write_tokens
+    let events_nonzero = run_stream(
+        &[
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"content":"Hi"}}]}"#,
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":8,"cache_write_tokens":2}}}"#,
+        ],
+        wide_limits(),
+    );
+    let completed_nonzero = &events_nonzero.last().unwrap().1["response"];
+    assert_eq!(completed_nonzero["usage"]["input_tokens_details"]["cached_tokens"], 8);
+    assert_eq!(
+        completed_nonzero["usage"]["input_tokens_details"]["cache_write_tokens"],
+        2
+    );
+
+    // 2. Explicit zero cache_write_tokens
+    let events_zero = run_stream(
+        &[
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"content":"Hi"}}]}"#,
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":8,"cache_write_tokens":0}}}"#,
+        ],
+        wide_limits(),
+    );
+    let completed_zero = &events_zero.last().unwrap().1["response"];
+    assert_eq!(completed_zero["usage"]["input_tokens_details"]["cached_tokens"], 8);
+    assert_eq!(completed_zero["usage"]["input_tokens_details"]["cache_write_tokens"], 0);
+
+    // 3. Absent cache_write_tokens
+    let events_absent = run_stream(
+        &[
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"content":"Hi"}}]}"#,
+            r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":8}}}"#,
+        ],
+        wide_limits(),
+    );
+    let completed_absent = &events_absent.last().unwrap().1["response"];
+    assert_eq!(completed_absent["usage"]["input_tokens_details"]["cached_tokens"], 8);
+    assert_eq!(
+        completed_absent["usage"]["input_tokens_details"]["cache_write_tokens"],
+        0
+    );
+}
+
+#[test]
 fn arbitrary_byte_splits_produce_identical_events() {
     let chunks = [
         r#"{"id":"chatcmpl_1","object":"chat.completion.chunk","model":"gpt-4.1-mini","choices":[{"index":0,"delta":{"role":"assistant"}}]}"#,

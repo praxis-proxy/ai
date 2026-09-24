@@ -3,7 +3,13 @@
 
 //! Unit tests for the MCP client wrapper.
 
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc as StdArc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use super::*;
 
@@ -63,6 +69,7 @@ fn trusted_forwarded_headers_override_tool_entry_values() {
         None,
         &[http::HeaderName::from_static("x-tenant-id")],
         Some(&forwarded),
+        None,
     )
     .unwrap();
 
@@ -92,6 +99,7 @@ fn configured_forwarded_names_are_stripped_without_trusted_values() {
         Some(&headers),
         None,
         &[http::HeaderName::from_static("x-tenant-id")],
+        None,
         None,
     )
     .unwrap();
@@ -269,7 +277,7 @@ fn reserved_internal_headers_stripped_from_mcp_headers() {
 #[test]
 fn build_transport_config_bounds_retry_to_three() {
     let config =
-        build_transport_config_with_forwarded_headers("https://mcp.example/mcp", None, None, &[], None).unwrap();
+        build_transport_config_with_forwarded_headers("https://mcp.example/mcp", None, None, &[], None, None).unwrap();
     // A policy consulted past its max returns None (no further retry).
     assert!(
         config.retry_config.retry(3).is_none(),
@@ -366,6 +374,112 @@ fn authorization_with_invalid_chars_returns_error() {
     assert!(
         msg.contains("invalid HTTP header"),
         "error should describe invalid header: {msg}"
+    );
+}
+
+#[test]
+fn connector_context_overrides_client_shadow_and_static_bearer() {
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let bearer = SecretString::from("per-user-token");
+    let assertion = SecretString::from("signed-assertion");
+    let context = McpConnectorContext {
+        owner: &owner,
+        bearer: Some(&bearer),
+        assertion: Some(&assertion),
+    };
+    let headers = serde_json::json!({
+        "authorization": "Basic spoofed",
+        "x-mcp-authorized": "client-spoofed",
+        "x-custom": "kept"
+    });
+    let config = build_transport_config_with_forwarded_headers(
+        "https://mcp.example/mcp",
+        Some(&headers),
+        Some("static-token"),
+        &[],
+        None,
+        Some(&context),
+    )
+    .unwrap();
+    assert_eq!(
+        config.custom_headers.get(&http::header::AUTHORIZATION).unwrap(),
+        "Bearer per-user-token"
+    );
+    assert_eq!(
+        config
+            .custom_headers
+            .get(&crate::callout_credentials::MCP_AUTHORIZED_HEADER)
+            .unwrap(),
+        "signed-assertion"
+    );
+}
+
+#[test]
+fn rotated_assertion_injects_latest_value_without_changing_other_context() {
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let bearer = SecretString::from("per-user-token");
+    let first_assertion = SecretString::from("assertion-v1");
+    let second_assertion = SecretString::from("assertion-v2");
+    let first_context = McpConnectorContext {
+        owner: &owner,
+        bearer: Some(&bearer),
+        assertion: Some(&first_assertion),
+    };
+    let second_context = McpConnectorContext {
+        owner: &owner,
+        bearer: Some(&bearer),
+        assertion: Some(&second_assertion),
+    };
+
+    let first = build_transport_config_with_forwarded_headers(
+        "https://mcp.example/mcp",
+        None,
+        None,
+        &[],
+        None,
+        Some(&first_context),
+    )
+    .unwrap();
+    let second = build_transport_config_with_forwarded_headers(
+        "https://mcp.example/mcp",
+        None,
+        None,
+        &[],
+        None,
+        Some(&second_context),
+    )
+    .unwrap();
+
+    assert_eq!(
+        first
+            .custom_headers
+            .get(&crate::callout_credentials::MCP_AUTHORIZED_HEADER)
+            .unwrap(),
+        "assertion-v1"
+    );
+    assert_eq!(
+        second
+            .custom_headers
+            .get(&crate::callout_credentials::MCP_AUTHORIZED_HEADER)
+            .unwrap(),
+        "assertion-v2"
+    );
+    assert_eq!(
+        second.custom_headers.get(&http::header::AUTHORIZATION).unwrap(),
+        "Bearer per-user-token"
+    );
+}
+
+#[test]
+fn direct_url_context_none_never_forwards_client_assertion() {
+    let headers = serde_json::json!({"x-mcp-authorized": "client-spoofed"});
+    let config =
+        build_transport_config_with_forwarded_headers("https://mcp.example/mcp", Some(&headers), None, &[], None, None)
+            .unwrap();
+    assert!(
+        !config
+            .custom_headers
+            .contains_key(&crate::callout_credentials::MCP_AUTHORIZED_HEADER)
     );
 }
 
@@ -1005,8 +1119,433 @@ async fn start_test_mcp_server() -> (String, tokio_util::sync::CancellationToken
     (format!("http://{addr}/mcp"), ct)
 }
 
+#[derive(Debug, Clone)]
+struct CapturedRequestHeaders {
+    path: String,
+    authorization: Option<String>,
+    assertion: Option<String>,
+    tenant: Option<String>,
+    subject: Option<String>,
+}
+
+type CapturedRequests = StdArc<Mutex<Vec<CapturedRequestHeaders>>>;
+
+async fn start_recording_mcp_server() -> (String, tokio_util::sync::CancellationToken, CapturedRequests) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+    let service: StreamableHttpService<TestMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(TestMcpServer::new()), StdArc::default(), config);
+
+    let captured = CapturedRequests::default();
+    let capture = StdArc::clone(&captured);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let capture = StdArc::clone(&capture);
+                async move {
+                    let headers = request.headers();
+                    capture.lock().unwrap().push(CapturedRequestHeaders {
+                        path: request.uri().path().to_owned(),
+                        authorization: headers
+                            .get(http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        assertion: headers
+                            .get(crate::callout_credentials::MCP_AUTHORIZED_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        tenant: headers
+                            .get("x-tenant-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        subject: headers
+                            .get("x-user-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                    });
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+
+    (format!("http://{addr}/mcp"), ct, captured)
+}
+
+async fn start_redirecting_mcp_server() -> (String, tokio_util::sync::CancellationToken, CapturedRequests) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .with_sse_keep_alive(None)
+        .with_cancellation_token(ct.child_token());
+    let service: StreamableHttpService<TestMcpServer, LocalSessionManager> =
+        StreamableHttpService::new(|| Ok(TestMcpServer::new()), StdArc::default(), config);
+
+    let captured = CapturedRequests::default();
+    let capture = StdArc::clone(&captured);
+    let router = axum::Router::new()
+        .route(
+            "/redirect",
+            axum::routing::post(|| async {
+                (http::StatusCode::TEMPORARY_REDIRECT, [(http::header::LOCATION, "/mcp")])
+            }),
+        )
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let capture = StdArc::clone(&capture);
+                async move {
+                    let headers = request.headers();
+                    capture.lock().unwrap().push(CapturedRequestHeaders {
+                        path: request.uri().path().to_owned(),
+                        authorization: headers
+                            .get(http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        assertion: headers
+                            .get(crate::callout_credentials::MCP_AUTHORIZED_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        tenant: headers
+                            .get("x-tenant-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        subject: headers
+                            .get("x-user-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                    });
+                    next.run(request).await
+                }
+            },
+        ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+
+    (format!("http://{addr}/redirect"), ct, captured)
+}
+
+async fn start_failing_initialize_server() -> (String, tokio_util::sync::CancellationToken, StdArc<AtomicUsize>) {
+    let ct = tokio_util::sync::CancellationToken::new();
+    let requests = StdArc::new(AtomicUsize::new(0));
+    let observed = StdArc::clone(&requests);
+    let router = axum::Router::new().route(
+        "/mcp",
+        axum::routing::post(move || {
+            let observed = StdArc::clone(&observed);
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                http::StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = ct.clone();
+    tokio::spawn(async move {
+        drop(
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled_owned().await })
+                .await,
+        );
+    });
+    (format!("http://{addr}/mcp"), ct, requests)
+}
+
+fn assert_scoped_context_on_every_exchange(captured: &CapturedRequests) {
+    let captured = captured.lock().unwrap();
+    assert!(
+        captured.len() >= 2,
+        "initialize and the requested MCP operation should both reach the server"
+    );
+    for request in captured.iter() {
+        assert_eq!(request.authorization.as_deref(), Some("Bearer per-user-token"));
+        assert_eq!(request.assertion.as_deref(), Some("signed-assertion"));
+    }
+}
+
+fn owner_projecting_mcp_callout() -> McpCallout {
+    let mut registry = praxis_filter::FilterRegistry::with_builtins();
+    praxis_filter::register_filters!(
+        @register registry,
+        http "project_state_owner_headers" => crate::ProjectStateOwnerHeadersFilter::from_config
+    );
+    let mut entries: Vec<praxis_filter::FilterEntry> = serde_yaml::from_str(
+        "- filter: project_state_owner_headers\n  tenant_header: x-tenant-id\n  subject_header: x-user-id\n",
+    )
+    .unwrap();
+    let mut pipeline = praxis_filter::FilterPipeline::build(&mut entries, &registry).unwrap();
+    pipeline.set_allow_private_upstreams(true);
+    McpCallout::fabricated(true)
+        .unwrap()
+        .with_pipeline_for_test(StdArc::new(pipeline))
+}
+
 const INTEGRATION_TIMEOUT: Duration = Duration::from_secs(10);
 const TEST_MAX_RESULT_BYTES: usize = 1_048_576;
+
+#[tokio::test]
+async fn scoped_connector_context_reaches_initialize_and_tools_list_unchanged() {
+    let (url, ct, captured) = start_recording_mcp_server().await;
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let bearer = SecretString::from("per-user-token");
+    let assertion = SecretString::from("signed-assertion");
+    let context = McpConnectorContext {
+        owner: &owner,
+        bearer: Some(&bearer),
+        assertion: Some(&assertion),
+    };
+    let client_shadow = serde_json::json!({
+        "authorization": "Bearer client-shadow",
+        "x-mcp-authorized": "client-shadow"
+    });
+
+    let tools = list_tools_with_forwarded_headers(
+        &url,
+        Some(&client_shadow),
+        Some("static-token"),
+        &[],
+        None,
+        Some(&context),
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
+    ct.cancel();
+
+    assert_eq!(tools.len(), 4);
+    assert_scoped_context_on_every_exchange(&captured);
+}
+
+#[tokio::test]
+async fn scoped_connector_context_reaches_initialize_and_tools_call_unchanged() {
+    let (url, ct, captured) = start_recording_mcp_server().await;
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let bearer = SecretString::from("per-user-token");
+    let assertion = SecretString::from("signed-assertion");
+    let context = McpConnectorContext {
+        owner: &owner,
+        bearer: Some(&bearer),
+        assertion: Some(&assertion),
+    };
+
+    let result = call_tool_with_forwarded_headers(
+        &url,
+        None,
+        Some("static-token"),
+        &[],
+        None,
+        Some(&context),
+        "echo",
+        serde_json::json!({"message": "hello"}),
+        INTEGRATION_TIMEOUT,
+        TEST_MAX_RESULT_BYTES,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
+    ct.cancel();
+
+    assert_eq!(
+        result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.as_str()),
+        Some("hello")
+    );
+    assert_scoped_context_on_every_exchange(&captured);
+}
+
+#[tokio::test]
+async fn two_user_mcp_contexts_are_isolated_across_initialize_and_list() {
+    for suffix in ["a", "b"] {
+        let (url, ct, captured) = start_recording_mcp_server().await;
+        let owner = StateOwner::from_trusted_parts(
+            format!("tenant-{suffix}"),
+            "urn:integration:test",
+            format!("user-{suffix}"),
+        )
+        .unwrap();
+        let bearer = SecretString::from(format!("credential-{suffix}"));
+        let assertion = SecretString::from(format!("assertion-{suffix}"));
+        let context = McpConnectorContext {
+            owner: &owner,
+            bearer: Some(&bearer),
+            assertion: Some(&assertion),
+        };
+
+        list_tools_with_forwarded_headers(
+            &url,
+            None,
+            None,
+            &[],
+            None,
+            Some(&context),
+            INTEGRATION_TIMEOUT,
+            128,
+            &owner_projecting_mcp_callout(),
+        )
+        .await
+        .unwrap();
+        ct.cancel();
+
+        let captured = captured.lock().unwrap();
+        assert!(captured.len() >= 2, "initialize and list must both be observed");
+        let expected_authorization = format!("Bearer credential-{suffix}");
+        let expected_assertion = format!("assertion-{suffix}");
+        let expected_tenant = format!("tenant-{suffix}");
+        let expected_subject = format!("user-{suffix}");
+        for request in captured.iter() {
+            assert_eq!(request.authorization.as_deref(), Some(expected_authorization.as_str()));
+            assert_eq!(request.assertion.as_deref(), Some(expected_assertion.as_str()));
+            assert_eq!(request.tenant.as_deref(), Some(expected_tenant.as_str()));
+            assert_eq!(request.subject.as_deref(), Some(expected_subject.as_str()));
+            let other = if suffix == "a" { "b" } else { "a" };
+            for leaked in [
+                format!("credential-{other}"),
+                format!("assertion-{other}"),
+                format!("tenant-{other}"),
+                format!("user-{other}"),
+            ] {
+                assert!(
+                    request.authorization.as_deref() != Some(leaked.as_str())
+                        && request.assertion.as_deref() != Some(leaked.as_str())
+                        && request.tenant.as_deref() != Some(leaked.as_str())
+                        && request.subject.as_deref() != Some(leaked.as_str()),
+                    "user {suffix} MCP exchange leaked user {other} context"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn direct_url_never_sends_client_shadow_as_ambient_context() {
+    let (url, ct, captured) = start_recording_mcp_server().await;
+    let client_shadow = serde_json::json!({
+        "authorization": "Bearer client-shadow",
+        "x-mcp-authorized": "client-shadow"
+    });
+
+    let tools = list_tools_with_forwarded_headers(
+        &url,
+        Some(&client_shadow),
+        None,
+        &[],
+        None,
+        None,
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await
+    .unwrap();
+    ct.cancel();
+
+    assert_eq!(tools.len(), 4);
+    let captured = captured.lock().unwrap();
+    assert!(captured.len() >= 2);
+    for request in captured.iter() {
+        assert!(
+            request.authorization.is_none(),
+            "direct URL received client Authorization shadow"
+        );
+        assert!(
+            request.assertion.is_none(),
+            "direct URL received client assertion shadow"
+        );
+    }
+}
+
+#[tokio::test]
+async fn scoped_connector_context_is_not_followed_across_redirects() {
+    let (url, ct, captured) = start_redirecting_mcp_server().await;
+    let owner = StateOwner::from_trusted_parts("tenant-a", "issuer-a", "subject-a").unwrap();
+    let bearer = SecretString::from("per-user-token");
+    let assertion = SecretString::from("signed-assertion");
+    let context = McpConnectorContext {
+        owner: &owner,
+        bearer: Some(&bearer),
+        assertion: Some(&assertion),
+    };
+
+    let result = list_tools_with_forwarded_headers(
+        &url,
+        None,
+        None,
+        &[],
+        None,
+        Some(&context),
+        INTEGRATION_TIMEOUT,
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
+    ct.cancel();
+
+    assert!(result.is_err(), "redirect must terminate the MCP exchange");
+    let captured = captured.lock().unwrap();
+    assert!(captured.iter().any(|request| request.path == "/redirect"));
+    assert!(
+        captured.iter().all(|request| request.path != "/mcp"),
+        "ambient connector context must never be replayed to a redirected target"
+    );
+}
+
+#[tokio::test]
+async fn failed_initialize_stops_before_service_start_without_background_retries() {
+    let (url, ct, requests) = start_failing_initialize_server().await;
+
+    let result = list_tools(
+        &url,
+        None,
+        None,
+        Duration::from_millis(500),
+        128,
+        &McpCallout::fabricated(true).unwrap(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    ct.cancel();
+
+    assert!(
+        result.is_err(),
+        "a failed initialize exchange must fail the MCP operation"
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "pre-running initialization failure must not leave a worker retrying in the background"
+    );
+}
 
 #[tokio::test]
 async fn list_tools_returns_all_tools() {

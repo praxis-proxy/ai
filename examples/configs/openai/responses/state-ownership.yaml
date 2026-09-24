@@ -1,4 +1,5 @@
 # Trusted OpenAI State Ownership
+# Requires `--features openai-conversations,store-sqlite` because these filters are opt-in.
 #
 # Provider-neutral owner isolation for persisted OpenAI Responses and Conversations.
 # A trusted authentication boundary must replace (not merely preserve) the
@@ -18,8 +19,11 @@
 # policy. A later policy integration can decide whether the authenticated owner
 # may perform an operation, without changing the storage ownership contract.
 #
-# `single_tenant` is available for isolated development deployments with one
-# shared owner. Multi-user deployments should use `trusted_owner` as below.
+# `single_tenant` is available only when the whole deployment is one trust
+# domain: it assigns every caller the same tenant, issuer, and `shared` subject,
+# so it cannot provide per-user attribution, cache separation, or state
+# isolation. Shared multi-user deployments must use `trusted_owner` as below
+# (or `trusted_headers` when the trusted boundary supplies separate fields).
 
 listeners:
   - name: ai-gateway
@@ -32,6 +36,9 @@ filter_chains:
       - filter: state_owner
         mode: trusted_owner
         header: x-authenticated-state-owner
+
+      # Publishes the typed operation consumed by openai_conversations.
+      - filter: openai_operation
 
       - filter: openai_responses_format
         # Conversation API bodies are handled locally later in this chain.

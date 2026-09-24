@@ -217,6 +217,7 @@ impl OperationSpec {
     /// Answers the runtime question directly rather than inferring it from
     /// contract ownership, so proxied operations report their real body shape.
     #[must_use]
+    #[cfg(all(test, feature = "openai-conversations"))]
     pub(crate) const fn has_request_body(&self) -> bool {
         self.request_body.is_present()
     }
@@ -292,6 +293,97 @@ impl<'a> RouteParams<'a> {
             .iter()
             .find(|(candidate, _)| *candidate == name)
             .map(|&(_, value)| value)
+    }
+
+    /// Convert borrowed values into checked byte offsets in their source path.
+    ///
+    /// Request extensions require `'static` values, so downstream filters
+    /// cannot retain these borrows. Offsets preserve allocation-free access to
+    /// the immutable request path without extending the borrow's lifetime.
+    pub(crate) fn offsets_in(&self, path: &str) -> Option<PathParameterOffsets> {
+        let path_start = path.as_ptr() as usize;
+        let path_end = path_start.checked_add(path.len())?;
+        let mut offsets = PathParameterOffsets::default();
+
+        for &(name, value) in self.pairs.get(..self.len)? {
+            let start_address = value.as_ptr() as usize;
+            let end_address = start_address.checked_add(value.len())?;
+            if start_address < path_start || end_address > path_end {
+                return None;
+            }
+            let start = start_address.checked_sub(path_start)?;
+            let end = start.checked_add(value.len())?;
+            if path.get(start..end) != Some(value) {
+                return None;
+            }
+            offsets.insert(name, start, end)?;
+        }
+
+        Some(offsets)
+    }
+}
+
+/// Allocation-free path-parameter locations in an immutable request path.
+///
+/// The matcher validates every byte range when constructing this value. The
+/// caller must recover parameters from that same immutable path. Consumers
+/// still use [`str::get`], so incompatible bounds or UTF-8 boundaries fail
+/// closed instead of panicking.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PathParameterOffsets {
+    /// Parameter names paired with start/end byte offsets.
+    pairs: [(&'static str, usize, usize); MAX_PATH_PARAMS],
+    /// Number of occupied slots.
+    len: usize,
+}
+
+impl Default for PathParameterOffsets {
+    fn default() -> Self {
+        Self {
+            pairs: [("", 0, 0); MAX_PATH_PARAMS],
+            len: 0,
+        }
+    }
+}
+
+impl PathParameterOffsets {
+    /// Record one validated byte range.
+    fn insert(&mut self, name: &'static str, start: usize, end: usize) -> Option<()> {
+        if self
+            .pairs
+            .get(..self.len)?
+            .iter()
+            .any(|(candidate, ..)| *candidate == name)
+        {
+            return None;
+        }
+        let slot = self.pairs.get_mut(self.len)?;
+        *slot = (name, start, end);
+        self.len += 1;
+        Some(())
+    }
+
+    /// Recover one parameter by name from the current immutable request path.
+    #[must_use]
+    pub fn get<'a>(&self, path: &'a str, name: &str) -> Option<&'a str> {
+        let &(_, start, end) = self
+            .pairs
+            .get(..self.len)?
+            .iter()
+            .find(|(candidate, ..)| *candidate == name)?;
+        path.get(start..end)
+    }
+
+    /// Number of captured path parameters.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the matched path captured no parameters.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
@@ -454,10 +546,22 @@ mod tests {
 
     #[test]
     fn parameters_borrow_from_the_request_path() {
-        let matched = match_operation(SPECS, "GET", "/v1/responses/resp_123", Transport::Http).unwrap();
+        let path = "/v1/responses/resp_123";
+        let matched = match_operation(SPECS, "GET", path, Transport::Http).unwrap();
         assert_eq!(matched.spec.operation_id, "getResponse");
         assert_eq!(matched.params.get("response_id"), Some("resp_123"));
         assert_eq!(matched.params.get("missing"), None);
+
+        let offsets = matched.params.offsets_in(path).unwrap();
+        assert_eq!(offsets.get(path, "response_id"), Some("resp_123"));
+        assert_eq!(offsets.get(path, "missing"), None);
+        assert_eq!(offsets.len(), 1);
+        assert!(!offsets.is_empty());
+        assert_eq!(
+            offsets.get("/changed", "response_id"),
+            None,
+            "offset recovery must fail closed when the source path is unavailable"
+        );
     }
 
     #[test]

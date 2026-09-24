@@ -21,43 +21,46 @@ use std::borrow::Cow;
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use utoipa::ToSchema;
 
 /// The spellings match OpenAI's `IncludeEnum` exactly. Runtime query parsing
 /// and generated `OpenAPI` both consume this enum.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openai-conversations", derive(utoipa::ToSchema))]
 pub(crate) enum IncludeField {
     /// Include file search result payloads.
     #[serde(rename = "file_search_call.results")]
-    #[schema(rename = "file_search_call.results")]
+    #[cfg_attr(feature = "openai-conversations", schema(rename = "file_search_call.results"))]
     FileSearchCallResults,
     /// Include web search result payloads.
     #[serde(rename = "web_search_call.results")]
-    #[schema(rename = "web_search_call.results")]
+    #[cfg_attr(feature = "openai-conversations", schema(rename = "web_search_call.results"))]
     WebSearchCallResults,
     /// Include the sources used by web search actions.
     #[serde(rename = "web_search_call.action.sources")]
-    #[schema(rename = "web_search_call.action.sources")]
+    #[cfg_attr(feature = "openai-conversations", schema(rename = "web_search_call.action.sources"))]
     WebSearchCallActionSources,
     /// Include image URLs in message input-image parts.
     #[serde(rename = "message.input_image.image_url")]
-    #[schema(rename = "message.input_image.image_url")]
+    #[cfg_attr(feature = "openai-conversations", schema(rename = "message.input_image.image_url"))]
     MessageInputImageImageUrl,
     /// Include image URLs in computer-call outputs.
     #[serde(rename = "computer_call_output.output.image_url")]
-    #[schema(rename = "computer_call_output.output.image_url")]
+    #[cfg_attr(
+        feature = "openai-conversations",
+        schema(rename = "computer_call_output.output.image_url")
+    )]
     ComputerCallOutputImageUrl,
     /// Include code-interpreter output payloads.
     #[serde(rename = "code_interpreter_call.outputs")]
-    #[schema(rename = "code_interpreter_call.outputs")]
+    #[cfg_attr(feature = "openai-conversations", schema(rename = "code_interpreter_call.outputs"))]
     CodeInterpreterCallOutputs,
     /// Include encrypted reasoning content.
     #[serde(rename = "reasoning.encrypted_content")]
-    #[schema(rename = "reasoning.encrypted_content")]
+    #[cfg_attr(feature = "openai-conversations", schema(rename = "reasoning.encrypted_content"))]
     ReasoningEncryptedContent,
     /// Include token log probabilities in message output-text parts.
     #[serde(rename = "message.output_text.logprobs")]
-    #[schema(rename = "message.output_text.logprobs")]
+    #[cfg_attr(feature = "openai-conversations", schema(rename = "message.output_text.logprobs"))]
     MessageOutputTextLogprobs,
 }
 

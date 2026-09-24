@@ -15,7 +15,7 @@ then exercises the Conversations API using the official OpenAI Python
 SDK to verify wire-format compatibility.
 
 Usage:
-    cargo build -p praxis-ai-proxy
+    cargo build -p praxis-ai-proxy --features full
     cargo build -p praxis-test-utils --example conversations_tenant_proxy
     uv run tests/integration/sdk/openai/test_openai_conversations.py -v
 """
@@ -74,7 +74,7 @@ def _find_binary() -> str:
         if os.path.isfile(candidate):
             return candidate
     raise FileNotFoundError(
-        "praxis-ai binary not found — run `cargo build -p praxis-ai-proxy` first"
+        "praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full` first"
     )
 
 
@@ -130,7 +130,18 @@ def _conversations_filter() -> dict:
     return cfg
 
 
-def _write_config(port: int) -> str:
+def _write_config(port: int, include_operation_classifier: bool = True) -> str:
+    filters = [
+        {
+            "filter": "state_owner",
+            "mode": "trusted_owner",
+            "header": OWNER_HEADER,
+        },
+    ]
+    if include_operation_classifier:
+        filters.append({"filter": "openai_operation"})
+    filters.append(_conversations_filter())
+
     config = {
         "listeners": [
             {
@@ -142,14 +153,7 @@ def _write_config(port: int) -> str:
         "filter_chains": [
             {
                 "name": "conversations-pipeline",
-                "filters": [
-                    {
-                        "filter": "state_owner",
-                        "mode": "trusted_owner",
-                        "header": OWNER_HEADER,
-                    },
-                    _conversations_filter(),
-                ],
+                "filters": filters,
             }
         ],
     }
@@ -180,6 +184,7 @@ def _write_tenant_config(port: int) -> str:
                 "name": "tenant-conversations-pipeline",
                 "filters": [
                     {"filter": "test_tenant_identity"},
+                    {"filter": "openai_operation"},
                     conversations_filter,
                 ],
             }
@@ -207,6 +212,31 @@ def praxis_proxy():
     """Start a Praxis proxy for the test session and tear it down after."""
     port = _free_port()
     config_path = _write_config(port)
+    binary = _find_binary()
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        _wait_for_proxy(port)
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def classifier_missing_proxy():
+    """Start Praxis with the Conversations dependency deliberately omitted."""
+    port = _free_port()
+    config_path = _write_config(port, include_operation_classifier=False)
     binary = _find_binary()
 
     proc = subprocess.Popen(
@@ -337,6 +367,52 @@ class TestOpenAIConversations:
         assert retrieved.object == "conversation"
         assert retrieved.metadata["topic"] == "demo"
         assert retrieved.created_at == conversation.created_at
+
+    def test_bodyless_retrieve_ignores_invalid_json_bytes(self, openai_client):
+        conversation = openai_client.conversations.create()
+        response = httpx.request(
+            "GET",
+            f"{str(openai_client.base_url).rstrip('/')}"
+            f"/conversations/{conversation.id}",
+            headers={
+                "Authorization": "Bearer not-needed",
+                OWNER_HEADER: _owner_assertion("alice"),
+                "Content-Type": "application/json",
+            },
+            content=b"not valid json",
+            timeout=10,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["id"] == conversation.id
+
+    def test_missing_operation_classifier_fails_closed(self, classifier_missing_proxy):
+        response = httpx.get(
+            f"http://127.0.0.1:{classifier_missing_proxy}/v1/conversations/conv_unclassified",
+            headers={
+                "Authorization": "Bearer not-needed",
+                OWNER_HEADER: _owner_assertion("alice"),
+            },
+            timeout=10,
+        )
+
+        assert response.status_code == 500
+        assert response.json()["error"]["type"] == "server_error"
+
+    def test_upgrade_on_conversation_route_fails_closed(self, openai_client):
+        response = httpx.get(
+            f"{str(openai_client.base_url).rstrip('/')}/conversations/conv_upgrade",
+            headers={
+                "Authorization": "Bearer not-needed",
+                OWNER_HEADER: _owner_assertion("alice"),
+                "Connection": "Upgrade",
+                "Upgrade": "websocket",
+            },
+            timeout=10,
+        )
+
+        assert response.status_code == 500
+        assert response.json()["error"]["type"] == "server_error"
 
     def test_conversation_retrieve_nonexistent(self, openai_client):
         with pytest.raises(NotFoundError) as exc_info:

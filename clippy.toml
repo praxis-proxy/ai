@@ -12,7 +12,7 @@ type-complexity-threshold = 200
 msrv = "1.96"
 stack-size-threshold = 16384
 avoid-breaking-exported-api = false
-doc-valid-idents = ["OpenAI", "Praxis", "Pingora", "SQLite", "gRPC", "OpenTelemetry", "NGINX", "HAProxy", "Envoy", "Rustls", "XDP", "eBPF", "IPv4", "IPv6", "KiB", "MiB"]
+doc-valid-idents = ["..", "OpenAI", "OpenSSL", "OpenPGP", "Praxis", "Pingora", "SQLite", "gRPC", "OpenTelemetry", "NGINX", "HAProxy", "Envoy", "Rustls", "XDP", "eBPF", "IPv4", "IPv6", "KiB", "MiB"]
 disallowed-methods = [
     { path = "std::thread::sleep", reason = "use tokio::time::sleep in async context" },
     { path = "std::io::stdin", reason = "a proxy must not read interactive input" },

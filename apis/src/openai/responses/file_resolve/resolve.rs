@@ -25,7 +25,10 @@ use tracing::{debug, warn};
 use super::resolve_url::{FileUrlResolver, redact_url};
 use crate::{
     callout_policy::OnMissing,
-    openai::api_client::{ApiClient, ApiClientError, DownstreamRuntime, OutboundExecution},
+    openai::{
+        api_client::{ApiClient, ApiClientError, DownstreamRuntime, OutboundExecution},
+        responses::content_parts::{content_parts, content_parts_mut, infer_mime_from_filename},
+    },
 };
 
 /// Files API path prefix used in resource URL construction.
@@ -38,6 +41,52 @@ pub(crate) enum ReferenceSource {
     FileId(String),
     /// Remote `file_url` reference.
     FileUrl(String),
+}
+
+/// Return whether a Responses request body contains a valid `file_id` reference that
+/// will dispatch to the configured Files API.
+pub(crate) fn body_has_file_id_reference(body: &serde_json::Value) -> bool {
+    body.get("input")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| items_have_file_id_reference(items))
+}
+
+/// Return whether any supported item contains a valid `file_id` reference.
+pub(crate) fn items_have_file_id_reference(items: &[serde_json::Value]) -> bool {
+    items
+        .iter()
+        .any(|item| content_parts(item).is_some_and(|parts| parts.iter().any(has_resolvable_file_id)))
+}
+
+/// Match the same valid single-source shapes as [`resolvable_reference`] without
+/// allocating a temporary owned [`ReferenceSource`].
+fn has_resolvable_file_id(part: &serde_json::Value) -> bool {
+    match part.get("type").and_then(serde_json::Value::as_str) {
+        Some("input_image") => {
+            part.get("image_url").and_then(serde_json::Value::as_str).is_none()
+                && part.get("file_id").and_then(serde_json::Value::as_str).is_some()
+        },
+        Some("input_file") => {
+            let mut valid_sources = 0_u8;
+            let mut malformed = false;
+            let mut has_file_id = false;
+            for field in ["file_data", "file_id", "file_url"] {
+                if let Some(value) = part.get(field) {
+                    if value.is_null() {
+                        continue;
+                    }
+                    if value.as_str().is_some() {
+                        valid_sources = valid_sources.saturating_add(1);
+                        has_file_id |= field == "file_id";
+                    } else {
+                        malformed = true;
+                    }
+                }
+            }
+            !malformed && valid_sources == 1 && has_file_id
+        },
+        _ => false,
+    }
 }
 
 impl std::fmt::Display for ReferenceSource {
@@ -637,23 +686,6 @@ async fn resolve_item(item: &mut serde_json::Value, resolver: &mut ContentResolv
     Ok(resolved_count)
 }
 
-/// Return the mutable content parts array for a given input item,
-/// if applicable.
-pub(crate) fn content_parts_mut(item: &mut serde_json::Value) -> Option<&mut Vec<serde_json::Value>> {
-    match item.get("type").and_then(serde_json::Value::as_str) {
-        Some("message") => item.get_mut("content").and_then(serde_json::Value::as_array_mut),
-        Some("function_call_output") => item.get_mut("output").and_then(serde_json::Value::as_array_mut),
-        Some(_) => None,
-        None => {
-            if item.get("role").and_then(serde_json::Value::as_str).is_some() && item.get("content").is_some() {
-                item.get_mut("content").and_then(serde_json::Value::as_array_mut)
-            } else {
-                None
-            }
-        },
-    }
-}
-
 /// Resolve a single content part if it contains a resolvable reference.
 async fn resolve_content_part(
     part: &mut serde_json::Value,
@@ -874,28 +906,6 @@ pub(super) fn max_content_bytes_for_data_url(max_data_url_bytes: usize, content_
     Some((available / 4) * 3)
 }
 
-/// Infer MIME type from a filename extension.
-pub(crate) fn infer_mime_from_filename(filename: Option<&str>) -> Option<&'static str> {
-    let ext = filename?.rsplit('.').next()?;
-    match ext.to_ascii_lowercase().as_str() {
-        "csv" => Some("text/csv"),
-        "doc" => Some("application/msword"),
-        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-        "gif" => Some("image/gif"),
-        "html" | "htm" => Some("text/html"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "json" => Some("application/json"),
-        "pdf" => Some("application/pdf"),
-        "png" => Some("image/png"),
-        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
-        "txt" => Some("text/plain"),
-        "webp" => Some("image/webp"),
-        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-        "xml" => Some("application/xml"),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
@@ -912,10 +922,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        openai::api_client::{ApiClient, ApiClientConfig},
-        subrequest::SubRequestClient,
-    };
+    use crate::openai::api_client::{ApiClient, ApiClientConfig};
 
     #[test]
     fn infer_mime_pdf() {
@@ -1048,7 +1055,7 @@ mod tests {
     fn test_api_client(api_base_url: &str, timeout_ms: u64) -> ApiClient {
         ApiClient::new(ApiClientConfig {
             api_base_url: api_base_url.to_owned(),
-            client: SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(4, None)),
+            client: crate::subrequest::isolated_client(4),
             timeout: std::time::Duration::from_millis(timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
@@ -1621,6 +1628,47 @@ mod tests {
         assert!(
             matches!(result, Some(("input_file", ReferenceSource::FileId(id))) if id == "file-abc"),
             "file_id-only part should be classified as FileId"
+        );
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one assertion per supported reference shape")]
+    fn file_id_preflight_matches_resolver_and_excludes_file_url() {
+        let file_id = serde_json::json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_file", "file_id": "file-abc"}]
+            }]
+        });
+        assert!(body_has_file_id_reference(&file_id));
+
+        let file_url = serde_json::json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_file", "file_url": "https://files.example/a"}]
+            }]
+        });
+        assert!(
+            !body_has_file_id_reference(&file_url),
+            "file_url must stay on the credential-free resolver path"
+        );
+
+        let ambiguous = serde_json::json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_file",
+                    "file_id": "file-abc",
+                    "file_url": "https://files.example/a"
+                }]
+            }]
+        });
+        assert!(
+            !body_has_file_id_reference(&ambiguous),
+            "a shape the resolver skips must not require an OGX credential"
         );
     }
 

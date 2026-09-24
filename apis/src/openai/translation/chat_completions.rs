@@ -9,6 +9,13 @@ use thiserror::Error;
 
 use crate::web_search::is_web_search_tool_type;
 
+/// Default prefix prepended to the summary when translating
+/// compaction items to backend-compatible messages.
+///
+/// Lives with the translation helpers (always compiled) so the stateless
+/// Responses path does not depend on the optional compaction filter.
+pub const DEFAULT_SUMMARY_PREFIX: &str = "[Previous conversation summary]\n\n";
+
 // -----------------------------------------------------------------------------
 // Constants
 // -----------------------------------------------------------------------------
@@ -390,18 +397,20 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 
 /// Reject request parameters this adapter cannot represent.
 ///
-/// `background` and `truncation` describe behaviors the Chat Completions
-/// translation does not implement. Accepting a non-default value would send a
-/// foreground, untruncated Chat request and then report the defaults back as
-/// though they had been honored, so the request fails closed instead. Rejecting
-/// here is what lets [`response_resource`] state those defaults truthfully.
+/// `background`, `truncation`, and `prompt` describe behaviors the Chat
+/// Completions translation does not implement. Accepting an unsupported value
+/// would silently change the request semantics, so the request fails closed
+/// instead. Rejecting `background` and `truncation` here is what lets
+/// [`response_resource`] state their defaults truthfully.
 ///
-/// Unlike parameters this translator forwards, both fields are dropped rather
+/// Unlike parameters this translator forwards, these fields are dropped rather
 /// than sent upstream, so the backend never sees them and cannot validate them
 /// on our behalf. A malformed value is therefore rejected too: anything that is
 /// not demonstrably the default would otherwise be silently discarded and then
 /// reported back as the default.
 fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    validate_prompt_parameter(obj)?;
+
     if let Some(background) = obj.get("background").filter(|value| !value.is_null())
         && background.as_bool() != Some(false)
     {
@@ -431,6 +440,18 @@ fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), Tra
     }
 
     Ok(())
+}
+
+/// Reject a non-null prompt because Chat Completions cannot resolve it.
+fn validate_prompt_parameter(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    let Some(prompt) = obj.get("prompt").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    Err(TranslationError::UnrepresentableRequestParameter {
+        parameter: "prompt",
+        value: json_type_name(prompt),
+        supported: "`prompt` null",
+    })
 }
 
 /// Copy a field from one JSON object to another.
@@ -641,7 +662,7 @@ fn append_compaction_item(messages: &mut Vec<Value>, obj: &Map<String, Value>) -
         let prefix = obj
             .get("summary_prefix")
             .and_then(Value::as_str)
-            .unwrap_or(crate::openai::responses::compact::DEFAULT_SUMMARY_PREFIX);
+            .unwrap_or(DEFAULT_SUMMARY_PREFIX);
         messages.push(json!({
             "role": "assistant",
             "content": format!("{prefix}{summary}")
@@ -1982,6 +2003,11 @@ fn build_usage_from_value(usage: Option<&Value>) -> Value {
         .and_then(|details| details.get("cached_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let cache_write_tokens = usage
+        .and_then(|usage| usage.get("prompt_tokens_details"))
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let reasoning_tokens = usage
         .and_then(|usage| usage.get("completion_tokens_details"))
         .and_then(|details| details.get("reasoning_tokens"))
@@ -1991,7 +2017,8 @@ fn build_usage_from_value(usage: Option<&Value>) -> Value {
     json!({
         "input_tokens": input_tokens,
         "input_tokens_details": {
-            "cached_tokens": cached_tokens
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens
         },
         "output_tokens": output_tokens,
         "output_tokens_details": {

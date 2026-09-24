@@ -46,6 +46,7 @@ pub(crate) fn is_non_public_ip(ip: &IpAddr) -> bool {
 }
 
 /// Return whether an IP must be blocked for an untrusted `file_url` fetch.
+#[cfg(feature = "openai-file-resolve-filter")]
 pub(crate) fn is_file_url_ssrf_blocked(ip: &IpAddr, allow_private: bool) -> bool {
     let ip = normalize_mapped_ipv4(*ip);
     if is_unconditionally_blocked(&ip) {

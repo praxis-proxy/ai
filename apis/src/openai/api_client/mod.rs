@@ -5,8 +5,8 @@
 //!
 //! Provides URL construction, SSRF-safe base-URL validation,
 //! resource-ID path-segment encoding, header forwarding, bounded
-//! JSON and byte reads, and normalized error mapping. Used by
-//! [`FilesApiClient`] and vector-store search.
+//! JSON and byte reads, and normalized error mapping. Used by the
+//! `openai_file_resolve` Files API client and vector-store search.
 //!
 //! All requests route through the [`SubRequestClient`] from
 //! praxis-core for connection pooling, TLS, admission control,
@@ -14,7 +14,6 @@
 //!
 //! Each consuming filter retains its own [`ApiClient`] instance.
 //!
-//! [`FilesApiClient`]: super::responses::file_resolve
 //! [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
 
 pub(crate) mod error;
@@ -34,11 +33,14 @@ use praxis_filter::{
     StagedUpstreamFallback, SubrequestRuntime, TlsPeerIdentity,
 };
 
+#[cfg(feature = "openai-responses")]
+pub(crate) use self::url::validate_forward_headers;
 pub(crate) use self::{
     error::ApiClientError,
-    url::{resource_url, validate_base_url, validate_forward_headers},
+    url::{resource_url, validate_base_url},
 };
 use crate::{
+    callout_identity::CalloutIdentity,
     callout_target::AddressPolicy,
     http_hop::{connection_nominates_header, is_hop_by_hop},
     subrequest::{self, SubRequest, SubRequestClient, SubRequestError, SubResponse},
@@ -312,6 +314,8 @@ impl ApiClient {
             client: self.client.clone(),
             step_timeout: self.timeout,
             runtime,
+            callout_identity: None,
+            credential_authority: None,
         }
     }
 
@@ -373,8 +377,15 @@ impl ApiClient {
             });
         }
 
-        // One clock bounds both target preparation and the sub-request.
-        let deadline = Instant::now() + self.timeout;
+        // One clock bounds both target preparation and the sub-request. A
+        // configured Files API callout staged inside an IRR cannot receive a
+        // fresh timeout beyond the router's remaining absolute deadline.
+        let started = Instant::now();
+        let deadline = outbound.callout_identity.as_ref().map_or_else(
+            || started.checked_add(self.timeout).unwrap_or(started),
+            |identity| identity.deadline(started, self.timeout),
+        );
+        let step_timeout = deadline.saturating_duration_since(started);
 
         // Pin the resolved target before dialing: the validation hook runs
         // once on the complete address set, rejecting private or reserved
@@ -423,13 +434,26 @@ impl ApiClient {
         let mut extensions = RequestExtensions::default();
         extensions.insert(staged_upstream);
         extensions.insert(staged_fallback);
+        if let Some(identity) = outbound.callout_identity.as_ref() {
+            let authority = outbound
+                .credential_authority
+                .as_deref()
+                .ok_or_else(|| ApiClientError::Transport {
+                    source: SubRequestError::InvalidRequest("missing configured credential authority".to_owned()),
+                })?;
+            identity
+                .stage_header_credential_into(&mut extensions, authority, http::header::AUTHORIZATION)
+                .map_err(|_error| ApiClientError::Transport {
+                    source: SubRequestError::InvalidRequest("Files API credential staging failed".to_owned()),
+                })?;
+        }
 
         let executor = FilteredSubrequestExecutor::for_callout(
             outbound.client.clone(),
             outbound.runtime.runtime(),
             OUTBOUND_CALLOUT_DEPTH,
             max_response_bytes,
-            outbound.step_timeout,
+            outbound.step_timeout.min(step_timeout),
         );
 
         let mut response = match Box::pin(executor.run_classified(&outbound.pipeline, &request, extensions, deadline))
@@ -499,6 +523,19 @@ pub(crate) struct OutboundExecution {
     step_timeout: Duration,
     /// Downstream attributes forwarded into each sub-request.
     runtime: DownstreamRuntime,
+    /// Trusted caller context projected into each child callout.
+    callout_identity: Option<CalloutIdentity>,
+    /// Exact authority for an optional caller-scoped Authorization credential.
+    credential_authority: Option<String>,
+}
+
+impl OutboundExecution {
+    /// Attach the trusted caller context used by configured Files API callouts.
+    pub(crate) fn with_callout_identity(mut self, identity: CalloutIdentity, credential_authority: String) -> Self {
+        self.callout_identity = Some(identity);
+        self.credential_authority = Some(credential_authority);
+        self
+    }
 }
 
 /// Retain the safe response metadata required by callout consumers.
@@ -534,7 +571,13 @@ mod tests {
         thread::JoinHandle,
     };
 
+    use http::HeaderValue;
+
     use super::*;
+    use crate::{
+        callout_identity::stage_callout_identity,
+        test_utils::{make_filter_context, make_request},
+    };
 
     fn bind_test_server() -> (TcpListener, SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -585,12 +628,10 @@ mod tests {
         }
     }
 
-    use praxis_core::subrequest::SubRequestConnector;
-
     fn test_client(base_url: &str) -> ApiClient {
         ApiClient::new(ApiClientConfig {
             api_base_url: base_url.to_owned(),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),
@@ -624,7 +665,7 @@ mod tests {
     fn forward_headers_copies_configured_headers() {
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: "http://ogx:8321".to_owned(),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: vec![
@@ -658,7 +699,7 @@ mod tests {
     fn forward_headers_skips_connection_nominated_fields() {
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: "http://ogx:8321".to_owned(),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: vec![
@@ -867,6 +908,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_file_call_is_capped_by_parent_deadline() {
+        let (listener, address) = bind_test_server();
+        slow_body_server(listener);
+        let client = test_client(&format!("http://{address}"));
+        let parent_deadline = Instant::now() + Duration::from_millis(50);
+        let outbound = private_outbound(&client).with_callout_identity(
+            CalloutIdentity::for_test_with_deadline(parent_deadline),
+            address.to_string(),
+        );
+        let started = Instant::now();
+
+        let response = client
+            .get_via_chain(
+                &format!("http://{address}/v1/files/slow/content"),
+                &HeaderMap::new(),
+                1024,
+                &outbound,
+            )
+            .await
+            .expect("the executor represents its local timeout as a buffered response");
+
+        assert_eq!(
+            response.status, 504,
+            "the parent deadline must stop the nested file callout"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the callout must not receive the client's fresh one-second timeout"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test runs and compares two complete parallel callout exchanges"
+    )]
+    async fn parallel_outbound_file_calls_share_trace_and_mint_distinct_spans() {
+        let (first_listener, first_address) = bind_test_server();
+        let first_request = capture_request(first_listener, "{}");
+        let (second_listener, second_address) = bind_test_server();
+        let second_request = capture_request(second_listener, "{}");
+
+        let mut parent_request = make_request(http::Method::POST, "/v1/responses");
+        parent_request
+            .headers
+            .insert("x-request-id", HeaderValue::from_static("request-parent"));
+        parent_request.headers.insert(
+            "traceparent",
+            HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        );
+        let mut parent_context = make_filter_context(&parent_request);
+        let trace_filter = praxis_filter::builtins::TraceContextFilter::from_config(
+            &serde_yaml::from_str("{}").expect("valid trace filter config"),
+        )
+        .expect("trace_context filter");
+        let _action = trace_filter
+            .on_request(&mut parent_context)
+            .await
+            .expect("trace context established");
+
+        let first_client = test_client(&format!("http://{first_address}"));
+        let first_outbound = private_outbound(&first_client).with_callout_identity(
+            stage_callout_identity(&parent_context, None).expect("first identity"),
+            first_address.to_string(),
+        );
+        let second_client = test_client(&format!("http://{second_address}"));
+        let second_outbound = private_outbound(&second_client).with_callout_identity(
+            stage_callout_identity(&parent_context, None).expect("second identity"),
+            second_address.to_string(),
+        );
+
+        let first_url = format!("http://{first_address}/v1/files/first/content");
+        let second_url = format!("http://{second_address}/v1/files/second/content");
+        let first_headers = HeaderMap::new();
+        let second_headers = HeaderMap::new();
+        let (first_result, second_result) = tokio::join!(
+            first_client.get_via_chain(&first_url, &first_headers, 1024, &first_outbound,),
+            second_client.get_via_chain(&second_url, &second_headers, 1024, &second_outbound,),
+        );
+        first_result.expect("first file callout");
+        second_result.expect("second file callout");
+
+        let first = first_request.join().expect("first captured request");
+        let second = second_request.join().expect("second captured request");
+        let first_traceparent = captured_header(&first, "traceparent").expect("first traceparent");
+        let second_traceparent = captured_header(&second, "traceparent").expect("second traceparent");
+        assert_eq!(captured_header(&first, "x-request-id"), Some("request-parent"));
+        assert_eq!(captured_header(&second, "x-request-id"), Some("request-parent"));
+        let (first_trace_id, first_span_id) = traceparent_ids(first_traceparent);
+        let (second_trace_id, second_span_id) = traceparent_ids(second_traceparent);
+        assert_eq!(first_trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(second_trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_ne!(first_span_id, "00f067aa0ba902b7");
+        assert_ne!(second_span_id, "00f067aa0ba902b7");
+        assert_ne!(
+            first_span_id, second_span_id,
+            "parallel child callouts require independent span IDs"
+        );
+    }
+
+    fn captured_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (candidate, value) = line.split_once(':')?;
+            candidate.eq_ignore_ascii_case(name).then_some(value.trim())
+        })
+    }
+
+    fn traceparent_ids(traceparent: &str) -> (&str, &str) {
+        let mut fields = traceparent.split('-');
+        assert_eq!(fields.next(), Some("00"), "expected W3C version 00");
+        let trace_id = fields.next().expect("trace ID");
+        let span_id = fields.next().expect("span ID");
+        assert_eq!(fields.next(), Some("01"), "expected sampled trace flags");
+        assert!(fields.next().is_none(), "unexpected traceparent fields");
+        (trace_id, span_id)
+    }
+
+    #[tokio::test]
     async fn get_returns_valid_json_without_decoding() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -969,7 +1128,7 @@ mod tests {
 
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: format!("http://{address}"),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(1_000),
             max_response_bytes: 1_048_576,
             forward_header_names: vec![http::header::CONTENT_TYPE],
@@ -1224,7 +1383,7 @@ mod tests {
 
         let client = ApiClient::new(ApiClientConfig {
             api_base_url: format!("http://{addr}"),
-            client: SubRequestClient::new(SubRequestConnector::new(4, None)),
+            client: subrequest::isolated_client(4),
             timeout: Duration::from_millis(50),
             max_response_bytes: 1_048_576,
             forward_header_names: Vec::new(),

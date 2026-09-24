@@ -1,4 +1,5 @@
 # Responses File Resolve
+# Requires `--features openai-file-resolve-filter` because these filters are opt-in.
 #
 # Resolves `file_id` and `file_url` references in Responses API
 # input by fetching file metadata and content, then inlining
@@ -28,7 +29,7 @@
 # extraction for vLLM is tracked separately in issue #397.
 #
 # Build:
-#   cargo build -p praxis-ai-proxy
+#   cargo build -p praxis-ai-proxy --features openai-file-resolve-filter
 
 listeners:
   - name: ai-gateway

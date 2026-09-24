@@ -22,10 +22,34 @@ name = "praxis-ai"
 path = "src/main.rs"
 
 [features]
-default = ["store-postgres"]
-store-postgres = ["praxis-ai-filters/store-postgres", "praxis-ai-apis/store-postgres"]
-store-sqlite = ["praxis-ai-filters/store-sqlite", "praxis-ai-apis/store-sqlite"]
+default = ["standard"]
+# Default-on filters that sit behind a gate so minimal builds can drop them.
+standard = ["aws-sigv4-filter", "policy-engine"]
+# The `policy` filter (Praxis Policy Engine) from praxis core. On by default;
+# off in the FIPS build, since its plugins carry pure-Rust cryptography
+# (aws-lc-rs through jsonwebtoken, sha2, hmac).
+policy-engine = [
+    "praxis-ai-filters/policy-engine",
+    "praxis-filter/policy-engine",
+    "praxis-protocol/policy-engine",
+]
+# aws_sigv4_sign: AWS Signature V4 request signing.
+aws-sigv4-filter = ["praxis-ai-filters/aws-sigv4-filter"]
+# Opt-in OpenAI filter groups (see praxis-ai-apis for what each one contains).
+openai-responses = ["praxis-ai-filters/openai-responses"]
+openai-file-resolve-filter = ["openai-responses", "praxis-ai-filters/openai-file-resolve-filter"]
+# Response store support; installs the response store pipeline extension.
+store = ["openai-responses", "praxis-ai-filters/store"]
+store-postgres = ["store", "praxis-ai-filters/store-postgres"]
+store-sqlite = ["store", "praxis-ai-filters/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
+openai-conversations = ["store", "praxis-ai-filters/openai-conversations"]
+openai-compact = ["store", "praxis-ai-filters/openai-compact"]
+openai-mcp-tools = ["store", "praxis-ai-filters/openai-mcp-tools"]
+# Every OpenAI group, without choosing a store backend.
+openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
+# Every non-experimental filter; equals the pre-feature-split capability.
+full = ["standard", "openai-all", "store-postgres"]
 # Experimental: the generic http_callout filter (see praxis-ai-filters).
 http-callout-filter = ["praxis-ai-filters/http-callout-filter", "experimental"]
 # Experimental: the azure_ad (Entra ID) auth filter (see praxis-ai-filters).
@@ -41,7 +65,7 @@ token-rate-limit-filter = ["praxis-ai-filters/token-rate-limit-filter", "experim
 experimental = ["praxis-ai-filters/experimental"]
 opentelemetry = ["praxis-ai-filters/opentelemetry"]
 llmd-ext-proc = ["dep:praxis-ai-llmd-ext-proc"]
-praxis-main = ["praxis-ai-filters/praxis-main", "praxis-ai-apis/praxis-main"]
+praxis-main = ["praxis-ai-filters/praxis-main"]
 
 [lints]
 workspace = true
@@ -50,12 +74,11 @@ workspace = true
 clap = { workspace = true }
 notify = { workspace = true }
 praxis-ai-filters = { workspace = true }
-praxis-ai-apis = { workspace = true }
 praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }
 # spiffe: enables the peer_identity_trust security builtin, required as the first
 # filter of every provider_route chain (and by the shipped provider-route.yaml
-# example). Off-by-default experimental feature in praxis 0.6.0 (no extra deps).
+# example). Off-by-default experimental feature in praxis 0.7.0 (no extra deps).
 praxis-filter = { workspace = true, features = ["spiffe"] }
 praxis-protocol = { workspace = true, features = ["admin-api", "config-reload"] }
 praxis-tls = { workspace = true }

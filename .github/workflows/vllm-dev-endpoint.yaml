@@ -1,0 +1,319 @@
+name: vLLM Dev Endpoint
+run-name: >-
+  vLLM dev endpoint - ${{ inputs.model }} (${{ inputs.duration_minutes }}m)
+
+# ------------------------------------------------------------------------------
+# On-demand vLLM GPU endpoint for manual testing.
+#
+# Press "Run workflow": this provisions an ephemeral EC2 GPU instance, serves
+# the requested model with vLLM (OpenAI-compatible API on :8000), exposes it
+# over the internet via a Cloudflare Quick Tunnel, prints the public HTTPS URL
+# to the run summary, holds the endpoint open for `duration_minutes`, then tears
+# the instance down unconditionally.
+#
+# It reuses the same reusable EC2 actions, OIDC role, AMI, subnet and security
+# group as the GPU test suite in vllm-integration.yaml. It is invoked ONLY by
+# manual workflow_dispatch -- it is deliberately off every push / PR / schedule
+# path, so it never runs as part of ordinary CI.
+#
+# SECURITY: the tunnel fronts an UNAUTHENTICATED vLLM server behind a random,
+# unguessable trycloudflare.com URL (security by obscurity). The URL is written
+# to this run's logs/summary, so treat it as a shared secret: keep sessions
+# short, do not paste the URL anywhere public, and let the endpoint tear itself
+# down. Quick Tunnels are Cloudflare's best-effort testing tier (throttled, no
+# uptime guarantee) -- fine for interactive testing, not for load testing.
+# ------------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Hugging Face model id to serve (must fit the GPU's VRAM).
+        required: false
+        default: Qwen/Qwen3-8B
+        type: string
+      served_model_name:
+        description: Slash-free model name exposed to Codex or Claude Code.
+        required: false
+        default: qwen3-8b
+        type: string
+      duration_minutes:
+        description: >-
+          How long to keep the endpoint open before auto-teardown. Clamped to
+          330 (the serve job is capped at GitHub's 6h limit, leaving headroom
+          for boot, model load, and teardown).
+        required: false
+        default: "120"
+        type: string
+      max_model_len:
+        description: vLLM --max-model-len (context window).
+        required: false
+        default: "16384"
+        type: string
+      instance_type:
+        description: EC2 GPU instance type.
+        required: false
+        default: g5.xlarge
+        type: string
+
+concurrency:
+  # One dev endpoint at a time to avoid stacking billable GPU instances. A
+  # second dispatch queues behind the active one rather than cancelling it, so
+  # an in-use session is never yanked out from under you; cancel the running run
+  # manually to release its GPU early (stop-runner then fires via always()).
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  start-runner:
+    name: Start ephemeral EC2 GPU runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      label: ${{ steps.start.outputs.label }}
+      ec2-instance-id: ${{ steps.start.outputs.ec2-instance-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start EC2 GPU runner
+        id: start
+        uses: ./.github/actions/start-ec2-runner
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+          aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+          ami-id: ${{ vars.AWS_GPU_AMI_ID }}
+          subnet-id: ${{ vars.AWS_SUBNET_ID || vars.US_EAST_2A_SUBNET_ID }}
+          security-group-id: ${{ vars.AWS_SECURITY_GROUP_ID || vars.US_EAST_2_SG_ID }}
+          instance-type: ${{ inputs.instance_type }}
+          github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
+
+  serve:
+    name: Serve vLLM and open tunnel
+    needs: [start-runner]
+    runs-on: ${{ needs.start-runner.outputs.label }}
+    # GitHub caps a job at 360 minutes; the hold below is clamped to 330 so boot,
+    # model load, and this job's own teardown fit inside the cap.
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    steps:
+      - name: Verify GPU and container runtime
+        run: |
+          nvidia-smi
+          if command -v docker >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
+            docker info >/dev/null
+          elif command -v podman >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
+            podman info >/dev/null
+          else
+            echo "Neither docker nor podman is available on this runner" >&2
+            exit 1
+          fi
+
+      - name: Start vLLM on GPU (background)
+        env:
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+          MODEL: ${{ inputs.model }}
+          SERVED_MODEL_NAME: ${{ inputs.served_model_name }}
+          MAX_MODEL_LEN: ${{ inputs.max_model_len }}
+          VLLM_GPU_IMAGE: docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2
+        run: |
+          # Background the image pull + container launch so the multi-GB CUDA
+          # image download and model weight load proceed while the tunnel binary
+          # is fetched. `run -d` needs the image present, so pull and run are
+          # chained in one detached subshell; the readiness wait joins on the
+          # serving port. Mirrors the GPU test suite's launch, minus the test
+          # harness, with the tool/reasoning parsers kept so this endpoint
+          # behaves like the CI backend.
+          gpu_args=()
+          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
+            gpu_args=(--device nvidia.com/gpu=all)
+          else
+            gpu_args=(--gpus all)
+          fi
+
+          # shellcheck disable=SC2016
+          nohup bash -c '
+            set -euo pipefail
+            runtime="$1"; image="$2"; model="$3"; served_model="$4"; max_len="$5"; shift 5
+            "$runtime" pull "$image"
+            "$runtime" run -d --name vllm \
+              "$@" \
+              -p 8000:8000 \
+              -e HUGGING_FACE_HUB_TOKEN \
+              "$image" \
+              --model "$model" \
+              --max-model-len "$max_len" \
+              --served-model-name "$served_model" \
+              --enable-auto-tool-choice \
+              --tool-call-parser hermes \
+              --reasoning-parser deepseek_r1 \
+              --gpu-memory-utilization 0.9
+          ' bash "$CONTAINER_RUNTIME" "$VLLM_GPU_IMAGE" "$MODEL" "$SERVED_MODEL_NAME" "$MAX_MODEL_LEN" "${gpu_args[@]}" \
+            > /tmp/vllm-launch.log 2>&1 &
+          echo $! > /tmp/vllm-launch.pid
+          echo "vLLM launch (pull + run) started in background, pid $(cat /tmp/vllm-launch.pid)"
+
+      - name: Wait for vLLM readiness
+        run: |
+          dump_launch_log() {
+            echo "----- /tmp/vllm-launch.log -----"
+            cat /tmp/vllm-launch.log 2>/dev/null || echo "No vLLM launch log found"
+          }
+          echo "Waiting for vLLM health and model endpoints..."
+          launch_pid="$(cat /tmp/vllm-launch.pid)"
+          deadline=$((SECONDS + 1200))
+          until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
+                curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
+            if ! kill -0 "$launch_pid" 2>/dev/null; then
+              if ! "$CONTAINER_RUNTIME" inspect --format='{{.State.Running}}' vllm 2>/dev/null | grep -q true; then
+                echo "::error::vLLM launcher exited without a running container"
+                dump_launch_log
+                "$CONTAINER_RUNTIME" logs vllm 2>&1 || true
+                exit 1
+              fi
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::vLLM did not become ready within 1200s"
+              dump_launch_log
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "vLLM is ready"
+          curl -sf http://127.0.0.1:8000/v1/models | head -c 500
+          echo
+
+      - name: Open Cloudflare tunnel
+        env:
+          MODEL: ${{ inputs.model }}
+          SERVED_MODEL_NAME: ${{ inputs.served_model_name }}
+        run: |
+          # Cloudflared is fetched at runtime (not baked into the AMI). The
+          # `latest` release URL always resolves to a current asset; this is a
+          # dev-only, opt-in, non-CI workflow, so a floating cloudflared is an
+          # acceptable trade for not maintaining a pinned mirror.
+          curl -sSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+
+          # Quick Tunnel: outbound-only, no account/login, random hostname. Needs
+          # no public IP and no inbound security-group rule -- it reuses the
+          # instance's egress.
+          nohup cloudflared tunnel --url http://localhost:8000 --no-autoupdate \
+            > /tmp/cloudflared.log 2>&1 &
+          echo $! > /tmp/cloudflared.pid
+
+          url=""
+          for _ in {1..60}; do
+            url="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 || true)"
+            [ -n "$url" ] && break
+            if ! kill -0 "$(cat /tmp/cloudflared.pid)" 2>/dev/null; then
+              echo "::error::cloudflared exited before publishing a tunnel URL"
+              cat /tmp/cloudflared.log 2>/dev/null || true
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ -z "$url" ]; then
+            echo "::error::cloudflared did not publish a tunnel URL within 120s"
+            cat /tmp/cloudflared.log 2>/dev/null || true
+            exit 1
+          fi
+
+          {
+            echo "## 🚀 vLLM dev endpoint is live"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Public URL** | \`$url\` |"
+            echo "| **OpenAI base URL** | \`$url/v1\` |"
+            echo "| **Model source** | \`$MODEL\` |"
+            echo "| **Served model name** | \`$SERVED_MODEL_NAME\` |"
+            echo "| **Instance** | \`${{ inputs.instance_type }}\` |"
+            echo "| **Open for** | ${{ inputs.duration_minutes }} min (clamped to 330) |"
+            echo ""
+            echo "\`\`\`bash"
+            echo "curl $url/v1/chat/completions \\"
+            echo "  -H 'Content-Type: application/json' \\"
+            echo "  -d '{\"model\":\"$SERVED_MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}'"
+            echo "\`\`\`"
+            echo ""
+            echo "> ⚠️ Unauthenticated endpoint behind an obscure URL. Do not share it; "
+            echo "> it tears down automatically. Cancel this run to release the GPU early."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "vLLM dev endpoint: $url  (OpenAI base: $url/v1, model: $SERVED_MODEL_NAME)"
+
+      - name: Hold endpoint open
+        env:
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+        run: |
+          # Clamp to 330 min so the 360-min job cap still covers teardown.
+          if ! [[ "$DURATION_MINUTES" =~ ^[0-9]+$ ]]; then
+            echo "::warning::duration_minutes '$DURATION_MINUTES' is not numeric; using 120"
+            DURATION_MINUTES=120
+          fi
+          if [ "$DURATION_MINUTES" -gt 330 ]; then
+            echo "::warning::duration_minutes clamped from $DURATION_MINUTES to 330"
+            DURATION_MINUTES=330
+          fi
+          echo "Holding endpoint for ${DURATION_MINUTES}m. Cancel this run to release early."
+          end=$((SECONDS + DURATION_MINUTES * 60))
+          while [ "$SECONDS" -lt "$end" ]; do
+            if ! "$CONTAINER_RUNTIME" inspect -f '{{.State.Running}}' vllm >/dev/null 2>&1; then
+              echo "::warning::vLLM container is no longer running; releasing early"
+              "$CONTAINER_RUNTIME" logs vllm 2>&1 | tail -n 100 || true
+              break
+            fi
+            if ! kill -0 "$(cat /tmp/cloudflared.pid)" 2>/dev/null; then
+              echo "::warning::cloudflared tunnel exited; releasing early"
+              cat /tmp/cloudflared.log 2>/dev/null || true
+              break
+            fi
+            sleep 30
+          done
+          echo "Hold complete; the instance will now be torn down."
+
+      - name: vLLM container logs
+        if: failure()
+        run: |
+          "$CONTAINER_RUNTIME" logs vllm 2>&1 || echo "(no vllm container)"
+
+      - name: Stop tunnel and vLLM
+        if: always()
+        run: |
+          if [ -f /tmp/cloudflared.pid ]; then
+            kill "$(cat /tmp/cloudflared.pid)" 2>/dev/null || true
+          fi
+          "${CONTAINER_RUNTIME:-docker}" rm -f vllm || true
+
+  stop-runner:
+    name: Stop ephemeral EC2 GPU runner
+    needs: [start-runner, serve]
+    # Always tear down the instance -- on success, failure, or cancellation --
+    # but skip if the runner was never started.
+    if: always() && needs.start-runner.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Stop EC2 GPU runner
+        uses: ./.github/actions/stop-ec2-runner
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+          aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+          github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
+          label: ${{ needs.start-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-runner.outputs.ec2-instance-id }}

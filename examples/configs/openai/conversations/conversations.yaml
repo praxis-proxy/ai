@@ -1,5 +1,5 @@
 # Conversations
-# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
+# Requires `--features openai-conversations,store-sqlite` because these filters are opt-in.
 #
 # Local /v1/conversations endpoints for conversation lifecycle,
 # backed by the ConversationItemStore. All requests are handled
@@ -11,7 +11,7 @@
 #   DELETE /v1/conversations/{id}   — delete conversation
 #
 # Usage:
-#   cargo run -p praxis-ai-proxy --no-default-features --features store-sqlite -- \
+#   cargo run -p praxis-ai-proxy --features openai-conversations,store-sqlite -- \
 #     -c examples/configs/openai/conversations/conversations.yaml
 #
 # This local example deliberately uses one shared owner. Deployments with
@@ -31,6 +31,9 @@ filter_chains:
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
+
+      # Required request-head classifier for openai_conversations.
+      - filter: openai_operation
 
       - filter: openai_conversations
         backend: sqlite

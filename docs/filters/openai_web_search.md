@@ -16,9 +16,10 @@ Each provider request is executed through the shared filtered-subrequest executo
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `provider` | `brave` \| `tavily` \| `you` | yes | Search backend provider. |
+| `user_credential` | string | no | Optional callout-credential slot id (see [`WebSearchFilterConfig::user_credential`]). |
 | `api_key` | string (secret) | yes | API key for the search provider (supports `${ENV_VAR}`). Wrapped in [`SecretString`] to prevent accidental logging. |
 | `default_context_size` | string | no | Default search context size when the client omits it. |
-| `timeout_ms` | integer | no | Callout timeout in milliseconds. |
+| `timeout_ms` | integer | no | Callout timeout in milliseconds. Inside an iterative request router, the effective timeout is capped by the router's remaining deadline. |
 | `max_calls_per_round` | integer | no | Hard cap on web-search calls processed from one model response (1..=1024; default: 32). |
 | `base_url` | string | no | Override the provider's default API base URL. |
 | `outbound_chain` | string \| object | no | Outbound filter chain the provider callout executes through. See [`WebSearchFilterConfig::outbound_chain`]; the two configs stay in sync. Optional — when omitted it defaults to an empty inline passthrough chain via [`default_outbound_chain`]. |

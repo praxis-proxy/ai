@@ -55,7 +55,7 @@ def _find_binary() -> str:
     for candidate in ("target/debug/praxis-ai", "target/release/praxis-ai"):
         if os.path.isfile(candidate):
             return candidate
-    raise FileNotFoundError("praxis-ai binary not found — run `cargo build -p praxis-ai-proxy` first")
+    raise FileNotFoundError("praxis-ai binary not found: run `cargo build -p praxis-ai-proxy --features full` first")
 
 
 def _load_manifest() -> dict:

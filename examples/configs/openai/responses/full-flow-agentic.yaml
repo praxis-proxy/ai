@@ -1,5 +1,5 @@
 # Responses API Full Flow — Unified Agentic Gateway
-# Requires `--no-default-features --features store-sqlite` because SQLite is opt-in.
+# Requires `--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite` because these filters are opt-in.
 #
 # Runs the complete Responses API pipeline through an agentic
 # iterative_request_router that executes hosted file_search, web_search,
@@ -7,7 +7,9 @@
 # and streaming (`stream: true`) responses. This is the single config an
 # operator would deploy for a Responses API gateway that must serve the
 # full agentic loop, the Conversations API, and the dedicated
-# prompts/embeddings/files/vector_stores services behind one listener.
+# prompts/embeddings/files/vector_stores services behind one listener. The
+# request trace is continued through every nested web-search, OGX, and MCP
+# callout with a fresh span ID per hop.
 #
 # Pre-IRR filters run once on the client request to set up shared state
 # (ResponsesState) which persists across all IRR iterations via extension
@@ -15,13 +17,25 @@
 #
 #   0. state_owner maps deployment-specific trusted ingress headers into one
 #      normalized tenant/issuer/subject context for owner-aware filters.
-#      state_owner_headers then projects that context as x-tenant-id and
+#      callout_credentials captures per-user Brave and OGX provider keys from
+#      trusted x-user-brave-key and x-user-ogx-key ingress headers into the
+#      `brave_search` and `ogx_files` slots, then strips both source headers
+#      before inference or IRR processing. The trusted boundary MUST
+#      unconditionally delete-then-set those source headers on every request;
+#      append-on-success is insufficient because this filter cannot authenticate
+#      header provenance. The IRR carries the resulting typed request extension
+#      across iterations, while each callout explicitly selects its slot for its
+#      exact-authority provider destination.
+#      project_state_owner_headers then projects that context as x-tenant-id and
 #      x-user-id for OGX and explicitly allowlisted callouts. The raw ingress
 #      names are stripped, and the projection is repeated inside the IRR step
 #      because it owns a separate destination request lifecycle.
 #      These adapters do not themselves change persistence predicates: this
 #      context-only configuration must be combined with owner-scoped store
 #      enforcement before it is exposed as a multi-owner state service.
+#
+#   0. openai_operation publishes the typed registry match consumed by
+#      openai_conversations. It must remain earlier in this filter chain.
 #
 #   1. openai_conversations handles CRUD for the Conversations API
 #      (/v1/conversations) and sets has_conversation metadata when a
@@ -129,11 +143,15 @@
 #   Request phase (forward):
 #     openai_stream_events → openai_web_search → openai_mcp_dispatch
 #       → openai_file_search_callout → openai_agentic_loop
-#       → openai_responses_proxy → headers → router → load_balancer
+#       → headers → router → load_balancer → openai_responses_proxy
 #   Response phase (reverse):
-#     load_balancer → router → headers → openai_responses_proxy
+#     openai_responses_proxy → load_balancer → router → headers
 #       → openai_agentic_loop → (dispatchers have no response phase)
 #       → openai_stream_events
+#   The proxy's request-body hook still participates in the pipeline body
+#   pre-read. Its request-header hook runs after load_balancer selection, so it
+#   can fail closed unless the selected cluster explicitly declares both
+#   application_protocol: openai_responses and application_provider: openai.
 #   The three dispatchers (openai_web_search, openai_mcp_dispatch,
 #   openai_file_search_callout) have no response phase: each executes the
 #   loop owner's assigned calls at request-body EOS on the next iteration,
@@ -234,9 +252,12 @@
 #   websocat -H="Authorization: Bearer $OPENAI_API_KEY" \
 #     ws://localhost:8080/v1/responses
 #
-# Web search requires a provider API key. Set WEB_SEARCH_API_KEY in the
-# environment before starting the proxy; openai_web_search stays inert
-# until the model emits a web_search_call.
+# Web search requires the trusted boundary to provide x-user-brave-key. The
+# WEB_SEARCH_API_KEY field remains required by the provider configuration, so
+# set it before starting the proxy; when `user_credential: brave_search` is
+# configured, a missing per-user slot fails closed instead of falling back to
+# that shared key. openai_web_search stays inert until the model emits a
+# web_search_call.
 #
 # Listener and cluster transport timeouts are intentionally omitted.
 # Configured downstream read and upstream idle/read/write timeouts remain
@@ -246,6 +267,11 @@
 #   - Replace the local inference-backend endpoint with api.openai.com:443
 #     and configure tls.sni: api.openai.com (in BOTH the bypass branch's
 #     load_balancer and the IRR step's load_balancer).
+#   - Uncomment the `http.application_protocol: openai_responses` and
+#     `http.application_provider: openai` declarations on BOTH
+#     inference-backend clusters below. The canonical IRR ordering already
+#     permits `prompt.id` once both capabilities are declared; endpoint
+#     identity does not participate in the trust decision.
 #   - Add this headers filter inside the IRR step after the router to
 #     replace the downstream Host:
 #
@@ -274,7 +300,7 @@
 #           sni: api.openai.com
 #
 # Build:
-#   cargo build -p praxis-ai-proxy
+#   cargo build -p praxis-ai-proxy --features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite
 
 listeners:
   - name: ai-gateway
@@ -284,6 +310,11 @@ listeners:
 filter_chains:
   - name: full-flow-agentic-pipeline
     filters:
+      - filter: trace_context
+        # Establish typed correlation before IRR snapshots request extensions.
+        # Child callouts retain this request/trace identity while Praxis core
+        # creates a fresh span ID for each outbound hop.
+
       - filter: state_owner
         # These source names are deployment-specific. The authentication
         # boundary must overwrite them and prevent clients from bypassing it.
@@ -295,12 +326,36 @@ filter_chains:
         subject:
           header: x-auth-user
 
+      - filter: callout_credentials
+        # The trusted authentication boundary must delete any client-supplied
+        # instance and then set exactly one authenticated value on every
+        # request. This filter establishes typed request context and strips the
+        # ingress header; it does not authenticate the header's provenance.
+        credentials:
+          - slot: brave_search
+            source_header: x-user-brave-key
+          - slot: ogx_files
+            source_header: x-user-ogx-key
+          - slot: mcp_gateway
+            source_header: x-user-mcp-key
+        assertions:
+          # The same establishing filter keeps assertions in a separate typed
+          # slot map. The trusted boundary MUST delete any client-supplied
+          # x-mcp-authorized value and then set the verified, short-lived
+          # assertion. Praxis forwards it unchanged only to configured
+          # connector_id destinations; the MCP Gateway decides authorization.
+          - slot: mcp_gateway
+            source_header: x-mcp-authorized
+
       # Emit the normalized owner in the contract expected by OGX and by the
       # explicitly configured downstream callouts below. Raw x-auth-* inputs
       # are stripped and never used directly as destination assertions.
-      - filter: state_owner_headers
+      - filter: project_state_owner_headers
         tenant_header: x-tenant-id
         subject_header: x-user-id
+
+      # Publishes the typed operation consumed by openai_conversations.
+      - filter: openai_operation
 
       - filter: openai_conversations
         backend: sqlite
@@ -333,6 +388,10 @@ filter_chains:
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
+        # Require the caller-scoped OGX credential captured above. It is
+        # injected only on configured file_id callouts; file_url downloads
+        # remain on the separate credential-free resolver.
+        user_credential: ogx_files
         allow_pre_security_callout: true
         # file_id callouts run through this outbound filter chain via the
         # filtered subrequest executor. SSRF protection for files_api_url
@@ -341,12 +400,14 @@ filter_chains:
         outbound_chain:
           name: files-api-outbound
           filters:
+            - filter: project_state_owner_headers
+              tenant_header: x-tenant-id
+              subject_header: x-user-id
             - filter: headers
               request_set:
                 - name: x-file-callout
                   value: file-resolve
         forward_headers:
-          - authorization
           - x-tenant-id
           - x-user-id
         on_missing: reject
@@ -357,6 +418,8 @@ filter_chains:
         on_unsupported: continue
 
       - filter: openai_mcp_tool_resolve
+        user_credential: mcp_gateway
+        authorization_assertion: mcp_gateway
         forward_headers:
           - x-tenant-id
           - x-user-id
@@ -429,6 +492,13 @@ filter_chains:
                         endpoints:
                           - "127.0.0.1:9999"
                       - name: "inference-backend"
+                        # Optional provider capability. Uncomment only when
+                        # this backend implements OpenAI-managed features such
+                        # as prompt IDs; generic/vLLM backends should leave it
+                        # absent so prompt templates fail closed.
+                        # http:
+                        #   application_protocol: openai_responses
+                        #   application_provider: openai
                         endpoints:
                           - "127.0.0.1:3001"
                       - name: "vector-stores-backend"
@@ -465,7 +535,7 @@ filter_chains:
               # the normalized StateOwner extension into each IRR step; this
               # strips any still-uncommitted raw ingress identity headers and
               # recreates only the OGX/callout contract.
-              - filter: state_owner_headers
+              - filter: project_state_owner_headers
                 tenant_header: x-tenant-id
                 subject_header: x-user-id
 
@@ -487,6 +557,10 @@ filter_chains:
               - filter: openai_web_search
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
+                # Require the per-user key captured by the outer
+                # callout_credentials filter. The secret is injected only at
+                # the exact resolved provider authority.
+                user_credential: brave_search
                 max_calls_per_round: 32
                 # Each provider callout executes through this outbound chain; the
                 # filtered-subrequest executor enforces destination authority,
@@ -499,6 +573,8 @@ filter_chains:
               # MCP calls prepared and classified by the loop owner. Inert
               # until the model emits an MCP tool call.
               - filter: openai_mcp_dispatch
+                user_credential: mcp_gateway
+                authorization_assertion: mcp_gateway
                 forward_headers:
                   - x-tenant-id
                   - x-user-id
@@ -514,11 +590,15 @@ filter_chains:
               # so it is inert unless the model emits a hosted file_search_call.
               - filter: openai_file_search_callout
                 vector_store_url: http://127.0.0.1:3002
+                user_credential: ogx_files
                 # Cross-cutting outbound chain every vector-store sub-request runs
                 # through; the destination comes from vector_store_url.
                 outbound_chain:
                   name: vector-store-outbound
                   filters:
+                    - filter: project_state_owner_headers
+                      tenant_header: x-tenant-id
+                      subject_header: x-user-id
                     - filter: headers
                       request_set:
                         - name: X-Vector-Store-Client
@@ -529,7 +609,6 @@ filter_chains:
                 max_state_bytes: 136314880
                 on_failure: closed
                 forward_headers:
-                  - authorization
                   - x-tenant-id
                   - x-user-id
               # Sole loop owner: parses each model response, records the
@@ -538,9 +617,6 @@ filter_chains:
               # must stay below the IRR max_iterations safety cap (7 + 1 = 8).
               - filter: openai_agentic_loop
                 max_infer_iters: 7
-              # Selects typed streaming automatically when the effective
-              # outbound body carries `"stream": true`; otherwise buffers.
-              - filter: openai_responses_proxy
               - filter: headers
                 request_set:
                   - name: Content-Type
@@ -558,8 +634,21 @@ filter_chains:
               - filter: load_balancer
                 clusters:
                   - name: "inference-backend"
+                    # Optional provider capability. Uncomment only when this
+                    # backend can resolve OpenAI-managed prompt IDs.
+                    # Endpoint hostname, port, TLS, and SNI are not the trust
+                    # boundary.
+                    # http:
+                    #   application_protocol: openai_responses
+                    #   application_provider: openai
                     endpoints:
                       - "127.0.0.1:3001"
+              # Selects typed streaming automatically when the effective
+              # outbound body carries `"stream": true`; otherwise buffers.
+              # Its request hook runs after load-balancer selection. Prompt
+              # templates fail closed unless the selected cluster enables both
+              # optional application declarations above.
+              - filter: openai_responses_proxy
             on_result:
               # openai_agentic_loop is the sole loop authority (issue #1046):
               # it parses each model response, records assignments for the

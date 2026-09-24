@@ -830,10 +830,8 @@ fn same_direct_url_reuses_persisted_listing() {
         ..McpMockConfig::default()
     });
     let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp.port());
-    let backend_body = format!(
-        r#"{{"id":"resp_previous","created_at":1000,"model":"gpt-4.1","status":"completed","output":[{{"type":"mcp_list_tools","server_label":"weather","server_url":"{mcp_url}","tools":[{{"name":"shared_tool"}}]}}]}}"#
-    );
-    let backend = Backend::fixed(&backend_body)
+    let backend_body = r#"{"id":"resp_previous","created_at":1000,"model":"gpt-4.1","status":"completed","output":[{"type":"mcp_list_tools","server_label":"weather","tools":[{"name":"shared_tool"}]}]}"#;
+    let backend = Backend::fixed(backend_body)
         .header("content-type", "application/json")
         .start_with_shutdown();
     let db = TempSqlite::new("mcp_cache_same_target");
@@ -857,9 +855,15 @@ fn same_direct_url_reuses_persisted_listing() {
         .as_array()
         .and_then(|output| output.iter().find(|item| item["type"] == "mcp_list_tools"))
         .expect("first response should contain the persisted MCP listing");
-    assert_eq!(
-        persisted_listing["server_url"], mcp_url,
-        "the persisted listing should retain its reusable target identity"
+    assert!(
+        persisted_listing.get("server_url").is_none(),
+        "public listing must not expose the target URL"
+    );
+    let (get_status, get_body) = http_get(proxy.addr(), "/v1/responses/resp_previous", None);
+    assert_eq!(get_status, 200, "stored response should be retrievable");
+    assert!(
+        !get_body.contains(&mcp_url),
+        "retrieved response must not expose the private target URL"
     );
     let list_calls = mcp.method_count("tools/list");
     assert!(list_calls >= 1, "first request should discover MCP tools");
@@ -888,7 +892,7 @@ fn changed_direct_url_does_not_reuse_unbound_cached_tools() {
         ..McpMockConfig::default()
     });
     let new_mcp = start_mcp_mock_server_with_config(McpMockConfig {
-        tools: vec![McpToolFixture::new("fresh_tool")],
+        tools: vec![McpToolFixture::new("shared_tool")],
         ..McpMockConfig::default()
     });
     let backend = Backend::fixed(
@@ -930,9 +934,25 @@ fn changed_direct_url_does_not_reuse_unbound_cached_tools() {
         200,
         "continuation should reach the backend"
     );
+    let new_list_calls = new_mcp.method_count("tools/list");
+    assert!(new_list_calls >= 1, "changed direct URL must fetch its own listing");
+    let continuation_response: serde_json::Value = serde_json::from_str(&parse_body(&continuation)).unwrap();
     assert!(
-        new_mcp.method_count("tools/list") >= 1,
-        "changed direct URL must fetch its own listing rather than reuse an unbound cache entry"
+        continuation_response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["type"] == "mcp_list_tools")
+            .all(|item| item.get("server_url").is_none()),
+        "public output must not expose either target URL"
+    );
+
+    let third = http_send(proxy.addr(), &json_post("/v1/responses", &continuation_body));
+    assert_eq!(parse_status(&third), 200, "second continuation should succeed");
+    assert_eq!(
+        new_mcp.method_count("tools/list"),
+        new_list_calls,
+        "A → B → B with identical tool names should reuse B's private listing"
     );
 }
 

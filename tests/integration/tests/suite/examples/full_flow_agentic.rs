@@ -57,6 +57,7 @@ const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Stable trusted identity used by this example's integration clients.
 const TEST_TENANT: &str = "integration-tenant";
 const TEST_SUBJECT: &str = "integration-user";
+const TEST_OGX_CREDENTIAL: &str = "Bearer integration-ogx-key";
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -66,7 +67,9 @@ const TEST_SUBJECT: &str = "integration-user";
 fn authenticated_request(request: &str) -> String {
     request.replacen(
         "\r\n\r\n",
-        &format!("\r\nx-auth-tenant: {TEST_TENANT}\r\nx-auth-user: {TEST_SUBJECT}\r\n\r\n"),
+        &format!(
+            "\r\nx-auth-tenant: {TEST_TENANT}\r\nx-auth-user: {TEST_SUBJECT}\r\nx-user-ogx-key: {TEST_OGX_CREDENTIAL}\r\n\r\n"
+        ),
         1,
     )
 }
@@ -1282,8 +1285,8 @@ fn full_flow_agentic_file_search_round_trip() {
         search_callouts[0]
             .headers
             .to_lowercase()
-            .contains("authorization: bearer search-key"),
-        "vector store callout should forward the authorization header: {}",
+            .contains("authorization: bearer integration-ogx-key"),
+        "vector store callout should use the scoped OGX credential: {}",
         search_callouts[0].headers,
     );
     let headers = search_callouts[0].headers.to_lowercase();
@@ -1384,6 +1387,110 @@ fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
 }
 
 #[test]
+fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
+    let path = example_config_path("openai/responses/full-flow-agentic.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("config should be valid YAML");
+    let outer_filters = config["filter_chains"][0]["filters"]
+        .as_sequence()
+        .expect("outer filter chain should contain filters");
+    let credentials_index = outer_filters
+        .iter()
+        .position(|filter| filter["filter"].as_str() == Some("callout_credentials"))
+        .expect("full-flow must establish callout credentials");
+    let irr_index = outer_filters
+        .iter()
+        .position(|filter| filter["filter"].as_str() == Some("iterative_request_router"))
+        .expect("full-flow must contain an iterative request router");
+    assert!(
+        credentials_index < irr_index,
+        "callout_credentials must capture and strip ingress secrets before IRR"
+    );
+    let credentials = outer_filters[credentials_index]["credentials"]
+        .as_sequence()
+        .expect("callout_credentials must declare slots");
+    let assertions = outer_filters[credentials_index]["assertions"]
+        .as_sequence()
+        .expect("callout_credentials must declare typed assertion slots");
+    let credential = credentials
+        .iter()
+        .find(|credential| credential["slot"].as_str() == Some("brave_search"))
+        .expect("web-search slot must be declared");
+    assert_eq!(
+        credential["slot"].as_str(),
+        Some("brave_search"),
+        "the outer filter must establish the slot consumed by web search"
+    );
+    assert_eq!(
+        credential["source_header"].as_str(),
+        Some("x-user-brave-key"),
+        "the example must name its trusted ingress source explicitly"
+    );
+    let mcp_credential = credentials
+        .iter()
+        .find(|credential| credential["slot"].as_str() == Some("mcp_gateway"))
+        .expect("MCP gateway slot must be declared");
+    assert_eq!(mcp_credential["slot"].as_str(), Some("mcp_gateway"));
+    assert_eq!(mcp_credential["source_header"].as_str(), Some("x-user-mcp-key"));
+    let mcp_assertion = assertions
+        .iter()
+        .find(|assertion| assertion["slot"].as_str() == Some("mcp_gateway"))
+        .expect("MCP gateway assertion slot must be declared");
+    assert_eq!(mcp_assertion["source_header"].as_str(), Some("x-mcp-authorized"));
+    assert!(
+        outer_filters
+            .iter()
+            .all(|filter| filter["filter"].as_str() != Some("callout_authorization")),
+        "the centralized callout_credentials filter must own all secret establishment"
+    );
+
+    let web_search = outer_filters[irr_index]["steps"][0]["filters"]
+        .as_sequence()
+        .expect("IRR inference step should contain filters")
+        .iter()
+        .find(|filter| filter["filter"].as_str() == Some("openai_web_search"))
+        .expect("IRR inference step should contain openai_web_search");
+    assert_eq!(
+        web_search["user_credential"].as_str(),
+        Some("brave_search"),
+        "web search must explicitly consume the established per-user slot"
+    );
+
+    let ogx = credentials
+        .iter()
+        .find(|credential| credential["slot"].as_str() == Some("ogx_files"))
+        .expect("OGX slot must be declared");
+    assert_eq!(ogx["source_header"].as_str(), Some("x-user-ogx-key"));
+    let file_resolve = outer_filters
+        .iter()
+        .find(|filter| filter["filter"].as_str() == Some("openai_file_resolve"))
+        .expect("full-flow must contain openai_file_resolve");
+    assert_eq!(file_resolve["user_credential"].as_str(), Some("ogx_files"));
+    let file_search = outer_filters[irr_index]["steps"][0]["filters"]
+        .as_sequence()
+        .expect("IRR inference step should contain filters")
+        .iter()
+        .find(|filter| filter["filter"].as_str() == Some("openai_file_search_callout"))
+        .expect("IRR inference step should contain openai_file_search_callout");
+    assert_eq!(file_search["user_credential"].as_str(), Some("ogx_files"));
+
+    let mcp_resolve = outer_filters
+        .iter()
+        .find(|filter| filter["filter"].as_str() == Some("openai_mcp_tool_resolve"))
+        .expect("outer chain should contain openai_mcp_tool_resolve");
+    assert_eq!(mcp_resolve["user_credential"].as_str(), Some("mcp_gateway"));
+    assert_eq!(mcp_resolve["authorization_assertion"].as_str(), Some("mcp_gateway"));
+    let mcp_dispatch = outer_filters[irr_index]["steps"][0]["filters"]
+        .as_sequence()
+        .expect("IRR inference step should contain filters")
+        .iter()
+        .find(|filter| filter["filter"].as_str() == Some("openai_mcp_dispatch"))
+        .expect("IRR inference step should contain openai_mcp_dispatch");
+    assert_eq!(mcp_dispatch["user_credential"].as_str(), Some("mcp_gateway"));
+    assert_eq!(mcp_dispatch["authorization_assertion"].as_str(), Some("mcp_gateway"));
+}
+
+#[test]
 fn full_flow_agentic_rejects_responses_subpath() {
     let backend =
         start_backend_with_shutdown(r#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#);
@@ -1464,10 +1571,14 @@ fn full_flow_agentic_connection_nominated_header_not_forwarded() {
     let search_requests = search.requests();
     let search_callouts: Vec<_> = search_requests.iter().filter(|r| r.method == "POST").collect();
     assert_eq!(search_callouts.len(), 1, "expected one vector store callout");
+    let headers = search_callouts[0].headers.to_lowercase();
     assert!(
-        !search_callouts[0].headers.to_lowercase().contains("authorization"),
-        "connection-nominated authorization must not be forwarded to vector store: {}",
-        search_callouts[0].headers,
+        headers.contains("authorization: bearer integration-ogx-key"),
+        "connection-nominated inference auth must be replaced by the scoped OGX credential: {headers}"
+    );
+    assert!(
+        !headers.contains("authorization: bearer secret"),
+        "connection-nominated inference credential must not reach the vector store: {headers}"
     );
 }
 

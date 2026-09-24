@@ -63,6 +63,31 @@ mod tests {
     }
 
     #[test]
+    fn prompt_template_is_rejected_rather_than_silently_dropped() {
+        let error = map_error(&json!({
+            "model": "m",
+            "input": "hello",
+            "prompt": {"id": "pmpt_123", "version": "2", "variables": {"name": "Ada"}}
+        }));
+        assert_eq!(
+            error,
+            "Responses `prompt` has no Chat Completions representation: got object, \
+             this adapter supports only `prompt` null",
+            "a non-null prompt must fail instead of disappearing from the Chat request"
+        );
+    }
+
+    #[test]
+    fn null_prompt_is_treated_as_absent() {
+        let chat = map(&json!({"model": "m", "input": "hello", "prompt": Value::Null}));
+        assert_eq!(chat["model"], "m", "null prompt must not disturb mapped fields");
+        assert!(
+            !chat.as_object().unwrap().contains_key("prompt"),
+            "null prompt is semantically absent and has no Chat representation"
+        );
+    }
+
+    #[test]
     fn explicit_default_background_and_truncation_translate() {
         let chat = map(&json!({
             "model": "m",
@@ -113,6 +138,7 @@ mod tests {
         for request in [
             json!({"model": "m", "input": "hello", "background": true}),
             json!({"model": "m", "input": "hello", "truncation": "auto"}),
+            json!({"model": "m", "input": "hello", "prompt": {"id": "pmpt_123"}}),
         ] {
             assert!(
                 super::chat_completions::responses_request_to_chat_request(&request).is_err(),
@@ -2581,7 +2607,7 @@ mod tests {
                 "prompt_tokens": 100,
                 "completion_tokens": 50,
                 "total_tokens": 150,
-                "prompt_tokens_details": {"cached_tokens": 80},
+                "prompt_tokens_details": {"cached_tokens": 80, "cache_write_tokens": 20},
                 "completion_tokens_details": {"reasoning_tokens": 20}
             }
         });
@@ -2592,6 +2618,7 @@ mod tests {
         assert_eq!(mapped["usage"]["output_tokens"], 50);
         assert_eq!(mapped["usage"]["total_tokens"], 150);
         assert_eq!(mapped["usage"]["input_tokens_details"]["cached_tokens"], 80);
+        assert_eq!(mapped["usage"]["input_tokens_details"]["cache_write_tokens"], 20);
         assert_eq!(mapped["usage"]["output_tokens_details"]["reasoning_tokens"], 20);
     }
 
@@ -2613,7 +2640,84 @@ mod tests {
         assert_eq!(mapped["usage"]["output_tokens"], 0);
         assert_eq!(mapped["usage"]["total_tokens"], 0);
         assert_eq!(mapped["usage"]["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(mapped["usage"]["input_tokens_details"]["cache_write_tokens"], 0);
         assert_eq!(mapped["usage"]["output_tokens_details"]["reasoning_tokens"], 0);
+    }
+
+    #[test]
+    fn cache_counts_stay_breakdowns_and_are_not_added_to_totals() {
+        let request = json!({"model": "m", "input": "hello"});
+        let context = make_response_context(&request);
+        let response = json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [{"finish_reason": "stop", "index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 50,
+                "total_tokens": 1050,
+                "prompt_tokens_details": {"cached_tokens": 800, "cache_write_tokens": 200},
+                "completion_tokens_details": {"reasoning_tokens": 10}
+            }
+        });
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(
+            mapped["usage"]["input_tokens"], 1000,
+            "input_tokens remains total prompt_tokens without double counting"
+        );
+        assert_eq!(mapped["usage"]["output_tokens"], 50);
+        assert_eq!(
+            mapped["usage"]["total_tokens"], 1050,
+            "total_tokens remains input + output"
+        );
+        assert_eq!(mapped["usage"]["input_tokens_details"]["cached_tokens"], 800);
+        assert_eq!(mapped["usage"]["input_tokens_details"]["cache_write_tokens"], 200);
+        assert_eq!(mapped["usage"]["output_tokens_details"]["reasoning_tokens"], 10);
+    }
+
+    #[test]
+    fn buffered_translation_handles_nonzero_zero_and_absent_cache_write_counts() {
+        let request = json!({"model": "m", "input": "hello"});
+        let context = make_response_context(&request);
+
+        // 1. Nonzero cache_write_tokens
+        let resp_nonzero = json!({
+            "id": "chatcmpl-1", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"finish_reason": "stop", "index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150, "prompt_tokens_details": {"cached_tokens": 80, "cache_write_tokens": 20}}
+        });
+        let mapped_nonzero =
+            super::chat_completions::chat_response_to_response_resource(&resp_nonzero, &context).unwrap();
+        assert_eq!(mapped_nonzero["usage"]["input_tokens_details"]["cached_tokens"], 80);
+        assert_eq!(
+            mapped_nonzero["usage"]["input_tokens_details"]["cache_write_tokens"],
+            20
+        );
+
+        // 2. Explicit zero cache_write_tokens
+        let resp_zero = json!({
+            "id": "chatcmpl-1", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"finish_reason": "stop", "index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150, "prompt_tokens_details": {"cached_tokens": 80, "cache_write_tokens": 0}}
+        });
+        let mapped_zero = super::chat_completions::chat_response_to_response_resource(&resp_zero, &context).unwrap();
+        assert_eq!(mapped_zero["usage"]["input_tokens_details"]["cached_tokens"], 80);
+        assert_eq!(mapped_zero["usage"]["input_tokens_details"]["cache_write_tokens"], 0);
+
+        // 3. Absent cache_write_tokens in prompt_tokens_details
+        let resp_absent = json!({
+            "id": "chatcmpl-1", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"finish_reason": "stop", "index": 0, "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150, "prompt_tokens_details": {"cached_tokens": 80}}
+        });
+        let mapped_absent =
+            super::chat_completions::chat_response_to_response_resource(&resp_absent, &context).unwrap();
+        assert_eq!(mapped_absent["usage"]["input_tokens_details"]["cached_tokens"], 80);
+        assert_eq!(mapped_absent["usage"]["input_tokens_details"]["cache_write_tokens"], 0);
     }
 
     #[test]
@@ -2632,6 +2736,7 @@ mod tests {
         let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
 
         assert_eq!(mapped["usage"]["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(mapped["usage"]["input_tokens_details"]["cache_write_tokens"], 0);
         assert_eq!(mapped["usage"]["output_tokens_details"]["reasoning_tokens"], 0);
     }
 
