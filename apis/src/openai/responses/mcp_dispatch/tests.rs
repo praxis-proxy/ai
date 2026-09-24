@@ -76,9 +76,12 @@ fn pool_session_key_folds_payload_limit_and_preserves_empty_sentinel() {
     let round_a = pool_session_key(fingerprint.clone(), 262_144);
     let round_b = pool_session_key(fingerprint.clone(), 131_072);
     assert_ne!(round_a, round_b, "distinct payload limits must key distinct sessions");
+    // Assert the structure without interpolating the key into the panic message:
+    // the key derives from credential-fingerprint material, so keeping it out of
+    // any log/panic sink avoids a cleartext-logging finding (CodeQL alert #29).
     assert!(
         round_a.starts_with(&fingerprint) && round_a.ends_with("262144"),
-        "the key must combine the identity fingerprint and the effective limit: {round_a}"
+        "the key must combine the identity fingerprint and the effective limit"
     );
 
     // The same identity + same limit is stable, so consecutive rounds reuse the
