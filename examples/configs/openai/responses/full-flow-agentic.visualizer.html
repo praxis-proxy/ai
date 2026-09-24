@@ -1,0 +1,1109 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+  full-flow-agentic.html  —  GENERATED DOCUMENTATION (interactive)
+  ----------------------------------------------------------------------------
+  This file is a living, self-contained visualizer of the Praxis AI Gateway
+  request pipeline. It is KEYED TO the source config:
+
+      examples/configs/openai/responses/full-flow-agentic.yaml
+
+  It must be UPDATED WHENEVER that config changes (filters added/removed/
+  reordered, config knobs, routes, clusters, or scenario behavior). The pipeline
+  model below is embedded as a single JS data object (PIPELINE) and ALL rendering
+  is driven from it, so the diagram and the prose cannot drift from one another.
+
+  This is generated documentation. Zero external network dependencies: inline
+  CSS + vanilla JS + inline SVG only. Open by double-clicking; works offline.
+
+  Build features required by the config:
+      --features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite
+  ============================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Gateway · Full-Flow Agentic Pipeline · Blueprint</title>
+<style>
+  :root{
+    /* Okabe-Ito–derived base (8 hues) plus three added categories. Not a pure
+       colorblind-safe set: the extra categories share hue families with the
+       base, so identity/backend (blue) and context/store (teal-green) are
+       separated by a large LIGHTNESS step rather than hue alone, and every
+       group is also carried by a redundant text label + line-style token so
+       identity never depends on color. Tuned for near-black. */
+    --c-identity:#7cc5f2;   /* light blue — paired with backend by lightness */
+    --c-conversations:#a99cf5;
+    --c-classification:#f2a838;
+    --c-context:#79e0cf;    /* light teal — paired with store by lightness */
+    --c-store:#12b184;      /* deep green — clearly darker than context */
+    --c-routing:#f4e04d;
+    --c-irr:#d98cbb;
+    --c-dispatch:#f4713b;
+    --c-loop:var(--c-irr);  /* loop owner shares the IRR hue (one token) */
+    --c-backend:#3f9bd8;    /* medium blue — clearly darker than identity */
+    --c-trace:#8fa3b8;      /* slate — cross-cutting trace / correlation */
+
+    --bg:#070a0d;
+    --bg2:#0b1116;
+    --panel:#0c1319;
+    --ink:#e2edf3;
+    --ink-dim:#9db0bd;      /* raised for WCAG AA on panel */
+    --ink-faint:#6d8492;
+    --stroke:#1d2b34;
+    --stroke-lit:#2c4250;
+    --accent:#4fd1e0;
+    --grid:rgba(79,209,224,0.035);
+    --grid2:rgba(79,209,224,0.07);
+    --ok:#3ad29f;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Fira Code",Menlo,Consolas,monospace;
+    --dim-floor:.62;        /* accessibility: unfocused text stays legible */
+  }
+
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:
+      radial-gradient(1100px 620px at 78% -12%, rgba(63,155,216,0.07), transparent 60%),
+      radial-gradient(900px 520px at 8% 4%, rgba(217,140,187,0.045), transparent 62%),
+      var(--bg);
+    color:var(--ink);
+    font-family:var(--mono);
+    font-size:13px;
+    line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+    padding:24px;
+  }
+
+  .sheet{
+    position:relative;
+    max-width:1400px;
+    margin:0 auto;
+    background:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+      linear-gradient(var(--grid2) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid2) 1px, transparent 1px),
+      var(--bg2);
+    background-size:24px 24px, 24px 24px, 120px 120px, 120px 120px, auto;
+    border:1px solid var(--stroke-lit);
+    border-radius:10px;
+    box-shadow:0 0 0 5px rgba(0,0,0,0.30), 0 34px 90px rgba(0,0,0,0.55);
+    padding:26px 30px 40px;
+  }
+  /* softened registration crosshairs — accents, not noise */
+  .xhair{position:absolute;width:12px;height:12px;pointer-events:none;opacity:.5}
+  .xhair.tl{top:9px;left:9px;border-top:1px solid var(--stroke-lit);border-left:1px solid var(--stroke-lit)}
+  .xhair.tr{top:9px;right:9px;border-top:1px solid var(--stroke-lit);border-right:1px solid var(--stroke-lit)}
+  .xhair.bl{bottom:9px;left:9px;border-bottom:1px solid var(--stroke-lit);border-left:1px solid var(--stroke-lit)}
+  .xhair.br{bottom:9px;right:9px;border-bottom:1px solid var(--stroke-lit);border-right:1px solid var(--stroke-lit)}
+
+  /* ---- header ---- */
+  header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;flex-wrap:wrap;
+    border-bottom:1px solid var(--stroke);padding-bottom:18px}
+  h1{font-size:20px;letter-spacing:1.5px;margin:0;font-weight:600}
+  h1 .tick{color:var(--accent)}
+  .sub{color:var(--ink-dim);font-size:12px;letter-spacing:.6px;margin-top:8px;max-width:70ch}
+  .features{margin-top:10px;font-size:11px;color:var(--ink-faint);letter-spacing:.3px}
+  .features code{color:var(--accent);background:rgba(79,209,224,.08);border:1px solid var(--stroke-lit);
+    border-radius:4px;padding:2px 7px;white-space:pre-wrap;word-break:break-word}
+
+  .tiles{display:flex;gap:10px;flex-wrap:wrap}
+  .tile{border:1px solid var(--stroke-lit);border-radius:8px;padding:9px 14px;min-width:92px;
+    background:linear-gradient(180deg,#0e161d,#0a1014)}
+  .tile .k{font-size:9.5px;letter-spacing:1.6px;color:var(--ink-faint);text-transform:uppercase}
+  .tile .v{font-size:19px;color:var(--ink);margin-top:2px}
+  .tile .v small{font-size:11px;color:var(--ink-dim)}
+
+  /* ---- controls ---- */
+  .controls{display:flex;flex-wrap:wrap;gap:14px 22px;align-items:center;margin:18px 0 6px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .chips .lbl,.seg .lbl{color:var(--ink-faint);font-size:10px;letter-spacing:1.8px;margin-right:2px;text-transform:uppercase}
+  .chip{
+    appearance:none;cursor:pointer;font-family:var(--mono);font-size:11.5px;letter-spacing:.4px;
+    color:var(--ink-dim);background:linear-gradient(180deg,#0e161d,#0a1014);
+    border:1px solid var(--stroke-lit);border-radius:6px;padding:6px 11px;
+    display:inline-flex;align-items:center;gap:7px;transition:.14s;
+  }
+  .chip .tag{font-size:9.5px;color:var(--ink-faint);letter-spacing:1px}
+  .chip:hover{color:var(--ink);border-color:var(--accent)}
+  .chip:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .chip.active{color:#04121a;background:var(--accent);border-color:var(--accent);font-weight:600}
+  .chip.active .tag{color:#04121a}
+
+  .seg{display:flex;align-items:center;gap:8px}
+  .seghint{color:var(--ink-faint);font-size:10px;letter-spacing:.3px;max-width:34ch;line-height:1.4}
+  .segbtns{display:inline-flex;border:1px solid var(--stroke-lit);border-radius:6px;overflow:hidden}
+  .segbtns button{appearance:none;cursor:pointer;font-family:var(--mono);font-size:11px;letter-spacing:.6px;
+    color:var(--ink-dim);background:transparent;border:none;padding:7px 13px;transition:.14s}
+  .segbtns button:hover{color:var(--ink)}
+  .segbtns button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  .segbtns button.on{background:var(--accent);color:#04121a;font-weight:600}
+
+  .play{appearance:none;cursor:pointer;font-family:var(--mono);font-size:11.5px;letter-spacing:.6px;
+    color:#04121a;background:var(--ok);border:1px solid var(--ok);border-radius:6px;padding:7px 15px;
+    display:inline-flex;align-items:center;gap:8px;font-weight:600;transition:.14s}
+  .play:hover{filter:brightness(1.08)}
+  .play:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .play .ico{width:0;height:0;border-left:9px solid #04121a;border-top:6px solid transparent;border-bottom:6px solid transparent}
+  .play.playing .ico{width:9px;height:10px;border:none;background:
+    linear-gradient(#04121a,#04121a) left/3px 100% no-repeat,
+    linear-gradient(#04121a,#04121a) right/3px 100% no-repeat}
+
+  /* ---- narrative caption ---- */
+  .narr{margin:14px 0 4px;padding:12px 16px;border:1px solid var(--stroke-lit);border-left:3px solid var(--accent);
+    border-radius:8px;background:rgba(79,209,224,.05);font-size:12.5px;color:var(--ink);letter-spacing:.2px}
+  .narr b{color:var(--accent)}
+  .narr .rounds{color:var(--ink-dim);font-size:11px;margin-left:6px}
+
+  /* ---- layout: flow + right rail ---- */
+  .layout{display:grid;grid-template-columns:1fr 320px;gap:22px;margin-top:18px;align-items:start}
+  .rail{position:sticky;top:16px;display:flex;flex-direction:column;gap:16px}
+
+  .panel{border:1px solid var(--stroke-lit);border-radius:10px;background:linear-gradient(180deg,#0d151b,#0a1015);
+    padding:14px 15px;box-shadow:0 12px 30px rgba(0,0,0,.28)}
+  .panel h3{margin:0 0 11px;font-size:10.5px;letter-spacing:2px;color:var(--ink-dim);text-transform:uppercase;
+    display:flex;align-items:center;gap:8px}
+  .panel h3::after{content:"";flex:1;height:1px;background:var(--stroke)}
+
+  /* legend */
+  .lg{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--ink-dim);letter-spacing:.3px;margin:5px 0}
+  .lg i{width:13px;height:13px;border-radius:3px;flex:none;box-shadow:0 0 0 1px rgba(0,0,0,.5) inset}
+  .lg .st{margin-left:auto;font-size:9.5px;color:var(--ink-faint)}
+  .linekey{margin-top:10px;border-top:1px solid var(--stroke);padding-top:10px}
+  .lksub,.keysub{font-size:9.5px;letter-spacing:1.6px;color:var(--ink-faint);text-transform:uppercase;margin:0 0 7px}
+  .linekey .row{display:flex;align-items:center;gap:9px;font-size:11px;color:var(--ink-dim);margin:6px 0}
+  .linekey svg{flex:none}
+
+  /* states key */
+  .statekey{display:flex;flex-direction:column;gap:9px}
+  .skrow{display:flex;align-items:flex-start;gap:9px;font-size:11px;color:var(--ink-dim);line-height:1.4}
+  .skbadge{flex:none;font-size:9px;letter-spacing:1.2px;text-transform:uppercase;
+    border:1px solid var(--stroke-lit);border-radius:20px;padding:2px 9px;min-width:78px;text-align:center;color:var(--ink-faint)}
+  .skdef{padding-top:1px}
+
+  /* donut caps */
+  .caps{display:flex;gap:8px;justify-content:space-around;flex-wrap:wrap}
+  .donut{text-align:center;font-size:10px;color:var(--ink-dim)}
+  .donut .lab{margin-top:4px;letter-spacing:.6px}
+  .donut .lab b{display:block;color:var(--ink);font-size:11px}
+  .capnote{margin-top:11px;font-size:10.5px;color:var(--ink-faint);line-height:1.5;border-top:1px solid var(--stroke);padding-top:9px}
+  .capnote b{color:var(--c-loop)}
+
+  /* backends + services */
+  .bk{border:1px solid var(--stroke-lit);border-left:3px solid var(--c-backend);border-radius:7px;
+    padding:9px 11px;margin:8px 0;background:rgba(0,0,0,.22);transition:.16s}
+  .bk .bh{display:flex;align-items:center;gap:8px}
+  .bk .nm{font-size:12px;color:var(--ink)}
+  .bk .ep{margin-left:auto;font-size:11px;color:var(--c-backend);letter-spacing:.3px;display:inline-flex;align-items:center;gap:6px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(58,210,159,.6)}
+  .bk.live .dot{animation:pulse 2.2s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(58,210,159,.55)}70%{box-shadow:0 0 0 6px rgba(58,210,159,0)}100%{box-shadow:0 0 0 0 rgba(58,210,159,0)}}
+  .bk .from{margin-top:5px;font-size:10px;color:var(--ink-faint);letter-spacing:.3px}
+  .bk.hlcluster{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent),0 0 22px -8px var(--accent)}
+  .bk.dimcluster{opacity:var(--dim-floor)}
+  .svc{display:flex;align-items:center;gap:8px;font-size:11px;color:var(--ink-dim);margin:7px 0;
+    border:1px solid var(--stroke);border-radius:6px;padding:7px 9px;transition:.16s}
+  .svc .ep{margin-left:auto;color:var(--accent);font-size:10px}
+  .svc.hlcluster{border-color:var(--accent);color:var(--ink)}
+  .svc.dimcluster{opacity:var(--dim-floor)}
+
+  /* ---- section bands ---- */
+  .band-lbl{display:flex;align-items:center;gap:12px;margin:24px 0 14px;color:var(--ink-dim);
+    font-size:10.5px;letter-spacing:2.4px;text-transform:uppercase}
+  .band-lbl::after{content:"";flex:1;height:1px;background:var(--stroke)}
+  .band-lbl .n{color:var(--accent);border:1px solid var(--stroke-lit);border-radius:5px;padding:1px 8px;font-size:10px}
+  .band-lbl .hint{color:var(--ink-faint);letter-spacing:.6px;text-transform:none;font-size:10.5px}
+
+  /* ---- spine ---- */
+  .spine{display:flex;flex-direction:column;gap:0}
+  .node{display:grid;grid-template-columns:250px 40px 1fr;align-items:stretch}
+  .gutter{padding:12px 12px 12px 0;text-align:right}
+  .gutter .glbl{font-size:9px;letter-spacing:1.8px;color:var(--ink-faint);text-transform:uppercase}
+  .gutter .stateset{margin-top:6px;display:inline-block;text-align:left;border-left:2px solid var(--gc,var(--stroke-lit));
+    padding:6px 10px;background:rgba(0,0,0,.26);border-radius:0 6px 6px 0;max-width:230px}
+  .gutter .kv{font-size:10.5px;color:var(--ink);white-space:normal;word-break:break-word}
+  .gutter .kv b{color:var(--gc);font-weight:600}
+
+  .rail-line{position:relative}
+  .rail-line::before{content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;
+    background:repeating-linear-gradient(var(--stroke-lit) 0 6px, transparent 6px 11px);transform:translateX(-.5px)}
+  .rail-line .port{position:absolute;left:50%;top:34px;width:11px;height:11px;transform:translate(-50%,-50%);
+    border-radius:50%;background:var(--bg2);border:1.5px solid var(--gc,var(--accent));
+    box-shadow:0 0 0 3px var(--bg2), 0 0 10px -2px var(--gc)}
+  .rail-line .stub{position:absolute;left:50%;top:34px;width:20px;height:1px;background:var(--gc,var(--stroke-lit));transform:translateY(-.5px)}
+
+  /* filter card (rounded/shadow polish, monospace designators) */
+  .card{position:relative;margin:8px 0;padding:12px 15px;border:1px solid var(--stroke-lit);
+    border-left:3px solid var(--gc,var(--accent));border-radius:10px;
+    background:linear-gradient(180deg,#0d151b,#0a1015);box-shadow:0 10px 26px rgba(0,0,0,.26);
+    transition:opacity .18s, box-shadow .18s, border-color .18s}
+  .card .top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .card .ord{font-size:9px;letter-spacing:1px;color:var(--ink-faint);border:1px solid var(--stroke);border-radius:5px;padding:1px 6px}
+  .card .id{font-size:9px;letter-spacing:1.6px;color:var(--gc);border:1px solid var(--gc);
+    border-radius:5px;padding:1px 7px;text-transform:uppercase;opacity:.92}
+  .card .nm{font-size:14px;color:var(--ink);letter-spacing:.2px}
+  .card .statebadge{margin-left:auto;font-size:9.5px;letter-spacing:1.2px;text-transform:uppercase;
+    border:1px solid var(--stroke-lit);border-radius:20px;padding:2px 10px;color:var(--ink-faint);display:none}
+  .card .sm{margin-top:7px;color:var(--ink-dim);font-size:11.5px;line-height:1.5;max-width:74ch}
+  .card .scnote{margin-top:8px;font-size:11px;color:var(--ink);line-height:1.5;
+    border-left:2px solid var(--gc);padding:5px 10px;background:rgba(255,255,255,.02);border-radius:0 6px 6px 0;display:none}
+  .card .scnote .pfx{color:var(--gc);letter-spacing:1px;font-size:9.5px;text-transform:uppercase;margin-right:6px}
+
+  .card .expander{margin-top:9px}
+  .card .exbtn{appearance:none;cursor:pointer;font-family:var(--mono);font-size:10.5px;letter-spacing:.6px;
+    color:var(--ink-dim);background:transparent;border:1px solid var(--stroke-lit);border-radius:6px;padding:4px 10px;transition:.14s}
+  .card .exbtn:hover{color:var(--ink);border-color:var(--gc)}
+  .card .exbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .card .detail{display:none;margin-top:11px;border-top:1px solid var(--stroke);padding-top:11px;font-size:11px}
+  .card .detail.open{display:block}
+  .card .detail .dh{font-size:9.5px;letter-spacing:1.6px;color:var(--ink-faint);text-transform:uppercase;margin:9px 0 5px}
+  .card .detail .dh:first-child{margin-top:0}
+  .card .kvrow{display:flex;gap:8px;margin:3px 0;line-height:1.45}
+  .card .kvrow .kk{color:var(--gc);min-width:150px;word-break:break-word}
+  .card .kvrow .vv{color:var(--ink-dim);word-break:break-word}
+  .card .prose{color:var(--ink-dim);line-height:1.55}
+
+  /* state styling — highlight-forward */
+  .card.st-active{border-left-color:var(--gc)}
+  .card.st-active.hl{box-shadow:0 0 0 1px var(--gc), 0 0 30px -8px var(--gc)}
+  .card.dimmed{opacity:var(--dim-floor)}
+  .card.st-active .statebadge{display:inline-block;color:var(--ok);border-color:var(--ok)}
+  .card.st-passthrough .statebadge{display:inline-block;color:var(--ink-dim)}
+  .card.st-inert .statebadge{display:inline-block;color:var(--c-classification)}
+  .card.st-skipped .statebadge{display:inline-block;color:var(--ink-faint)}
+  body.scenario .card.st-active .scnote{display:block}
+  body.scenario .card .sm{display:none}
+
+  .card.pulse{animation:cardpulse 1.15s ease}
+  @keyframes cardpulse{0%{box-shadow:0 0 0 1px var(--gc)}40%{box-shadow:0 0 0 2px var(--gc),0 0 40px -6px var(--gc)}100%{box-shadow:0 0 0 1px var(--gc)}}
+
+  /* svg wraps */
+  .svgwrap{border:1px solid var(--stroke);border-radius:10px;background:rgba(0,0,0,.24);padding:8px}
+  svg.diagram{display:block;width:100%;height:auto}
+  .svgcap{margin:8px 2px 0;font-size:10.5px;color:var(--ink-faint);line-height:1.5;max-width:96ch}
+  .svgcap b{color:var(--ink-dim)}
+  .svgcap em{color:var(--accent);font-style:normal}
+  .s-mono{font-family:var(--mono)}
+
+  /* svg scenario states */
+  .flt{transition:opacity .2s}
+  svg .flt.dim{opacity:var(--dim-floor)}
+  svg .flt.on rect{filter:drop-shadow(0 0 6px currentColor)}
+
+  /* phase emphasis */
+  .arc-req{transition:opacity .2s, stroke-width .2s}
+  .arc-res{transition:opacity .2s, stroke-width .2s}
+  body.phase-request .arc-res{opacity:.28}
+  body.phase-request .arc-req{opacity:1}
+  body.phase-response .arc-req{opacity:.28}
+  body.phase-response .arc-res{opacity:1}
+
+  /* irr-step card grid */
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}
+
+  /* tooltip layer (supplement only) */
+  #tt{position:fixed;z-index:50;max-width:320px;pointer-events:none;opacity:0;transform:translateY(4px);
+    transition:opacity .12s, transform .12s;background:#0b141b;border:1px solid var(--stroke-lit);
+    border-radius:8px;padding:10px 12px;box-shadow:0 18px 40px rgba(0,0,0,.55);font-size:11px;color:var(--ink)}
+  #tt.show{opacity:1;transform:translateY(0)}
+  #tt .tth{color:var(--accent);font-size:11px;letter-spacing:.5px;margin-bottom:5px}
+  #tt .ttk{color:var(--ink-faint);font-size:10px;letter-spacing:1px;text-transform:uppercase;margin-top:7px}
+  #tt .ttv{color:var(--ink-dim);line-height:1.45}
+
+  .footnote{margin-top:22px;border-top:1px solid var(--stroke);padding-top:14px;color:var(--ink-faint);
+    font-size:10.5px;line-height:1.6}
+  .footnote b{color:var(--ink-dim)}
+  .titleblock{margin-top:16px;display:inline-grid;grid-template-columns:repeat(4,auto);
+    border:1px solid var(--stroke-lit);border-radius:8px;overflow:hidden;font-size:9.5px;letter-spacing:.5px;background:rgba(0,0,0,.3)}
+  .titleblock div{padding:6px 12px;border-left:1px solid var(--stroke);color:var(--ink-dim)}
+  .titleblock div:first-child{border-left:none}
+  .titleblock b{color:var(--ink);display:block;font-size:11px;letter-spacing:1px}
+  .titleblock span{color:var(--ink-faint)}
+
+  .visually-hidden{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+
+  @media(max-width:1080px){
+    .layout{grid-template-columns:1fr}
+    .rail{position:static;flex-direction:row;flex-wrap:wrap}
+    .rail .panel{flex:1 1 260px}
+  }
+  @media(max-width:720px){
+    body{padding:10px}
+    .sheet{padding:18px 14px 30px}
+    .node{grid-template-columns:1fr}
+    .gutter{text-align:left;padding:8px 0 0}
+    .gutter .stateset{max-width:100%}
+    .rail-line{display:none}
+  }
+  @media (prefers-reduced-motion: reduce){
+    *{animation:none !important;transition:none !important}
+    .bk.live .dot{animation:none}
+  }
+</style>
+</head>
+<body class="phase-request">
+<div class="sheet">
+  <span class="xhair tl"></span><span class="xhair tr"></span><span class="xhair bl"></span><span class="xhair br"></span>
+
+  <header>
+    <div>
+      <h1>PRAXIS <span class="tick">/</span> AI GATEWAY <span class="tick">·</span> FULL-FLOW AGENTIC PIPELINE</h1>
+      <div class="sub">Responses API gateway serving the agentic model→tool→model loop, the Conversations API, and the dedicated prompts / embeddings / files / vector_stores services behind one listener. Per-user credentials are scoped into typed slots and the request's trace identity threads through every callout with a fresh span per hop. Select a scenario to trace the exact path a request takes.</div>
+      <div class="features">Build: <code>--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite</code></div>
+    </div>
+    <div class="tiles" id="tiles" aria-hidden="true"></div>
+  </header>
+
+  <div class="controls">
+    <div class="chips" id="chips" role="radiogroup" aria-label="Request scenario">
+      <span class="lbl" aria-hidden="true">Scenario</span>
+    </div>
+    <div class="seg" role="group" aria-label="Pipeline phase">
+      <span class="lbl">Phase</span>
+      <div class="segbtns" id="phase">
+        <button type="button" data-phase="request" class="on" aria-pressed="true">Request ▶</button>
+        <button type="button" data-phase="response" aria-pressed="false">◀ Response</button>
+      </div>
+      <span class="seghint">emphasizes forward vs. return arcs in the agentic-loop diagram (band 03)</span>
+    </div>
+    <button type="button" class="play" id="play" aria-label="Animate the selected request end to end"><span class="ico"></span><span id="playtxt">Play trace</span></button>
+  </div>
+
+  <p class="narr" id="narr" role="status" aria-live="polite"></p>
+
+  <div class="layout">
+    <!-- ============ FLOW COLUMN ============ -->
+    <main id="flow">
+
+      <div class="band-lbl"><span class="n">01</span> Pre-IRR spine <span class="hint">— sequential filters run once; state accumulates in the left gutter</span></div>
+      <div class="spine" id="spine"></div>
+
+      <div class="band-lbl"><span class="n">02</span> Route fork <span class="hint">— bypass unless-gate vs. the Internal Request Router</span></div>
+      <div class="svgwrap">
+        <svg class="diagram" viewBox="0 0 980 260" role="img" aria-label="Route fork: the bypass branch (dedicated services, WebSocket, and 404 route-miss) versus the Internal Request Router entering the agentic loop">
+          <defs>
+            <marker id="mk-route" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#f4e04d"/></marker>
+            <marker id="mk-dim" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#6d8492"/></marker>
+          </defs>
+          <line x1="490" y1="6" x2="490" y2="40" stroke="#2c4250"/>
+          <text x="500" y="24" class="s-mono" fill="#6d8492" font-size="10">from spine · x-praxis-ai-format</text>
+          <g>
+            <path d="M490,40 L534,68 L490,96 L446,68 Z" fill="#0c1319" stroke="#f4e04d" stroke-width="1.3"/>
+            <text x="490" y="72" text-anchor="middle" class="s-mono" fill="#f4e04d" font-size="10.5">unless-gate</text>
+          </g>
+          <text x="490" y="116" text-anchor="middle" class="s-mono" fill="#6d8492" font-size="9.5">POST /v1/responses + x-praxis-ai-format:openai_responses ?</text>
+
+          <!-- left: bypass branch -->
+          <path d="M446,68 C 300,68 250,96 250,132" fill="none" stroke="#6d8492" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#mk-dim)"/>
+          <g class="flt" data-fid="bypass_gate">
+            <rect x="24" y="132" width="452" height="104" rx="8" fill="#0c1319" stroke="#2c4250"/>
+            <rect x="24" y="132" width="3" height="104" fill="#f4e04d"/>
+            <text x="42" y="154" class="s-mono" fill="#e2edf3" font-size="12.5">NO → BYPASS CARRIER (branch → rejoin terminal)</text>
+            <text x="42" y="174" class="s-mono" fill="#9db0bd" font-size="10.5">router path_prefix → /v1/prompts · /v1/embeddings</text>
+            <text x="42" y="189" class="s-mono" fill="#9db0bd" font-size="10.5">/v1/files · /v1/vector_stores → dedicated backends</text>
+            <text x="42" y="209" class="s-mono" fill="#3f9bd8" font-size="10.5">/v1/responses + Upgrade:websocket → inference-backend</text>
+            <text x="42" y="227" class="s-mono" fill="#f4713b" font-size="10.5">non-Responses body → route-miss 404</text>
+          </g>
+
+          <!-- right: IRR -->
+          <path d="M534,68 C 700,68 740,96 740,132" fill="none" stroke="#f4e04d" stroke-width="1.5" marker-end="url(#mk-route)"/>
+          <g class="flt" data-fid="iterative_request_router">
+            <rect x="504" y="132" width="452" height="104" rx="8" fill="#0c1319" stroke="#f4e04d"/>
+            <rect x="504" y="132" width="3" height="104" fill="#f4e04d"/>
+            <text x="522" y="154" class="s-mono" fill="#e2edf3" font-size="12.5">YES → INTERNAL REQUEST ROUTER (terminal)</text>
+            <text x="522" y="176" class="s-mono" fill="#9db0bd" font-size="10.5">classified openai_responses create → agentic loop</text>
+            <text x="522" y="194" class="s-mono" fill="#9db0bd" font-size="10.5">strips x-praxis-* → step router is PATH-ONLY</text>
+            <text x="522" y="214" class="s-mono" fill="#d98cbb" font-size="10.5">initial_step:inference · max_iterations 8</text>
+          </g>
+        </svg>
+      </div>
+
+      <div class="band-lbl"><span class="n">03</span> Agentic loop <span class="hint">— openai_agentic_loop is the sole transition authority (issue #1046)</span></div>
+      <div class="svgwrap">
+        <svg class="diagram" viewBox="0 0 980 430" role="img" aria-label="Agentic inference loop: forward request-phase arc to the backend, reverse response-phase arc, the dispatch bus feeding three dispatchers, the loop owner, and the done exit that triggers reverse-path persistence">
+          <defs>
+            <marker id="mk-req" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#4fd1e0"/></marker>
+            <marker id="mk-res" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#f2a838"/></marker>
+            <marker id="mk-disp" markerWidth="8" markerHeight="8" refX="6.5" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#f4713b"/></marker>
+            <marker id="mk-done" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#d98cbb"/></marker>
+            <marker id="mk-bk" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0,0 L9,4.5 L0,9 Z" fill="#3f9bd8"/></marker>
+          </defs>
+
+          <rect x="12" y="12" width="956" height="406" rx="10" fill="none" stroke="#1d2b34" stroke-dasharray="3 5"/>
+          <text x="28" y="32" class="s-mono" fill="#6d8492" font-size="10" letter-spacing="2">IRR INFERENCE STEP · canonical #1046 order</text>
+
+          <line x1="16" y1="196" x2="86" y2="196" stroke="#f4e04d" stroke-width="1.4" marker-end="url(#mk-route)"/>
+          <text x="18" y="187" class="s-mono" fill="#6d8492" font-size="9.5">from IRR</text>
+
+          <!-- loop owner -->
+          <g class="flt" data-fid="openai_agentic_loop">
+            <rect x="90" y="140" width="256" height="120" rx="9" fill="#101820" stroke="#d98cbb" stroke-width="1.5"/>
+            <rect x="90" y="140" width="4" height="120" fill="#d98cbb"/>
+            <text x="108" y="166" class="s-mono" fill="#d98cbb" font-size="8.5" letter-spacing="1.6">LOOP-OWNER · SOLE TRANSITION AUTHORITY</text>
+            <text x="108" y="190" class="s-mono" fill="#e2edf3" font-size="14.5">openai_agentic_loop</text>
+            <text x="108" y="212" class="s-mono" fill="#9db0bd" font-size="10.5">parse model output · assign tool calls</text>
+            <text x="108" y="229" class="s-mono" fill="#9db0bd" font-size="10.5">publish action = loop | done</text>
+            <text x="108" y="249" class="s-mono" fill="#6d8492" font-size="9.5">max_infer_iters 7</text>
+          </g>
+
+          <!-- stream_events (composes lifecycle) -->
+          <g class="flt" data-fid="openai_stream_events">
+            <rect x="90" y="286" width="256" height="52" rx="8" fill="#101820" stroke="#f2a838"/>
+            <text x="106" y="308" class="s-mono" fill="#e2edf3" font-size="12">openai_stream_events</text>
+            <text x="106" y="325" class="s-mono" fill="#6d8492" font-size="9.5">composes ONE SSE lifecycle · populates response_object</text>
+          </g>
+
+          <!-- forward arc -->
+          <path class="arc-req" d="M346,172 C 470,120 540,92 636,92" fill="none" stroke="#4fd1e0" stroke-width="1.8" marker-end="url(#mk-req)"/>
+          <text x="392" y="118" class="s-mono arc-req" fill="#4fd1e0" font-size="10.5" letter-spacing="1">REQUEST PHASE ▶ dispatch + proxy</text>
+
+          <!-- reverse arc -->
+          <path class="arc-res" d="M636,320 C 540,320 470,250 346,224" fill="none" stroke="#f2a838" stroke-width="1.8" stroke-dasharray="7 4" marker-end="url(#mk-res)"/>
+          <text x="392" y="300" class="s-mono arc-res" fill="#f2a838" font-size="10.5" letter-spacing="1">◀ RESPONSE PHASE · agentic_loop parses, then stream_events</text>
+
+          <!-- dispatch bus -->
+          <line x1="636" y1="82" x2="636" y2="330" stroke="#f4713b" stroke-width="1.4"/>
+          <text x="628" y="74" text-anchor="end" class="s-mono" fill="#f4713b" font-size="9.5" letter-spacing="1">DISPATCH BUS (request-phase, no response phase)</text>
+          <circle cx="636" cy="118" r="3.2" fill="#f4713b"/>
+          <circle cx="636" cy="186" r="3.2" fill="#f4713b"/>
+          <circle cx="636" cy="254" r="3.2" fill="#f4713b"/>
+
+          <line x1="636" y1="118" x2="702" y2="118" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
+          <g class="flt" data-fid="openai_web_search">
+            <rect x="704" y="98" width="252" height="44" rx="8" fill="#101820" stroke="#f4713b"/>
+            <text x="720" y="117" class="s-mono" fill="#e2edf3" font-size="12">openai_web_search</text>
+            <text x="720" y="133" class="s-mono" fill="#6d8492" font-size="9.5">Brave · per-user brave_search slot</text>
+          </g>
+          <line x1="636" y1="186" x2="702" y2="186" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
+          <g class="flt" data-fid="openai_mcp_dispatch">
+            <rect x="704" y="166" width="252" height="44" rx="8" fill="#101820" stroke="#f4713b"/>
+            <text x="720" y="185" class="s-mono" fill="#e2edf3" font-size="12">openai_mcp_dispatch</text>
+            <text x="720" y="201" class="s-mono" fill="#6d8492" font-size="9.5">8001 · mcp_gateway cred + assertion · ≤8∥</text>
+          </g>
+          <line x1="636" y1="254" x2="702" y2="254" stroke="#f4713b" stroke-width="1.2" marker-end="url(#mk-disp)"/>
+          <g class="flt" data-fid="openai_file_search_callout">
+            <rect x="704" y="234" width="252" height="44" rx="8" fill="#101820" stroke="#f4713b"/>
+            <text x="720" y="253" class="s-mono" fill="#e2edf3" font-size="12">openai_file_search_callout</text>
+            <text x="720" y="269" class="s-mono" fill="#6d8492" font-size="9.5">3002 · ogx_files cred · on_failure closed</text>
+          </g>
+
+          <!-- proxy + backend -->
+          <g class="flt" data-fid="openai_responses_proxy">
+            <rect x="704" y="300" width="252" height="44" rx="8" fill="#101820" stroke="#3f9bd8"/>
+            <text x="720" y="319" class="s-mono" fill="#e2edf3" font-size="12">openai_responses_proxy</text>
+            <text x="720" y="335" class="s-mono" fill="#6d8492" font-size="9.5">rebuild body · header hook after LB select</text>
+          </g>
+          <line class="arc-req" x1="830" y1="344" x2="830" y2="372" stroke="#3f9bd8" stroke-width="1.4" marker-end="url(#mk-bk)"/>
+          <g class="flt" data-fid="__inference">
+            <rect x="704" y="374" width="252" height="40" rx="8" fill="#0c1319" stroke="#3f9bd8"/>
+            <text x="720" y="399" class="s-mono" fill="#3f9bd8" font-size="12">inference-backend · 127.0.0.1:3001</text>
+          </g>
+
+          <!-- done exit -->
+          <path d="M204,260 L204,318 L58,318 L58,360" fill="none" stroke="#d98cbb" stroke-width="1.4" marker-end="url(#mk-done)"/>
+          <g>
+            <rect x="30" y="362" width="330" height="50" rx="8" fill="#0c1319" stroke="#d98cbb"/>
+            <text x="46" y="383" class="s-mono" fill="#e2edf3" font-size="11.5">▣ DONE → compose terminal event</text>
+            <text x="46" y="400" class="s-mono" fill="#d98cbb" font-size="9.5">reverse path → openai_response_store persists</text>
+          </g>
+        </svg>
+      </div>
+      <p class="svgcap"><b>How to read this:</b> a semantic hub view — the loop owner directs the three request-phase dispatchers and the proxy. The arcs show the request vs. response <em>phases</em>, not the linear filter order. The canonical request-phase order (state_owner_headers → openai_stream_events → dispatchers → openai_agentic_loop → headers → router → load_balancer → openai_responses_proxy) is shown below in band 04.</p>
+
+      <div class="band-lbl"><span class="n">04</span> IRR step filters <span class="hint">— the inference-step chain in canonical order; annotations update per scenario</span></div>
+      <div class="grid" id="irrgrid"></div>
+
+    </main>
+
+    <!-- ============ RIGHT RAIL ============ -->
+    <aside class="rail" aria-label="Reference">
+      <div class="panel">
+        <h3>Groups</h3>
+        <div id="legend"></div>
+        <div class="linekey" aria-label="Line semantics">
+          <div class="lksub">Line semantics</div>
+          <div class="row"><svg width="34" height="10"><line x1="0" y1="5" x2="34" y2="5" stroke="#4fd1e0" stroke-width="2"/></svg> solid — forward / request phase</div>
+          <div class="row"><svg width="34" height="10"><line x1="0" y1="5" x2="34" y2="5" stroke="#f2a838" stroke-width="2" stroke-dasharray="6 3"/></svg> dashed — return / response phase</div>
+          <div class="row"><svg width="34" height="10"><line x1="0" y1="5" x2="34" y2="5" stroke="#f4713b" stroke-width="2" stroke-dasharray="1 4" stroke-linecap="round"/></svg> dotted — dispatch (request-phase, no response)</div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Filter states</h3>
+        <div class="statekey">
+          <div class="skrow"><span class="skbadge" style="color:var(--ok);border-color:var(--ok)">active</span><span class="skdef">runs and mutates this request</span></div>
+          <div class="skrow"><span class="skbadge" style="color:var(--ink-dim)">passthrough</span><span class="skdef">runs, but is a no-op for this input</span></div>
+          <div class="skrow"><span class="skbadge" style="color:var(--c-classification);border-color:var(--c-classification)">inert</span><span class="skdef">loaded, but its trigger condition is absent</span></div>
+          <div class="skrow"><span class="skbadge" style="color:var(--ink-faint)">skipped</span><span class="skdef">never reached on this path</span></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>Loop caps</h3>
+        <div class="caps" id="caps"></div>
+        <div class="capnote">Constraint: <b>max_iterations ≥ max_infer_iters + 1</b> (7 + 1 = 8) — initial inference plus the allowed tool-backed continuations.</div>
+      </div>
+
+      <div class="panel">
+        <h3>Backends</h3>
+        <div id="backends"></div>
+      </div>
+
+      <div class="panel">
+        <h3>External services</h3>
+        <div id="services"></div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="footnote" id="foot"></div>
+  <div class="titleblock" aria-hidden="true">
+    <div><span>DWG</span><b>FULL-FLOW-AGENTIC</b></div>
+    <div><span>SRC</span><b>*.yaml</b></div>
+    <div><span>VIEW</span><b>SCHEMATIC</b></div>
+    <div><span>SHEET</span><b>1 / 1</b></div>
+  </div>
+</div>
+
+<div id="tt" role="tooltip" aria-hidden="true"></div>
+
+<script>
+/* ============================================================================
+   PIPELINE — single source of truth (embedded from full-flow-agentic.yaml).
+   All rendering, tracing, and tooltips are driven from this object.
+   ========================================================================= */
+const PIPELINE = {"filters":[{"id":"trace_context","name":"trace_context","group":"trace","order":1,"phase":"request-phase; establishes typed correlation BEFORE the IRR snapshots request extensions; no response phase","config":{},"promotes":"establishes a typed TraceContext extension carried across every IRR iteration; child callouts retain this request/trace identity while Praxis core assigns a fresh span ID to each outbound hop","scenarios":{"S1":{"state":"active","note":"establishes TraceContext for the single inference round"},"S2":{"state":"active","note":"establishes TraceContext for the streaming round"},"S3":{"state":"active","note":"establishes TraceContext (independent of the store flag)"},"S4":{"state":"active","note":"establishes TraceContext for the multi-turn request"},"S5":{"state":"active","note":"TraceContext propagates into the file_search vector-store callout (fresh span per hop)"},"S6":{"state":"active","note":"TraceContext propagates into every MCP resolve/dispatch hop (fresh span each)"},"S7":{"state":"active","note":"TraceContext propagates into the Brave web_search callout (fresh span per hop)"},"S8":{"state":"active","note":"establishes TraceContext before the store answers the GET retrieve"},"S9":{"state":"active","note":"establishes TraceContext on the WS handshake before bypass"},"S10":{"state":"active","note":"establishes TraceContext before the route-miss"},"S11":{"state":"active","note":"establishes TraceContext before the dedicated-service bypass"}}},{"id":"state_owner","name":"state_owner","group":"identity","order":2,"phase":"request-phase header mapping only; no response phase","config":{"mode":"trusted_headers","tenant.header":"x-auth-tenant","issuer.static":"urn:example:gateway","subject.header":"x-auth-user"},"promotes":"normalized StateOwner extension (tenant/issuer/subject) carried across IRR iterations","scenarios":{"S1":{"state":"active","note":"maps x-auth-* ingress into owner context (no auth verification)"},"S2":{"state":"active","note":"same owner mapping for streaming create"},"S3":{"state":"active","note":"owner mapped even though store:false"},"S4":{"state":"active","note":"owner mapped for multi-turn create"},"S5":{"state":"active","note":"owner mapped; forwarded to file_search callout"},"S6":{"state":"active","note":"owner mapped; forwarded to MCP connector"},"S7":{"state":"active","note":"owner underpins per-user brave_search slot selection"},"S8":{"state":"active","note":"runs before store answers the GET retrieve"},"S9":{"state":"active","note":"owner mapped on WS handshake before bypass"},"S10":{"state":"active","note":"owner mapped before route-miss"},"S11":{"state":"active","note":"owner mapped before dedicated-service bypass"}}},{"id":"callout_credentials","name":"callout_credentials","group":"identity","order":3,"phase":"request-phase; captures typed credential slot, does not authenticate provenance","config":{"credentials":[{"slot":"brave_search","source_header":"x-user-brave-key"},{"slot":"ogx_files","source_header":"x-user-ogx-key"},{"slot":"mcp_gateway","source_header":"x-user-mcp-key"}]},"promotes":"captures per-user brave_search / ogx_files / mcp_gateway credential slots into the request extension; STRIPS the x-user-brave-key / x-user-ogx-key / x-user-mcp-key ingress headers (cannot authenticate provenance)","scenarios":{"S1":{"state":"active","note":"strips all x-user-* provider keys defensively; slots empty if absent"},"S2":{"state":"active","note":"strips all provider-key headers; slots unused this scenario"},"S3":{"state":"active","note":"strips all provider-key headers; slots unused"},"S4":{"state":"active","note":"strips all provider-key headers; slots unused"},"S5":{"state":"active","note":"captures the ogx_files key later injected on the file_search callout"},"S6":{"state":"active","note":"captures the mcp_gateway key used by MCP resolve + dispatch"},"S7":{"state":"active","note":"captures the brave_search key required by openai_web_search"},"S8":{"state":"active","note":"strips all provider-key headers on GET before the store answers"},"S9":{"state":"active","note":"strips all provider-key headers on the WS handshake"},"S10":{"state":"active","note":"strips all provider-key headers before the route-miss"},"S11":{"state":"active","note":"strips all provider-key headers before the dedicated-service bypass"}}},{"id":"callout_authorization","name":"callout_authorization","group":"identity","order":4,"phase":"request-phase security filter; captures the trusted-boundary MCP authorization assertion; Praxis never parses it or treats its presence as a decision","config":{"assertion_slot":"mcp_gateway"},"promotes":"unconditionally deletes any client-supplied x-mcp-authorized, then sets the verified short-lived assertion into the mcp_gateway slot; forwarded unchanged ONLY to configured connector_id targets (the MCP Gateway makes the authorization decision)","scenarios":{"S1":{"state":"active","note":"strips client x-mcp-authorized and sets the verified assertion; slot consumed only by MCP filters"},"S2":{"state":"active","note":"strips + sets the assertion; slot unused this scenario"},"S3":{"state":"active","note":"strips + sets the assertion; slot unused"},"S4":{"state":"active","note":"strips + sets the assertion; slot unused"},"S5":{"state":"active","note":"strips + sets the assertion; file_search does not consume it"},"S6":{"state":"active","note":"assertion in mcp_gateway is consumed by openai_mcp_tool_resolve + openai_mcp_dispatch"},"S7":{"state":"active","note":"strips + sets the assertion; web_search does not consume it"},"S8":{"state":"active","note":"strips client x-mcp-authorized before the store answers GET"},"S9":{"state":"active","note":"strips + sets the assertion on the WS handshake"},"S10":{"state":"active","note":"strips + sets the assertion before the route-miss"},"S11":{"state":"active","note":"strips + sets the assertion before the dedicated-service bypass"}}},{"id":"state_owner_headers_preirr","name":"state_owner_headers","group":"identity","order":5,"phase":"request-phase header projection; no response phase","config":{"tenant_header":"x-tenant-id","subject_header":"x-user-id"},"promotes":"projects owner as x-tenant-id/x-user-id for OGX and allowlisted callouts; strips raw x-auth-* ingress","scenarios":{"S1":{"state":"active","note":"projects x-tenant-id/x-user-id, strips raw ingress"},"S2":{"state":"active","note":"same projection for streaming"},"S3":{"state":"active","note":"projection regardless of store flag"},"S4":{"state":"active","note":"projection for multi-turn"},"S5":{"state":"active","note":"projected ids forwarded to file_search callout"},"S6":{"state":"active","note":"projected ids forwarded to MCP connector"},"S7":{"state":"active","note":"projection precedes web_search"},"S8":{"state":"active","note":"projects before store answers GET"},"S9":{"state":"active","note":"projects before WS bypass"},"S10":{"state":"active","note":"projects before route-miss"},"S11":{"state":"active","note":"projects before dedicated-service bypass"}}},{"id":"openai_conversations","name":"openai_conversations","group":"conversations","order":6,"phase":"request-phase (CRUD + has_conversation); response-phase appends items on success (non-streaming)","config":{"backend":"sqlite","database_url":"sqlite://responses.db?mode=rwc","conversations_table":"openai_conversations","items_table":"openai_conversation_items"},"promotes":"sets has_conversation when Responses request carries a conversation field; on response path appends input+output items back to the conversation","scenarios":{"S1":{"state":"passthrough","note":"no conversation field; would activate on /v1/conversations CRUD or conversation-bearing create"},"S2":{"state":"passthrough","note":"no conversation field; note append-back is non-streaming only"},"S3":{"state":"passthrough","note":"no conversation field"},"S4":{"state":"passthrough","note":"prev_response_id path, not a conversation field"},"S5":{"state":"passthrough","note":"no conversation field"},"S6":{"state":"passthrough","note":"no conversation field"},"S7":{"state":"passthrough","note":"no conversation field"},"S8":{"state":"passthrough","note":"GET retrieve, not a conversations op"},"S9":{"state":"passthrough","note":"WS handshake, not a conversations op"},"S10":{"state":"passthrough","note":"non-Responses body, not a conversations op"},"S11":{"state":"passthrough","note":"dedicated-service path, not a conversations op"}}},{"id":"openai_responses_format","name":"openai_responses_format","group":"classification","order":7,"phase":"request-phase classifier; promotes internal x-praxis-* routing headers","config":{"on_invalid":"continue","headers.format":"x-praxis-ai-format","headers.model":"x-praxis-ai-model","headers.stream":"x-praxis-ai-stream","headers.mode":"x-praxis-responses-mode"},"promotes":"x-praxis-ai-format, x-praxis-ai-model, x-praxis-ai-stream, x-praxis-responses-mode","scenarios":{"S1":{"state":"active","note":"classifies openai_responses; sets format/model/mode, stream=false"},"S2":{"state":"active","note":"classifies openai_responses; promotes x-praxis-ai-stream=true"},"S3":{"state":"active","note":"classifies openai_responses (store flag not classification input)"},"S4":{"state":"active","note":"classifies openai_responses create"},"S5":{"state":"active","note":"classifies openai_responses (tools present)"},"S6":{"state":"active","note":"classifies openai_responses (mcp tools)"},"S7":{"state":"active","note":"classifies openai_responses"},"S8":{"state":"active","note":"classifies GET as non-create; header drives later gating"},"S9":{"state":"active","note":"classifies GET/WS as non-create (no openai_responses create marker)"},"S10":{"state":"active","note":"classifies as chat/anthropic/unclassified -> not openai_responses, on_invalid:continue avoids early reject"},"S11":{"state":"passthrough","note":"path not /v1/responses; no Responses classification"}}},{"id":"openai_responses_validate","name":"openai_responses_validate","group":"classification","order":8,"phase":"request-phase; JSON syntax + ID generation","config":{},"promotes":"validates JSON syntax; generates response and conversation IDs; writes responses.* metadata (provider-owned param combos pass through)","scenarios":{"S1":{"state":"active","note":"validates syntax, generates response id"},"S2":{"state":"active","note":"validates + generates ids for streaming create"},"S3":{"state":"active","note":"validates; ids generated even if not persisted"},"S4":{"state":"active","note":"validates multi-turn create"},"S5":{"state":"active","note":"validates create with file_search tools"},"S6":{"state":"active","note":"validates create with mcp tools"},"S7":{"state":"active","note":"validates create"},"S8":{"state":"passthrough","note":"GET has no body to validate"},"S9":{"state":"passthrough","note":"WS handshake, no Responses body"},"S10":{"state":"passthrough","note":"non-Responses body passes through (not classified openai_responses)"},"S11":{"state":"passthrough","note":"dedicated-service path"}}},{"id":"openai_tool_parse","name":"openai_tool_parse","group":"classification","order":9,"phase":"request-phase; parses tools/tool_choice, does NOT mutate body","config":{},"promotes":"has_tools, has_web_search, tool_choice, function_count (summary facts to metadata/results)","scenarios":{"S1":{"state":"passthrough","note":"no tools; has_tools=false"},"S2":{"state":"passthrough","note":"no tools"},"S3":{"state":"passthrough","note":"no tools"},"S4":{"state":"passthrough","note":"no tools"},"S5":{"state":"active","note":"parses file_search tool; has_tools=true"},"S6":{"state":"active","note":"parses mcp tool; has_tools=true"},"S7":{"state":"active","note":"parses tools; may set has_web_search"},"S8":{"state":"passthrough","note":"GET retrieve"},"S9":{"state":"passthrough","note":"WS handshake"},"S10":{"state":"passthrough","note":"non-Responses body"},"S11":{"state":"passthrough","note":"dedicated-service path"}}},{"id":"openai_response_store","name":"openai_response_store","group":"store","order":10,"phase":"request-phase registers backend + serves GET retrieve (terminal); response-phase persists AFTER IRR composes terminal (reverse order)","config":{"backend":"sqlite","database_url":"sqlite://responses.db?mode=rwc","responses_table":"openai_responses","conversations_table":"openai_conversations"},"promotes":"registers store backend for rehydrate/compact; persists ResponsesState.response_object on response path; answers GET /v1/responses/{id} pre-IRR","scenarios":{"S1":{"state":"active","note":"persists buffered response on reverse path (store default true)"},"S2":{"state":"active","note":"persists response_object populated by openai_stream_events inside IRR"},"S3":{"state":"inert","note":"backend registered but store:false -> no persistence"},"S4":{"state":"active","note":"persists; rehydrate also reads prior response from this store"},"S5":{"state":"active","note":"persists final composed response after file_search loop"},"S6":{"state":"active","note":"persists final response after MCP loop"},"S7":{"state":"active","note":"persists final response after web_search loop"},"S8":{"state":"active","note":"SERVES GET as terminal response pre-IRR and short-circuits pipeline"},"S9":{"state":"passthrough","note":"WS handshake is GET /v1/responses with no id; store does not answer"},"S10":{"state":"passthrough","note":"non-Responses body not persisted"},"S11":{"state":"passthrough","note":"dedicated-service path"}}},{"id":"openai_responses_rehydrate","name":"openai_responses_rehydrate","group":"context","order":11,"phase":"request-phase; loads and prepends prior history","config":{},"promotes":"loads context from previous_response_id or conversation, prepends message history; previous_response_id takes precedence when both present","scenarios":{"S1":{"state":"passthrough","note":"no previous_response_id/conversation"},"S2":{"state":"passthrough","note":"no prior context markers"},"S3":{"state":"passthrough","note":"no prior context markers"},"S4":{"state":"active","note":"loads stored prior response via previous_response_id and prepends it"},"S5":{"state":"passthrough","note":"no prior context markers"},"S6":{"state":"passthrough","note":"no prior context markers"},"S7":{"state":"passthrough","note":"no prior context markers"},"S8":{"state":"skipped","note":"store short-circuited GET before this filter"},"S9":{"state":"passthrough","note":"WS handshake, no rehydrate"},"S10":{"state":"passthrough","note":"non-Responses body"},"S11":{"state":"passthrough","note":"dedicated-service path"}}},{"id":"openai_file_resolve","name":"openai_file_resolve","group":"context","order":12,"phase":"request-phase pre-security callout; fires only when file_id refs present","config":{"files_api_url":"http://127.0.0.1:9999","user_credential":"ogx_files","allow_pre_security_callout":true,"outbound_chain":"files-api-outbound (state_owner_headers x-tenant-id/x-user-id + headers x-file-callout=file-resolve)","forward_headers":["x-tenant-id","x-user-id"],"on_missing":"reject","timeout_ms":10000},"promotes":"resolves file_id refs in current input + rehydrated history via Files API; rebuilds body with file_data/image_url (on_missing: reject); injects the caller-scoped ogx_files credential on file_id callouts (file_url downloads use the separate credential-free resolver)","scenarios":{"S1":{"state":"inert","note":"no file_id refs; callout does not fire"},"S2":{"state":"inert","note":"no file_id refs"},"S3":{"state":"inert","note":"no file_id refs"},"S4":{"state":"inert","note":"no file_id refs in prepended history"},"S5":{"state":"inert","note":"file_search uses vector stores, not file_id input refs"},"S6":{"state":"inert","note":"no file_id refs"},"S7":{"state":"inert","note":"no file_id refs"},"S8":{"state":"skipped","note":"store short-circuited GET"},"S9":{"state":"passthrough","note":"WS handshake, no body refs"},"S10":{"state":"passthrough","note":"non-Responses body"},"S11":{"state":"passthrough","note":"dedicated-service path"}}},{"id":"openai_doc_extract","name":"openai_doc_extract","group":"context","order":13,"phase":"request-phase; converts input_file parts, on_unsupported continue","config":{"allow_pre_security_callout":true,"on_unsupported":"continue"},"promotes":"converts input_file content parts to input_text (base64 decode + UTF-8 validate) for backends lacking native input_file; unsupported formats left unchanged","scenarios":{"S1":{"state":"inert","note":"no input_file parts to convert"},"S2":{"state":"inert","note":"no input_file parts"},"S3":{"state":"inert","note":"no input_file parts"},"S4":{"state":"inert","note":"no input_file parts"},"S5":{"state":"inert","note":"no input_file parts"},"S6":{"state":"inert","note":"no input_file parts"},"S7":{"state":"inert","note":"no input_file parts"},"S8":{"state":"skipped","note":"store short-circuited GET"},"S9":{"state":"passthrough","note":"WS handshake"},"S10":{"state":"passthrough","note":"non-Responses body"},"S11":{"state":"passthrough","note":"dedicated-service path"}}},{"id":"openai_mcp_tool_resolve","name":"openai_mcp_tool_resolve","group":"context","order":14,"phase":"request-phase; resolves MCP tools/list from operator connectors","config":{"user_credential":"mcp_gateway","authorization_assertion":"mcp_gateway","forward_headers":["x-tenant-id","x-user-id"],"connectors":[{"id":"trusted-mcp","server_url":"http://127.0.0.1:8001/mcp"}]},"promotes":"calls tools/list on each upstream MCP server; writes mcp_tool_map to ResponsesState; forwards the caller-scoped mcp_gateway credential + opaque authorization assertion and identity headers ONLY to configured connector_id targets, never an arbitrary client server_url","scenarios":{"S1":{"state":"passthrough","note":"no MCP tool entries"},"S2":{"state":"passthrough","note":"no MCP tool entries"},"S3":{"state":"passthrough","note":"no MCP tool entries"},"S4":{"state":"passthrough","note":"no MCP tool entries"},"S5":{"state":"passthrough","note":"file_search tool, not MCP"},"S6":{"state":"active","note":"resolves tools/list from connector trusted-mcp with mcp_gateway credential + authorization assertion; writes mcp_tool_map"},"S7":{"state":"passthrough","note":"no MCP tool entries"},"S8":{"state":"skipped","note":"store short-circuited GET"},"S9":{"state":"passthrough","note":"WS handshake"},"S10":{"state":"passthrough","note":"non-Responses body"},"S11":{"state":"passthrough","note":"dedicated-service path"}}},{"id":"bypass_gate","name":"headers (bypass carrier)","group":"routing","order":15,"phase":"request-phase carrier with unless-gate; branch_chains route to backends and rejoin at terminal","config":{"conditions.unless":{"path":"/v1/responses","methods":["POST"],"headers":{"x-praxis-ai-format":"openai_responses"}},"branch_chains":[{"name":"bypass-irr","rejoin":"terminal","chain":"bypass-chain"}],"routes":[{"path_prefix":"/v1/prompts","cluster":"prompts-api"},{"path_prefix":"/v1/embeddings","cluster":"embeddings-api"},{"path_prefix":"/v1/files","cluster":"files-api"},{"path":"/v1/responses","headers":{"upgrade":"websocket"},"cluster":"inference-backend"},{"path_prefix":"/v1/vector_stores","cluster":"vector-stores-backend"}]},"promotes":"runs for everything EXCEPT a classified POST /v1/responses create; branch router+load_balancer select a backend, or route-miss 404; discrimination lives here because IRR strips x-praxis-*","scenarios":{"S1":{"state":"skipped","note":"unless matches classified POST create; falls through to IRR"},"S2":{"state":"skipped","note":"unless matches; streaming create falls through to IRR"},"S3":{"state":"skipped","note":"unless matches; still a classified create -> IRR"},"S4":{"state":"skipped","note":"unless matches; create -> IRR"},"S5":{"state":"skipped","note":"unless matches; create -> IRR"},"S6":{"state":"skipped","note":"unless matches; create -> IRR"},"S7":{"state":"skipped","note":"unless matches; create -> IRR"},"S8":{"state":"skipped","note":"store already produced terminal GET response before this carrier runs"},"S9":{"state":"active","note":"not a POST create -> carrier runs; /v1/responses + upgrade:websocket route -> inference-backend"},"S10":{"state":"active","note":"missing x-praxis-ai-format:openai_responses -> carrier runs; no upgrade header -> route-miss 404"},"S11":{"state":"active","note":"carrier runs; path_prefix routes to prompts/embeddings/files/vector_stores backend"}}},{"id":"iterative_request_router","name":"iterative_request_router","group":"irr","order":16,"phase":"terminal filter; owns agentic model-tool-model loop; transitions on openai_agentic_loop action","config":{"initial_step":"inference","max_iterations":8,"timeout_ms":360000,"step_timeout_ms":300000,"max_response_bytes":67108864,"max_stream_response_bytes":67108864,"max_state_bytes":136314880,"on_result":[{"filter":"openai_agentic_loop","key":"action","value":"loop","next":"inference"},{"default":true,"done":true}]},"promotes":"runs classified openai_responses create requests through the inference step loop; strips x-praxis-* from sub-request (step router is path-only)","scenarios":{"S1":{"state":"active","note":"enters IRR; one inference round; agentic_loop action=done"},"S2":{"state":"active","note":"enters IRR; one round; streaming lifecycle composed"},"S3":{"state":"active","note":"enters IRR; routed but not persisted"},"S4":{"state":"active","note":"enters IRR with rehydrated history"},"S5":{"state":"active","note":"enters IRR; loops for file_search rounds then done"},"S6":{"state":"active","note":"enters IRR; loops for MCP rounds then done"},"S7":{"state":"active","note":"enters IRR; loops for web_search rounds then done"},"S8":{"state":"skipped","note":"store short-circuited GET before IRR"},"S9":{"state":"skipped","note":"WS handshake took bypass branch"},"S10":{"state":"skipped","note":"non-Responses body took bypass -> 404"},"S11":{"state":"skipped","note":"dedicated services took bypass branch"}}},{"id":"irr_state_owner_headers","name":"state_owner_headers (IRR step)","group":"irr-step","order":17,"phase":"IRR inference step, request-phase; re-projection inside destination-owned subrequest","config":{"tenant_header":"x-tenant-id","subject_header":"x-user-id"},"promotes":"re-projects x-tenant-id/x-user-id inside subrequest; strips still-uncommitted raw ingress identity headers","scenarios":{"S1":{"state":"active","note":"re-projects owner headers each round"},"S2":{"state":"active","note":"re-projects for streaming subrequest"},"S3":{"state":"active","note":"re-projects owner headers"},"S4":{"state":"active","note":"re-projects owner headers"},"S5":{"state":"active","note":"re-projects; ids forwarded to file_search callout"},"S6":{"state":"active","note":"re-projects; ids forwarded to MCP dispatch"},"S7":{"state":"active","note":"re-projects; owner underpins web_search slot"},"S8":{"state":"skipped","note":"IRR not entered"},"S9":{"state":"skipped","note":"IRR not entered"},"S10":{"state":"skipped","note":"IRR not entered"},"S11":{"state":"skipped","note":"IRR not entered"}}},{"id":"openai_stream_events","name":"openai_stream_events","group":"irr-step","order":18,"phase":"IRR step; request-phase pass + response-phase composes one logical Responses lifecycle across rounds","config":{},"promotes":"composes every inference SSE stream into ONE lifecycle; withholds per-round terminal events until IRR transition known; populates ResponsesState.response_object (required for streaming persistence + loop-terminal error delivery)","scenarios":{"S1":{"state":"active","note":"one-round logical stream; still composes and populates response_object"},"S2":{"state":"active","note":"composes streaming lifecycle; populates response_object for store persistence"},"S3":{"state":"active","note":"composes lifecycle (object not persisted due to store:false)"},"S4":{"state":"active","note":"composes lifecycle for multi-turn"},"S5":{"state":"active","note":"composes across file_search rounds; withholds terminal until done"},"S6":{"state":"active","note":"composes across MCP rounds"},"S7":{"state":"active","note":"composes across web_search rounds"},"S8":{"state":"skipped","note":"IRR not entered"},"S9":{"state":"skipped","note":"IRR not entered"},"S10":{"state":"skipped","note":"IRR not entered"},"S11":{"state":"skipped","note":"IRR not entered"}}},{"id":"openai_web_search","name":"openai_web_search","group":"irr-step","order":19,"phase":"IRR step request-phase dispatcher; no response phase; inert until model emits web_search_call","config":{"provider":"brave","api_key":"${WEB_SEARCH_API_KEY}","user_credential":"brave_search","max_calls_per_round":32,"outbound_chain":"web-search-outbound (request_id filter)"},"promotes":"executes web_search_call assignments prepared by the loop owner; fails closed if per-user brave_search slot missing","scenarios":{"S1":{"state":"inert","note":"no web_search_call emitted"},"S2":{"state":"inert","note":"no web_search_call emitted"},"S3":{"state":"inert","note":"no web_search_call emitted"},"S4":{"state":"inert","note":"no web_search_call emitted"},"S5":{"state":"inert","note":"file_search, not web_search"},"S6":{"state":"inert","note":"MCP, not web_search"},"S7":{"state":"active","note":"executes web_search_call via Brave using per-user brave_search slot; fails closed if slot missing"},"S8":{"state":"skipped","note":"IRR not entered"},"S9":{"state":"skipped","note":"IRR not entered"},"S10":{"state":"skipped","note":"IRR not entered"},"S11":{"state":"skipped","note":"IRR not entered"}}},{"id":"openai_mcp_dispatch","name":"openai_mcp_dispatch","group":"irr-step","order":20,"phase":"IRR step request-phase dispatcher; no response phase; inert until model emits MCP tool call","config":{"user_credential":"mcp_gateway","authorization_assertion":"mcp_gateway","forward_headers":["x-tenant-id","x-user-id"],"max_calls_per_round":32,"max_parallel_calls":8,"max_result_bytes":1048576,"max_total_result_bytes":8388608},"promotes":"executes MCP calls prepared/classified by the loop owner; forwards the caller-scoped mcp_gateway credential + authorization assertion on each connector call; reconciles results into ResponsesState","scenarios":{"S1":{"state":"inert","note":"no MCP call emitted"},"S2":{"state":"inert","note":"no MCP call emitted"},"S3":{"state":"inert","note":"no MCP call emitted"},"S4":{"state":"inert","note":"no MCP call emitted"},"S5":{"state":"inert","note":"file_search, not MCP"},"S6":{"state":"active","note":"executes MCP calls via 127.0.0.1:8001/mcp with mcp_gateway credential + assertion (max 8 parallel, byte-capped)"},"S7":{"state":"inert","note":"web_search, not MCP"},"S8":{"state":"skipped","note":"IRR not entered"},"S9":{"state":"skipped","note":"IRR not entered"},"S10":{"state":"skipped","note":"IRR not entered"},"S11":{"state":"skipped","note":"IRR not entered"}}},{"id":"openai_file_search_callout","name":"openai_file_search_callout","group":"irr-step","order":21,"phase":"IRR step request-phase dispatcher; executes at request-body EOS on re-entry; no response phase; inert until model emits file_search_call","config":{"vector_store_url":"http://127.0.0.1:3002","user_credential":"ogx_files","outbound_chain":"vector-store-outbound (state_owner_headers x-tenant-id/x-user-id + headers X-Vector-Store-Client=praxis-ai-gateway)","timeout_ms":5000,"max_response_bytes":10485760,"max_total_response_bytes":67108864,"max_state_bytes":136314880,"on_failure":"closed","forward_headers":["x-tenant-id","x-user-id"]},"promotes":"executes assigned file_search_call items against vector store 3002; injects the caller-scoped ogx_files credential on the vector-store callout; reconciles results in place in ResponsesState.accumulated_output","scenarios":{"S1":{"state":"inert","note":"no file_search_call emitted"},"S2":{"state":"inert","note":"no file_search_call emitted"},"S3":{"state":"inert","note":"no file_search_call emitted"},"S4":{"state":"inert","note":"no file_search_call emitted"},"S5":{"state":"active","note":"executes file_search_call via vector store 3002 with the ogx_files credential; on_failure closed"},"S6":{"state":"inert","note":"MCP, not file_search"},"S7":{"state":"inert","note":"web_search, not file_search"},"S8":{"state":"skipped","note":"IRR not entered"},"S9":{"state":"skipped","note":"IRR not entered"},"S10":{"state":"skipped","note":"IRR not entered"},"S11":{"state":"skipped","note":"IRR not entered"}}},{"id":"openai_agentic_loop","name":"openai_agentic_loop","group":"irr-step","order":22,"phase":"IRR step; request-phase records assignments; response-phase parses model output and publishes single loop|done transition (sole authority)","config":{"max_infer_iters":7},"promotes":"extracts completed function_call/web_search_call/file_search_call/MCP items; records dispatcher assignments; publishes action=loop|done (issue #1046 sole transition authority)","scenarios":{"S1":{"state":"active","note":"parses single round; action=done (no tools)"},"S2":{"state":"active","note":"parses streaming round; action=done"},"S3":{"state":"active","note":"parses single round; action=done"},"S4":{"state":"active","note":"parses round over rehydrated context; action=done"},"S5":{"state":"active","note":"assigns file_search_call then action=loop; finalizes with done"},"S6":{"state":"active","note":"assigns MCP call then action=loop; finalizes with done"},"S7":{"state":"active","note":"assigns web_search_call then action=loop; finalizes with done"},"S8":{"state":"skipped","note":"IRR not entered"},"S9":{"state":"skipped","note":"IRR not entered"},"S10":{"state":"skipped","note":"IRR not entered"},"S11":{"state":"skipped","note":"IRR not entered"}}},{"id":"irr_headers","name":"headers (IRR step)","group":"irr-step","order":23,"phase":"IRR step request-phase; sets outbound header","config":{"request_set":[{"name":"Content-Type","value":"application/json"}]},"promotes":"forces Content-Type: application/json on the outbound subrequest","scenarios":{"S1":{"state":"active","note":"sets Content-Type"},"S2":{"state":"active","note":"sets Content-Type"},"S3":{"state":"active","note":"sets Content-Type"},"S4":{"state":"active","note":"sets Content-Type"},"S5":{"state":"active","note":"sets Content-Type each round"},"S6":{"state":"active","note":"sets Content-Type each round"},"S7":{"state":"active","note":"sets Content-Type each round"},"S8":{"state":"skipped","note":"IRR not entered"},"S9":{"state":"skipped","note":"IRR not entered"},"S10":{"state":"skipped","note":"IRR not entered"},"S11":{"state":"skipped","note":"IRR not entered"}}},{"id":"irr_router","name":"router (IRR step)","group":"irr-step","order":24,"phase":"IRR step request-phase; PATH-ONLY routing (x-praxis-* stripped)","config":{"routes":[{"path":"/v1/responses","cluster":"inference-backend"}]},"promotes":"routes /v1/responses to inference-backend; cannot match x-praxis-ai-format because IRR strips reserved-prefix headers","scenarios":{"S1":{"state":"active","note":"path /v1/responses -> inference-backend"},"S2":{"state":"active","note":"routes to inference-backend"},"S3":{"state":"active","note":"routes to inference-backend"},"S4":{"state":"active","note":"routes to inference-backend"},"S5":{"state":"active","note":"routes to inference-backend each round"},"S6":{"state":"active","note":"routes to inference-backend each round"},"S7":{"state":"active","note":"routes to inference-backend each round"},"S8":{"state":"skipped","note":"IRR not entered"},"S9":{"state":"skipped","note":"IRR not entered"},"S10":{"state":"skipped","note":"IRR not entered"},"S11":{"state":"skipped","note":"IRR not entered"}}},{"id":"irr_load_balancer","name":"load_balancer (IRR step)","group":"irr-step","order":25,"phase":"IRR step request-phase; selects endpoint for inference-backend","config":{"clusters":[{"name":"inference-backend","endpoints":["127.0.0.1:3001"],"http.application_protocol":"openai_responses (commented out)","http.application_provider":"openai (commented out)"}]},"promotes":"selects inference-backend endpoint 127.0.0.1:3001; selection precedes proxy request-header hook; optional application_* declarations left commented so prompt templates fail closed","scenarios":{"S1":{"state":"active","note":"selects 127.0.0.1:3001"},"S2":{"state":"active","note":"selects 127.0.0.1:3001"},"S3":{"state":"active","note":"selects 127.0.0.1:3001"},"S4":{"state":"active","note":"selects 127.0.0.1:3001"},"S5":{"state":"active","note":"selects 127.0.0.1:3001 each round"},"S6":{"state":"active","note":"selects 127.0.0.1:3001 each round"},"S7":{"state":"active","note":"selects 127.0.0.1:3001 each round"},"S8":{"state":"skipped","note":"IRR not entered"},"S9":{"state":"skipped","note":"IRR not entered"},"S10":{"state":"skipped","note":"IRR not entered"},"S11":{"state":"skipped","note":"IRR not entered"}}},{"id":"openai_responses_proxy","name":"openai_responses_proxy","group":"irr-step","order":26,"phase":"IRR step; request-body hook rebuilds outbound body; request-header hook runs AFTER load_balancer selection (fail-closed capability check); response-phase handles buffered/streamed","config":{},"promotes":"rebuilds outbound body from ResponsesState; auto-selects typed streaming when effective body has stream:true; fails closed on prompt templates unless selected cluster declares BOTH application_protocol:openai_responses AND application_provider:openai (both commented out here)","scenarios":{"S1":{"state":"active","note":"rebuilds body; buffered (stream:false)"},"S2":{"state":"active","note":"rebuilds body; auto-selects typed streaming (stream:true)"},"S3":{"state":"active","note":"rebuilds body; buffered"},"S4":{"state":"active","note":"rebuilds body with rehydrated history"},"S5":{"state":"active","note":"rebuilds body each round incorporating file_search results"},"S6":{"state":"active","note":"rebuilds body each round incorporating MCP results"},"S7":{"state":"active","note":"rebuilds body each round incorporating web_search results"},"S8":{"state":"skipped","note":"IRR not entered"},"S9":{"state":"skipped","note":"IRR not entered"},"S10":{"state":"skipped","note":"IRR not entered"},"S11":{"state":"skipped","note":"IRR not entered"}}}],"scenarios":[{"id":"S1","label":"Stateful create","request":"POST /v1/responses {model,input} (store defaults true)","entersIRR":true,"loopRounds":1},{"id":"S2","label":"Streaming create","request":"POST /v1/responses {model,input,stream:true}","entersIRR":true,"loopRounds":1},{"id":"S3","label":"Stateless create","request":"POST /v1/responses {model,input,store:false}","entersIRR":true,"loopRounds":1},{"id":"S4","label":"Multi-turn","request":"POST /v1/responses {input,previous_response_id}","entersIRR":true,"loopRounds":1},{"id":"S5","label":"File search","request":"POST /v1/responses tools:[{type:file_search,vector_store_ids}]","entersIRR":true,"loopRounds":"2+ (model emits file_search_call, callout via vector store 3002, re-enter, finalize)"},{"id":"S6","label":"MCP loop","request":"POST /v1/responses tools:[{type:mcp,server_label,server_url,allowed_tools,require_approval:never}]","entersIRR":true,"loopRounds":"2+ (mcp_tool_resolve then model emits MCP call, dispatch via 8001, finalize)"},{"id":"S7","label":"Web search","request":"POST /v1/responses; model emits web_search_call (per-user brave_search key required)","entersIRR":true,"loopRounds":"2+ (web_search via Brave, re-enter, finalize)"},{"id":"S8","label":"GET retrieve","request":"GET /v1/responses/{id}","entersIRR":false,"loopRounds":0},{"id":"S9","label":"WebSocket","request":"GET /v1/responses with Upgrade: websocket","entersIRR":false,"loopRounds":0},{"id":"S10","label":"Non-Responses body on /v1/responses","request":"POST /v1/responses with Chat Completions / Anthropic / unclassified body","entersIRR":false,"loopRounds":0},{"id":"S11","label":"Dedicated services","request":"POST /v1/prompts | /v1/embeddings | /v1/files | /v1/vector_stores","entersIRR":false,"loopRounds":0}],"clusters":[{"name":"prompts-api","endpoints":["127.0.0.1:9998"],"definedIn":"bypass-chain load_balancer","routedBy":"bypass router path_prefix /v1/prompts"},{"name":"embeddings-api","endpoints":["127.0.0.1:9997"],"definedIn":"bypass-chain load_balancer","routedBy":"bypass router path_prefix /v1/embeddings"},{"name":"files-api","endpoints":["127.0.0.1:9999"],"definedIn":"bypass-chain load_balancer","routedBy":"bypass router path_prefix /v1/files"},{"name":"inference-backend","endpoints":["127.0.0.1:3001"],"definedIn":"BOTH bypass-chain load_balancer AND IRR inference-step load_balancer","routedBy":"bypass router (path /v1/responses + upgrade:websocket) and IRR step router (path /v1/responses)","note":"optional http.application_protocol:openai_responses + http.application_provider:openai are commented out on both definitions, so prompt-template requests fail closed in openai_responses_proxy"},{"name":"vector-stores-backend","endpoints":["127.0.0.1:3002"],"definedIn":"bypass-chain load_balancer","routedBy":"bypass router path_prefix /v1/vector_stores"}],"externalServices":[{"name":"MCP server","endpoint":"http://127.0.0.1:8001/mcp","connectorId":"trusted-mcp","usedBy":["openai_mcp_tool_resolve (tools/list)","openai_mcp_dispatch (tool calls)"],"credential":"user_credential mcp_gateway (x-user-mcp-key) + opaque authorization_assertion mcp_gateway (x-mcp-authorized); both forwarded ONLY to connector_id trusted-mcp, never a client-supplied server_url"},{"name":"Files API","endpoint":"http://127.0.0.1:9999","usedBy":["openai_file_resolve callout (files_api_url)","bypass files-api cluster (/v1/files)"],"credential":"user_credential ogx_files (per-user slot from x-user-ogx-key) injected on file_id callouts; file_url downloads use the separate credential-free resolver"},{"name":"Vector store","endpoint":"http://127.0.0.1:3002","usedBy":["openai_file_search_callout (vector_store_url)","bypass vector-stores-backend cluster (/v1/vector_stores)"],"credential":"user_credential ogx_files (per-user slot from x-user-ogx-key) injected on file_search callouts"},{"name":"Brave Search","endpoint":"provider:brave (external Brave API)","usedBy":["openai_web_search"],"credential":"user_credential brave_search (per-user slot from x-user-brave-key); WEB_SEARCH_API_KEY still required by provider config; missing per-user slot fails closed (no shared-key fallback)"}],"knobs":{"max_infer_iters":7,"max_iterations":8,"max_iterations_constraint":"must be >= max_infer_iters + 1 (7+1=8): initial inference plus allowed tool-backed continuations","timeout_ms":360000,"step_timeout_ms":300000,"max_response_bytes":67108864,"max_stream_response_bytes":67108864,"max_state_bytes":136314880,"file_search.timeout_ms":5000,"file_search.max_response_bytes":10485760,"file_search.max_total_response_bytes":67108864,"file_search.max_state_bytes":136314880,"file_search.on_failure":"closed","mcp_dispatch.max_calls_per_round":32,"mcp_dispatch.max_parallel_calls":8,"mcp_dispatch.max_result_bytes":1048576,"mcp_dispatch.max_total_result_bytes":8388608,"web_search.max_calls_per_round":32,"file_resolve.timeout_ms":10000,"file_resolve.on_missing":"reject","insecure_options.allow_private_endpoints":true,"insecure_options.allow_private_upstreams":true}};
+
+/* Per-scenario narrative + cluster/service highlight (derived, kept beside PIPELINE). */
+const SCEN_META = {
+  overview:{narr:"<b>Overview.</b> All filters shown at rest. trace_context and callout_authorization now bracket the identity band at the head of the spine. Select a scenario chip to trace the exact path — active filters glow, and skipped / inert / passthrough filters are dimmed and labeled with their state.",clusters:[],services:[]},
+  S1:{narr:"<b>Stateful create</b> (store defaults true) runs the full pre-IRR spine, enters the IRR for one inference round, then persists the composed response on the reverse path.",clusters:["inference-backend"],services:[]},
+  S2:{narr:"<b>Streaming create.</b> openai_stream_events composes one logical SSE lifecycle inside the IRR and populates the response_object that openai_response_store persists on the reverse path.",clusters:["inference-backend"],services:[]},
+  S3:{narr:"<b>Stateless create</b> (store:false) runs identically, but the store is inert on the reverse path — nothing is persisted.",clusters:["inference-backend"],services:[]},
+  S4:{narr:"<b>Multi-turn.</b> openai_responses_rehydrate loads the prior response via previous_response_id and prepends its history, then one inference round runs.",clusters:["inference-backend"],services:[]},
+  S5:{narr:"<b>File search loop.</b> The model emits file_search_call; openai_file_search_callout queries vector store 3002 at re-entry carrying the caller-scoped ogx_files credential and the request's trace identity; the loop owner finalizes with done.",clusters:["inference-backend","vector-stores-backend"],services:["Vector store"]},
+  S6:{narr:"<b>MCP loop.</b> openai_mcp_tool_resolve lists tools from connector trusted-mcp; the model emits an MCP call; openai_mcp_dispatch executes it against 127.0.0.1:8001. Both forward the mcp_gateway credential plus the opaque authorization assertion, and each hop gets a fresh trace span.",clusters:["inference-backend"],services:["MCP server"]},
+  S7:{narr:"<b>Web search loop.</b> The model emits web_search_call; openai_web_search executes it via Brave using the per-user brave_search slot (fails closed if the slot is missing), inheriting the request's trace identity.",clusters:["inference-backend"],services:["Brave Search"]},
+  S8:{narr:"<b>GET retrieve.</b> openai_response_store answers PRE-IRR as a terminal response and short-circuits — rehydrate, the callouts, the bypass carrier, and the IRR never run.",clusters:[],services:[]},
+  S9:{narr:"<b>WebSocket.</b> A GET /v1/responses handshake with Upgrade:websocket takes the bypass branch and routes to inference-backend.",clusters:["inference-backend"],services:[]},
+  S10:{narr:"<b>Non-Responses body.</b> A Chat/Anthropic/unclassified body posted to /v1/responses is not classified openai_responses, runs the bypass carrier, and gets a route-miss 404.",clusters:[],services:[]},
+  S11:{narr:"<b>Dedicated services.</b> /v1/prompts | /v1/embeddings | /v1/files | /v1/vector_stores take the bypass branch and route by path_prefix to their backend cluster.",clusters:["prompts-api","embeddings-api","files-api","vector-stores-backend"],services:["Files API","Vector store"]}
+};
+
+/* group → color + label */
+const GROUPS = {
+  trace:{c:"var(--c-trace)",label:"trace"},
+  identity:{c:"var(--c-identity)",label:"identity"},
+  conversations:{c:"var(--c-conversations)",label:"conversations"},
+  classification:{c:"var(--c-classification)",label:"classification"},
+  context:{c:"var(--c-context)",label:"context"},
+  store:{c:"var(--c-store)",label:"store / persist"},
+  routing:{c:"var(--c-routing)",label:"routing"},
+  irr:{c:"var(--c-irr)",label:"IRR (loop owner)"},
+  "irr-step":{c:"var(--c-dispatch)",label:"IRR step"},
+  backend:{c:"var(--c-backend)",label:"backend"}
+};
+/* per-filter color override for the mixed irr-step group */
+function filterColor(f){
+  if(f.group!=="irr-step") return GROUPS[f.group].c;
+  if(f.id==="openai_agentic_loop") return "var(--c-loop)";
+  if(["openai_web_search","openai_mcp_dispatch","openai_file_search_callout"].includes(f.id)) return "var(--c-dispatch)";
+  if(f.id==="openai_stream_events") return "var(--c-classification)";
+  if(["irr_router","irr_load_balancer","openai_responses_proxy"].includes(f.id)) return "var(--c-backend)";
+  return "var(--c-context)";
+}
+
+const STATE_LABEL = {active:"active",passthrough:"passthrough",inert:"inert",skipped:"skipped"};
+
+/* ---- small DOM helpers ---- */
+function el(tag,cls,txt){const n=document.createElement(tag);if(cls)n.className=cls;if(txt!=null)n.textContent=txt;return n;}
+function fmtBytes(n){
+  if(n>=1048576 && n%1048576===0) return (n/1048576)+" MiB";
+  if(n>=1024 && n%1024===0) return (n/1024)+" KiB";
+  return n+" B";
+}
+
+/* ============================================================================
+   RENDER — header tiles
+   ========================================================================= */
+(function renderTiles(){
+  const wrap=document.getElementById("tiles");
+  const disp=PIPELINE.filters.filter(f=>["openai_web_search","openai_mcp_dispatch","openai_file_search_callout"].includes(f.id)).length;
+  const tiles=[
+    ["Filters",PIPELINE.filters.length,""],
+    ["Dispatchers",disp,""],
+    ["Clusters",PIPELINE.clusters.length,""],
+    ["Loop caps",PIPELINE.knobs.max_infer_iters,"/ "+PIPELINE.knobs.max_iterations]
+  ];
+  tiles.forEach(([k,v,s])=>{
+    const t=el("div","tile");
+    t.appendChild(el("div","k",k));
+    const vv=el("div","v");vv.textContent=v;if(s){const sm=el("small");sm.textContent=" "+s;vv.appendChild(sm);}
+    t.appendChild(vv);wrap.appendChild(t);
+  });
+})();
+
+/* ============================================================================
+   RENDER — scenario chips
+   ========================================================================= */
+(function renderChips(){
+  const wrap=document.getElementById("chips");
+  function chip(id,label,tag){
+    const b=el("button","chip");b.type="button";b.setAttribute("role","radio");
+    b.dataset.scen=id;b.setAttribute("aria-checked","false");
+    b.appendChild(document.createTextNode(label));
+    if(tag){const t=el("span","tag");t.textContent=tag;b.appendChild(t);}
+    return b;
+  }
+  wrap.appendChild(chip("overview","All / overview"));
+  PIPELINE.scenarios.forEach(s=>wrap.appendChild(chip(s.id,s.label,s.id)));
+})();
+
+/* ============================================================================
+   RENDER — spine (pre-IRR filters: order 1..15) + IRR-step grid (order 16..26)
+   ========================================================================= */
+function gutterFor(f){
+  const box=el("div","stateset");box.style.setProperty("--gc",filterColor(f));
+  const kv=el("div","kv");
+  kv.innerHTML="<b>promotes</b> — "+escapeHtml(f.promotes);
+  box.appendChild(kv);
+  return box;
+}
+function escapeHtml(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+function detailFor(f){
+  const d=el("div","detail");
+  d.id="detail-"+f.id;
+  // config knobs
+  const keys=Object.keys(f.config||{});
+  if(keys.length){
+    d.appendChild(el("div","dh","Config knobs"));
+    keys.forEach(k=>{
+      const row=el("div","kvrow");
+      row.appendChild(el("span","kk",k));
+      let v=f.config[k];
+      if(typeof v!=="string")v=JSON.stringify(v);
+      row.appendChild(el("span","vv",v));
+      d.appendChild(row);
+    });
+  }
+  d.appendChild(el("div","dh","Phase"));
+  const p=el("div","prose");p.textContent=f.phase;d.appendChild(p);
+  d.appendChild(el("div","dh","Promotes / effect"));
+  const pr=el("div","prose");pr.textContent=f.promotes;d.appendChild(pr);
+  return d;
+}
+
+function cardFor(f,inSpine){
+  const card=el("div","card flt");
+  card.dataset.fid=f.id;
+  card.style.setProperty("--gc",filterColor(f));
+  card.setAttribute("tabindex","0");
+  card.setAttribute("role","group");
+  card.setAttribute("aria-label",f.name+" filter, order "+f.order);
+
+  const top=el("div","top");
+  top.appendChild(el("span","ord","#"+f.order));
+  top.appendChild(el("span","id",GROUPS[f.group].label));
+  top.appendChild(el("span","nm",f.name));
+  const badge=el("span","statebadge");badge.dataset.role="badge";top.appendChild(badge);
+  card.appendChild(top);
+
+  const sm=el("div","sm");sm.textContent=f.promotes;card.appendChild(sm);
+
+  const scnote=el("div","scnote");
+  const pfx=el("span","pfx");pfx.dataset.role="scpfx";
+  const txt=el("span");txt.dataset.role="scnote";
+  scnote.appendChild(pfx);scnote.appendChild(txt);
+  card.appendChild(scnote);
+
+  const exWrap=el("div","expander");
+  const btn=el("button","exbtn");btn.type="button";btn.textContent="▸ details";
+  const detail=detailFor(f);
+  btn.setAttribute("aria-expanded","false");
+  btn.setAttribute("aria-controls",detail.id);
+  btn.addEventListener("click",()=>{
+    const open=detail.classList.toggle("open");
+    btn.setAttribute("aria-expanded",open?"true":"false");
+    btn.textContent=(open?"▾":"▸")+" details";
+  });
+  exWrap.appendChild(btn);
+  card.appendChild(exWrap);
+  card.appendChild(detail);
+
+  attachTooltip(card,f);
+  return card;
+}
+
+(function renderSpine(){
+  const spine=document.getElementById("spine");
+  PIPELINE.filters.filter(f=>f.order<=15).forEach(f=>{
+    const node=el("div","node");
+    // gutter
+    const g=el("div","gutter");
+    g.appendChild(el("div","glbl",(f.group==="store"?"reads + writes state":"writes state")));
+    const gs=gutterFor(f);
+    g.appendChild(gs);
+    node.appendChild(g);
+    // rail
+    const rail=el("div","rail-line");
+    const stub=el("span","stub");stub.style.setProperty("--gc",filterColor(f));
+    const port=el("span","port");port.style.setProperty("--gc",filterColor(f));
+    rail.appendChild(stub);rail.appendChild(port);
+    node.appendChild(rail);
+    // card
+    node.appendChild(cardFor(f,true));
+    spine.appendChild(node);
+  });
+})();
+
+(function renderIrrGrid(){
+  const grid=document.getElementById("irrgrid");
+  PIPELINE.filters.filter(f=>f.group==="irr"||f.group==="irr-step").forEach(f=>{
+    grid.appendChild(cardFor(f,false));
+  });
+})();
+
+/* ============================================================================
+   RENDER — right rail: legend, caps donuts, backends, services
+   ========================================================================= */
+(function renderLegend(){
+  const wrap=document.getElementById("legend");
+  function swatch(color,label){
+    const row=el("div","lg");
+    const i=el("i");i.style.background=color;
+    row.appendChild(i);
+    row.appendChild(document.createTextNode(label));
+    wrap.appendChild(row);
+  }
+  // Pre-IRR / sequential groups (one hue each).
+  [
+    ["trace","trace / correlation"],
+    ["identity","identity adapters"],
+    ["conversations","conversations"],
+    ["classification","classify"],
+    ["context","context / rehydrate"],
+    ["store","store / persist"],
+    ["routing","routing / bypass"]
+  ].forEach(([g,label])=>swatch(GROUPS[g].c,label));
+  // The IRR step is a MIXED group — filterColor() paints its cards in four
+  // different hues by role, so the key lists each role with its true color
+  // instead of one swatch that would contradict the grid.
+  const sub=el("div","keysub");sub.textContent="IRR step (mixed)";
+  sub.style.marginTop="9px";sub.style.paddingTop="9px";sub.style.borderTop="1px solid var(--stroke)";
+  wrap.appendChild(sub);
+  [
+    ["var(--c-loop)","loop owner — IRR + agentic_loop"],
+    ["var(--c-dispatch)","dispatchers — web / mcp / file_search"],
+    ["var(--c-classification)","stream compose — stream_events"],
+    ["var(--c-backend)","route + proxy + backend"]
+  ].forEach(([c,label])=>swatch(c,label));
+})();
+
+function donut(value,max,label,color){
+  const r=26,c=2*Math.PI*r,frac=Math.max(0,Math.min(1,value/max));
+  const wrap=el("div","donut");
+  const svg=document.createElementNS("http://www.w3.org/2000/svg","svg");
+  svg.setAttribute("width","72");svg.setAttribute("height","72");svg.setAttribute("viewBox","0 0 72 72");
+  svg.setAttribute("role","img");svg.setAttribute("aria-label",label+" "+value+" of "+max);
+  const bg=document.createElementNS(svg.namespaceURI,"circle");
+  bg.setAttribute("cx","36");bg.setAttribute("cy","36");bg.setAttribute("r",r);
+  bg.setAttribute("fill","none");bg.setAttribute("stroke","#1d2b34");bg.setAttribute("stroke-width","7");
+  svg.appendChild(bg);
+  const fg=document.createElementNS(svg.namespaceURI,"circle");
+  fg.setAttribute("cx","36");fg.setAttribute("cy","36");fg.setAttribute("r",r);
+  fg.setAttribute("fill","none");fg.setAttribute("stroke",color);fg.setAttribute("stroke-width","7");
+  fg.setAttribute("stroke-linecap","round");fg.setAttribute("stroke-dasharray",c);
+  fg.setAttribute("stroke-dashoffset",c*(1-frac));
+  fg.setAttribute("transform","rotate(-90 36 36)");
+  fg.dataset.circ=c;
+  // Respect reduced motion: skip the sweep so the ring updates instantly.
+  if(!window.matchMedia("(prefers-reduced-motion: reduce)").matches){
+    fg.style.transition="stroke-dashoffset .5s ease";
+  }
+  svg.appendChild(fg);
+  const t=document.createElementNS(svg.namespaceURI,"text");
+  t.setAttribute("x","36");t.setAttribute("y","41");t.setAttribute("text-anchor","middle");
+  t.setAttribute("fill","#e2edf3");t.setAttribute("font-size","16");t.setAttribute("font-family","var(--mono)");
+  t.textContent=value;t.dataset.role="donutval";
+  svg.appendChild(t);
+  wrap.appendChild(svg);
+  const lab=el("div","lab");lab.innerHTML="<b>"+label+"</b>max "+max;wrap.appendChild(lab);
+  wrap._fg=fg;wrap._txt=t;wrap._max=max;
+  return wrap;
+}
+let donutInfer,donutIter;
+(function renderCaps(){
+  const wrap=document.getElementById("caps");
+  donutInfer=donut(0,PIPELINE.knobs.max_infer_iters,"infer",getComputedStyle(document.documentElement).getPropertyValue("--c-loop"));
+  donutIter=donut(0,PIPELINE.knobs.max_iterations,"iter",getComputedStyle(document.documentElement).getPropertyValue("--accent"));
+  wrap.appendChild(donutInfer);wrap.appendChild(donutIter);
+})();
+function setDonut(d,v){
+  const c=parseFloat(d._fg.dataset.circ);
+  const frac=Math.max(0,Math.min(1,v/d._max));
+  d._fg.setAttribute("stroke-dashoffset",c*(1-frac));
+  d._txt.textContent=v;
+}
+
+(function renderBackends(){
+  const wrap=document.getElementById("backends");
+  PIPELINE.clusters.forEach(cl=>{
+    const b=el("div","bk live");b.dataset.cluster=cl.name;
+    const bh=el("div","bh");
+    bh.appendChild(el("span","nm",cl.name));
+    const ep=el("span","ep");
+    const dot=el("span","dot");ep.appendChild(dot);
+    ep.appendChild(document.createTextNode(cl.endpoints.join(", ")));
+    bh.appendChild(ep);
+    b.appendChild(bh);
+    b.appendChild(el("div","from",cl.routedBy));
+    attachTooltipRaw(b,cl.name,[["endpoints",cl.endpoints.join(", ")],["defined in",cl.definedIn],["routed by",cl.routedBy],...(cl.note?[["note",cl.note]]:[])]);
+    wrap.appendChild(b);
+  });
+})();
+
+(function renderServices(){
+  const wrap=document.getElementById("services");
+  PIPELINE.externalServices.forEach(s=>{
+    const row=el("div","svc");row.dataset.service=s.name;
+    row.appendChild(el("span","nm",s.name));
+    const ep=el("span","ep");ep.textContent=s.endpoint;row.appendChild(ep);
+    const rows=[["endpoint",s.endpoint],["used by",s.usedBy.join("; ")]];
+    if(s.connectorId)rows.push(["connector",s.connectorId]);
+    if(s.credential)rows.push(["credential",s.credential]);
+    attachTooltipRaw(row,s.name,rows);
+    wrap.appendChild(row);
+  });
+})();
+
+(function renderFoot(){
+  const k=PIPELINE.knobs;
+  const foot=document.getElementById("foot");
+  foot.innerHTML=
+    "<b>Accuracy note.</b> Persistence runs on the RESPONSE path (reverse config order): openai_response_store is pre-IRR (#10) yet persists AFTER the IRR composes the terminal object. For stream:true it persists ResponsesState.response_object, which ONLY openai_stream_events populates. GET /v1/responses/{id} is answered by the store PRE-IRR and short-circuits rehydrate / callouts / bypass / IRR. The IRR strips every x-praxis-* header, so its step router is PATH-ONLY and Responses-vs-Chat discrimination lives at the pre-IRR bypass carrier. openai_agentic_loop is the sole loop transition authority (issue #1046); the three dispatchers have no response phase. inference-backend is defined twice (bypass LB + IRR-step LB) — a Direct-OpenAI variant must edit BOTH. SSRF for callouts relies on insecure_options.allow_private_upstreams:true.<br><br>"+
+    "<b>Trace + scoped credentials.</b> trace_context (#1) establishes a typed correlation identity BEFORE the IRR snapshots request extensions, so every nested web-search / OGX / MCP callout keeps this request's trace while Praxis core mints a fresh span per hop. callout_credentials captures per-user secrets into typed slots (brave_search / ogx_files / mcp_gateway) and STRIPS the raw x-user-* ingress headers; each dispatcher selects only its slot (web_search→brave_search, file_resolve + file_search→ogx_files, MCP→mcp_gateway), and the legacy raw authorization forward has been dropped from the file callouts. callout_authorization (#4) is separate from credentials: it deletes any client-supplied x-mcp-authorized and sets a verified, opaque assertion forwarded ONLY to configured connector_id targets — the MCP Gateway makes the decision.<br><br>"+
+    "<b>Timeouts</b> "+k.timeout_ms+" ms loop / "+k.step_timeout_ms+" ms step · "+
+    "<b>Byte caps</b> response "+fmtBytes(k.max_response_bytes)+" · state "+fmtBytes(k.max_state_bytes)+" · "+
+    "<b>MCP</b> "+k["mcp_dispatch.max_parallel_calls"]+" parallel, result "+fmtBytes(k["mcp_dispatch.max_result_bytes"])+"/"+fmtBytes(k["mcp_dispatch.max_total_result_bytes"])+" · "+
+    "<b>file_search</b> "+k["file_search.timeout_ms"]+" ms, on_failure "+k["file_search.on_failure"]+" · "+
+    "<b>file_resolve</b> "+k["file_resolve.timeout_ms"]+" ms, on_missing "+k["file_resolve.on_missing"]+".";
+})();
+
+/* ============================================================================
+   TOOLTIP (supplement only — duplicates on-card text, never gates meaning)
+   ========================================================================= */
+const tt=document.getElementById("tt");
+function showTip(html,x,y){
+  tt.innerHTML=html;tt.classList.add("show");tt.setAttribute("aria-hidden","false");
+  const pad=14,w=tt.offsetWidth,h=tt.offsetHeight;
+  let nx=x+pad,ny=y+pad;
+  if(nx+w>window.innerWidth-8)nx=x-w-pad;
+  if(ny+h>window.innerHeight-8)ny=y-h-pad;
+  tt.style.left=Math.max(8,nx)+"px";tt.style.top=Math.max(8,ny)+"px";
+}
+function hideTip(){tt.classList.remove("show");tt.setAttribute("aria-hidden","true");}
+function tipHtml(title,rows){
+  let h="<div class='tth'>"+escapeHtml(title)+"</div>";
+  rows.forEach(([k,v])=>{h+="<div class='ttk'>"+escapeHtml(k)+"</div><div class='ttv'>"+escapeHtml(v)+"</div>";});
+  return h;
+}
+function attachTooltip(node,f){
+  const rows=[["phase",f.phase],["promotes",f.promotes]];
+  const keys=Object.keys(f.config||{});
+  if(keys.length)rows.push(["config",keys.map(k=>k+"="+(typeof f.config[k]==="string"?f.config[k]:JSON.stringify(f.config[k]))).join("  ·  ")]);
+  const html=tipHtml(f.name,rows);
+  node.addEventListener("mousemove",e=>showTip(html,e.clientX,e.clientY));
+  node.addEventListener("mouseleave",hideTip);
+  node.addEventListener("focus",()=>{const r=node.getBoundingClientRect();showTip(html,r.left,r.bottom);});
+  node.addEventListener("blur",hideTip);
+}
+function attachTooltipRaw(node,title,rows){
+  const html=tipHtml(title,rows);
+  node.addEventListener("mousemove",e=>showTip(html,e.clientX,e.clientY));
+  node.addEventListener("mouseleave",hideTip);
+}
+
+/* ============================================================================
+   SCENARIO ENGINE — single source of truth drives highlight + tooltip + caps
+   ========================================================================= */
+const body=document.body;
+let currentScen="overview";
+
+function stateForSvg(fid,scen){
+  // map svg-only ids to filter ids
+  if(fid==="__inference"){
+    return SCEN_META[scen]&&SCEN_META[scen].clusters.includes("inference-backend")?"active":"skipped";
+  }
+  const f=PIPELINE.filters.find(x=>x.id===fid);
+  if(!f)return null;
+  if(scen==="overview")return "overview";
+  return (f.scenarios[scen]||{}).state||"skipped";
+}
+
+function applyScenario(scen){
+  currentScen=scen;
+  const overview=scen==="overview";
+  body.classList.toggle("scenario",!overview);
+
+  // narrative
+  const meta=SCEN_META[scen]||SCEN_META.overview;
+  const sdef=PIPELINE.scenarios.find(s=>s.id===scen);
+  let narrHtml=meta.narr;
+  if(sdef){
+    narrHtml+=" <span class='rounds'>· "+escapeHtml(sdef.request)+" · loop rounds: "+escapeHtml(String(sdef.loopRounds))+"</span>";
+  }
+  document.getElementById("narr").innerHTML=narrHtml;
+
+  // cards
+  document.querySelectorAll(".card.flt").forEach(card=>{
+    const f=PIPELINE.filters.find(x=>x.id===card.dataset.fid);
+    card.classList.remove("st-active","st-passthrough","st-inert","st-skipped","dimmed","hl","pulse");
+    const badge=card.querySelector("[data-role=badge]");
+    if(overview){badge.textContent="";return;}
+    const sc=f.scenarios[scen]||{state:"skipped",note:""};
+    card.classList.add("st-"+sc.state);
+    if(sc.state==="active"){card.classList.add("hl");}
+    else{card.classList.add("dimmed");}
+    badge.textContent=STATE_LABEL[sc.state]||sc.state;
+    card.querySelector("[data-role=scpfx]").textContent="→ this request:";
+    card.querySelector("[data-role=scnote]").textContent=sc.note||"";
+  });
+
+  // svg filter groups
+  document.querySelectorAll("svg .flt").forEach(g=>{
+    g.classList.remove("on","dim");
+    if(overview)return;
+    const st=stateForSvg(g.dataset.fid,scen);
+    if(st==="active")g.classList.add("on");
+    else g.classList.add("dim");
+  });
+
+  // backends + services
+  document.querySelectorAll(".bk").forEach(b=>{
+    b.classList.remove("hlcluster","dimcluster");
+    if(overview)return;
+    if(meta.clusters.includes(b.dataset.cluster))b.classList.add("hlcluster");
+    else b.classList.add("dimcluster");
+  });
+  document.querySelectorAll(".svc").forEach(s=>{
+    s.classList.remove("hlcluster","dimcluster");
+    if(overview)return;
+    if(meta.services.includes(s.dataset.service))s.classList.add("hlcluster");
+    else s.classList.add("dimcluster");
+  });
+
+  // caps donuts — reflect this scenario's steady-state
+  const rounds=sdef?sdef.loopRounds:0;
+  let iterVal=0,inferVal=0;
+  if(sdef&&sdef.entersIRR){
+    if(typeof rounds==="number"){iterVal=rounds;inferVal=rounds;}
+    else{iterVal=2;inferVal=2;} // 2+ scenarios: show model→tool→model steady state
+  }
+  setDonut(donutInfer,inferVal);
+  setDonut(donutIter,iterVal);
+}
+
+/* ---- chip wiring (keyboard: arrows + home/end, activate) ---- */
+const chipEls=Array.from(document.querySelectorAll("#chips .chip"));
+function selectChip(btn){
+  chipEls.forEach(c=>{c.classList.remove("active");c.setAttribute("aria-checked","false");c.tabIndex=-1;});
+  btn.classList.add("active");btn.setAttribute("aria-checked","true");btn.tabIndex=0;
+  applyScenario(btn.dataset.scen);
+}
+chipEls.forEach((btn,i)=>{
+  btn.tabIndex=i===0?0:-1;
+  btn.addEventListener("click",()=>{stopPlay();selectChip(btn);});
+  btn.addEventListener("keydown",e=>{
+    let ni=-1;
+    if(e.key==="ArrowRight"||e.key==="ArrowDown")ni=(i+1)%chipEls.length;
+    else if(e.key==="ArrowLeft"||e.key==="ArrowUp")ni=(i-1+chipEls.length)%chipEls.length;
+    else if(e.key==="Home")ni=0;
+    else if(e.key==="End")ni=chipEls.length-1;
+    if(ni>=0){e.preventDefault();chipEls[ni].focus();stopPlay();selectChip(chipEls[ni]);}
+  });
+});
+
+/* ---- phase toggle ---- */
+document.getElementById("phase").addEventListener("click",e=>{
+  const b=e.target.closest("button[data-phase]");if(!b)return;
+  document.querySelectorAll("#phase button").forEach(x=>{x.classList.remove("on");x.setAttribute("aria-pressed","false");});
+  b.classList.add("on");b.setAttribute("aria-pressed","true");
+  body.classList.remove("phase-request","phase-response");
+  body.classList.add("phase-"+b.dataset.phase);
+});
+
+/* ============================================================================
+   PLAY — animate the selected request; respects reduced motion
+   ========================================================================= */
+const reduce=window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+let playTimer=null,playing=false;
+const playBtn=document.getElementById("play"),playTxt=document.getElementById("playtxt");
+
+function stopPlay(){
+  if(playTimer){clearTimeout(playTimer);playTimer=null;}
+  playing=false;playBtn.classList.remove("playing");playTxt.textContent="Play trace";
+  document.querySelectorAll(".card.pulse").forEach(c=>c.classList.remove("pulse"));
+}
+function startPlay(){
+  const scen=currentScen==="overview"?"S1":currentScen;
+  if(currentScen==="overview")selectChip(chipEls.find(c=>c.dataset.scen==="S1"));
+  playing=true;playBtn.classList.add("playing");playTxt.textContent="Stop";
+  const sdef=PIPELINE.scenarios.find(s=>s.id===scen);
+
+  // sequential pulse over active filters in order
+  const active=PIPELINE.filters.filter(f=>((f.scenarios[scen]||{}).state)==="active").sort((a,b)=>a.order-b.order);
+  const cards=active.map(f=>document.querySelector('.card.flt[data-fid="'+f.id+'"]')).filter(Boolean);
+
+  if(reduce){
+    // no motion: jump to final iteration counts
+    finishRounds(sdef);
+    stopPlay();
+    return;
+  }
+
+  let idx=0;
+  const step=()=>{
+    if(!playing)return;
+    document.querySelectorAll(".card.pulse").forEach(c=>c.classList.remove("pulse"));
+    if(idx<cards.length){
+      const card=cards[idx];card.classList.add("pulse");
+      card.scrollIntoView({behavior:"smooth",block:"center"});
+      idx++;playTimer=setTimeout(step,650);
+    }else{
+      // animate loop rounds on the counters for tool scenarios
+      animateRounds(sdef,()=>{ if(playing){stopPlay();} });
+    }
+  };
+  step();
+}
+function finishRounds(sdef){
+  if(!sdef||!sdef.entersIRR){setDonut(donutInfer,0);setDonut(donutIter,0);return;}
+  const r=typeof sdef.loopRounds==="number"?sdef.loopRounds:3;
+  setDonut(donutInfer,r);setDonut(donutIter,r);
+}
+function animateRounds(sdef,done){
+  if(!sdef||!sdef.entersIRR){done();return;}
+  const total=typeof sdef.loopRounds==="number"?sdef.loopRounds:3;
+  let n=0;
+  const tick=()=>{
+    if(!playing){return;}
+    n++;
+    setDonut(donutInfer,Math.min(n,PIPELINE.knobs.max_infer_iters));
+    setDonut(donutIter,Math.min(n,PIPELINE.knobs.max_iterations));
+    if(n<total){playTimer=setTimeout(tick,700);}
+    else{playTimer=setTimeout(done,700);}
+  };
+  tick();
+}
+playBtn.addEventListener("click",()=>{ if(playing)stopPlay(); else startPlay(); });
+
+/* ============================================================================
+   INIT
+   ========================================================================= */
+selectChip(chipEls[0]); // overview
+</script>
+</body>
+</html>
