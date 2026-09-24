@@ -697,7 +697,6 @@ impl McpSubrequestClient {
     ///
     /// SSRF/DNS validation, TLS/SNI, Host binding, and the response-size ceiling
     /// are enforced by [`prepare_url_target`] and the executor.
-    #[expect(clippy::large_stack_frames, reason = "rmcp/executor futures are inherently large")]
     #[expect(
         clippy::too_many_arguments,
         reason = "method/uri/body/headers/limit describe one dial call"
@@ -865,7 +864,6 @@ impl McpSubrequestClient {
     /// Returns `(response, None)` when the callout was buffered anyway (Blocker 5:
     /// the full buffered body is preserved on `response.body`), and records a 413
     /// signal on [`CalloutOutcome::ResponseTooLarge`].
-    #[expect(clippy::large_stack_frames, reason = "rmcp/executor futures are inherently large")]
     #[expect(
         clippy::too_many_arguments,
         reason = "method/uri/body/headers/limit describe one dial call"
@@ -1114,7 +1112,6 @@ impl StreamableHttpClient for McpSubrequestClient {
         clippy::too_many_lines,
         reason = "streaming + buffered-fallback ladder mirrors post_message structure"
     )]
-    #[expect(clippy::large_stack_frames, reason = "rmcp/executor futures are inherently large")]
     async fn post_message_with_max_sse_event_size(
         &self,
         uri: Arc<str>,

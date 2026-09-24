@@ -754,7 +754,7 @@ async fn two_user_file_id_contexts_are_isolated() {
     let captured = (0..4)
         .map(|_| requests.recv_timeout(Duration::from_secs(1)).unwrap())
         .collect::<Vec<_>>();
-    for (pair, suffix) in captured.chunks_exact(2).zip(["a", "b"]) {
+    for (pair, suffix) in captured.as_chunks::<2>().0.iter().zip(["a", "b"]) {
         for request in pair {
             for expected in [
                 format!("authorization: Bearer scoped-user-{suffix}"),

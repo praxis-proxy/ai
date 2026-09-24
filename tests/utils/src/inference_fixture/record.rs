@@ -2223,7 +2223,7 @@ mod tests {
         for _ in 0..CHUNK_COUNT {
             provider_tx
                 .unbounded_send(Ok(Bytes::from_owner(TrackedByte {
-                    byte: [b'b'],
+                    byte: *b"b",
                     dropped: Arc::clone(&dropped),
                 })))
                 .unwrap();

@@ -7,7 +7,6 @@ use std::{
     error::Error as _,
     fmt::Write as _,
     fs,
-    io::{Read as _, Write as _},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::mpsc,
@@ -15,7 +14,6 @@ use std::{
     time::Duration,
 };
 
-use clap::Parser as _;
 use praxis_test_utils::inference_fixture::{
     BodyKind, FixtureProvenance, InferenceProtocol, InferenceScenario, NormalizationMetadata, ProvenanceKind,
     RecordedBody, RecordedExchange, RecordedRequest, RecordedResponse, ScenarioExpectation, ScenarioTurn, WireFixture,

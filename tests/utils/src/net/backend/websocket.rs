@@ -493,8 +493,6 @@ async fn capture_and_service_message(
 mod tests {
     use std::time::Duration;
 
-    use futures::{SinkExt as _, StreamExt as _};
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
     use super::*;

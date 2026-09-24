@@ -354,8 +354,7 @@ impl ApiClient {
     #[expect(
         clippy::too_many_arguments,
         clippy::too_many_lines,
-        clippy::large_stack_frames,
-        reason = "callout assembly holds the staged target, sub-request, and extensions; transport futures are already boxed"
+        reason = "callout assembly holds the staged target, sub-request, and extensions"
     )]
     async fn execute_via_chain(
         &self,

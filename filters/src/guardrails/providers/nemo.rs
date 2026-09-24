@@ -250,10 +250,6 @@ impl NemoProvider {
         clippy::too_many_lines,
         reason = "target pinning and classified response mapping form one operation"
     )]
-    #[expect(
-        clippy::large_stack_frames,
-        reason = "filtered subrequest executor owns the callout state machine"
-    )]
     async fn execute_callout(
         &self,
         request: SubRequest,

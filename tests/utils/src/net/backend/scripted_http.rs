@@ -349,10 +349,6 @@ async fn run_listener(
 }
 
 /// Complete one HTTP request/response cycle against a single connection.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "bounded test-backend connection state is only slightly above the workspace threshold"
-)]
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     state: Arc<ScriptState>,
@@ -740,8 +736,6 @@ async fn read_full_request(stream: &mut tokio::net::TcpStream, peek: PeekedHttpR
 )]
 mod tests {
     use std::time::Duration;
-
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
 

@@ -810,12 +810,10 @@ fn decode_hex(hex: &str) -> Option<Vec<u8>> {
     }
 
     hex.as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let hi = hex_digit(*pair.first()?)?;
-            let lo = hex_digit(*pair.last()?)?;
-            Some(hi << 4 | lo)
-        })
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[hi, lo]| Some(hex_digit(hi)? << 4 | hex_digit(lo)?))
         .collect()
 }
 

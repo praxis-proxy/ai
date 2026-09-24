@@ -418,7 +418,7 @@ fn resolve_api_key(filter_name: &'static str, raw: &str) -> Result<String, Filte
 )]
 mod tests {
     use praxis_filter::parse_filter_config;
-    use secrecy::{ExposeSecret as _, SecretString};
+    use secrecy::SecretString;
 
     use super::*;
 

@@ -1028,12 +1028,10 @@ fn encode_hex_bytes(bytes: &[u8]) -> String {
 /// Decode a hex-encoded byte slice.
 fn decode_hex_bytes(hex: &str) -> Vec<u8> {
     hex.as_bytes()
-        .chunks_exact(2)
-        .filter_map(|pair| {
-            let hi = hex_nibble(*pair.first()?)?;
-            let lo = hex_nibble(*pair.last()?)?;
-            Some(hi << 4 | lo)
-        })
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .filter_map(|&[hi, lo]| Some(hex_nibble(hi)? << 4 | hex_nibble(lo)?))
         .collect()
 }
 
