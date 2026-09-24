@@ -1723,7 +1723,11 @@ async fn json_stream_buffer_double_delivery_extracts_once() {
         Some("15"),
         "the EOS frozen buffer must be parsed exactly once"
     );
-    assert_eq!(ctx.get_metadata("token.output"), Some("42"), "output tokens should match");
+    assert_eq!(
+        ctx.get_metadata("token.output"),
+        Some("42"),
+        "output tokens should match"
+    );
 }
 
 /// When a buffered chain releases its buffer mid-stream, the EOS call carries
@@ -1756,7 +1760,11 @@ async fn json_stream_buffer_released_falls_back_to_chunks() {
         Some("7"),
         "released buffers must still extract from the streamed chunks"
     );
-    assert_eq!(ctx.get_metadata("token.output"), Some("11"), "output tokens should match");
+    assert_eq!(
+        ctx.get_metadata("token.output"),
+        Some("11"),
+        "output tokens should match"
+    );
 }
 
 /// Run a full `on_response` -> `on_response_body` cycle and return the prompt

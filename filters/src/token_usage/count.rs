@@ -409,9 +409,9 @@ fn handle_json_body(
     // instead; the hex path stays for plain `Stream` chains and for chains
     // whose buffer was released mid-stream (where the EOS call carries no
     // body).
-    let buffered_eos_body = body.as_deref().filter(|_| {
-        end_of_stream && matches!(ctx.response_body_mode, BodyMode::StreamBuffer { .. })
-    });
+    let buffered_eos_body = body
+        .as_deref()
+        .filter(|_| end_of_stream && matches!(ctx.response_body_mode, BodyMode::StreamBuffer { .. }));
 
     if let Some(chunk) = body.as_ref()
         && buffered_eos_body.is_none()
@@ -425,9 +425,7 @@ fn handle_json_body(
 
     if end_of_stream {
         let hex_data = if buffered_eos_body.is_none() {
-            ctx.filter_metadata
-                .get(META_BUF_HEX)
-                .and_then(|hex| decode_hex(hex))
+            ctx.filter_metadata.get(META_BUF_HEX).and_then(|hex| decode_hex(hex))
         } else {
             None
         };
