@@ -19,7 +19,7 @@
       "resp_5bffeecee0988c576925000000000000": "resp_recorded_0001",
       "resp_5bffeecefb868c576925000000000002": "resp_recorded_0004",
       "resp_5bffeecf00fe8c576925000000000004": "resp_recorded_0007",
-      "rs_resp_5bffeecee0988c576925000000000000": "rs_recorded_0002"
+      "rs_resp_5bffeecee0988c576925000000000000_chatcmpl-controlled-0": "rs_recorded_0002"
     }
   },
   "turns": [

@@ -11,10 +11,10 @@
   "normalization": {
     "version": 1,
     "linked_ids": {
-      "chatcmpl-9de28af1f824d4f1": "chatcmpl-recorded-0004",
-      "msg_resp_5b27e0df91cefc2e2ec4000000000000": "msg_recorded_0003",
-      "resp_5b27e0df91cefc2e2ec4000000000000": "resp_recorded_0001",
-      "rs_resp_5b27e0df91cefc2e2ec4000000000000": "rs_recorded_0002"
+      "chatcmpl-b50a20ad23d3e871": "chatcmpl-recorded-0004",
+      "msg_resp_5c3fca23b1c4c125ef56000000000000": "msg_recorded_0003",
+      "resp_5c3fca23b1c4c125ef56000000000000": "resp_recorded_0001",
+      "rs_resp_5c3fca23b1c4c125ef56000000000000_chatcmpl-b50a20ad23d3e871": "rs_recorded_0002"
     }
   },
   "turns": [
@@ -70,7 +70,7 @@
                 {
                   "content": [
                     {
-                      "text": "The user is asking for the result of the addition \"2+2\".\nThe user requested the output to be \"just the number\".\n2 + 2 = 4.\nThe output should be \"4\".",
+                      "text": "The user is asking for the sum of 2+2.\nThe user requested to reply with *just* the number.\n\n    *   2 + 2 = 4.\nThe answer should be \"4\".",
                       "type": "reasoning_text"
                     }
                   ],
@@ -123,11 +123,11 @@
                   "cache_write_tokens": 0,
                   "cached_tokens": 0
                 },
-                "output_tokens": 51,
+                "output_tokens": 52,
                 "output_tokens_details": {
                   "reasoning_tokens": 0
                 },
-                "total_tokens": 80
+                "total_tokens": 81
               }
             }
           }
@@ -177,7 +177,7 @@
                     "audio": null,
                     "content": "4",
                     "function_call": null,
-                    "reasoning": "The user is asking for the result of the addition \"2+2\".\nThe user requested the output to be \"just the number\".\n2 + 2 = 4.\nThe output should be \"4\".",
+                    "reasoning": "The user is asking for the sum of 2+2.\nThe user requested to reply with *just* the number.\n\n    *   2 + 2 = 4.\nThe answer should be \"4\".",
                     "refusal": null,
                     "role": "assistant",
                     "tool_calls": []
@@ -197,10 +197,10 @@
               "prompt_token_ids": null,
               "service_tier": null,
               "usage": {
-                "completion_tokens": 51,
+                "completion_tokens": 52,
                 "prompt_tokens": 29,
                 "prompt_tokens_details": null,
-                "total_tokens": 80
+                "total_tokens": 81
               }
             }
           }

@@ -799,7 +799,8 @@ fn translate_success_response(
             .with_reasoning_options(reasoning.clone());
     // Echo the client's canonical tool declarations, not the backend-lowered forms
     // that openai_file_search_callout writes into request_body (e.g. a hosted
-    // `file_search` tool lowered to a private `function`).
+    // `file_search` tool lowered to a private `function`). This mirrors how the
+    // outbound request is built from `state.tools`/`state.tool_choice`.
     response_context.tools = &state.tools;
     response_context.tool_choice = state.original_tool_choice.as_ref().or(Some(&state.tool_choice));
     let provider_response: serde_json::Value = serde_json::from_slice(body)
