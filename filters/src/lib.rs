@@ -8,6 +8,15 @@
 //! Contains agentic protocol filters (A2A, MCP), guardrails,
 //! inference routing, prompt enrichment, and token usage handling.
 
+#[cfg(all(
+    any(feature = "azure-ad-filter", feature = "gcp-adc-filter"),
+    not(any(feature = "callout-rustls", feature = "callout-native-tls"))
+))]
+compile_error!(
+    "azure-ad-filter and gcp-adc-filter require a callout TLS backend: \
+     enable `callout-rustls` or `callout-native-tls`"
+);
+
 pub mod agentic;
 #[cfg(feature = "aws-sigv4-filter")]
 pub mod aws;

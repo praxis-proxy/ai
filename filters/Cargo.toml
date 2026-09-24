@@ -38,8 +38,8 @@ openai-mcp-tools = ["store", "praxis-ai-apis/openai-mcp-tools"]
 openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
 # Every non-experimental filter; equals the pre-feature-split capability.
 full = ["standard", "openai-all", "store-postgres", "callout-rustls"]
-callout-rustls = ["praxis-ai-apis/callout-rustls"]
-callout-native-tls = ["praxis-ai-apis/callout-native-tls"]
+callout-rustls = ["praxis-ai-apis/callout-rustls", "reqwest?/rustls"]
+callout-native-tls = ["praxis-ai-apis/callout-native-tls", "reqwest?/native-tls"]
 # Experimental: the generic http_callout filter. Work in progress; the config
 # surface may change. Activates the `experimental` marker.
 http-callout-filter = ["experimental", "dep:serde_json_path"]

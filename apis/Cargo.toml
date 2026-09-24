@@ -81,8 +81,11 @@ zstd = { workspace = true, optional = true }
 [dev-dependencies]
 allocation-counter = { workspace = true }
 axum = { workspace = true }
+rcgen = { workspace = true }
 rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
+rustls = { workspace = true }
 schemars = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }

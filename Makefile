@@ -147,6 +147,9 @@ test-callout-tls-features:
 		echo "ERROR: callout-native-tls proxy reqwest contains rustls backend"; \
 		exit 1; \
 	fi
+	cargo test -p praxis-ai-apis --no-default-features \
+		--features openai-file-resolve-filter,callout-native-tls \
+		callout_target::tests::pinned_client_completes_tls_handshake $(_NOCAPTURE)
 
 test-schema:
 	cargo test -p praxis-tests-schema --features store-all $(_NOCAPTURE)
