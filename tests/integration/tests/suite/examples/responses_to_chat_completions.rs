@@ -607,3 +607,71 @@ fn responses_to_chat_completions_rejects_unknown_previous_response() {
         "unknown predecessor must not reach backend"
     );
 }
+
+#[test]
+fn responses_to_chat_completions_preserves_nonzero_zero_and_absent_cache_write_counts() {
+    let chat_response_nonzero = serde_json::json!({
+        "id": "chatcmpl_nonzero",
+        "object": "chat.completion",
+        "model": "gpt-4.1-mini",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+            "prompt_tokens_details": {"cached_tokens": 80, "cache_write_tokens": 20}
+        }
+    });
+    let chat_response_zero = serde_json::json!({
+        "id": "chatcmpl_zero",
+        "object": "chat.completion",
+        "model": "gpt-4.1-mini",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+            "prompt_tokens_details": {"cached_tokens": 80, "cache_write_tokens": 0}
+        }
+    });
+    let chat_response_absent = serde_json::json!({
+        "id": "chatcmpl_absent",
+        "object": "chat.completion",
+        "model": "gpt-4.1-mini",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110,
+            "prompt_tokens_details": {"cached_tokens": 80}
+        }
+    });
+
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, chat_response_nonzero.to_string()),
+        (200, chat_response_zero.to_string()),
+        (200, chat_response_absent.to_string()),
+    ])
+    .start_with_shutdown();
+
+    let proxy_port = free_port();
+    let (config, _db) = load_test_config(
+        "cache_write_counts",
+        proxy_port,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    );
+    let proxy = start_proxy(&config);
+    let req = r#"{"model":"gpt-4.1-mini","input":"Hi","stream":false,"store":false}"#;
+
+    // 1. Nonzero
+    let raw1 = http_send(proxy.addr(), &json_post("/v1/responses", req));
+    let resp1: serde_json::Value = serde_json::from_str(&parse_body(&raw1)).unwrap();
+    assert_eq!(resp1["usage"]["input_tokens_details"]["cached_tokens"], 80);
+    assert_eq!(resp1["usage"]["input_tokens_details"]["cache_write_tokens"], 20);
+
+    // 2. Zero
+    let raw2 = http_send(proxy.addr(), &json_post("/v1/responses", req));
+    let resp2: serde_json::Value = serde_json::from_str(&parse_body(&raw2)).unwrap();
+    assert_eq!(resp2["usage"]["input_tokens_details"]["cached_tokens"], 80);
+    assert_eq!(resp2["usage"]["input_tokens_details"]["cache_write_tokens"], 0);
+
+    // 3. Absent
+    let raw3 = http_send(proxy.addr(), &json_post("/v1/responses", req));
+    let resp3: serde_json::Value = serde_json::from_str(&parse_body(&raw3)).unwrap();
+    assert_eq!(resp3["usage"]["input_tokens_details"]["cached_tokens"], 80);
+    assert_eq!(resp3["usage"]["input_tokens_details"]["cache_write_tokens"], 0);
+}

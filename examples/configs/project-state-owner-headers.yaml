@@ -1,14 +1,15 @@
-# Trusted State Owner Header Projection
+# Project Trusted State Owner Headers
 #
 # Demonstrates the production boundary used when an external authenticator
 # injects separate tenant and subject headers. `state_owner` consumes those
 # assertions into an immutable internal owner and strips the inbound copies.
-# `state_owner_headers` then recreates destination-specific headers from that
-# normalized context. Place the projection only in a chain whose upstream is
-# authorized to receive identity (for example, an OGX upstream-header endpoint).
+# `project_state_owner_headers` then recreates destination-specific headers
+# from that normalized context. Place the projection only in a chain whose
+# upstream is authorized to receive identity (for example, an OGX
+# upstream-header endpoint).
 #
 # Usage:
-#   cargo run -p praxis-ai-proxy -- -c examples/configs/state-owner-headers.yaml
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/project-state-owner-headers.yaml
 #   curl http://localhost:8080/v1/responses \
 #     -H "x-auth-tenant: tenant-a" \
 #     -H "x-auth-user: alice"
@@ -33,7 +34,7 @@ filter_chains:
 
       # OGX upstream_header authentication reads these names when configured
       # with principal_header: x-user-id and tenant_header: x-tenant-id.
-      - filter: state_owner_headers
+      - filter: project_state_owner_headers
         tenant_header: x-tenant-id
         subject_header: x-user-id
 

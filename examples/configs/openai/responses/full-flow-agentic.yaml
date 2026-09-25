@@ -26,13 +26,16 @@
 #      header provenance. The IRR carries the resulting typed request extension
 #      across iterations, while each callout explicitly selects its slot for its
 #      exact-authority provider destination.
-#      state_owner_headers then projects that context as x-tenant-id and
+#      project_state_owner_headers then projects that context as x-tenant-id and
 #      x-user-id for OGX and explicitly allowlisted callouts. The raw ingress
 #      names are stripped, and the projection is repeated inside the IRR step
 #      because it owns a separate destination request lifecycle.
 #      These adapters do not themselves change persistence predicates: this
 #      context-only configuration must be combined with owner-scoped store
 #      enforcement before it is exposed as a multi-owner state service.
+#
+#   0. openai_operation publishes the typed registry match consumed by
+#      openai_conversations. It must remain earlier in this filter chain.
 #
 #   1. openai_conversations handles CRUD for the Conversations API
 #      (/v1/conversations) and sets has_conversation metadata when a
@@ -347,9 +350,12 @@ filter_chains:
       # Emit the normalized owner in the contract expected by OGX and by the
       # explicitly configured downstream callouts below. Raw x-auth-* inputs
       # are stripped and never used directly as destination assertions.
-      - filter: state_owner_headers
+      - filter: project_state_owner_headers
         tenant_header: x-tenant-id
         subject_header: x-user-id
+
+      # Publishes the typed operation consumed by openai_conversations.
+      - filter: openai_operation
 
       - filter: openai_conversations
         backend: sqlite
@@ -394,7 +400,7 @@ filter_chains:
         outbound_chain:
           name: files-api-outbound
           filters:
-            - filter: state_owner_headers
+            - filter: project_state_owner_headers
               tenant_header: x-tenant-id
               subject_header: x-user-id
             - filter: headers
@@ -529,7 +535,7 @@ filter_chains:
               # the normalized StateOwner extension into each IRR step; this
               # strips any still-uncommitted raw ingress identity headers and
               # recreates only the OGX/callout contract.
-              - filter: state_owner_headers
+              - filter: project_state_owner_headers
                 tenant_header: x-tenant-id
                 subject_header: x-user-id
 
@@ -590,7 +596,7 @@ filter_chains:
                 outbound_chain:
                   name: vector-store-outbound
                   filters:
-                    - filter: state_owner_headers
+                    - filter: project_state_owner_headers
                       tenant_header: x-tenant-id
                       subject_header: x-user-id
                     - filter: headers

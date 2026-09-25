@@ -446,7 +446,7 @@ filter_chains:
         outbound_chain:
           name: files-api-outbound
           filters:
-            - filter: state_owner_headers
+            - filter: project_state_owner_headers
               tenant_header: x-tenant-id
               subject_header: x-user-id
             - filter: headers

@@ -3669,9 +3669,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "286a764b06b52230f2dc13f8bb1cabf04a2a79a54129b8ed706d50bd9538cfe8"
+checksum = "32a8ca4ee31652a41abaa513e7ba83ff2720bd049f206dbf03d8004ed2cc632b"
 dependencies = [
  "praxis-policy-apl-cmf",
  "praxis-policy-apl-core",
@@ -3688,9 +3688,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-apl-cmf"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6be770424cfe4f023098356c88c6c27ebd49472a33f1cd3824567d3832f9305d"
+checksum = "73fb7174cbfb3910333da6785c0a334197545b74795f4c3c2a4529121d36f323"
 dependencies = [
  "praxis-policy-apl-core",
  "praxis-policy-core",
@@ -3699,9 +3699,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-apl-core"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f654b0908eb17e9a3bdcaae82ad8a3e28622b0e84aafaacae076fdc698201281"
+checksum = "d623aaac798c46ef6b65bc20687260c8e81b78c3dc8f21e4842f21bc7cf117ed"
 dependencies = [
  "async-trait",
  "futures",
@@ -3716,9 +3716,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-apl-runtime"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "005904c00ed9a6723f4c5bf333d52ebfcf18bd32d8bae600336f58b8236dcd02"
+checksum = "085dab775f296ef4bab474b88f3658a29712e15c57c9638a9297acea468c75a4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3735,9 +3735,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-core"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "700256f9e9a57d885be7d35029dce1a9bc472e3a6203bdfb2728e4372ecdf31c"
+checksum = "6a42d7b1ba4144ba03fe67a43a2310993a9f86505f1b2664cb012202b3e02453"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3760,9 +3760,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-orchestration"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a4475b74afc9811454a976f0ee1b1588b259b786203f1f176493a6fded51a8c"
+checksum = "83adb04a772578fd76807ac80a228bc79f97484713228942e1ac1f76f55a9897"
 dependencies = [
  "futures",
  "tokio",
@@ -3770,9 +3770,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-pdp-cedar-direct"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "741064cc4513a43aee6ea93407ef2b42153f8d2dc6c64cc27da82008a00f293f"
+checksum = "2d4f2fa4c3ce1e3e7b996331a8072a1325702bef9dee747b1e14a16c8cceffab"
 dependencies = [
  "async-trait",
  "cedar-policy",
@@ -3785,9 +3785,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-pdp-cel"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc8375a8b343433def3ae40c325a586a88c60ed7f0ccd1bde454d487dfd0ccc3"
+checksum = "14b5e6d4c0953c9d05635bda377c2e28aca3a6bcee55ac9ca078fd46ecd8eb96"
 dependencies = [
  "async-trait",
  "cel",
@@ -3799,9 +3799,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-pdp-opa"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c44b83b536dbd64fd7039e96fd6f5f728884c49e1946d5a67906c75d889401bb"
+checksum = "8ffca5e5784a03278f8bb11816aa232d45622b3651ce6db9d5ac5269fff9aac2"
 dependencies = [
  "async-trait",
  "praxis-policy-apl-core",
@@ -3815,9 +3815,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-plugin-delegator-oauth"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddd97e18fb69bd0b2ce2ac16edb7fccfb6f95c2a1a9cdd209be4cdea71b7f88e"
+checksum = "b62a4b7b75abdd7cab397ea48386abd66f378ef9bea4d3d2a9a9604211e43b2f"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3836,9 +3836,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-plugin-elicitation-ciba"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c730f75ae22bd2844000cd3da0b6d3eb886ff37b301faab7405b8655839dcae4"
+checksum = "127173c6290d19aa85b044b173bb2c20b38c15a9953d5c794297012611c260ba"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3852,9 +3852,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-plugin-identity-jwt"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02732b66491e6cde021253b45798077a01383248a7f8334c4ee816ccd3a7542f"
+checksum = "d123c9325791463fd88f03e028d484e81cd91bafd7b3fff081aa78e89e4e4f1d"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3870,9 +3870,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-policy-session-valkey"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "425a4a72e0c2cf5db263dbba2ecd2b647ec7f469780d8fe2d85eb4ed5f759139"
+checksum = "0559a3cc86f7528cb7d28a4b5a9ba4751d8f6855698a2a4bc752a3fcc04cdf67"
 dependencies = [
  "async-trait",
  "deadpool-redis",
@@ -3889,8 +3889,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy"
-version = "0.6.0"
-source = "git+https://github.com/praxis-proxy/praxis?rev=cb5371ed88613d6eaa53b303b934f4f9318cb027#cb5371ed88613d6eaa53b303b934f4f9318cb027"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1326e24a8e76ba27bf9a57cf2a704e077f921b746ccafdea1ecbfee8c3180e0"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3910,8 +3911,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-core"
-version = "0.6.0"
-source = "git+https://github.com/praxis-proxy/praxis?rev=cb5371ed88613d6eaa53b303b934f4f9318cb027#cb5371ed88613d6eaa53b303b934f4f9318cb027"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f8c42b4b7897a0e92e645257d296d2e715193e9fb72e03c51e5987d4151d68b"
 dependencies = [
  "bytes",
  "chrono",
@@ -3935,8 +3937,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-filter"
-version = "0.6.0"
-source = "git+https://github.com/praxis-proxy/praxis?rev=cb5371ed88613d6eaa53b303b934f4f9318cb027#cb5371ed88613d6eaa53b303b934f4f9318cb027"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1cf3501ed24494a5fbc33002bb51fe1c84b26990fa3b78d975f1c84fe9d8b85b"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3968,8 +3971,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-protocol"
-version = "0.6.0"
-source = "git+https://github.com/praxis-proxy/praxis?rev=cb5371ed88613d6eaa53b303b934f4f9318cb027#cb5371ed88613d6eaa53b303b934f4f9318cb027"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0861180c42d285dcb8dafcf9cca73920ba3a0436f735b8a6330908f3439ec5c2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3996,8 +4000,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-tls"
-version = "0.6.0"
-source = "git+https://github.com/praxis-proxy/praxis?rev=cb5371ed88613d6eaa53b303b934f4f9318cb027#cb5371ed88613d6eaa53b303b934f4f9318cb027"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6c77916394e4aeb21ed7de2f1582e9b0f79e2e280cf0ffb02150449c0d632ca"
 dependencies = [
  "arc-swap",
  "notify",
@@ -4477,7 +4482,7 @@ dependencies = [
  "windows-sys 0.59.0",
  "x509-parser",
  "yaml_serde",
- "zstd 0.13.3",
+ "zstd 0.14.0",
 ]
 
 [[package]]
@@ -5994,18 +5999,18 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",

@@ -96,7 +96,7 @@ impl OpenAiOperationSpec {
     ///
     /// Answers the runtime question directly rather than inferring it from
     /// contract ownership, so proxied operations report their real body shape.
-    #[cfg(feature = "openai-conversations")]
+    #[cfg(all(test, feature = "openai-conversations"))]
     pub(crate) const fn has_request_body(&self) -> bool {
         self.runtime.has_request_body()
     }

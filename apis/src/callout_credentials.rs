@@ -318,7 +318,7 @@ fn reject_duplicate_source_headers(
 }
 
 /// Validate a configured source header: parseable, not reserved/framing/hop-by-hop, not
-/// routing-prefixed. Mirrors `state_owner_headers::parse_projection_header`.
+/// routing-prefixed. Mirrors `project_state_owner_headers::parse_projection_header`.
 fn parse_credential_source_header(raw: &str) -> Result<HeaderName, FilterError> {
     let name = parse_safe_header(raw)?;
     let lower = name.as_str();

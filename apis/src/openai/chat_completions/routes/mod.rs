@@ -17,8 +17,8 @@ use std::ops::Deref;
 use crate::{
     openai::operation::OpenAiOperationSpec,
     operation::{
-        ApplicationProtocol, HandlingMode, HttpMethod, OperationEntry, OperationSpec, RequestBody, Transport,
-        match_operation,
+        ApplicationProtocol, HandlingMode, HttpMethod, OperationEntry, OperationSpec, RequestBody, RouteParams,
+        Transport, match_operation,
     },
 };
 
@@ -162,9 +162,11 @@ chat_completions_operations! {
 
 /// One matched Chat Completions route.
 #[derive(Clone, Copy)]
-pub(crate) struct MatchedChatCompletionsRoute {
+pub(crate) struct MatchedChatCompletionsRoute<'a> {
     /// Matched operation metadata.
     pub spec: &'static ChatCompletionsOperationSpec,
+    /// Borrowed path parameters, captured by the shared matcher.
+    pub(crate) params: RouteParams<'a>,
 }
 
 /// Return all Chat Completions operation specs.
@@ -176,9 +178,11 @@ pub const fn operation_specs() -> &'static [ChatCompletionsOperationSpec] {
 /// Match a request head to a Chat Completions operation.
 ///
 /// Chat Completions is reached over plain HTTP only.
-pub(crate) fn match_route(method: &str, path: &str) -> Option<MatchedChatCompletionsRoute> {
-    match_operation(OPERATION_SPECS, method, path, Transport::Http)
-        .map(|matched| MatchedChatCompletionsRoute { spec: matched.spec })
+pub(crate) fn match_route<'a>(method: &str, path: &'a str) -> Option<MatchedChatCompletionsRoute<'a>> {
+    match_operation(OPERATION_SPECS, method, path, Transport::Http).map(|matched| MatchedChatCompletionsRoute {
+        spec: matched.spec,
+        params: matched.params,
+    })
 }
 
 #[cfg(test)]

@@ -11,20 +11,38 @@ use std::{
 
 use bytes::Bytes;
 use http::Method;
-use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter, parse_filter_config};
+use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter, HttpFilterContext, Request, parse_filter_config};
 use serde_json::Value;
 
 use super::{
     config::{ConversationsConfig, revalidate_postgres_host, validate_config},
     filter::OpenaiConversationsFilter,
-    routes::{self, ConversationOperation, ConversationOperationSpec, operation_specs},
+    routes::{ConversationOperation, ConversationOperationSpec, operation_specs},
     validate::validate_metadata,
 };
 use crate::{
-    openai::responses::{DEFAULT_TENANT_ID, state::ResponsesState},
+    openai::{
+        operation_classifier::{OpenAiOperationMatch, OpenaiOperationFilter, classify},
+        responses::{DEFAULT_TENANT_ID, state::ResponsesState},
+    },
+    operation::{ApplicationProtocol, Transport},
     store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, SqliteResponseStore, StoreError},
-    test_utils::{make_owned_filter_context, make_request, make_response},
+    test_utils::{make_owned_filter_context as base_owned_filter_context, make_request, make_response},
 };
+
+/// Build a test context after running the shared request-head classifier.
+fn make_owned_filter_context(req: &Request) -> HttpFilterContext<'_> {
+    let mut ctx = base_owned_filter_context(req);
+    insert_classifier_matches(&mut ctx, req);
+    ctx
+}
+
+/// Publish the same generic extension as `openai_operation`.
+fn insert_classifier_matches(ctx: &mut HttpFilterContext<'_>, req: &Request) {
+    if let Some(matched) = classify(req.method.as_str(), req.uri.path(), Transport::Http) {
+        ctx.extensions.insert(matched);
+    }
+}
 
 fn rejection_body(rejection: &praxis_filter::Rejection) -> Value {
     serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap()
@@ -1518,6 +1536,111 @@ async fn unmatched_path_continues() {
 }
 
 #[tokio::test]
+async fn conversations_route_without_classifier_match_fails_closed() {
+    let filter = build_test_filter();
+    let req = make_request(Method::GET, "/v1/conversations/conv_unclassified");
+    let mut ctx = base_owned_filter_context(&req);
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected missing classifier to fail closed, got {action:?}");
+    };
+    assert_eq!(rejection.status, 500);
+}
+
+#[tokio::test]
+async fn impossible_classifier_body_metadata_fails_closed() {
+    let filter = build_test_filter();
+    let req = make_request(Method::GET, "/v1/conversations/conv_1");
+    let mut ctx = make_owned_filter_context(&req);
+    let matched = ctx.extensions.get_mut::<OpenAiOperationMatch>().unwrap();
+    matched.request_body = crate::operation::RequestBody::Json { required: true };
+
+    let result = filter.on_request(&mut ctx).await;
+    assert!(result.is_err(), "inconsistent operation/body metadata must fail closed");
+}
+
+#[tokio::test]
+async fn conversations_unknown_operation_id_fails_closed() {
+    let filter = build_test_filter();
+    let req = make_request(Method::GET, "/v1/conversations/conv_1");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions.get_mut::<OpenAiOperationMatch>().unwrap().operation_id = "unknownConversationOperation";
+
+    assert!(filter.on_request(&mut ctx).await.is_err());
+}
+
+#[tokio::test]
+async fn missing_classifier_match_fails_closed() {
+    let filter = build_test_filter();
+    let req = make_request(Method::GET, "/v1/conversations/conv_1");
+    let mut ctx = make_owned_filter_context(&req);
+    let _removed = ctx.extensions.remove::<OpenAiOperationMatch>();
+
+    let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
+        panic!("expected missing classifier to fail closed");
+    };
+    assert_eq!(rejection.status, 500);
+}
+
+#[tokio::test]
+async fn conversations_upgrade_cannot_bypass_the_classifier_dependency() {
+    let filter = build_test_filter();
+    let req = make_request(Method::GET, "/v1/conversations/conv_1");
+    let mut req = req;
+    req.headers.insert(http::header::CONNECTION, "Upgrade".parse().unwrap());
+    req.headers.insert(http::header::UPGRADE, "websocket".parse().unwrap());
+    let mut ctx = base_owned_filter_context(&req);
+
+    let config: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+    let classifier = OpenaiOperationFilter::from_config(&config).unwrap();
+    drop(classifier.on_request(&mut ctx).await.unwrap());
+    assert!(
+        ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
+        "the HTTP-only Conversations route must remain unclassified on a WebSocket handshake"
+    );
+
+    let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
+        panic!("expected the local filter to reject an unclassified owned route");
+    };
+    assert_eq!(rejection.status, 500);
+}
+
+#[tokio::test]
+async fn another_protocol_match_fails_closed() {
+    let filter = build_test_filter();
+    let req = make_request(Method::GET, "/v1/conversations/conv_1");
+    let mut ctx = make_owned_filter_context(&req);
+    ctx.extensions
+        .get_mut::<OpenAiOperationMatch>()
+        .unwrap()
+        .application_protocol = ApplicationProtocol::new("openai_responses");
+
+    let FilterAction::Reject(rejection) = filter.on_request(&mut ctx).await.unwrap() else {
+        panic!("expected an inconsistent classifier protocol to fail closed");
+    };
+    assert_eq!(rejection.status, 500);
+}
+
+#[tokio::test]
+async fn classified_operation_missing_required_path_parameter_is_an_error() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/conversations");
+    let mut ctx = make_owned_filter_context(&req);
+    let matched = ctx.extensions.get_mut::<OpenAiOperationMatch>().unwrap();
+    matched.operation_id = ConversationOperation::UpdateConversation.operation_id();
+    matched.request_body = ConversationOperation::UpdateConversation.request_body();
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from_static(br#"{"metadata":{}}"#));
+    let result = filter.on_request_body(&mut ctx, &mut body, true).await;
+    assert!(
+        result.is_err(),
+        "required parameters must not be synthesized or ignored"
+    );
+}
+
+#[tokio::test]
 async fn post_routes_use_stream_buffer_request_body_mode() {
     let filter = build_test_filter();
     assert!(
@@ -1567,6 +1690,7 @@ async fn early_body_pre_read_defers_store_write_until_request_filters_run() {
     let req = make_request(Method::POST, "/v1/conversations");
     let mut ctx = make_owned_filter_context(&req);
     ctx.current_filter_id = Some(7);
+    let _removed_match = ctx.extensions.remove::<OpenAiOperationMatch>();
 
     let body_json = serde_json::json!({"metadata": {"phase": "deferred"}});
     let mut body = Some(Bytes::from(serde_json::to_vec(&body_json).unwrap()));
@@ -1576,6 +1700,7 @@ async fn early_body_pre_read_defers_store_write_until_request_filters_run() {
         "early body hook should not write the store before request filters run"
     );
 
+    insert_classifier_matches(&mut ctx, &req);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let FilterAction::Reject(rejection) = action else {
         panic!("expected deferred body to be handled during on_request, got {action:?}");
@@ -1583,6 +1708,54 @@ async fn early_body_pre_read_defers_store_write_until_request_filters_run() {
     assert_eq!(rejection.status, 200);
     let resp = rejection_body(&rejection);
     assert_eq!(resp["metadata"]["phase"], "deferred");
+}
+
+#[tokio::test]
+async fn unmatched_pre_read_body_state_is_discarded_after_classification() {
+    let filter = build_test_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = base_owned_filter_context(&req);
+    ctx.current_filter_id = Some(7);
+
+    let mut body = Some(Bytes::from_static(br#"{"input":"forward"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    assert!(
+        ctx.filter_state.contains_key(&7),
+        "pre-read should retain the body until request-head classification"
+    );
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        !ctx.filter_state.contains_key(&7),
+        "unmatched requests must not retain the pre-read body through the upstream response"
+    );
+}
+
+#[tokio::test]
+async fn bodyless_operation_ignores_invalid_deferred_body_bytes() {
+    let filter = build_test_filter();
+    let req = make_request(Method::GET, "/v1/conversations/conv_missing");
+    let mut ctx = base_owned_filter_context(&req);
+    ctx.current_filter_id = Some(7);
+
+    let mut body = Some(Bytes::from_static(b"not valid json"));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Release));
+
+    insert_classifier_matches(&mut ctx, &req);
+    let matched = ctx.extensions.get::<OpenAiOperationMatch>().copied().unwrap();
+    assert_eq!(matched.request_body, crate::operation::RequestBody::None);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected bodyless GET to dispatch without parsing its body")
+    };
+    assert_eq!(rejection.status, 404);
+    assert!(
+        !ctx.filter_state.contains_key(&7),
+        "bodyless local operations must not retain deferred request state"
+    );
 }
 
 #[tokio::test]
@@ -3472,12 +3645,12 @@ async fn patch_on_conversation_path_continues() {
 // Append-Back: on_response
 // -----------------------------------------------------------------------------
 
-fn set_append_back_metadata(ctx: &mut praxis_filter::HttpFilterContext<'_>) {
+fn set_append_back_metadata(ctx: &mut HttpFilterContext<'_>) {
     ctx.set_metadata("openai_responses_format.has_conversation", "true");
     ctx.set_metadata("responses.conversation_id", "conv_test_123");
 }
 
-async fn capture_append_owner_for_test(filter: &dyn HttpFilter, ctx: &mut praxis_filter::HttpFilterContext<'_>) {
+async fn capture_append_owner_for_test(filter: &dyn HttpFilter, ctx: &mut HttpFilterContext<'_>) {
     let action = filter.on_request(ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
 }
@@ -3948,23 +4121,36 @@ fn conformance_conversations_routes_match_runtime_registry() {
 
     for operation in operation_specs() {
         let path = runtime_path(operation, Some("conv_sync"), Some("item_sync"));
-        let matched = routes::match_route(operation.method().as_str(), &path).unwrap_or_else(|| {
+        let matched = classify(operation.method().as_str(), &path, Transport::Http).unwrap_or_else(|| {
             panic!(
-                "runtime route table did not match {} {path}",
+                "openai_operation did not classify {} {path}",
                 operation.method().as_str()
             )
         });
         assert_eq!(
-            matched.spec.operation,
-            operation.operation,
-            "runtime route table matched the wrong operation for {} {path}",
+            ConversationOperation::from_operation_id(matched.operation_id),
+            Some(operation.operation),
+            "classifier matched the wrong typed operation for {} {path}",
             operation.method().as_str(),
         );
         assert_eq!(
-            OperationKey::new(matched.spec.method().as_str(), matched.spec.spec_path),
-            OperationKey::new(operation.method().as_str(), operation.spec_path),
-            "runtime route metadata drifted from operation_specs() for {} {path}",
+            matched.application_protocol,
+            operation.application_protocol(),
+            "classifier registry identity drifted for {} {path}",
             operation.method().as_str(),
+        );
+        assert_eq!(matched.operation_id, operation.operation_id());
+        assert_eq!(matched.request_body, operation.request_body());
+        assert_eq!(
+            matched.path_parameters.get(&path, "conversation_id"),
+            operation
+                .runtime_path()
+                .contains("{conversation_id}")
+                .then_some("conv_sync")
+        );
+        assert_eq!(
+            matched.path_parameters.get(&path, "item_id"),
+            operation.runtime_path().contains("{item_id}").then_some("item_sync")
         );
     }
     println!("PRAXIS_CONFORMANCE_OK conversations route_dispatch");

@@ -339,7 +339,7 @@ fn map_chat_usage_maps_all_fields() {
         "prompt_tokens": 50,
         "completion_tokens": 10,
         "total_tokens": 60,
-        "prompt_tokens_details": {"cached_tokens": 8},
+        "prompt_tokens_details": {"cached_tokens": 8, "cache_write_tokens": 12},
         "completion_tokens_details": {"reasoning_tokens": 4}
     });
     let mapped = map_chat_usage(&usage);
@@ -347,7 +347,7 @@ fn map_chat_usage_maps_all_fields() {
     assert_eq!(mapped["output_tokens"], 10);
     assert_eq!(mapped["total_tokens"], 60);
     assert_eq!(mapped["input_tokens_details"]["cached_tokens"], 8);
-    assert_eq!(mapped["input_tokens_details"]["cache_write_tokens"], 0);
+    assert_eq!(mapped["input_tokens_details"]["cache_write_tokens"], 12);
     assert_eq!(mapped["output_tokens_details"]["reasoning_tokens"], 4);
 }
 
