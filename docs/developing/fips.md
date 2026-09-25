@@ -189,9 +189,11 @@ runner in FIPS mode, selected by the labels `fips` and `rhel`. It tests the
 exact image the hosted `ubi-image` job built and scanned, handed over as an
 artifact and checked by image id, then runs `make fips-host-check`,
 `make test-fips-host` and `make fips-runtime-probe` through
-`.github/actions/fips-host`; the release workflow runs the same composite
-action (without the suites) against the pushed `-fips` image, pulled by
-digest, before the release is cut.
+`.github/actions/fips-host`; the release workflow requires a recorded green
+`fips-host` run for the exact commit being released (its `fips-proof` gate
+polls out a run still in flight) and runs the same composite action (without
+the suites) against the pushed `-fips` image, pulled by digest, before the
+release is cut.
 
 The runner needs `git`, `make`, `podman` (rootless), `gnupg2`, `gcc`,
 `gcc-c++`, `cmake` and `openssl-devel`, checked up front by

@@ -163,9 +163,10 @@ cannot have happened outside FIPS mode. `fips-runtime-probe` starts the
 shipped image itself under `PRAXIS_REQUIRE_FIPS=1`, drives raw TLS probes
 against its listener (approved algorithms negotiated, ChaCha20-only and
 X25519-only clients refused), and checks the startup line. The CI `FIPS`
-workflow runs all three on a RHEL 9 runner in FIPS mode for every change,
-and the release workflow attests and probes the exact pushed image, pulled
-back by digest, before a release is cut.
+workflow runs all three on a RHEL 9 runner in FIPS mode for every change;
+a release requires a recorded green `fips-host` run for the exact commit
+being released, and the release workflow attests and probes the exact
+pushed image, pulled back by digest, before a release is cut.
 
 A hand check of the shipped image remains a two-liner:
 

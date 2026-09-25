@@ -196,13 +196,90 @@ jobs:
           echo "digest=$(cat "$digest_file")" >> "$GITHUB_OUTPUT"
 
   # ----------------------------------------------------------------------------
+  # FIPS proof of record: the tagged commit must hold a green fips-host run
+  # ----------------------------------------------------------------------------
+  #
+  # The FIPS workflow does not run on tags, so this job links the release to
+  # the runtime proof: the exact commit being released must have a recorded
+  # successful fips-host run (the full suites on the FIPS runner, see
+  # .github/workflows/fips.yaml). The push run for that commit may still be
+  # in flight when the tag lands, so the check polls instead of failing on
+  # the race. A commit with no such run fails here: dispatch the FIPS
+  # workflow on the tag's ref, let fips-host pass, then re-run this workflow.
+
+  fips-proof:
+    needs: [validate]
+    runs-on: ubuntu-24.04
+    # Enough to ride out a fips-host run still in flight; that job's own
+    # ceiling is 180 minutes on a cold cache.
+    timeout-minutes: 190
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require a green fips-host suites run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # An annotated tag's github.sha can name the tag object, not the
+          # commit; peel to the commit the release actually ships.
+          sha=$(git rev-parse 'HEAD^{commit}')
+          echo "requiring a successful fips-host run of the FIPS workflow at $sha"
+          deadline=$(( $(date +%s) + 185 * 60 ))
+          while :; do
+            pending=""
+            if runs=$(gh api "repos/$REPO/actions/workflows/fips.yaml/runs?head_sha=$sha&per_page=100" \
+              --jq '.workflow_runs[] | "\(.id) \(.status)"'); then
+              if [ -z "$runs" ]; then
+                echo "::error::no FIPS workflow run exists for $sha; dispatch the FIPS workflow on this ref, let fips-host pass, then re-run the release workflow"
+                exit 1
+              fi
+              while read -r id status; do
+                [ -n "$id" ] || continue
+                job=$(gh api "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
+                  --jq '[.jobs[] | select(.name == "fips-host")] | first | if . == null then "absent" else (.conclusion // .status) end' \
+                  || echo "unknown")
+                case "$job" in
+                  success)
+                    echo "fips-host succeeded in run $id"
+                    exit 0
+                    ;;
+                  queued | in_progress | waiting | pending | unknown)
+                    pending="run $id (fips-host $job)"
+                    ;;
+                  absent)
+                    [ "$status" = "completed" ] || pending="run $id ($status, fips-host not scheduled yet)"
+                    ;;
+                esac
+              done <<< "$runs"
+              if [ -z "$pending" ]; then
+                echo "::error::no successful fips-host run for $sha and none in flight; make one pass (re-run its fips-host job, or dispatch the FIPS workflow on this ref), then re-run the release workflow"
+                exit 1
+              fi
+            else
+              pending="the runs listing (query failed)"
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::timed out waiting for $pending"
+              exit 1
+            fi
+            echo "waiting on $pending"
+            sleep 120
+          done
+
+  # ----------------------------------------------------------------------------
   # FIPS host: check the pushed release image on the FIPS runner
   # ----------------------------------------------------------------------------
   #
   # The runtime attestation of the exact bits that were just published,
   # pulled back by digest: the host and module attestation and the running
-  # probe. The suites already ran against this commit's image in the FIPS
-  # workflow, so this job attests and probes without rerunning them.
+  # probe. The full suites for this exact commit are required by the
+  # fips-proof gate, so this job attests and probes without rerunning them.
 
   fips-host:
     needs: [validate, container-fips]
@@ -246,7 +323,7 @@ jobs:
   # ----------------------------------------------------------------------------
 
   github-release:
-    needs: [validate, container, container-fips, fips-host]
+    needs: [validate, container, container-fips, fips-proof, fips-host]
     # fips-host needs the self-hosted FIPS runner; a release must not be
     # unpublishable while that runner is offline, so skipped is acceptable
     # and only a run that failed blocks the release.
@@ -255,6 +332,7 @@ jobs:
       && needs.validate.result == 'success'
       && needs.container.result == 'success'
       && needs.container-fips.result == 'success'
+      && needs.fips-proof.result == 'success'
       && (needs.fips-host.result == 'success' || needs.fips-host.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
