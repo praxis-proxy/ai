@@ -3,7 +3,10 @@
 
 //! Unit tests for the GCP ADC upstream-auth filter.
 
-use std::io::{Read as _, Write as _};
+use std::{
+    io::{Read as _, Write as _},
+    sync::LazyLock,
+};
 
 use http::{HeaderValue, Method, header};
 use praxis_ai_apis::subrequest::SubRequestClient;
@@ -109,13 +112,22 @@ fn mock_token_endpoint(body: &'static str) -> (String, std::sync::mpsc::Receiver
 /// endpoint (no fetch is attempted in parse-only tests).
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
-/// Test-only RSA private key (PKCS#1 PEM, the shape Google key files
-/// carry). Already public by embedding here; guards nothing.
-const TEST_SA_PRIVATE_KEY_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA0+b+pTrSMwTd5XSJqd+bzIdLSpjUAiZmcxB3NmfWeFam9uzt\nMn5HVLcdKmZIYUKMqx5xEBBk4ujRTM8VsuRD+6ZJ8rpZShqwzflnKjy3Kbga5IJf\n+8isW/xvUDWjPc28NeW+UTBJaBYYvzEnW7jKjVoE3i/JhqAQpe61Gm73DNI9pQys\nteTNSwmnxm+WX7GSFlI4gtm3DUyCOW2oNRLyzNr5k0aDGHpy2PDgNMMUhS+IO27C\noZp4GZvWjvzpFRI8L25b04r9+Rjr+iChpYnzofE3N2mfOE4b0p+D7ulxiTLxSTDw\nCBwEfm5w01fku3NgATiS9Q9vRLva2G10U/ZGmwIDAQABAoIBAB0ZKdu3rZi68Nuq\n+qJ8pdDavVCTlv1ql4PyfWRXswBYadobo+DcrV/pO1SQshzE/jsbVYxOrAPq0574\nCvNDXECIz7vIsi02aBQIzQ1kRASzFuJNMvAI2P5Stlht3SpF/7PpBg7xEgt8iU5r\n6gsy34G0nFmEd2iIv3CBzJXCKiO01QXBBuyuzK5hmMHopFJgXOxz0lt6If1BoKxZ\nr5tTHKZY19riEVu7zS+Wxpc2Dv+0V0ny1TjYTncW3MWxOFuzMhdRhi5A/ciP0FHr\n2voOCeYGNug1BC6FKmsYtXbOPs8cQO8VEXT6n/fB25ecSby1oB7kPyNWhM3vxJ9I\nSq/rLtECgYEA+psUzWIPLomMKhXBBpAl7vPkBLGg/L/1IjvM2SqzYtXtP2oXxwFt\n89P4b2OD/UGQbRvA5n6dOechWxliz09SGv3Leb8DiSyagO90qgwgR8YU6fnC+E+c\nwE5vNBD22UPF8sGz+SFXrX1w+WeNTNxeb6cExTN+BNJIrbl7PeQgGcsCgYEA2Hal\nFuBoiJO2b5v2OZceFUPj5ztpL76jdLM3pSAAEd1QLFKS30FFu1tG3Hxm5SYkSlmi\na3T4SNbF+2EtjJjcdCC8bXx68F3oOfrWJ9FdnI2WjdRqxrmMQFtvqNiCLEBjl3IN\n0yEUN8JfAx7R4Tg1BD/29PPMm6GrEi5aJByULHECgYEA6fnI3kjja8u4NcLByWLk\nR8kl5swBRnniYOf8RfX8LhcVvtNLB95pzfDmTvlWzilcssHqxEkKenk1R1zYSD4C\npni2dSDGKFigmCj5f5p6uQhTlnA+fJ+39kRExxPfpNIGCrSXV86tkalAxVrNLinB\ncfU6GvQMgGvkt24photq/SkCgYBqZZ7t6K3Y++n/YASd+BZ0U2NxI/Wm3yiO0wx1\n4I3IOiUPNCM3E2lIFyx0cb1NwvqxhO9drCfh/Zdg4To3UmeBuRmFI1t2TGI6JX4g\nIjvGGJ445oD5Xvh+JbNzpcAOKjQJm6kJ7sd2RNbYvMxizHLavOoRKsiWcteYXyo1\nd8qpMQKBgQDseUVOdyMRAWmI25+/pejYbOJNoqCl+2w36k2WDX8JfO1DG5W+kWLa\nwj/PBLlmpgnzEEzB2AbKN8dQZpIMFN3BnYPPdUrMlMPOtnHxvb1Djw8Y7RASnSkV\npLaYeBPEAgALZhdv1PQihp0YXKHTRGngim+aSQZ78kNANCmRnbv27g==\n-----END RSA PRIVATE KEY-----\n";
+/// Test-only RSA material generated at runtime, never stored in the repository.
+struct TestServiceAccountKey {
+    /// Private key in the PEM format used by service-account key files.
+    private_key_pem: String,
+    /// Public key used to verify the JWT assertion in tests.
+    public_key_pem: Vec<u8>,
+}
 
-/// The public half of [`TEST_SA_PRIVATE_KEY_PEM`], for verifying signed
-/// assertions inside tests.
-const TEST_SA_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0+b+pTrSMwTd5XSJqd+b\nzIdLSpjUAiZmcxB3NmfWeFam9uztMn5HVLcdKmZIYUKMqx5xEBBk4ujRTM8VsuRD\n+6ZJ8rpZShqwzflnKjy3Kbga5IJf+8isW/xvUDWjPc28NeW+UTBJaBYYvzEnW7jK\njVoE3i/JhqAQpe61Gm73DNI9pQysteTNSwmnxm+WX7GSFlI4gtm3DUyCOW2oNRLy\nzNr5k0aDGHpy2PDgNMMUhS+IO27CoZp4GZvWjvzpFRI8L25b04r9+Rjr+iChpYnz\nofE3N2mfOE4b0p+D7ulxiTLxSTDwCBwEfm5w01fku3NgATiS9Q9vRLva2G10U/ZG\nmwIDAQAB\n-----END PUBLIC KEY-----\n";
+static TEST_SERVICE_ACCOUNT_KEY: LazyLock<TestServiceAccountKey> = LazyLock::new(|| {
+    let key = openssl::rsa::Rsa::generate(2048).expect("generate ephemeral test RSA key");
+    TestServiceAccountKey {
+        private_key_pem: String::from_utf8(key.private_key_to_pem().expect("serialize test private key"))
+            .expect("RSA private PEM is UTF-8"),
+        public_key_pem: key.public_key_to_pem().expect("serialize test public key"),
+    }
+});
 
 /// Email carried by every `key_file` test fixture.
 const TEST_SA_EMAIL: &str = "test-sa@test-project.iam.gserviceaccount.com";
@@ -128,7 +140,7 @@ fn write_service_account_key_file(token_uri: &str) -> NamedTempFile {
     let doc = serde_json::json!({
         "type": "service_account",
         "client_email": TEST_SA_EMAIL,
-        "private_key": TEST_SA_PRIVATE_KEY_PEM,
+        "private_key": TEST_SERVICE_ACCOUNT_KEY.private_key_pem.as_str(),
         "token_uri": token_uri,
     });
     write_json(&doc.to_string())
@@ -569,7 +581,7 @@ async fn fetch_service_account_key_mints_bearer_from_signed_assertion() {
     validation.set_audience(&[token_url.as_str()]);
     let claims = jsonwebtoken::decode::<serde_json::Value>(
         &assertion,
-        &jsonwebtoken::DecodingKey::from_rsa_pem(TEST_SA_PUBLIC_KEY_PEM.as_bytes())
+        &jsonwebtoken::DecodingKey::from_rsa_pem(&TEST_SERVICE_ACCOUNT_KEY.public_key_pem)
             .expect("fixture public PEM must parse"),
         &validation,
     )
