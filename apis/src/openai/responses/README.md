@@ -38,15 +38,15 @@ Body-phase columns show `Access / Mode` when the hook is implemented.
 | `openai_file_search_callout` | — | ReadOnly / StreamBuffer | — | — |
 | `openai_mcp_dispatch` | ✓ | ReadOnly / StreamBuffer | — | — |
 | `openai_mcp_tool_resolve` | ✓ | ReadWrite / StreamBuffer | — | — |
-| `openai_response_store` | ✓ | ReadOnly / Stream | ✓ | ReadOnly / Stream |
+| `openai_response_store` | ✓ | ReadOnly / StreamBuffer | ✓ | ReadOnly / Stream |
 | `openai_responses_compact` | — | ReadOnly / StreamBuffer | — | — |
 | `openai_responses_format` | — | ReadOnly / StreamBuffer | — | — |
 | `openai_responses_model_rewrite` | ✓ | ReadWrite / StreamBuffer | — | — |
-| `openai_responses_proxy` | ✓ | ReadWrite / StreamBuffer | — | — |
+| `openai_responses_proxy` | — | — | — | — |
 | `openai_responses_rehydrate` | — | ReadOnly / StreamBuffer | ✓ | ReadWrite / Stream |
 | `openai_responses_request` | — | ReadOnly / StreamBuffer | — | — |
 | `openai_responses_validate` | — | ReadOnly / StreamBuffer | — | — |
 | `openai_stream_events` | ✓ | ReadOnly / Stream | ✓ | ReadWrite / Stream |
 | `openai_tool_parse` | ✓ | ReadOnly / StreamBuffer | — | — |
 | `openai_web_search` | — | ReadOnly / StreamBuffer | — | — |
-| `responses_to_chat_completions` | — | ReadWrite / StreamBuffer | ✓ | ReadWrite / Stream |
+| `responses_to_chat_completions` | — | — | ✓ | ReadWrite / Stream |

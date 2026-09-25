@@ -138,6 +138,7 @@ use tracing::{debug, trace};
 
 use self::config::{AgenticLoopConfig, build_config};
 use super::{
+    arm_agentic_stream_guard, enforce_agentic_stream_guard,
     error::responses_error_rejection,
     file_search_callout::{
         ensure_public_output_item_ids_in_response, has_file_search_tool, is_file_search_function_call,
@@ -263,38 +264,28 @@ impl HttpFilter for AgenticLoopFilter {
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        // Fail closed on an unsafe terminal-streaming configuration *before* any
-        // upstream dispatch. Within each IRR round this filter's `on_request`
-        // runs after `openai_responses_proxy` has selected the typed transport
-        // and after `openai_stream_events` has published whether a logical-stream
-        // finalizer is armed, so both facts are observable here.
+        // Arm a fail-closed check for an unsafe terminal-streaming
+        // configuration. The selected protocol adapter chooses the effective
+        // transport later, in the selected-upstream body phase, and consumes
+        // this marker there before any backend dispatch.
         //
-        // When the sub-request will commit a typed stream (an effective
-        // `"stream": true` request, for which `openai_responses_proxy` selects
-        // streaming automatically) but no `openai_stream_events` logical-stream
-        // finalizer is present, a loop-terminal error detected later in
+        // When the selected protocol adapter will commit a typed stream (an
+        // effective `"stream": true` request) but no `openai_stream_events`
+        // logical-stream finalizer is present, a loop-terminal error detected later in
         // `on_response_body` cannot reach the client: typed streaming has already
         // committed `response.completed`, so the error would be silently dropped
         // after a truncated success is on the wire. This is a server
         // misconfiguration, so reject with a 500 rather than forward that
         // truncated success. Buffered rounds retain full error handling and are
         // unaffected.
-        if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
-            // `openai_stream_events` publishes this marker on every armed round
-            // (it always composes its stream into one logical Responses
-            // lifecycle). Consume it so a `"true"` published by another IRR step
-            // cannot satisfy a later step's check; the filter re-publishes it
-            // every armed round before this filter reads it.
-            let stream_events_armed = ctx.get_metadata("responses.logical_stream") == Some("true");
-            ctx.set_metadata("responses.logical_stream", "false");
-            if !stream_events_armed {
-                return Ok(FilterAction::Reject(responses_error_rejection(
-                    500,
-                    "server_error",
-                    "openai_agentic_loop with a streaming openai_responses_proxy sub-request requires \
-                     openai_stream_events in the same step so loop-terminal errors can reach the client",
-                )));
-            }
+        arm_agentic_stream_guard(ctx);
+        // Retain compatibility with a protocol adapter that selected streaming
+        // during body pre-read. Selected-upstream adapters enforce the same
+        // guard after making their later transport decision.
+        if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming
+            && let Some(rejection) = enforce_agentic_stream_guard(ctx)
+        {
+            return Ok(FilterAction::Reject(rejection));
         }
         Ok(FilterAction::Continue)
     }

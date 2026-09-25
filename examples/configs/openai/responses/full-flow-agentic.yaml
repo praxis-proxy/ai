@@ -11,9 +11,18 @@
 # request trace is continued through every nested web-search, OGX, and MCP
 # callout with a fresh span ID per hop.
 #
-# Pre-IRR filters run once on the client request to set up shared state
-# (ResponsesState) which persists across all IRR iterations via extension
-# swapping:
+# The request is classified once, then a top-level router freezes one logical
+# cluster plus its application_provider/application_protocol metadata. That
+# binding drives two mutually exclusive paths:
+#
+#   - application_provider=openai: a terminal branch forwards the original
+#     request directly. Validation, local state, hosted-tool resolution, and
+#     the IRR never run.
+#   - every managed provider: the bound-body barrier runs provider-aware body
+#     filters once, then the IRR executes the agentic loop.
+#
+# ResponsesState created on the managed path persists across all IRR
+# iterations via extension swapping:
 #
 #   0. state_owner maps deployment-specific trusted ingress headers into one
 #      normalized tenant/issuer/subject context for owner-aware filters.
@@ -38,8 +47,7 @@
 #      openai_conversations. It must remain earlier in this filter chain.
 #
 #   1. openai_conversations handles CRUD for the Conversations API
-#      (/v1/conversations) and sets has_conversation metadata when a
-#      Responses request carries a conversation field. On the response
+#      (/v1/conversations). On the managed Responses response
 #      path it appends input+output items back to the conversation after
 #      a successful non-streaming response.
 #
@@ -49,10 +57,12 @@
 #      Conversations API traffic is not rejected before the conversations
 #      filter can handle it in the body phase.
 #
-#   3. openai_responses_validate checks JSON syntax, generates response
-#      and conversation IDs, and writes responses.* metadata for
-#      downstream filters. Provider-owned parameter combinations pass
-#      through.
+#   3. The binding router selects the logical provider/protocol. The filters
+#      below that declare bound-body access then run once against the buffered
+#      request. Their `unless application_provider=openai` conditions make the
+#      OpenAI route true passthrough. openai_responses_validate checks JSON,
+#      initializes ResponsesState, and rejects gateway-unsupported fields such
+#      as background=true only on managed routes.
 #
 #   4. openai_tool_parse parses the tools array and tool_choice from
 #      Responses API requests and promotes summary facts (has_tools,
@@ -61,8 +71,8 @@
 #
 #   5. openai_response_store persists responses to SQLite and registers
 #      the store backend so downstream filters (rehydrate, compact) can
-#      read from it. It runs PRE-IRR (before the iterative_request_router
-#      below), so on the response path — which runs in reverse config
+#      read from it. It runs once at the post-binding body barrier before
+#      the iterative_request_router, so on the response path — which runs in reverse config
 #      order — it persists AFTER the IRR step has composed the terminal
 #      event. This is what makes streaming persistence work: the store
 #      reads the accumulated response object that openai_stream_events
@@ -95,63 +105,50 @@
 #      Projected identity headers are forwarded only to operator-configured
 #      connector_id targets, never arbitrary client-selected server_url values.
 #
-#   10. The bypass gateway (a no-op `headers` carrier hosting a
-#      branch_chains bypass) routes everything EXCEPT a classified
-#      `POST /v1/responses` create request directly to a backend. The IRR
-#      below fully owns the sub-request lifecycle, which is incompatible
-#      with WebSocket upgrades and with the dedicated
-#      prompts/embeddings/files/vector_stores services — so those, plus
-#      `GET /v1/responses` WebSocket handshakes, take the bypass branch.
-#      The carrier's `unless` condition skips it only when the request is
-#      `POST /v1/responses` AND classified as x-praxis-ai-format:
-#      openai_responses, so genuine create requests fall through to the
-#      IRR while a Chat Completions or Anthropic Messages body posted to
-#      /v1/responses (or a GET WebSocket handshake) still runs the
-#      carrier. The `unless` gate is a positive allow-list of one format:
-#      any body that is NOT classified openai_responses (Chat Completions,
-#      Anthropic Messages, or any future/unclassified format) runs the
-#      carrier and gets a route-miss (404) — no per-format reject rule is
-#      needed. Discrimination lives here, PRE-IRR, because the IRR strips
-#      x-praxis-* headers from its sub-request (see step 11). Inside the
-#      bypass, the `/v1/responses` route matches on the WebSocket
-#      `Upgrade` header (routes cannot match on HTTP method), so a WS
-#      handshake reaches the backend while a non-Responses body gets a
-#      route-miss (404). The bypass router/load_balancer live INSIDE the
-#      branch: a top-level router or load_balancer cannot coexist with an
-#      IRR in the same chain, and the branch rejoins at `terminal` so its
-#      selected cluster is forwarded upstream directly.
+#   10. Two terminal branches consume the frozen binding before the IRR.
+#       One forwards provider-owned OpenAI Responses traffic unchanged; the
+#       other preserves the direct service/WebSocket routes. Both use
+#       `cluster_source: bound_upstream`, so no second routing decision can
+#       disagree with the provider selected for the request.
 #
 #   11. The iterative_request_router owns the agentic loop for classified
-#      openai_responses create requests. openai_responses_proxy rebuilds
-#      the outbound body from ResponsesState and automatically selects the
-#      typed streaming transport for an effective `stream: true` request,
-#      so each backend SSE chunk reaches openai_stream_events
-#      incrementally. openai_agentic_loop is the sole loop owner, sole
+#      openai_responses create requests. For a native Responses upstream,
+#      openai_responses_proxy rebuilds the outbound body from ResponsesState
+#      and automatically selects the typed streaming transport for an
+#      effective `stream: true` request, so each backend SSE chunk reaches
+#      openai_stream_events incrementally; for a Chat Completions upstream,
+#      responses_to_chat_completions does the equivalent build and translates
+#      Chat responses back to Responses. Both now run AFTER the step load
+#      balancer, each gated on the selected upstream's protocol (see the
+#      "Protocol-adaptive translation" note below).
+#      The step load balancer consumes the request-level binding directly;
+#      there is no router inside the IRR. openai_agentic_loop is the sole loop owner, sole
 #      response parser, and sole transition authority: it extracts
 #      completed function_call, web_search_call, file_search_call, and MCP
 #      items, records the assignment each request-phase dispatcher must
-#      execute next, and publishes the single loop/done decision. Because
-#      the IRR is the terminal filter, all backend routing for create
-#      requests lives inside the IRR step. That step router is path-only:
-#      the IRR strips every x-praxis-* reserved-prefix header from its
-#      sub-request before the step runs, so it cannot route on
-#      x-praxis-ai-format. Responses-vs-Chat discrimination therefore
-#      happens PRE-IRR at the bypass carrier (step 10); only a classified
-#      openai_responses create request reaches this step.
+#      execute next, and publishes the single loop/done decision.
 #
-# IRR inference filter chain (canonical #1046 order):
+# IRR inference filter chain (canonical #1046 order with
+# protocol-adaptive translation):
 #   Request phase (forward):
 #     openai_stream_events → openai_web_search → openai_mcp_dispatch
 #       → openai_file_search_callout → openai_agentic_loop
-#       → headers → router → load_balancer → openai_responses_proxy
+#       → headers → load_balancer(cluster_source=bound_upstream)
+#       → openai_responses_proxy         (when selected upstream = Responses)
+#       → responses_to_chat_completions  (when selected upstream = Chat)
+#       → path_rewrite                   (when selected upstream = Chat)
 #   Response phase (reverse):
-#     openai_responses_proxy → load_balancer → router → headers
-#       → openai_agentic_loop → (dispatchers have no response phase)
-#       → openai_stream_events
-#   The proxy's request-body hook still participates in the pipeline body
-#   pre-read. Its request-header hook runs after load_balancer selection, so it
-#   can fail closed unless the selected cluster explicitly declares both
-#   application_protocol: openai_responses and application_provider: openai.
+#     path_rewrite → responses_to_chat_completions → openai_responses_proxy
+#       → load_balancer → headers → openai_agentic_loop
+#       → (dispatchers have no response phase) → openai_stream_events
+#   The protocol-adaptive body builders run AFTER the load balancer because
+#   they carry selected_upstream conditions, which are rejected
+#   at build time unless an unconditional load balancer is guaranteed to run
+#   before them. On the response path they therefore run FIRST, converting a
+#   Chat Completions response into Responses before openai_agentic_loop and
+#   openai_stream_events observe it. Exactly one body builder fires per
+#   request, keyed to the selected cluster's declared application_protocol;
+#   the match fails closed when the cluster declares none.
 #   The three dispatchers (openai_web_search, openai_mcp_dispatch,
 #   openai_file_search_callout) have no response phase: each executes the
 #   loop owner's assigned calls at request-body EOS on the next iteration,
@@ -182,10 +179,30 @@
 #   error detected by openai_agentic_loop can only reach the client
 #   through this filter's logical-stream finalizer. When it is absent from
 #   a streaming step, openai_agentic_loop fails closed with a 500 before
-#   any backend request. Keep the store PRE-IRR and openai_stream_events
+#   any backend request. Keep the store before the IRR and openai_stream_events
 #   INSIDE the IRR step so both buffered and streaming responses are
-#   persisted and retrievable via GET /v1/responses/{id} (served pre-IRR
+#   persisted and retrievable via GET /v1/responses/{id} (served before the IRR
 #   by openai_response_store).
+#
+# Protocol-adaptive translation:
+#   This config serves ONE Responses gateway pipeline regardless of whether
+#   the inference backend speaks the Responses API natively or only Chat
+#   Completions. The IRR step's load balancer publishes the selected
+#   cluster's typed application metadata (http.application_protocol /
+#   http.application_provider), and three filters carry selected_upstream
+#   conditions that read it:
+#     - openai_responses_proxy         when application_protocol=openai_responses
+#     - responses_to_chat_completions  when application_protocol=openai_chat_completions
+#     - path_rewrite                   when application_protocol=openai_chat_completions
+#   The load balancer declares both supported protocol variants because core
+#   validates selected_upstream matcher values against the clusters that can be
+#   selected. The top-level binding router maps `vllm-chat` to
+#   chat-completions-backend and other managed models to inference-backend;
+#   deployments can replace that illustrative model policy. selected_upstream fails
+#   closed: declare application_protocol on every selectable cluster, or neither
+#   branch fires and no outbound body is built. The gated filters must sit AFTER
+#   the unconditional load balancer, so build-time validation can prove a load
+#   balancer always runs before them.
 #
 # Security: StreamBuffer body callouts run before this listener's
 # header-phase filters. Deploy this example behind an outer authentication
@@ -264,40 +281,13 @@
 # active after a 101 upgrade and can terminate long-lived WebSockets.
 #
 # Direct OpenAI upstream variant:
-#   - Replace the local inference-backend endpoint with api.openai.com:443
-#     and configure tls.sni: api.openai.com (in BOTH the bypass branch's
-#     load_balancer and the IRR step's load_balancer).
-#   - Uncomment the `http.application_protocol: openai_responses` and
-#     `http.application_provider: openai` declarations on BOTH
-#     inference-backend clusters below. The canonical IRR ordering already
-#     permits `prompt.id` once both capabilities are declared; endpoint
-#     identity does not participate in the trust decision.
-#   - Add this headers filter inside the IRR step after the router to
-#     replace the downstream Host:
-#
-#       - filter: headers
-#         request_set:
-#           - name: Host
-#             value: api.openai.com
-#
-#   - Either pass through the client's Authorization header or add a
-#     credential_injection filter inside the IRR step to inject a
-#     server-owned credential:
-#
-#       - filter: credential_injection
-#         clusters:
-#           - name: inference-backend
-#             header: Authorization
-#             env_var: OPENAI_API_KEY
-#             header_prefix: "Bearer "
-#
-#   - Configure the inference cluster as:
-#
-#       - name: "inference-backend"
-#         endpoints:
-#           - "api.openai.com:443"
-#         tls:
-#           sni: api.openai.com
+#   The example routes model `gpt-5` to openai-responses-backend and tags that
+#   binding with application_provider=openai. Configure that cluster's endpoint
+#   as api.openai.com:443 with tls.sni/Host api.openai.com, and either preserve
+#   the caller's Authorization header or inject an operator-owned credential in
+#   the direct-openai branch. Do not put the OpenAI cluster in the IRR: the
+#   provider tag intentionally terminates through direct-openai-dispatch before
+#   validation, local persistence/rehydration, or agentic iteration.
 #
 # Build:
 #   cargo build -p praxis-ai-proxy --features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite
@@ -356,13 +346,6 @@ filter_chains:
 
       # Publishes the typed operation consumed by openai_conversations.
       - filter: openai_operation
-
-      - filter: openai_conversations
-        backend: sqlite
-        database_url: "sqlite://responses.db?mode=rwc"
-        conversations_table: openai_conversations
-        items_table: openai_conversation_items
-
       - filter: openai_responses_format
         on_invalid: continue
         headers:
@@ -371,9 +354,135 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
-      - filter: openai_responses_validate
-
       - filter: openai_tool_parse
+
+      # Bind one logical destination before any provider-owned body work. The
+      # classifier overwrites the reserved x-praxis-ai-model header from the
+      # parsed body, so clients cannot spoof a different promoted value. This
+      # example uses `gpt-5` for the direct OpenAI path, `vllm-chat` for a
+      # managed Chat Completions backend, and any other Responses model for a
+      # managed native-Responses backend. Deployments may replace this model
+      # policy with another trusted routing fact.
+      - filter: router
+        routes:
+          - path_prefix: "/v1/prompts"
+            cluster: "prompts-api"
+          - path_prefix: "/v1/embeddings"
+            cluster: "embeddings-api"
+          - path_prefix: "/v1/files"
+            cluster: "files-api"
+          # Conversations is gateway-owned in this example. Bind it to a
+          # managed cluster so the provider-gated bound-body filter runs and
+          # terminates the request locally before the IRR.
+          - path_prefix: "/v1/conversations"
+            cluster: "inference-backend"
+          - path: "/v1/responses"
+            headers:
+              upgrade: "websocket"
+            cluster: "responses-websocket-backend"
+          - path: "/v1/responses"
+            headers:
+              x-praxis-ai-format: "openai_responses"
+              x-praxis-ai-model: "gpt-5"
+            cluster: "openai-responses-backend"
+          - path: "/v1/responses"
+            headers:
+              x-praxis-ai-format: "openai_responses"
+              x-praxis-ai-model: "vllm-chat"
+            cluster: "chat-completions-backend"
+          - path_prefix: "/v1/responses"
+            headers:
+              x-praxis-ai-format: "openai_responses"
+            cluster: "inference-backend"
+          - path_prefix: "/v1/vector_stores"
+            cluster: "vector-stores-backend"
+
+      # Provider-owned Responses requests leave through a direct terminal
+      # branch. They never reach validation, persistence, rehydration, hosted
+      # tool resolution, or IRR. Endpoint selection still happens normally,
+      # but consumes the frozen logical binding rather than re-routing.
+      - filter: headers
+        conditions:
+          - when:
+              bound_upstream:
+                application_provider: openai
+        branch_chains:
+          - name: direct-openai
+            rejoin: terminal
+            chains:
+              - name: direct-openai-dispatch
+                filters:
+                  - filter: load_balancer
+                    cluster_source: bound_upstream
+                    clusters:
+                      - name: "openai-responses-backend"
+                        http:
+                          application_protocol: openai_responses
+                          application_provider: openai
+                        endpoints:
+                          - "127.0.0.1:3001"
+
+      # Non-agentic service and WebSocket routes retain the historical bypass,
+      # now driven by the same binding router rather than a router nested in a
+      # branch (binding pipelines permit exactly one top-level router).
+      - filter: headers
+        conditions:
+          - when:
+              bound_upstream:
+                application_provider: direct
+        branch_chains:
+          - name: direct-services
+            rejoin: terminal
+            chains:
+              - name: direct-services-dispatch
+                filters:
+                  - filter: load_balancer
+                    cluster_source: bound_upstream
+                    clusters:
+                      - name: "prompts-api"
+                        http:
+                          application_provider: direct
+                        endpoints:
+                          - "127.0.0.1:9998"
+                      - name: "embeddings-api"
+                        http:
+                          application_provider: direct
+                        endpoints:
+                          - "127.0.0.1:9997"
+                      - name: "files-api"
+                        http:
+                          application_provider: direct
+                        endpoints:
+                          - "127.0.0.1:9999"
+                      - name: "responses-websocket-backend"
+                        http:
+                          application_provider: direct
+                        endpoints:
+                          - "127.0.0.1:3001"
+                      - name: "vector-stores-backend"
+                        http:
+                          application_provider: direct
+                        endpoints:
+                          - "127.0.0.1:3002"
+
+      # The filters below participate in the once-per-request bound-body phase.
+      # OpenAI owns these capabilities on its direct path, so the condition
+      # suppresses their request, response, and response-body lifecycle hooks.
+      - filter: openai_responses_validate
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
+
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        conversations_table: openai_conversations
+        items_table: openai_conversation_items
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
 
       - filter: openai_response_store
         backend: sqlite
@@ -383,8 +492,16 @@ filter_chains:
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
 
       - filter: openai_responses_rehydrate
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
 
       - filter: openai_file_resolve
         files_api_url: "http://127.0.0.1:9999"
@@ -407,10 +524,18 @@ filter_chains:
               subject_header: x-user-id
         on_missing: reject
         timeout_ms: 10000
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
 
       - filter: openai_doc_extract
         allow_pre_security_callout: true
         on_unsupported: continue
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
 
       - filter: openai_mcp_tool_resolve
         user_credential: mcp_gateway
@@ -424,92 +549,36 @@ filter_chains:
         connectors:
           - id: trusted-mcp
             server_url: http://127.0.0.1:8001/mcp
-
-      # Bypass gateway: a no-op carrier that runs for everything EXCEPT a
-      # classified `POST /v1/responses` create request. When it runs, its
-      # unconditional branch routes the request directly (WebSocket
-      # upgrades, /v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores)
-      # and rejoins at `terminal`, forwarding the selected cluster upstream
-      # without entering the IRR. The router and load_balancer live inside
-      # the branch because a top-level router/load_balancer cannot coexist
-      # with the IRR below. The `unless` condition skips this carrier only
-      # for `POST /v1/responses` bearing x-praxis-ai-format:
-      # openai_responses, so create requests fall through to the IRR while a
-      # non-Responses body on /v1/responses (Chat Completions, Anthropic
-      # Messages, or unclassified) still runs the carrier and gets a
-      # route-miss (404). Discrimination lives here because the IRR strips
-      # x-praxis-* headers from its sub-request; inside the branch the
-      # /v1/responses route matches the WebSocket Upgrade header (routes
-      # cannot match on HTTP method), so a WS handshake reaches the backend
-      # while a non-Responses body does not.
-      - filter: headers
         conditions:
           - unless:
-              path: "/v1/responses"
-              methods: [POST]
-              headers:
-                x-praxis-ai-format: "openai_responses"
-        branch_chains:
-          - name: bypass-irr
-            rejoin: terminal
-            chains:
-              - name: bypass-chain
-                filters:
-                  - filter: router
-                    routes:
-                      - path_prefix: "/v1/prompts"
-                        cluster: "prompts-api"
-                      - path_prefix: "/v1/embeddings"
-                        cluster: "embeddings-api"
-                      - path_prefix: "/v1/files"
-                        cluster: "files-api"
-                      # WebSocket handshakes are GET /v1/responses with an
-                      # Upgrade header. Routes cannot match on HTTP method, so
-                      # the Upgrade header discriminates: a WS handshake routes
-                      # to the backend, while a non-Responses body posted to
-                      # /v1/responses carries no Upgrade header and gets a
-                      # route-miss (404) here instead of reaching the backend.
-                      - path: "/v1/responses"
-                        headers:
-                          upgrade: "websocket"
-                        cluster: "inference-backend"
-                      - path_prefix: "/v1/vector_stores"
-                        cluster: "vector-stores-backend"
-                  - filter: load_balancer
-                    clusters:
-                      - name: "prompts-api"
-                        endpoints:
-                          - "127.0.0.1:9998"
-                      - name: "embeddings-api"
-                        endpoints:
-                          - "127.0.0.1:9997"
-                      - name: "files-api"
-                        endpoints:
-                          - "127.0.0.1:9999"
-                      - name: "inference-backend"
-                        # Optional provider capability. Uncomment only when
-                        # this backend implements OpenAI-managed features such
-                        # as prompt IDs; generic/vLLM backends should leave it
-                        # absent so prompt templates fail closed.
-                        # http:
-                        #   application_protocol: openai_responses
-                        #   application_provider: openai
-                        endpoints:
-                          - "127.0.0.1:3001"
-                      - name: "vector-stores-backend"
-                        endpoints:
-                          - "127.0.0.1:3002"
+              bound_upstream:
+                application_provider: openai
 
-      # Classified openai_responses POST /v1/responses create requests flow
-      # here. The IRR runs the agentic model-tool-model loop: each round
+      # Local store operations above serve the managed GET/DELETE resource
+      # endpoints. Any other managed Responses subpath (for example /cancel)
+      # is unsupported and must not fall through into the inference IRR.
+      # Provider-owned OpenAI traffic already left through direct-openai.
+      - filter: static_response
+        status: 404
+        body: '{"error":{"message":"unsupported managed Responses operation","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}'
+        headers:
+          - name: Content-Type
+            value: application/json
+        conditions:
+          - when:
+              path_prefix: "/v1/responses"
+          - unless:
+              path: "/v1/responses"
+
+      # Gateway-owned Responses requests flow here after both terminal direct
+      # branches have been considered. The IRR runs the agentic model-tool-model loop: each round
       # streams through openai_stream_events, the three request-phase
       # dispatchers execute the loop owner's assigned hosted-tool calls, and
       # openai_agentic_loop parses each response and publishes the single
-      # loop/done transition. The pre-IRR openai_response_store persists the
-      # composed object on the response path (reverse order). The step
-      # router is path-only because the IRR strips x-praxis-* headers from
-      # its sub-request; the bypass carrier above has already excluded
-      # non-Responses traffic.
+      # loop/done transition. The bound-body openai_response_store persists the
+      # composed object on the response path (reverse order). The inference
+      # step consumes the frozen logical binding directly; it must not route
+      # again or attempt to replace the request-level provider decision.
       - filter: iterative_request_router
         initial_step: inference
         # Safety cap: at least max_infer_iters + 1 (7 + 1 = 8).
@@ -544,7 +613,19 @@ filter_chains:
               # "Streaming persistence" note above); openai_agentic_loop
               # fails closed with a 500 on an effective stream:true request
               # when it is absent.
+              #
+              # Its limits are set at or above responses_to_chat_completions'
+              # converter bounds below so no frame the client receives is ever
+              # rejected here and dropped from the store (the accumulator must
+              # never be tighter than the converter): max_events (200000) >=
+              # converter max_stream_events (100000); max_buffer_bytes (64 MiB)
+              # > converter max_emitted_sse_frame_bytes (48 MiB); timeout_secs
+              # (600) >= converter stream_timeout_secs (300). These apply on the
+              # native path too and stay within the IRR's byte/time caps above.
               - filter: openai_stream_events
+                max_buffer_bytes: 67108864
+                max_events: 200000
+                timeout_secs: 600
 
               # Request-phase dispatcher: runs first on re-entry to execute
               # web_search_call assignments prepared by the loop owner. Inert
@@ -602,38 +683,86 @@ filter_chains:
               # must stay below the IRR max_iterations safety cap (7 + 1 = 8).
               - filter: openai_agentic_loop
                 max_infer_iters: 7
+              # Protocol adapters run after the load balancer publishes the
+              # selected cluster's typed application metadata.
               - filter: headers
                 request_set:
                   - name: Content-Type
                     value: application/json
-              # Path-only routing. The x-praxis-ai-format header cannot be
-              # matched here: the IRR strips every x-praxis-* reserved-prefix
-              # header from the sub-request before this step's router runs, so
-              # a header match would always miss (404). Responses-vs-Chat
-              # discrimination therefore happens PRE-IRR at the bypass carrier
-              # (only a classified openai_responses POST reaches this step).
-              - filter: router
-                routes:
-                  - path: "/v1/responses"
-                    cluster: "inference-backend"
+              # Select an endpoint from the request-level binding and publish
+              # exchange-local application metadata. Every selected_upstream
+              # condition below reads this fresh selection, so the matching
+              # protocol adapter runs independently on every IRR round.
               - filter: load_balancer
+                cluster_source: bound_upstream
                 clusters:
                   - name: "inference-backend"
-                    # Optional provider capability. Uncomment only when this
-                    # backend can resolve OpenAI-managed prompt IDs.
-                    # Endpoint hostname, port, TLS, and SNI are not the trust
-                    # boundary.
-                    # http:
-                    #   application_protocol: openai_responses
-                    #   application_provider: openai
+                    # Gateway-owned native Responses backend.
+                    http:
+                      application_protocol: openai_responses
+                      application_provider: vllm
                     endpoints:
                       - "127.0.0.1:3001"
-              # Selects typed streaming automatically when the effective
-              # outbound body carries `"stream": true`; otherwise buffers.
-              # Its request hook runs after load-balancer selection. Prompt
-              # templates fail closed unless the selected cluster enables both
-              # optional application declarations above.
+                  - name: "chat-completions-backend"
+                    # Gateway-owned Chat Completions backend.
+                    http:
+                      application_protocol: openai_chat_completions
+                      application_provider: vllm
+                    endpoints:
+                      - "127.0.0.1:3001"
+
+              # ---- Protocol-adaptive body builders (run AFTER selection) ----
+              # Exactly one branch fires, chosen by the selected upstream's
+              # declared application_protocol. selected_upstream fails closed:
+              # always declare http.application_protocol on the cluster above.
+
+              # Native Responses upstream: enforce provider-aware prompt
+              # support, rebuild the outbound body from ResponsesState, and
+              # select the typed streaming transport for `stream: true`.
               - filter: openai_responses_proxy
+                conditions:
+                  - when:
+                      selected_upstream:
+                        application_protocol: openai_responses
+
+              # Chat Completions upstream: translate the canonical Responses
+              # request into Chat Completions on the request path, and
+              # translate the Chat Completions response (finite JSON or streamed
+              # SSE) back into a Responses resource / Responses SSE on the
+              # response path. Because response filters run in reverse, this
+              # converts the raw Chat response into Responses BEFORE
+              # openai_agentic_loop and openai_stream_events observe it (both
+              # require Responses). It fully owns outbound body build for Chat
+              # backends. It also rejects OpenAI prompt templates, which have no
+              # Chat representation. Stream bounds stay at/under
+              # openai_stream_events'
+              # limits so no frame the client receives is dropped from the store
+              # (cf. responses-to-chat-completions.yaml).
+              - filter: responses_to_chat_completions
+                max_rewritten_body_bytes: 33554432
+                max_emitted_sse_frame_bytes: 50331648
+                max_stream_events: 100000
+                stream_timeout_secs: 300
+                conditions:
+                  - when:
+                      selected_upstream:
+                        application_protocol: openai_chat_completions
+
+              # The translator owns body/response conversion but deliberately
+              # leaves the request URI unchanged. A Chat Completions backend
+              # still expects POST /v1/chat/completions, so rewrite that transport
+              # detail separately. The identical protocol gate plus create
+              # verb/path guards ensure only translated requests are rewritten.
+              - filter: path_rewrite
+                replace:
+                  pattern: "^/v1/responses/?$"
+                  replacement: "/v1/chat/completions"
+                conditions:
+                  - when:
+                      selected_upstream:
+                        application_protocol: openai_chat_completions
+                      path_prefix: "/v1/responses"
+                      methods: [POST]
             on_result:
               # openai_agentic_loop is the sole loop authority (issue #1046):
               # it parses each model response, records assignments for the

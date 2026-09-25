@@ -26,6 +26,8 @@ mod validate;
 #[cfg(feature = "openai-conversations")]
 pub use filter::OpenaiConversationsFilter;
 #[cfg(feature = "openai-conversations")]
+pub(crate) use filter::capture_validated_append_owner;
+#[cfg(feature = "openai-conversations")]
 pub use openapi::implementation_openapi_json;
 pub use routes::{ConversationOperation, ConversationOperationSpec, operation_specs};
 

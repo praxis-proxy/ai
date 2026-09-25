@@ -17,6 +17,14 @@ fn default_config_parses() {
 }
 
 #[test]
+fn declares_dual_phase_body_access() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+    let filter = McpToolResolveFilter::from_config(&yaml).unwrap();
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
+}
+
+#[test]
 fn config_with_custom_timeout() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("timeout_ms: 10000").unwrap();
     let filter = McpToolResolveFilter::from_config(&yaml).unwrap();

@@ -38,6 +38,6 @@ unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
-    # Temporary: until v0.5.2 is published on crates.io
+    # Temporary: consume Praxis condition-inferred bound-body scheduling from #1268.
     "https://github.com/praxis-proxy/praxis",
 ]

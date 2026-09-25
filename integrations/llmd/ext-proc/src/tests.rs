@@ -2500,6 +2500,7 @@ fn make_ctx(req: &praxis_filter::Request) -> HttpFilterContext<'_> {
         current_filter_id: None,
         downstream_tls: false,
         extensions: praxis_filter::RequestExtensions::default(),
+        executed_branch_filters: Vec::new(),
         executed_filter_indices: Vec::new(),
         extra_request_headers: Vec::new(),
         request_headers_to_remove: Vec::new(),

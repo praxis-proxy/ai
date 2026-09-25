@@ -65,13 +65,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_core::config::InsecureOptions;
 use praxis_filter::{
-    BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
-    HttpFilterContext, TerminalResponse, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, ChainBindingContext, FilterAction, FilterError, FilterPipeline,
+    HttpFilter, HttpFilterContext, TerminalResponse, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::debug;
 
 use self::config::{McpToolResolveConfig, build_config};
 use super::{
+    bound_body_outcome,
     error::responses_error_rejection,
     state::{DeferredMcpConnector, McpConnectorContextPolicy, ResponsesState},
 };
@@ -596,6 +597,10 @@ impl HttpFilter for McpToolResolveFilter {
         BodyAccess::ReadWrite
     }
 
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
     fn request_body_mode(&self) -> BodyMode {
         // Accept up to the absolute ceiling; the pipeline's body_limits
         // decides the real raw cap. max_rewritten_body_bytes bounds only
@@ -642,6 +647,15 @@ impl HttpFilter for McpToolResolveFilter {
             Ok(action) => Ok(action),
             Err(e) => Ok(resolve_error_action(ctx, &e, streaming, &bytes)),
         }
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 }
 

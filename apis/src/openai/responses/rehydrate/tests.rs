@@ -45,13 +45,10 @@ fn unknown_field_rejected() {
 }
 
 #[test]
-fn body_access_is_read_only() {
+fn declares_dual_phase_body_access() {
     let filter = default_filter();
-    assert_eq!(
-        filter.request_body_access(),
-        BodyAccess::ReadOnly,
-        "filter should use read-only body access"
-    );
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
 }
 
 // -----------------------------------------------------------------------------
@@ -334,12 +331,21 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
 - filter: openai_responses_format
+- filter: router
+  routes:
+    - path_prefix: "/"
+      cluster: test-backend
 - filter: openai_response_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
   conversations_table: test_conversations
 - filter: openai_responses_rehydrate
+- filter: load_balancer
+  cluster_source: bound_upstream
+  clusters:
+    - name: test-backend
+      endpoints: ["127.0.0.1:3001"]
 "#
     ))
     .unwrap();
@@ -351,8 +357,6 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     pipeline.prepare_extensions(&mut ctx.extensions);
 
-    drop(pipeline.execute_http_request(&mut ctx).await.unwrap());
-
     let original = r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#;
     let mut body = Some(Bytes::from(original));
 
@@ -362,7 +366,14 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
         .unwrap();
     assert!(
         matches!(action, FilterAction::Release),
-        "on_request should register store so rehydrate finds it in on_request_body"
+        "format classification should release the canonical pre-read body"
+    );
+    ctx.buffered_request_body = body.clone();
+
+    let request_action = pipeline.execute_http_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(request_action, FilterAction::Continue),
+        "binding should run the bound-body store and rehydrate hooks"
     );
 
     assert_eq!(

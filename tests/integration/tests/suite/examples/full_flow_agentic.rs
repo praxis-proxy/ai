@@ -297,6 +297,129 @@ fn full_flow_stateless_valid_request_reaches_same_backend() {
 }
 
 #[test]
+fn full_flow_openai_provider_is_direct_passthrough() {
+    let provider_response = json!({
+        "id": "resp_openai_direct",
+        "object": "response",
+        "status": "queued",
+        "background": true,
+        "output": []
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, provider_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_openai_direct");
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let proxy = start_proxy(&config);
+
+    // `background:true` and an unresolved provider-owned continuation would
+    // both be rejected by the gateway-owned path. Reaching the backend proves
+    // the OpenAI binding skipped validation, store/rehydrate, and IRR.
+    let request = json!({
+        "model": "gpt-5",
+        "input": "continue at the provider",
+        "background": true,
+        "previous_response_id": "resp_provider_owned"
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "direct OpenAI request should reach the provider: {raw}"
+    );
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("provider response should remain JSON");
+    assert_eq!(
+        response, provider_response,
+        "direct response must bypass gateway composition"
+    );
+
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 1, "direct provider should receive exactly one request");
+    assert_eq!(requests[0].uri, "/v1/responses");
+    let forwarded: Value = serde_json::from_str(&requests[0].body).expect("forwarded body should remain JSON");
+    assert_eq!(
+        forwarded, request,
+        "provider-owned request fields must pass through unchanged"
+    );
+}
+
+#[test]
+fn full_flow_managed_provider_rejects_background_before_forwarding() {
+    let backend = StatefulCapturingBackend::new(vec![(200, "{}".to_owned())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_managed_background");
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"run locally","background":true}"#,
+        ),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        400,
+        "managed background request must fail before forwarding"
+    );
+    assert!(
+        backend.requests().is_empty(),
+        "rejected request must not contact the managed backend"
+    );
+    let body: Value = serde_json::from_str(&parse_body(&raw)).expect("rejection should be JSON");
+    assert_eq!(body["error"]["message"], "background mode is not supported");
+}
+
+#[test]
+fn full_flow_managed_chat_backend_translates_after_binding() {
+    let chat_response = json!({
+        "id": "chatcmpl_bound",
+        "object": "chat.completion",
+        "created": 1000,
+        "model": "vllm-chat",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "translated"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, chat_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_managed_chat");
+    let config = load_full_flow_config_with_db(proxy_port, &db, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"vllm-chat","input":"hello","store":false}"#,
+        ),
+    );
+
+    assert_eq!(parse_status(&raw), 200, "translated request should complete: {raw}");
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("client response should be JSON");
+    assert_eq!(response["object"], "response");
+    assert_eq!(response["output"][0]["content"][0]["text"], "translated");
+
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 1, "single-pass IRR should make one inference request");
+    assert_eq!(requests[0].uri, "/v1/chat/completions");
+    let translated: Value = serde_json::from_str(&requests[0].body).expect("backend request should be JSON");
+    assert!(
+        translated.get("messages").is_some(),
+        "Chat backend must receive messages"
+    );
+    assert!(
+        translated.get("input").is_none(),
+        "Responses input must not leak to the Chat backend"
+    );
+}
+
+#[test]
 fn full_flow_chat_completions_body_on_responses_path_does_not_reach_backend() {
     let backend_guard = start_backend_with_shutdown("inference-backend");
     let proxy_port = free_port();

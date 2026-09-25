@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::StatusCode;
 use praxis_core::time::FixedTimeSource;
-use praxis_filter::{BodyAccess, BodyMode, FilterAction, SubRequestResponseMode};
+use praxis_filter::{BodyAccess, BodyMode, FilterAction, SelectedUpstreamBodyOutcome, SubRequestResponseMode};
 use serde_json::json;
 
 use super::{
@@ -21,7 +21,8 @@ fn default_config_parses() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&yaml).unwrap();
 
     assert_eq!(filter.name(), "responses_to_chat_completions");
-    assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(filter.request_body_access(), BodyAccess::None);
+    assert_eq!(filter.selected_upstream_request_body_access(), BodyAccess::ReadWrite);
     assert!(
         matches!(
             filter.request_body_mode(),
@@ -63,10 +64,13 @@ async fn non_create_request_continues_without_rewriting_or_arming() {
     let original = Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#);
     let mut body = Some(original.clone());
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "a non-create request must pass through unchanged"
     );
     assert_eq!(body.as_deref(), Some(original.as_ref()));
@@ -208,18 +212,21 @@ fn response_body_access_is_read_write() {
 }
 
 #[tokio::test]
-async fn classified_non_responses_request_is_released() {
+async fn classified_non_responses_request_continues_without_rewriting() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut context = crate::test_utils::make_filter_context(&request);
     context.set_metadata("openai_responses_format.format", "openai_chat_completions");
     let mut body = Some(Bytes::from_static(br#"{"messages":[]}"#));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Release),
-        "a non-Responses classified request must be released to sibling filters"
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "a non-Responses classified request must continue unchanged"
     );
 }
 
@@ -230,7 +237,10 @@ async fn responses_create_without_classifier_metadata_fails_closed() {
     let mut context = crate::test_utils::make_filter_context(&request);
     let mut body = Some(Bytes::from_static(br#"{"model":"m","input":"hello"}"#));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
     assert_server_error(action);
 }
@@ -243,7 +253,10 @@ async fn classified_responses_create_without_state_fails_closed() {
     context.set_metadata("openai_responses_format.format", "openai_responses");
     let mut body = Some(Bytes::from_static(br#"{"model":"m","input":"hello"}"#));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
     assert_server_error(action);
 }
@@ -264,9 +277,12 @@ async fn canonical_state_translates_across_iterative_metadata_boundary() {
         br#"{"model":"gpt-4.1-mini","input":"hello","stream":false}"#,
     ));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
     let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     assert_eq!(translated["messages"][0]["content"], "hello");
     assert_eq!(translated["stream"], false);
@@ -289,9 +305,12 @@ async fn canonical_state_installs_stream_converter_across_iterative_metadata_bou
         br#"{"model":"gpt-4.1-mini","input":"hello","stream":true}"#,
     ));
 
-    let request_action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let request_action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
     assert!(
-        matches!(request_action, FilterAction::Continue),
+        matches!(request_action, SelectedUpstreamBodyOutcome::Continue),
         "canonical streaming request should translate successfully"
     );
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
@@ -324,7 +343,10 @@ async fn unvalidated_state_does_not_bypass_missing_classifier_metadata() {
     })));
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
     assert_server_error(action);
     assert!(context.get_metadata(ARMED_KEY).is_none());
@@ -347,9 +369,12 @@ async fn unresolved_previous_response_id_fails_closed() {
     );
     let mut body = Some(original.clone());
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
         panic!("expected rejection");
     };
     assert_eq!(rejection.status, 500);
@@ -385,9 +410,12 @@ async fn unresolved_streaming_previous_response_id_fails_closed_with_json_error(
     );
     let mut body = Some(original.clone());
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
         panic!("expected rejection");
     };
     assert_eq!(rejection.status, 500);
@@ -419,9 +447,12 @@ async fn streaming_responses_create_without_state_uses_json_error() {
     context.set_metadata("openai_responses_format.stream", "true");
     let mut body = Some(Bytes::from_static(br#"{"model":"m","input":"hello","stream":true}"#));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
         panic!("expected rejection");
     };
     assert_eq!(rejection.status, 500);
@@ -435,8 +466,8 @@ async fn streaming_responses_create_without_state_uses_json_error() {
     assert_eq!(parsed["error"]["message"], "request pipeline state is unavailable");
 }
 
-fn assert_server_error(action: FilterAction) {
-    let FilterAction::Reject(rejection) = action else {
+fn assert_server_error(action: SelectedUpstreamBodyOutcome) {
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
         panic!("expected rejection");
     };
     assert_eq!(rejection.status, 500);
@@ -468,10 +499,13 @@ async fn canonical_state_is_translated_and_arms_response() {
         br#"{"model":"gpt-4.1-mini","input":"current input","stream":false}"#,
     ));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "canonical Responses request should translate successfully"
     );
     let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
@@ -514,9 +548,12 @@ async fn prompt_template_is_rejected_before_chat_translation() {
     let original = Bytes::from(serde_json::to_vec(&request_body).unwrap());
     let mut body = Some(original.clone());
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
         panic!("a prompt template must not be silently dropped during Chat translation");
     };
     assert_eq!(rejection.status, 400, "prompt translation rejection must be HTTP 400");
@@ -554,8 +591,8 @@ fn always_advertises_streaming_subrequest_capability() {
     );
 }
 
-/// Drive one create request through `on_request_body` with the given config and
-/// return the transport the filter selected for the translated subrequest.
+/// Drive one create request through the selected-upstream body hook with the
+/// given config and return the translated subrequest transport.
 async fn selected_subrequest_mode(config_yaml: &str, request_body: serde_json::Value) -> SubRequestResponseMode {
     let config = serde_yaml::from_str(config_yaml).unwrap();
     let filter = ResponsesToChatCompletionsFilter::from_config(&config).unwrap();
@@ -567,8 +604,14 @@ async fn selected_subrequest_mode(config_yaml: &str, request_body: serde_json::V
         .insert(ResponsesState::from_request_body(request_body.clone()));
     let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
-    assert!(matches!(action, FilterAction::Continue), "translation should continue");
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
+    assert!(
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
+        "translation should continue"
+    );
     assert_eq!(context.get_metadata(ARMED_KEY), Some("true"), "translation should arm");
     context.subrequest_response_mode()
 }
@@ -642,9 +685,12 @@ async fn malformed_responses_input_is_rejected_before_request_translation() {
         let original = Bytes::from(serde_json::to_vec(&request_body).unwrap());
         let mut body = Some(original.clone());
 
-        let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+        let action = filter
+            .on_selected_upstream_request_body(&mut context, &mut body)
+            .await
+            .unwrap();
 
-        let FilterAction::Reject(rejection) = action else {
+        let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
             panic!("{case} should be rejected");
         };
         assert_eq!(rejection.status, 400, "{case} should produce a client error");
@@ -688,10 +734,13 @@ async fn rehydrated_previous_response_id_translates_full_history() {
         br#"{"model":"gpt-4.1-mini","input":"current input","previous_response_id":"resp_previous","stream":false}"#,
     ));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "rehydrated continuation should translate successfully"
     );
     let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
@@ -731,9 +780,12 @@ async fn translated_request_over_configured_limit_is_rejected() {
         .insert(ResponsesState::from_request_body(request_body));
     let mut body = Some(Bytes::from(encoded));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
         panic!("expected rejection");
     };
     assert_eq!(rejection.status, 413);
@@ -772,9 +824,12 @@ async fn web_search_translation_preserves_canonical_hosted_tool_state() {
         br#"{"model":"gpt-4.1-mini","input":"hello","tools":[{"type":"web_search","search_context_size":"high","user_location":{"type":"approximate","country":"FR"}}],"tool_choice":{"type":"web_search"}}"#,
     ));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
     let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     assert_eq!(translated["tools"][0]["function"]["name"], "web_search");
     assert_eq!(
@@ -812,10 +867,13 @@ async fn lowered_request_body_tools_translate_over_canonical_rich_tools() {
     context.extensions.insert(state);
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "lowered function tools must translate successfully, not reject as UnsupportedToolType"
     );
     let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
@@ -850,9 +908,12 @@ async fn lowered_request_body_tool_choice_translates_over_canonical() {
     context.extensions.insert(state);
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
     let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     assert_eq!(
         translated["tool_choice"], "required",
@@ -888,9 +949,12 @@ async fn non_compat_state_translation_is_golden_unchanged() {
     })));
     let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1-mini","input":"hello"}"#));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
     let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     assert_eq!(
         translated["tools"],
@@ -927,9 +991,12 @@ async fn streaming_translation_error_uses_responses_json_error() {
         br#"{"model":"gpt-4.1-mini","input":"hello","stream":true,"tools":[{"type":"code_interpreter"}]}"#,
     ));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
         panic!("expected rejection");
     };
     assert_responses_json_translation_error(&rejection);
@@ -981,11 +1048,11 @@ async fn successful_sse_response_installs_stream_converter() {
         br#"{"model":"gpt-4.1-mini","input":"hello","stream":true}"#,
     ));
     let request_action = filter
-        .on_request_body(&mut context, &mut request_body, true)
+        .on_selected_upstream_request_body(&mut context, &mut request_body)
         .await
         .unwrap();
     assert!(
-        matches!(request_action, FilterAction::Continue),
+        matches!(request_action, SelectedUpstreamBodyOutcome::Continue),
         "installing the stream converter must let the request continue"
     );
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
@@ -1400,11 +1467,11 @@ async fn non_streaming_chat_response_becomes_response_resource() {
         br#"{"model":"gpt-4.1-mini","input":"hello","stream":false}"#,
     ));
     let request_action = filter
-        .on_request_body(&mut context, &mut request_body, true)
+        .on_selected_upstream_request_body(&mut context, &mut request_body)
         .await
         .unwrap();
     assert!(
-        matches!(request_action, FilterAction::Continue),
+        matches!(request_action, SelectedUpstreamBodyOutcome::Continue),
         "a rehydrated finite create request must continue"
     );
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
@@ -1477,10 +1544,10 @@ async fn chat_file_search_function_call_becomes_responses_function_call() {
         br#"{"model":"chat-only-model","input":"find revenue"}"#,
     ));
     let request_action = filter
-        .on_request_body(&mut context, &mut request_body, true)
+        .on_selected_upstream_request_body(&mut context, &mut request_body)
         .await
         .unwrap();
-    assert!(matches!(request_action, FilterAction::Continue));
+    assert!(matches!(request_action, SelectedUpstreamBodyOutcome::Continue));
 
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.headers.insert(
@@ -1546,10 +1613,10 @@ async fn buffered_file_search_echo_uses_hosted_tools_after_backend_lowering() {
         br#"{"model":"chat-only-model","input":"find revenue"}"#,
     ));
     let request_action = filter
-        .on_request_body(&mut context, &mut request_body, true)
+        .on_selected_upstream_request_body(&mut context, &mut request_body)
         .await
         .unwrap();
-    assert!(matches!(request_action, FilterAction::Continue));
+    assert!(matches!(request_action, SelectedUpstreamBodyOutcome::Continue));
 
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.headers.insert(
@@ -1828,11 +1895,11 @@ async fn successful_sse_chunks_translate_to_responses_events() {
         br#"{"model":"gpt-4.1-mini","input":"hello","stream":true}"#,
     ));
     let request_action = filter
-        .on_request_body(&mut context, &mut request_body, true)
+        .on_selected_upstream_request_body(&mut context, &mut request_body)
         .await
         .unwrap();
     assert!(
-        matches!(request_action, FilterAction::Continue),
+        matches!(request_action, SelectedUpstreamBodyOutcome::Continue),
         "installing the stream converter must let the streaming request continue"
     );
     let response = Box::leak(Box::new(crate::test_utils::make_response()));

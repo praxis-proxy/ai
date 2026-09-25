@@ -73,8 +73,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_core::config::ChainRef;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, FilterPipeline, HttpFilter, HttpFilterContext, Rejection,
-    body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, FilterPipeline, HttpFilter,
+    HttpFilterContext, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -87,8 +87,8 @@ use self::{
     resolve_url::{FileUrlResolver, NormalizedOrigin},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, openai_responses_proxy::serialized_outbound_body_len,
-    state::ResponsesState,
+    body_limits::reject_rewritten_body_too_large, bound_body_outcome,
+    openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
 };
 use crate::{
     callout_headers::effective_body_callout_headers,
@@ -357,6 +357,10 @@ impl HttpFilter for FileResolveFilter {
         BodyAccess::ReadWrite
     }
 
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
     fn request_body_mode(&self) -> BodyMode {
         // Accept up to the absolute ceiling; the pipeline's body_limits
         // decides the real raw cap. max_rewritten_body_bytes bounds only
@@ -404,6 +408,15 @@ impl HttpFilter for FileResolveFilter {
         };
 
         resolve_and_rewrite(self, ctx, body, parsed).await
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 
     fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {

@@ -944,6 +944,8 @@ async fn on_request_body_appends_backend_valid_continuation() {
 
 #[tokio::test]
 async fn web_search_continuation_serializes_backend_valid_input() {
+    use praxis_filter::SelectedUpstreamBodyOutcome;
+
     use crate::openai::responses::{AgenticLoopFilter, openai_responses_proxy::ResponsesProxyFilter};
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -996,9 +998,14 @@ async fn web_search_continuation_serializes_backend_valid_input() {
         "web_search dispatch should continue"
     );
     let mut body = Some(Bytes::from(br#"{"model":"gpt-4.1","input":"search rust"}"#.to_vec()));
-    let action = proxy.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    // The proxy rebuilds the outbound body in the selected-upstream body phase
+    // (it translates after upstream selection), not in on_request_body.
+    let action = proxy
+        .on_selected_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
     assert!(
-        matches!(action, FilterAction::Continue),
+        matches!(action, SelectedUpstreamBodyOutcome::Continue),
         "proxy body rebuild should continue"
     );
 

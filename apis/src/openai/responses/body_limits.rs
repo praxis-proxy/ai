@@ -18,7 +18,7 @@
 //!
 //! [`responses_error_rejection`]: super::error::responses_error_rejection
 
-use praxis_filter::{FilterAction, FilterError, body::MAX_JSON_BODY_BYTES};
+use praxis_filter::{FilterAction, FilterError, Rejection, body::MAX_JSON_BODY_BYTES};
 
 use super::error::responses_error_rejection;
 
@@ -40,18 +40,24 @@ pub(crate) fn validate_size_limit(filter: &str, field: &str, value: usize) -> Re
     Ok(())
 }
 
-/// Build a 413 for a rewritten/resolved body that exceeds the filter's
-/// configured limit.
+/// Build a 413 [`Rejection`] for a rewritten/resolved body that exceeds the
+/// filter's configured limit.
 ///
 /// `len` is the measured serialized length and `limit` the configured
 /// maximum. This is a pre-commitment rejection, so it always uses the
 /// JSON error envelope (see [`responses_error_rejection`]).
-pub(crate) fn reject_rewritten_body_too_large(len: usize, limit: usize) -> FilterAction {
-    FilterAction::Reject(responses_error_rejection(
+pub(crate) fn rewritten_body_too_large_rejection(len: usize, limit: usize) -> Rejection {
+    responses_error_rejection(
         413,
         "invalid_request_error",
         &format!("rewritten request body ({len} bytes) exceeds maximum ({limit} bytes)"),
-    ))
+    )
+}
+
+/// [`FilterAction::Reject`] wrapper over [`rewritten_body_too_large_rejection`]
+/// for filters that reject in the [`FilterAction`]-typed request phases.
+pub(crate) fn reject_rewritten_body_too_large(len: usize, limit: usize) -> FilterAction {
+    FilterAction::Reject(rewritten_body_too_large_rejection(len, limit))
 }
 
 #[cfg(test)]

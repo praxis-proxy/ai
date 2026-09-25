@@ -53,8 +53,8 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
-    body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use tracing::{debug, trace, warn};
 
@@ -63,7 +63,7 @@ use self::{
     extract::{ExtractError, ExtractionBudget, extract_input_file},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, content_parts::content_parts_mut,
+    body_limits::reject_rewritten_body_too_large, bound_body_outcome, content_parts::content_parts_mut,
     openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
 };
 use crate::{classifier::is_responses_create, json_body::serialize_json_body};
@@ -118,6 +118,10 @@ impl HttpFilter for DocExtractFilter {
         BodyAccess::ReadWrite
     }
 
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
     fn request_body_mode(&self) -> BodyMode {
         // Accept up to the absolute ceiling; the pipeline's body_limits
         // decides the real raw cap. max_rewritten_body_bytes bounds only
@@ -165,6 +169,15 @@ impl HttpFilter for DocExtractFilter {
         };
 
         extract_and_rewrite(self, ctx, body, parsed)
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 }
 

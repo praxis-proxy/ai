@@ -101,11 +101,11 @@ zstd = "0.14.0"
 # Policy Engine) and the pure-Rust cryptography its plugins carry; praxis-ai
 # forwards that engine through its own `policy-engine` feature instead, on by
 # default and off in the FIPS build (see FIPS_FEATURES in the Makefile).
-praxis-core = { version = "0.7.0", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.0", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
-praxis-protocol = { version = "0.7.0", package = "praxis-proxy-protocol" }
-praxis-tls = { version = "0.7.0", package = "praxis-proxy-tls" }
-praxis = { version = "0.7.0", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
+praxis-core = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a1b529e522bccb40f7bba6e2d5bc8558334f3a14", package = "praxis-proxy-core" }
+praxis-filter = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a1b529e522bccb40f7bba6e2d5bc8558334f3a14", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
+praxis-protocol = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a1b529e522bccb40f7bba6e2d5bc8558334f3a14", package = "praxis-proxy-protocol" }
+praxis-tls = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a1b529e522bccb40f7bba6e2d5bc8558334f3a14", package = "praxis-proxy-tls" }
+praxis = { git = "https://github.com/praxis-proxy/praxis.git", rev = "a1b529e522bccb40f7bba6e2d5bc8558334f3a14", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer
