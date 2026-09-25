@@ -101,7 +101,7 @@ struct ExampleEntry {
     /// Filename only (e.g. `full-flow-agentic.yaml`).
     filename: String,
     /// Relative link path from `examples/` (e.g.
-    /// `configs/openai/responses/full-flow-agentic.yaml`).
+    /// `configs/agentic/full-flow-agentic.yaml`).
     link_path: String,
 }
 

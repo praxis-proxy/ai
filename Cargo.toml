@@ -103,7 +103,7 @@ zstd = "0.14.0"
 # default and off in the FIPS build (see FIPS_FEATURES in the Makefile).
 praxis-core = { version = "0.7.0", package = "praxis-proxy-core" }
 praxis-filter = { version = "0.7.0", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
-praxis-protocol = { version = "0.7.0", package = "praxis-proxy-protocol" }
+praxis-protocol = { version = "0.7.0", package = "praxis-proxy-protocol", features = ["upstream-binding"] }
 praxis-tls = { version = "0.7.0", package = "praxis-proxy-tls" }
 praxis = { version = "0.7.0", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
 praxis-test-utils = { path = "tests/utils", default-features = false }

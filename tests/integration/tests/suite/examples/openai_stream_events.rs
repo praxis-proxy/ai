@@ -22,7 +22,7 @@ const OWNER_ASSERTION: &str = "v1.WyJzdHJlYW0tdGVuYW50IiwidXJuOnByYXhpczp0ZXN0Ii
 
 const STREAMING_EXAMPLES: [(&str, u64); 5] = [
     ("openai/responses/agentic-loop.yaml", 360_000),
-    ("openai/responses/full-flow-agentic.yaml", 300_000),
+    ("agentic/full-flow-agentic.yaml", 300_000),
     ("openai/responses/irr-terminal-streaming.yaml", 360_000),
     ("openai/responses/responses-to-chat-completions.yaml", 660_000),
     ("openai/responses/stream-events.yaml", 360_000),

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Praxis Contributors
 
 //! Functional coverage for the Anthropic Messages full-flow agentic example
-//! (`anthropic/full-flow-agentic.yaml`).
+//! (`agentic/full-flow-agentic.yaml`).
 //!
 //! A single example config serves the server-owned web-search loop in BOTH
 //! modes via `terminal_streaming: true`, selected per request from the client's
@@ -31,7 +31,7 @@ use praxis_test_utils::{
 };
 use serde_json::{Value, json};
 
-const EXAMPLE: &str = "anthropic/full-flow-agentic.yaml";
+const EXAMPLE: &str = "agentic/full-flow-agentic.yaml";
 const TOOL_USE_ID: &str = "toolu_web_search_01";
 const USER_SEARCH_HEADER: &str = "x-user-you-key";
 const USER_SEARCH_CREDENTIAL: &str = "test-user-search-key";
@@ -206,15 +206,12 @@ fn base_example_yaml(proxy_port: u16, model_port: u16, search_port: u16) -> Stri
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("read full-flow-agentic example");
     let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8000", model_port)]));
     let yaml = yaml.replace(
-        "api_key: ${WEB_SEARCH_API_KEY}",
-        &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
+        "provider: you\n                api_key: ${WEB_SEARCH_API_KEY}",
+        &format!(
+            "provider: you\n                api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"
+        ),
     );
-    // The provider callout targets a loopback mock, so the executor's SSRF check
-    // requires the operator opt-in on the outbound pipeline.
-    yaml.replace(
-        "allow_private_endpoints: true",
-        "allow_private_endpoints: true\n  allow_private_upstreams: true",
-    )
+    yaml.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
 }
 
 fn load_config(proxy_port: u16, model_port: u16, search_port: u16) -> praxis_core::config::Config {
@@ -231,7 +228,7 @@ fn load_config_with_max_iterations(
     max_iterations: u32,
 ) -> praxis_core::config::Config {
     let yaml = base_example_yaml(proxy_port, model_port, search_port)
-        .replace("max_iterations: 6", &format!("max_iterations: {max_iterations}"));
+        .replace("max_iterations: 8", &format!("max_iterations: {max_iterations}"));
     praxis_core::config::Config::from_yaml(&yaml).expect("parse full-flow-agentic example")
 }
 
@@ -244,7 +241,7 @@ fn load_config_with_timeout(
     timeout_ms: u32,
 ) -> praxis_core::config::Config {
     let yaml = base_example_yaml(proxy_port, model_port, search_port)
-        .replace("timeout_ms: 90000", &format!("timeout_ms: {timeout_ms}"));
+        .replace("timeout_ms: 360000", &format!("timeout_ms: {timeout_ms}"));
     praxis_core::config::Config::from_yaml(&yaml).expect("parse full-flow-agentic example")
 }
 
@@ -269,14 +266,16 @@ fn load_config_with_limits(
     let mut yaml = base_example_yaml(proxy_port, model_port, search_port);
     if let Some(max_state_bytes) = max_state_bytes {
         yaml = yaml.replace(
-            "max_iterations: 6",
-            &format!("max_iterations: 6\n        max_state_bytes: {max_state_bytes}"),
+            "max_state_bytes: 136314880",
+            &format!("max_state_bytes: {max_state_bytes}"),
         );
     }
     if let Some(max_body_bytes) = max_body_bytes {
         yaml = yaml.replace(
-            "timeout_ms: 10000",
-            &format!("timeout_ms: 10000\n                max_body_bytes: {max_body_bytes}"),
+            "default_context_size: medium\n                timeout_ms: 10000",
+            &format!(
+                "default_context_size: medium\n                timeout_ms: 10000\n                max_body_bytes: {max_body_bytes}"
+            ),
         );
     }
     praxis_core::config::Config::from_yaml(&yaml).expect("parse full-flow-agentic example")
@@ -513,7 +512,7 @@ fn messages_web_search_round_trip_re_enters_the_model() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post("/v1/messages", &fixture["initial_request"].to_string()),
+        &authenticated_json_post("/v1/messages", &fixture["initial_request"].to_string()),
     );
 
     assert_eq!(parse_status(&raw), 200);
@@ -572,7 +571,7 @@ fn messages_web_search_callout_executes_outbound_chain_filters() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post("/v1/messages", &fixture["initial_request"].to_string()),
+        &authenticated_json_post("/v1/messages", &fixture["initial_request"].to_string()),
     );
 
     assert_eq!(parse_status(&raw), 200);
@@ -600,7 +599,7 @@ fn provider_failure_appends_is_error_tool_result_and_re_enters_model() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post("/v1/messages", &fixture["initial_request"].to_string()),
+        &authenticated_json_post("/v1/messages", &fixture["initial_request"].to_string()),
     );
 
     assert_eq!(
@@ -693,7 +692,7 @@ fn non_success_tool_use_response_passes_through_without_search_or_reentry() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post("/v1/messages", &fixture["initial_request"].to_string()),
+        &authenticated_json_post("/v1/messages", &fixture["initial_request"].to_string()),
     );
 
     assert_eq!(parse_status(&raw), 429);
@@ -744,7 +743,7 @@ fn two_sequential_web_searches_retain_ordered_tool_history() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post("/v1/messages", &fixture["initial_request"].to_string()),
+        &authenticated_json_post("/v1/messages", &fixture["initial_request"].to_string()),
     );
 
     assert_eq!(parse_status(&raw), 200);
@@ -785,7 +784,10 @@ fn stream_false_preserves_buffered_loop() {
     let mut request: Value = serde_json::from_str(&streaming_request()).expect("request JSON");
     request["stream"] = Value::Bool(false);
 
-    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &request.to_string()));
+    let raw = http_send(
+        proxy.addr(),
+        &authenticated_json_post("/v1/messages", &request.to_string()),
+    );
 
     assert_eq!(parse_status(&raw), 200, "the buffered loop returns 200: {raw}");
     let client_response: Value = serde_json::from_str(&parse_body(&raw)).expect("client response JSON");
@@ -818,7 +820,7 @@ fn state_limit_rejects_before_large_search_result_reenters_model() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post("/v1/messages", &fixture["initial_request"].to_string()),
+        &authenticated_json_post("/v1/messages", &fixture["initial_request"].to_string()),
     );
 
     assert_eq!(parse_status(&raw), 413);
@@ -856,7 +858,7 @@ fn body_limit_rejects_before_large_rebuilt_request_reenters_model() {
 
     let raw = http_send(
         proxy.addr(),
-        &json_post("/v1/messages", &fixture["initial_request"].to_string()),
+        &authenticated_json_post("/v1/messages", &fixture["initial_request"].to_string()),
     );
 
     assert_eq!(parse_status(&raw), 413);
@@ -1601,7 +1603,7 @@ fn connect_and_send(proxy_addr: &str, body: &str) -> TcpStream {
         .set_read_timeout(Some(Duration::from_secs(4)))
         .expect("client read timeout should be set");
     stream
-        .write_all(json_post("/v1/messages", body).as_bytes())
+        .write_all(authenticated_json_post("/v1/messages", body).as_bytes())
         .expect("client request should be written");
     stream
 }
@@ -1644,6 +1646,8 @@ fn json_post_with_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> S
          Host: localhost\r\n\
          Content-Type: application/json\r\n\
          Connection: close\r\n\
+         x-auth-tenant: integration-tenant\r\n\
+         x-auth-user: integration-user\r\n\
          Content-Length: {}\r\n\
          {extra}\
          \r\n\
@@ -1652,6 +1656,6 @@ fn json_post_with_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> S
     )
 }
 
-fn json_post(path: &str, body: &str) -> String {
+fn authenticated_json_post(path: &str, body: &str) -> String {
     json_post_with_headers(path, body, &[(USER_SEARCH_HEADER, USER_SEARCH_CREDENTIAL)])
 }
