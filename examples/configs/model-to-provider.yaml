@@ -1,0 +1,38 @@
+# Map a stable public model ID to a provider route and provider-specific model.
+# The router consumes the reserved x-praxis-ai-provider header; the provider
+# receives the rewritten body model.
+listeners:
+  - name: model-to-provider
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - mapped-model
+
+filter_chains:
+  - name: mapped-model
+    filters:
+      - filter: model_to_header
+        header: X-Model
+      - filter: model_to_provider
+        models:
+          - model: claude-sonnet-4-5
+            provider: vertex
+            target_model: vertex/claude-sonnet-4-5
+            paths:
+              - /v1/messages
+              - /v1/messages/count_tokens
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            headers:
+              x-praxis-ai-provider: vertex
+            cluster: vertex
+          - path_prefix: "/"
+            cluster: vertex
+      - filter: load_balancer
+        clusters:
+          - name: vertex
+            endpoints:
+              - "127.0.0.1:9001"
+
+insecure_options:
+  allow_private_endpoints: true

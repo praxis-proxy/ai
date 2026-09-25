@@ -5,4 +5,5 @@
 
 mod intelligent_route;
 mod model_to_header;
+mod model_to_provider;
 mod openai_responses_proxy;
