@@ -1289,6 +1289,10 @@ fn full_flow_agentic_file_search_round_trip() {
         "vector store callout should use the scoped OGX credential: {}",
         search_callouts[0].headers,
     );
+    // The vector-store callout carries no forward_headers, so x-tenant-id /
+    // x-user-id can only originate from the outbound chain's
+    // project_state_owner_headers re-projecting the trusted StateOwner. Their
+    // presence is therefore a positive witness that the outbound chain ran.
     let headers = search_callouts[0].headers.to_lowercase();
     assert!(
         headers.contains("x-tenant-id: integration-tenant"),

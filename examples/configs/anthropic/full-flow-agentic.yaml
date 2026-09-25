@@ -87,13 +87,6 @@ filter_chains:
                 default_context_size: medium
                 timeout_ms: 10000
                 terminal_streaming: true
-                # Each You.com provider callout executes through this outbound
-                # chain; the filtered-subrequest executor enforces destination
-                # authority, DNS/SSRF, TLS/SNI, and Host centrally.
-                outbound_chain:
-                  name: anthropic-web-search-outbound
-                  filters:
-                    - filter: request_id
               - filter: anthropic_messages_protocol
                 default_version: "2023-06-01"
               - filter: router
