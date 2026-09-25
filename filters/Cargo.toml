@@ -13,7 +13,7 @@ publish = false
 name = "praxis_ai_filters"
 
 [features]
-default = ["standard"]
+default = ["standard", "callout-rustls"]
 # Default-on filters that sit behind a gate so minimal builds can drop them.
 standard = ["aws-sigv4-filter", "policy-engine"]
 # The `policy` filter from Praxis core. Kept explicit so no-default FIPS builds

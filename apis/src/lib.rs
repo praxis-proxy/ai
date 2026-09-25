@@ -15,9 +15,6 @@
 ))]
 compile_error!("at least one callout TLS backend is required: enable `callout-rustls` or `callout-native-tls`");
 
-#[cfg(all(feature = "callout-rustls", feature = "callout-native-tls"))]
-compile_error!("`callout-rustls` and `callout-native-tls` are mutually exclusive");
-
 pub mod anthropic;
 pub mod azure;
 mod callout_credentials;

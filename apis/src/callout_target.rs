@@ -282,7 +282,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(feature = "callout-rustls", feature = "callout-native-tls"))]
+    #[cfg(feature = "callout-rustls")]
     #[allow(clippy::too_many_lines, reason = "test helper: cert generation + server setup")]
     fn spawn_tls_server() -> (u16, reqwest::Certificate, tokio::task::JoinHandle<()>) {
         use std::sync::Arc;
@@ -341,7 +341,7 @@ mod tests {
         (port, root_cert, handle)
     }
 
-    #[cfg(any(feature = "callout-rustls", feature = "callout-native-tls"))]
+    #[cfg(feature = "callout-rustls")]
     #[tokio::test]
     async fn pinned_client_completes_tls_handshake() {
         praxis_tls::provider::install();

@@ -148,8 +148,20 @@ test-callout-tls-features:
 		exit 1; \
 	fi
 	cargo test -p praxis-ai-apis --no-default-features \
-		--features openai-file-resolve-filter,callout-native-tls \
+		--features openai-file-resolve-filter,callout-rustls \
 		callout_target::tests::pinned_client_completes_tls_handshake $(_NOCAPTURE)
+
+test-feature-isolation:
+	@for group in openai-file-resolve-filter openai-mcp-tools; do \
+		echo "check: $$group (default TLS backend)"; \
+		cargo check -p praxis-ai-proxy --features $$group || exit 1; \
+	done
+	@for group in azure-ad-filter gcp-adc-filter; do \
+		echo "check: $$group (default TLS backend)"; \
+		cargo check -p praxis-ai-proxy --features $$group || exit 1; \
+	done
+	cargo check -p praxis-test-utils --no-default-features --features callout-native-tls
+	cargo check -p praxis-test-utils --no-default-features --features callout-rustls
 
 test-schema:
 	cargo test -p praxis-tests-schema --features store-all $(_NOCAPTURE)

@@ -22,7 +22,7 @@ name = "praxis-ai"
 path = "src/main.rs"
 
 [features]
-default = ["standard"]
+default = ["standard", "callout-rustls"]
 # Default-on filters that sit behind a gate so minimal builds can drop them.
 standard = ["aws-sigv4-filter", "policy-engine"]
 # The `policy` filter (Praxis Policy Engine) from praxis core. On by default;

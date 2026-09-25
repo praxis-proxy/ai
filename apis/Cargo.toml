@@ -13,7 +13,7 @@ publish = false
 name = "praxis_ai_apis"
 
 [features]
-default = []
+default = ["callout-rustls"]
 # Stateful OpenAI Responses subsystem: request state kernel, validation, body
 # rebuild, stream composition, Chat Completions translation filter, document
 # extraction, client-tool compatibility, agentic loop, file search and web
@@ -37,8 +37,8 @@ openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream"]
 openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
 # Every non-experimental opt-in; equals the pre-feature-split capability.
 full = ["openai-all", "store-postgres", "callout-rustls"]
-callout-rustls = ["reqwest/rustls", "rmcp/reqwest"]
-callout-native-tls = ["reqwest/native-tls", "rmcp/reqwest-native-tls"]
+callout-rustls = ["reqwest?/rustls", "rmcp?/reqwest"]
+callout-native-tls = ["reqwest?/native-tls", "rmcp?/reqwest-native-tls"]
 praxis-main = []
 
 [lints]
