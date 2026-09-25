@@ -10,7 +10,7 @@
 """
 OpenAI SDK compatibility tests for the openai_conversations filter.
 
-Starts a Praxis proxy with an in-memory SQLite conversations store,
+Starts a Praxis proxy with a file-backed SQLite conversations store,
 then exercises the Conversations API using the official OpenAI Python
 SDK to verify wire-format compatibility.
 
@@ -98,7 +98,7 @@ def _find_tenant_binary() -> str:
     )
 
 
-def _conversations_filter(table_prefix: str) -> dict:
+def _conversations_filter(table_prefix: str, db_path: str) -> dict:
     """Build the conversations store for the backend configured by CI."""
     tables = {
         "conversations_table": f"{table_prefix}_conversations",
@@ -115,9 +115,15 @@ def _conversations_filter(table_prefix: str) -> dict:
     else:
         store = {
             "backend": "sqlite",
-            "database_url": "sqlite::memory:",
-            # Every pooled SQLite in-memory connection is a distinct
-            # database, so keep this SDK suite on one connection.
+            # File-backed, not `sqlite::memory:`. A private in-memory
+            # database lives only as long as the single pooled connection
+            # that created it: if that connection is ever replaced, or the
+            # store is rebuilt on a runtime pipeline swap, the data vanishes
+            # and a just-created conversation 404s on the very next request
+            # (an intermittent, PR-independent flake in this session-scoped
+            # suite). An on-disk file keeps state alive across connection and
+            # store recreation.
+            "database_url": f"sqlite://{db_path}?mode=rwc",
             "pool": {"max_connections": 1},
         }
     return {
@@ -127,7 +133,9 @@ def _conversations_filter(table_prefix: str) -> dict:
     }
 
 
-def _write_config(port: int, include_operation_classifier: bool = True) -> str:
+def _write_config(
+    port: int, db_path: str, include_operation_classifier: bool = True
+) -> str:
     filters = [
         {
             "filter": "state_owner",
@@ -137,7 +145,7 @@ def _write_config(port: int, include_operation_classifier: bool = True) -> str:
     ]
     if include_operation_classifier:
         filters.append({"filter": "openai_operation"})
-    filters.append(_conversations_filter(f"sdk_{port}"))
+    filters.append(_conversations_filter(f"sdk_{port}", db_path))
 
     config = {
         "listeners": [
@@ -160,11 +168,11 @@ def _write_config(port: int, include_operation_classifier: bool = True) -> str:
     return path
 
 
-def _write_tenant_config(port: int) -> str:
+def _write_tenant_config(port: int, db_path: str) -> str:
     # Keep the generated `{conversations}_unused_responses` identifier below
     # PostgreSQL's 45-byte validation limit while retaining per-process
     # isolation from the main SDK fixture.
-    conversations_filter = _conversations_filter(f"t_{port}")
+    conversations_filter = _conversations_filter(f"t_{port}", db_path)
     config = {
         "listeners": [
             {
@@ -340,52 +348,56 @@ def _wait_for_proxy(
 @pytest.fixture(scope="session")
 def praxis_proxy():
     """Start a Praxis proxy for the test session and tear it down after."""
-    port = _free_port()
-    config_path = _write_config(port)
-    binary = _find_binary()
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        db_path = os.path.join(db_dir, "conversations.db")
+        config_path = _write_config(port, db_path)
+        binary = _find_binary()
 
-    proc = subprocess.Popen(
-        [binary, "-c", config_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        _wait_for_proxy(port, proc)
-        yield port
-    finally:
-        proc.send_signal(signal.SIGINT)
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        os.unlink(config_path)
+            _wait_for_proxy(port, proc)
+            yield port
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
 
 
 @pytest.fixture(scope="session")
 def classifier_missing_proxy():
     """Start Praxis with the Conversations dependency deliberately omitted."""
-    port = _free_port()
-    config_path = _write_config(port, include_operation_classifier=False)
-    binary = _find_binary()
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        db_path = os.path.join(db_dir, "conversations.db")
+        config_path = _write_config(port, db_path, include_operation_classifier=False)
+        binary = _find_binary()
 
-    proc = subprocess.Popen(
-        [binary, "-c", config_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        _wait_for_proxy(port)
-        yield port
-    finally:
-        proc.send_signal(signal.SIGINT)
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        os.unlink(config_path)
+            _wait_for_proxy(port)
+            yield port
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
 
 
 @pytest.fixture(scope="session")
@@ -460,26 +472,28 @@ def other_owner_client(praxis_proxy):
 def tenant_praxis_proxy():
     """Start Praxis with deterministic test credentials mapped to tenants."""
     binary = _find_tenant_binary()
-    port = _free_port()
-    config_path = _write_tenant_config(port)
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        db_path = os.path.join(db_dir, "conversations.db")
+        config_path = _write_tenant_config(port, db_path)
 
-    proc = subprocess.Popen(
-        [binary, "-c", config_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        _wait_for_proxy(port, proc)
-        yield port
-    finally:
-        proc.send_signal(signal.SIGINT)
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        os.unlink(config_path)
+            _wait_for_proxy(port, proc)
+            yield port
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
 
 
 @pytest.fixture(scope="session")
