@@ -36,13 +36,9 @@ use tokio::sync::oneshot;
 
 use super::subrequest_transport::{TransportSignal, TransportSignalState};
 
-/// Synchronized ownership claim for one parked session's idle cancellation.
-struct IdleTimer {
-    /// Wakes the timer task early after checkout or explicit closure.
-    disarm: oneshot::Sender<()>,
-    /// Exactly one side may claim the parked state: checkout or the timer.
-    parked: Arc<AtomicBool>,
-}
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
 
 /// Maximum idle sessions retained per dispatcher + target identity.
 pub(crate) const MAX_IDLE_PER_KEY: usize = 1;
@@ -58,6 +54,10 @@ const MAX_CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 /// Monotonic source for process-local dispatcher namespaces.
 static NEXT_POOL_NAMESPACE: AtomicU64 = AtomicU64::new(1);
+
+// -----------------------------------------------------------------------------
+// Pool Identity
+// -----------------------------------------------------------------------------
 
 /// Unique namespace assigned to one `openai_mcp_dispatch` filter instance.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -90,6 +90,18 @@ impl McpPoolKey {
             target_fingerprint,
         })
     }
+}
+
+// -----------------------------------------------------------------------------
+// PooledSession
+// -----------------------------------------------------------------------------
+
+/// Synchronized ownership claim for one parked session's idle cancellation.
+struct IdleTimer {
+    /// Wakes the timer task early after checkout or explicit closure.
+    disarm: oneshot::Sender<()>,
+    /// Exactly one side may claim the parked state: checkout or the timer.
+    parked: Arc<AtomicBool>,
 }
 
 /// A live, initialized MCP session ready for another exclusive `tools/call`.
@@ -226,6 +238,10 @@ impl PooledSession {
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// McpSessionPool
+// -----------------------------------------------------------------------------
 
 /// Sessions accepted and rejected by one checkout operation.
 pub(crate) struct PoolCheckout {
@@ -385,6 +401,10 @@ impl McpSessionPool {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Cleanup
+// -----------------------------------------------------------------------------
+
 /// Explicitly close rejected sessions concurrently.
 pub(crate) async fn close_sessions(sessions: Vec<PooledSession>) {
     join_all(sessions.into_iter().map(PooledSession::close)).await;
@@ -401,6 +421,10 @@ pub(crate) fn close_sessions_in_background(sessions: Vec<PooledSession>) {
     }
     drop(tokio::spawn(close_sessions(sessions)));
 }
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

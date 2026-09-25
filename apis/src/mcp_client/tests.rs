@@ -1054,19 +1054,26 @@ struct SlowRequest {
 #[derive(Debug, Clone)]
 struct TestMcpServer {
     tool_router: ToolRouter<Self>,
+    echo_calls: StdArc<AtomicUsize>,
 }
 
 #[expect(clippy::unused_self, reason = "rmcp macro-generated code")]
 #[tool_router]
 impl TestMcpServer {
     fn new() -> Self {
+        Self::with_echo_calls(StdArc::default())
+    }
+
+    fn with_echo_calls(echo_calls: StdArc<AtomicUsize>) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            echo_calls,
         }
     }
 
     #[tool(description = "Echo the input message back verbatim")]
     fn echo(&self, Parameters(req): Parameters<EchoRequest>) -> String {
+        self.echo_calls.fetch_add(1, Ordering::Relaxed);
         req.message
     }
 
@@ -1362,13 +1369,20 @@ async fn start_expirable_mcp_server() -> (
     tokio_util::sync::CancellationToken,
     ObservedMethods,
     StdArc<LocalSessionManager>,
+    StdArc<AtomicUsize>,
 ) {
     let ct = tokio_util::sync::CancellationToken::new();
     let config = StreamableHttpServerConfig::default()
         .with_sse_keep_alive(None)
         .with_cancellation_token(ct.child_token());
     let sessions = StdArc::new(LocalSessionManager::default());
-    let service = StreamableHttpService::new(|| Ok(TestMcpServer::new()), StdArc::clone(&sessions), config);
+    let echo_calls = StdArc::new(AtomicUsize::new(0));
+    let server_echo_calls = StdArc::clone(&echo_calls);
+    let service = StreamableHttpService::new(
+        move || Ok(TestMcpServer::with_echo_calls(StdArc::clone(&server_echo_calls))),
+        StdArc::clone(&sessions),
+        config,
+    );
 
     let methods: ObservedMethods = StdArc::default();
     let record = StdArc::clone(&methods);
@@ -1400,7 +1414,7 @@ async fn start_expirable_mcp_server() -> (
         );
     });
 
-    (format!("http://{addr}/mcp"), ct, methods, sessions)
+    (format!("http://{addr}/mcp"), ct, methods, sessions, echo_calls)
 }
 
 /// A real rmcp server that records methods and rejects the *second* `tools/call`
@@ -2211,7 +2225,7 @@ async fn reused_session_failure_evicts_without_retry() {
 
 #[tokio::test]
 async fn reused_session_transparently_reinitializes_after_server_404() {
-    let (url, ct, methods, sessions) = start_expirable_mcp_server().await;
+    let (url, ct, methods, sessions, echo_calls) = start_expirable_mcp_server().await;
     let pool = McpSessionPool::new();
     let key = McpPoolKey::new(McpPoolNamespace::new(), "identity-shared".to_owned()).unwrap();
     let callout = McpCallout::fabricated(true).unwrap();
@@ -2256,6 +2270,22 @@ async fn reused_session_transparently_reinitializes_after_server_404() {
         3,
         "round 2 has one server-rejected stale-session attempt and one post-reinit execution"
     );
+    assert_eq!(
+        echo_calls.load(Ordering::Relaxed),
+        2,
+        "the stale request must be rejected before execution, leaving exactly one execution per round"
+    );
+
+    let checkout = pool.checkout(&key, TEST_MAX_RESULT_BYTES);
+    assert!(
+        checkout.rejected.is_empty(),
+        "the reinitialized session must remain compatible"
+    );
+    let session = checkout
+        .session
+        .expect("the successfully reinitialized session must be returned to the pool");
+    let rejected = pool.checkin(key, session);
+    assert!(rejected.is_empty(), "the re-pooled session must remain healthy");
     pool.drain().await;
     ct.cancel();
 }
@@ -2298,7 +2328,7 @@ async fn payload_limit_change_replaces_session_without_fragmenting_identity_key(
 
 #[tokio::test]
 async fn pool_drain_explicitly_closes_idle_server_session() {
-    let (url, ct, _methods, sessions) = start_expirable_mcp_server().await;
+    let (url, ct, _methods, sessions, _echo_calls) = start_expirable_mcp_server().await;
     let pool = McpSessionPool::new();
     let key = McpPoolKey::new(McpPoolNamespace::new(), "identity-shared".to_owned()).unwrap();
     let callout = McpCallout::fabricated(true).unwrap();
