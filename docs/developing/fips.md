@@ -192,8 +192,13 @@ artifact and checked by image id, then runs `make fips-host-check`,
 `.github/actions/fips-host`; the release workflow requires a recorded green
 `fips-host` run for the exact commit being released (its `fips-proof` gate
 polls out a run still in flight) and runs the same composite action (without
-the suites) against the pushed `-fips` image, pulled by digest, before the
-release is cut.
+the suites) against the pushed `-fips` image, pulled by digest. That digest
+attestation runs alongside the release rather than gating it: an offline
+runner leaves a self-hosted job queued, never skipped, so it reports red on
+the release run instead of holding the release back. Releasing without the
+recorded proof takes the release workflow's explicit `skip-fips-proof`
+dispatch input, so a runner outage is a visible maintainer decision, never
+a silent pass.
 
 The runner needs `git`, `make`, `podman` (rootless), `gnupg2`, `gcc`,
 `gcc-c++`, `cmake` and `openssl-devel`, checked up front by

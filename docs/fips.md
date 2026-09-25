@@ -166,7 +166,7 @@ X25519-only clients refused), and checks the startup line. The CI `FIPS`
 workflow runs all three on a RHEL 9 runner in FIPS mode for every change;
 a release requires a recorded green `fips-host` run for the exact commit
 being released, and the release workflow attests and probes the exact
-pushed image, pulled back by digest, before a release is cut.
+pushed image, pulled back by digest, on the release run itself.
 
 A hand check of the shipped image remains a two-liner:
 
