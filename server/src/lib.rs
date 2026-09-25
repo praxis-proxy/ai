@@ -12,7 +12,8 @@ pub use pipelines::resolve_pipelines;
 pub use praxis_ai_filters::install_pipeline_extensions;
 pub use praxis_core::logging::init_tracing;
 pub use server::{
-    check_root_privilege, fatal, install_crypto_provider, resolve_config_path, run_server, run_server_with_registry,
+    check_root_privilege, fatal, fips_blocker, install_crypto_provider, resolve_config_path, run_server,
+    run_server_with_registry,
 };
 pub use subrequest::create_subrequest_client;
 
