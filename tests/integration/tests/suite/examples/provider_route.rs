@@ -6,7 +6,6 @@
 use std::{collections::HashMap, fmt::Write as _, path::Path, sync::Arc};
 
 use praxis_core::config::Config;
-use sha2::{Digest as _, Sha256};
 
 const CANDIDATE_ID: &str = "inference_model/mock-model/site-us-west/provider-us-west";
 const ANTHROPIC_CANDIDATE_ID: &str = "inference_model/mock-anthropic-model/site-us-west/provider-us-west";
@@ -52,9 +51,10 @@ fn certificate_digest(path: &Path) -> String {
         .next()
         .expect("client certificate must be present")
         .expect("parse client certificate");
-    let digest = Sha256::digest(certificate.as_ref());
+    let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), certificate.as_ref())
+        .expect("SHA-256 digest of the client certificate");
     let mut value = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    for byte in digest.as_ref() {
         write!(value, "{byte:02x}").expect("writing to String cannot fail");
     }
     value

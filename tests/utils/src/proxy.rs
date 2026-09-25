@@ -33,15 +33,87 @@ use tokio::sync::Notify;
 /// crypto provider first: the binary installs it at startup, and the harness
 /// does the same here (a no-op after the first call). Tests that build a
 /// registry themselves must take their client from here for the same reason.
+/// The install goes through [`crate::ensure_crypto_provider`], which fails
+/// closed on a declared FIPS host that is not in FIPS mode.
 pub fn test_subrequest_client() -> praxis_core::subrequest::SubRequestClient {
-    praxis_tls::provider::install();
+    crate::net::tls::ensure_crypto_provider();
     praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
 }
 
 /// Shared client honoring runtime connector settings, including the circuit breaker.
 fn configured_subrequest_client(config: &Config) -> praxis_core::subrequest::SubRequestClient {
-    praxis_tls::provider::install();
+    crate::net::tls::ensure_crypto_provider();
     praxis_ai::create_subrequest_client(config)
+}
+
+// -----------------------------------------------------------------------------
+// Binary Location
+// -----------------------------------------------------------------------------
+
+/// Environment variable naming the `praxis-ai` binary subprocess tests spawn.
+///
+/// `make test-integration-fips` points it at the FIPS build so the binary
+/// under test is the FIPS one, not whatever the harness would build.
+pub const PRAXIS_AI_BIN_ENV: &str = "PRAXIS_AI_BIN";
+
+/// Path to the `praxis-ai` binary for subprocess integration tests.
+///
+/// Uses [`PRAXIS_AI_BIN_ENV`] when set, then `CARGO_BIN_EXE_praxis-ai`;
+/// otherwise resolves under `CARGO_TARGET_DIR` (including llvm-cov's
+/// alternate target dir) and builds the binary if it is not already present.
+///
+/// # Panics
+///
+/// Panics if [`PRAXIS_AI_BIN_ENV`] names a file that does not exist, or if
+/// `cargo build` for the `praxis-ai` binary fails or the binary is still
+/// missing afterward.
+pub fn praxis_ai_bin() -> PathBuf {
+    if let Some(explicit) = std::env::var_os(PRAXIS_AI_BIN_ENV) {
+        let path = PathBuf::from(explicit);
+        assert!(
+            path.is_file(),
+            "{PRAXIS_AI_BIN_ENV} names {} but there is no such file",
+            path.display()
+        );
+        return path;
+    }
+
+    let path = resolve_praxis_ai_bin_path();
+    if path.exists() {
+        return path;
+    }
+
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["build", "-p", "praxis-ai-proxy", "--bin", "praxis-ai", "-q"])
+        .status()
+        .expect("spawn cargo build for the praxis-ai binary");
+    assert!(
+        status.success(),
+        "cargo build -p praxis-ai-proxy --bin praxis-ai failed"
+    );
+
+    let path = resolve_praxis_ai_bin_path();
+    assert!(
+        path.exists(),
+        "praxis-ai binary missing at {} after build",
+        path.display()
+    );
+    path
+}
+
+/// The path cargo puts the `praxis-ai` binary at, without building it.
+fn resolve_praxis_ai_bin_path() -> PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_praxis-ai").map_or_else(
+        || {
+            let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+                || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target"),
+                PathBuf::from,
+            );
+            let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+            target.join(profile).join("praxis-ai")
+        },
+        PathBuf::from,
+    )
 }
 
 // -----------------------------------------------------------------------------

@@ -44,6 +44,8 @@ endif
 	patch-praxis unpatch-praxis \
 	require-podman require-go require-oc \
 	build-fips release-fips check-fips lint-fips test-fips test-fips-provider \
+	test-integration-fips test-schema-fips test-fips-host fips-toolchain fips-host-facts \
+	fips-host-check fips-runtime-probe fips-image-save fips-image-load fips-image-tag fips-version \
 	container-fips container-fips-run \
 	fips-check fips-check-ubi fips-deps fips-report fips-signature-store fips-verify-image \
 	fips-image-ref fips-oc fips-scan fips-scanner fips-smoke
@@ -325,8 +327,14 @@ FIPS_FEATURES           := openai-responses,aws-sigv4-filter
 # The same list qualified for a multi-package cargo invocation.
 _COMMA                  := ,
 FIPS_FEATURES_QUALIFIED := $(subst $(_COMMA),$(_COMMA)praxis-ai-proxy/,praxis-ai-proxy/$(FIPS_FEATURES))
-FIPS_TARGET_DIR         := target/fips
+# Overridable so the FIPS host run can point the whole recursion at a
+# container volume (see test-fips-host).
+FIPS_TARGET_DIR         ?= target/fips
 FIPS_BIN                ?= $(FIPS_TARGET_DIR)/release/praxis-ai
+# Extra cargo arguments for every FIPS test target; the toolchain image sets
+# --ignore-rust-version because Red Hat's rust-toolset may trail the
+# workspace's rust-version.
+FIPS_CARGO_EXTRA        ?=
 FIPS_CARGO_ARGS         := -p praxis-ai-proxy --no-default-features --features $(FIPS_FEATURES) --target-dir $(FIPS_TARGET_DIR)
 # Red Hat's scanner reads the crate list that `cargo auditable` embeds in the
 # binary (the .dep-v0 section); without it a binary is graded inconclusive.
@@ -409,7 +417,7 @@ fips-oc: $(OC)
 # The debug build is the edit-compile loop; only the release build carries
 # the manifest.
 build-fips:
-	cargo build $(FIPS_CARGO_ARGS)
+	cargo build $(FIPS_CARGO_ARGS) $(FIPS_CARGO_EXTRA)
 
 # cargo before 1.99 does not relink a binary when only the SBOM setting
 # changed (rust-lang/cargo#15695, fixed by #17216), so the old binary goes
@@ -440,7 +448,28 @@ lint-fips:
 test-fips:
 	cargo test --target-dir $(FIPS_TARGET_DIR) --no-default-features \
 		-p praxis-ai-proxy -p praxis-ai-filters -p praxis-ai-apis \
-		--features $(FIPS_FEATURES_QUALIFIED) $(_NOCAPTURE)
+		--features $(FIPS_FEATURES_QUALIFIED) $(FIPS_CARGO_EXTRA) $(_NOCAPTURE)
+
+# The integration and schema suites resolved exactly as the FIPS build: no
+# default features anywhere, only FIPS_FEATURES on the test crates (which
+# forward them to the proxy). The proxy runs in-process in these suites, so
+# the test binary's dependency graph is the FIPS build's graph, and tests of
+# filters the FIPS build leaves out are compiled out with it. The tests that
+# spawn the binary get the FIPS binary (`build-fips`, named through
+# PRAXIS_AI_BIN) rather than the standard one the harness would build.
+#
+# On a host that is not in FIPS mode this proves the suites pass on the FIPS
+# feature set; every FIPS behavior test takes its non-FIPS branch. On a FIPS
+# host, run it through `test-fips-host`, which declares the host as such so
+# the same tests insist on their approved-mode branch instead.
+test-integration-fips: build-fips
+	PRAXIS_AI_BIN=$(abspath $(FIPS_TARGET_DIR))/debug/praxis-ai \
+	cargo test --target-dir $(FIPS_TARGET_DIR) -p praxis-tests-integration \
+		--no-default-features --features $(FIPS_FEATURES) $(FIPS_CARGO_EXTRA) $(_NOCAPTURE)
+
+test-schema-fips:
+	cargo test --target-dir $(FIPS_TARGET_DIR) -p praxis-tests-schema \
+		--no-default-features --features $(FIPS_FEATURES) $(FIPS_CARGO_EXTRA) $(_NOCAPTURE)
 
 # The same unit tests with the RHEL FIPS provider active in every test
 # process: OPENSSL_CONF names xtask/assets/fips/fips-provider.cnf (the file

@@ -19,6 +19,7 @@ pub mod agentic;
 pub mod cli_process;
 pub mod example_config;
 pub mod filters;
+pub mod fips;
 /// Versioned wire fixtures and inference scenarios for integration tests.
 pub mod inference_fixture;
 pub mod net;
@@ -26,6 +27,7 @@ pub mod proxy;
 pub mod recording;
 pub mod session_replay;
 pub mod sqlite;
+pub mod tls_probe;
 
 pub use agentic::{
     A2aMockConfig, A2aMockServerGuard, A2aRecordedRequest, McpMockConfig, McpMockServerGuard, McpRecordedRequest,
@@ -37,11 +39,13 @@ pub use cli_process::{
     capture_child_output_with_limit, configure_isolated_process_group,
 };
 pub use example_config::{allow_loopback_endpoints, example_config_path, load_example_config, patch_yaml};
+pub use fips::{approved_mode, assert_fips_host_if_declared, expect_approved_mode, fips_host, fips_host_declared};
 pub use net::*;
 pub use proxy::{
-    ProxyGuard, ProxyShutdownError, ReloadableProxyGuard, build_pipeline, custom_filter_yaml, registry_with,
-    simple_proxy_yaml, start_full_proxy, start_proxy, start_proxy_no_wait, start_proxy_with_registry,
-    start_reloadable_proxy, start_tls_proxy, start_tls_proxy_no_wait, test_subrequest_client,
+    PRAXIS_AI_BIN_ENV, ProxyGuard, ProxyShutdownError, ReloadableProxyGuard, build_pipeline, custom_filter_yaml,
+    praxis_ai_bin, registry_with, simple_proxy_yaml, start_full_proxy, start_proxy, start_proxy_no_wait,
+    start_proxy_with_registry, start_reloadable_proxy, start_tls_proxy, start_tls_proxy_no_wait,
+    test_subrequest_client,
 };
 pub use recording::Recording;
 pub use session_replay::{

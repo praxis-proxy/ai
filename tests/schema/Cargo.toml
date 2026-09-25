@@ -12,6 +12,9 @@ publish = false
 # default is `full` so a plain `cargo test -p <crate>` exercises every filter.
 default = ["full"]
 standard = ["praxis-test-utils/standard"]
+# The signing filter alone, so the FIPS suite run can enable exactly the
+# feature set the FIPS binary ships (see FIPS_FEATURES in the Makefile).
+aws-sigv4-filter = ["praxis-test-utils/aws-sigv4-filter"]
 openai-responses = ["praxis-test-utils/openai-responses"]
 openai-file-resolve-filter = ["openai-responses", "praxis-test-utils/openai-file-resolve-filter"]
 store = ["openai-responses", "praxis-test-utils/store"]
