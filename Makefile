@@ -43,7 +43,7 @@ endif
 	setup-hooks help \
 	patch-praxis unpatch-praxis \
 	require-podman require-go require-oc \
-	build-fips release-fips check-fips lint-fips test-fips \
+	build-fips release-fips check-fips lint-fips test-fips test-fips-provider \
 	container-fips container-fips-run \
 	fips-check fips-check-ubi fips-deps fips-report fips-signature-store fips-verify-image \
 	fips-image-ref fips-oc fips-scan fips-scanner fips-smoke
@@ -271,7 +271,6 @@ coverage-check:
 # FIPS build turns off what is known not to be FIPS 140-3 compliant yet, so
 # nobody has to know which features to pick:
 #
-#   aws-sigv4-filter     the aws-sigv4 crate signs with pure-Rust hmac/sha2
 #   policy-engine        praxis-policy carries its own cryptography (sha2,
 #                        hmac, jsonwebtoken on aws-lc-rs)
 #   store, store-sqlite, store-postgres, openai-conversations, openai-compact
@@ -282,10 +281,11 @@ coverage-check:
 #   gcp-adc-filter       reqwest's `rustls` feature compiles aws-lc-rs in
 #
 # What remains of the opt-in groups is openai-responses (the Responses API
-# kernel, which adds no crates). The experimental filters stay off for the
-# same reasons they are off in the standard build. FIPS_FEATURES is the
-# single place this is defined; Containerfile.fips (CARGO_FEATURES) mirrors
-# it and must be kept in sync.
+# kernel, which adds no crates) and aws-sigv4-filter (aws_sigv4_sign signs
+# through the system OpenSSL; the aws-sigv4 crate is only its test oracle).
+# The experimental filters stay off for the same reasons they are off in
+# the standard build. FIPS_FEATURES is the single place this is defined;
+# Containerfile.fips (CARGO_FEATURES) mirrors it and must be kept in sync.
 #
 # The FIPS build goes to its own target directory so it never overwrites,
 # or is mistaken for, the standard build.
@@ -294,9 +294,13 @@ coverage-check:
 #   make release-fips      FIPS build, release profile
 #   make lint-fips         clippy + rustfmt for the FIPS feature set
 #   make test-fips         unit tests for the FIPS feature set
+#   make test-fips-provider
+#                          the same tests with the RHEL FIPS provider
+#                          active in the test processes (needs fips.so)
 #   make container-fips    FIPS runtime image on UBI 9 (Red Hat toolchain,
 #                          signature-verified base images)
-#   make fips-check        build on UBI 9 and print the compliance report
+#   make fips-check        build on UBI 9, run the crypto unit tests on the
+#                          FIPS provider, print the compliance report
 #   make fips-report       the same report against the local FIPS build
 #   make fips-deps         dependency graph only (seconds, no build; also
 #                          runs under `make lint`, so a PR cannot reintroduce
@@ -317,7 +321,7 @@ coverage-check:
 #
 # See docs/developing/fips.md and docs/developing/getting-started.md.
 
-FIPS_FEATURES           := openai-responses
+FIPS_FEATURES           := openai-responses,aws-sigv4-filter
 # The same list qualified for a multi-package cargo invocation.
 _COMMA                  := ,
 FIPS_FEATURES_QUALIFIED := $(subst $(_COMMA),$(_COMMA)praxis-ai-proxy/,praxis-ai-proxy/$(FIPS_FEATURES))
@@ -437,6 +441,31 @@ test-fips:
 	cargo test --target-dir $(FIPS_TARGET_DIR) --no-default-features \
 		-p praxis-ai-proxy -p praxis-ai-filters -p praxis-ai-apis \
 		--features $(FIPS_FEATURES_QUALIFIED) $(_NOCAPTURE)
+
+# The same unit tests with the RHEL FIPS provider active in every test
+# process: OPENSSL_CONF names xtask/assets/fips/fips-provider.cnf (the file
+# the report probes with), so OpenSSL's default properties are `fips=yes`
+# and every digest and MAC the tests compute (aws_sigv4_sign's HMAC-SHA256
+# among them) has to come from the FIPS provider. The variable reaches the
+# test binaries through cargo's runner, not cargo itself, whose libgit2
+# cannot run under that property; for the same reason only the lib and bin
+# unit tests run (the e2e test target spawns cargo). A missing or wrong
+# OPENSSL_CONF is silently ignored by OpenSSL, so the run also sets
+# PRAXIS_TEST_FIPS_PROVIDER, on cargo itself so it reaches the test binaries
+# whatever the runner does: the apis and filters test processes then assert
+# that the provider reports FIPS and refuses MD5, and fail otherwise. Needs
+# the host's fips module (Fedora and RHEL ship /usr/lib64/ossl-modules/fips.so);
+# the same tests run inside the UBI 9 report stage (make fips-check), and
+# only a FIPS-mode host proves a deployment (docs/fips.md).
+FIPS_PROVIDER_CNF       := $(CURDIR)/xtask/assets/fips/fips-provider.cnf
+test-fips-provider:
+	@OPENSSL_CONF=$(FIPS_PROVIDER_CNF) openssl list -providers 2>/dev/null | grep -q '^  fips$$' \
+		|| { echo "no OpenSSL FIPS provider on this host: 'OPENSSL_CONF=$(FIPS_PROVIDER_CNF) openssl list -providers' does not list fips"; exit 1; }
+	PRAXIS_TEST_FIPS_PROVIDER=1 cargo test --target-dir $(FIPS_TARGET_DIR) --no-default-features --lib --bins \
+		-p praxis-ai-proxy -p praxis-ai-filters -p praxis-ai-apis \
+		--features $(FIPS_FEATURES_QUALIFIED) \
+		--config 'target."cfg(all())".runner=["env","OPENSSL_CONF=$(FIPS_PROVIDER_CNF)"]' \
+		$(_NOCAPTURE)
 
 # podman finds Red Hat's detached image signatures through its registries.d
 # (containers-registries.d(5)). Fedora and RHEL ship the entry; Debian and
@@ -585,6 +614,7 @@ help:
 	@echo "  check-fips           cargo check of the FIPS build"
 	@echo "  lint-fips            clippy (all targets) + rustfmt check for the FIPS feature set"
 	@echo "  test-fips            unit tests resolved as the FIPS build (no defaults, FIPS_FEATURES on the binary)"
+	@echo "  test-fips-provider   the same unit tests with the RHEL FIPS provider active and asserted in each test process (needs fips.so)"
 	@echo "  container-fips       FIPS runtime image on UBI 9 (Red Hat toolchain, signature-verified bases)"
 	@echo "  container-fips-run   run the FIPS image in foreground (host network)"
 	@echo "  fips-check           build on UBI 9 and print the compliance report (fails while findings remain)"
