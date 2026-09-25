@@ -23,7 +23,6 @@ dev = [
     "dep:praxis-test-utils",
     "dep:quote",
     "dep:reqwest",
-    "dep:serde",
     "dep:serde_yaml",
     "dep:sha2",
     "dep:syn",
@@ -56,7 +55,9 @@ praxis-test-utils = { workspace = true, optional = true }
 quote = { workspace = true, optional = true }
 regex = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"], optional = true }
-serde = { workspace = true, optional = true }
+# Unconditional: `fips host-check` deserializes the compiled-in certified
+# modules list, and the FIPS xtask build runs without default features.
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
