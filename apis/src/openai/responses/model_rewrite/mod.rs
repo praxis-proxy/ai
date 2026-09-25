@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Model rewrite filter for `OpenAI` Responses API requests.
+//! Model rewrite filter for `OpenAI` inference create requests.
 //!
-//! Rewrites the top-level `model` field in `POST /v1/responses`
-//! request bodies using a configured alias map. Alias sources may
-//! be exact model names or single-wildcard patterns such as
-//! `codex-*`; exact aliases win before wildcard aliases, then the
-//! wildcard with the most literal characters wins. Equal-specificity
+//! Rewrites the top-level `model` field in `POST /v1/responses` and
+//! `POST /v1/chat/completions` request bodies using a configured alias
+//! map. Both endpoints carry the client-facing model as a top-level
+//! string, so the rewrite is endpoint-agnostic: a gateway that maps a
+//! client-facing name onto a provider-specific target model applies the
+//! same alias table to either API.
+//!
+//! Alias sources may be exact model names or single-wildcard patterns
+//! such as `codex-*`; exact aliases win before wildcard aliases, then
+//! the wildcard with the most literal characters wins. Equal-specificity
 //! wildcard ties use lexical source-pattern ordering so `HashMap`
 //! iteration order cannot affect the rewrite. When the `model` field
 //! is missing or null and a `default_model` is configured, injects the
@@ -16,10 +21,15 @@
 //! requests are re-serialized as JSON, so original whitespace and
 //! byte-level object key order are not preserved.
 //!
-//! Gates on the request path (`POST /v1/responses` exactly), not
-//! on classifier metadata. This ensures `on_invalid: reject` fires
-//! for malformed JSON on the create endpoint even when the
-//! classifier could not classify the body.
+//! Gates on the request path (`POST /v1/responses` or
+//! `POST /v1/chat/completions` exactly), not on classifier metadata.
+//! This ensures `on_invalid: reject` fires for malformed JSON on a
+//! create endpoint even when the classifier could not classify the
+//! body. Sub-resource paths such as `/v1/responses/{id}/cancel` and
+//! every other endpoint are left untouched.
+//!
+//! The filter name keeps its `openai_responses_` prefix for config
+//! compatibility even though it now covers Chat Completions too.
 
 mod config;
 
@@ -49,13 +59,17 @@ use tracing::{debug, trace, warn};
 
 use self::config::{ModelRewriteConfig, OnInvalidBehavior, validate_config};
 use super::error::responses_error_rejection;
-use crate::{classifier::is_responses_create, json_body::replace_json_body, promotion::is_promotable_value};
+use crate::{
+    classifier::{is_chat_completions_create, is_responses_create},
+    json_body::replace_json_body,
+    promotion::is_promotable_value,
+};
 
 // -----------------------------------------------------------------------------
 // ModelRewriteFilter
 // -----------------------------------------------------------------------------
 
-/// Rewrites the `model` field in Responses API request bodies.
+/// Rewrites the `model` field in Responses and Chat Completions request bodies.
 ///
 /// # YAML
 ///
@@ -183,7 +197,8 @@ impl HttpFilter for ModelRewriteFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if !is_responses_create(&ctx.request.method, ctx.request.uri.path()) {
+        let path = ctx.request.uri.path();
+        if !is_responses_create(&ctx.request.method, path) && !is_chat_completions_create(&ctx.request.method, path) {
             trace!("skipping non-create request");
             return Ok(FilterAction::Continue);
         }

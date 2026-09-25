@@ -2314,3 +2314,602 @@ async fn token_bucket_applies_the_same_weighted_cost() {
         "token_bucket must apply the same partitioned weighted cost as sliding_window"
     );
 }
+
+// -----------------------------------------------------------------------------
+// S1: Graduated soft-limit tiers (inject action)
+// -----------------------------------------------------------------------------
+
+/// Helper: build a config with tiers on a `sliding_window` rule.
+fn tiered_rule_yaml(capacity: u64, reserved_tokens: u64, tiers_yaml: &str) -> serde_yaml::Value {
+    let indented_tiers = tiers_yaml
+        .lines()
+        .map(|line| format!("      {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let yaml = format!(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: {capacity}\n\
+         \x20   reserved_tokens: {reserved_tokens}\n\
+         \x20   tiers:\n\
+         {indented_tiers}\n"
+    );
+    serde_yaml::from_str(&yaml).unwrap()
+}
+
+// -- Config validation --
+
+#[test]
+fn tier_config_parses_valid_inject_and_deny_tiers() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[test]
+fn tier_config_rejects_empty_tiers_list() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 100\n    \
+         reserved_tokens: 10\n    tiers: []\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("must not be empty"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_non_ascending_capacities() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 90\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: high\n\
+         - capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: low\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("strictly ascending"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_deny_tier_not_last() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 200\n\
+         \x20   reserved_tokens: 10\n\
+         \x20   tiers:\n\
+         \x20     - capacity: 100\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: low\n\
+         \x20     - capacity: 200\n\
+         \x20       action:\n\
+         \x20         type: deny\n\
+         \x20     - capacity: 300\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: over\n",
+    )
+    .unwrap();
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("deny tier must be the last"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_deny_capacity_mismatch() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 90\n  action:\n    type: deny",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("must equal the algorithm"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_inject_without_headers() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("at least one header"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_zero_capacity_tier() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 0\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: bad\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("capacity > 0"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_invalid_header_name() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      \"invalid header!\": value\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("invalid inject header"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_inject_tier_above_algorithm_capacity() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 120\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: over",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("above the algorithm"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_reserved_header_name() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      content-length: \"42\"",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("reserved/hop-by-hop"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_hop_by_hop_header_name() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      transfer-encoding: chunked",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("reserved/hop-by-hop"), "got: {err}");
+}
+
+#[test]
+fn tier_config_rejects_duplicate_header_after_normalization() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n      x-token-tier: degraded",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("duplicate header"), "got: {err}");
+}
+
+#[test]
+fn tier_config_allows_inject_only_tiers_without_deny() {
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 95\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: degraded",
+    );
+    assert!(
+        TokenRateLimitFilter::from_config(&yaml).is_ok(),
+        "inject-only tiers (no deny) are valid for soft enforcement"
+    );
+}
+
+#[test]
+fn no_tiers_preserves_backward_compatible_behavior() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 50");
+    assert!(
+        TokenRateLimitFilter::from_config(&yaml).is_ok(),
+        "a rule with no tiers must still parse as before"
+    );
+}
+
+// -- Admission with tier header injection --
+
+#[tokio::test]
+async fn inject_tier_adds_headers_when_usage_exceeds_threshold() {
+    // capacity 100, reserve 60. After first request: usage_after=60, which
+    // exceeds the 50-token inject tier → header should be injected.
+    let yaml = tiered_rule_yaml(
+        100,
+        60,
+        "- capacity: 50\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "should be admitted");
+    let injected = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-token-tier");
+    assert!(injected.is_some(), "inject tier header should be set");
+    assert_eq!(
+        injected.unwrap().1.to_str().unwrap(),
+        "warning",
+        "header value should match the tier config"
+    );
+}
+
+#[tokio::test]
+async fn no_headers_injected_when_usage_is_below_all_tiers() {
+    // capacity 100, reserve 10. After first request: usage_after=10,
+    // below the 50-token inject tier → no headers.
+    let yaml = tiered_rule_yaml(
+        100,
+        10,
+        "- capacity: 50\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.request_headers_to_set.is_empty(),
+        "no tier headers should be injected when usage is below all thresholds"
+    );
+}
+
+#[tokio::test]
+async fn highest_breached_tier_header_wins_for_the_same_header_name() {
+    // capacity 100, reserve 80. usage_after=80 breaches both the 50 and
+    // 70 tiers. Both inject X-Token-Tier but with different values.
+    // The last pushed value (70-tier's "degraded") wins.
+    let yaml = tiered_rule_yaml(
+        100,
+        80,
+        "- capacity: 50\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 70\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: degraded\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let tier_headers: Vec<_> = ctx
+        .request_headers_to_set
+        .iter()
+        .filter(|(name, _)| name.as_str() == "x-token-tier")
+        .collect();
+    assert_eq!(tier_headers.len(), 2, "both breached tiers push their header");
+    assert_eq!(
+        tier_headers.last().unwrap().1.to_str().unwrap(),
+        "degraded",
+        "the highest breached tier's value should be last (wins for same-name headers)"
+    );
+}
+
+#[tokio::test]
+async fn multiple_distinct_headers_from_different_tiers_are_all_injected() {
+    // capacity 100, reserve 80. usage_after=80 breaches both tiers.
+    // Tier 1 injects X-Token-Hour-Tier; Tier 2 injects a different header.
+    let yaml = tiered_rule_yaml(
+        100,
+        80,
+        "- capacity: 50\n  action:\n    type: inject\n    headers:\n      X-Token-Hour-Tier: warning\n\
+         - capacity: 70\n  action:\n    type: inject\n    headers:\n      X-Fairness-Id: \"85\"\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let hour_tier = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-token-hour-tier");
+    let fairness = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-fairness-id");
+    assert_eq!(
+        hour_tier.unwrap().1.to_str().unwrap(),
+        "warning",
+        "first tier's header should be injected"
+    );
+    assert_eq!(
+        fairness.unwrap().1.to_str().unwrap(),
+        "85",
+        "second tier's header should also be injected"
+    );
+}
+
+#[tokio::test]
+async fn deny_tier_still_rejects_when_budget_exhausted() {
+    // capacity 100, reserve 60. First request: usage_after=60, admitted
+    // with warning header. Second request: needs 60 more, only 40 left → 429.
+    let yaml = tiered_rule_yaml(
+        100,
+        60,
+        "- capacity: 50\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 100\n  action:\n    type: deny",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    let first = filter.on_request(&mut first_ctx).await.unwrap();
+    assert!(
+        matches!(first, FilterAction::Continue),
+        "first request should be admitted"
+    );
+
+    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let second = filter.on_request(&mut second_ctx).await.unwrap();
+    assert!(
+        matches!(second, FilterAction::Reject(_)),
+        "second request should be denied (429) when capacity is exhausted"
+    );
+}
+
+#[tokio::test]
+async fn inject_only_tiers_never_deny() {
+    // No deny tier. capacity 100, reserve 60. Two requests: 60+60=120 > 100.
+    // Without a deny tier in the tiers list, the backend's capacity (100)
+    // still governs the deny decision.
+    let yaml = tiered_rule_yaml(
+        100,
+        60,
+        "- capacity: 50\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: warning\n\
+         - capacity: 80\n  action:\n    type: inject\n    headers:\n      X-Token-Tier: degraded",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    let first = filter.on_request(&mut first_ctx).await.unwrap();
+    assert!(
+        matches!(first, FilterAction::Continue),
+        "first request should be admitted with inject headers"
+    );
+    let tier_header = first_ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-token-tier");
+    assert_eq!(
+        tier_header.unwrap().1.to_str().unwrap(),
+        "warning",
+        "usage_after 60 breaches the 50 tier but not the 80 tier"
+    );
+}
+
+#[tokio::test]
+async fn tier_evaluation_with_token_bucket_algorithm() {
+    // Same tier behavior should work with token_bucket.
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: token_bucket\n\
+         \x20   capacity: 100\n\
+         \x20   refill_rate: 0.0001\n\
+         \x20   reserved_tokens: 60\n\
+         \x20   tiers:\n\
+         \x20     - capacity: 50\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: warning\n\
+         \x20     - capacity: 100\n\
+         \x20       action:\n\
+         \x20         type: deny\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "should be admitted");
+    let injected = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-token-tier");
+    assert!(injected.is_some(), "token_bucket should also evaluate inject tiers");
+}
+
+#[tokio::test]
+async fn tier_headers_injected_from_on_request_body_path() {
+    // Body-dependent estimation with tiers.
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 200\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         \x20     fallback_estimate: 100\n\
+         \x20   tiers:\n\
+         \x20     - capacity: 80\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: warning\n\
+         \x20     - capacity: 200\n\
+         \x20       action:\n\
+         \x20         type: deny\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"max_tokens": 100}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    let injected = ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-token-tier");
+    assert!(
+        injected.is_some(),
+        "inject tier should fire from the on_request_body path too (usage_after=100 > 80)"
+    );
+}
+
+#[tokio::test]
+async fn tiers_with_match_condition_only_apply_to_matching_requests() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: team-alpha\n\
+         \x20   match:\n\
+         \x20     headers:\n\
+         \x20       x-app-id: alpha\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   reserved_tokens: 60\n\
+         \x20   tiers:\n\
+         \x20     - capacity: 50\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: warning\n\
+         \x20     - capacity: 100\n\
+         \x20       action:\n\
+         \x20         type: deny\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    // Request matching the rule: should get inject headers.
+    let alpha_req = make_request_with_header("x-app-id", "alpha");
+    let mut alpha_ctx = crate::test_utils::make_filter_context(&alpha_req);
+    let action = filter.on_request(&mut alpha_ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        alpha_ctx
+            .request_headers_to_set
+            .iter()
+            .any(|(name, _)| name.as_str() == "x-token-tier"),
+        "matching request should get inject tier headers"
+    );
+
+    // Request not matching: should pass through without tiers or rate limiting.
+    let other_req = make_request_with_header("x-app-id", "beta");
+    let mut other_ctx = crate::test_utils::make_filter_context(&other_req);
+    let action = filter.on_request(&mut other_ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        other_ctx.request_headers_to_set.is_empty(),
+        "non-matching request should not get any injected headers"
+    );
+}
+
+/// Client-supplied tier header is stripped on admission, preventing
+/// a below-threshold client from spoofing the tier signal.
+#[tokio::test]
+async fn client_supplied_tier_header_is_stripped_on_admission() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   reserved_tokens: 10\n\
+         \x20   tiers:\n\
+         \x20     - capacity: 50\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: warning\n\
+         \x20     - capacity: 100\n\
+         \x20       action:\n\
+         \x20         type: deny\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    // Client sends the inject header pre-emptively.
+    let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    req.headers.insert("x-token-tier", "spoofed".parse().unwrap());
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    // The spoofed header should be in request_headers_to_remove.
+    assert!(
+        ctx.request_headers_to_remove
+            .iter()
+            .any(|n| n.as_str() == "x-token-tier"),
+        "client-supplied inject header name must be stripped"
+    );
+}
+
+/// When `pre_read_mutations` is already active (body phase with earlier
+/// ordered producers), `evaluate_tiers` pushes inject headers into
+/// the ordered log as well as `request_headers_to_set`.
+#[tokio::test]
+async fn tier_headers_join_pre_read_mutations_when_ordered_log_is_active() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         \x20   tiers:\n\
+         \x20     - capacity: 50\n\
+         \x20       action:\n\
+         \x20         type: inject\n\
+         \x20         headers:\n\
+         \x20           X-Token-Tier: warning\n\
+         \x20     - capacity: 100\n\
+         \x20       action:\n\
+         \x20         type: deny\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    // Simulate an earlier filter having activated the ordered log.
+    ctx.pre_read_mutations.push(praxis_filter::TrustedHeaderMutation::Set(
+        http::HeaderName::from_static("x-tenant-id"),
+        http::HeaderValue::from_static("acme"),
+    ));
+
+    let mut body = Some(bytes::Bytes::from_static(br#"{"max_tokens":60}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    // The inject header should appear in both queues.
+    assert!(
+        ctx.request_headers_to_set
+            .iter()
+            .any(|(n, _)| n.as_str() == "x-token-tier"),
+        "inject header should be in request_headers_to_set"
+    );
+    assert!(
+        ctx.pre_read_mutations.iter().any(|m| matches!(
+            m,
+            praxis_filter::TrustedHeaderMutation::Set(name, _) if name.as_str() == "x-token-tier"
+        )),
+        "inject header should also be in pre_read_mutations when ordered log is active"
+    );
+}

@@ -341,21 +341,42 @@ async fn empty_body_continues() {
 }
 
 #[tokio::test]
-async fn chat_completions_path_skips() {
+async fn legacy_completions_path_skips() {
     let filter = make_filter(ALIAS_CONFIG);
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/completions");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let mut body = Some(Bytes::from(r#"{"model":"codex-mini-latest","messages":[]}"#));
+    let mut body = Some(Bytes::from(r#"{"model":"codex-mini-latest","prompt":"hi"}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "chat completions path should skip"
+        "legacy completions path should skip"
+    );
+    assert_eq!(
+        body.as_deref(),
+        Some(r#"{"model":"codex-mini-latest","prompt":"hi"}"#.as_bytes()),
+        "legacy completions body should pass through unchanged"
     );
     assert!(
         !ctx.filter_metadata
             .contains_key("openai_responses_model_rewrite.effective_model"),
-        "non-responses path should not set metadata"
+        "non-create path should not set metadata"
+    );
+}
+
+#[tokio::test]
+async fn embeddings_path_skips() {
+    let filter = make_filter(ALIAS_CONFIG);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/embeddings");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from(r#"{"model":"codex-mini-latest","input":"hi"}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue), "embeddings path should skip");
+    assert_eq!(
+        body.as_deref(),
+        Some(r#"{"model":"codex-mini-latest","input":"hi"}"#.as_bytes()),
+        "embeddings body should pass through unchanged"
     );
 }
 
@@ -461,6 +482,111 @@ async fn reject_mode_rejects_malformed_create() {
     assert!(
         matches!(action, FilterAction::Reject(_)),
         "malformed POST /v1/responses should be rejected in reject mode"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Body Processing — Chat Completions
+// -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn chat_completions_alias_rewrites_model() {
+    let (ctx, body) = run_filter_at_path(
+        ALIAS_CONFIG,
+        "/v1/chat/completions",
+        r#"{"model":"codex-mini-latest","messages":[{"role":"user","content":"Hi"}]}"#,
+    )
+    .await;
+
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        parsed["model"].as_str(),
+        Some("llama-3.3-70b"),
+        "chat completions model should be rewritten to the alias target"
+    );
+    assert_eq!(
+        parsed["messages"][0]["content"].as_str(),
+        Some("Hi"),
+        "chat completions messages should be preserved"
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_model_rewrite.original_model")
+            .map(String::as_str),
+        Some("codex-mini-latest"),
+        "original model should be promoted to metadata"
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_trailing_slash_does_not_rewrite_model() {
+    let original = r#"{"model":"codex-mini-latest","messages":[]}"#;
+    let (_, body) = run_filter_at_path(ALIAS_CONFIG, "/v1/chat/completions/", original).await;
+
+    assert_eq!(
+        body.as_ref(),
+        original.as_bytes(),
+        "trailing-slash Chat Completions path should be skipped"
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_default_model_injected() {
+    let (_, body) = run_filter_at_path(
+        DEFAULT_CONFIG,
+        "/v1/chat/completions",
+        r#"{"messages":[{"role":"user","content":"Hi"}]}"#,
+    )
+    .await;
+
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        parsed["model"].as_str(),
+        Some("llama-3.3-70b"),
+        "default model should be injected for chat completions"
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_unknown_model_passes_through() {
+    let original = r#"{"model":"some-unknown-model","messages":[]}"#;
+    let (_, body) = run_filter_at_path(ALIAS_CONFIG, "/v1/chat/completions", original).await;
+
+    assert_eq!(
+        body.as_ref(),
+        original.as_bytes(),
+        "unaliased chat completions body should not be re-serialized"
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_promotes_effective_model_header() {
+    let (ctx, _) = run_filter_at_path(
+        ALIAS_CONFIG,
+        "/v1/chat/completions",
+        r#"{"model":"gpt-4.1-mini","messages":[]}"#,
+    )
+    .await;
+
+    let headers = collect_headers(&ctx);
+    assert_eq!(
+        headers.get("x-praxis-ai-effective-model").copied(),
+        Some("qwen-2.5-72b"),
+        "chat completions rewrite should promote the effective model header for routing"
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_reject_mode_rejects_malformed_body() {
+    let filter = make_filter(REJECT_CONFIG);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(Bytes::from("not valid json {{{"));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Reject(_)),
+        "malformed POST /v1/chat/completions should be rejected in reject mode"
     );
 }
 
@@ -1152,6 +1278,22 @@ async fn run_filter_with_body(config_yaml: &str, body_str: &str) -> (HttpFilterC
         http::Method::POST,
         "/v1/responses",
     )));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    let mut body = Some(Bytes::from(body_str.to_owned()));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "valid request should continue: got {action:?}"
+    );
+    (ctx, body.unwrap())
+}
+
+/// Run the filter against an explicit request path and return context and body.
+async fn run_filter_at_path(config_yaml: &str, path: &str, body_str: &str) -> (HttpFilterContext<'static>, Bytes) {
+    let filter = make_filter(config_yaml);
+    let req: &'static praxis_filter::Request =
+        Box::leak(Box::new(crate::test_utils::make_request(http::Method::POST, path)));
     let mut ctx = crate::test_utils::make_filter_context(req);
     let mut body = Some(Bytes::from(body_str.to_owned()));
 

@@ -1,23 +1,24 @@
 {
   "version": 1,
-  "scenario_id": "responses/client-tool-compat-chat",
+  "scenario_id": "responses/chat-null-tool-choice",
   "protocol": "openai_responses",
   "provenance": {
     "kind": "synthetic",
     "provider": "synthetic",
-    "model": "synthetic-compat-model",
-    "source_id": "responses/client-tool-compat-chat"
+    "model": "synthetic-chat-model",
+    "source_id": "responses/chat-null-tool-choice"
   },
   "normalization": {
     "version": 1,
     "linked_ids": {
-      "call_recorded_0002": "call_recorded_0002",
-      "resp_5c00ec9f7df5e11162c9000000000000": "resp_recorded_0001"
+      "call_1": "call_recorded_0002",
+      "chatcmpl-tool-echo": "chatcmpl-recorded-0003",
+      "resp_5af671940311c470ca6f000000000000": "resp_recorded_0001"
     }
   },
   "turns": [
     {
-      "name": "custom-tool-lower-restore-over-chat",
+      "name": "null-tool-choice",
       "client": {
         "request": {
           "method": "POST",
@@ -30,15 +31,27 @@
           "body": {
             "kind": "json",
             "value": {
-              "input": "Apply the patch.",
-              "model": "synthetic-compat-model",
+              "input": "What's the weather like in San Francisco?",
+              "model": "synthetic-chat-model",
               "store": false,
               "stream": false,
+              "tool_choice": null,
               "tools": [
                 {
-                  "description": "Apply a unified diff to the workspace.",
-                  "name": "apply_patch",
-                  "type": "custom"
+                  "description": "Get the current weather for a location",
+                  "name": "get_weather",
+                  "parameters": {
+                    "properties": {
+                      "location": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "location"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "function"
                 }
               ]
             }
@@ -61,20 +74,21 @@
               "frequency_penalty": 0.0,
               "id": "resp_recorded_0001",
               "incomplete_details": null,
-              "input": "Apply the patch.",
+              "input": "What's the weather like in San Francisco?",
               "instructions": null,
               "max_output_tokens": null,
               "max_tool_calls": null,
               "metadata": {},
-              "model": "synthetic-compat-model",
+              "model": "synthetic-chat-model",
               "object": "response",
               "output": [
                 {
+                  "arguments": "{\"location\":\"San Francisco, CA\"}",
                   "call_id": "call_recorded_0002",
-                  "id": "ctc_call_recorded_0002",
-                  "input": "*** Begin Patch\n*** Update File: hello.txt\n@@\n-hello\n+hello world\n*** End Patch",
-                  "name": "apply_patch",
-                  "type": "custom_tool_call"
+                  "id": "fc_call_recorded_0002",
+                  "name": "get_weather",
+                  "status": "completed",
+                  "type": "function_call"
                 }
               ],
               "parallel_tool_calls": true,
@@ -95,25 +109,37 @@
               "tool_choice": "auto",
               "tools": [
                 {
-                  "description": "Apply a unified diff to the workspace.",
-                  "name": "apply_patch",
-                  "type": "custom"
+                  "description": "Get the current weather for a location",
+                  "name": "get_weather",
+                  "parameters": {
+                    "properties": {
+                      "location": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "location"
+                    ],
+                    "type": "object"
+                  },
+                  "strict": false,
+                  "type": "function"
                 }
               ],
               "top_logprobs": 0,
               "top_p": 1.0,
               "truncation": "disabled",
               "usage": {
-                "input_tokens": 6,
+                "input_tokens": 20,
                 "input_tokens_details": {
                   "cache_write_tokens": 0,
                   "cached_tokens": 0
                 },
-                "output_tokens": 4,
+                "output_tokens": 10,
                 "output_tokens_details": {
                   "reasoning_tokens": 0
                 },
-                "total_tokens": 10
+                "total_tokens": 30
               }
             }
           }
@@ -133,32 +159,28 @@
             "value": {
               "messages": [
                 {
-                  "content": "Apply the patch.",
+                  "content": "What's the weather like in San Francisco?",
                   "role": "user"
                 }
               ],
-              "model": "synthetic-compat-model",
+              "model": "synthetic-chat-model",
               "stream": false,
-              "tool_choice": "auto",
               "tools": [
                 {
                   "function": {
-                    "description": "Apply a unified diff to the workspace.\n\nProvide the raw tool input in the `input` string field.",
-                    "name": "apply_patch",
+                    "description": "Get the current weather for a location",
+                    "name": "get_weather",
                     "parameters": {
-                      "additionalProperties": false,
                       "properties": {
-                        "input": {
-                          "description": "Raw custom tool input. Follow the tool description and declared format exactly.",
+                        "location": {
                           "type": "string"
                         }
                       },
                       "required": [
-                        "input"
+                        "location"
                       ],
                       "type": "object"
-                    },
-                    "strict": true
+                    }
                   },
                   "type": "function"
                 }
@@ -186,8 +208,8 @@
                     "tool_calls": [
                       {
                         "function": {
-                          "arguments": "{\"input\":\"*** Begin Patch\\n*** Update File: hello.txt\\n@@\\n-hello\\n+hello world\\n*** End Patch\"}",
-                          "name": "apply_patch"
+                          "arguments": "{\"location\":\"San Francisco, CA\"}",
+                          "name": "get_weather"
                         },
                         "id": "call_recorded_0002",
                         "type": "function"
@@ -196,13 +218,14 @@
                   }
                 }
               ],
-              "id": "chatcmpl_custom",
-              "model": "synthetic-compat-model",
+              "created": 0,
+              "id": "chatcmpl-recorded-0003",
+              "model": "synthetic-chat-model",
               "object": "chat.completion",
               "usage": {
-                "completion_tokens": 4,
-                "prompt_tokens": 6,
-                "total_tokens": 10
+                "completion_tokens": 10,
+                "prompt_tokens": 20,
+                "total_tokens": 30
               }
             }
           }

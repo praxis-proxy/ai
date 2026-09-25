@@ -947,6 +947,43 @@ async fn non_compat_state_translation_is_golden_unchanged() {
 }
 
 #[tokio::test]
+async fn null_tool_choice_translates_as_absent() {
+    let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.set_metadata("openai_responses_format.format", "openai_responses");
+    context.extensions.insert(ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1-mini",
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "lookup",
+            "parameters": {"type": "object"},
+        }],
+        "tool_choice": null,
+    })));
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1-mini","input":"hello","tool_choice":null}"#,
+    ));
+
+    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let state = context.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.tool_choice,
+        json!("auto"),
+        "canonical tool_choice in ResponsesState must normalize null to auto"
+    );
+    let translated: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert!(translated.get("tools").is_some());
+    assert!(
+        translated.get("tool_choice").is_none(),
+        "explicit null tool_choice must be omitted from translated Chat Completions request"
+    );
+}
+
+#[tokio::test]
 async fn streaming_translation_error_uses_responses_json_error() {
     let filter = ResponsesToChatCompletionsFilter::from_config(&serde_yaml::Value::Null).unwrap();
     let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");

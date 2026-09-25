@@ -15,7 +15,7 @@ Pipeline overview for filters under `apis/src/openai/responses/`.
 - **`openai_response_store`** — Persists Responses API responses to the configured response store backend.
 - **`openai_responses_compact`** — Summarizes conversation history when the token count exceeds a configured threshold.
 - **`openai_responses_format`** — Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body.
-- **`openai_responses_model_rewrite`** — Rewrites the `model` field in Responses API request bodies.
+- **`openai_responses_model_rewrite`** — Rewrites the `model` field in Responses and Chat Completions request bodies.
 - **`openai_responses_proxy`** — Rebuilds the request body from `ResponsesState` when present.
 - **`openai_responses_rehydrate`** — Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input).
 - **`openai_responses_request`** — Processes the Responses create request body once and initializes state.

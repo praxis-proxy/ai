@@ -144,7 +144,7 @@ impl<'a> ResponseContext<'a> {
             previous_response_id: request.string("previous_response_id"),
             store: request.bool("store").unwrap_or(true),
             tools: request.array("tools").unwrap_or_default(),
-            tool_choice: request.value("tool_choice"),
+            tool_choice: request.value("tool_choice").filter(|v| !v.is_null()),
             presence_penalty: request.value("presence_penalty"),
             frequency_penalty: request.value("frequency_penalty"),
             top_logprobs: request.u64("top_logprobs"),
@@ -1348,6 +1348,10 @@ fn convert_function_tool(tool: &Map<String, Value>) -> Value {
 }
 
 /// Convert Responses `tool_choice` into Chat Completions-compatible shape.
+///
+/// An explicit JSON `null` (or absent `None`) is treated as absent/default per
+/// observed OpenAI compatibility, returning `Ok(None)` so translation omits the
+/// `tool_choice` field from the outbound Chat Completions request.
 fn build_chat_tool_choice(
     choice: Option<&Value>,
     has_web_search: bool,
@@ -1358,6 +1362,7 @@ fn build_chat_tool_choice(
     };
 
     match choice {
+        Value::Null => Ok(None),
         Value::String(_) => Ok(Some(choice.clone())),
         Value::Object(choice_obj) => build_object_tool_choice(choice_obj, has_web_search, has_file_search).map(Some),
         _ => Err(TranslationError::UnsupportedToolChoiceType(
@@ -1796,6 +1801,7 @@ fn reasoning_value(context: &ResponseContext<'_>) -> Result<Value, TranslationEr
 fn tool_choice_value(context: &ResponseContext<'_>) -> Value {
     context
         .tool_choice
+        .filter(|v| !v.is_null())
         .cloned()
         .unwrap_or_else(|| Value::String(DEFAULT_TOOL_CHOICE.to_owned()))
 }

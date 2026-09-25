@@ -89,6 +89,10 @@ pub(super) struct Reservation {
     pub(super) estimate: u64,
     /// Monotonic timestamp at admission, in milliseconds.
     pub(super) created_at_ms: u64,
+    /// Total committed usage in the window after this reservation was
+    /// placed (settled + active + this estimate). Exposed for the
+    /// filter's graduated tier evaluation (S1).
+    pub(super) usage_after: u64,
 }
 
 /// Result of attempting admission.
@@ -296,16 +300,16 @@ impl Ledger {
         }
         self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
 
-        if self
-            .config
-            .budgets
-            .iter()
-            .any(|budget| state.usage_in_window(now_ms, budget.window_ms).saturating_add(estimate) > budget.capacity)
-        {
-            return Decision::Denied {
-                retry_after_ms: state.retry_after_ms(now_ms, &self.config),
-                reason: DenialReason::WindowCapacity,
-            };
+        let mut max_usage = 0_u64;
+        for budget in &self.config.budgets {
+            let usage = state.usage_in_window(now_ms, budget.window_ms).saturating_add(estimate);
+            max_usage = max_usage.max(usage);
+            if usage > budget.capacity {
+                return Decision::Denied {
+                    retry_after_ms: state.retry_after_ms(now_ms, &self.config),
+                    reason: DenialReason::WindowCapacity,
+                };
+            }
         }
         if self
             .active_reservations
@@ -334,6 +338,7 @@ impl Ledger {
             id,
             estimate,
             created_at_ms: now_ms,
+            usage_after: max_usage,
         })
     }
 

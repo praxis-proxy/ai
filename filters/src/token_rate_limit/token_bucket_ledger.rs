@@ -132,6 +132,10 @@ pub(super) struct Reservation {
     pub(super) estimate: u64,
     /// Monotonic timestamp at admission, in milliseconds.
     pub(super) created_at_ms: u64,
+    /// Tokens consumed from the bucket after this reservation
+    /// (`capacity - remaining`). Exposed for the filter's graduated
+    /// tier evaluation (S1).
+    pub(super) usage_after: u64,
 }
 
 /// Result of attempting admission.
@@ -357,6 +361,13 @@ impl TokenBucketLedger {
         }
 
         state.tokens -= estimate_f64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "capacity is bounded by MAX_F64_SAFE_INTEGER, difference is non-negative and within u64 range"
+        )]
+        let usage_after = (self.config.capacity as f64 - state.tokens).max(0.0) as u64;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         state.active.insert(
             id,
@@ -371,6 +382,7 @@ impl TokenBucketLedger {
             id,
             estimate,
             created_at_ms: now_ms,
+            usage_after,
         })
     }
 
