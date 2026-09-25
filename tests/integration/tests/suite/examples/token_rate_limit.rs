@@ -279,6 +279,88 @@ fn example_config_token_rate_limit_mixed_algorithms() {
     );
 }
 
+/// Per-header bucket keys (ai#123 / ai#129): one in-process catch-all
+/// rule, keyed on `x-tenant-id`. Two tenants with capacity=10 and
+/// reserved_tokens=10 each get their own bucket; a second request from
+/// the same tenant is 429; the other tenant is unaffected.
+#[test]
+fn header_bucket_keys_isolate_tenants() {
+    let backend = Backend::fixed(PLAIN_TEXT_BODY)
+        .header("content-type", "text/plain")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let yaml = format!(
+        "listeners:\n\
+         \x20 - name: default\n\
+         \x20   address: \"127.0.0.1:{proxy_port}\"\n\
+         \x20   filter_chains: [main]\n\
+         filter_chains:\n\
+         \x20 - name: main\n\
+         \x20   filters:\n\
+         \x20     - filter: router\n\
+         \x20       routes:\n\
+         \x20         - path: \"/v1/chat/completions\"\n\
+         \x20           cluster: backend\n\
+         \x20     - filter: token_rate_limit\n\
+         \x20       key:\n\
+         \x20         - header: x-tenant-id\n\
+         \x20       rules:\n\
+         \x20         - name: default\n\
+         \x20           algorithm: sliding_window\n\
+         \x20           window: 1h\n\
+         \x20           capacity: 10\n\
+         \x20           reserved_tokens: 10\n\
+         \x20     - filter: access_log\n\
+         \x20     - filter: load_balancer\n\
+         \x20       clusters:\n\
+         \x20         - name: backend\n\
+         \x20           endpoints:\n\
+         \x20             - \"127.0.0.1:{}\"\n\
+         insecure_options:\n\
+         \x20 allow_private_endpoints: true\n",
+        backend.port()
+    );
+    let config = praxis_core::config::Config::from_yaml(&yaml).expect("header-key config should parse");
+    let proxy = start_proxy(&config);
+
+    let alpha = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-tenant-id", "alpha")]),
+    );
+    assert_eq!(
+        parse_status(&alpha),
+        200,
+        "first tenant-alpha request should be admitted"
+    );
+
+    let beta = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-tenant-id", "beta")]),
+    );
+    assert_eq!(
+        parse_status(&beta),
+        200,
+        "tenant-beta must not share tenant-alpha's bucket"
+    );
+
+    let alpha_again = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-tenant-id", "alpha")]),
+    );
+    assert_eq!(
+        parse_status(&alpha_again),
+        429,
+        "second tenant-alpha request should exhaust its own 10-token bucket"
+    );
+
+    let missing = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&missing),
+        400,
+        "a missing key header must fail closed with 400, not fall through to the global bucket"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Mixed algorithms, per rule (ai#789/praxis#551) -- Valkey-backed, driven
 // through the real gateway pipeline across two independent proxy

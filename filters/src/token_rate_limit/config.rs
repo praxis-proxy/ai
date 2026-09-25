@@ -48,10 +48,22 @@ pub(super) struct TokenRateLimitConfig {
     /// a catch-all budget instead.
     pub rules: Vec<RuleConfig>,
 
-    /// Trusted request identity used to partition each rule's budget.
-    /// The default preserves the historical single global bucket.
+    /// How this filter partitions each matched rule's token budget.
+    ///
+    /// Accepts a scalar (`global`, `authenticated_subject`, `ip`,
+    /// `model`), a list of dimensions (composite keys), a single
+    /// dimension mapping (`header: x-tenant-id`), or a full spec with
+    /// `dimensions` and `missing`. Defaults to one shared global bucket.
     #[serde(default)]
-    pub key: KeySource,
+    pub key: KeySpec,
+
+    /// Soft cap on distinct in-memory / Valkey budget keys retained at
+    /// once, per rule. Bounds cardinality from per-header, per-IP, and
+    /// composite keying. Defaults to 100000. A new distinct key past this
+    /// cap is denied (429) rather than growing without bound; idle keys
+    /// are reaped by the existing ledger cleanup path.
+    #[serde(default)]
+    pub max_keys: Option<usize>,
 
     /// Where every rule's admission state lives: in-process (default,
     /// one budget per gateway instance) or a shared Valkey backend (one
@@ -73,16 +85,346 @@ pub(super) struct TokenRateLimitConfig {
     pub default_weights: super::weights::TokenTypeWeightsConfig,
 }
 
-/// Trusted source used to partition a rule's token budget.
+/// Policy applied when a key dimension cannot be resolved from the request.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum KeySource {
-    /// Every request matching a rule shares that rule's budget.
+pub(super) enum MissingKeyPolicy {
+    /// Fail closed: reject the request before provider contact.
     #[default]
-    Global,
+    Reject,
+    /// Drop the unresolved dimension. If nothing remains, use the global
+    /// bucket (`__fallback__`) -- the #129 "header absent" behaviour.
+    Fallback,
+}
 
-    /// Partition the rule by Praxis's verified request subject.
+/// One dimension of a token-budget key (proposal M5 / ai#123).
+///
+/// Composite keys are an ordered list of these. A lone `Global` dimension
+/// preserves the historical single-bucket-per-rule behaviour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum KeyDimension {
+    /// Shared bucket for every request matching the rule.
+    Global,
+    /// Verified [`praxis_filter::AuthenticatedIdentity`] subject.
     AuthenticatedSubject,
+    /// Downstream TCP peer address, or an optional trusted forwarding header.
+    Ip {
+        /// When set (e.g. `x-forwarded-for`), take the left-most IP from
+        /// that header instead of `client_addr`. Only safe behind a
+        /// trusted proxy that overwrites the header.
+        header: Option<String>,
+    },
+    /// Model identity from the JSON body `model` field, then `header`
+    /// (default `x-model`).
+    Model {
+        /// Header consulted when the body has no `model` field.
+        header: Option<String>,
+    },
+    /// Arbitrary request header value. As trusted as whoever set the
+    /// header -- pair with an upstream auth filter, do not key on a
+    /// caller-controlled identity header.
+    Header {
+        /// Header name (case-insensitive HTTP name).
+        name: String,
+        /// Overrides the spec-level [`KeySpec::missing`] for this header.
+        missing: Option<MissingKeyPolicy>,
+    },
+}
+
+/// Filter-level budget key configuration.
+///
+/// YAML shapes (all equivalent for a single subject key):
+///
+/// ```yaml
+/// key: authenticated_subject
+/// key:
+///   - authenticated_subject
+/// key:
+///   missing: reject
+///   dimensions:
+///     - type: authenticated_subject
+/// ```
+///
+/// Composite example (subject + model + tenant header):
+///
+/// ```yaml
+/// key:
+///   - authenticated_subject
+///   - model
+///   - header: x-tenant-id
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct KeySpec {
+    /// Ordered dimensions joined into one opaque backend key.
+    pub dimensions: Vec<KeyDimension>,
+    /// Default missing-dimension policy. Per-header `missing:` overrides
+    /// this for that header only.
+    pub missing: MissingKeyPolicy,
+}
+
+impl Default for KeySpec {
+    fn default() -> Self {
+        Self {
+            dimensions: vec![KeyDimension::Global],
+            missing: MissingKeyPolicy::Reject,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KeySpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = KeySpecDe::deserialize(deserializer)?;
+        wire.into_spec().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Wire form for [`KeySpec`]: scalar, list, single dimension map, or full spec.
+///
+/// Mapping variants that carry a sibling `missing:` are listed *before*
+/// [`KeySpecDe::Dimension`] so `{ header: x-tenant-id, missing: fallback }`
+/// is not swallowed by a header-only shortcut that would ignore `missing`.
+/// Each of those mappings uses `deny_unknown_fields` so
+/// `{ type: ip, header: x-forwarded-for }` still falls through to the
+/// tagged dimension parser instead of being misread as a header key.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KeySpecDe {
+    /// `key: authenticated_subject`
+    Scalar(String),
+    /// `key: [authenticated_subject, model]`
+    List(Vec<KeyDimensionDe>),
+    /// `key: { missing, dimensions }`
+    Spec(KeySpecMapping),
+    /// `key: { header: x-tenant-id }` or `{ header: x-tenant-id, missing: fallback }`
+    HeaderKey(HeaderKeyMapping),
+    /// `key: { model: {} }` or `{ model: { header: x-model }, missing: fallback }`
+    ModelKey(ModelKeyMapping),
+    /// `key: { ip: {} }` or `{ ip: { header: x-forwarded-for }, missing: fallback }`
+    IpKey(IpKeyMapping),
+    /// `key: { header: x-tenant-id }` (no sibling fields) or `{ type: ip, header: ... }`
+    Dimension(KeyDimensionDe),
+}
+
+/// Single-header spec that may set the spec-level missing policy.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeaderKeyMapping {
+    /// Header name or name+missing spec.
+    header: HeaderRef,
+    /// Spec-level missing policy (per-header `missing` still wins).
+    #[serde(default)]
+    missing: MissingKeyPolicy,
+}
+
+/// Single-model spec that may set the spec-level missing policy.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelKeyMapping {
+    /// Optional model header override.
+    model: ModelRef,
+    /// Spec-level missing policy.
+    #[serde(default)]
+    missing: MissingKeyPolicy,
+}
+
+/// Single-IP spec that may set the spec-level missing policy.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpKeyMapping {
+    /// Optional forwarding-header override.
+    ip: IpRef,
+    /// Spec-level missing policy.
+    #[serde(default)]
+    missing: MissingKeyPolicy,
+}
+
+/// Mapping form of [`KeySpec`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeySpecMapping {
+    /// Dimension list; empty is rejected at compile time.
+    #[serde(default)]
+    dimensions: Vec<KeyDimensionDe>,
+    /// Default missing-dimension policy.
+    #[serde(default)]
+    missing: MissingKeyPolicy,
+}
+
+impl KeySpecDe {
+    /// Convert the wire form into a [`KeySpec`].
+    fn into_spec(self) -> Result<KeySpec, String> {
+        match self {
+            Self::Scalar(name) => Ok(named_spec(&name)?),
+            Self::List(items) => Ok(KeySpec {
+                dimensions: decode_dimensions(items)?,
+                missing: MissingKeyPolicy::Reject,
+            }),
+            Self::Spec(spec) => Ok(KeySpec {
+                dimensions: decode_dimensions(spec.dimensions)?,
+                missing: spec.missing,
+            }),
+            Self::HeaderKey(map) => Ok(KeySpec {
+                dimensions: vec![header_dimension(map.header)],
+                missing: map.missing,
+            }),
+            Self::ModelKey(map) => Ok(KeySpec {
+                dimensions: vec![KeyDimension::Model {
+                    header: map.model.header,
+                }],
+                missing: map.missing,
+            }),
+            Self::IpKey(map) => Ok(KeySpec {
+                dimensions: vec![KeyDimension::Ip { header: map.ip.header }],
+                missing: map.missing,
+            }),
+            Self::Dimension(item) => Ok(KeySpec {
+                dimensions: vec![item.into_dimension()?],
+                missing: MissingKeyPolicy::Reject,
+            }),
+        }
+    }
+}
+
+/// One-dimension spec from a scalar name.
+fn named_spec(name: &str) -> Result<KeySpec, String> {
+    Ok(KeySpec {
+        dimensions: vec![dimension_from_name(name)?],
+        missing: MissingKeyPolicy::Reject,
+    })
+}
+
+/// Decode a list of wire dimensions.
+fn decode_dimensions(items: Vec<KeyDimensionDe>) -> Result<Vec<KeyDimension>, String> {
+    items.into_iter().map(KeyDimensionDe::into_dimension).collect()
+}
+
+/// Wire form for one [`KeyDimension`].
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KeyDimensionDe {
+    /// Scalar name (`global`, `authenticated_subject`, `ip`, `model`).
+    Name(String),
+    /// Internally tagged `{ type: ..., ... }`.
+    Tagged(TaggedDimension),
+    /// `{ header: x-tenant-id }` or `{ header: { name, missing } }`.
+    HeaderShortcut {
+        /// Header name or name+missing spec.
+        header: HeaderRef,
+    },
+    /// `{ model: {} }` or `{ model: { header } }`.
+    ModelShortcut {
+        /// Optional model header override.
+        model: ModelRef,
+    },
+    /// `{ ip: {} }` or `{ ip: { header } }`.
+    IpShortcut {
+        /// Optional forwarding-header override.
+        ip: IpRef,
+    },
+}
+
+/// Header shortcut value: a name, or a name plus missing policy.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HeaderRef {
+    /// `header: x-tenant-id`
+    Name(String),
+    /// `header: { name: x-tenant-id, missing: fallback }`
+    Spec {
+        /// Header to read.
+        name: String,
+        /// Optional per-header missing policy.
+        #[serde(default)]
+        missing: Option<MissingKeyPolicy>,
+    },
+}
+
+/// `{ model: {} }` or `{ model: { header: x-model } }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRef {
+    /// Header consulted when the body has no `model` field.
+    #[serde(default)]
+    header: Option<String>,
+}
+
+/// `{ ip: {} }` or `{ ip: { header: x-forwarded-for } }`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IpRef {
+    /// Trusted forwarding header, when set.
+    #[serde(default)]
+    header: Option<String>,
+}
+
+/// Internally tagged dimension (`type: ...`).
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum TaggedDimension {
+    /// Shared bucket for every matching request.
+    Global,
+    /// Verified authenticated subject.
+    AuthenticatedSubject,
+    /// Client IP.
+    Ip {
+        /// Optional forwarding header.
+        #[serde(default)]
+        header: Option<String>,
+    },
+    /// Model identity.
+    Model {
+        /// Optional model header override.
+        #[serde(default)]
+        header: Option<String>,
+    },
+    /// Named request header.
+    Header {
+        /// Header to read.
+        name: String,
+        /// Optional per-header missing policy.
+        #[serde(default)]
+        missing: Option<MissingKeyPolicy>,
+    },
+}
+
+impl KeyDimensionDe {
+    /// Convert the wire form into a [`KeyDimension`].
+    fn into_dimension(self) -> Result<KeyDimension, String> {
+        match self {
+            Self::Name(name) => dimension_from_name(&name),
+            Self::HeaderShortcut { header } => Ok(header_dimension(header)),
+            Self::ModelShortcut { model } => Ok(KeyDimension::Model { header: model.header }),
+            Self::IpShortcut { ip } => Ok(KeyDimension::Ip { header: ip.header }),
+            Self::Tagged(tagged) => Ok(match tagged {
+                TaggedDimension::Global => KeyDimension::Global,
+                TaggedDimension::AuthenticatedSubject => KeyDimension::AuthenticatedSubject,
+                TaggedDimension::Ip { header } => KeyDimension::Ip { header },
+                TaggedDimension::Model { header } => KeyDimension::Model { header },
+                TaggedDimension::Header { name, missing } => KeyDimension::Header { name, missing },
+            }),
+        }
+    }
+}
+
+/// Convert a header shortcut into a [`KeyDimension`].
+fn header_dimension(header: HeaderRef) -> KeyDimension {
+    match header {
+        HeaderRef::Name(name) => KeyDimension::Header { name, missing: None },
+        HeaderRef::Spec { name, missing } => KeyDimension::Header { name, missing },
+    }
+}
+
+/// Parse a scalar dimension name.
+fn dimension_from_name(name: &str) -> Result<KeyDimension, String> {
+    match name {
+        "global" => Ok(KeyDimension::Global),
+        "authenticated_subject" => Ok(KeyDimension::AuthenticatedSubject),
+        "ip" => Ok(KeyDimension::Ip { header: None }),
+        "model" => Ok(KeyDimension::Model { header: None }),
+        other => Err(format!(
+            "unknown key dimension '{other}': expected global, authenticated_subject, ip, model, or a header mapping"
+        )),
+    }
 }
 
 /// One `rules:` entry: an optional match condition, an algorithm choice
@@ -315,6 +657,7 @@ pub(super) struct EstimationConfig {
     clippy::panic,
     clippy::indexing_slicing,
     clippy::match_wildcard_for_single_variants,
+    clippy::too_many_lines,
     reason = "tests intentionally fail fast on impossible fixture states"
 )]
 mod tests {
@@ -322,6 +665,14 @@ mod tests {
 
     fn parse(yaml: &str) -> Result<TokenRateLimitConfig, serde_yaml::Error> {
         serde_yaml::from_str(yaml)
+    }
+
+    /// One catch-all sliding-window rule, so tests can focus on `key:`.
+    fn key_yaml(key: &str) -> String {
+        format!(
+            "{key}\nrules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    \
+             reserved_tokens: 50\n"
+        )
     }
 
     #[test]
@@ -340,17 +691,79 @@ mod tests {
             RuleAlgorithm::SlidingWindow { capacity: 1000, .. }
         ));
         assert_eq!(rule.reserved_tokens, Some(50));
-        assert_eq!(cfg.key, KeySource::Global);
+        assert_eq!(cfg.key, KeySpec::default());
     }
 
     #[test]
     fn parses_authenticated_subject_key_source() {
-        let cfg = parse(
-            "key: authenticated_subject\nrules:\n  - name: default\n    algorithm: sliding_window\n    window: 1h\n    capacity: 1000\n    reserved_tokens: 50\n",
-        )
-        .unwrap();
+        let cfg = parse(&key_yaml("key: authenticated_subject")).unwrap();
+        assert_eq!(cfg.key.dimensions, vec![KeyDimension::AuthenticatedSubject]);
+        assert_eq!(cfg.key.missing, MissingKeyPolicy::Reject);
+    }
 
-        assert_eq!(cfg.key, KeySource::AuthenticatedSubject);
+    #[test]
+    fn parses_a_composite_subject_model_and_header_list() {
+        let cfg = parse(&key_yaml(
+            "key:\n  - authenticated_subject\n  - model\n  - header: x-tenant-id",
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![
+                KeyDimension::AuthenticatedSubject,
+                KeyDimension::Model { header: None },
+                KeyDimension::Header {
+                    name: "x-tenant-id".into(),
+                    missing: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_tagged_dimensions_with_per_header_missing_override() {
+        let cfg = parse(&key_yaml(
+            "key:\n  missing: fallback\n  dimensions:\n    - type: header\n      name: x-api-key\n      missing: reject\n    - type: ip\n      header: x-forwarded-for",
+        ))
+        .unwrap();
+        assert_eq!(cfg.key.missing, MissingKeyPolicy::Fallback);
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![
+                KeyDimension::Header {
+                    name: "x-api-key".into(),
+                    missing: Some(MissingKeyPolicy::Reject),
+                },
+                KeyDimension::Ip {
+                    header: Some("x-forwarded-for".into()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_header_mapping_with_spec_level_missing_fallback() {
+        let cfg = parse(&key_yaml("key:\n  header: x-tenant-id\n  missing: fallback")).unwrap();
+        assert_eq!(cfg.key.missing, MissingKeyPolicy::Fallback);
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![KeyDimension::Header {
+                name: "x-tenant-id".into(),
+                missing: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_tagged_ip_with_forwarding_header() {
+        let cfg = parse(&key_yaml("key:\n  type: ip\n  header: x-forwarded-for")).unwrap();
+        assert_eq!(
+            cfg.key.dimensions,
+            vec![KeyDimension::Ip {
+                header: Some("x-forwarded-for".into()),
+            }]
+        );
+        assert_eq!(cfg.key.missing, MissingKeyPolicy::Reject);
     }
 
     #[test]

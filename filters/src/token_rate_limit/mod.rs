@@ -48,9 +48,10 @@
 //!
 //! - **CEL-expression matchers**: only static, exact header-value equality matching is implemented (overlapping
 //!   `praxis#189`/`#232`).
-//! - **Composite/multi-dimension keys, per-model keys**: flagged as TBD under the proposal's own M5 goal (see
-//!   `ai#123`/`ai#232`). This filter supports either one global bucket per rule or one bucket per trusted
-//!   [`AuthenticatedIdentity`] subject. Arbitrary header-derived and compound keys remain deferred.
+//! - **Flexible bucket keys (M5)**: filter-level `key:` accepts `global` (default), `authenticated_subject`, `ip`,
+//!   `model`, named headers, and ordered composites of those (ai#123 / ai#129). Values are hashed before storage.
+//!   Missing dimensions reject by default and can `fallback` to the remaining dimensions (or the global bucket).
+//!   CEL-expression keys remain deferred.
 //! - **Configurable estimation (M3)**: implemented -- per-rule `estimation:` block with pluggable strategies (`fixed`,
 //!   `max_tokens`, `input_plus_max_tokens`, `model_scaled`). See [`config::EstimationConfig`].
 //! - **Multiple budgets per rule, soft-limit tiers**: the proposal allows several `token_budgets` (e.g. hourly + daily)
@@ -96,6 +97,7 @@ mod tests;
 
 mod backend;
 mod config;
+mod keys;
 mod ledger;
 mod token_bucket_ledger;
 mod weights;
@@ -107,11 +109,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::header::HeaderName;
 use metrics::{counter, gauge};
-use praxis_ai_apis::hash::Sha256;
 use praxis_filter::{
     AuthenticatedIdentity, BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     parse_filter_config,
@@ -125,9 +125,10 @@ use self::{
         ValkeyTokenRateLimitBackend,
     },
     config::{
-        BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, EstimationConfig, EstimationStrategy, KeySource,
-        MatchConfig, RuleAlgorithm, RuleConfig, TokenRateLimitConfig,
+        BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, EstimationConfig, EstimationStrategy, MatchConfig,
+        RuleAlgorithm, RuleConfig, TokenRateLimitConfig,
     },
+    keys::{CompiledKeySpec, KeyDecision, KeyInputs, compile_key_spec},
     ledger::{Budget, Ledger, LedgerConfig},
     token_bucket_ledger::{TokenBucketConfig, TokenBucketLedger},
     weights::{TokenWeights, UsageCounts, parse_u64_meta, weighted_cost},
@@ -157,16 +158,18 @@ const META_RULE_INDEX: &str = "token_rate_limit.rule_index";
 const META_ESTIMATE: &str = "token_rate_limit.estimate";
 
 /// The budget key used by the backward-compatible global key mode.
-const FALLBACK_KEY: &str = "__fallback__";
+pub(super) const FALLBACK_KEY: &str = "__fallback__";
 
 /// Bound on distinct budget keys retained at once, per rule.
 ///
-/// Authenticated-subject keying can create one entry per verified subject.
-/// This mirrors the soft cap `rate_limit` uses for per-IP entries.
-const MAX_KEYS: usize = 100_000;
+/// High-cardinality dimensions (header, IP, model, composites) can
+/// create one entry per distinct resolved key. Operators can lower this
+/// with `max_keys`. Mirrors the soft cap `rate_limit` uses for per-IP
+/// entries.
+pub(super) const MAX_KEYS: usize = 100_000;
 
 /// Bound on a single budget key's length.
-const MAX_KEY_LENGTH: usize = 256;
+pub(super) const MAX_KEY_LENGTH: usize = 256;
 
 /// Bound on reservations awaiting reconciliation across all keys, per rule.
 const MAX_ACTIVE_RESERVATIONS: usize = 200_000;
@@ -250,13 +253,14 @@ fn build_sliding_window_backend(
     rule_name: &str,
     budgets: Vec<Budget>,
     reservation_timeout_ms: u64,
+    max_keys: usize,
 ) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
     match backend {
         BackendResource::Memory => {
             let ledger = Ledger::new(LedgerConfig {
                 budgets,
                 reservation_timeout_ms,
-                max_keys: MAX_KEYS,
+                max_keys,
                 max_key_length: MAX_KEY_LENGTH,
                 max_active_reservations: MAX_ACTIVE_RESERVATIONS,
             })
@@ -270,7 +274,7 @@ fn build_sliding_window_backend(
                 rule: rule_name.to_owned(),
                 budgets,
                 reservation_timeout_ms,
-                max_keys: MAX_KEYS,
+                max_keys,
                 max_active_reservations: MAX_ACTIVE_RESERVATIONS,
             })))
         },
@@ -284,12 +288,17 @@ fn build_sliding_window_backend(
 /// # Errors
 ///
 /// Returns [`FilterError`] if the ledger config is invalid.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors sliding-window builder; bounds stay explicit rather than a throwaway struct"
+)]
 fn build_token_bucket_backend(
     backend: &BackendResource,
     rule_name: &str,
     capacity: u64,
     refill_rate: f64,
     reservation_timeout_ms: u64,
+    max_keys: usize,
 ) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
     match backend {
         BackendResource::Memory => {
@@ -297,7 +306,7 @@ fn build_token_bucket_backend(
                 capacity,
                 refill_rate,
                 reservation_timeout_ms,
-                max_keys: MAX_KEYS,
+                max_keys,
                 max_key_length: MAX_KEY_LENGTH,
                 max_active_reservations: MAX_ACTIVE_RESERVATIONS,
             })
@@ -312,7 +321,7 @@ fn build_token_bucket_backend(
                 capacity,
                 refill_rate,
                 reservation_timeout_ms,
-                max_keys: MAX_KEYS,
+                max_keys,
                 max_active_reservations: MAX_ACTIVE_RESERVATIONS,
             })?))
         },
@@ -327,13 +336,13 @@ fn build_token_bucket_backend(
 /// body-dependent estimation strategies, without deserializing the
 /// entire request payload.
 #[derive(serde::Deserialize)]
-struct BodyProbe {
+pub(super) struct BodyProbe {
     /// OpenAI-style `max_tokens` field (preferred over `max_completion_tokens`).
-    max_tokens: Option<u64>,
+    pub(super) max_tokens: Option<u64>,
     /// OpenAI-style `max_completion_tokens` fallback field.
-    max_completion_tokens: Option<u64>,
-    /// Model identifier, used by `model_scaled` strategy.
-    model: Option<String>,
+    pub(super) max_completion_tokens: Option<u64>,
+    /// Model identifier, used by `model_scaled` strategy and M5 model keys.
+    pub(super) model: Option<String>,
 }
 
 /// Compiled, ready-to-use estimation strategy for one rule.
@@ -608,6 +617,7 @@ fn build_rule_backend(
     backend: &BackendResource,
     rule_name: &str,
     reservation_timeout_ms: u64,
+    max_keys: usize,
 ) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
     match algorithm {
         RuleAlgorithm::SlidingWindow { window, capacity } => {
@@ -616,11 +626,16 @@ fn build_rule_backend(
                 window_ms,
                 capacity: *capacity,
             }];
-            build_sliding_window_backend(backend, rule_name, budgets, reservation_timeout_ms)
+            build_sliding_window_backend(backend, rule_name, budgets, reservation_timeout_ms, max_keys)
         },
-        RuleAlgorithm::TokenBucket { capacity, refill_rate } => {
-            build_token_bucket_backend(backend, rule_name, *capacity, *refill_rate, reservation_timeout_ms)
-        },
+        RuleAlgorithm::TokenBucket { capacity, refill_rate } => build_token_bucket_backend(
+            backend,
+            rule_name,
+            *capacity,
+            *refill_rate,
+            reservation_timeout_ms,
+            max_keys,
+        ),
     }
 }
 
@@ -843,11 +858,12 @@ fn compile_rule(
     rule: RuleConfig,
     backend: &BackendResource,
     filter_defaults: TokenWeights,
+    max_keys: usize,
 ) -> Result<CompiledRule, FilterError> {
     let capacity = rule.algorithm.capacity();
     let reservation_timeout_ms = validate_rule_bounds(&rule, capacity)?;
     let estimation = compile_estimation(&rule.name, rule.reserved_tokens, rule.estimation, capacity)?;
-    let backend = build_rule_backend(&rule.algorithm, backend, &rule.name, reservation_timeout_ms)?;
+    let backend = build_rule_backend(&rule.algorithm, backend, &rule.name, reservation_timeout_ms, max_keys)?;
     let matcher = compile_matcher(&rule.name, rule.r#match)?;
     let loc = format!("rule '{}'", rule.name);
     let weights = filter_defaults.overlay(&rule.weights, &loc)?;
@@ -874,6 +890,9 @@ fn compile_rule(
 ///
 /// ```yaml
 /// filter: token_rate_limit
+/// key:                               # optional: defaults to one shared bucket per rule
+///   - authenticated_subject          # global | authenticated_subject | ip | model | header: NAME
+///   - model
 /// backend:                           # optional: defaults to in-process state, shared by every rule
 ///   kind: valkey                      # memory (default) | valkey
 ///   url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
@@ -916,13 +935,14 @@ pub struct TokenRateLimitFilter {
     /// Compiled rules, evaluated in configured order.
     rules: Vec<CompiledRule>,
 
-    /// Whether any rule uses a body-dependent estimation strategy.
-    /// When `true`, `on_request` defers reservation to `on_request_body`
-    /// and the pipeline buffers the request body for inspection.
+    /// Whether any rule uses a body-dependent estimation strategy, or
+    /// the key spec reads the JSON `model` field. When `true`,
+    /// `on_request` defers reservation to `on_request_body`.
     needs_body: bool,
 
-    /// Trusted request identity used to partition every rule's budget.
-    key_source: KeySource,
+    /// Compiled budget-key spec (ai#123). Partition every matching
+    /// rule's budget by the configured dimensions.
+    key_spec: CompiledKeySpec,
 
     /// Monotonic clock reference; all timestamps are offsets from this.
     epoch: Instant,
@@ -950,18 +970,24 @@ impl TokenRateLimitFilter {
 
         let backend = build_backend_resource(&cfg.backend)?;
         let filter_defaults = TokenWeights::UNITY.overlay(&cfg.default_weights, "default_weights")?;
+        let max_keys = match cfg.max_keys {
+            Some(0) => return Err("token_rate_limit: max_keys must be greater than 0".into()),
+            Some(max_keys) => max_keys,
+            None => MAX_KEYS,
+        };
+        let key_spec = compile_key_spec(cfg.key)?;
         let rules = cfg
             .rules
             .into_iter()
-            .map(|rule| compile_rule(rule, &backend, filter_defaults))
+            .map(|rule| compile_rule(rule, &backend, filter_defaults, max_keys))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let needs_body = rules.iter().any(|r| r.estimation.needs_body());
+        let needs_body = rules.iter().any(|r| r.estimation.needs_body()) || key_spec.needs_body();
 
         Ok(Box::new(Self {
             rules,
             needs_body,
-            key_source: cfg.key,
+            key_spec,
             epoch: Instant::now(),
         }))
     }
@@ -981,35 +1007,45 @@ impl TokenRateLimitFilter {
         self.rules.iter().enumerate().find(|(_, rule)| rule.matches(headers))
     }
 
-    /// Resolve an opaque backend bucket key from trusted request state.
-    fn resolve_key(&self, ctx: &HttpFilterContext<'_>) -> Option<String> {
-        match self.key_source {
-            KeySource::Global => Some(FALLBACK_KEY.to_owned()),
-            KeySource::AuthenticatedSubject => ctx
+    /// Resolve an opaque backend bucket key from request state.
+    fn resolve_key(&self, ctx: &HttpFilterContext<'_>, body_probe: Option<&BodyProbe>) -> KeyDecision {
+        self.key_spec.resolve(&KeyInputs {
+            subject: ctx
                 .extensions
                 .get::<AuthenticatedIdentity>()
-                .map(AuthenticatedIdentity::subject_id)
-                .map(subject_bucket_key),
-        }
+                .map(AuthenticatedIdentity::subject_id),
+            client_addr: ctx.client_addr,
+            headers: &ctx.request.headers,
+            body_probe,
+        })
     }
 
-    /// Resolve the trusted quota key and record a fail-closed identity miss.
-    fn resolve_key_or_record_rejection(&self, ctx: &HttpFilterContext<'_>, rule: &CompiledRule) -> Option<String> {
-        let key = self.resolve_key(ctx);
-        if key.is_none() {
-            tracing::info!(
-                rule = rule.name,
-                "token_rate_limit: rejecting request (401), no authenticated subject"
-            );
-            counter!(
-                "praxis_ai_token_rate_limit_requests_total",
-                "decision" => "denied",
-                "reason" => "missing_authenticated_subject",
-                "rule" => rule.name.clone(),
-            )
-            .increment(1);
+    /// Resolve the budget key, recording a fail-closed miss.
+    fn resolve_key_or_record_rejection(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        rule: &CompiledRule,
+        body_probe: Option<&BodyProbe>,
+    ) -> Result<String, u16> {
+        match self.resolve_key(ctx, body_probe) {
+            KeyDecision::Admit(key) => Ok(key),
+            KeyDecision::Reject { status, reason } => {
+                tracing::info!(
+                    rule = rule.name,
+                    reason,
+                    status,
+                    "token_rate_limit: rejecting request, key dimension missing"
+                );
+                counter!(
+                    "praxis_ai_token_rate_limit_requests_total",
+                    "decision" => "denied",
+                    "reason" => reason,
+                    "rule" => rule.name.clone(),
+                )
+                .increment(1);
+                Err(status)
+            },
         }
-        key
     }
 
     /// Reclaim idle/orphaned in-process state for one rule and publish
@@ -1173,8 +1209,7 @@ struct PendingReservation {
 /// [`TokenRateLimitFilter::record_admission`] stays within clippy's
 /// argument-count budget.
 struct AdmittedReservation {
-    /// The budget key this reservation was admitted under (see
-    /// [`FALLBACK_KEY`] -- always that sentinel in this milestone).
+    /// The budget key this reservation was admitted under.
     key: String,
     /// The backend-issued reservation ID, stashed for later reconciliation.
     reservation_id: u64,
@@ -1264,8 +1299,9 @@ impl HttpFilter for TokenRateLimitFilter {
         let Some(estimate) = estimate else {
             return Ok(FilterAction::Continue);
         };
-        let Some(key) = self.resolve_key_or_record_rejection(ctx, rule) else {
-            return Ok(FilterAction::Reject(Rejection::status(401)));
+        let key = match self.resolve_key_or_record_rejection(ctx, rule, None) {
+            Ok(key) => key,
+            Err(status) => return Ok(FilterAction::Reject(Rejection::status(status))),
         };
         let outcome = rule
             .backend
@@ -1304,8 +1340,9 @@ impl HttpFilter for TokenRateLimitFilter {
             return Ok(FilterAction::Continue);
         };
 
-        let Some(key) = self.resolve_key_or_record_rejection(ctx, rule) else {
-            return Ok(FilterAction::Reject(Rejection::status(401)));
+        let key = match self.resolve_key_or_record_rejection(ctx, rule, body_probe.as_ref()) {
+            Ok(key) => key,
+            Err(status) => return Ok(FilterAction::Reject(Rejection::status(status))),
         };
         let outcome = rule
             .backend
@@ -1340,9 +1377,9 @@ impl HttpFilter for TokenRateLimitFilter {
 }
 
 /// Convert a verified subject into a fixed-size, non-identifying backend key.
+#[cfg(test)]
 fn subject_bucket_key(subject: &str) -> String {
-    let digest = Sha256::digest(subject.as_bytes());
-    format!("subject:v1:{}", URL_SAFE_NO_PAD.encode(digest))
+    keys::opaque_part("subject", subject)
 }
 
 /// Parse the bounded request body fields used by estimation strategies.
@@ -1489,7 +1526,7 @@ mod backend_injection_tests {
                 weights: super::TokenWeights::UNITY,
             }],
             needs_body: false,
-            key_source: super::KeySource::Global,
+            key_spec: super::CompiledKeySpec::global(),
             epoch: std::time::Instant::now(),
         };
 

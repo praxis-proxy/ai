@@ -94,6 +94,324 @@ async fn authenticated_subject_keying_fails_closed_without_identity() {
 }
 
 #[test]
+fn from_config_accepts_header_ip_model_and_composite_keys() {
+    for top_level in [
+        "key: ip",
+        "key: model",
+        "key:\n  - header: x-tenant-id",
+        "key:\n  - authenticated_subject\n  - model",
+        "key:\n  missing: fallback\n  dimensions:\n    - type: header\n      name: x-api-key",
+        "max_keys: 16\nkey:\n  - header: x-tenant-id",
+        "key:\n  header: x-tenant-id\n  missing: fallback",
+        "key: global",
+    ] {
+        let yaml = single_rule_yaml_with(
+            top_level,
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 100000\nreserved_tokens: 500",
+        );
+        assert!(
+            TokenRateLimitFilter::from_config(&yaml).is_ok(),
+            "config should parse:\n{top_level}"
+        );
+    }
+}
+
+#[test]
+fn from_config_rejects_empty_key_dimensions_and_zero_max_keys() {
+    let empty = single_rule_yaml_with(
+        "key:\n  dimensions: []",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&empty).err().expect("should error");
+    assert!(err.to_string().contains("must not be empty"), "got: {err}");
+
+    let zero = single_rule_yaml_with(
+        "max_keys: 0",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&zero).err().expect("should error");
+    assert!(err.to_string().contains("max_keys"), "got: {err}");
+}
+
+#[test]
+fn from_config_rejects_invalid_key_combinations() {
+    let mixed = single_rule_yaml_with(
+        "key:\n  - global\n  - ip",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&mixed).err().expect("should error");
+    assert!(err.to_string().contains("cannot be combined"), "got: {err}");
+
+    let dup = single_rule_yaml_with(
+        "key:\n  - model\n  - model",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&dup).err().expect("should error");
+    assert!(err.to_string().contains("duplicate"), "got: {err}");
+
+    let empty_header = single_rule_yaml_with(
+        "key:\n  - header: \"\"",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let err = TokenRateLimitFilter::from_config(&empty_header)
+        .err()
+        .expect("should error");
+    assert!(err.to_string().contains("header name"), "got: {err}");
+}
+
+#[tokio::test]
+async fn header_keys_give_each_value_its_own_bucket() {
+    let yaml = single_rule_yaml_with(
+        "key:\n  - header: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let alpha_req = make_request_with_header("x-tenant-id", "alpha");
+    let mut alpha_ctx = crate::test_utils::make_filter_context(&alpha_req);
+    assert!(matches!(
+        filter.on_request(&mut alpha_ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let beta_req = make_request_with_header("x-tenant-id", "beta");
+    let mut beta_ctx = crate::test_utils::make_filter_context(&beta_req);
+    assert!(
+        matches!(filter.on_request(&mut beta_ctx).await.unwrap(), FilterAction::Continue),
+        "a different header value must not share alpha's exhausted-looking 10-token bucket"
+    );
+
+    let alpha_again_req = make_request_with_header("x-tenant-id", "alpha");
+    let mut alpha_again_ctx = crate::test_utils::make_filter_context(&alpha_again_req);
+    assert!(
+        matches!(
+            filter.on_request(&mut alpha_again_ctx).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "the same tenant must hit its own exhausted bucket"
+    );
+}
+
+#[tokio::test]
+async fn missing_header_rejects_by_default_and_can_fall_back() {
+    let reject_yaml = single_rule_yaml_with(
+        "key:\n  - header: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&reject_yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 400
+    ));
+
+    let fallback_yaml = single_rule_yaml_with(
+        "key:\n  missing: fallback\n  dimensions:\n    - type: header\n      name: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&fallback_yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut first = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut first).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut second = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(
+            filter.on_request(&mut second).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "header-absent fallback must share the global bucket"
+    );
+}
+
+#[tokio::test]
+async fn ip_keys_partition_by_client_address() {
+    let yaml = single_rule_yaml_with(
+        "key: ip",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut alice = crate::test_utils::make_filter_context(&req);
+    alice.client_addr = Some("203.0.113.10".parse().unwrap());
+    assert!(matches!(
+        filter.on_request(&mut alice).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut bob = crate::test_utils::make_filter_context(&req);
+    bob.client_addr = Some("203.0.113.11".parse().unwrap());
+    assert!(matches!(
+        filter.on_request(&mut bob).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut alice_again = crate::test_utils::make_filter_context(&req);
+    alice_again.client_addr = Some("203.0.113.10".parse().unwrap());
+    assert!(matches!(
+        filter.on_request(&mut alice_again).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 429
+    ));
+}
+
+#[tokio::test]
+async fn missing_ip_rejects_when_client_addr_is_absent() {
+    let yaml = single_rule_yaml_with(
+        "key: ip",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 400
+    ));
+}
+
+#[tokio::test]
+async fn model_keys_prefer_body_and_isolate_models() {
+    let yaml = single_rule_yaml_with(
+        "key: model",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut gpt = crate::test_utils::make_filter_context(&req);
+    let mut gpt_body = Some(bytes::Bytes::from(r#"{"model":"gpt-4"}"#));
+    assert!(matches!(
+        filter.on_request_body(&mut gpt, &mut gpt_body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut llama = crate::test_utils::make_filter_context(&req);
+    let mut llama_body = Some(bytes::Bytes::from(r#"{"model":"llama-3"}"#));
+    assert!(matches!(
+        filter.on_request_body(&mut llama, &mut llama_body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut gpt_again = crate::test_utils::make_filter_context(&req);
+    let mut gpt_again_body = Some(bytes::Bytes::from(r#"{"model":"gpt-4"}"#));
+    assert!(matches!(
+        filter.on_request_body(&mut gpt_again, &mut gpt_again_body, true).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 429
+    ));
+}
+
+#[tokio::test]
+async fn missing_model_rejects_when_body_and_header_are_absent() {
+    let yaml = single_rule_yaml_with(
+        "key: model",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(bytes::Bytes::from("{}"));
+    assert!(matches!(
+        filter.on_request_body(&mut ctx, &mut body, true).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 400
+    ));
+}
+
+#[tokio::test]
+async fn header_mapping_with_missing_fallback_shares_the_global_bucket() {
+    let yaml = single_rule_yaml_with(
+        "key:\n  header: x-tenant-id\n  missing: fallback",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut first = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut first).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let mut second = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(
+            filter.on_request(&mut second).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "{{ header, missing: fallback }} must not ignore missing and must share the global bucket"
+    );
+}
+
+#[tokio::test]
+async fn composite_header_and_model_are_isolated_from_header_only() {
+    let yaml = single_rule_yaml_with(
+        "key:\n  - header: x-tenant-id\n  - model",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 10\nreserved_tokens: 10",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = make_request_with_header("x-tenant-id", "acme");
+
+    let mut gpt = crate::test_utils::make_filter_context(&req);
+    let mut gpt_body = Some(bytes::Bytes::from(r#"{"model":"gpt-4"}"#));
+    assert!(matches!(
+        filter.on_request_body(&mut gpt, &mut gpt_body, true).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut llama = crate::test_utils::make_filter_context(&req);
+    let mut llama_body = Some(bytes::Bytes::from(r#"{"model":"llama-3"}"#));
+    assert!(
+        matches!(
+            filter.on_request_body(&mut llama, &mut llama_body, true).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "same tenant on a different model must not share the gpt-4 bucket"
+    );
+}
+
+#[tokio::test]
+async fn whitespace_header_is_treated_as_missing() {
+    let yaml = single_rule_yaml_with(
+        "key:\n  - header: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 5",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = make_request_with_header("x-tenant-id", "   ");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Reject(rejection) if rejection.status == 400
+    ));
+}
+
+#[tokio::test]
+async fn max_keys_denies_a_new_distinct_key_once_the_cap_is_hit() {
+    let yaml = single_rule_yaml_with(
+        "max_keys: 1\nkey:\n  - header: x-tenant-id",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 1",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    let first_req = make_request_with_header("x-tenant-id", "alpha");
+    let mut first = crate::test_utils::make_filter_context(&first_req);
+    assert!(matches!(
+        filter.on_request(&mut first).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let second_req = make_request_with_header("x-tenant-id", "beta");
+    let mut second = crate::test_utils::make_filter_context(&second_req);
+    assert!(
+        matches!(
+            filter.on_request(&mut second).await.unwrap(),
+            FilterAction::Reject(rejection) if rejection.status == 429
+        ),
+        "a second distinct header key must be denied once max_keys is exhausted"
+    );
+}
+
+#[test]
 fn from_config_rejects_an_empty_rules_list() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("rules: []\n").unwrap();
     let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
@@ -182,7 +500,7 @@ fn from_config_rejects_unknown_field() {
     );
     assert!(
         TokenRateLimitFilter::from_config(&yaml).is_err(),
-        "composite/CEL bucket keys are still deliberately unsupported, config should reject the unknown field"
+        "unknown rule-level field 'bucket_key' must still be rejected; keys are configured at filter level"
     );
 }
 
@@ -717,14 +1035,14 @@ fn debug_format_lists_configured_rule_names() {
     let rules = cfg
         .rules
         .into_iter()
-        .map(|rule| super::compile_rule(rule, &backend, super::TokenWeights::UNITY))
+        .map(|rule| super::compile_rule(rule, &backend, super::TokenWeights::UNITY, super::MAX_KEYS))
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let needs_body = rules.iter().any(|r| r.estimation.needs_body());
     let filter = TokenRateLimitFilter {
         rules,
         needs_body,
-        key_source: cfg.key,
+        key_spec: super::compile_key_spec(cfg.key).unwrap(),
         epoch: std::time::Instant::now(),
     };
     let debug = format!("{filter:?}");

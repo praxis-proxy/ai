@@ -28,11 +28,13 @@
 # share every rule's budget across every gateway instance/replica over
 # one shared connection.
 #
-# Set `key: authenticated_subject` on token_rate_limit to give every
-# verified Praxis subject an independent budget within each matching
-# rule. It fails closed when no authenticated identity is present and
-# hashes the subject before using it as a backend key. The default is
-# `key: global`, preserving one shared budget per rule.
+# Set `key:` to partition each matching rule's budget. Scalars
+# (`global`, `authenticated_subject`, `ip`, `model`), a header mapping
+# (`header: x-tenant-id`), or a list of those (composite, e.g. subject
+# + model) are accepted. Missing dimensions reject by default; set
+# `missing: fallback` to drop an absent dimension (header-absent traffic
+# then shares the global bucket). Values are hashed before storage.
+# The default is `key: global`, one shared budget per rule.
 #
 # `default_weights` (M4) scale provider-reported token types when the
 # reservation is reconciled. Cache read/write are a breakdown of
@@ -41,7 +43,7 @@
 # 1.0. Admission still reserves `reserved_tokens` unweighted (M3).
 #
 # Deliberately not yet built (see filters/src/token_rate_limit/mod.rs
-# for the full rationale): arbitrary CEL/composite bucket keys, and
+# for the full rationale): CEL-expression matchers/keys, and
 # observability/metering (M7/M8/S3).
 #
 # token_rate_limit is declared *before* token_count: response hooks

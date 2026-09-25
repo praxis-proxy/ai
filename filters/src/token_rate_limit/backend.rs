@@ -7,9 +7,8 @@
 //! on nerdalert's `poc/distributed-token-rate-limit-demo` spike branch
 //! (<https://github.com/nerdalert/ai/tree/poc/distributed-token-rate-limit-demo>).
 //! `reserve`/`reconcile` are key-agnostic (`ReserveRequest`/`ReconcileRequest`
-//! carry a plain `String` key); this filter supplies a single fixed key
-//! (see `FALLBACK_KEY`) instead of the source branch's principal+model
-//! composite key, so no logic here was changed to adopt it.
+//! carry a plain `String` key). The filter resolves M5 dimensions into an
+//! opaque key before calling these backends.
 
 use std::{
     sync::{Arc, Mutex, OnceLock},
@@ -35,7 +34,7 @@ const VALKEY_TIMEOUT: Duration = Duration::from_millis(500);
 /// Request to admit an estimated token cost against a key's budget.
 #[derive(Debug, Clone)]
 pub(super) struct ReserveRequest {
-    /// Opaque budget key (this milestone always uses `FALLBACK_KEY`).
+    /// Opaque budget key resolved from the filter's key spec.
     pub(super) key: String,
     /// Estimated token cost to reserve if admitted.
     pub(super) estimate: u64,

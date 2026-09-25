@@ -41,7 +41,8 @@ Assumes request identity has already been resolved upstream (this filter doesn't
 | `rules[].weights.cached_input` | number | no | Weight for prompt-cache hits (`token.cache_read`). A value below `1.0` cheapens cached input; the proposal's example is `0.1`. |
 | `rules[].weights.cache_write` | number | no | Weight for prompt-cache writes (`token.cache_write`). Anthropic cache creation is typically priced *above* uncached input; omit to keep `1.0`. |
 | `rules[].weights.reasoning` | number | no | Weight for reasoning / thinking tokens (`token.reasoning`). |
-| `key` | `global` \| `authenticated_subject` | no | Trusted request identity used to partition each rule's budget. The default preserves the historical single global bucket. |
+| `key` | KeySpec | no | How this filter partitions each matched rule's token budget. Accepts a scalar (`global`, `authenticated_subject`, `ip`, `model`), a list of dimensions (composite keys), a single dimension mapping (`header: x-tenant-id`), or a full spec with `dimensions` and `missing`. Defaults to one shared global bucket. |
+| `max_keys` | integer | no | Soft cap on distinct in-memory / Valkey budget keys retained at once, per rule. Bounds cardinality from per-header, per-IP, and composite keying. Defaults to 100000. A new distinct key past this cap is denied (429) rather than growing without bound; idle keys are reaped by the existing ledger cleanup path. |
 | `backend` | BackendConfig | no | Where every rule's admission state lives: in-process (default, one budget per gateway instance) or a shared Valkey backend (one budget shared across every gateway instance/replica). One backend for the whole filter, not per rule -- rules already share Valkey key-space isolation via `namespace`/rule-name hashing, so per-rule backend selection bought no isolation benefit, only a separate Valkey connection per rule pointed at the same URL. Revisit if a real deployment ever needs to mix in-process and Valkey rules in one filter instance. |
 | `backend.kind` | `memory` \| `valkey` | no | Which backend implementation to use. |
 | `backend.url` | string | no | Backend connection URL. Supports one `${ENV_VAR}` reference, so credentials/hostnames don't need to be committed to config. Required when `kind: valkey`, ignored otherwise. |
@@ -57,6 +58,9 @@ Assumes request identity has already been resolved upstream (this filter doesn't
 
 ```yaml
 filter: token_rate_limit
+key:                               # optional: defaults to one shared bucket per rule
+  - authenticated_subject          # global | authenticated_subject | ip | model | header: NAME
+  - model
 backend:                           # optional: defaults to in-process state, shared by every rule
   kind: valkey                      # memory (default) | valkey
   url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"
