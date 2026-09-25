@@ -2,7 +2,9 @@
 # Configuration
 # -------------------------------------------------------------------
 
-VERSION          ?= $(shell perl -ne 'print $$1 if /^version\s*=\s*"(.+)"/' Cargo.toml)
+# sed rather than perl: the UBI 9 toolchain image and a minimal RHEL runner
+# have no perl, and the FIPS host targets run make inside both.
+VERSION          ?= $(shell sed -n 's/^version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' Cargo.toml | head -n 1)
 IMAGE            ?= praxis-ai
 CONTAINER_ENGINE ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 OPENAI_CONFORMANCE_ARGS ?=
@@ -361,6 +363,9 @@ FIPS_UBI9_MINIMAL_DIGEST := sha256:8ebe2ad8fdf3cab3e5a53c1edc69194c98209cfadab24
 FIPS_UBI9_IMAGE         := registry.access.redhat.com/ubi9/ubi@$(FIPS_UBI9_DIGEST)
 FIPS_UBI9_MINIMAL_IMAGE := registry.access.redhat.com/ubi9/ubi-minimal@$(FIPS_UBI9_MINIMAL_DIGEST)
 FIPS_CHECK_IMAGE        ?= praxis-ai-fips-check
+# Red Hat's toolchain and OpenSSL, no sources: the image `test-fips-host`
+# runs the suites in (the `toolchain` stage of Containerfile.fips).
+FIPS_TOOLCHAIN_IMAGE    ?= praxis-ai-fips-toolchain
 FIPS_BUILD_ARGS         := --build-arg UBI9_DIGEST=$(FIPS_UBI9_DIGEST) \
 	--build-arg UBI9_MINIMAL_DIGEST=$(FIPS_UBI9_MINIMAL_DIGEST) \
 	--build-arg CARGO_FEATURES=$(FIPS_FEATURES)
@@ -516,6 +521,115 @@ container-fips: fips-verify-image
 	podman build -f Containerfile.fips --target runtime $(FIPS_BUILD_ARGS) \
 		-t $(IMAGE):$(VERSION)-fips .
 
+fips-toolchain: fips-verify-image
+	podman build -f Containerfile.fips --target toolchain $(FIPS_BUILD_ARGS) \
+		-t $(FIPS_TOOLCHAIN_IMAGE) .
+
+# The test suites as the FIPS build, inside the toolchain image, on a
+# FIPS-enabled host: the runtime proof the hosted checks cannot give. The
+# checkout is bind-mounted, so the tests are the working tree's; the
+# toolchain and OpenSSL are the image's, the same packages the FIPS image is
+# built with; the kernel flag and the FIPS crypto policy are the host's,
+# which podman passes into the container. PRAXIS_FIPS_HOST makes the harness
+# fail closed unless the process really is in FIPS mode, PRAXIS_REQUIRE_FIPS
+# makes every proxy the suites start enforce it, and
+# PRAXIS_TEST_FIPS_PROVIDER arms the hash and SigV4 unit tests' assertion
+# that the provider is in approved mode. The cargo home and the target
+# directory live in named volumes so a second run is incremental.
+#
+# The container runs as the invoking user (rootless podman, keep-id):
+# praxis-ai refuses to start as root, and the tests that boot the real
+# server would fail for that reason alone as container root.
+#
+# Needs rootless podman on a RHEL 9 host in FIPS mode (docs/fips.md). On any
+# other host it fails at the first test, by design.
+test-fips-host: fips-toolchain
+	podman run --rm --userns=keep-id --security-opt label=disable \
+		-v $(CURDIR):/src -w /src \
+		-v praxis-ai-fips-host-cargo:/cargo:U \
+		-v praxis-ai-fips-host-target:/target \
+		-e PRAXIS_FIPS_HOST=1 -e PRAXIS_REQUIRE_FIPS=1 -e PRAXIS_TEST_FIPS_PROVIDER=1 \
+		-e CARGO_TERM_COLOR=always \
+		$(FIPS_TOOLCHAIN_IMAGE) \
+		make fips-host-facts test-fips test-integration-fips test-schema-fips \
+			FIPS_TARGET_DIR=/target FIPS_CARGO_EXTRA=--ignore-rust-version $(if $(V),V=$(V))
+
+# What the process the suites run as actually sees, printed into the log next
+# to the results: the user, the kernel flag and boot parameter, the crypto
+# policy, the OpenSSL packages, the providers OpenSSL loads, whether MD5 is
+# refused, and the variables that drive the FIPS tests. These are properties
+# of the container, so one process proving them proves them for every test
+# binary in the run. With PRAXIS_FIPS_HOST declared it fails here, before
+# anything compiles, unless the kernel flag, the active fips provider and
+# the MD5 refusal all agree.
+fips-host-facts:
+	@echo "== FIPS host facts, as seen by the process the suites run as"
+	@echo "user: $$(id -u):$$(id -g)"
+	@echo "kernel fips_enabled: $$(cat /proc/sys/crypto/fips_enabled 2>/dev/null || echo unreadable)"
+	@echo "kernel cmdline fips=1: $$(tr ' ' '\n' < /proc/cmdline | grep -qx 'fips=1' && echo yes || echo no)"
+	@echo "crypto policy: $$(grep -v '^#' /etc/crypto-policies/config 2>/dev/null | grep -m1 . || echo none)"
+	@echo "packages: $$(rpm -q openssl-libs openssl-fips-provider-so 2>/dev/null | tr '\n' ' ')"
+	@echo "openssl: $$(openssl version 2>/dev/null || echo 'no openssl command')"
+	@openssl list -providers 2>/dev/null | sed 's/^/  /'
+	@echo "md5: $$(echo x | openssl dgst -md5 >/dev/null 2>&1 && echo works || echo refused)"
+	@echo "PRAXIS_FIPS_HOST=$${PRAXIS_FIPS_HOST:-} PRAXIS_REQUIRE_FIPS=$${PRAXIS_REQUIRE_FIPS:-} PRAXIS_TEST_FIPS_PROVIDER=$${PRAXIS_TEST_FIPS_PROVIDER:-}"
+	@case "$$(echo "$${PRAXIS_FIPS_HOST:-}" | tr A-Z a-z)" in \
+	''|0|false|no|off) echo "verdict: PRAXIS_FIPS_HOST not declared; the FIPS tests take whichever branch the provider dictates" ;; \
+	*) [ "$$(cat /proc/sys/crypto/fips_enabled 2>/dev/null)" = 1 ] || { echo "verdict: PRAXIS_FIPS_HOST is set but the kernel is not in FIPS mode"; exit 1; }; \
+	   openssl list -providers 2>/dev/null | grep -qx '  fips' || { echo "verdict: PRAXIS_FIPS_HOST is set but the fips provider is not active"; exit 1; }; \
+	   echo x | openssl dgst -md5 >/dev/null 2>&1 && { echo "verdict: PRAXIS_FIPS_HOST is set but MD5 works"; exit 1; }; \
+	   echo "verdict: FIPS mode confirmed for this container; every test below runs in it" ;; \
+	esac
+
+# The FIPS-host attestation: kernel flag, boot parameter, crypto policy and
+# the module the host's OpenSSL loads, then the same questions of the FIPS
+# image (the crypto policy podman propagates into it, and the build of
+# fips.so it carries, looked up in xtask/assets/fips/certified-modules.json).
+# Exit 1 on any unmet requirement; a module build still in validation is a
+# warning unless FIPS_HOST_CHECK_ARGS adds --require-certified. Writes the
+# attestation to target/fips/ for CI to keep.
+FIPS_HOST_CHECK_ARGS    ?=
+fips-host-check: | require-podman
+	@mkdir -p $(FIPS_TARGET_DIR)
+	$(XTASK_FIPS) fips host-check --image $(FIPS_IMAGE_REF) \
+		--out $(FIPS_TARGET_DIR)/host-attestation.txt \
+		--json $(FIPS_TARGET_DIR)/host-attestation.json $(FIPS_HOST_CHECK_ARGS)
+
+# Run the FIPS image on this FIPS host under PRAXIS_REQUIRE_FIPS=1 and drive
+# the listener probes of the integration suite against it from the toolchain
+# image; keeps the container's log in target/fips/.
+fips-runtime-probe: | require-podman
+	@mkdir -p $(FIPS_TARGET_DIR)
+	$(XTASK_FIPS) fips runtime-probe $(FIPS_IMAGE_REF) \
+		--toolchain-image $(FIPS_TOOLCHAIN_IMAGE) --log $(FIPS_TARGET_DIR)/runtime-probe.log
+
+# Hand the built image to another machine as an archive (the FIPS runner
+# tests the exact image the hosted job built and scanned, not a rebuild).
+FIPS_IMAGE_ARCHIVE      ?= $(FIPS_TARGET_DIR)/praxis-ai-fips-image.tar
+fips-image-save: | require-podman
+	@mkdir -p $(dir $(FIPS_IMAGE_ARCHIVE))
+	podman save --output $(FIPS_IMAGE_ARCHIVE) $(FIPS_IMAGE_REF)
+	podman image inspect --format '{{.Id}}' $(FIPS_IMAGE_REF) > $(FIPS_IMAGE_ARCHIVE).id
+
+# Load an archive `fips-image-save` wrote and check its id is the one that
+# was saved.
+fips-image-load: | require-podman
+	podman load --input $(FIPS_IMAGE_ARCHIVE)
+	@loaded=$$(podman image inspect --format '{{.Id}}' $(FIPS_IMAGE_REF)); \
+	saved=$$(cat $(FIPS_IMAGE_ARCHIVE).id); \
+	[ "$$loaded" = "$$saved" ] || { echo "loaded image $$loaded is not the saved image $$saved"; exit 1; }; \
+	echo "loaded $(FIPS_IMAGE_REF) $$loaded"
+
+# Name an image podman already has (a published digest that was pulled, say)
+# the way the FIPS targets expect it.
+fips-image-tag: | require-podman
+	@[ -n "$(FIPS_IMAGE_SOURCE)" ] || { echo "set FIPS_IMAGE_SOURCE to the reference to tag as $(FIPS_IMAGE_REF)"; exit 1; }
+	podman tag $(FIPS_IMAGE_SOURCE) $(FIPS_IMAGE_REF)
+
+# The version the FIPS image is tagged with, for scripts that need it.
+fips-version:
+	@echo $(VERSION)
+
 container-fips-run: | require-podman
 	podman run --rm --network=host $(IMAGE):$(VERSION)-fips 2>&1
 
@@ -655,6 +769,19 @@ help:
 	@echo "  fips-deps            dependency graph vs Red Hat's crypto denylist (seconds, no build)"
 	@echo "  fips-verify-image    verify the pinned UBI 9 base images are Red Hat's (digest + signature)"
 	@echo "  fips-signature-store point podman at Red Hat's signature store (once, on Debian/Ubuntu hosts)"
+	@echo ""
+	@echo "FIPS host (RHEL 9 in FIPS mode; see docs/fips.md):"
+	@echo "  test-integration-fips  the integration suite as the FIPS build (in-process proxy, FIPS binary for subprocess tests)"
+	@echo "  test-schema-fips       the schema suite as the FIPS build"
+	@echo "  fips-toolchain         build the UBI 9 toolchain image the host run uses"
+	@echo "  test-fips-host         the suites as the FIPS build inside the toolchain image, fail-closed on FIPS mode"
+	@echo "  fips-host-facts        print the container's FIPS facts; fails unless FIPS mode holds when declared"
+	@echo "  fips-host-check        attest the host and the image's module build (target/fips/host-attestation.*)"
+	@echo "  fips-runtime-probe     run the FIPS image under PRAXIS_REQUIRE_FIPS=1 and probe its listener"
+	@echo "  fips-image-save        save the FIPS image and its id for handoff to the runner"
+	@echo "  fips-image-load        load a saved image and check it is the one that was saved"
+	@echo "  fips-image-tag         name a pulled digest the way the FIPS targets expect (FIPS_IMAGE_SOURCE=...)"
+	@echo "  fips-version           the version the FIPS image is tagged with"
 	@echo ""
 	@echo "Praxis override:"
 	@echo "  patch-praxis         use ../praxis path deps instead of crates.io"

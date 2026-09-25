@@ -117,6 +117,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      fips-digest: ${{ steps.push-fips.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -178,22 +180,82 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
 
       - name: Tag and push the scanned FIPS image
+        id: push-fips
         env:
           PUBLISHED_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           source_image=$(make -s fips-image-ref)
+          digest_file=$(mktemp)
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
             podman tag "$source_image" "$tag"
-            podman push "$tag"
+            # Every tag pushes the same image, so the last digest stands
+            # for all of them; the fips-host job pulls the release by it.
+            podman push --digestfile "$digest_file" "$tag"
           done <<< "$PUBLISHED_TAGS"
+          echo "digest=$(cat "$digest_file")" >> "$GITHUB_OUTPUT"
+
+  # ----------------------------------------------------------------------------
+  # FIPS host: check the pushed release image on the FIPS runner
+  # ----------------------------------------------------------------------------
+  #
+  # The runtime attestation of the exact bits that were just published,
+  # pulled back by digest: the host and module attestation and the running
+  # probe. The suites already ran against this commit's image in the FIPS
+  # workflow, so this job attests and probes without rerunning them.
+
+  fips-host:
+    needs: [validate, container-fips]
+    if: >-
+      !cancelled()
+      && needs.validate.result == 'success'
+      && needs.container-fips.result == 'success'
+      && needs.container-fips.outputs.fips-digest != ''
+    runs-on: [self-hosted, fips, rhel]
+    concurrency:
+      group: fips-host-runner
+      cancel-in-progress: false
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.ref_name }}
+
+      - uses: ./.github/actions/fips-runner-check
+
+      - name: Pull the pushed FIPS image by digest and name it for the checks
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}@${{ needs.container-fips.outputs.fips-digest }}
+        run: |
+          podman pull "$IMAGE"
+          make fips-image-tag FIPS_IMAGE_SOURCE="$IMAGE"
+
+      - uses: ./.github/actions/fips-host
+        with:
+          run-suites: "false"
+
+      - name: Remove the pulled image
+        if: always()
+        run: podman rmi --force "localhost/praxis-ai:$(make -s fips-version)-fips" || true
 
   # ----------------------------------------------------------------------------
   # Create GitHub release
   # ----------------------------------------------------------------------------
 
   github-release:
-    needs: [validate, container, container-fips]
+    needs: [validate, container, container-fips, fips-host]
+    # fips-host needs the self-hosted FIPS runner; a release must not be
+    # unpublishable while that runner is offline, so skipped is acceptable
+    # and only a run that failed blocks the release.
+    if: >-
+      !cancelled()
+      && needs.validate.result == 'success'
+      && needs.container.result == 'success'
+      && needs.container-fips.result == 'success'
+      && (needs.fips-host.result == 'success' || needs.fips-host.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:

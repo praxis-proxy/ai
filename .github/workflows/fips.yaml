@@ -18,6 +18,14 @@ name: FIPS
 # Ubuntu's podman packaging ships no registries.d entry for Red Hat's
 # registry, so the job first tells podman where the signatures live
 # (make fips-signature-store), as a developer on Debian or Ubuntu would.
+#
+# The second job, fips-host, is the runtime proof the hosted job cannot
+# give: on the self-hosted RHEL 9 runner in FIPS mode it attests the host
+# and the image's module build, runs the test suites as the FIPS build
+# inside the toolchain image, and probes the exact image the hosted job
+# built and scanned, handed over as an artifact and checked by id. It never
+# runs a fork's code, and it stays out of the merge queue so queue
+# throughput never depends on the single runner.
 
 on:
   push:
@@ -26,6 +34,9 @@ on:
     branches: [main]
   merge_group:
     branches: [main]
+  schedule:
+    # Nightly runtime proof; clear of the other nightly schedules.
+    - cron: "53 4 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -44,6 +55,8 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+    outputs:
+      image-id: ${{ steps.save.outputs.image-id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -87,3 +100,73 @@ jobs:
 
       - name: Scan the image with check-payload (warnings fatal)
         run: make fips-scan
+
+      # The merge queue never runs fips-host, so it skips the handoff too.
+      - name: Save the image for the FIPS runner
+        id: save
+        if: github.event_name != 'merge_group'
+        run: |
+          make fips-image-save
+          echo "image-id=$(cat target/fips/praxis-ai-fips-image.tar.id)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name != 'merge_group'
+        with:
+          name: fips-image
+          path: |
+            target/fips/praxis-ai-fips-image.tar
+            target/fips/praxis-ai-fips-image.tar.id
+          if-no-files-found: error
+          retention-days: 3
+
+  # ----------------------------------------------------------------------------
+  # FIPS host: the runtime proof, on the RHEL 9 runner in FIPS mode
+  # ----------------------------------------------------------------------------
+
+  fips-host:
+    needs: ubi-image
+    # Never a fork's code on the self-hosted runner: pull requests only from
+    # this repository's own branches. Not in the merge queue: ubi-image is
+    # the required check there, and the queue must not wait on one runner.
+    if: >-
+      needs.ubi-image.result == 'success'
+      && github.event_name != 'merge_group'
+      && (github.event_name != 'pull_request'
+          || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, fips, rhel]
+    # One runner: queue behind any other run rather than share it.
+    concurrency:
+      group: fips-host-runner
+      cancel-in-progress: false
+    # Building the suites in the toolchain image from a cold cache dominates.
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/fips-runner-check
+
+      - name: Fetch the image the hosted job built and scanned
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: fips-image
+          path: target/fips
+
+      - name: Load it and check it is that image
+        env:
+          EXPECTED_ID: ${{ needs.ubi-image.outputs.image-id }}
+        run: |
+          make fips-image-load
+          [ "$(cat target/fips/praxis-ai-fips-image.tar.id)" = "$EXPECTED_ID" ] \
+            || { echo "::error::the archive's image id does not match the one the hosted job recorded"; exit 1; }
+
+      - uses: ./.github/actions/fips-host
+        with:
+          run-suites: "true"
+
+      - name: Remove the loaded image
+        if: always()
+        run: podman rmi --force "localhost/praxis-ai:$(make -s fips-version)-fips" || true
