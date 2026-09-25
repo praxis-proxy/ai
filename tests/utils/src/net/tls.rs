@@ -286,11 +286,9 @@ pub struct ClientCert {
 // CA Generation
 // -----------------------------------------------------------------------------
 
-/// Install the process-wide crypto provider for TLS tests: the same one the
-/// binary installs at startup (the system OpenSSL), so the proxy under test
-/// runs on the provider it ships with. A no-op after the first call.
-/// Install the process-wide crypto provider, as the binary does at startup,
-/// and fail closed on a declared FIPS host that is not in FIPS mode.
+/// Install the process-wide crypto provider, the same system-OpenSSL one
+/// the binary installs at startup, and fail closed on a declared FIPS host
+/// that is not in FIPS mode. A no-op after the first call.
 ///
 /// Every harness entry point that builds a TLS configuration goes through
 /// here, so with `PRAXIS_FIPS_HOST=1` (`make test-fips-host`) a green run
