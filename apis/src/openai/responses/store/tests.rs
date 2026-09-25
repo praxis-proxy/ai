@@ -1816,6 +1816,113 @@ async fn pipeline_persists_after_format_request_body_classification() {
     cleanup_sqlite_file(&db_path);
 }
 
+#[cfg(feature = "openai-conversations")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipeline_persists_chunked_response_with_unarmed_conversations_filter() {
+    let (db_url, db_path) = temp_sqlite_url("pipeline_persists_chunked_with_conversations");
+
+    let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
+        r#"
+- filter: openai_responses_format
+- filter: openai_response_store
+  backend: sqlite
+  database_url: "{db_url}"
+  responses_table: test_responses
+  conversations_table: test_conversations
+- filter: openai_conversations
+  backend: sqlite
+  database_url: "{db_url}"
+  conversations_table: test_conversations_api
+  items_table: test_conversation_items
+"#
+    ))
+    .unwrap();
+    let mut registry = crate::test_utils::make_ai_registry();
+    praxis_filter::register_filters!(
+        @register registry,
+        http "openai_conversations" => crate::openai::OpenaiConversationsFilter::from_config
+    );
+    let pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
+
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let request_json = json!({
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": "Hello"}]
+    });
+    let mut request_body = Some(Bytes::from(serde_json::to_vec(&request_json).unwrap()));
+    assert!(matches!(
+        pipeline
+            .execute_http_request_body(&mut ctx, &mut request_body, true)
+            .await
+            .unwrap(),
+        FilterAction::Release
+    ));
+    assert!(matches!(
+        pipeline.execute_http_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut resp = crate::test_utils::make_response();
+    resp.headers
+        .insert(http::header::CONTENT_TYPE, "application/json".parse().unwrap());
+    ctx.response_header = Some(&mut resp);
+    assert!(matches!(
+        pipeline.execute_http_response(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.response_header = None;
+
+    let response_json = json!({
+        "id": "resp_chunked_pipeline",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{"type": "message", "content": "Hi"}]
+    });
+    let response_bytes = serde_json::to_vec(&response_json).unwrap();
+    let split_at = response_bytes.len() / 2;
+    let full_body = Bytes::from(response_bytes);
+
+    let mut first_body = Some(full_body.slice(..split_at));
+    let first_action = pipeline
+        .execute_http_response_body(&mut ctx, &mut first_body, false)
+        .unwrap();
+
+    // `StreamBuffer` releases the first chunk unchanged when a filter returns
+    // `Release`; subsequent callbacks then receive only the tail. When every
+    // filter continues, the protocol retains the first chunk and presents the
+    // frozen aggregate at EOS. Mirror both paths so the persistence assertion
+    // catches a premature release rather than merely checking the action.
+    let eos_body = if matches!(&first_action, FilterAction::Release) {
+        full_body.slice(split_at..)
+    } else {
+        full_body.clone()
+    };
+    let mut second_body = Some(eos_body);
+    assert!(matches!(
+        pipeline
+            .execute_http_response_body(&mut ctx, &mut second_body, true)
+            .unwrap(),
+        FilterAction::Continue
+    ));
+
+    let store = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None, None)
+        .await
+        .unwrap();
+    let record = store
+        .get_response(&crate::test_utils::test_owner("default"), "resp_chunked_pipeline")
+        .await
+        .unwrap()
+        .expect("chunked response must be persisted when Conversations is unarmed");
+    assert_eq!(record.response_object, response_json);
+    assert!(matches!(&first_action, FilterAction::Continue));
+
+    drop(store);
+    drop(pipeline);
+    cleanup_sqlite_file(&db_path);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_persists_streaming_response_from_accumulated_state() {
     let (db_url, db_path) = temp_sqlite_url("pipeline_persists_streaming_response_from_accumulated_state");

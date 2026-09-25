@@ -61,13 +61,13 @@ feature set: every filter on this page except the groups below, which carry
 heavier dependencies or a large amount of stateful code and compile only when
 their feature is enabled. The published container image and `make release`
 build `full`, which matches the complete filter set. The FIPS build
-(`make release-fips`, the `-fips` image) compiles only `openai-responses` on
-top of the always-on filters; [FIPS 140-3](fips.md) lists what is left out
-and why.
+(`make release-fips`, the `-fips` image) compiles only `openai-responses` and
+`aws-sigv4-filter` on top of the always-on filters; [FIPS 140-3](fips.md)
+lists what is left out and why.
 
 | Feature | Filters it adds | Notable dependencies |
 |---------|-----------------|----------------------|
-| `aws-sigv4-filter` (part of `standard`) | `aws_sigv4_sign` | `aws-sigv4` |
+| `aws-sigv4-filter` (part of `standard`) | `aws_sigv4_sign` | `aws-credential-types`; the signature is computed by the system OpenSSL |
 | `openai-responses` | `openai_responses_validate`, `openai_responses_proxy`, `openai_stream_events`, `responses_to_chat_completions`, `openai_doc_extract`, `openai_client_tool_compat`, `openai_agentic_loop`, `openai_file_search_callout`, `openai_web_search` | none beyond the default build |
 | `openai-file-resolve-filter` | `openai_file_resolve` | `reqwest` |
 | `store-postgres`, `store-sqlite`, `store-all` | `openai_response_store`, `openai_responses_rehydrate`, and the SQL backends | `sqlx` (PostgreSQL adds native TLS through the system OpenSSL) |

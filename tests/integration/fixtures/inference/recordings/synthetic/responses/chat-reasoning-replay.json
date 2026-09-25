@@ -1,0 +1,717 @@
+{
+  "version": 1,
+  "scenario_id": "responses/chat-reasoning-replay",
+  "protocol": "openai_responses",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "synthetic-reasoning-replay-model",
+    "source_id": "controlled-chat-reasoning-replay"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "chatcmpl-controlled-0": "chatcmpl-recorded-0003",
+      "chatcmpl-controlled-1": "chatcmpl-recorded-0006",
+      "chatcmpl-controlled-2": "chatcmpl-recorded-0009",
+      "msg_resp_5bffeecefb868c576925000000000002": "msg_recorded_0005",
+      "msg_resp_5bffeecf00fe8c576925000000000004": "msg_recorded_0008",
+      "resp_5bffeecee0988c576925000000000000": "resp_recorded_0001",
+      "resp_5bffeecefb868c576925000000000002": "resp_recorded_0004",
+      "resp_5bffeecf00fe8c576925000000000004": "resp_recorded_0007",
+      "rs_resp_5bffeecee0988c576925000000000000_chatcmpl-controlled-0": "rs_recorded_0002"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "Pick a number.",
+              "model": "synthetic-reasoning-replay-model",
+              "store": true,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": 0,
+              "error": null,
+              "frequency_penalty": 0.0,
+              "id": "resp_recorded_0001",
+              "incomplete_details": null,
+              "input": "Pick a number.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "max_tool_calls": null,
+              "metadata": {},
+              "model": "synthetic-reasoning-replay-model",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "text": "I picked 42.",
+                      "type": "reasoning_text"
+                    }
+                  ],
+                  "id": "rs_recorded_0002",
+                  "status": "completed",
+                  "summary": [],
+                  "type": "reasoning"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "presence_penalty": 0.0,
+              "previous_response_id": null,
+              "prompt_cache_key": null,
+              "reasoning": null,
+              "safety_identifier": null,
+              "service_tier": "default",
+              "status": "completed",
+              "store": true,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [],
+              "top_logprobs": 0,
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {
+                  "cache_write_tokens": 0,
+                  "cached_tokens": 0
+                },
+                "output_tokens": 1,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": "Pick a number.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-reasoning-replay-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": null,
+                    "reasoning": "I picked 42.",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0003",
+              "model": "synthetic-reasoning-replay-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 1,
+                "prompt_tokens": 12,
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "continuation",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": "Now answer.",
+              "model": "synthetic-reasoning-replay-model",
+              "previous_response_id": "resp_recorded_0001",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": 0,
+              "error": null,
+              "frequency_penalty": 0.0,
+              "id": "resp_recorded_0004",
+              "incomplete_details": null,
+              "input": "Now answer.",
+              "instructions": null,
+              "max_output_tokens": null,
+              "max_tool_calls": null,
+              "metadata": {},
+              "model": "synthetic-reasoning-replay-model",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "42",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0005",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "presence_penalty": 0.0,
+              "previous_response_id": "resp_recorded_0001",
+              "prompt_cache_key": null,
+              "reasoning": null,
+              "safety_identifier": null,
+              "service_tier": "default",
+              "status": "completed",
+              "store": false,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [],
+              "top_logprobs": 0,
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {
+                  "cache_write_tokens": 0,
+                  "cached_tokens": 0
+                },
+                "output_tokens": 1,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": "Pick a number.",
+                  "role": "user"
+                },
+                {
+                  "content": null,
+                  "reasoning": "I picked 42.",
+                  "role": "assistant"
+                },
+                {
+                  "content": "Now answer.",
+                  "role": "user"
+                }
+              ],
+              "model": "synthetic-reasoning-replay-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": "42",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0006",
+              "model": "synthetic-reasoning-replay-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 1,
+                "prompt_tokens": 12,
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "trailing",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": [
+                {
+                  "content": [
+                    {
+                      "text": "I picked 42.",
+                      "type": "reasoning_text"
+                    }
+                  ],
+                  "type": "reasoning"
+                }
+              ],
+              "model": "synthetic-reasoning-replay-model",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "background": false,
+              "completed_at": 0,
+              "created_at": 0,
+              "error": null,
+              "frequency_penalty": 0.0,
+              "id": "resp_recorded_0007",
+              "incomplete_details": null,
+              "input": [
+                {
+                  "content": [
+                    {
+                      "text": "I picked 42.",
+                      "type": "reasoning_text"
+                    }
+                  ],
+                  "type": "reasoning"
+                }
+              ],
+              "instructions": null,
+              "max_output_tokens": null,
+              "max_tool_calls": null,
+              "metadata": {},
+              "model": "synthetic-reasoning-replay-model",
+              "object": "response",
+              "output": [
+                {
+                  "content": [
+                    {
+                      "annotations": [],
+                      "logprobs": [],
+                      "text": "42",
+                      "type": "output_text"
+                    }
+                  ],
+                  "id": "msg_recorded_0008",
+                  "role": "assistant",
+                  "status": "completed",
+                  "type": "message"
+                }
+              ],
+              "parallel_tool_calls": true,
+              "presence_penalty": 0.0,
+              "previous_response_id": null,
+              "prompt_cache_key": null,
+              "reasoning": null,
+              "safety_identifier": null,
+              "service_tier": "default",
+              "status": "completed",
+              "store": false,
+              "temperature": 1.0,
+              "text": {
+                "format": {
+                  "type": "text"
+                }
+              },
+              "tool_choice": "auto",
+              "tools": [],
+              "top_logprobs": 0,
+              "top_p": 1.0,
+              "truncation": "disabled",
+              "usage": {
+                "input_tokens": 12,
+                "input_tokens_details": {
+                  "cache_write_tokens": 0,
+                  "cached_tokens": 0
+                },
+                "output_tokens": 1,
+                "output_tokens_details": {
+                  "reasoning_tokens": 0
+                },
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/chat/completions",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": null,
+                  "reasoning": "I picked 42.",
+                  "role": "assistant"
+                }
+              ],
+              "model": "synthetic-reasoning-replay-model",
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "choices": [
+                {
+                  "finish_reason": "stop",
+                  "index": 0,
+                  "message": {
+                    "content": "42",
+                    "role": "assistant"
+                  }
+                }
+              ],
+              "created": 0,
+              "id": "chatcmpl-recorded-0009",
+              "model": "synthetic-reasoning-replay-model",
+              "object": "chat.completion",
+              "usage": {
+                "completion_tokens": 1,
+                "prompt_tokens": 12,
+                "total_tokens": 13
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "encrypted",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": [
+                {
+                  "encrypted_content": "opaque",
+                  "summary": [],
+                  "type": "reasoning"
+                }
+              ],
+              "model": "synthetic-reasoning-replay-model",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "code": "invalid_request_error",
+                "message": "unsupported reasoning input item: encrypted_content cannot be replayed",
+                "param": null,
+                "type": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
+      "name": "summary_only",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": [
+                {
+                  "summary": [],
+                  "type": "reasoning"
+                }
+              ],
+              "model": "synthetic-reasoning-replay-model",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "code": "invalid_request_error",
+                "message": "unsupported reasoning input item: content must contain raw reasoning_text parts",
+                "param": null,
+                "type": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    },
+    {
+      "name": "malformed",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/responses",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "input": [
+                {
+                  "content": [
+                    {
+                      "text": null,
+                      "type": "reasoning_text"
+                    }
+                  ],
+                  "type": "reasoning"
+                }
+              ],
+              "model": "synthetic-reasoning-replay-model",
+              "store": false,
+              "stream": false
+            }
+          }
+        },
+        "response": {
+          "status": 400,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "error": {
+                "code": "invalid_request_error",
+                "message": "malformed reasoning input item: reasoning_text must be a string, found null",
+                "param": null,
+                "type": "invalid_request_error"
+              }
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "",
+          "path": "",
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        },
+        "response": {
+          "status": 0,
+          "headers": {},
+          "body": {
+            "kind": "empty"
+          }
+        }
+      }
+    }
+  ]
+}

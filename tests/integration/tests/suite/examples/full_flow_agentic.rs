@@ -454,6 +454,47 @@ fn full_flow_streaming_response_is_persisted_and_retrievable() {
     drop(proxy);
 }
 
+/// A chunked non-streaming Responses body must remain buffered until the
+/// response store sees EOS. `openai_conversations` is composed in this example
+/// but append-back is unarmed without a conversation request; it must not
+/// release the shared buffer before persistence (#1265).
+#[test]
+fn full_flow_chunked_response_is_persisted_and_retrievable() {
+    let response = FIRST_RESPONSE_JSON;
+    let split_at = response.len() / 2;
+    let backend_guard = Backend::chunked(vec![response[..split_at].to_owned(), response[split_at..].to_owned()])
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_chunked_persist");
+
+    let config = load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    );
+    let proxy = start_proxy(&config);
+
+    let raw = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello"}"#),
+    );
+    assert_eq!(parse_status(&raw), 200, "chunked create should succeed: {raw}");
+    let created: Value = serde_json::from_str(&parse_body(&raw)).expect("chunked response should be JSON");
+    let response_id = created["id"].as_str().expect("response should contain an id");
+
+    let (status, stored_body) = http_get(proxy.addr(), &format!("/v1/responses/{response_id}"), None);
+    assert_eq!(
+        status, 200,
+        "chunked response should be persisted and retrievable: {stored_body}"
+    );
+    let stored: Value = serde_json::from_str(&stored_body).expect("stored response should be JSON");
+    assert_eq!(stored["id"], response_id);
+    assert_eq!(stored["status"], "completed");
+
+    drop(proxy);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_flow_previous_response_id_rebuilds_body_with_history() {
     let backend_guard = Backend::fixed(FIRST_RESPONSE_JSON)
@@ -1289,6 +1330,10 @@ fn full_flow_agentic_file_search_round_trip() {
         "vector store callout should use the scoped OGX credential: {}",
         search_callouts[0].headers,
     );
+    // The vector-store callout carries no forward_headers, so x-tenant-id /
+    // x-user-id can only originate from the outbound chain's
+    // project_state_owner_headers re-projecting the trusted StateOwner. Their
+    // presence is therefore a positive witness that the outbound chain ran.
     let headers = search_callouts[0].headers.to_lowercase();
     assert!(
         headers.contains("x-tenant-id: integration-tenant"),

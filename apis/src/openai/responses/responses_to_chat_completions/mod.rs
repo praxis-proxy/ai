@@ -44,8 +44,9 @@ use super::{
 };
 use crate::{
     classifier::is_responses_create,
-    openai::translation::chat_completions::{
-        ResponseContext, chat_response_to_response_resource, responses_state_to_chat_request,
+    openai::translation::{
+        chat_completions::{ResponseContext, chat_response_to_response_resource, responses_state_to_chat_request},
+        reasoning::{ReasoningOptions, validate_requested_reasoning},
     },
 };
 
@@ -99,6 +100,24 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// reverse response order then restores the hosted call before those filters
 /// inspect it.
 ///
+/// The optional `reasoning` block selects a dialect that promotes raw
+/// chain-of-thought returned by the backend into a Responses `reasoning`
+/// output item. The default dialect `none` performs no extraction and
+/// preserves only portable Chat Completions fields. The `vllm` dialect
+/// reads the current `message.reasoning` field (falling back to the deprecated
+/// `message.reasoning_content` alias) and emits it as a reasoning item whose
+/// `content` is `reasoning_text`. Raw reasoning is never placed in the item
+/// summary, which is reserved for safe summaries. No current dialect can
+/// generate a safe summary, so a client that requests `reasoning.summary` (or
+/// the deprecated `reasoning.generate_summary`) is rejected. Streaming reasoning
+/// translation is not yet implemented, so a streaming request is rejected when
+/// valid reasoning dialect is configured. On continuation, raw reasoning
+/// is replayed into the following assistant turn's `reasoning` field, preserving
+/// its ordinary `content`. Reasoning-only output becomes a standalone assistant
+/// message at a turn boundary or end of input. Reasoning input requires an
+/// enabled dialect and non-empty raw `reasoning_text` content; encrypted,
+/// summary-only, and malformed items are rejected before forwarding.
+///
 /// To emit translated SSE events incrementally, this filter forces the
 /// reconciled response body mode to `Stream` for the entire filter chain. The
 /// protocol layer reconciles a single chain-wide response body mode with no
@@ -139,6 +158,9 @@ const RESPONSE_TRANSFORM_STREAM: &str = "stream";
 /// ```yaml
 /// filter: responses_to_chat_completions
 /// max_rewritten_body_bytes: 67108864
+/// reasoning:
+///   dialect: vllm
+///   max_reasoning_bytes: 65536
 /// ```
 pub struct ResponsesToChatCompletionsFilter {
     /// Parsed and validated body limits.
@@ -168,7 +190,7 @@ impl ResponsesToChatCompletionsFilter {
         &self,
         ctx: &HttpFilterContext<'_>,
     ) -> Result<Result<Vec<u8>, FilterAction>, FilterError> {
-        let translated = match translate_canonical_state(ctx) {
+        let translated = match translate_canonical_state(ctx, &self.config.reasoning) {
             Ok(value) => value,
             Err(action) => return Ok(Err(action)),
         };
@@ -210,7 +232,7 @@ impl ResponsesToChatCompletionsFilter {
         ctx: &HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
     ) -> Result<(), FilterError> {
-        match translate_success_response(ctx, body.as_deref().unwrap_or_default()) {
+        match translate_success_response(ctx, body.as_deref().unwrap_or_default(), &self.config.reasoning) {
             Ok(translated) if translated.len() <= self.config.max_rewritten_body_bytes => {
                 *body = Some(translated);
                 Ok(())
@@ -532,7 +554,10 @@ fn request_disposition(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
 }
 
 /// Convert the validator-owned canonical state to a Chat request value.
-fn translate_canonical_state(ctx: &HttpFilterContext<'_>) -> Result<serde_json::Value, FilterAction> {
+fn translate_canonical_state(
+    ctx: &HttpFilterContext<'_>,
+    reasoning: &ReasoningOptions,
+) -> Result<serde_json::Value, FilterAction> {
     let Some(state) = ctx.extensions.get::<ResponsesState>() else {
         warn!(
             prerequisite = "openai_responses_validate",
@@ -541,6 +566,7 @@ fn translate_canonical_state(ctx: &HttpFilterContext<'_>) -> Result<serde_json::
         return Err(missing_pipeline_state());
     };
     ensure_previous_response_rehydrated(state)?;
+    reject_incompatible_reasoning(&state.request_body, reasoning, request_is_streaming(ctx))?;
     // Read the *outbound* tools/tool_choice through the accessor so a
     // `openai_client_tool_compat`-lowered request (rich client tools rewritten to
     // private `function` tools in `request_body` only) translates the lowered view
@@ -552,9 +578,38 @@ fn translate_canonical_state(ctx: &HttpFilterContext<'_>) -> Result<serde_json::
         &state.messages,
         state.request_tools(),
         state.request_tool_choice(),
+        reasoning,
     )
     .map_err(|error| {
         debug!(error = %error, "Responses request cannot be represented by Chat Completions");
+        FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            &error.to_string(),
+        ))
+    })
+}
+
+/// Reject a request whose reasoning controls are incompatible with the dialect.
+fn reject_incompatible_reasoning(
+    request_body: &serde_json::Value,
+    reasoning: &ReasoningOptions,
+    streaming: bool,
+) -> Result<(), FilterAction> {
+    let Some(request) = request_body.as_object() else {
+        return Ok(());
+    };
+    // Streaming reasoning translation is not yet implemented.
+    if streaming && reasoning.dialect.is_enabled() {
+        debug!("streaming reasoning translation is unsupported for the configured dialect");
+        return Err(FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "streaming is not supported when a reasoning dialect is configured",
+        )));
+    }
+    validate_requested_reasoning(request, reasoning).map_err(|error| {
+        debug!(error = %error, "reasoning request rejected before forwarding");
         FilterAction::Reject(responses_error_rejection(
             400,
             "invalid_request_error",
@@ -720,7 +775,11 @@ fn prepare_transformed_stream_headers(ctx: &mut HttpFilterContext<'_>) {
 }
 
 /// Convert a finite successful Chat response into a Responses resource.
-fn translate_success_response(ctx: &HttpFilterContext<'_>, body: &[u8]) -> Result<Bytes, FilterError> {
+fn translate_success_response(
+    ctx: &HttpFilterContext<'_>,
+    body: &[u8],
+    reasoning: &ReasoningOptions,
+) -> Result<Bytes, FilterError> {
     let state = ctx
         .extensions
         .get::<ResponsesState>()
@@ -736,7 +795,8 @@ fn translate_success_response(ctx: &HttpFilterContext<'_>, body: &[u8]) -> Resul
         .ok_or_else(|| -> FilterError { "responses_to_chat_completions: missing creation timestamp".into() })?;
     let mut response_context =
         ResponseContext::from_responses_request(&state.request_body, response_id.to_owned(), created_at)
-            .with_completed_at(ctx.time_source.now().as_secs());
+            .with_completed_at(ctx.time_source.now().as_secs())
+            .with_reasoning_options(reasoning.clone());
     // Echo the client's canonical tool declarations, not the backend-lowered forms
     // that openai_file_search_callout writes into request_body (e.g. a hosted
     // `file_search` tool lowered to a private `function`). This mirrors how the

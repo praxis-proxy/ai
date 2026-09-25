@@ -833,6 +833,30 @@ async fn deduplicates_mcp_tools_independent_of_tool_order() {
     );
 }
 
+#[test]
+fn retains_private_mcp_targets_with_identical_tool_names() {
+    let a = "https://a.example/mcp";
+    let b = "https://b.example/mcp";
+    let record = ResponseRecord {
+        id: "resp_targets".to_owned(),
+        owner: crate::test_utils::test_owner("default"),
+        created_at: 1000,
+        model: "gpt-4.1".to_owned(),
+        response_object: json!({
+            "output": [{"type": "mcp_list_tools", "server_label": "weather", "tools": [{"name": "shared_tool"}]}]
+        }),
+        input: json!("Hi"),
+        messages: json!([
+            {"type": "praxis_mcp_cached_listing", "server_label": "weather", "server_url": a, "tools": [{"name": "shared_tool"}]},
+            {"type": "praxis_mcp_cached_listing", "server_label": "weather", "server_url": b, "tools": [{"name": "shared_tool"}]}
+        ]),
+    };
+    let listings = collect_mcp_tool_listings(&record);
+    assert!(listings.iter().any(|item| item["server_url"] == a));
+    assert!(listings.iter().any(|item| item["server_url"] == b));
+    assert!(listings.iter().all(|item| item["tools"][0]["name"] == "shared_tool"));
+}
+
 #[tokio::test]
 async fn extracts_mcp_tools_from_stored_history_when_latest_output_has_none() {
     let mut records = std::collections::HashMap::new();

@@ -40,11 +40,11 @@ filter_chains:
       # Publishes the typed operation consumed by openai_conversations.
       - filter: openai_operation
 
-      - filter: openai_responses_format
-        # Conversation API bodies are handled locally later in this chain.
+      - filter: openai_responses_request
+        # Only POST /v1/responses reaches this filter, so Conversations API
+        # bodies pass through untouched to their handler later in this chain.
+        # on_invalid still governs malformed create bodies.
         on_invalid: continue
-
-      - filter: openai_responses_validate
 
       - filter: openai_response_store
         backend: sqlite

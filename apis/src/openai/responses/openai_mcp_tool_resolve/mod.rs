@@ -539,7 +539,6 @@ impl McpToolResolveFilter {
                 server_url,
                 owner_fingerprint,
                 cache_allowed_names,
-                is_connector,
             )
         {
             // Cache hit: no dial is made, so validate the target here to preserve
@@ -775,12 +774,16 @@ struct Resolution {
 /// A successful local MCP discovery listing awaiting commit as an
 /// `mcp_list_tools` output item.
 ///
-/// Carries only the fields the output item needs; the item `id` is assigned at
-/// commit time from the request's id generator so it matches the failure path's
-/// `mcpl_` convention.
+/// The item `id` is assigned at commit time from the request's id generator so
+/// it matches the failure path's `mcpl_` convention. Direct, uncredentialed
+/// listings also carry their exact URL in private persisted history so a
+/// continuation can reuse them without repeating `tools/list`. Connector and
+/// credentialed listings omit it and remain ineligible for cache reuse.
 struct McpListing {
     /// The MCP server's client-visible label.
     server_label: String,
+    /// Exact target identity for a cacheable direct listing.
+    server_url: Option<String>,
     /// The resolved tools normalized to the `MCPListToolsTool` shape
     /// (`name`, `input_schema`, optional `description`/`annotations`).
     tools: Vec<serde_json::Value>,
@@ -807,6 +810,10 @@ fn check_body_size(serialized: &SerializedJson, max_rewritten_body_bytes: usize)
 }
 
 /// Collect per-entry resolutions from task results.
+#[expect(
+    clippy::too_many_lines,
+    reason = "per-entry results and cache identity are collected at the same boundary"
+)]
 fn collect_resolutions(
     entries: &[serde_json::Value],
     entry_to_task: &[Option<usize>],
@@ -826,6 +833,7 @@ fn collect_resolutions(
             resolved_labels.insert(label.clone());
             listings.push(McpListing {
                 server_label: label,
+                server_url: reusable_listing_server_url(entry).map(str::to_owned),
                 tools: listing_tools,
             });
             per_entry.push(resolution);
@@ -2689,7 +2697,7 @@ fn commit_discovery_items(ctx: &mut HttpFilterContext<'_>, listings: Vec<McpList
     }
     // Assign ids up front (borrowing `id_generator`/`time_source`) so the mutable
     // `ResponsesState` borrow below never overlaps the id-generator borrow.
-    let items: Vec<serde_json::Value> = listings
+    let items: Vec<(serde_json::Value, Option<serde_json::Value>)> = listings
         .into_iter()
         .map(|listing| build_discovery_item(ctx, listing))
         .collect();
@@ -2697,40 +2705,66 @@ fn commit_discovery_items(ctx: &mut HttpFilterContext<'_>, listings: Vec<McpList
     let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
         return;
     };
-    for item in items {
-        append_discovery_item(state, item);
+    for (item, cached) in items {
+        if append_discovery_item(state, item)
+            && let Some(cached) = cached
+        {
+            state.persisted_messages.push(cached);
+        }
     }
 }
 
-/// Build one `mcp_list_tools` output item with a fresh `mcpl_` id (issue #1022).
-fn build_discovery_item(ctx: &HttpFilterContext<'_>, listing: McpListing) -> serde_json::Value {
-    let McpListing { server_label, tools } = listing;
+/// Build a public listing and, where safe, a private cache record for the store.
+fn build_discovery_item(
+    ctx: &HttpFilterContext<'_>,
+    listing: McpListing,
+) -> (serde_json::Value, Option<serde_json::Value>) {
+    let McpListing {
+        server_label,
+        server_url,
+        tools,
+    } = listing;
     let id = format!("mcpl_{}", ctx.id_generator.generate(ctx.time_source));
-    serde_json::json!({
-        "id": id,
-        "type": "mcp_list_tools",
-        "server_label": server_label,
-        "tools": tools,
-    })
+    let mut item = serde_json::Map::new();
+    item.insert("id".to_owned(), serde_json::Value::String(id));
+    item.insert(
+        "type".to_owned(),
+        serde_json::Value::String("mcp_list_tools".to_owned()),
+    );
+    // The store's message history is never serialized as a Responses output item.
+    // A second copy of the tool definitions is necessary at this persistence
+    // boundary; the public item must not carry the target URL.
+    let cached = server_url.map(|server_url| {
+        serde_json::json!({
+            "type": "praxis_mcp_cached_listing",
+            "server_label": server_label,
+            "server_url": server_url,
+            "tools": tools.clone(),
+        })
+    });
+    item.insert("server_label".to_owned(), serde_json::Value::String(server_label));
+    item.insert("tools".to_owned(), serde_json::Value::Array(tools));
+    (serde_json::Value::Object(item), cached)
 }
 
 /// Append a discovery item unless its server is already listed, recording the id
 /// in `locally_executed_output_items` so the item's lifecycle is synthesized. The
 /// dedup keeps an internal retry that re-runs resolution from emitting a second
 /// discovery for the same server (issue #1022).
-fn append_discovery_item(state: &mut ResponsesState, item: serde_json::Value) {
+fn append_discovery_item(state: &mut ResponsesState, item: serde_json::Value) -> bool {
     let server_label = item.get("server_label").and_then(serde_json::Value::as_str);
     let already_listed = state.accumulated_output.iter().any(|existing| {
         existing.get("type").and_then(serde_json::Value::as_str) == Some("mcp_list_tools")
             && existing.get("server_label").and_then(serde_json::Value::as_str) == server_label
     });
     if already_listed {
-        return;
+        return false;
     }
     if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
         state.locally_executed_output_items.insert(id.to_owned());
     }
     state.accumulated_output.push(item);
+    true
 }
 
 /// Check whether `openai_tool_parse` detected MCP tools.
@@ -2747,12 +2781,21 @@ fn is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Whether the entry carries per-entry credentials that
 /// affect the `tools/list` response.
+///
+/// URL query parameters are treated as credentials because they may contain
+/// API keys. Such URLs are resolved normally but never copied into a reusable
+/// private listing.
 fn has_entry_credentials(entry: &serde_json::Value) -> bool {
     entry.get("authorization").and_then(serde_json::Value::as_str).is_some()
         || entry
             .get("headers")
             .and_then(serde_json::Value::as_object)
             .is_some_and(|h| !h.is_empty())
+        || entry
+            .get("server_url")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| url::Url::parse(raw).ok())
+            .is_some_and(|url| url.query().is_some())
 }
 
 /// Whether a previous `tools/list` result is valid without current request context.
@@ -2762,6 +2805,16 @@ fn can_reuse_cached_listing(entry: &serde_json::Value, is_connector: bool) -> bo
     // pipeline, so connector listings must always be refreshed. Direct URLs
     // remain reusable only when their entry has no request-specific credentials.
     !is_connector && !has_entry_credentials(entry)
+}
+
+/// Return the exact target only when it is safe to persist privately and reuse.
+fn reusable_listing_server_url(entry: &serde_json::Value) -> Option<&str> {
+    let is_connector = entry.get("connector_id").is_some();
+    if can_reuse_cached_listing(entry, is_connector) {
+        resolvable_server_url(entry)
+    } else {
+        None
+    }
 }
 
 /// Extract `server_label` from an MCP tool entry.
@@ -2909,53 +2962,33 @@ impl AllowedTools {
 }
 
 /// Check `previous_tools` for a cached listing matching
-/// `server_label` and `server_url`.
+/// `server_label` and the exact `server_url`.
 ///
-/// When the cached entry has `server_url`, both label and
-/// URL must match. When the cached entry lacks `server_url`
-/// (real `mcp_list_tools` output items from the API omit
-/// it), label-only matching is used.
-///
-/// # Safety of label-only matching
-///
-/// Real `mcp_list_tools` items in the API response carry
-/// `server_label` and `tools` but not `server_url`.
-/// Label-only matching is safe because:
-///
-/// 1. Tool dispatch uses the current request's `server_url`, so stale tools fail safely at call time.
-/// 2. When the cached entry _does_ carry `server_url` (e.g. enriched by a future storage layer), exact URL matching
-///    applies automatically.
+/// A listing without `server_url` has no target identity and
+/// must not be reused. Public API `mcp_list_tools` items lack the URL,
+/// so legacy listings cause a fresh `tools/list` request.
 ///
 /// Requires `allowed_tools` to be `Some` and verifies the
 /// cache covers all named tools. Returns `None` for
 /// unrestricted entries because the cached listing may be
 /// a filtered subset from a previous response.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "cache matching binds target, owner, allowlist, and connector URL policy"
-)]
 fn find_cached_listing(
     previous_tools: Option<&Vec<serde_json::Value>>,
     label: &str,
     server_url: &str,
     owner_fingerprint: Option<&str>,
     allowed_tools: Option<&[String]>,
-    require_url_match: bool,
 ) -> Option<Vec<serde_json::Value>> {
     let previous = previous_tools?;
     let allowed = allowed_tools?;
 
-    let entry = previous.iter().find(|pt| {
-        let label_matches = pt.get("server_label").and_then(serde_json::Value::as_str) == Some(label);
-        let url_ok = match pt.get("server_url").and_then(serde_json::Value::as_str) {
-            Some(cached_url) => cached_url == server_url,
-            None => !require_url_match,
-        };
-        let cached_owner_fingerprint = pt
-            .get(super::mcp_dispatch::OWNER_FINGERPRINT)
-            .and_then(serde_json::Value::as_str);
-        let owner_matches = cached_owner_fingerprint == owner_fingerprint;
-        label_matches && url_ok && owner_matches
+    let entry = previous.iter().rev().find(|pt| {
+        pt.get("server_label").and_then(serde_json::Value::as_str) == Some(label)
+            && pt.get("server_url").and_then(serde_json::Value::as_str) == Some(server_url)
+            && pt
+                .get(super::mcp_dispatch::OWNER_FINGERPRINT)
+                .and_then(serde_json::Value::as_str)
+                == owner_fingerprint
     })?;
 
     let cached_tools = entry.get("tools").and_then(serde_json::Value::as_array)?;

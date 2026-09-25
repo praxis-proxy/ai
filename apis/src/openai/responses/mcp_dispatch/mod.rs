@@ -147,6 +147,9 @@ pub(super) fn is_connector_tool_entry(entry: &serde_json::Value) -> bool {
 /// receive ambient request headers. Credential headers are rejected; use the
 /// MCP tool entry's dedicated `authorization` field for per-target credentials.
 pub struct McpDispatchFilter {
+    /// Per-filter namespace preventing sessions from crossing dispatcher
+    /// configuration boundaries within one logical execution.
+    pool_namespace: mcp_client::McpPoolNamespace,
     /// Optional per-user bearer slot required for configured connectors.
     user_credential_slot: Option<String>,
     /// Optional opaque assertion slot required for configured connectors.
@@ -247,6 +250,7 @@ impl McpDispatchFilter {
     /// Assemble the filter from a validated config and a bound outbound pipeline.
     fn assemble(validated: &McpDispatchConfig, outbound_pipeline: Arc<FilterPipeline>) -> Box<dyn HttpFilter> {
         Box::new(Self {
+            pool_namespace: mcp_client::McpPoolNamespace::new(),
             user_credential_slot: validated.user_credential.clone(),
             authorization_assertion_slot: validated.authorization_assertion.clone(),
             outbound_pipeline,
@@ -281,6 +285,7 @@ impl McpDispatchFilter {
         forwarded_headers: &http::HeaderMap,
         callout: &mcp_client::McpCallout,
         connector_identity: Option<&McpCalloutIdentity>,
+        session_pool: &mcp_client::McpSessionPool,
     ) -> Result<Vec<McpCallResult>, McpResultLimitExceeded> {
         debug!(
             count = mcp_calls.len(),
@@ -298,6 +303,8 @@ impl McpDispatchFilter {
             forwarded_header_names: &self.forward_headers,
             forwarded_headers: Some(forwarded_headers),
             connector_identity,
+            session_pool,
+            pool_namespace: self.pool_namespace,
         };
         execute_mcp_calls(mcp_calls, tool_index, options, callout).await
     }
@@ -791,6 +798,10 @@ impl HttpFilter for McpDispatchFilter {
         clippy::too_many_lines,
         reason = "deferred discovery and MCP execution share one request-body path"
     )]
+    #[expect(
+        clippy::large_stack_frames,
+        reason = "request-body dispatch retains admitted call state across bounded async MCP execution"
+    )]
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -852,6 +863,16 @@ impl HttpFilter for McpDispatchFilter {
             None
         };
         self.bind_request_forwarded_header_context(ctx, &forwarded_headers, connector_identity.as_ref());
+
+        // Fetch (or lazily create) the per-execution MCP session pool. It lives
+        // in the request's threaded `RequestExtensions`, so this same pool is
+        // shared across every agentic round and dropped — cancelling every idle
+        // session — when the request completes, is cancelled, or the pipeline is
+        // reloaded. The handle is a cheap `Arc` clone threaded into each call.
+        let session_pool = ctx
+            .extensions
+            .get_or_insert_with(mcp_client::McpSessionPool::new)
+            .clone();
 
         // Resume approvals from the previous turn before executing any calls.
         // On approval this injects a function-call-shaped tool call that the
@@ -939,6 +960,7 @@ impl HttpFilter for McpDispatchFilter {
                 &forwarded_headers,
                 &callout,
                 connector_identity.as_ref(),
+                &session_pool,
             )
             .await
         {
@@ -1405,6 +1427,11 @@ struct McpExecutionOptions<'a> {
     forwarded_headers: Option<&'a http::HeaderMap>,
     /// Request-scoped context injected only for configured connector entries.
     connector_identity: Option<&'a McpCalloutIdentity>,
+    /// Per-execution pool of initialized MCP sessions reused across rounds.
+    session_pool: &'a mcp_client::McpSessionPool,
+    /// Namespace unique to the dispatcher whose transport configuration opened
+    /// the session.
+    pool_namespace: mcp_client::McpPoolNamespace,
 }
 
 /// Execute MCP tool calls — concurrently when `parallel` is true,
@@ -1690,7 +1717,12 @@ async fn execute_single_call(
         ));
     }
 
+    // The opaque key binds target identity to this dispatcher's outbound
+    // pipeline, timeout, and forwarding policy. Empty fingerprints construct no
+    // key and therefore remain fail-closed and unpooled.
+    let session_key = mcp_client::McpPoolKey::new(options.pool_namespace, target_fingerprint(entry));
     let result = mcp_client::call_tool_with_forwarded_headers(
+        session_key.as_ref().map(|key| (options.session_pool, key)),
         server_url,
         headers,
         authorization,

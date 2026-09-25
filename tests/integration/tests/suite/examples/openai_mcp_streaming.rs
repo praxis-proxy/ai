@@ -14,6 +14,10 @@ use praxis_test_utils::{
     start_mcp_mock_server_with_config, start_proxy, start_proxy_with_registry,
 };
 
+/// Bound asynchronous rmcp cleanup/stream observations without making the
+/// integration test fail on a busy shared CI runner.
+const RECORDED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Load the `mcp-streaming.yaml` example, patching the listener/backend ports and
 /// pointing the response store at a private temp SQLite database so tests never
 /// share persisted state (a stale shared `responses.db` otherwise surfaces as a
@@ -37,7 +41,7 @@ fn wait_for_recorded<F>(mcp: &praxis_test_utils::McpMockServerGuard, pred: F) ->
 where
     F: Fn(&[praxis_test_utils::McpRecordedRequest]) -> bool,
 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + RECORDED_REQUEST_TIMEOUT;
     loop {
         if pred(&mcp.received_requests()) {
             return true;
@@ -492,7 +496,7 @@ fn get_common_stream_and_delete_cleanup_route_through_outbound_chain() {
     assert!(
         saw_chain_get,
         "the mcp_dispatch session's eager GET common stream must route through the \
-         filtered outbound chain and carry x-mcp-client (within 5s)"
+         filtered outbound chain and carry x-mcp-client (within 30s)"
     );
     let reqs = mcp.received_requests();
     let chain_get = reqs
@@ -531,7 +535,7 @@ fn get_common_stream_and_delete_cleanup_route_through_outbound_chain() {
     assert!(
         saw_chain_delete,
         "the mcp_dispatch session's DELETE cleanup should route through the filtered \
-         outbound chain and be recorded within 5s of transport drop"
+         outbound chain and be recorded within 30s of transport drop"
     );
 
     let reqs = mcp.received_requests();

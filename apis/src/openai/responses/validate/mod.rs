@@ -93,6 +93,14 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         Ok(FilterAction::Continue)
     }
 
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::Stream
+    }
+
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -134,6 +142,30 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         );
 
         Ok(FilterAction::Release)
+    }
+
+    fn on_response_body(
+        &self,
+        #[cfg_attr(
+            not(feature = "openai-mcp-tools"),
+            expect(unused_variables, reason = "the response context only carries the MCP session pool")
+        )]
+        ctx: &mut HttpFilterContext<'_>,
+        _body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if end_of_stream {
+            // This validator runs outside IRR. Its terminal response-body hook
+            // sees extensions restored after every finite or streamed agentic
+            // round, unlike the response-header hook, which precedes streamed
+            // body execution. Drain here so all warm sessions receive bounded
+            // graceful shutdown after their final opportunity for reuse.
+            #[cfg(feature = "openai-mcp-tools")]
+            if let Some(pool) = ctx.extensions.remove::<crate::mcp_client::McpSessionPool>() {
+                pool.drain_in_background();
+            }
+        }
+        Ok(FilterAction::Continue)
     }
 }
 
@@ -282,6 +314,46 @@ mod tests {
             filter.request_body_access(),
             BodyAccess::ReadOnly,
             "filter should use read-only body access"
+        );
+    }
+
+    #[cfg(feature = "openai-mcp-tools")]
+    #[tokio::test]
+    async fn response_body_teardown_removes_and_drains_mcp_session_pool_at_eos() {
+        let filter = OpenaiResponsesValidateFilter;
+        let req = Box::leak(Box::new(crate::test_utils::make_request(
+            http::Method::POST,
+            "/v1/responses",
+        )));
+        let mut ctx = crate::test_utils::make_filter_context(req);
+        ctx.extensions.insert(crate::mcp_client::McpSessionPool::new());
+
+        let action = filter.on_response_body(&mut ctx, &mut None, true).unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.extensions.get::<crate::mcp_client::McpSessionPool>().is_none(),
+            "the outer response-body EOS hook must not leave live session ownership in request extensions"
+        );
+    }
+
+    #[cfg(feature = "openai-mcp-tools")]
+    #[tokio::test]
+    async fn response_body_teardown_keeps_pool_before_eos() {
+        let filter = OpenaiResponsesValidateFilter;
+        let req = Box::leak(Box::new(crate::test_utils::make_request(
+            http::Method::POST,
+            "/v1/responses",
+        )));
+        let mut ctx = crate::test_utils::make_filter_context(req);
+        ctx.extensions.insert(crate::mcp_client::McpSessionPool::new());
+
+        let action = filter.on_response_body(&mut ctx, &mut None, false).unwrap();
+
+        assert!(matches!(action, FilterAction::Continue));
+        assert!(
+            ctx.extensions.get::<crate::mcp_client::McpSessionPool>().is_some(),
+            "streaming response chunks must retain the pool for later agentic rounds"
         );
     }
 

@@ -117,6 +117,7 @@ before sending requests.
 | [response-store.yaml](configs/openai/responses/response-store.yaml) | Persists non-streaming Responses API responses to a database and serves stored data via GET endpoints and handles DELETE /v1/responses/{id} locally |
 | [responses-proxy.yaml](configs/openai/responses/responses-proxy.yaml) | Proxies OpenAI Responses API requests to a native /v1/responses backend |
 | [responses-routing.yaml](configs/openai/responses/responses-routing.yaml) | Routes Responses API traffic by detected mode |
+| [responses-to-chat-completions-reasoning.yaml](configs/openai/responses/responses-to-chat-completions-reasoning.yaml) | Same pipeline as responses-to-chat-completions.yaml, but targets a vLLM backend that returns raw reasoning in choices[].message.reasoning |
 | [responses-to-chat-completions.yaml](configs/openai/responses/responses-to-chat-completions.yaml) | Accepts OpenAI Responses create requests, including finite stored continuations, while targeting a backend that only implements /v1/chat/completions |
 | [state-ownership.yaml](configs/openai/responses/state-ownership.yaml) | Provider-neutral owner isolation for persisted OpenAI Responses and Conversations |
 | [stream-events.yaml](configs/openai/responses/stream-events.yaml) | Demonstrates the `openai_stream_events` filter, which composes the current iterative-request-router (IRR) execution into one logical Responses SSE stream: it parses each backend SSE chunk, accumulates state (response object, output items, tool calls, usage) into ResponsesState, normalizes the per-round lifecycle, and preserves parser state through stream completion |
@@ -133,3 +134,9 @@ before sending requests.
 | File | Description |
 | ------ | ------------- |
 | [mcp-static-catalog.yaml](configs/payload-processing/mcp-static-catalog.yaml) | Provides a static MCP catalog and broker for initialize, tools/list, ping, and notifications/initialized requests |
+
+### Vertex
+
+| File | Description |
+| ------ | ------------- |
+| [chat-completions-to-gemini.yaml](configs/vertex/chat-completions-to-gemini.yaml) | Transforms OpenAI Chat Completions requests into Vertex AI Gemini generateContent format and translates responses back |

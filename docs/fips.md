@@ -22,9 +22,9 @@ to be FIPS compliant yet, so nobody has to know which features to pick:
 | | Standard | FIPS |
 |---|---|---|
 | Make targets | `release`, `container` | `release-fips`, `container-fips` |
-| Cargo features | `full` | `openai-responses` |
+| Cargo features | `full` | `openai-responses`, `aws-sigv4-filter` |
 | Responses API kernel (`openai_responses_*`, `responses_to_chat_completions`, agentic loop, file and web search dispatch) | yes | yes |
-| `aws_sigv4_sign` filter | yes | no: the `aws-sigv4` crate signs with pure-Rust `hmac`/`sha2` |
+| `aws_sigv4_sign` filter (AWS request signing) | yes | yes: SHA-256 and HMAC-SHA256 through OpenSSL |
 | `policy` filter (policy engine) | yes | no: its dependencies carry their own cryptography |
 | Response store (`store-postgres`), Conversations API, context compaction, MCP tools | yes | no: `sqlx` pulls `sha2` for migration checksums, and PostgreSQL authentication is pure Rust |
 | `openai_file_resolve`, `azure_ad`, `gcp_adc`, MCP tool dispatch | `full` / experimental | no: `reqwest` bundles its own TLS provider (`aws-lc-rs`) |
@@ -116,6 +116,13 @@ fatal: PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect: the OpenSSL pr
   `safety_identifier`, routing descriptor ids, MCP approval fingerprints,
   token-rate-limit bucket keys, overlay content hashes) go through OpenSSL's
   SHA-256 in every build. None of them is a security function.
+- **AWS request signing** (`aws_sigv4_sign`) is one: the payload and
+  canonical-request SHA-256, the four-step HMAC-SHA256 key derivation and
+  the signature all run through OpenSSL's EVP digest and signing APIs, so on
+  a FIPS host they execute inside the validated module. The `SigV4`
+  canonicalization itself is protocol text assembly in praxis-ai, checked
+  in its tests against the `aws-sigv4` crate, which the binary does not
+  link.
 
 ## Verifying a deployment
 
@@ -163,11 +170,11 @@ Every crypto-adjacent component in the FIPS image, and why it is compliant:
 | x509-parser, asn1-rs, der-parser, oid-registry (parsing only, no `verify` feature) | peer certificate fields in the Pingora fork | parse only |
 | subtle, zeroize, secrecy | constant-time comparison, wiping, secret wrappers | helpers |
 | policy engine (`policy` filter) | JWT, OAuth, Valkey builtins carry aws-lc, sha2 and hmac | not in the FIPS build |
-| `aws_sigv4_sign` filter | the `aws-sigv4` crate's hmac/sha2 | not in the FIPS build |
+| `aws_sigv4_sign` filter | SHA-256 and HMAC-SHA256 for `SigV4` through OpenSSL (`praxis_ai_apis::hash`) | compliant; the `aws-sigv4` crate (RustCrypto `hmac`/`sha2`) is a test-only dependency |
 | response stores, Conversations, compaction, MCP tools | sqlx's sha2 (migration checksums), sqlx-postgres' md-5/hmac/sha2/hkdf/rsa (SCRAM) | not in the FIPS build |
 | `openai_file_resolve`, `azure_ad`, `gcp_adc`, MCP tool dispatch | reqwest's bundled rustls provider (aws-lc-rs) | not in the FIPS build |
 | `basic_auth` filter (praxis core) | password hashing through OpenSSL's SHA-256 (EVP) | compliant; experimental in praxis-ai and off in every build unless enabled |
-| sha2, rcgen, aws-lc-rs | test utilities, fixtures and xtask | development only, absent from the shipped binary and its manifest |
+| sha2, hmac, aws-sigv4, rcgen, aws-lc-rs | test utilities, fixtures, xtask and the `SigV4` test oracle | development only, absent from the shipped binary and its manifest |
 
 The report and Red Hat's scanner both confirm the last row on every build:
 the embedded crate manifest lists none of the denied crates, and the binary

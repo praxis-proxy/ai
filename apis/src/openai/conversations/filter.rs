@@ -660,7 +660,13 @@ impl HttpFilter for OpenaiConversationsFilter {
             .and_then(|state| state.append_owner.clone());
 
         let Some(append_owner) = append_owner else {
-            return Ok(FilterAction::Release);
+            // This filter is composed with other response-body consumers, such
+            // as `openai_response_store`. Releasing here drains a shared
+            // StreamBuffer before those filters see end-of-stream, which can
+            // turn a complete chunked response into several unpersistable
+            // chunks (#1265). A filter that has no work for this exchange must
+            // leave release ownership to the pipeline as a whole.
+            return Ok(FilterAction::Continue);
         };
 
         if !end_of_stream {
