@@ -9,10 +9,10 @@ use praxis_filter::{FilterAction, HttpFilter, SubRequestResponseMode};
 use serde_json::{Value, json};
 
 use super::super::state::ResponsesState;
+#[cfg(feature = "openai-mcp-tools")]
+use crate::openai::responses::state::DeferredMcpConnector;
 use crate::{
-    openai::responses::state::{
-        DeferredMcpConnector, DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind,
-    },
+    openai::responses::state::{DispatchFailure, FileSearchAssignment, McpApprovalState, SynthesisKind},
     test_utils::{make_filter_context, make_request},
 };
 
@@ -741,6 +741,7 @@ fn multiple_streamed_client_function_calls_end_done() {
     assert_eq!(ctx.get_metadata("responses.stream_error_code"), None);
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn mixed_streamed_function_call_ownership_fails_before_dispatch() {
     let filter = make_filter();
@@ -996,6 +997,7 @@ fn non_end_of_stream_passes_through() {
 // on_response_body: Tool Calls Present → Loop
 // -----------------------------------------------------------------------------
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn tool_calls_set_loop() {
     let filter = make_filter();
@@ -1013,6 +1015,7 @@ fn tool_calls_set_loop() {
     assert_eq!(state.iteration, 1, "iteration should be incremented");
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn any_dispatchable_call_type_sets_loop() {
     // An MCP `function_call`, a hosted `web_search_call`, and a hosted
@@ -1071,6 +1074,7 @@ fn completed_file_search_call_sets_done() {
 // on_response_body: Config Defaults
 // -----------------------------------------------------------------------------
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn default_config_has_max_infer_iters_ten() {
     let filter = make_filter();
@@ -1100,6 +1104,7 @@ fn default_config_has_max_infer_iters_ten() {
 // on_response_body: Iteration Limit
 // -----------------------------------------------------------------------------
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn max_infer_iters_one_allows_exactly_one_loop() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 1").unwrap();
@@ -1126,6 +1131,7 @@ fn max_infer_iters_one_allows_exactly_one_loop() {
     );
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn iteration_limit_returns_508_error() {
     let yaml: serde_yaml::Value = serde_yaml::from_str("max_infer_iters: 2").unwrap();
@@ -1197,6 +1203,7 @@ fn multiple_client_function_calls_are_preserved() {
     assert_eq!(ctx.extensions.get::<ResponsesState>().unwrap().tool_calls.len(), 2);
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn mixed_buffered_function_call_ownership_returns_upstream_error() {
     let filter = make_filter();
@@ -1231,6 +1238,7 @@ fn mixed_buffered_function_call_ownership_returns_upstream_error() {
     assert!(ctx.extensions.get::<ResponsesState>().is_some());
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn mixed_buffered_custom_and_mcp_calls_return_upstream_error() {
     let filter = make_filter();
@@ -1261,6 +1269,7 @@ fn mixed_buffered_custom_and_mcp_calls_return_upstream_error() {
     assert_eq!(rejection.status, 502);
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn all_client_executed_call_types_conflict_with_mcp_dispatch() {
     for client_call in [
@@ -1521,6 +1530,7 @@ fn finish_reason_length_passes_body_unchanged() {
 // on_response_body: Iteration Counter
 // -----------------------------------------------------------------------------
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn iteration_incremented_on_loop() {
     let filter = make_filter();
@@ -1750,6 +1760,7 @@ fn parse_failure_clears_stale_state() {
 // on_response_body: Usage Accumulation
 // -----------------------------------------------------------------------------
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn accumulates_usage_across_rounds() {
     let filter = make_filter();
@@ -2134,6 +2145,7 @@ fn web_search_call_excluded_from_messages_but_persisted() {
     );
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn tool_search_call_queued_for_deferred_discovery() {
     let filter = make_filter();
@@ -2329,6 +2341,7 @@ fn incomplete_tool_search_call_is_not_queued_for_deferred_discovery() {
     );
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn streamed_tool_search_call_is_queued_for_deferred_discovery() {
     let filter = make_filter();
@@ -2649,6 +2662,7 @@ fn malformed_function_call_status_is_ignored() {
 /// is parsed by the sole owner so that `accumulated_output` preserves the model's
 /// ordering while each dispatcher's target is recorded against the correct
 /// absolute index. Proves model output ordering survives all three dispatchers.
+#[cfg(feature = "openai-mcp-tools")]
 #[test]
 fn model_output_ordering_survives_all_three_dispatchers() {
     let filter = make_filter();
@@ -2981,6 +2995,7 @@ fn make_state_with_tool_calls(tool_calls: Vec<Value>) -> ResponsesState {
     state
 }
 
+#[cfg(feature = "openai-mcp-tools")]
 fn pending_deferred_connector() -> DeferredMcpConnector {
     DeferredMcpConnector {
         authorization: None,
@@ -2999,6 +3014,12 @@ fn pending_deferred_connector() -> DeferredMcpConnector {
 /// A completed `function_call` whose encoded name (`server__lookup`) resolves to
 /// the MCP tool registered by [`make_state_with_mcp_tool_calls`], so the owner
 /// classifies it as a dispatchable server-owned call and signals `loop`.
+///
+/// Tests that drive the loop through this call are gated on
+/// `openai-mcp-tools`, the feature that gives the owner an MCP dispatcher;
+/// without it the same call resolves to no dispatcher and the owner
+/// correctly signals `done` (the FIPS build ships that way).
+#[cfg(feature = "openai-mcp-tools")]
 fn mcp_tool_call(call_id: &str) -> Value {
     json!({
         "type": "function_call",

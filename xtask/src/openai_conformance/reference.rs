@@ -141,6 +141,10 @@ fn check_reference_source() -> Result<(), String> {
 /// Fetch the one permitted upstream document at an immutable revision.
 fn fetch_upstream(revision: &str) -> Result<Vec<u8>, String> {
     validate_revision(revision)?;
+    // reqwest resolves TLS through the process rustls provider
+    // (`rustls-no-provider`, see the workspace Cargo.toml) and building its
+    // client aborts if none is installed yet.
+    praxis_ai::install_crypto_provider();
     let url = format!("https://raw.githubusercontent.com/openai/openai-openapi/{revision}/{OPENAI_OPENAPI_PATH}");
     let response = reqwest::blocking::get(&url).map_err(|e| format!("failed to fetch {url}: {e}"))?;
     let status = response.status();

@@ -286,11 +286,21 @@ pub struct ClientCert {
 // CA Generation
 // -----------------------------------------------------------------------------
 
-/// Install the process-wide crypto provider for TLS tests: the same one the
-/// binary installs at startup (the system OpenSSL), so the proxy under test
-/// runs on the provider it ships with. A no-op after the first call.
-fn ensure_crypto_provider() {
+/// Install the process-wide crypto provider, the same system-OpenSSL one
+/// the binary installs at startup, and fail closed on a declared FIPS host
+/// that is not in FIPS mode. A no-op after the first call.
+///
+/// Every harness entry point that builds a TLS configuration goes through
+/// here, so with `PRAXIS_FIPS_HOST=1` (`make test-fips-host`) a green run
+/// cannot have quietly happened on OpenSSL's default provider.
+///
+/// # Panics
+///
+/// Panics when `PRAXIS_FIPS_HOST` declares a FIPS host but the process is
+/// not in FIPS mode ([`crate::fips::assert_fips_host_if_declared`]).
+pub fn ensure_crypto_provider() {
     praxis_tls::provider::install();
+    crate::fips::assert_fips_host_if_declared();
 }
 
 /// Generate a self-signed CA certificate, parameters, and key pair.
@@ -609,7 +619,39 @@ pub fn start_tls_backend(certs: &TestCertificates, body: &str) -> u16 {
 fn build_tls_acceptor(certs: &TestCertificates) -> tokio_rustls::TlsAcceptor {
     let certs_pem = std::fs::read(&certs.cert_path).expect("read cert PEM");
     let key_pem = std::fs::read(&certs.key_path).expect("read key PEM");
+    build_tls_acceptor_from_pem(&certs_pem, &key_pem)
+}
 
+/// Start a TLS HTTP backend from PEM bytes rather than a
+/// [`TestCertificates`], for fixture certificates a test carries (for
+/// example the SHA-1 chain the FIPS tests offer an upstream client).
+///
+/// # Panics
+///
+/// Panics if TLS server setup or binding fails.
+pub fn start_tls_backend_from_pem(cert_pem: &[u8], key_pem: &[u8], body: &str) -> u16 {
+    let acceptor = build_tls_acceptor_from_pem(cert_pem, key_pem);
+    let body = body.to_owned();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind TLS backend");
+    let port = listener.local_addr().expect("TLS backend port").port();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime for TLS backend");
+        rt.block_on(tls_accept_loop(listener, acceptor, body));
+    });
+
+    port
+}
+
+/// Build a [`TlsAcceptor`] from PEM bytes, on the installed provider.
+///
+/// [`TlsAcceptor`]: tokio_rustls::TlsAcceptor
+fn build_tls_acceptor_from_pem(certs_pem: &[u8], key_pem: &[u8]) -> tokio_rustls::TlsAcceptor {
+    ensure_crypto_provider();
     let certs = rustls_pemfile::certs(&mut &*certs_pem)
         .collect::<Result<Vec<_>, _>>()
         .expect("parse cert PEM");

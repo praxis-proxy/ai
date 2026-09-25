@@ -111,7 +111,7 @@ impl ScenarioRunner {
         let mut proxy = start_proxy(&config);
         backend.finish_proxy_readiness();
 
-        let client = reqwest::Client::builder()
+        let client = crate::inference_fixture::http_client_builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -1712,6 +1712,7 @@ mod tests {
     };
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    #[cfg(feature = "store")]
     use praxis_ai_apis::openai::ResponseStoreFilter;
     use praxis_core::config::Config;
     use serde_json::{Value, json};
@@ -2356,7 +2357,7 @@ mod tests {
     #[tokio::test]
     async fn replay_transport_error_never_exposes_request_query() {
         let port = free_port_guard().release();
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
         let request = RecordedRequest {
             method: "GET".to_owned(),
             path: "/?credential=transport-secret-never-log".to_owned(),
@@ -2612,6 +2613,8 @@ mod tests {
     // Asserts the live ResponseStore API accepts scheme-less sqlite paths, so it
     // needs the store-sqlite backend compiled in (run via
     // `make test-inference-fixtures`).
+    // Needs the store-backed response filter, which the reduced builds leave out.
+    #[cfg(feature = "store")]
     #[cfg(feature = "store-sqlite")]
     #[test]
     fn replay_config_matches_response_store_scheme_less_sqlite_paths() {
@@ -3192,6 +3195,8 @@ mod tests {
         assert_eq!(error.to_string(), "scenario outbound URL is not loopback");
     }
 
+    // Needs the store-backed response filter, which the reduced builds leave out.
+    #[cfg(feature = "store")]
     #[test]
     fn replay_config_rejects_all_response_store_postgres_targets() {
         let cases = [
@@ -3285,6 +3290,8 @@ mod tests {
     // Asserts the live ResponseStore API accepts empty/temporary sqlite targets,
     // so it needs the store-sqlite backend compiled in (run via
     // `make test-inference-fixtures`).
+    // Needs the store-backed response filter, which the reduced builds leave out.
+    #[cfg(feature = "store")]
     #[cfg(feature = "store-sqlite")]
     #[test]
     fn replay_config_matches_response_store_empty_sqlite_temporary_databases() {
@@ -3332,7 +3339,7 @@ mod tests {
 
     #[tokio::test]
     async fn scenario_request_path_rejects_non_origin_forms_before_networking() {
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
         let sentinel = ScriptedHttpServer::start(Vec::new()).expect("loopback sentinel should start");
         let invalid_paths = [
             "https://example.test/v1/messages",
@@ -3386,7 +3393,7 @@ mod tests {
             ),
         ] {
             let sentinel = ScriptedHttpServer::start(Vec::new()).expect("loopback sentinel should start");
-            let client = reqwest::Client::new();
+            let client = crate::inference_fixture::http_client();
             let mut scenario = scenario_with_turns(vec![
                 scenario_turn("first", "must not reach the wire", false),
                 scenario_turn("invalid", "must fail during preflight", false),
@@ -3442,7 +3449,7 @@ mod tests {
             body: RecordedBody::Empty,
         }])
         .expect("loopback capture server should start");
-        let client = reqwest::Client::new();
+        let client = crate::inference_fixture::http_client();
         let path = "/v1/messages?mode=a%2Fb&author=O%27Reilly&dot=%2E&empty=";
         let request = RecordedRequest {
             method: "GET".to_owned(),
@@ -3595,6 +3602,8 @@ mod tests {
         std::fs::read_to_string(example_config_path(relative)).expect("example config should load")
     }
 
+    // Needs the store-backed response filter, which the reduced builds leave out.
+    #[cfg(feature = "store")]
     fn response_store_filter_accepts_database_url(backend: &str, database_url: &str, allow_private: bool) {
         let database_url = serde_json::to_string(database_url).expect("database URL should serialize");
         let private_option = if allow_private {
