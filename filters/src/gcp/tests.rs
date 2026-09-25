@@ -199,6 +199,39 @@ credentials_file: /var/secrets/sa.json
     assert_eq!(config.credentials_file.as_deref(), Some("/var/secrets/sa.json"));
 }
 
+#[tokio::test]
+async fn gcp_auth_can_be_scoped_to_selected_clusters() {
+    let config = yaml("source: metadata\nclusters: [vertex, vertex-east]");
+    let filter = GcpAdcFilter::from_config(&config).expect("cluster-scoped metadata config should parse");
+
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&request);
+    ctx.cluster = Some(std::sync::Arc::from("anthropic"));
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "out-of-scope requests pass through"
+    );
+    assert!(
+        ctx.request_headers_to_set.is_empty(),
+        "no GCP Authorization header is injected"
+    );
+}
+
+#[test]
+fn gcp_cluster_scope_rejects_blank_and_duplicate_names() {
+    for yaml_text in [
+        "source: metadata\nclusters: ['']",
+        "source: metadata\nclusters: [vertex, vertex]",
+    ] {
+        assert!(
+            GcpAdcFilter::from_config(&yaml(yaml_text)).is_err(),
+            "must reject {yaml_text}"
+        );
+    }
+}
+
 #[test]
 fn rejects_missing_credentials_file_for_key_file() {
     let err = GcpAdcFilter::from_config(&yaml("source: key_file"))
