@@ -31,6 +31,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     net::{IpAddr, Ipv4Addr},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -43,13 +44,13 @@ use rmcp::{
 use secrecy::{ExposeSecret as _, SecretString};
 
 pub use self::streaming_selector::McpStreamingSelectorFilter;
+use self::{session_pool::PooledSession, subrequest_transport::MAX_CONTROL_RESPONSE_BYTES};
 pub(crate) use self::{
-    session_pool::McpSessionPool,
+    session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
     subrequest_transport::{
         McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
     },
 };
-use self::{session_pool::PooledSession, subrequest_transport::MAX_CONTROL_RESPONSE_BYTES};
 use crate::StateOwner;
 
 /// Request-scoped ambient context authorized only for a configured connector.
@@ -506,6 +507,7 @@ async fn open_tool_session(
         connector_context.map(|context| context.owner.clone()),
     );
     let signal = mcp_client.signal_handle();
+    let signal_state = mcp_client.signal_state();
     let transport = StreamableHttpClientTransport::with_client(
         mcp_client,
         build_transport_config_with_forwarded_headers(
@@ -524,7 +526,8 @@ async fn open_tool_session(
             url: display_url.clone(),
         })
     })?;
-    Ok(PooledSession::new(service, signal))
+    signal_state.finish_exchange(&signal);
+    Ok(PooledSession::new(service, signal_state, max_result_bytes))
 }
 
 /// Issue one `tools/call` on an already-initialized session without closing it.
@@ -534,6 +537,7 @@ async fn open_tool_session(
 /// escaping) before deserialization, applied inside the session's transport.
 async fn invoke_tool(
     session: &PooledSession,
+    signal: &Arc<OnceLock<subrequest_transport::TransportSignal>>,
     tool_name: &str,
     arguments: serde_json::Value,
     display_url: &McpDisplayUrl,
@@ -548,7 +552,7 @@ async fn invoke_tool(
         params = params.with_arguments(args_obj);
     }
     Box::pin(session.service().call_tool(params)).await.map_err(|_source| {
-        transport_signal_error(session.signal(), display_url).unwrap_or_else(|| McpClientError::CallTool {
+        transport_signal_error(signal, display_url).unwrap_or_else(|| McpClientError::CallTool {
             url: display_url.clone(),
             tool_name: tool_name.to_owned(),
         })
@@ -560,7 +564,7 @@ async fn invoke_tool(
 ///
 /// Forwarded values override same-named client tool-entry headers.
 ///
-/// When `pool` is `Some((pool, key))` and `key` is non-empty, a warm session for
+/// When `pool` is `Some((pool, key))`, a warm session for
 /// that exact identity is reused (skipping the handshake) and returned to the
 /// pool after a clean call. A failure on a *reused* session evicts (closes) it
 /// and surfaces the error **without** a fresh retry: rmcp already reinitializes
@@ -569,9 +573,10 @@ async fn invoke_tool(
 /// timeout or 5xx cannot prove the tool was not already executed, and blindly
 /// retrying would risk duplicating a non-idempotent side effect. The single
 /// reused attempt is bounded by one `timeout`, so a logical call never exceeds
-/// its configured deadline. Fresh sessions are pooled on success and closed on
-/// any error; a `None` pool (or the empty fingerprint sentinel) never reuses or
-/// retains a session.
+/// its configured deadline. A restarted server that rejects the old session
+/// with a non-404 status therefore surfaces an error rather than opening a fresh
+/// session automatically. Fresh sessions are pooled on success and closed on any
+/// error; a `None` pool never reuses or retains a session.
 #[expect(
     clippy::too_many_arguments,
     reason = "trusted forwarded headers and optional pooling extend the existing API"
@@ -580,8 +585,12 @@ async fn invoke_tool(
     clippy::too_many_lines,
     reason = "reuse attempt and fresh open share one boundary with distinct cleanup on each exit"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "rmcp service setup and explicit success/error cleanup remain in one async ownership boundary"
+)]
 pub(crate) async fn call_tool_with_forwarded_headers(
-    pool: Option<(&McpSessionPool, &str)>,
+    pool: Option<(&McpSessionPool, &McpPoolKey)>,
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
@@ -595,43 +604,51 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
     let display_url = parse_display_url(server_url);
-    // The empty fingerprint is a fail-closed sentinel for an ambiguous identity;
-    // never pool such a target.
-    let poolable = matches!(pool, Some((_, key)) if !key.is_empty());
-
+    let deadline = tokio::time::Instant::now() + timeout;
     // 1. Reuse a warm session for this exact identity, if one exists. A reused session only ever existed after a prior
-    //    clean success, so its signal `OnceLock` is pristine, and the pool key folds in the effective payload limit so
-    //    its baked-in transport bounds match this call's. The single attempt is bounded by one `timeout`.
-    if poolable
-        && let Some((pool, key)) = pool
-        && let Some(session) = pool.checkout(key)
-    {
-        let outcome = tokio::time::timeout(timeout, invoke_tool(&session, tool_name, arguments, &display_url)).await;
-        return match outcome {
-            Ok(Ok(result)) => {
-                pool.checkin(key.to_owned(), session);
-                Ok(result)
-            },
-            // A reused session's failure is evicted, never retried: rmcp already transparently reinitializes a 404
-            // `SessionExpired` session, so any error surfaced here is genuine and of unknown delivery — retrying a
-            // timeout or 5xx could execute a non-idempotent tool twice (at-most-once for the reused path).
-            Ok(Err(err)) => {
-                session.close().await;
-                Err(err)
-            },
-            Err(_elapsed) => {
-                // Read the signal (an oversized/SSRF exchange surfaced only when the deadline fired) before closing.
-                let signal = std::sync::Arc::clone(session.signal());
-                session.close().await;
-                Err(classify_deadline(&signal, &display_url, timeout))
-            },
-        };
+    //    clean success. Checkout rejects closed, expired, or limit-mismatched sessions before any request is sent;
+    //    those sessions are explicitly closed in the background so their DELETE cannot consume this call's delivery
+    //    deadline, and a miss safely falls through to a fresh open. Each attempt installs a fresh transport signal so
+    //    an idle GET-stream failure cannot poison this call.
+    if let Some((pool, key)) = pool {
+        let checkout = pool.checkout(key, max_result_bytes);
+        session_pool::close_sessions_in_background(checkout.rejected);
+        if let Some(session) = checkout.session {
+            let signal = session.begin_call();
+            let outcome = tokio::time::timeout_at(
+                deadline,
+                invoke_tool(&session, &signal, tool_name, arguments, &display_url),
+            )
+            .await;
+            session.finish_call(&signal);
+            return match outcome {
+                Ok(Ok(result)) => {
+                    let rejected = pool.checkin(key.clone(), session);
+                    session_pool::close_sessions_in_background(rejected);
+                    Ok(result)
+                },
+                // A reused session's failure is evicted, never retried: rmcp already transparently reinitializes a 404
+                // `SessionExpired` session, so any error surfaced here is genuine and of unknown delivery — retrying a
+                // timeout or 5xx could execute a non-idempotent tool twice (at-most-once for the reused path).
+                Ok(Err(err)) => {
+                    session.close_before(deadline).await;
+                    Err(err)
+                },
+                Err(_elapsed) => {
+                    // Read the signal (an oversized/SSRF exchange surfaced only when the deadline fired) before
+                    // closing.
+                    session.close_before(deadline).await;
+                    Err(classify_deadline(&signal, &display_url, timeout))
+                },
+            };
+        }
     }
 
     // 2. Fresh session: first use, a `None` pool, or the empty-fingerprint sentinel. Close (not drop) the service on
     //    every post-serve exit so no background worker task is left holding our subrequest executor.
     let mut session: Option<PooledSession> = None;
-    let outcome = tokio::time::timeout(timeout, async {
+    let mut call_signal = None;
+    let outcome = tokio::time::timeout_at(deadline, async {
         let opened = open_tool_session(
             server_url,
             headers,
@@ -646,22 +663,31 @@ pub(crate) async fn call_tool_with_forwarded_headers(
         )
         .await?;
         let opened = session.insert(opened);
-        invoke_tool(opened, tool_name, arguments, &display_url).await
+        let signal = opened.begin_call();
+        call_signal = Some(Arc::clone(&signal));
+        invoke_tool(opened, &signal, tool_name, arguments, &display_url).await
     })
     .await;
 
+    if let (Some(session), Some(signal)) = (session.as_ref(), call_signal.as_ref()) {
+        session.finish_call(signal);
+    }
+
     match outcome {
         Ok(Ok(result)) => {
-            match (poolable, pool, session.take()) {
-                (true, Some((pool, key)), Some(session)) => pool.checkin(key.to_owned(), session),
-                (_, _, Some(session)) => session.close().await,
-                (_, _, None) => {},
+            match (pool, session.take()) {
+                (Some((pool, key)), Some(session)) => {
+                    let rejected = pool.checkin(key.clone(), session);
+                    session_pool::close_sessions_in_background(rejected);
+                },
+                (None, Some(session)) => session.close_before(deadline).await,
+                (_, None) => {},
             }
             Ok(result)
         },
         Ok(Err(err)) => {
             if let Some(session) = session.take() {
-                session.close().await;
+                session.close_before(deadline).await;
             }
             Err(err)
         },
@@ -669,11 +695,10 @@ pub(crate) async fn call_tool_with_forwarded_headers(
             // Read the signal (if the handshake completed) before closing, so an
             // oversized/SSRF exchange surfaced only when the deadline fired still
             // maps to its typed error.
-            let signal = session.as_ref().map(|session| std::sync::Arc::clone(session.signal()));
             if let Some(session) = session.take() {
-                session.close().await;
+                session.close_before(deadline).await;
             }
-            Err(signal.map_or_else(
+            Err(call_signal.map_or_else(
                 || McpClientError::Timeout {
                     url: display_url.clone(),
                     timeout,
@@ -737,7 +762,7 @@ async fn paginate_tools(
 /// response, surfaced only when the outer deadline fired) becomes its typed
 /// error (413 for a size breach); otherwise a generic timeout.
 fn classify_deadline(
-    signal: &std::sync::Arc<std::sync::OnceLock<subrequest_transport::TransportSignal>>,
+    signal: &Arc<OnceLock<subrequest_transport::TransportSignal>>,
     url: &McpDisplayUrl,
     timeout: Duration,
 ) -> McpClientError {
@@ -791,7 +816,7 @@ fn build_transport_config_with_forwarded_headers(
     // so construct via `default()` then set the public field.
     let mut backoff = rmcp::transport::common::client_side_sse::ExponentialBackoff::default();
     backoff.max_times = Some(3);
-    config.retry_config = std::sync::Arc::new(backoff);
+    config.retry_config = Arc::new(backoff);
     let mut header_map = HashMap::new();
 
     if let Some(headers_obj) = headers.and_then(serde_json::Value::as_object) {

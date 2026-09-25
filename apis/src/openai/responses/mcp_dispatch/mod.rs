@@ -147,6 +147,9 @@ pub(super) fn is_connector_tool_entry(entry: &serde_json::Value) -> bool {
 /// receive ambient request headers. Credential headers are rejected; use the
 /// MCP tool entry's dedicated `authorization` field for per-target credentials.
 pub struct McpDispatchFilter {
+    /// Per-filter namespace preventing sessions from crossing dispatcher
+    /// configuration boundaries within one logical execution.
+    pool_namespace: mcp_client::McpPoolNamespace,
     /// Optional per-user bearer slot required for configured connectors.
     user_credential_slot: Option<String>,
     /// Optional opaque assertion slot required for configured connectors.
@@ -247,6 +250,7 @@ impl McpDispatchFilter {
     /// Assemble the filter from a validated config and a bound outbound pipeline.
     fn assemble(validated: &McpDispatchConfig, outbound_pipeline: Arc<FilterPipeline>) -> Box<dyn HttpFilter> {
         Box::new(Self {
+            pool_namespace: mcp_client::McpPoolNamespace::new(),
             user_credential_slot: validated.user_credential.clone(),
             authorization_assertion_slot: validated.authorization_assertion.clone(),
             outbound_pipeline,
@@ -300,6 +304,7 @@ impl McpDispatchFilter {
             forwarded_headers: Some(forwarded_headers),
             connector_identity,
             session_pool,
+            pool_namespace: self.pool_namespace,
         };
         execute_mcp_calls(mcp_calls, tool_index, options, callout).await
     }
@@ -792,6 +797,10 @@ impl HttpFilter for McpDispatchFilter {
     #[expect(
         clippy::too_many_lines,
         reason = "deferred discovery and MCP execution share one request-body path"
+    )]
+    #[expect(
+        clippy::large_stack_frames,
+        reason = "request-body dispatch retains admitted call state across bounded async MCP execution"
     )]
     async fn on_request_body(
         &self,
@@ -1333,24 +1342,6 @@ fn result_payload_limit(retained_result_limit: usize) -> usize {
     retained_result_limit / RESULT_PAYLOAD_OWNER_COUNT
 }
 
-/// Compose the session-pool reuse key from the target's security fingerprint and
-/// the effective per-call payload limit (#1019).
-///
-/// `open_tool_session` bakes the payload limit into a session's transport
-/// permanently, and the limit shrinks as the batch's executable-call count grows
-/// (see [`admitted_result_limits`]). Folding it into the key means a later round
-/// whose limit differs lands on a different key and never reuses a session that
-/// would enforce the wrong response-size ceiling. The empty fingerprint is a
-/// fail-closed sentinel for an ambiguous identity: it stays empty so the caller
-/// (`call_tool_with_forwarded_headers`) never pools or reuses such a target.
-fn pool_session_key(fingerprint: String, payload_limit: usize) -> String {
-    if fingerprint.is_empty() {
-        fingerprint
-    } else {
-        format!("{fingerprint}:{payload_limit}")
-    }
-}
-
 /// Result of executing a single MCP tool call.
 #[derive(Debug)]
 struct McpCallResult {
@@ -1438,6 +1429,9 @@ struct McpExecutionOptions<'a> {
     connector_identity: Option<&'a McpCalloutIdentity>,
     /// Per-execution pool of initialized MCP sessions reused across rounds.
     session_pool: &'a mcp_client::McpSessionPool,
+    /// Namespace unique to the dispatcher whose transport configuration opened
+    /// the session.
+    pool_namespace: mcp_client::McpPoolNamespace,
 }
 
 /// Execute MCP tool calls — concurrently when `parallel` is true,
@@ -1723,12 +1717,12 @@ async fn execute_single_call(
         ));
     }
 
-    // Key the reusable session on the target's validated server + credential/
-    // header identity *and* the effective payload limit (#1019); see
-    // [`pool_session_key`].
-    let session_key = pool_session_key(target_fingerprint(entry), payload_limit);
+    // The opaque key binds target identity to this dispatcher's outbound
+    // pipeline, timeout, and forwarding policy. Empty fingerprints construct no
+    // key and therefore remain fail-closed and unpooled.
+    let session_key = mcp_client::McpPoolKey::new(options.pool_namespace, target_fingerprint(entry));
     let result = mcp_client::call_tool_with_forwarded_headers(
-        Some((options.session_pool, &session_key)),
+        session_key.as_ref().map(|key| (options.session_pool, key)),
         server_url,
         headers,
         authorization,
