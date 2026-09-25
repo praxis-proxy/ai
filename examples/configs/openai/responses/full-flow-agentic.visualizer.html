@@ -965,10 +965,65 @@ const PIPELINE = {
       }
     },
     {
+      "id": "openai_operation",
+      "name": "openai_operation",
+      "group": "classification",
+      "order": 5,
+      "phase": "request-phase classification; no response phase",
+      "config": {},
+      "promotes": "classifies the request head (method + path + transport) against the registered OpenAI operation registries (Conversations, Chat Completions, Responses); on a match publishes the typed operation into request extensions, sets x-praxis-ai-application-protocol + x-praxis-ai-operation, and records application_protocol/operation_id filter results consumed by on_result branches and openai_conversations; on no match strips those headers and continues. Must precede openai_conversations.",
+      "scenarios": {
+        "S1": {
+          "state": "active",
+          "note": "POST /v1/responses -\u003e application_protocol openai_responses (create)"
+        },
+        "S2": {
+          "state": "active",
+          "note": "streaming create, same head -\u003e openai_responses"
+        },
+        "S3": {
+          "state": "active",
+          "note": "store:false create, same head -\u003e openai_responses"
+        },
+        "S4": {
+          "state": "active",
+          "note": "previous_response_id create (POST /v1/responses) -\u003e openai_responses"
+        },
+        "S5": {
+          "state": "active",
+          "note": "file_search create -\u003e openai_responses"
+        },
+        "S6": {
+          "state": "active",
+          "note": "MCP create -\u003e openai_responses"
+        },
+        "S7": {
+          "state": "active",
+          "note": "web_search create -\u003e openai_responses"
+        },
+        "S8": {
+          "state": "active",
+          "note": "GET /v1/responses/{id} -\u003e openai_responses (retrieve)"
+        },
+        "S9": {
+          "state": "active",
+          "note": "GET /v1/responses + Upgrade: websocket -\u003e openai_responses (WebSocket handshake)"
+        },
+        "S10": {
+          "state": "active",
+          "note": "head-based match -\u003e openai_responses create; the Chat/unclassified body is ignored here and discriminated later by openai_responses_format"
+        },
+        "S11": {
+          "state": "passthrough",
+          "note": "/v1/prompts|/v1/embeddings|/v1/files|/v1/vector_stores are not in any operation registry; strips routing headers"
+        }
+      }
+    },
+    {
       "id": "openai_conversations",
       "name": "openai_conversations",
       "group": "conversations",
-      "order": 5,
+      "order": 6,
       "phase": "request-phase (CRUD + has_conversation); response-phase appends items on success (non-streaming)",
       "config": {
         "backend": "sqlite",
@@ -1028,7 +1083,7 @@ const PIPELINE = {
       "id": "openai_responses_format",
       "name": "openai_responses_format",
       "group": "classification",
-      "order": 6,
+      "order": 7,
       "phase": "request-phase classifier; promotes internal x-praxis-* routing headers",
       "config": {
         "on_invalid": "continue",
@@ -1089,7 +1144,7 @@ const PIPELINE = {
       "id": "openai_responses_validate",
       "name": "openai_responses_validate",
       "group": "classification",
-      "order": 7,
+      "order": 8,
       "phase": "request-phase; JSON syntax + ID generation",
       "config": {},
       "promotes": "validates JSON syntax; generates response and conversation IDs; writes responses.* metadata (provider-owned param combos pass through)",
@@ -1144,7 +1199,7 @@ const PIPELINE = {
       "id": "openai_tool_parse",
       "name": "openai_tool_parse",
       "group": "classification",
-      "order": 8,
+      "order": 9,
       "phase": "request-phase; parses tools/tool_choice, does NOT mutate body",
       "config": {},
       "promotes": "has_tools, has_web_search, tool_choice, function_count (summary facts to metadata/results)",
@@ -1199,7 +1254,7 @@ const PIPELINE = {
       "id": "openai_response_store",
       "name": "openai_response_store",
       "group": "store",
-      "order": 9,
+      "order": 10,
       "phase": "request-phase registers backend + serves GET retrieve (terminal); response-phase persists AFTER IRR composes terminal (reverse order)",
       "config": {
         "backend": "sqlite",
@@ -1259,7 +1314,7 @@ const PIPELINE = {
       "id": "openai_responses_rehydrate",
       "name": "openai_responses_rehydrate",
       "group": "context",
-      "order": 10,
+      "order": 11,
       "phase": "request-phase; loads and prepends prior history",
       "config": {},
       "promotes": "loads context from previous_response_id or conversation, prepends message history; previous_response_id takes precedence when both present",
@@ -1314,7 +1369,7 @@ const PIPELINE = {
       "id": "openai_file_resolve",
       "name": "openai_file_resolve",
       "group": "context",
-      "order": 11,
+      "order": 12,
       "phase": "request-phase pre-security callout; fires only when file_id refs present",
       "config": {
         "files_api_url": "http://127.0.0.1:9999",
@@ -1380,7 +1435,7 @@ const PIPELINE = {
       "id": "openai_doc_extract",
       "name": "openai_doc_extract",
       "group": "context",
-      "order": 12,
+      "order": 13,
       "phase": "request-phase; converts input_file parts, on_unsupported continue",
       "config": {
         "allow_pre_security_callout": true,
@@ -1438,7 +1493,7 @@ const PIPELINE = {
       "id": "openai_mcp_tool_resolve",
       "name": "openai_mcp_tool_resolve",
       "group": "context",
-      "order": 13,
+      "order": 14,
       "phase": "request-phase; resolves MCP tools/list from operator connectors",
       "config": {
         "user_credential": "mcp_gateway",
@@ -1506,7 +1561,7 @@ const PIPELINE = {
       "id": "bypass_gate",
       "name": "headers (bypass carrier)",
       "group": "routing",
-      "order": 14,
+      "order": 15,
       "phase": "request-phase carrier with unless-gate; branch_chains route to backends and rejoin at terminal",
       "config": {
         "conditions.unless": {
@@ -1603,7 +1658,7 @@ const PIPELINE = {
       "id": "iterative_request_router",
       "name": "iterative_request_router",
       "group": "irr",
-      "order": 15,
+      "order": 16,
       "phase": "terminal filter; owns agentic model-tool-model loop; transitions on openai_agentic_loop action",
       "config": {
         "initial_step": "inference",
@@ -1678,7 +1733,7 @@ const PIPELINE = {
       "id": "irr_project_state_owner_headers",
       "name": "project_state_owner_headers (IRR step)",
       "group": "irr-step",
-      "order": 16,
+      "order": 17,
       "phase": "IRR inference step, request-phase; re-projection inside destination-owned subrequest",
       "config": {
         "tenant_header": "x-tenant-id",
@@ -1736,7 +1791,7 @@ const PIPELINE = {
       "id": "openai_stream_events",
       "name": "openai_stream_events",
       "group": "irr-step",
-      "order": 17,
+      "order": 18,
       "phase": "IRR step; request-phase pass + response-phase composes one logical Responses lifecycle across rounds",
       "config": {},
       "promotes": "composes every inference SSE stream into ONE lifecycle; withholds per-round terminal events until IRR transition known; populates ResponsesState.response_object (required for streaming persistence + loop-terminal error delivery)",
@@ -1791,7 +1846,7 @@ const PIPELINE = {
       "id": "openai_web_search",
       "name": "openai_web_search",
       "group": "irr-step",
-      "order": 18,
+      "order": 19,
       "phase": "IRR step request-phase dispatcher; no response phase; inert until model emits web_search_call",
       "config": {
         "provider": "brave",
@@ -1852,7 +1907,7 @@ const PIPELINE = {
       "id": "openai_mcp_dispatch",
       "name": "openai_mcp_dispatch",
       "group": "irr-step",
-      "order": 19,
+      "order": 20,
       "phase": "IRR step request-phase dispatcher; no response phase; inert until model emits MCP tool call",
       "config": {
         "user_credential": "mcp_gateway",
@@ -1918,7 +1973,7 @@ const PIPELINE = {
       "id": "openai_file_search_callout",
       "name": "openai_file_search_callout",
       "group": "irr-step",
-      "order": 20,
+      "order": 21,
       "phase": "IRR step request-phase dispatcher; executes at request-body EOS on re-entry; no response phase; inert until model emits file_search_call",
       "config": {
         "vector_store_url": "http://127.0.0.1:3002",
@@ -1986,7 +2041,7 @@ const PIPELINE = {
       "id": "openai_agentic_loop",
       "name": "openai_agentic_loop",
       "group": "irr-step",
-      "order": 21,
+      "order": 22,
       "phase": "IRR step; request-phase records assignments; response-phase parses model output and publishes single loop|done transition (sole authority)",
       "config": {
         "max_infer_iters": 7
@@ -2043,7 +2098,7 @@ const PIPELINE = {
       "id": "irr_headers",
       "name": "headers (IRR step)",
       "group": "irr-step",
-      "order": 22,
+      "order": 23,
       "phase": "IRR step request-phase; sets outbound header",
       "config": {
         "request_set": [
@@ -2105,7 +2160,7 @@ const PIPELINE = {
       "id": "irr_router",
       "name": "router (IRR step)",
       "group": "irr-step",
-      "order": 23,
+      "order": 24,
       "phase": "IRR step request-phase; PATH-ONLY routing (x-praxis-* stripped)",
       "config": {
         "routes": [
@@ -2167,7 +2222,7 @@ const PIPELINE = {
       "id": "irr_load_balancer",
       "name": "load_balancer (IRR step)",
       "group": "irr-step",
-      "order": 24,
+      "order": 25,
       "phase": "IRR step request-phase; selects endpoint for inference-backend",
       "config": {
         "clusters": [
@@ -2233,7 +2288,7 @@ const PIPELINE = {
       "id": "openai_responses_proxy",
       "name": "openai_responses_proxy",
       "group": "irr-step",
-      "order": 25,
+      "order": 26,
       "phase": "IRR step; request-body hook rebuilds outbound body; request-header hook runs AFTER load_balancer selection (fail-closed capability check); response-phase handles buffered/streamed",
       "config": {},
       "promotes": "rebuilds outbound body from ResponsesState; auto-selects typed streaming when effective body has stream:true; fails closed on prompt templates unless selected cluster declares BOTH application_protocol:openai_responses AND application_provider:openai (both commented out here)",
@@ -2326,7 +2381,7 @@ const PIPELINE = {
       {
         "order": 5,
         "depth": 0,
-        "filter_type": "openai_conversations",
+        "filter_type": "openai_operation",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -2335,7 +2390,7 @@ const PIPELINE = {
       {
         "order": 6,
         "depth": 0,
-        "filter_type": "openai_responses_format",
+        "filter_type": "openai_conversations",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -2344,7 +2399,7 @@ const PIPELINE = {
       {
         "order": 7,
         "depth": 0,
-        "filter_type": "openai_responses_validate",
+        "filter_type": "openai_responses_format",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -2353,7 +2408,7 @@ const PIPELINE = {
       {
         "order": 8,
         "depth": 0,
-        "filter_type": "openai_tool_parse",
+        "filter_type": "openai_responses_validate",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -2362,7 +2417,7 @@ const PIPELINE = {
       {
         "order": 9,
         "depth": 0,
-        "filter_type": "openai_response_store",
+        "filter_type": "openai_tool_parse",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -2371,7 +2426,7 @@ const PIPELINE = {
       {
         "order": 10,
         "depth": 0,
-        "filter_type": "openai_responses_rehydrate",
+        "filter_type": "openai_response_store",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -2380,7 +2435,7 @@ const PIPELINE = {
       {
         "order": 11,
         "depth": 0,
-        "filter_type": "openai_file_resolve",
+        "filter_type": "openai_responses_rehydrate",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -2389,7 +2444,7 @@ const PIPELINE = {
       {
         "order": 12,
         "depth": 0,
-        "filter_type": "openai_doc_extract",
+        "filter_type": "openai_file_resolve",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -2398,7 +2453,7 @@ const PIPELINE = {
       {
         "order": 13,
         "depth": 0,
-        "filter_type": "openai_mcp_tool_resolve",
+        "filter_type": "openai_doc_extract",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -2406,6 +2461,15 @@ const PIPELINE = {
       },
       {
         "order": 14,
+        "depth": 0,
+        "filter_type": "openai_mcp_tool_resolve",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 15,
         "depth": 0,
         "filter_type": "headers",
         "name": null,
@@ -2422,6 +2486,7 @@ const PIPELINE = {
               "headers": {
                 "x-praxis-ai-format": "openai_responses"
               },
+              "bound_upstream": null,
               "selected_upstream": null
             }
           }
@@ -2508,7 +2573,7 @@ const PIPELINE = {
         ]
       },
       {
-        "order": 15,
+        "order": 16,
         "depth": 0,
         "filter_type": "iterative_request_router",
         "name": null,
@@ -2517,7 +2582,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 16,
+        "order": 17,
         "depth": 1,
         "filter_type": "project_state_owner_headers",
         "name": null,
@@ -2526,7 +2591,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 17,
+        "order": 18,
         "depth": 1,
         "filter_type": "openai_stream_events",
         "name": null,
@@ -2535,7 +2600,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 18,
+        "order": 19,
         "depth": 1,
         "filter_type": "openai_web_search",
         "name": null,
@@ -2544,7 +2609,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 19,
+        "order": 20,
         "depth": 1,
         "filter_type": "openai_mcp_dispatch",
         "name": null,
@@ -2553,7 +2618,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 20,
+        "order": 21,
         "depth": 1,
         "filter_type": "openai_file_search_callout",
         "name": null,
@@ -2562,7 +2627,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 21,
+        "order": 22,
         "depth": 1,
         "filter_type": "openai_agentic_loop",
         "name": null,
@@ -2571,7 +2636,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 22,
+        "order": 23,
         "depth": 1,
         "filter_type": "headers",
         "name": null,
@@ -2580,7 +2645,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 23,
+        "order": 24,
         "depth": 1,
         "filter_type": "router",
         "name": null,
@@ -2595,7 +2660,7 @@ const PIPELINE = {
         ]
       },
       {
-        "order": 24,
+        "order": 25,
         "depth": 1,
         "filter_type": "load_balancer",
         "name": null,
@@ -2604,7 +2669,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 25,
+        "order": 26,
         "depth": 1,
         "filter_type": "openai_responses_proxy",
         "name": null,

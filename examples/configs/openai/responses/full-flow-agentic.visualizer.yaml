@@ -180,6 +180,47 @@ pipeline:
       S11:
         state: active
         note: projects before dedicated-service bypass
+  - id: openai_operation
+    name: openai_operation
+    group: classification
+    filter_type: openai_operation
+    phase: request-phase classification; no response phase
+    config: {}
+    promotes: classifies the request head (method + path + transport) against the registered OpenAI operation registries (Conversations, Chat Completions, Responses); on a match publishes the typed operation into request extensions, sets x-praxis-ai-application-protocol + x-praxis-ai-operation, and records application_protocol/operation_id filter results consumed by on_result branches and openai_conversations; on no match strips those headers and continues. Must precede openai_conversations.
+    scenarios:
+      S1:
+        state: active
+        note: POST /v1/responses -> application_protocol openai_responses (create)
+      S2:
+        state: active
+        note: streaming create, same head -> openai_responses
+      S3:
+        state: active
+        note: store:false create, same head -> openai_responses
+      S4:
+        state: active
+        note: previous_response_id create (POST /v1/responses) -> openai_responses
+      S5:
+        state: active
+        note: file_search create -> openai_responses
+      S6:
+        state: active
+        note: MCP create -> openai_responses
+      S7:
+        state: active
+        note: web_search create -> openai_responses
+      S8:
+        state: active
+        note: GET /v1/responses/{id} -> openai_responses (retrieve)
+      S9:
+        state: active
+        note: 'GET /v1/responses + Upgrade: websocket -> openai_responses (WebSocket handshake)'
+      S10:
+        state: active
+        note: head-based match -> openai_responses create; the Chat/unclassified body is ignored here and discriminated later by openai_responses_format
+      S11:
+        state: passthrough
+        note: /v1/prompts|/v1/embeddings|/v1/files|/v1/vector_stores are not in any operation registry; strips routing headers
   - id: openai_conversations
     name: openai_conversations
     group: conversations
