@@ -210,7 +210,6 @@ fn sqlite_pool_options(database_url: &str, pool_config: Option<&PoolConfig>) -> 
     }
 }
 
-
 /// Return whether the database URL targets an in-memory `SQLite` database.
 fn is_memory_database_url(database_url: &str) -> bool {
     let url = database_url.trim();

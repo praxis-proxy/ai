@@ -16,7 +16,7 @@ const CREATED_AT: u64 = 1_700_000_000;
 const NOW: u64 = 1_700_000_005;
 
 /// Generous limits that never trip in the happy-path tests.
-fn wide_limits() -> StreamLimits {
+pub(crate) fn wide_limits() -> StreamLimits {
     StreamLimits {
         max_sse_buffer_bytes: 1 << 20,
         max_stream_events: 100_000,
@@ -104,7 +104,7 @@ fn parse_events(raw: &[u8]) -> Vec<(String, Value)> {
 }
 
 /// Run a full provider stream at once and return parsed events.
-fn run_stream(chunks: &[&str], limits: StreamLimits) -> Vec<(String, Value)> {
+pub(crate) fn run_stream(chunks: &[&str], limits: StreamLimits) -> Vec<(String, Value)> {
     let body = request_body();
     run_stream_with_body(chunks, &body, limits)
 }

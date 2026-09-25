@@ -19,6 +19,8 @@ default = []
 # extraction, client-tool compatibility, agentic loop, file search and web
 # search dispatch. Adds no crates; gated because of its size and coupling.
 openai-responses = []
+# Generated OpenAPI description and utoipa contract schemas for Responses API.
+openai-responses-openapi = ["openai-responses", "dep:utoipa"]
 # openai_file_resolve: downloads referenced files (pinned reqwest client).
 openai-file-resolve-filter = ["openai-responses", "dep:reqwest"]
 # Response and conversation storage (SQL). Implies the Responses kernel it serves.
@@ -34,7 +36,7 @@ openai-compact = ["store", "dep:tiktoken-rs"]
 # MCP tool resolution and dispatch through the rmcp client (approvals persist).
 openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream"]
 # Every OpenAI group, without choosing a store backend.
-openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
+openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools", "openai-responses-openapi"]
 # Every non-experimental opt-in; equals the pre-feature-split capability.
 full = ["openai-all", "store-postgres"]
 praxis-main = []

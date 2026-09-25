@@ -9,7 +9,7 @@ mod config;
 mod error;
 
 /// Incremental Chat Completions SSE to Responses SSE conversion.
-mod stream;
+pub(crate) mod stream;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]

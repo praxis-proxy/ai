@@ -503,7 +503,6 @@ fn compaction_to_assistant_message(m: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-
 /// Count the exact bytes the proxy will serialize for an outbound body.
 pub(super) fn serialized_outbound_body_len(state: &ResponsesState) -> Result<usize, serde_json::Error> {
     let mut counter = ByteCounter::default();

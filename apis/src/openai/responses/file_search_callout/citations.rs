@@ -467,7 +467,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn overlong_marker_candidate_does_not_hide_later_valid_marker() {
         let malformed = format!("<|file-{}", "x".repeat(MAX_FILE_ID_BYTES));
@@ -553,7 +552,6 @@ mod tests {
         let error = annotate_output_items(&mut output, &files).unwrap_err();
         assert!(error.to_string().contains("marker"));
     }
-
 
     #[test]
     fn marker_removal_preserves_file_path_index_semantics() {

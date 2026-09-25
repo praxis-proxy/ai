@@ -1650,7 +1650,6 @@ fn streaming_mcp_two_tool_batch_uses_one_logical_sse_response() {
     );
 }
 
-
 #[test]
 fn streaming_mcp_failure_synthesizes_failed_progress_in_one_logical_response() {
     let first_response = vec![

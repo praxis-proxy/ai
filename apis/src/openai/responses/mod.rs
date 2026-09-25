@@ -74,6 +74,8 @@ pub(crate) mod stream_events;
 pub(crate) mod usage;
 
 #[cfg(feature = "openai-responses")]
+pub use agentic_loop::AgenticLoopFilter;
+#[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
 pub use file_resolve::FileResolveFilter;
@@ -759,10 +761,14 @@ pub(crate) mod validate;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod web_search;
 
-#[cfg(feature = "openai-responses")]
-pub use agentic_loop::AgenticLoopFilter;
+#[cfg(feature = "openai-responses-openapi")]
+pub(crate) mod contracts;
+#[cfg(feature = "openai-responses-openapi")]
+pub(crate) mod openapi;
 #[cfg(feature = "openai-compact")]
 pub use compact::CompactFilter;
+#[cfg(feature = "openai-responses-openapi")]
+pub use openapi::implementation_openapi_json;
 #[cfg(feature = "store")]
 pub use rehydrate::RehydrateFilter;
 #[cfg(feature = "openai-responses")]
