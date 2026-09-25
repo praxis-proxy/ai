@@ -43,7 +43,7 @@ from openai import (
 )
 
 # When set to a postgres:// URL (the vllm-responses-postgres CI job), the
-# conversations store runs against PostgreSQL instead of the default in-memory
+# conversations store runs against PostgreSQL instead of the default file-backed
 # SQLite, so this suite exercises the backend compiled into that job.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 OWNER_HEADER = "x-authenticated-state-owner"
