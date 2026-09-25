@@ -109,6 +109,14 @@
   }
   pre.json .redacted{color:var(--danger)}
   .empty{color:var(--fg-faint); font-style:italic; font-size:.85rem}
+  .bcount{font-size:.8rem; color:var(--fg-faint); margin:.55rem 0 .1rem}
+  .branches{display:flex; flex-direction:column; gap:.5rem; margin:.35rem 0 0}
+  .branch{background:var(--bg3); border:1px solid var(--line); border-left:3px solid var(--accent); border-radius:8px; padding:.5rem .65rem}
+  .bhead{display:flex; flex-wrap:wrap; gap:.4rem .7rem; align-items:baseline}
+  .bname{font-family:var(--mono); font-weight:600; font-size:.85rem; color:var(--fg)}
+  .brejoin{font-family:var(--mono); font-size:.76rem; color:var(--accent2)}
+  .bchain{display:flex; flex-wrap:wrap; gap:.4rem; margin:.35rem 0 0; font-family:var(--mono); font-size:.8rem; color:var(--fg-dim)}
+  .blabel{font-family:var(--mono); color:var(--fg-faint); font-size:.78rem}
   .legend{display:flex; flex-wrap:wrap; gap:.5rem 1rem; font-size:.78rem; color:var(--fg-dim); margin:.2rem 0 1.4rem}
   .legend .swatch{display:inline-block; width:.8rem; height:.8rem; border-radius:3px; vertical-align:middle; margin-right:.35rem}
   footer{max-width:1080px; margin:2rem auto 0; padding:1rem 1.4rem 0; border-top:1px solid var(--line); color:var(--fg-faint); font-size:.78rem}
@@ -213,6 +221,39 @@ function renderClusters(model){
   return s;
 }
 
+// Render a filter's branch chains: each branch's name, rejoin target, any
+// per-branch conditions, and the filter-type sequence of every inner chain, plus
+// the full redacted branch as a collapsible block so nothing is hidden. The data
+// is the parser's verbatim (redacted) branch model — no behavior is inferred.
+function renderBranches(branches){
+  const wrap = el('div', 'branches');
+  for (const b of branches){
+    const bx = el('div', 'branch');
+    const head = el('div', 'bhead');
+    head.appendChild(el('span', 'bname', b.name || '(unnamed branch)'));
+    if (b.rejoin) head.appendChild(el('span', 'brejoin', 'rejoin → ' + b.rejoin));
+    bx.appendChild(head);
+    if (!isEmpty(b.conditions)){
+      const dl = el('dl', 'kv');
+      kvRow(dl, 'conditions', JSON.stringify(b.conditions));
+      bx.appendChild(dl);
+    }
+    for (const chain of (b.chains || [])){
+      const row = el('div', 'bchain');
+      row.appendChild(el('span', 'blabel', (chain.name || 'chain') + ':'));
+      const seq = (chain.filters || []).map((f) => f.filter || f.filter_type || '(filter)').join(' → ');
+      row.appendChild(el('span', null, seq || '(empty)'));
+      bx.appendChild(row);
+    }
+    const d = el('details', 'cfg');
+    d.appendChild(el('summary', null, 'branch detail (redacted)'));
+    d.appendChild(jsonBlock(b));
+    bx.appendChild(d);
+    wrap.appendChild(bx);
+  }
+  return wrap;
+}
+
 function renderFilter(f){
   const known = !!f.known;
   const c = el('div', 'card filter ' + (known ? 'known' : 'unknown') + (f.depth ? ' nested' : ''));
@@ -230,11 +271,15 @@ function renderFilter(f){
     c.appendChild(el('p', 'desc unavailable', 'No definition found in this repository — structure shown, behavior not described.'));
   }
 
-  if (!isEmpty(f.conditions) || !isEmpty(f.branch_chains)){
+  if (!isEmpty(f.conditions)){
     const dl = el('dl', 'kv');
-    if (!isEmpty(f.conditions)) kvRow(dl, 'conditions', JSON.stringify(f.conditions));
-    if (!isEmpty(f.branch_chains)) kvRow(dl, 'branch_chains', f.branch_chains.length + ' branch chain(s)');
+    kvRow(dl, 'conditions', JSON.stringify(f.conditions));
     c.appendChild(dl);
+  }
+
+  if (!isEmpty(f.branch_chains)){
+    c.appendChild(el('div', 'bcount', f.branch_chains.length + ' branch chain(s):'));
+    c.appendChild(renderBranches(f.branch_chains));
   }
 
   if (!isEmpty(f.config)){

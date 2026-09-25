@@ -22,7 +22,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value as JsonV;
 use serde_yaml::{Mapping, Number, Value};
 
-use crate::flow_graph::{FlowGraph, FlowNode};
+use crate::{
+    flow_graph::{FlowGraph, FlowNode, IRR_FILTER},
+    html,
+};
 
 /// A shared empty value returned when a sidecar block is absent (the caller has
 /// already recorded the error, so the emitted placeholder is never used).
@@ -91,11 +94,17 @@ pub(crate) fn render(
     if !errors.is_empty() {
         return Err(errors);
     }
-    let mut html = template.replace("@@PIPELINE@@", &to_pretty_json(&pipeline));
+    // Every block is inlined into a <script> as `const X = {...};`, so any
+    // `</script>` (or `<!--`) inside a curated string must be neutralized or it
+    // would break the page. Escaping leaves the parsed JSON identical.
+    let mut out = template.replace(
+        "@@PIPELINE@@",
+        &html::escape_json_for_script(&to_pretty_json(&pipeline)),
+    );
     for ((_, placeholder), (_, value)) in VERBATIM_BLOCKS.iter().zip(blocks.iter()) {
-        html = html.replace(placeholder, &to_pretty_json(value));
+        out = out.replace(placeholder, &html::escape_json_for_script(&to_pretty_json(value)));
     }
-    Ok(html)
+    Ok(out)
 }
 
 /// Look up a top-level sidecar block, recording an error when it is absent.
@@ -128,6 +137,7 @@ fn build_pipeline(
 
     let mut map = Mapping::new();
     map.insert(Value::from("filters"), Value::Sequence(filters));
+    map.insert(Value::from("structure"), build_structure(nodes));
     for key in ["scenarios", "clusters", "externalServices", "knobs"] {
         let value = pipeline.and_then(|p| p.get(key)).cloned().unwrap_or_else(|| {
             errors.push(format!("sidecar.pipeline.{key} missing"));
@@ -203,6 +213,97 @@ fn merge_filter(entry: &Value, order: usize) -> Value {
         map.insert(Value::from(key), entry.get(key).cloned().unwrap_or(Value::Null));
     }
     Value::Mapping(map)
+}
+
+// -----------------------------------------------------------------------------
+// Structural signature (config-authoritative topology)
+// -----------------------------------------------------------------------------
+
+/// Build the config-authoritative `structure` block emitted alongside the curated
+/// pipeline.
+///
+/// The curated cross-checks above cover filter count/type/order, clusters, and
+/// the registered scalar knobs — but not a filter's `conditions`, its
+/// `branch_chains` (names, rejoin targets, nested routes and filters), a
+/// `router`'s `routes`, or the IRR's `initial_step` and step transitions. Because
+/// the generated HTML is verified byte-for-byte by `sync-flow-visualizers`,
+/// embedding this mechanically inferred fingerprint makes any such topology drift
+/// force a regeneration, so no structural change lands silently. It is derived
+/// only from the parsed config, never the sidecar.
+fn build_structure(nodes: &[FlowNode]) -> Value {
+    let filters: Vec<Value> = nodes.iter().map(structure_node).collect();
+    let mut map = Mapping::new();
+    map.insert(Value::from("filters"), Value::Sequence(filters));
+    if let Some(irr) = irr_routing(nodes) {
+        map.insert(Value::from("irr"), irr);
+    }
+    Value::Mapping(map)
+}
+
+/// Capture one flattened node's structural identity plus every topology-bearing
+/// field: its `conditions`, `branch_chains`, and any `routes` in its config.
+fn structure_node(node: &FlowNode) -> Value {
+    let mut map = Mapping::new();
+    map.insert(Value::from("order"), number(node.order));
+    map.insert(Value::from("depth"), number(node.depth));
+    map.insert(Value::from("filter_type"), Value::from(node.filter_type.as_str()));
+    map.insert(Value::from("name"), opt_string(node.name.as_deref()));
+    map.insert(Value::from("irr_step"), opt_string(node.irr_step.as_deref()));
+    map.insert(Value::from("conditions"), json_to_yaml(&node.conditions));
+    map.insert(Value::from("branch_chains"), json_to_yaml(&node.branch_chains));
+    if let Some(routes) = node.config.get("routes") {
+        map.insert(Value::from("routes"), json_to_yaml(routes));
+    }
+    Value::Mapping(map)
+}
+
+/// Capture the `iterative_request_router` step-transition graph: the
+/// `initial_step` and, per step, its name plus every routing key other than the
+/// (already-flattened) `filters` list.
+fn irr_routing(nodes: &[FlowNode]) -> Option<Value> {
+    let router = nodes.iter().find(|node| node.filter_type == IRR_FILTER)?;
+    let config = router.config.as_object()?;
+    let mut map = Mapping::new();
+    if let Some(initial) = config.get("initial_step") {
+        map.insert(Value::from("initial_step"), json_to_yaml(initial));
+    }
+    if let Some(steps) = config.get("steps").and_then(JsonV::as_array) {
+        let summaries: Vec<Value> = steps.iter().filter_map(step_routing).collect();
+        map.insert(Value::from("steps"), Value::Sequence(summaries));
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Mapping(map))
+    }
+}
+
+/// Summarize one IRR step: every key except the already-flattened `filters` list,
+/// so transitions (`on_result`, `next`, `default`, `done`, conditions) are kept.
+fn step_routing(step: &JsonV) -> Option<Value> {
+    let object = step.as_object()?;
+    let mut map = Mapping::new();
+    for (key, value) in object {
+        if key != "filters" {
+            map.insert(Value::from(key.as_str()), json_to_yaml(value));
+        }
+    }
+    Some(Value::Mapping(map))
+}
+
+/// A `serde_yaml` unsigned number from a `usize` position or depth.
+fn number(value: usize) -> Value {
+    Value::Number(Number::from(u64::try_from(value).unwrap_or_default()))
+}
+
+/// A YAML string, or null when the optional slice is absent.
+fn opt_string(value: Option<&str>) -> Value {
+    value.map_or(Value::Null, Value::from)
+}
+
+/// Convert a `serde_json` value into the `serde_yaml` value the emitter expects.
+fn json_to_yaml(value: &JsonV) -> Value {
+    serde_yaml::to_value(value).unwrap_or(Value::Null)
 }
 
 // -----------------------------------------------------------------------------
@@ -596,5 +697,142 @@ mod tests {
         let json = to_pretty_json(&value);
         let parsed: JsonV = serde_json::from_str(&json).expect("emitted text is valid JSON");
         assert_eq!(parsed, to_json(&value), "pretty JSON must round-trip losslessly");
+    }
+
+    // -------------------------------------------------------------------------
+    // Structural signature drift
+    // -------------------------------------------------------------------------
+
+    /// A config faithful to the full-flow topology that the sidecar cross-checks
+    /// cannot see: a bypass carrier with an `unless` condition and a branch chain
+    /// (its own router routes plus a `load_balancer`), and an IRR whose step carries
+    /// a router and an `on_result` transition graph. Each drift test mutates a
+    /// single, uniquely spelled token of this base.
+    const TOPOLOGY_CONFIG: &str = r#"
+listeners:
+  - name: l
+    address: 127.0.0.1:8080
+    filter_chains: [c]
+filter_chains:
+  - name: c
+    filters:
+      - filter: headers
+        conditions:
+          - unless:
+              path: "/v1/responses"
+              methods: [POST]
+        branch_chains:
+          - name: bypass-irr
+            rejoin: terminal
+            chains:
+              - name: bypass-chain
+                filters:
+                  - filter: router
+                    routes:
+                      - path_prefix: "/v1/files"
+                        cluster: files-api
+                  - filter: load_balancer
+                    clusters:
+                      - name: files-api
+                        endpoints: ["127.0.0.1:9999"]
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 4
+        steps:
+          - name: inference
+            filters:
+              - filter: openai_agentic_loop
+                max_infer_iters: 3
+              - filter: router
+                routes:
+                  - path: "/v1/inference"
+                    cluster: inference-backend
+              - filter: load_balancer
+                clusters:
+                  - name: inference-backend
+                    endpoints: ["127.0.0.1:3001"]
+              - filter: openai_responses_proxy
+            on_result:
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+insecure_options:
+  allow_private_endpoints: true
+"#;
+
+    /// Flatten [`TOPOLOGY_CONFIG`] (or a mutated variant) and emit its structural
+    /// signature as pretty JSON — exactly the text embedded in the visualizer.
+    fn structure_json(config: &str) -> String {
+        let graph = FlowGraph::from_yaml_str(config).expect("topology config parses");
+        let nodes = graph.flatten_chain("c").expect("chain c exists");
+        to_pretty_json(&build_structure(&nodes))
+    }
+
+    #[test]
+    fn structure_captures_branch_and_irr_topology() {
+        let json = structure_json(TOPOLOGY_CONFIG);
+        // Branch topology the curated cross-checks never inspect.
+        assert!(json.contains("bypass-irr"), "branch name captured: {json}");
+        assert!(json.contains("\"rejoin\": \"terminal\""), "rejoin target captured");
+        assert!(json.contains("/v1/files"), "branch router route captured");
+        // The flattened IRR-step router's routes, surfaced as a node field.
+        assert!(json.contains("/v1/inference"), "step router route captured");
+        // The IRR step-transition graph.
+        assert!(
+            json.contains("\"initial_step\": \"inference\""),
+            "IRR entry step captured"
+        );
+        assert!(
+            json.contains("\"next\": \"inference\""),
+            "IRR transition target captured"
+        );
+        assert!(json.contains("\"value\": \"loop\""), "IRR transition trigger captured");
+        // The carrier's `unless` condition.
+        assert!(json.contains("unless"), "filter condition captured");
+    }
+
+    #[test]
+    fn structure_detects_rejoin_drift() {
+        let baseline = structure_json(TOPOLOGY_CONFIG);
+        let drifted = structure_json(&TOPOLOGY_CONFIG.replace("rejoin: terminal", "rejoin: inference"));
+        assert_ne!(
+            baseline, drifted,
+            "a changed branch rejoin target must alter the signature"
+        );
+    }
+
+    #[test]
+    fn structure_detects_condition_drift() {
+        let baseline = structure_json(TOPOLOGY_CONFIG);
+        let drifted = structure_json(&TOPOLOGY_CONFIG.replace("methods: [POST]", "methods: [GET]"));
+        assert_ne!(baseline, drifted, "a changed filter condition must alter the signature");
+    }
+
+    #[test]
+    fn structure_detects_branch_route_drift() {
+        let baseline = structure_json(TOPOLOGY_CONFIG);
+        let drifted =
+            structure_json(&TOPOLOGY_CONFIG.replace("path_prefix: \"/v1/files\"", "path_prefix: \"/v1/embeddings\""));
+        assert_ne!(baseline, drifted, "a changed branch route must alter the signature");
+    }
+
+    #[test]
+    fn structure_detects_step_router_route_drift() {
+        let baseline = structure_json(TOPOLOGY_CONFIG);
+        let drifted = structure_json(&TOPOLOGY_CONFIG.replace("path: \"/v1/inference\"", "path: \"/v1/other\""));
+        assert_ne!(
+            baseline, drifted,
+            "a changed IRR-step router route must alter the signature"
+        );
+    }
+
+    #[test]
+    fn structure_detects_irr_transition_drift() {
+        let baseline = structure_json(TOPOLOGY_CONFIG);
+        let drifted = structure_json(&TOPOLOGY_CONFIG.replace("value: loop", "value: continue"));
+        assert_ne!(baseline, drifted, "a changed IRR transition must alter the signature");
     }
 }

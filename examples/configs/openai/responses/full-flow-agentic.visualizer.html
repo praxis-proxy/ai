@@ -1077,7 +1077,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "active",
-          "note": "classifies as chat/anthropic/unclassified -> not openai_responses, on_invalid:continue avoids early reject"
+          "note": "classifies as chat/anthropic/unclassified -\u003e not openai_responses, on_invalid:continue avoids early reject"
         },
         "S11": {
           "state": "passthrough",
@@ -1219,7 +1219,7 @@ const PIPELINE = {
         },
         "S3": {
           "state": "inert",
-          "note": "backend registered but store:false -> no persistence"
+          "note": "backend registered but store:false -\u003e no persistence"
         },
         "S4": {
           "state": "active",
@@ -1563,23 +1563,23 @@ const PIPELINE = {
         },
         "S3": {
           "state": "skipped",
-          "note": "unless matches; still a classified create -> IRR"
+          "note": "unless matches; still a classified create -\u003e IRR"
         },
         "S4": {
           "state": "skipped",
-          "note": "unless matches; create -> IRR"
+          "note": "unless matches; create -\u003e IRR"
         },
         "S5": {
           "state": "skipped",
-          "note": "unless matches; create -> IRR"
+          "note": "unless matches; create -\u003e IRR"
         },
         "S6": {
           "state": "skipped",
-          "note": "unless matches; create -> IRR"
+          "note": "unless matches; create -\u003e IRR"
         },
         "S7": {
           "state": "skipped",
-          "note": "unless matches; create -> IRR"
+          "note": "unless matches; create -\u003e IRR"
         },
         "S8": {
           "state": "skipped",
@@ -1587,11 +1587,11 @@ const PIPELINE = {
         },
         "S9": {
           "state": "active",
-          "note": "not a POST create -> carrier runs; /v1/responses + upgrade:websocket route -> inference-backend"
+          "note": "not a POST create -\u003e carrier runs; /v1/responses + upgrade:websocket route -\u003e inference-backend"
         },
         "S10": {
           "state": "active",
-          "note": "missing x-praxis-ai-format:openai_responses -> carrier runs; no upgrade header -> route-miss 404"
+          "note": "missing x-praxis-ai-format:openai_responses -\u003e carrier runs; no upgrade header -\u003e route-miss 404"
         },
         "S11": {
           "state": "active",
@@ -1666,7 +1666,7 @@ const PIPELINE = {
         },
         "S10": {
           "state": "skipped",
-          "note": "non-Responses body took bypass -> 404"
+          "note": "non-Responses body took bypass -\u003e 404"
         },
         "S11": {
           "state": "skipped",
@@ -2119,7 +2119,7 @@ const PIPELINE = {
       "scenarios": {
         "S1": {
           "state": "active",
-          "note": "path /v1/responses -> inference-backend"
+          "note": "path /v1/responses -\u003e inference-backend"
         },
         "S2": {
           "state": "active",
@@ -2285,6 +2285,355 @@ const PIPELINE = {
       }
     }
   ],
+  "structure": {
+    "filters": [
+      {
+        "order": 1,
+        "depth": 0,
+        "filter_type": "trace_context",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 2,
+        "depth": 0,
+        "filter_type": "state_owner",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 3,
+        "depth": 0,
+        "filter_type": "callout_credentials",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 4,
+        "depth": 0,
+        "filter_type": "project_state_owner_headers",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 5,
+        "depth": 0,
+        "filter_type": "openai_conversations",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 6,
+        "depth": 0,
+        "filter_type": "openai_responses_format",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 7,
+        "depth": 0,
+        "filter_type": "openai_responses_validate",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 8,
+        "depth": 0,
+        "filter_type": "openai_tool_parse",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 9,
+        "depth": 0,
+        "filter_type": "openai_response_store",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 10,
+        "depth": 0,
+        "filter_type": "openai_responses_rehydrate",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 11,
+        "depth": 0,
+        "filter_type": "openai_file_resolve",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 12,
+        "depth": 0,
+        "filter_type": "openai_doc_extract",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 13,
+        "depth": 0,
+        "filter_type": "openai_mcp_tool_resolve",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 14,
+        "depth": 0,
+        "filter_type": "headers",
+        "name": null,
+        "irr_step": null,
+        "conditions": [
+          {
+            "unless": {
+              "grpc": null,
+              "path": "/v1/responses",
+              "path_prefix": null,
+              "methods": [
+                "POST"
+              ],
+              "headers": {
+                "x-praxis-ai-format": "openai_responses"
+              },
+              "selected_upstream": null
+            }
+          }
+        ],
+        "branch_chains": [
+          {
+            "name": "bypass-irr",
+            "chains": [
+              {
+                "name": "bypass-chain",
+                "filters": [
+                  {
+                    "filter": "router",
+                    "failure_mode": "closed",
+                    "routes": [
+                      {
+                        "path_prefix": "/v1/prompts",
+                        "cluster": "prompts-api"
+                      },
+                      {
+                        "path_prefix": "/v1/embeddings",
+                        "cluster": "embeddings-api"
+                      },
+                      {
+                        "path_prefix": "/v1/files",
+                        "cluster": "files-api"
+                      },
+                      {
+                        "path": "/v1/responses",
+                        "headers": {
+                          "upgrade": "websocket"
+                        },
+                        "cluster": "inference-backend"
+                      },
+                      {
+                        "path_prefix": "/v1/vector_stores",
+                        "cluster": "vector-stores-backend"
+                      }
+                    ]
+                  },
+                  {
+                    "filter": "load_balancer",
+                    "failure_mode": "closed",
+                    "clusters": [
+                      {
+                        "name": "prompts-api",
+                        "endpoints": [
+                          "127.0.0.1:9998"
+                        ]
+                      },
+                      {
+                        "name": "embeddings-api",
+                        "endpoints": [
+                          "127.0.0.1:9997"
+                        ]
+                      },
+                      {
+                        "name": "files-api",
+                        "endpoints": [
+                          "127.0.0.1:9999"
+                        ]
+                      },
+                      {
+                        "name": "inference-backend",
+                        "endpoints": [
+                          "127.0.0.1:3001"
+                        ]
+                      },
+                      {
+                        "name": "vector-stores-backend",
+                        "endpoints": [
+                          "127.0.0.1:3002"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ],
+            "max_iterations": null,
+            "on_result": null,
+            "rejoin": "terminal"
+          }
+        ]
+      },
+      {
+        "order": 15,
+        "depth": 0,
+        "filter_type": "iterative_request_router",
+        "name": null,
+        "irr_step": null,
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 16,
+        "depth": 1,
+        "filter_type": "project_state_owner_headers",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 17,
+        "depth": 1,
+        "filter_type": "openai_stream_events",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 18,
+        "depth": 1,
+        "filter_type": "openai_web_search",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 19,
+        "depth": 1,
+        "filter_type": "openai_mcp_dispatch",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 20,
+        "depth": 1,
+        "filter_type": "openai_file_search_callout",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 21,
+        "depth": 1,
+        "filter_type": "openai_agentic_loop",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 22,
+        "depth": 1,
+        "filter_type": "headers",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 23,
+        "depth": 1,
+        "filter_type": "router",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [],
+        "branch_chains": [],
+        "routes": [
+          {
+            "path": "/v1/responses",
+            "cluster": "inference-backend"
+          }
+        ]
+      },
+      {
+        "order": 24,
+        "depth": 1,
+        "filter_type": "load_balancer",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [],
+        "branch_chains": []
+      },
+      {
+        "order": 25,
+        "depth": 1,
+        "filter_type": "openai_responses_proxy",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [],
+        "branch_chains": []
+      }
+    ],
+    "irr": {
+      "initial_step": "inference",
+      "steps": [
+        {
+          "name": "inference",
+          "on_result": [
+            {
+              "filter": "openai_agentic_loop",
+              "key": "action",
+              "value": "loop",
+              "next": "inference"
+            },
+            {
+              "default": true,
+              "done": true
+            }
+          ]
+        }
+      ]
+    }
+  },
   "scenarios": [
     {
       "id": "S1",
@@ -2448,7 +2797,7 @@ const PIPELINE = {
   "knobs": {
     "max_infer_iters": 7,
     "max_iterations": 8,
-    "max_iterations_constraint": "must be >= max_infer_iters + 1 (7+1=8): initial inference plus allowed tool-backed continuations",
+    "max_iterations_constraint": "must be \u003e= max_infer_iters + 1 (7+1=8): initial inference plus allowed tool-backed continuations",
     "timeout_ms": 360000,
     "step_timeout_ms": 300000,
     "max_response_bytes": 67108864,
@@ -2474,40 +2823,40 @@ const PIPELINE = {
 /* Per-scenario narrative + cluster/service highlight (derived, kept beside PIPELINE). */
 const SCEN_META = {
   "overview": {
-    "narr": "<b>Overview.</b> All filters shown at rest. trace_context opens the spine and callout_credentials anchors the identity band — since #1341 it is the single establishing filter for scoped secrets AND the MCP authorization assertion. Select a scenario chip to trace the exact path — active filters glow, and skipped / inert / passthrough filters are dimmed and labeled with their state.",
+    "narr": "\u003cb\u003eOverview.\u003c/b\u003e All filters shown at rest. trace_context opens the spine and callout_credentials anchors the identity band — since #1341 it is the single establishing filter for scoped secrets AND the MCP authorization assertion. Select a scenario chip to trace the exact path — active filters glow, and skipped / inert / passthrough filters are dimmed and labeled with their state.",
     "clusters": [],
     "services": []
   },
   "S1": {
-    "narr": "<b>Stateful create</b> (store defaults true) runs the full pre-IRR spine, enters the IRR for one inference round, then persists the composed response on the reverse path.",
+    "narr": "\u003cb\u003eStateful create\u003c/b\u003e (store defaults true) runs the full pre-IRR spine, enters the IRR for one inference round, then persists the composed response on the reverse path.",
     "clusters": [
       "inference-backend"
     ],
     "services": []
   },
   "S2": {
-    "narr": "<b>Streaming create.</b> openai_stream_events composes one logical SSE lifecycle inside the IRR and populates the response_object that openai_response_store persists on the reverse path.",
+    "narr": "\u003cb\u003eStreaming create.\u003c/b\u003e openai_stream_events composes one logical SSE lifecycle inside the IRR and populates the response_object that openai_response_store persists on the reverse path.",
     "clusters": [
       "inference-backend"
     ],
     "services": []
   },
   "S3": {
-    "narr": "<b>Stateless create</b> (store:false) runs identically, but the store is inert on the reverse path — nothing is persisted.",
+    "narr": "\u003cb\u003eStateless create\u003c/b\u003e (store:false) runs identically, but the store is inert on the reverse path — nothing is persisted.",
     "clusters": [
       "inference-backend"
     ],
     "services": []
   },
   "S4": {
-    "narr": "<b>Multi-turn.</b> openai_responses_rehydrate loads the prior response via previous_response_id and prepends its history, then one inference round runs.",
+    "narr": "\u003cb\u003eMulti-turn.\u003c/b\u003e openai_responses_rehydrate loads the prior response via previous_response_id and prepends its history, then one inference round runs.",
     "clusters": [
       "inference-backend"
     ],
     "services": []
   },
   "S5": {
-    "narr": "<b>File search loop.</b> The model emits file_search_call; openai_file_search_callout queries vector store 3002 at re-entry carrying the caller-scoped ogx_files credential and the request's trace identity; the loop owner finalizes with done.",
+    "narr": "\u003cb\u003eFile search loop.\u003c/b\u003e The model emits file_search_call; openai_file_search_callout queries vector store 3002 at re-entry carrying the caller-scoped ogx_files credential and the request's trace identity; the loop owner finalizes with done.",
     "clusters": [
       "inference-backend",
       "vector-stores-backend"
@@ -2517,7 +2866,7 @@ const SCEN_META = {
     ]
   },
   "S6": {
-    "narr": "<b>MCP loop.</b> openai_mcp_tool_resolve lists tools from connector trusted-mcp; the model emits an MCP call; openai_mcp_dispatch executes it against 127.0.0.1:8001. Both forward the mcp_gateway credential plus the opaque authorization assertion, and each hop gets a fresh trace span.",
+    "narr": "\u003cb\u003eMCP loop.\u003c/b\u003e openai_mcp_tool_resolve lists tools from connector trusted-mcp; the model emits an MCP call; openai_mcp_dispatch executes it against 127.0.0.1:8001. Both forward the mcp_gateway credential plus the opaque authorization assertion, and each hop gets a fresh trace span.",
     "clusters": [
       "inference-backend"
     ],
@@ -2526,7 +2875,7 @@ const SCEN_META = {
     ]
   },
   "S7": {
-    "narr": "<b>Web search loop.</b> The model emits web_search_call; openai_web_search executes it via Brave using the per-user brave_search slot (fails closed if the slot is missing), inheriting the request's trace identity.",
+    "narr": "\u003cb\u003eWeb search loop.\u003c/b\u003e The model emits web_search_call; openai_web_search executes it via Brave using the per-user brave_search slot (fails closed if the slot is missing), inheriting the request's trace identity.",
     "clusters": [
       "inference-backend"
     ],
@@ -2535,24 +2884,24 @@ const SCEN_META = {
     ]
   },
   "S8": {
-    "narr": "<b>GET retrieve.</b> openai_response_store answers PRE-IRR as a terminal response and short-circuits — rehydrate, the callouts, the bypass carrier, and the IRR never run.",
+    "narr": "\u003cb\u003eGET retrieve.\u003c/b\u003e openai_response_store answers PRE-IRR as a terminal response and short-circuits — rehydrate, the callouts, the bypass carrier, and the IRR never run.",
     "clusters": [],
     "services": []
   },
   "S9": {
-    "narr": "<b>WebSocket.</b> A GET /v1/responses handshake with Upgrade:websocket takes the bypass branch and routes to inference-backend.",
+    "narr": "\u003cb\u003eWebSocket.\u003c/b\u003e A GET /v1/responses handshake with Upgrade:websocket takes the bypass branch and routes to inference-backend.",
     "clusters": [
       "inference-backend"
     ],
     "services": []
   },
   "S10": {
-    "narr": "<b>Non-Responses body.</b> A Chat/Anthropic/unclassified body posted to /v1/responses is not classified openai_responses, runs the bypass carrier, and gets a route-miss 404.",
+    "narr": "\u003cb\u003eNon-Responses body.\u003c/b\u003e A Chat/Anthropic/unclassified body posted to /v1/responses is not classified openai_responses, runs the bypass carrier, and gets a route-miss 404.",
     "clusters": [],
     "services": []
   },
   "S11": {
-    "narr": "<b>Dedicated services.</b> /v1/prompts | /v1/embeddings | /v1/files | /v1/vector_stores take the bypass branch and route by path_prefix to their backend cluster.",
+    "narr": "\u003cb\u003eDedicated services.\u003c/b\u003e /v1/prompts | /v1/embeddings | /v1/files | /v1/vector_stores take the bypass branch and route by path_prefix to their backend cluster.",
     "clusters": [
       "prompts-api",
       "embeddings-api",
@@ -2611,7 +2960,7 @@ const WIRE = {
       "Cache-Control: no-cache"
     ],
     "resBody": "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_a1b2c3d4e5f60718\",\"object\":\"response\",\"created_at\":1730902147,\"status\":\"in_progress\",\"background\":false,\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"gpt-4.1\",\"output\":[],\"parallel_tool_calls\":true,\"previous_response_id\":null,\"store\":true,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":\"auto\",\"tools\":[],\"top_p\":1.0,\"truncation\":\"disabled\",\"metadata\":{},\"usage\":null}}\n\nevent: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"sequence_number\":1,\"response\":{\"id\":\"resp_a1b2c3d4e5f60718\",\"object\":\"response\",\"created_at\":1730902147,\"status\":\"in_progress\",\"background\":false,\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"gpt-4.1\",\"output\":[],\"parallel_tool_calls\":true,\"previous_response_id\":null,\"store\":true,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":\"auto\",\"tools\":[],\"top_p\":1.0,\"truncation\":\"disabled\",\"metadata\":{},\"usage\":null}}\n\nevent: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":2,\"output_index\":0,\"item\":{\"id\":\"msg_a1b2c3d4e5f60718\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"in_progress\",\"content\":[]}}\n\nevent: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"sequence_number\":3,\"item_id\":\"msg_a1b2c3d4e5f60718\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":4,\"item_id\":\"msg_a1b2c3d4e5f60718\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hi\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":5,\"item_id\":\"msg_a1b2c3d4e5f60718\",\"output_index\":0,\"content_index\":0,\"delta\":\" there\"}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":6,\"item_id\":\"msg_a1b2c3d4e5f60718\",\"output_index\":0,\"content_index\":0,\"delta\":\"!\"}\n\nevent: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"sequence_number\":7,\"item_id\":\"msg_a1b2c3d4e5f60718\",\"output_index\":0,\"content_index\":0,\"text\":\"Hi there!\"}\n\nevent: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"sequence_number\":8,\"item_id\":\"msg_a1b2c3d4e5f60718\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"Hi there!\",\"annotations\":[]}}\n\nevent: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":9,\"output_index\":0,\"item\":{\"id\":\"msg_a1b2c3d4e5f60718\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi there!\",\"annotations\":[]}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":10,\"response\":{\"id\":\"resp_a1b2c3d4e5f60718\",\"object\":\"response\",\"created_at\":1730902147,\"completed_at\":1730902148,\"status\":\"completed\",\"background\":false,\"error\":null,\"incomplete_details\":null,\"instructions\":null,\"max_output_tokens\":null,\"model\":\"gpt-4.1\",\"output\":[{\"id\":\"msg_a1b2c3d4e5f60718\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hi there!\",\"annotations\":[]}]}],\"parallel_tool_calls\":true,\"previous_response_id\":null,\"store\":true,\"temperature\":1.0,\"text\":{\"format\":{\"type\":\"text\"}},\"tool_choice\":\"auto\",\"tools\":[],\"top_p\":1.0,\"truncation\":\"disabled\",\"metadata\":{},\"usage\":{\"input_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":4,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":13}}}\n\n",
-    "notes": "Full native Responses SSE lifecycle composed by openai_stream_events inside the IRR: response.created/in_progress carry an in_progress response with empty output[], the message item streams through output_item.added -> content_part.added -> several output_text.delta -> output_text.done -> content_part.done -> output_item.done, and the terminal response.completed carries the fully assembled response object (status completed, output[], usage). sequence_number is monotonic and integer on every frame; the client stream ends on response.completed with no trailing data: [DONE] (client fixtures set done:false). store defaults to true so this streamed resource is accumulated into response_object and persisted pre-IRR, retrievable via GET /v1/responses/{id}. Bare create: only Content-Type (plus Accept for SSE) is relevant; no credential/trace headers apply.",
+    "notes": "Full native Responses SSE lifecycle composed by openai_stream_events inside the IRR: response.created/in_progress carry an in_progress response with empty output[], the message item streams through output_item.added -\u003e content_part.added -\u003e several output_text.delta -\u003e output_text.done -\u003e content_part.done -\u003e output_item.done, and the terminal response.completed carries the fully assembled response object (status completed, output[], usage). sequence_number is monotonic and integer on every frame; the client stream ends on response.completed with no trailing data: [DONE] (client fixtures set done:false). store defaults to true so this streamed resource is accumulated into response_object and persisted pre-IRR, retrievable via GET /v1/responses/{id}. Bare create: only Content-Type (plus Accept for SSE) is relevant; no credential/trace headers apply.",
     "provenance": [
       "tests/integration/tests/suite/examples/full_flow_agentic.rs:372-455 (exact request {\"model\":\"gpt-4.1\",\"input\":\"Hello\",\"stream\":true} against THIS config; native SSE lifecycle, resp id + created_at + model in terminal, store-default persistence + retrieval)",
       "tests/integration/fixtures/inference/recordings/synthetic/responses/chat-basic-stream.json:50-113 (full client lifecycle with sequence_number on every frame, two output_text.delta, output_text.done/content_part.done/output_item.done ordering, usage detail shape, done:false = no [DONE])",
@@ -2684,7 +3033,7 @@ const WIRE = {
       "Content-Type: application/json"
     ],
     "resBody": "{\n  \"id\": \"resp_final\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"id\": \"fs_1\",\n      \"type\": \"file_search_call\",\n      \"status\": \"completed\",\n      \"queries\": [\n        \"deployment instructions\"\n      ],\n      \"results\": [\n        {\n          \"file_id\": \"file-readme\",\n          \"filename\": \"README.md\",\n          \"score\": 0.92,\n          \"content\": [\n            {\n              \"type\": \"text\",\n              \"text\": \"Deploy the gateway by building the container image with `make container`, then run it behind an auth boundary.\"\n            }\n          ],\n          \"attributes\": null\n        }\n      ]\n    },\n    {\n      \"id\": \"msg_final\",\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Deploy by building the container image and running it.\",\n          \"annotations\": [\n            {\n              \"type\": \"file_citation\",\n              \"file_id\": \"file-readme\",\n              \"filename\": \"README.md\",\n              \"index\": 54\n            }\n          ]\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 30,\n    \"output_tokens\": 12,\n    \"total_tokens\": 42\n  }\n}",
-    "notes": "Buffered final composed object after a 2-round model->tool->model loop. Round 1: model emits a pending file_search_call (id fs_1, status \"searching\", queries). openai_file_search_callout POSTs a vector-store query to 127.0.0.1:3002 with body {\"query\":\"deployment instructions\",\"rewrite_query\":false}, authenticating with the ogx_files slot (Authorization: Bearer integration-ogx-key captured from x-user-ogx-key) and projected x-tenant-id/x-user-id headers; it reconciles results in place. Round 2: model composes the answer with a <|file-readme|> marker; the citation rewriter strips the marker (popping the preceding space) and appends a file_citation annotation at cleaned-text index 54. openai_agentic_loop publishes action=done. results[] appears only because include:[\"file_search_call.results\"] was requested (otherwise stripped). usage aggregates both rounds (10+20 / 5+7 / 15+27).",
+    "notes": "Buffered final composed object after a 2-round model-\u003etool-\u003emodel loop. Round 1: model emits a pending file_search_call (id fs_1, status \"searching\", queries). openai_file_search_callout POSTs a vector-store query to 127.0.0.1:3002 with body {\"query\":\"deployment instructions\",\"rewrite_query\":false}, authenticating with the ogx_files slot (Authorization: Bearer integration-ogx-key captured from x-user-ogx-key) and projected x-tenant-id/x-user-id headers; it reconciles results in place. Round 2: model composes the answer with a \u003c|file-readme|\u003e marker; the citation rewriter strips the marker (popping the preceding space) and appends a file_citation annotation at cleaned-text index 54. openai_agentic_loop publishes action=done. results[] appears only because include:[\"file_search_call.results\"] was requested (otherwise stripped). usage aggregates both rounds (10+20 / 5+7 / 15+27).",
     "provenance": [
       "tests/integration/tests/suite/examples/full_flow_agentic.rs:1190-1305",
       "tests/integration/tests/suite/examples/file_search_callout.rs:37-146",
@@ -2810,7 +3159,7 @@ const WIRE = {
       "tests/integration/tests/suite/examples/full_flow_agentic.rs:909-916 (handshake returns SWITCHING_PROTOCOLS), 944-957 (backend receives GET /v1/responses + headers)",
       "tests/integration/tests/suite/examples/full_flow_agentic.rs:1142-1167 (WS handshake reaches inference-backend via non-IRR bypass; IRR cannot handle 101)",
       "tests/integration/fixtures/openai/responses/websocket-codex-0.144.1.json:15-19 (WS response.create client kind and Responses event schema)",
-      "examples/configs/openai/responses/full-flow-agentic.yaml:96-119 (bypass branch owns non-create/WS traffic), 444-474 (headers carrier unless-gate + /v1/responses route matching upgrade: websocket -> inference-backend), 247-261 (WebSocket takes bypass, not IRR)"
+      "examples/configs/openai/responses/full-flow-agentic.yaml:96-119 (bypass branch owns non-create/WS traffic), 444-474 (headers carrier unless-gate + /v1/responses route matching upgrade: websocket -\u003e inference-backend), 247-261 (WebSocket takes bypass, not IRR)"
     ]
   },
   "S10": {
@@ -2833,7 +3182,7 @@ const WIRE = {
       "examples/configs/openai/responses/full-flow-agentic.yaml:444-470 (bypass carrier `unless` gate + bypass router: no route matches a non-Responses POST /v1/responses)",
       "tests/integration/tests/suite/examples/full_flow_agentic.rs:299-329 (full_flow_chat_completions_body_on_responses_path_does_not_reach_backend asserts status 404)",
       "tests/integration/tests/suite/examples/full_flow_agentic.rs:331-361 (Anthropic Messages body variant also 404 via the same structural allow-list)",
-      "~/.cargo/registry/.../praxis-proxy-filter-0.6.0/src/builtins/http/traffic_management/router/mod.rs:514 (route-miss => Rejection::status(404), body:None) [praxis core dep]",
+      "~/.cargo/registry/.../praxis-proxy-filter-0.6.0/src/builtins/http/traffic_management/router/mod.rs:514 (route-miss =\u003e Rejection::status(404), body:None) [praxis core dep]",
       "~/.cargo/registry/.../praxis-proxy-protocol-0.6.0/src/http/pingora/convert.rs:150-171 (send_rejection: no content-length when body absent, keepalive disabled) [praxis core dep]"
     ]
   },
@@ -2852,9 +3201,9 @@ const WIRE = {
       "Content-Type: application/json"
     ],
     "resBody": "{\n  \"object\": \"list\",\n  \"data\": [\n    {\n      \"object\": \"embedding\",\n      \"index\": 0,\n      \"embedding\": [\n        0.0023064255,\n        -0.009327292,\n        0.015797347,\n        -0.0079056\n      ]\n    }\n  ],\n  \"model\": \"text-embedding-3-small\",\n  \"usage\": {\n    \"prompt_tokens\": 5,\n    \"total_tokens\": 5\n  }\n}",
-    "notes": "POST /v1/embeddings matches the bypass router's path_prefix `/v1/embeddings` -> cluster embeddings-api (127.0.0.1:9997) and rejoins at `terminal`, so it is forwarded straight upstream and NEVER enters the IRR. The gateway forwards the embeddings backend's response verbatim (bypass branch), so the exact embedding object shape is produced by the upstream embeddings-api, not the gateway. The `embedding` vector is truncated to four floats for brevity (real vectors are 1536-dim for text-embedding-3-small). The other dedicated services take the same bypass branch by path_prefix and likewise skip the IRR: /v1/prompts -> prompts-api (127.0.0.1:9998), /v1/files -> files-api (127.0.0.1:9999), /v1/vector_stores -> vector-stores-backend (127.0.0.1:3002). NOTE: no repo fixture emits a real embeddings JSON object (the embeddings-routing functional test returns the marker string \"embeddings-api\"); this is the minimal truthful OpenAI embeddings shape.",
+    "notes": "POST /v1/embeddings matches the bypass router's path_prefix `/v1/embeddings` -\u003e cluster embeddings-api (127.0.0.1:9997) and rejoins at `terminal`, so it is forwarded straight upstream and NEVER enters the IRR. The gateway forwards the embeddings backend's response verbatim (bypass branch), so the exact embedding object shape is produced by the upstream embeddings-api, not the gateway. The `embedding` vector is truncated to four floats for brevity (real vectors are 1536-dim for text-embedding-3-small). The other dedicated services take the same bypass branch by path_prefix and likewise skip the IRR: /v1/prompts -\u003e prompts-api (127.0.0.1:9998), /v1/files -\u003e files-api (127.0.0.1:9999), /v1/vector_stores -\u003e vector-stores-backend (127.0.0.1:3002). NOTE: no repo fixture emits a real embeddings JSON object (the embeddings-routing functional test returns the marker string \"embeddings-api\"); this is the minimal truthful OpenAI embeddings shape.",
     "provenance": [
-      "examples/configs/openai/responses/full-flow-agentic.yaml:457-500 (bypass router path_prefix /v1/embeddings -> embeddings-api; load_balancer endpoint 127.0.0.1:9997; also /v1/prompts:9998, /v1/files:9999, /v1/vector_stores:3002)",
+      "examples/configs/openai/responses/full-flow-agentic.yaml:457-500 (bypass router path_prefix /v1/embeddings -\u003e embeddings-api; load_balancer endpoint 127.0.0.1:9997; also /v1/prompts:9998, /v1/files:9999, /v1/vector_stores:3002)",
       "tests/integration/tests/suite/examples/full_flow_agentic.rs:1324-1352 (full_flow_agentic_non_responses_path_bypasses_irr proves a dedicated-service path bypasses the IRR and the bypass branch forwards the backend response verbatim)",
       "tests/integration/tests/suite/examples/openai_embeddings_routing.rs:14-60 (embeddings routing functional test; backend returns marker string, no JSON embeddings fixture exists)"
     ]
@@ -2871,7 +3220,7 @@ const WIRE = {
    ========================================================================= */
 const TIMELINE = {
   "S1": {
-    "summary": "A no-tools create crosses the wire in exactly one inference round: client POST /v1/responses {model,input} -> IRR forwards the create to inference-backend 127.0.0.1:3001 -> the model returns a final assistant message with NO tool-call items -> the gateway ships that Responses object back byte-for-byte. The IRR transition is owned solely by openai_agentic_loop (full-flow-agentic.yaml:608-613): it parses each model response and publishes a single continuation signal action=loop|done, routed at :646-658 (`key: action, value: loop, next: inference` re-enters inference; the `default: true / done: true` branch finalizes). A plain assistant message has no hosted-tool items, so the loop does NOT publish action=loop and the default done branch finalizes after the first pass (mechanic mirrored by the injected on_result at openai_agentic_loop.rs:6919-6923, whose comment states 'IRR terminates after the first pass via the default `done: true` branch'). This is why tool scenarios need extra rounds and this one does not: hosted-tool items make the loop publish action=loop -> next: inference, adding a re-entry round after the callout (file_search two-round trip full_flow_agentic.rs:1189-1305 with one vector-store callout at :1283; MCP two-round trip openai_agentic_loop.rs:250-428 with model_reqs.len()==2 at :366), whereas a plain message — or even a client-owned function_call — returns after a single model request (openai_agentic_loop.rs:60-61 and :139-143). NOTE: the S1 passthrough test itself only asserts status + byte-equal body; forwarded-body and header-projection details are grounded in sibling tests, cited per step.",
+    "summary": "A no-tools create crosses the wire in exactly one inference round: client POST /v1/responses {model,input} -\u003e IRR forwards the create to inference-backend 127.0.0.1:3001 -\u003e the model returns a final assistant message with NO tool-call items -\u003e the gateway ships that Responses object back byte-for-byte. The IRR transition is owned solely by openai_agentic_loop (full-flow-agentic.yaml:608-613): it parses each model response and publishes a single continuation signal action=loop|done, routed at :646-658 (`key: action, value: loop, next: inference` re-enters inference; the `default: true / done: true` branch finalizes). A plain assistant message has no hosted-tool items, so the loop does NOT publish action=loop and the default done branch finalizes after the first pass (mechanic mirrored by the injected on_result at openai_agentic_loop.rs:6919-6923, whose comment states 'IRR terminates after the first pass via the default `done: true` branch'). This is why tool scenarios need extra rounds and this one does not: hosted-tool items make the loop publish action=loop -\u003e next: inference, adding a re-entry round after the callout (file_search two-round trip full_flow_agentic.rs:1189-1305 with one vector-store callout at :1283; MCP two-round trip openai_agentic_loop.rs:250-428 with model_reqs.len()==2 at :366), whereas a plain message — or even a client-owned function_call — returns after a single model request (openai_agentic_loop.rs:60-61 and :139-143). NOTE: the S1 passthrough test itself only asserts status + byte-equal body; forwarded-body and header-projection details are grounded in sibling tests, cited per step.",
     "rounds": "single round · no tools",
     "steps": [
       {
@@ -2899,7 +3248,7 @@ const TIMELINE = {
         "kind": "request",
         "title": "IRR forwards the classified create to inference",
         "channel": "POST http://127.0.0.1:3001/v1/responses",
-        "note": "Router maps /v1/responses -> cluster inference-backend at 127.0.0.1:3001 (yaml:624-639). Exactly one model request is made for a no-server-tool create and the body is forwarded byte-exact — grounded in the sibling tests single_pass_completes_through_irr (model_reqs.len()==1, openai_agentic_loop.rs:60-67) and explicit_false_preserves_original_request_bytes (byte-exact passthrough, :85-88); the S1 passthrough test uses a non-capturing backend so it does not itself assert the forwarded body. Identity projection (inference receives x-tenant-id: integration-tenant and x-user-id: integration-user via project_state_owner_headers at yaml:532-534, and raw x-auth-tenant/x-auth-user are stripped at the IRR boundary) is asserted in the sibling file_search round-trip at full_flow_agentic.rs:1261-1279, not in the S1 test.",
+        "note": "Router maps /v1/responses -\u003e cluster inference-backend at 127.0.0.1:3001 (yaml:624-639). Exactly one model request is made for a no-server-tool create and the body is forwarded byte-exact — grounded in the sibling tests single_pass_completes_through_irr (model_reqs.len()==1, openai_agentic_loop.rs:60-67) and explicit_false_preserves_original_request_bytes (byte-exact passthrough, :85-88); the S1 passthrough test uses a non-capturing backend so it does not itself assert the forwarded body. Identity projection (inference receives x-tenant-id: integration-tenant and x-user-id: integration-user via project_state_owner_headers at yaml:532-534, and raw x-auth-tenant/x-auth-user are stripped at the IRR boundary) is asserted in the sibling file_search round-trip at full_flow_agentic.rs:1261-1279, not in the S1 test.",
         "bodyKind": "json",
         "body": "{\"model\":\"gpt-4.1\",\"input\":\"Hello\"}",
         "provenance": [
@@ -2937,7 +3286,7 @@ const TIMELINE = {
         "kind": "response",
         "title": "Final Responses object returned verbatim",
         "channel": "200 POST /v1/responses",
-        "note": "Status 200 (assert at :1320) and the client body equals the backend response byte-for-byte (assert_eq!(parse_body(&raw), response) at :1321), confirming a single-round pass-through with no loop re-entry.",
+        "note": "Status 200 (assert at :1320) and the client body equals the backend response byte-for-byte (assert_eq!(parse_body(\u0026raw), response) at :1321), confirming a single-round pass-through with no loop re-entry.",
         "bodyKind": "json",
         "body": "{\"id\":\"resp_456\",\"object\":\"response\",\"output\":[{\"id\":\"msg_456\",\"type\":\"message\",\"role\":\"assistant\",\"status\":\"completed\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\",\"annotations\":[]}]}]}",
         "provenance": [
@@ -2948,7 +3297,7 @@ const TIMELINE = {
     ]
   },
   "S5": {
-    "summary": "Adversarial re-verification confirms every step: a hosted file_search request enters the full-flow-agentic IRR, round-1 inference emits a file_search_call, openai_file_search_callout POSTs the query to the vector store at 127.0.0.1:3002 with the scoped ogx_files credential and X-Vector-Store-Client header, the result is reconciled into accumulated_output and bridged as a [function_call, function_call_output] pair into round-2 inference, whose <|file-q4|> marker becomes a file_citation annotation in the final /v1/responses object; all payloads are faithful quotes/trims and all cited line numbers are correct.",
+    "summary": "Adversarial re-verification confirms every step: a hosted file_search request enters the full-flow-agentic IRR, round-1 inference emits a file_search_call, openai_file_search_callout POSTs the query to the vector store at 127.0.0.1:3002 with the scoped ogx_files credential and X-Vector-Store-Client header, the result is reconciled into accumulated_output and bridged as a [function_call, function_call_output] pair into round-2 inference, whose \u003c|file-q4|\u003e marker becomes a file_citation annotation in the final /v1/responses object; all payloads are faithful quotes/trims and all cited line numbers are correct.",
     "rounds": "2 rounds · hosted file_search",
     "steps": [
       {
@@ -2959,7 +3308,7 @@ const TIMELINE = {
         "kind": "request",
         "title": "Client posts a hosted file_search request",
         "channel": "POST http://127.0.0.1:8080/v1/responses",
-        "note": "VERIFIED. Body matches full_flow_agentic.rs:1242-1246. Authorization: Bearer search-key prepended via replacen at :1247-1251. json_post -> authenticated_request (:78-79, :67-75) injects x-auth-tenant: integration-tenant / x-auth-user: integration-user / x-user-ogx-key: Bearer integration-ogx-key (consts at :58-60); these ingress identity headers are consumed pre-IRR by state_owner + callout_credentials. Listener is 127.0.0.1:8080 (config :302-305).",
+        "note": "VERIFIED. Body matches full_flow_agentic.rs:1242-1246. Authorization: Bearer search-key prepended via replacen at :1247-1251. json_post -\u003e authenticated_request (:78-79, :67-75) injects x-auth-tenant: integration-tenant / x-auth-user: integration-user / x-user-ogx-key: Bearer integration-ogx-key (consts at :58-60); these ingress identity headers are consumed pre-IRR by state_owner + callout_credentials. Listener is 127.0.0.1:8080 (config :302-305).",
         "bodyKind": "json",
         "body": "{\"model\": \"gpt-4.1\", \"input\": \"What do the documents say about Q4?\", \"tools\": [{\"type\": \"file_search\", \"vector_store_ids\": [\"vs_q4\"]}]}",
         "provenance": [
@@ -2976,7 +3325,7 @@ const TIMELINE = {
         "kind": "request",
         "title": "IRR round-1 inference request carries the file_search tool",
         "channel": "POST http://127.0.0.1:3001/v1/responses",
-        "note": "VERIFIED. openai_responses_proxy (config :645) rebuilds the outbound body from ResponsesState. S5 asserts per-round inference headers at :1261-1279: authorization: bearer search-key (client key preserved), projected x-tenant-id: integration-tenant + x-user-id: integration-user (project_state_owner_headers, config :532-534), and NO x-auth-tenant:/x-auth-user: (raw ingress identity stripped at the IRR boundary). Router path /v1/responses -> cluster inference-backend endpoint 127.0.0.1:3001 (config :624-639). The exact wire body is NOT asserted by S5; shown faithful to the client input+tools it is rebuilt from.",
+        "note": "VERIFIED. openai_responses_proxy (config :645) rebuilds the outbound body from ResponsesState. S5 asserts per-round inference headers at :1261-1279: authorization: bearer search-key (client key preserved), projected x-tenant-id: integration-tenant + x-user-id: integration-user (project_state_owner_headers, config :532-534), and NO x-auth-tenant:/x-auth-user: (raw ingress identity stripped at the IRR boundary). Router path /v1/responses -\u003e cluster inference-backend endpoint 127.0.0.1:3001 (config :624-639). The exact wire body is NOT asserted by S5; shown faithful to the client input+tools it is rebuilt from.",
         "bodyKind": "json",
         "body": "{\"model\": \"gpt-4.1\", \"input\": \"What do the documents say about Q4?\", \"tools\": [{\"type\": \"file_search\", \"vector_store_ids\": [\"vs_q4\"]}]}",
         "provenance": [
@@ -3029,7 +3378,7 @@ const TIMELINE = {
         "kind": "response",
         "title": "Vector store returns the matching chunk",
         "channel": "200 http://127.0.0.1:3002/v1/vector_stores/vs_q4/search",
-        "note": "VERIFIED. Exact quote of search_response (full_flow_agentic.rs:1225-1234). The dispatcher reconciles in place: accumulated_output[fs_1].status becomes completed (status->completed proven by sibling unit test tests.rs:512; results are NOT added because the S5 request sets no include:[file_search_call.results], no-results-when-unset proven by tests.rs:611-612), citation_files gains file-q4 -> q4-results.txt, and the model-context bridge is appended to state.messages via model_context_messages (mod.rs:1339-1366).",
+        "note": "VERIFIED. Exact quote of search_response (full_flow_agentic.rs:1225-1234). The dispatcher reconciles in place: accumulated_output[fs_1].status becomes completed (status-\u003ecompleted proven by sibling unit test tests.rs:512; results are NOT added because the S5 request sets no include:[file_search_call.results], no-results-when-unset proven by tests.rs:611-612), citation_files gains file-q4 -\u003e q4-results.txt, and the model-context bridge is appended to state.messages via model_context_messages (mod.rs:1339-1366).",
         "bodyKind": "json",
         "body": "{\"data\": [{\"file_id\": \"file-q4\", \"filename\": \"q4-results.txt\", \"score\": 0.99, \"content\": [{\"type\": \"text\", \"text\": \"Q4 revenue was $42 million.\"}], \"attributes\": null}]}",
         "provenance": [
@@ -3046,9 +3395,9 @@ const TIMELINE = {
         "kind": "request",
         "title": "IRR round-2 inference request with results bridged in",
         "channel": "POST http://127.0.0.1:3001/v1/responses",
-        "note": "VERIFIED. The [function_call, function_call_output] bridge shape is quoted from model_context_messages (mod.rs:1339-1366): call_id = file_search_{output_index}_{call_hash:016x} (:1350), arguments = json!({\"query\": query}).to_string() (:1351). Output string built from CONTEXT_TEMPLATE + ANNOTATION_TEMPLATE (model_context.rs:26-29), score via to_string (model_context.rs:382). Unit test tests.rs:520-536 confirms messages == [message, function_call, function_call_output] and the output starts_with 'file_search found 1 chunks for ...', contains '<|file-...|>', ends_with content+'\\n'. Same per-round headers as round 1 (:1261-1279). The round-2 wire body is NOT directly asserted by S5; reconstructed faithfully from the bridge unit test + templates + mod.rs applied to S5 data.",
+        "note": "VERIFIED. The [function_call, function_call_output] bridge shape is quoted from model_context_messages (mod.rs:1339-1366): call_id = file_search_{output_index}_{call_hash:016x} (:1350), arguments = json!({\"query\": query}).to_string() (:1351). Output string built from CONTEXT_TEMPLATE + ANNOTATION_TEMPLATE (model_context.rs:26-29), score via to_string (model_context.rs:382). Unit test tests.rs:520-536 confirms messages == [message, function_call, function_call_output] and the output starts_with 'file_search found 1 chunks for ...', contains '\u003c|file-...|\u003e', ends_with content+'\\n'. Same per-round headers as round 1 (:1261-1279). The round-2 wire body is NOT directly asserted by S5; reconstructed faithfully from the bridge unit test + templates + mod.rs applied to S5 data.",
         "bodyKind": "json",
-        "body": "{\"model\": \"gpt-4.1\", …, \"input\": [ …prior items…, {\"type\": \"function_call\", \"call_id\": \"file_search_0_<hash16>\", \"name\": \"file_search\", \"arguments\": \"{\\\"query\\\":\\\"What were the Q4 results?\\\"}\", \"status\": \"completed\"}, {\"type\": \"function_call_output\", \"call_id\": \"file_search_0_<hash16>\", \"output\": \"file_search found 1 chunks for \\\"What were the Q4 results?\\\":\\n[0] q4-results.txt (score: 0.99) cite as <|file-q4|>\\nQ4 revenue was $42 million.\\n\"}]}",
+        "body": "{\"model\": \"gpt-4.1\", …, \"input\": [ …prior items…, {\"type\": \"function_call\", \"call_id\": \"file_search_0_\u003chash16\u003e\", \"name\": \"file_search\", \"arguments\": \"{\\\"query\\\":\\\"What were the Q4 results?\\\"}\", \"status\": \"completed\"}, {\"type\": \"function_call_output\", \"call_id\": \"file_search_0_\u003chash16\u003e\", \"output\": \"file_search found 1 chunks for \\\"What were the Q4 results?\\\":\\n[0] q4-results.txt (score: 0.99) cite as \u003c|file-q4|\u003e\\nQ4 revenue was $42 million.\\n\"}]}",
         "provenance": [
           "apis/src/openai/responses/file_search_callout/mod.rs:1339-1366",
           "apis/src/openai/responses/file_search_callout/tests.rs:520-536",
@@ -3067,7 +3416,7 @@ const TIMELINE = {
         "channel": "200 http://127.0.0.1:3001/v1/responses",
         "note": "VERIFIED. Exact quote of final_model_response (full_flow_agentic.rs:1203-1219), served second by StatefulCapturingBackend (:1220-1224). openai_agentic_loop sees no further hosted-tool calls and publishes done (exit to client).",
         "bodyKind": "json",
-        "body": "{\"id\": \"resp_final\", \"object\": \"response\", \"status\": \"completed\", \"output\": [{\"id\": \"msg_final\", \"type\": \"message\", \"role\": \"assistant\", \"status\": \"completed\", \"content\": [{\"type\": \"output_text\", \"text\": \"Q4 revenue was $42 million <|file-q4|>\", \"annotations\": []}]}], \"usage\": {\"input_tokens\": 20, \"output_tokens\": 7, \"total_tokens\": 27}}",
+        "body": "{\"id\": \"resp_final\", \"object\": \"response\", \"status\": \"completed\", \"output\": [{\"id\": \"msg_final\", \"type\": \"message\", \"role\": \"assistant\", \"status\": \"completed\", \"content\": [{\"type\": \"output_text\", \"text\": \"Q4 revenue was $42 million \u003c|file-q4|\u003e\", \"annotations\": []}]}], \"usage\": {\"input_tokens\": 20, \"output_tokens\": 7, \"total_tokens\": 27}}",
         "provenance": [
           "tests/integration/tests/suite/examples/full_flow_agentic.rs:1203-1219",
           "tests/integration/tests/suite/examples/full_flow_agentic.rs:1220-1224"
@@ -3081,7 +3430,7 @@ const TIMELINE = {
         "kind": "response",
         "title": "Final /v1/responses object returned to client",
         "channel": "200 http://127.0.0.1:8080/v1/responses",
-        "note": "VERIFIED. S5 asserts the structural subset directly (:1256-1259): id==resp_final, output[0].type==file_search_call, output[0].status==completed, output[1].type==message. output[0] has no results because the S5 request set no include. The <|file-q4|> marker stripping + file_citation conversion is NOT asserted by S5 itself but is proven by the sibling file-search-callout example test (file_search_callout.rs:117-125: text==\"Q4 revenue was $42 million\", annotations[0].file_id==\"file-q4\") and by citations.rs, which builds {type:file_citation, file_id, filename, index} annotations (citations.rs:209-212) after removing markers from output_text.",
+        "note": "VERIFIED. S5 asserts the structural subset directly (:1256-1259): id==resp_final, output[0].type==file_search_call, output[0].status==completed, output[1].type==message. output[0] has no results because the S5 request set no include. The \u003c|file-q4|\u003e marker stripping + file_citation conversion is NOT asserted by S5 itself but is proven by the sibling file-search-callout example test (file_search_callout.rs:117-125: text==\"Q4 revenue was $42 million\", annotations[0].file_id==\"file-q4\") and by citations.rs, which builds {type:file_citation, file_id, filename, index} annotations (citations.rs:209-212) after removing markers from output_text.",
         "bodyKind": "json",
         "body": "{\"id\": \"resp_final\", \"object\": \"response\", \"status\": \"completed\", \"output\": [{\"id\": \"fs_1\", \"type\": \"file_search_call\", \"status\": \"completed\", \"queries\": [\"What were the Q4 results?\"]}, {\"id\": \"msg_final\", \"type\": \"message\", \"role\": \"assistant\", \"status\": \"completed\", \"content\": [{\"type\": \"output_text\", \"text\": \"Q4 revenue was $42 million\", \"annotations\": [{\"type\": \"file_citation\", \"file_id\": \"file-q4\", \"filename\": \"q4-results.txt\", \"index\": …}]}]}]}",
         "provenance": [
@@ -3104,7 +3453,7 @@ const TIMELINE = {
         "kind": "request",
         "title": "Client POST /v1/responses with an MCP tool",
         "channel": "POST http://localhost:8080/v1/responses",
-        "note": "Faithful trim of the integration-test request bodies (openai_agentic_loop.rs:299-311 and openai_mcp_streaming.rs:109-119), which pass server_url directly as a dynamic 127.0.0.1:<mcp-port>/mcp; normalized here to the documented connector port :8001. NOTE: the config curl example (yaml:232-242) actually shows server_url http://mcp-weather:8001/mcp, and per yaml:422 real clients reference the trusted-mcp connector via connector_id, not server_url. The round-trip test additionally sends conversation.id=conv_native and parallel_tool_calls=true (trimmed here). In full-flow-agentic the trusted boundary supplies x-user-mcp-key (->mcp_gateway slot) and x-mcp-authorized (->mcp_gateway assertion); callout_credentials strips both ingress headers before the IRR.",
+        "note": "Faithful trim of the integration-test request bodies (openai_agentic_loop.rs:299-311 and openai_mcp_streaming.rs:109-119), which pass server_url directly as a dynamic 127.0.0.1:\u003cmcp-port\u003e/mcp; normalized here to the documented connector port :8001. NOTE: the config curl example (yaml:232-242) actually shows server_url http://mcp-weather:8001/mcp, and per yaml:422 real clients reference the trusted-mcp connector via connector_id, not server_url. The round-trip test additionally sends conversation.id=conv_native and parallel_tool_calls=true (trimmed here). In full-flow-agentic the trusted boundary supplies x-user-mcp-key (-\u003emcp_gateway slot) and x-mcp-authorized (-\u003emcp_gateway assertion); callout_credentials strips both ingress headers before the IRR.",
         "bodyKind": "json",
         "body": "{\"model\":\"gpt-4.1\",\"input\":\"What is the weather in SF?\",\"tools\":[{\"type\":\"mcp\",\"server_label\":\"weather\",\"server_url\":\"http://127.0.0.1:8001/mcp\",\"allowed_tools\":[\"get_weather\"],\"require_approval\":\"never\"}]}",
         "provenance": [
@@ -3122,7 +3471,7 @@ const TIMELINE = {
         "kind": "request",
         "title": "MCP handshake: JSON-RPC initialize",
         "channel": "POST http://127.0.0.1:8001/mcp",
-        "note": "openai_mcp_tool_resolve opens a fresh Streamable HTTP transport; rmcp .serve() performs the handshake (mod.rs:403). For the connector target the exchange carries forwarded credentials: Authorization: Bearer <mcp_gateway>, x-mcp-authorized: <assertion>, x-tenant-id/x-user-id (asserted in mcp_client tests). JSON-RPC envelope is standard; the id scalar (0) and params (protocolVersion/capabilities/clientInfo) are rmcp-generated and trimmed — only protocolVersion 2025-03-26 is grounded (mcp.rs:35).",
+        "note": "openai_mcp_tool_resolve opens a fresh Streamable HTTP transport; rmcp .serve() performs the handshake (mod.rs:403). For the connector target the exchange carries forwarded credentials: Authorization: Bearer \u003cmcp_gateway\u003e, x-mcp-authorized: \u003cassertion\u003e, x-tenant-id/x-user-id (asserted in mcp_client tests). JSON-RPC envelope is standard; the id scalar (0) and params (protocolVersion/capabilities/clientInfo) are rmcp-generated and trimmed — only protocolVersion 2025-03-26 is grounded (mcp.rs:35).",
         "bodyKind": "json",
         "body": "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{…},\"clientInfo\":{…}}}",
         "provenance": [
@@ -3197,7 +3546,7 @@ const TIMELINE = {
         "kind": "request",
         "title": "Round-1 inference carrying the resolved MCP tools",
         "channel": "POST http://127.0.0.1:3001/v1/responses",
-        "note": "The resolver lowers each MCP tool to an encoded function tool named <server_label>__<tool_name> (encode_function_name -> weather__get_weather, mcp_dispatch/tests.rs:2124-2126). Test asserts first_model_body.tools contains {type:function, name:weather__get_weather} and preserves parallel_tool_calls=true (openai_agentic_loop.rs:365-382). Routed to inference-backend 127.0.0.1:3001 by the IRR step router.",
+        "note": "The resolver lowers each MCP tool to an encoded function tool named \u003cserver_label\u003e__\u003ctool_name\u003e (encode_function_name -\u003e weather__get_weather, mcp_dispatch/tests.rs:2124-2126). Test asserts first_model_body.tools contains {type:function, name:weather__get_weather} and preserves parallel_tool_calls=true (openai_agentic_loop.rs:365-382). Routed to inference-backend 127.0.0.1:3001 by the IRR step router.",
         "bodyKind": "json",
         "body": "{\"model\":\"gpt-4.1\",\"input\":\"What is the weather in SF?\",\"parallel_tool_calls\":true,\"tools\":[{\"type\":\"function\",\"name\":\"weather__get_weather\",…}]}",
         "provenance": [
@@ -3231,7 +3580,7 @@ const TIMELINE = {
         "kind": "request",
         "title": "JSON-RPC tools/call get_weather",
         "channel": "POST http://127.0.0.1:8001/mcp",
-        "note": "Envelope grounded in the transport test fixture (subrequest_transport.rs:1761 shows tools/call with id:1 and params {name, arguments}); the id scalar is rmcp-generated. openai_mcp_dispatch decodes the encoded name back to the original tool_name get_weather (mcp_dispatch/tests.rs:2158-2189) and forwards the model's arguments (round-trip test asserts call_body.params.arguments.location == 'SF', openai_agentic_loop.rs:359-360). The dispatch outbound_chain stamps X-MCP-Client: praxis-ai-gateway (asserted openai_agentic_loop.rs:352-358); for a connector target it also carries Bearer <mcp_gateway> + x-mcp-authorized + x-tenant-id/x-user-id, whereas for a request-supplied server_url the round-trip test asserts x-tenant-id must NOT cross (openai_agentic_loop.rs:342-347).",
+        "note": "Envelope grounded in the transport test fixture (subrequest_transport.rs:1761 shows tools/call with id:1 and params {name, arguments}); the id scalar is rmcp-generated. openai_mcp_dispatch decodes the encoded name back to the original tool_name get_weather (mcp_dispatch/tests.rs:2158-2189) and forwards the model's arguments (round-trip test asserts call_body.params.arguments.location == 'SF', openai_agentic_loop.rs:359-360). The dispatch outbound_chain stamps X-MCP-Client: praxis-ai-gateway (asserted openai_agentic_loop.rs:352-358); for a connector target it also carries Bearer \u003cmcp_gateway\u003e + x-mcp-authorized + x-tenant-id/x-user-id, whereas for a request-supplied server_url the round-trip test asserts x-tenant-id must NOT cross (openai_agentic_loop.rs:342-347).",
         "bodyKind": "json",
         "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"get_weather\",\"arguments\":{\"location\":\"SF\"}}}",
         "provenance": [
@@ -3366,8 +3715,8 @@ const TIMELINE = {
         "to": "brave",
         "kind": "request",
         "title": "openai_web_search Brave callout (deferred per-user x-subscription-token)",
-        "channel": "GET https://api.search.brave.com/res/v1/web/search?q=Rust%202025%20edition&count=5",
-        "note": "URL modeled by build_brave_request: {base}/res/v1/web/search?q={percent-encoded query}&count={count}; count=5 from default_context_size Medium (result_count). Only Accept: application/json rides in-chain; the API key is staged as a deferred x-subscription-token injected only at the resolved authority. With user_credential: brave_search the per-user secret from x-user-brave-key is used, not the shared api_key — the slot wiring (brave_search slot, source_header x-user-brave-key, web_search user_credential brave_search) is proven structurally by full_flow_agentic.rs:1409-1457, and the runtime behavior by scoped-credentials: callout carries 'x-subscription-token: alice-brave-secret', shared 'test-key' absent, 'x-user-brave-key' stripped. In the round-trip functional test the provider base_url is patched to a local mock via load_web_search_config (openai_agentic_loop.rs:5506-5509).",
+        "channel": "GET https://api.search.brave.com/res/v1/web/search?q=Rust%202025%20edition\u0026count=5",
+        "note": "URL modeled by build_brave_request: {base}/res/v1/web/search?q={percent-encoded query}\u0026count={count}; count=5 from default_context_size Medium (result_count). Only Accept: application/json rides in-chain; the API key is staged as a deferred x-subscription-token injected only at the resolved authority. With user_credential: brave_search the per-user secret from x-user-brave-key is used, not the shared api_key — the slot wiring (brave_search slot, source_header x-user-brave-key, web_search user_credential brave_search) is proven structurally by full_flow_agentic.rs:1409-1457, and the runtime behavior by scoped-credentials: callout carries 'x-subscription-token: alice-brave-secret', shared 'test-key' absent, 'x-user-brave-key' stripped. In the round-trip functional test the provider base_url is patched to a local mock via load_web_search_config (openai_agentic_loop.rs:5506-5509).",
         "bodyKind": "none",
         "provenance": [
           "apis/src/web_search/provider.rs:585-607",
@@ -3406,7 +3755,7 @@ const TIMELINE = {
         "channel": "POST http://127.0.0.1:3001/v1/responses",
         "note": "Issue #808: a hosted web_search_call is NOT a valid Responses input item, so the continuation bridges results as function_call + function_call_output (output = format_search_results). Test asserts input has NO web_search_call, has a function_call name==web_search, and a function_call_output whose output contains 'blog.rust-lang.org'.",
         "bodyKind": "json",
-        "body": "{…, \"input\":[ …, {\"type\":\"function_call\",\"call_id\":\"<bridge>\",\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Rust 2025 edition\\\"}\",\"status\":\"completed\"}, {\"type\":\"function_call_output\",\"call_id\":\"<bridge>\",\"output\":\"[1] Rust 2025 Edition\\nhttps://blog.rust-lang.org/2025\\nThe Rust 2025 edition is here.\"} ]}",
+        "body": "{…, \"input\":[ …, {\"type\":\"function_call\",\"call_id\":\"\u003cbridge\u003e\",\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"Rust 2025 edition\\\"}\",\"status\":\"completed\"}, {\"type\":\"function_call_output\",\"call_id\":\"\u003cbridge\u003e\",\"output\":\"[1] Rust 2025 Edition\\nhttps://blog.rust-lang.org/2025\\nThe Rust 2025 edition is here.\"} ]}",
         "provenance": [
           "tests/integration/tests/suite/examples/openai_agentic_loop.rs:3309-3341",
           "apis/src/openai/responses/web_search/mod.rs:876-905",

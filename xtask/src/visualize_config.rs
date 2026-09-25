@@ -29,6 +29,7 @@ use serde_json::{Map, Value as Json};
 use crate::{
     filter_docs,
     flow_graph::{FlowGraph, FlowNode},
+    html,
 };
 
 // -----------------------------------------------------------------------------
@@ -181,23 +182,58 @@ fn redact(value: &Json) -> Json {
     }
 }
 
-/// Redact one object: sensitive keys collapse to the sentinel, others recurse.
+/// Redact one object: sensitive keys collapse to the sentinel (unless the value
+/// is a plain config knob), others recurse, then the `{name, value}` header shape
+/// is handled as a special case.
 fn redact_map(map: &Map<String, Json>) -> Map<String, Json> {
     let mut out = Map::new();
     for (key, value) in map {
         let redacted = if is_sensitive_key(key) {
-            Json::String(REDACTED.to_owned())
+            redact_sensitive_value(value)
         } else {
             redact(value)
         };
         out.insert(key.clone(), redacted);
     }
+    redact_named_value(&mut out);
     out
 }
 
-/// Return `true` when a config key looks like it carries a secret.
+/// Collapse a sensitive-keyed value to the sentinel, but keep scalar knobs.
+///
+/// A key can contain a sensitive fragment (`token`) yet name an ordinary numeric
+/// or boolean limit — `max_tokens: 500`, `reserved_tokens: 8`, `refresh_token:
+/// true`. Those carry no secret, so preserve them; only strings, arrays, and
+/// objects can hold actual credential material, so collapse those.
+fn redact_sensitive_value(value: &Json) -> Json {
+    match value {
+        Json::Number(_) | Json::Bool(_) | Json::Null => value.clone(),
+        _ => Json::String(REDACTED.to_owned()),
+    }
+}
+
+/// Redact a `{ name: "<sensitive>", value: "<secret>" }` pairing.
+///
+/// Header-style config hides the secret in a `value` whose sibling `name`
+/// identifies it (e.g. `name: Authorization`, `value: "Bearer …"`). The per-key
+/// pass misses it because neither `name` nor `value` is itself a sensitive key.
+/// Only a string `value` is collapsed, so a `{name, value: 30}` numeric pair is
+/// left intact.
+fn redact_named_value(out: &mut Map<String, Json>) {
+    let named_secret = out.get("name").and_then(Json::as_str).is_some_and(is_sensitive_key);
+    if named_secret
+        && let Some(value) = out.get_mut("value")
+        && value.is_string()
+    {
+        *value = Json::String(REDACTED.to_owned());
+    }
+}
+
+/// Return `true` when a config key looks like it carries a secret. Hyphens are
+/// normalized to underscores so `api-key` and `x-api-key` match the same
+/// fragments as `api_key`.
 fn is_sensitive_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
+    let lower = key.to_ascii_lowercase().replace('-', "_");
     SENSITIVE_KEY_FRAGMENTS.iter().any(|fragment| lower.contains(fragment))
 }
 
@@ -217,18 +253,8 @@ fn embed(template: &str, model: &Json) -> Result<String, String> {
         ));
     }
     let pretty = serde_json::to_string_pretty(model).map_err(|err| err.to_string())?;
-    let safe = html_escape_json(&pretty);
+    let safe = html::escape_json_for_script(&pretty);
     Ok(template.replacen(MODEL_PLACEHOLDER, &safe, 1))
-}
-
-/// Escape the three characters that could prematurely close the `<script>` or
-/// open a comment when JSON is embedded in HTML. Each maps to a JSON string
-/// escape, so the parsed value is unchanged; outside JSON strings these
-/// characters never occur, so structure is untouched.
-fn html_escape_json(json: &str) -> String {
-    json.replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026")
 }
 
 // -----------------------------------------------------------------------------
@@ -365,7 +391,15 @@ mod tests {
 
     #[test]
     fn sensitive_key_detection() {
-        for key in ["token", "API_KEY", "Authorization", "client_secret", "db_password"] {
+        for key in [
+            "token",
+            "API_KEY",
+            "api-key",
+            "x-api-key",
+            "Authorization",
+            "client_secret",
+            "db_password",
+        ] {
             assert!(is_sensitive_key(key), "{key} should be sensitive");
         }
         for key in ["address", "timeout_ms", "max_iterations", "endpoints"] {
@@ -374,12 +408,70 @@ mod tests {
     }
 
     #[test]
-    fn html_escape_neutralizes_script_close() {
-        let escaped = html_escape_json(r#""a</script><!--&b""#);
-        assert!(!escaped.contains("</script>"), "closing tag is neutralized");
-        assert!(
-            escaped.contains("\\u003c") && escaped.contains("\\u0026"),
-            "chars are JSON-escaped"
+    fn sensitive_keyed_numeric_knobs_are_preserved() {
+        // A key can carry a sensitive fragment yet name a plain scalar limit; the
+        // knob is not a secret and must survive, while string material does not.
+        let input = serde_json::json!({
+            "max_tokens": 500,
+            "reserved_tokens": 8,
+            "refresh_token": true,
+            "access_token": "sk-live-123",
+        });
+        let out = redact(&input);
+        assert_eq!(
+            out.get("max_tokens").and_then(Json::as_u64),
+            Some(500),
+            "numeric knob kept"
+        );
+        assert_eq!(
+            out.get("reserved_tokens").and_then(Json::as_u64),
+            Some(8),
+            "numeric knob kept"
+        );
+        assert_eq!(
+            out.get("refresh_token").and_then(Json::as_bool),
+            Some(true),
+            "boolean knob kept"
+        );
+        assert_eq!(
+            out.get("access_token"),
+            Some(&Json::String(REDACTED.to_owned())),
+            "string secret redacted"
+        );
+    }
+
+    #[test]
+    fn named_value_secret_pairs_are_redacted() {
+        // Header-style config: the secret hides in `value`, identified only by a
+        // sibling `name`. A string value is redacted; a numeric one is a knob.
+        let input = serde_json::json!({
+            "headers": [
+                { "name": "Authorization", "value": "Bearer sk-live-123" },
+                { "name": "X-Api-Key", "value": "secret-key" },
+                { "name": "X-Timeout", "value": 30 },
+                { "name": "Accept", "value": "application/json" },
+            ]
+        });
+        let out = redact(&input);
+        assert_eq!(
+            out.pointer("/headers/0/value"),
+            Some(&Json::String(REDACTED.to_owned())),
+            "authorization value redacted"
+        );
+        assert_eq!(
+            out.pointer("/headers/1/value"),
+            Some(&Json::String(REDACTED.to_owned())),
+            "api-key value redacted"
+        );
+        assert_eq!(
+            out.pointer("/headers/2/value").and_then(Json::as_u64),
+            Some(30),
+            "numeric value under a sensitive name is a knob, not a secret"
+        );
+        assert_eq!(
+            out.pointer("/headers/3/value").and_then(Json::as_str),
+            Some("application/json"),
+            "non-sensitive name leaves its value intact"
         );
     }
 

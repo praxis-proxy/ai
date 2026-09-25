@@ -26,7 +26,7 @@ use serde_json::{Map, Value as Json};
 
 /// The filter type whose inference-step filters are hoisted inline when a chain
 /// is flattened for display.
-const IRR_FILTER: &str = "iterative_request_router";
+pub(crate) const IRR_FILTER: &str = "iterative_request_router";
 
 /// Keys of a raw filter mapping that are modelled as first-class node fields
 /// rather than opaque configuration.

@@ -28,6 +28,8 @@ mod flow_graph;
 #[cfg(feature = "dev")]
 mod flow_visualizer;
 #[cfg(feature = "dev")]
+mod html;
+#[cfg(feature = "dev")]
 mod inference_fixtures;
 #[cfg(feature = "dev")]
 mod lint_deps;
