@@ -50,7 +50,6 @@ use super::{
 };
 use crate::{
     is_event_stream_content_type,
-    openai::RequestBodyPhase,
     state_owner::{StateOwner, require_state_owner},
     store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry},
 };
@@ -85,25 +84,17 @@ const PREV_USAGE_TOTAL_KEY: &str = "responses.previous_usage_total_tokens";
 /// ```yaml
 /// filter: openai_responses_rehydrate
 /// ```
-///
-/// The default `pre_read` body phase preserves standalone pipelines. Use
-/// `request_body_phase: bound_upstream` only after an unconditional binding
-/// router when provider-aware conditions must gate this filter.
 #[derive(Default)]
-pub struct RehydrateFilter {
-    /// Configured request-body lifecycle.
-    request_body_phase: RequestBodyPhase,
-}
+pub struct RehydrateFilter;
 
 /// Configuration for `openai_responses_rehydrate`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RehydrateConfig {
-    /// Request-body lifecycle. Defaults to `pre_read`; use `bound_upstream`
-    /// only after an unconditional binding router.
-    #[serde(default)]
-    request_body_phase: RequestBodyPhase,
-}
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "an empty mapping accepts omitted config while deny_unknown_fields rejects stale options"
+)]
+struct RehydrateConfig {}
 
 impl RehydrateFilter {
     /// Create a filter from YAML config.
@@ -113,10 +104,8 @@ impl RehydrateFilter {
     /// Returns [`FilterError`] if the YAML config contains unknown
     /// fields.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: RehydrateConfig = parse_filter_config("openai_responses_rehydrate", config)?;
-        Ok(Box::new(Self {
-            request_body_phase: cfg.request_body_phase,
-        }))
+        let _: RehydrateConfig = parse_filter_config("openai_responses_rehydrate", config)?;
+        Ok(Box::new(Self))
     }
 
     /// Parse body, resolve rehydration source (`previous_response_id` or
@@ -203,11 +192,11 @@ impl HttpFilter for RehydrateFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        self.request_body_phase.pre_read_access(BodyAccess::ReadOnly)
+        BodyAccess::ReadOnly
     }
 
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        self.request_body_phase.bound_upstream_access(BodyAccess::ReadOnly)
+        BodyAccess::ReadOnly
     }
 
     /// `StreamBuffer` so the protocol layer assembles the complete

@@ -17,7 +17,6 @@ All matched requests are served from the local store and never forwarded upstrea
 | `database_url` | string (secret) | yes | Database connection URL. Wrapped in [`SecretString`] to prevent accidental logging of credentials. |
 | `conversations_table` | string | no | Table name for conversation records. |
 | `items_table` | string | no | Table name for conversation item records. |
-| `request_body_phase` | `pre_read` \| `bound_upstream` | no | Lifecycle for body-bearing Conversations operations. The default `pre_read` mode supports standalone local-serving pipelines. Use `bound_upstream` when this filter has a `bound_upstream` condition; that mode requires an unconditional binding router earlier in the pipeline. |
 | `ssl_mode` | SslMode | no | TLS mode for `PostgreSQL` connections. Only valid when `backend` is `postgres`. Overrides any `sslmode` parameter in the connection URL. |
 | `ssl_root_cert` | string (secret) | no | Path to a PEM-encoded root CA certificate for `PostgreSQL` TLS verification. Only valid when `backend` is `postgres` and the effective SSL mode is `verify-ca` or `verify-full`. |
 | `ssl_client_cert` | string (secret) | no | Path to a PEM-encoded client certificate for mutual TLS with `PostgreSQL`. Only valid when `backend` is `postgres` and the effective SSL mode is `verify-ca` or `verify-full`. Must be configured together with `ssl_client_key`. Enables certificate authentication so the server does not challenge for a password. |

@@ -9,12 +9,6 @@ Validates `previous_response_id` by fetching the stored response, confirming its
 
 The request body is **not** modified; downstream filters read from `ResponsesState.messages` instead.
 
-## Configuration
-
-| Field | Type | Required | Description |
-|-------|------|---------|-------------|
-| `request_body_phase` | `pre_read` \| `bound_upstream` | no | Request-body lifecycle. Defaults to `pre_read`; use `bound_upstream` only after an unconditional binding router. |
-
 ## Example
 
 ```yaml

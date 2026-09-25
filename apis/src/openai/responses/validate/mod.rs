@@ -36,17 +36,15 @@ use super::{
     extract_conversation_id,
     state::ResponsesState,
 };
-use crate::openai::RequestBodyPhase;
 
 /// Configuration for `openai_responses_validate`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OpenaiResponsesValidateConfig {
-    /// Request-body lifecycle. Defaults to `pre_read`; use `bound_upstream`
-    /// only after an unconditional binding router.
-    #[serde(default)]
-    request_body_phase: RequestBodyPhase,
-}
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "an empty mapping accepts omitted config while deny_unknown_fields rejects stale options"
+)]
+struct OpenaiResponsesValidateConfig {}
 
 // -----------------------------------------------------------------------------
 // OpenaiResponsesValidateFilter
@@ -67,15 +65,8 @@ struct OpenaiResponsesValidateConfig {
 /// Generates metadata: `responses.response_id` (format: `resp_` + 32
 /// hex chars, CSPRNG), `responses.conversation_id`, `responses.store`,
 /// `responses.background`, `responses.stream`.
-///
-/// The default `pre_read` body phase preserves standalone pipelines. Use
-/// `request_body_phase: bound_upstream` only after an unconditional binding
-/// router when provider-aware conditions must gate this filter.
 #[derive(Default)]
-pub struct OpenaiResponsesValidateFilter {
-    /// Configured request-body lifecycle.
-    request_body_phase: RequestBodyPhase,
-}
+pub struct OpenaiResponsesValidateFilter;
 
 impl OpenaiResponsesValidateFilter {
     /// Create a filter from YAML config.
@@ -86,10 +77,8 @@ impl OpenaiResponsesValidateFilter {
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: OpenaiResponsesValidateConfig = parse_filter_config("openai_responses_validate", config)?;
-        Ok(Box::new(Self {
-            request_body_phase: cfg.request_body_phase,
-        }))
+        let _: OpenaiResponsesValidateConfig = parse_filter_config("openai_responses_validate", config)?;
+        Ok(Box::new(Self))
     }
 }
 
@@ -100,11 +89,11 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        self.request_body_phase.pre_read_access(BodyAccess::ReadOnly)
+        BodyAccess::ReadOnly
     }
 
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        self.request_body_phase.bound_upstream_access(BodyAccess::ReadOnly)
+        BodyAccess::ReadOnly
     }
 
     fn request_body_mode(&self) -> BodyMode {
@@ -355,22 +344,9 @@ mod tests {
     }
 
     #[test]
-    fn body_phase_defaults_to_pre_read_and_can_bind_upstream() {
-        let filter = OpenaiResponsesValidateFilter::default();
-        assert_eq!(
-            filter.request_body_access(),
-            BodyAccess::ReadOnly,
-            "legacy pipelines should retain pre-read validation"
-        );
-        assert_eq!(
-            filter.bound_upstream_request_body_access(),
-            BodyAccess::None,
-            "legacy pipelines should not require a bound upstream"
-        );
-
-        let yaml: serde_yaml::Value = serde_yaml::from_str("request_body_phase: bound_upstream").unwrap();
-        let filter = OpenaiResponsesValidateFilter::from_config(&yaml).unwrap();
-        assert_eq!(filter.request_body_access(), BodyAccess::None);
+    fn declares_dual_phase_body_access() {
+        let filter = OpenaiResponsesValidateFilter;
+        assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
         assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
     }
 
@@ -719,7 +695,7 @@ mod tests {
 
     #[tokio::test]
     async fn not_end_of_stream_continues() {
-        let filter = OpenaiResponsesValidateFilter::default();
+        let filter = OpenaiResponsesValidateFilter;
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
         let mut ctx = crate::test_utils::make_filter_context(&req);
         let mut body = Some(Bytes::from(r#"{"input": "partial"}"#));

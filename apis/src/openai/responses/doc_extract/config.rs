@@ -6,7 +6,7 @@
 use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 
-use crate::openai::{RequestBodyPhase, responses::body_limits::validate_size_limit};
+use crate::openai::responses::body_limits::validate_size_limit;
 
 /// Default maximum number of `input_file` parts extracted per request.
 const DEFAULT_MAX_FILE_REFERENCES: usize = 32;
@@ -42,11 +42,6 @@ pub(crate) enum OnUnsupported {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DocExtractConfig {
-    /// Request-body lifecycle. Defaults to `pre_read`; use `bound_upstream`
-    /// only after an unconditional binding router.
-    #[serde(default)]
-    pub request_body_phase: RequestBodyPhase,
-
     /// Acknowledge that `StreamBuffer` body processing runs before
     /// header-phase security filters.  Must be `true`.
     #[serde(default)]

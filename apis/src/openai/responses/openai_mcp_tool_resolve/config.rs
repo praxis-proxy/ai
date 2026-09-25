@@ -10,7 +10,7 @@ use praxis_filter::{FilterError, body::MAX_JSON_BODY_BYTES};
 use serde::Deserialize;
 use url::Url;
 
-use crate::openai::{RequestBodyPhase, responses::body_limits::validate_size_limit};
+use crate::openai::responses::body_limits::validate_size_limit;
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -54,11 +54,6 @@ pub(crate) struct ConnectorConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct McpToolResolveConfig {
-    /// Request-body lifecycle. Defaults to `pre_read`; use `bound_upstream`
-    /// only after an unconditional binding router.
-    #[serde(default)]
-    pub request_body_phase: RequestBodyPhase,
-
     /// Optional per-user bearer slot from `callout_credentials`. Must match the
     /// corresponding `openai_mcp_dispatch` setting.
     #[serde(default)]

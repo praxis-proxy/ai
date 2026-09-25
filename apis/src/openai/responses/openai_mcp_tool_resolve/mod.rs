@@ -192,9 +192,6 @@ pub struct McpToolResolveFilter {
 
     /// Per-server timeout for `tools/list` calls.
     timeout: Duration,
-
-    /// Configured request-body lifecycle.
-    request_body_phase: crate::openai::RequestBodyPhase,
 }
 
 impl McpToolResolveFilter {
@@ -312,7 +309,6 @@ impl McpToolResolveFilter {
             max_tools: validated.max_tools,
             outbound_pipeline,
             timeout: Duration::from_millis(validated.timeout_ms),
-            request_body_phase: validated.request_body_phase,
         }))
     }
 
@@ -598,11 +594,11 @@ impl HttpFilter for McpToolResolveFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
-        self.request_body_phase.pre_read_access(BodyAccess::ReadWrite)
+        BodyAccess::ReadWrite
     }
 
     fn bound_upstream_request_body_access(&self) -> BodyAccess {
-        self.request_body_phase.bound_upstream_access(BodyAccess::ReadWrite)
+        BodyAccess::ReadWrite
     }
 
     fn request_body_mode(&self) -> BodyMode {

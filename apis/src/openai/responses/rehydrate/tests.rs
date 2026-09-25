@@ -17,7 +17,7 @@ use crate::{
 };
 
 fn default_filter() -> RehydrateFilter {
-    RehydrateFilter::default()
+    RehydrateFilter
 }
 
 // -----------------------------------------------------------------------------
@@ -45,22 +45,9 @@ fn unknown_field_rejected() {
 }
 
 #[test]
-fn body_phase_defaults_to_pre_read_and_can_bind_upstream() {
+fn declares_dual_phase_body_access() {
     let filter = default_filter();
-    assert_eq!(
-        filter.request_body_access(),
-        BodyAccess::ReadOnly,
-        "legacy pipelines should retain pre-read rehydration"
-    );
-    assert_eq!(
-        filter.bound_upstream_request_body_access(),
-        BodyAccess::None,
-        "legacy pipelines should not require a bound upstream"
-    );
-
-    let yaml: serde_yaml::Value = serde_yaml::from_str("request_body_phase: bound_upstream").unwrap();
-    let filter = RehydrateFilter::from_config(&yaml).unwrap();
-    assert_eq!(filter.request_body_access(), BodyAccess::None);
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
     assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
 }
 

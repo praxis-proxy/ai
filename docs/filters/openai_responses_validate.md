@@ -13,14 +13,6 @@ Must be placed after `openai_responses_format` in the filter chain. Skips non-Re
 
 Generates metadata: `responses.response_id` (format: `resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, `responses.stream`.
 
-The default `pre_read` body phase preserves standalone pipelines. Use `request_body_phase: bound_upstream` only after an unconditional binding router when provider-aware conditions must gate this filter.
-
-## Configuration
-
-| Field | Type | Required | Description |
-|-------|------|---------|-------------|
-| `request_body_phase` | `pre_read` \| `bound_upstream` | no | Request-body lifecycle. Defaults to `pre_read`; use `bound_upstream` only after an unconditional binding router. |
-
 ## Example
 
 ```yaml

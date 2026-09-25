@@ -10,10 +10,7 @@ use serde::Deserialize;
 
 #[cfg(feature = "store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_set_identifiers};
-use crate::{
-    openai::RequestBodyPhase,
-    store::{PoolConfig, SslMode, validate_table_identifier},
-};
+use crate::store::{PoolConfig, SslMode, validate_table_identifier};
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_conversations";
@@ -57,15 +54,6 @@ pub(crate) struct ConversationsConfig {
     /// Table name for conversation item records.
     #[serde(default = "default_items_table")]
     pub items_table: String,
-
-    /// Lifecycle for body-bearing Conversations operations.
-    ///
-    /// The default `pre_read` mode supports standalone local-serving pipelines.
-    /// Use `bound_upstream` when this filter has a `bound_upstream` condition;
-    /// that mode requires an unconditional binding router earlier in the
-    /// pipeline.
-    #[serde(default)]
-    pub request_body_phase: RequestBodyPhase,
 
     /// TLS mode for `PostgreSQL` connections.
     ///

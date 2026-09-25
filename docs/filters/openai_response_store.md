@@ -9,7 +9,6 @@ Persists Responses API responses to the configured response store backend.
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
-| `request_body_phase` | `pre_read` \| `bound_upstream` | no | Request-body lifecycle. Defaults to `pre_read`; use `bound_upstream` only after an unconditional binding router. |
 | `backend` | `sqlite` \| `postgres` | yes | Storage backend to use. |
 | `database_url` | string (secret) | yes | Database connection URL. Wrapped in [`SecretString`] to prevent accidental logging of credentials. |
 | `responses_table` | string | yes | Table name for response records. |
