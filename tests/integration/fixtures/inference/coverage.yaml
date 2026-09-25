@@ -49,6 +49,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.response.invalid_tool_id
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/invalid-tool-id
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.streaming.usage
     scopes:
       - messages_to_chat_completions
@@ -274,6 +283,24 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.reasoning.request
+    scopes:
+      - responses_to_chat_completions
+    status: live_covered
+    scenarios:
+      - responses/chat-reasoning-nonstream
+    providers:
+      vllm:
+        status: live_covered
+  - id: responses.chat.reasoning.response
+    scopes:
+      - responses_to_chat_completions
+    status: live_covered
+    scenarios:
+      - responses/chat-reasoning-nonstream
+    providers:
+      vllm:
+        status: live_covered
   - id: responses.chat.malformed_compaction
     scopes:
       - responses_to_chat_completions
@@ -298,6 +325,25 @@ features:
     status: synthetic_only
     scenarios:
       - responses/chat-tool-echo
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.null_tool_choice
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-null-tool-choice
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.reasoning.replay
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-reasoning-replay
+      - responses/chat-reasoning-disabled
     providers:
       synthetic:
         status: synthetic_only

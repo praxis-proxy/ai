@@ -10,7 +10,7 @@
 """
 OpenAI SDK compatibility tests for the openai_conversations filter.
 
-Starts a Praxis proxy with an in-memory SQLite conversations store,
+Starts a Praxis proxy with a file-backed SQLite conversations store,
 then exercises the Conversations API using the official OpenAI Python
 SDK to verify wire-format compatibility.
 
@@ -21,6 +21,7 @@ Usage:
 """
 
 import base64
+import http.server
 import json
 import os
 import signal
@@ -28,6 +29,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import httpx
@@ -41,10 +43,11 @@ from openai import (
 )
 
 # When set to a postgres:// URL (the vllm-responses-postgres CI job), the
-# conversations store runs against PostgreSQL instead of the default in-memory
-# SQLite, so this suite exercises the same store backend as the responses tests.
+# conversations store runs against PostgreSQL instead of the default file-backed
+# SQLite, so this suite exercises the backend compiled into that job.
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 OWNER_HEADER = "x-authenticated-state-owner"
+PROXY_STARTUP_TIMEOUT = 30.0
 
 
 def _owner_assertion(subject: str) -> str:
@@ -95,42 +98,44 @@ def _find_tenant_binary() -> str:
     )
 
 
-def _conversations_filter() -> dict:
-    """Build the openai_conversations filter config for the configured store.
-
-    Defaults to in-memory SQLite; switches to PostgreSQL when DATABASE_URL is a
-    postgres:// URL, matching the responses tests' backend selection so both
-    suites cover the same store backend in CI.
-    """
-    cfg = {
-        "filter": "openai_conversations",
-        "conversations_table": "conversations",
-        "items_table": "conversation_items",
+def _conversations_filter(table_prefix: str, db_path: str) -> dict:
+    """Build the conversations store for the backend configured by CI."""
+    tables = {
+        "conversations_table": f"{table_prefix}_conversations",
+        "items_table": f"{table_prefix}_conversation_items",
     }
     if DATABASE_URL.startswith("postgres"):
-        cfg.update(
-            {
-                "backend": "postgres",
-                "database_url": DATABASE_URL,
-                # Local CI postgres service is loopback + non-TLS.
-                "allow_private_database_url": True,
-                "ssl_mode": "disable",
-            }
-        )
+        store = {
+            "backend": "postgres",
+            "database_url": DATABASE_URL,
+            # Local CI postgres service is loopback + non-TLS.
+            "allow_private_database_url": True,
+            "ssl_mode": "disable",
+        }
     else:
-        cfg.update(
-            {
-                "backend": "sqlite",
-                "database_url": "sqlite::memory:",
-                # Every pooled SQLite in-memory connection is a distinct
-                # database, so keep this SDK suite on one connection.
-                "pool": {"max_connections": 1},
-            }
-        )
-    return cfg
+        store = {
+            "backend": "sqlite",
+            # File-backed, not `sqlite::memory:`. A private in-memory
+            # database lives only as long as the single pooled connection
+            # that created it: if that connection is ever replaced, or the
+            # store is rebuilt on a runtime pipeline swap, the data vanishes
+            # and a just-created conversation 404s on the very next request
+            # (an intermittent, PR-independent flake in this session-scoped
+            # suite). An on-disk file keeps state alive across connection and
+            # store recreation.
+            "database_url": f"sqlite://{db_path}?mode=rwc",
+            "pool": {"max_connections": 1},
+        }
+    return {
+        "filter": "openai_conversations",
+        **store,
+        **tables,
+    }
 
 
-def _write_config(port: int, include_operation_classifier: bool = True) -> str:
+def _write_config(
+    port: int, db_path: str, include_operation_classifier: bool = True
+) -> str:
     filters = [
         {
             "filter": "state_owner",
@@ -140,7 +145,7 @@ def _write_config(port: int, include_operation_classifier: bool = True) -> str:
     ]
     if include_operation_classifier:
         filters.append({"filter": "openai_operation"})
-    filters.append(_conversations_filter())
+    filters.append(_conversations_filter(f"sdk_{port}", db_path))
 
     config = {
         "listeners": [
@@ -163,14 +168,11 @@ def _write_config(port: int, include_operation_classifier: bool = True) -> str:
     return path
 
 
-def _write_tenant_config(port: int) -> str:
-    conversations_filter = _conversations_filter()
-    conversations_filter.update(
-        {
-            "conversations_table": "tenant_test_conversations",
-            "items_table": "tenant_test_conversation_items",
-        }
-    )
+def _write_tenant_config(port: int, db_path: str) -> str:
+    # Keep the generated `{conversations}_unused_responses` identifier below
+    # PostgreSQL's 45-byte validation limit while retaining per-process
+    # isolation from the main SDK fixture.
+    conversations_filter = _conversations_filter(f"t_{port}", db_path)
     config = {
         "listeners": [
             {
@@ -196,65 +198,206 @@ def _write_tenant_config(port: int) -> str:
     return path
 
 
-def _wait_for_proxy(port: int, timeout: float = 10.0) -> None:
+class _ChunkedResponsesBackend(http.server.BaseHTTPRequestHandler):
+    """Return a successful Responses JSON object in two HTTP chunks."""
+
+    protocol_version = "HTTP/1.1"
+    response_body = json.dumps(
+        {
+            "id": "resp_sdk_chunked",
+            "created_at": 1000,
+            "model": "gpt-4.1",
+            "object": "response",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "chunked"},
+                    ],
+                },
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+        content_length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(content_length)
+
+        split_at = len(self.response_body) // 2
+        chunks = (self.response_body[:split_at], self.response_body[split_at:])
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        for chunk in chunks:
+            self.wfile.write(f"{len(chunk):x}\r\n".encode())
+            self.wfile.write(chunk)
+            self.wfile.write(b"\r\n")
+            self.wfile.flush()
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+    def log_message(self, _format, *_args):
+        return
+
+
+def _chunked_response_store_filters(db_path: str, port: int) -> tuple[dict, dict]:
+    """Build matching filters for the listener-level regression test."""
+    tables = {
+        "conversations_table": f"chunked_{port}_conversations",
+        "items_table": f"chunked_{port}_conversation_items",
+    }
+    if DATABASE_URL.startswith("postgres"):
+        store = {
+            "backend": "postgres",
+            "database_url": DATABASE_URL,
+            "allow_private_database_url": True,
+            "ssl_mode": "disable",
+        }
+    else:
+        store = {
+            "backend": "sqlite",
+            "database_url": f"sqlite://{db_path}?mode=rwc",
+            "pool": {"max_connections": 1},
+        }
+
+    conversations = {"filter": "openai_conversations", **store, **tables}
+    response_store = {
+        "filter": "openai_response_store",
+        **store,
+        "responses_table": f"chunked_{port}_responses",
+        "conversations_table": tables["conversations_table"],
+    }
+    return conversations, response_store
+
+
+def _write_chunked_response_config(port: int, backend_port: int, db_path: str) -> str:
+    conversations_filter, response_store_filter = _chunked_response_store_filters(db_path, port)
+    config = {
+        "listeners": [
+            {
+                "name": "responses-test",
+                "address": f"127.0.0.1:{port}",
+                "filter_chains": ["responses-test-pipeline"],
+            }
+        ],
+        "filter_chains": [
+            {
+                "name": "responses-test-pipeline",
+                "filters": [
+                    {
+                        "filter": "state_owner",
+                        "mode": "trusted_owner",
+                        "header": OWNER_HEADER,
+                    },
+                    conversations_filter,
+                    {"filter": "openai_responses_format"},
+                    response_store_filter,
+                    {
+                        "filter": "router",
+                        "routes": [
+                            {"path": "/v1/responses", "cluster": "responses-backend"}
+                        ],
+                    },
+                    {
+                        "filter": "load_balancer",
+                        "clusters": [
+                            {
+                                "name": "responses-backend",
+                                "endpoints": [f"127.0.0.1:{backend_port}"],
+                            }
+                        ],
+                    },
+                ],
+            }
+        ],
+        "insecure_options": {"allow_private_endpoints": True},
+    }
+    fd, path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(fd, "w") as f:
+        json.dump(config, f)
+    return path
+
+
+def _wait_for_proxy(
+    port: int,
+    process: subprocess.Popen | None = None,
+    timeout: float = PROXY_STARTUP_TIMEOUT,
+) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            stderr = process.stderr.read().strip() if process.stderr is not None else ""
+            raise RuntimeError(
+                f"proxy exited with status {process.returncode} before binding: {stderr}"
+            )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                 return
         except OSError:
             time.sleep(0.1)
-    raise TimeoutError(f"proxy did not start within {timeout}s")
+    raise TimeoutError(
+        f"proxy did not start within {timeout}s"
+        + (f" (process status: {process.poll()})" if process is not None else "")
+    )
 
 
 @pytest.fixture(scope="session")
 def praxis_proxy():
     """Start a Praxis proxy for the test session and tear it down after."""
-    port = _free_port()
-    config_path = _write_config(port)
-    binary = _find_binary()
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        db_path = os.path.join(db_dir, "conversations.db")
+        config_path = _write_config(port, db_path)
+        binary = _find_binary()
 
-    proc = subprocess.Popen(
-        [binary, "-c", config_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        _wait_for_proxy(port)
-        yield port
-    finally:
-        proc.send_signal(signal.SIGINT)
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        os.unlink(config_path)
+            _wait_for_proxy(port, proc)
+            yield port
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
 
 
 @pytest.fixture(scope="session")
 def classifier_missing_proxy():
     """Start Praxis with the Conversations dependency deliberately omitted."""
-    port = _free_port()
-    config_path = _write_config(port, include_operation_classifier=False)
-    binary = _find_binary()
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        db_path = os.path.join(db_dir, "conversations.db")
+        config_path = _write_config(port, db_path, include_operation_classifier=False)
+        binary = _find_binary()
 
-    proc = subprocess.Popen(
-        [binary, "-c", config_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        _wait_for_proxy(port)
-        yield port
-    finally:
-        proc.send_signal(signal.SIGINT)
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        os.unlink(config_path)
+            _wait_for_proxy(port)
+            yield port
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
 
 
 @pytest.fixture(scope="session")
@@ -267,6 +410,50 @@ def openai_client(praxis_proxy):
         max_retries=0,
         timeout=10.0,
     )
+
+
+@pytest.fixture
+def chunked_response_client():
+    """Start a composed response-store/Conversations proxy and chunked backend."""
+    backend = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _ChunkedResponsesBackend
+    )
+    backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    backend_thread.start()
+
+    with tempfile.TemporaryDirectory() as db_dir:
+        proxy_port = _free_port()
+        db_path = os.path.join(db_dir, "responses.db")
+        config_path = _write_chunked_response_config(
+            proxy_port, backend.server_port, db_path
+        )
+        binary = _find_binary()
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _wait_for_proxy(proxy_port, proc)
+            yield OpenAI(
+                api_key="not-needed",
+                base_url=f"http://127.0.0.1:{proxy_port}/v1",
+                default_headers={OWNER_HEADER: _owner_assertion("alice")},
+                max_retries=0,
+                timeout=10.0,
+            )
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
+            backend.shutdown()
+            backend.server_close()
+            backend_thread.join(timeout=5)
 
 
 @pytest.fixture(scope="session")
@@ -285,25 +472,28 @@ def other_owner_client(praxis_proxy):
 def tenant_praxis_proxy():
     """Start Praxis with deterministic test credentials mapped to tenants."""
     binary = _find_tenant_binary()
-    port = _free_port()
-    config_path = _write_tenant_config(port)
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        db_path = os.path.join(db_dir, "conversations.db")
+        config_path = _write_tenant_config(port, db_path)
 
-    proc = subprocess.Popen(
-        [binary, "-c", config_path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        _wait_for_proxy(port)
-        yield port
-    finally:
-        proc.send_signal(signal.SIGINT)
+        proc = subprocess.Popen(
+            [binary, "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-        os.unlink(config_path)
+            _wait_for_proxy(port, proc)
+            yield port
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
 
 
 @pytest.fixture(scope="session")
@@ -347,6 +537,19 @@ class TestOpenAIConversations:
         assert conversation.metadata["topic"] == "demo"
         assert isinstance(conversation.created_at, int)
         assert conversation.created_at > 0
+
+    def test_chunked_response_is_retrievable_with_composed_filters(
+        self, chunked_response_client
+    ):
+        response = chunked_response_client.responses.create(
+            model="gpt-4.1",
+            input="Hello",
+        )
+
+        assert response.id == "resp_sdk_chunked"
+        retrieved = chunked_response_client.responses.retrieve(response.id)
+        assert retrieved.id == response.id
+        assert retrieved.status == "completed"
 
     def test_conversation_create_no_metadata(self, openai_client):
         conversation = openai_client.conversations.create()

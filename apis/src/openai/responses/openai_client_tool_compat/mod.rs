@@ -2409,15 +2409,15 @@ fn carry_caller(out: &mut Value, source: &Value) {
 /// Restore the client's original `tools`/`tool_choice` onto an echoed response
 /// from the pre-lowering snapshot, keeping private lowered `function` names out
 /// of client-visible output (#1159). Infallible: a `None` echo or a non-object
-/// response is a no-op. A `Null` snapshot `tool_choice` means the client never
-/// sent one, so the echoed field is REMOVED rather than set to null.
+/// response is a no-op. A `Null` snapshot `tool_choice` means the client sent
+/// `null` or omitted `tool_choice`, so the echoed field is normalized to `"auto"`.
 pub(crate) fn restore_snapshot_tools(response: &mut Value, echo: Option<&ClientToolEcho>) {
     let (Some(echo), Some(object)) = (echo, response.as_object_mut()) else {
         return;
     };
     object.insert("tools".to_owned(), Value::Array(echo.tools.clone()));
     if echo.tool_choice.is_null() {
-        object.remove("tool_choice");
+        object.insert("tool_choice".to_owned(), Value::String("auto".to_owned()));
     } else {
         object.insert("tool_choice".to_owned(), echo.tool_choice.clone());
     }

@@ -19,6 +19,9 @@ build to run; the same invocation runs inside the report stage of
 | `cargo xtask fips verify-image REFERENCE` | `fips-verify-image` (run by `container-fips` and `fips-check` first) | Refuses any base image that is not digest-pinned, from `registry.access.redhat.com`, and signed by Red Hat's release key. |
 | `cargo xtask fips signature-store [--install]` | `fips-signature-store` | Whether podman's `registries.d` names Red Hat's signature store, without which every Red Hat image looks unsigned; `--install` adds the bundled entry for the current user on hosts whose podman packaging ships none (Debian, Ubuntu, GitHub's runners). CI runs it before `fips-verify-image`. |
 | `check-payload scan image ...` | `fips-scanner`, `fips-oc`, `fips-scan` | Red Hat's own scanner at a pinned revision, run against the FIPS image with warnings fatal: the actual gate. |
+| `cargo xtask fips host-check [--image IMAGE] [--require-certified] [--out FILE] [--json FILE]` | `fips-host-check` | The FIPS-host attestation: the kernel flag, `fips=1` on the command line, the `FIPS` crypto policy, `fips-mode-setup --check`, the module the host's OpenSSL loads; with `--image`, the crypto policy podman propagates into the container and the build of `fips.so` inside it, graded against `certified-modules.json`. Exit 1 on any unmet requirement; a module in validation warns unless `--require-certified`. |
+| `cargo xtask fips runtime-probe IMAGE [--toolchain-image IMAGE] [--host-cargo] [--log FILE]` | `fips-runtime-probe` | Runs the shipped FIPS image under `PRAXIS_REQUIRE_FIPS=1` with a generated listener config, waits for a real TLS handshake, drives the `fips::listener_` probes of the integration suite against it (from the toolchain image, or with the host's cargo), and checks the startup status line reports FIPS on both signals. |
+| `PRAXIS_TEST_FIPS_PROVIDER=1 cargo test ... --config 'target."cfg(all())".runner=["env","OPENSSL_CONF=$PWD/xtask/assets/fips/fips-provider.cnf"]'` | `test-fips-provider` | The FIPS feature set's unit tests with the RHEL FIPS provider active (`fips=yes` default properties) in every test process, so the digests and MACs the code computes, `aws_sigv4_sign`'s HMAC-SHA256 included, have to come from the provider. The runner sets `OPENSSL_CONF` on the test binaries only: cargo itself (its libgit2) cannot run under it, which is also why only lib and bin unit tests run. The path must be absolute (cargo runs each test binary from its package directory) and OpenSSL silently ignores a configuration file it cannot find, so `PRAXIS_TEST_FIPS_PROVIDER` makes the apis and filters test processes assert that the provider reports FIPS-approved default properties and refuses MD5; a run that never reached the provider fails instead of passing. Needs the host's `fips.so`. The UBI 9 report stage (`fips-check`) runs the crypto tests (`hash::`, `aws::`) the same way. |
 
 ## What the report checks
 
@@ -27,8 +30,10 @@ build to run; the same invocation runs inside the report stage of
    dependency graph, resolved for the assessed feature set. `--deps-only`
    stops here; this is what `make lint` runs. Every finding names the ai
    feature that pulls the crate (the stores through sqlx, the reqwest-based
-   filters, AWS SigV4, the policy engine), so the fix is usually a line in
-   `FIPS_FEATURES`.
+   filters, the policy engine), so the fix is usually a line in
+   `FIPS_FEATURES`. A `sha2` or `hmac` finding that names `aws-sigv4` means
+   the crate escaped `dev-dependencies`: `aws_sigv4_sign` signs through
+   OpenSSL and only tests against it.
 2. **Binary**: links the system `libcrypto.so.3` dynamically, defines no
    symbol of a bundled crypto backend (`ring_core_`, `aws_lc_`, `BORINGSSL_`,
    `OPENSSL_`), imports OpenSSL, carries the cargo-auditable manifest
@@ -50,6 +55,7 @@ From `xtask/assets/fips/`:
 | `redhat-release-key-2.asc` | Red Hat, Inc. (release key 2), the GPG key Red Hat signs its container images with. See provenance below. |
 | `registry.access.redhat.com.yaml` | The `registries.d` entry that tells podman where Red Hat's signature store is. podman reads only its own `registries.d` (`~/.config/containers/registries.d` when it exists, else `/etc/containers/registries.d`), so `verify-image` checks the directory podman reads names the store, and `signature-store --install` (`make fips-signature-store`) writes this file into the user's directory when it does not. Fedora and RHEL ship the same entry in containers-common; Debian and Ubuntu ship no `registries.d` at all. |
 | `fips-provider.cnf` | An `OPENSSL_CONF` that activates the RHEL FIPS provider for one process, used by the report to probe FIPS behaviour on hosts that are not in FIPS mode. Test infrastructure only; the application never enables FIPS itself. |
+| `certified-modules.json` | The builds of Red Hat's OpenSSL FIPS provider module, by the version string the module reports, with their CMVP status and sources. `host-check` grades the module a host or an image carries against it: a build on an active certificate passes, one in validation is stated as such (the pinned UBI 9 images currently carry one), one unknown is a finding. Re-verify the sources when a UBI pin or a RHEL release changes. |
 
 ### Provenance of the signing key
 
@@ -144,6 +150,63 @@ Hat's gated scans. All of this needs a Linux podman, rootless or root, not a
 podman machine. Point `CHECK_PAYLOAD` at another build to use it instead.
 Move `CHECK_PAYLOAD_REV` forward once the PR merges or a release carries
 Rust support.
+
+## The FIPS host run
+
+`make test-fips-host` is the runtime proof: on a RHEL 9 host in FIPS mode it
+runs `make test-fips test-integration-fips test-schema-fips` inside the
+`toolchain` stage of `Containerfile.fips` (`make fips-toolchain`), so the
+compiler and OpenSSL are the same Red Hat packages the FIPS image is built
+with, while the kernel flag and the `FIPS` crypto policy are the host's,
+which podman passes into the container. The run first prints
+`make fips-host-facts`: the kernel flag, boot parameter, crypto policy,
+OpenSSL packages and providers, and whether MD5 is refused, and fails there,
+before anything compiles, unless they all agree that the container is in
+FIPS mode.
+
+Three variables drive the suites. `PRAXIS_FIPS_HOST=1` declares the host to
+be in FIPS mode: the harness then fails closed the first time it installs
+the crypto provider on a host that is not, and every FIPS behavior test
+(`tests/integration/tests/suite/fips.rs`, `server/tests/fips_required.rs`)
+insists on its approved-mode branch instead of keying on whatever the
+provider reports. `PRAXIS_REQUIRE_FIPS=1` makes every proxy the suites start
+enforce FIPS mode. `PRAXIS_TEST_FIPS_PROVIDER=1` arms the hash and
+`aws_sigv4_sign` unit tests' assertion that the provider is in approved
+mode. The cargo home and target directory live in the named volumes
+`praxis-ai-fips-host-cargo` and `praxis-ai-fips-host-target`, so a second
+run is incremental; the container runs as the invoking user
+(`--userns=keep-id`), because praxis-ai refuses to start as root.
+
+On a developer machine that is not in FIPS mode, `make test-integration-fips`
+and `make test-schema-fips` still run the same suites as the FIPS build; the
+FIPS behavior tests then assert their non-approved branch, so both sides of
+every expectation stay exercised everywhere.
+
+## The runner job
+
+The `fips-host` job of the `FIPS` workflow runs on a self-hosted RHEL 9
+runner in FIPS mode, selected by the labels `fips` and `rhel`. It tests the
+exact image the hosted `ubi-image` job built and scanned, handed over as an
+artifact and checked by image id, then runs `make fips-host-check`,
+`make test-fips-host` and `make fips-runtime-probe` through
+`.github/actions/fips-host`; the release workflow requires a recorded green
+`fips-host` run for the exact commit being released (its `fips-proof` gate
+polls out a run still in flight) and runs the same composite action (without
+the suites) against the pushed `-fips` image, pulled by digest. That digest
+attestation runs alongside the release rather than gating it: an offline
+runner leaves a self-hosted job queued, never skipped, so it reports red on
+the release run instead of holding the release back. Releasing without the
+recorded proof takes the release workflow's explicit `skip-fips-proof`
+dispatch input, so a runner outage is a visible maintainer decision, never
+a silent pass.
+
+The runner needs `git`, `make`, `podman` (rootless), `gnupg2`, `gcc`,
+`gcc-c++`, `cmake` and `openssl-devel`, checked up front by
+`.github/actions/fips-runner-check`, and its runner group must grant this
+repository access. The job never runs a fork's code (same-repository pull
+requests only) and never runs in the merge queue, so queue throughput does
+not depend on the single runner. The attestation and the probe log are
+uploaded as artifacts on every run.
 
 ## Updating the pinned base image
 

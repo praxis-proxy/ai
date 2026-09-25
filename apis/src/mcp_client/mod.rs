@@ -7,6 +7,7 @@
 //! MCP tool declarations. Designed for reuse by `mcp_tool` (#27)
 //! when `call_tool` support is added.
 
+mod session_pool;
 mod sse_adapter;
 mod streaming_selector;
 mod subrequest_transport;
@@ -30,6 +31,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     net::{IpAddr, Ipv4Addr},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -42,9 +44,12 @@ use rmcp::{
 use secrecy::{ExposeSecret as _, SecretString};
 
 pub use self::streaming_selector::McpStreamingSelectorFilter;
-use self::subrequest_transport::MAX_CONTROL_RESPONSE_BYTES;
-pub(crate) use self::subrequest_transport::{
-    McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
+use self::{session_pool::PooledSession, subrequest_transport::MAX_CONTROL_RESPONSE_BYTES};
+pub(crate) use self::{
+    session_pool::{McpPoolKey, McpPoolNamespace, McpSessionPool},
+    subrequest_transport::{
+        McpCallout, bind_mcp_outbound_chain, build_bare_outbound_pipeline, transport_signal_error, validate_mcp_target,
+    },
 };
 use crate::StateOwner;
 
@@ -453,6 +458,7 @@ pub(crate) async fn call_tool(
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
     call_tool_with_forwarded_headers(
+        None,
         server_url,
         headers,
         authorization,
@@ -468,14 +474,123 @@ pub(crate) async fn call_tool(
     .await
 }
 
-/// Call `tools/call` with an additional trusted, operator-allowlisted header
-/// set. Forwarded values override same-named client tool-entry headers.
+/// Open and initialize a fresh MCP session for a `tools/call` target.
+///
+/// Builds the subrequest-backed rmcp client, captures its signal handle before
+/// the client is moved into the transport (so a `ResponseTooLarge`/`SsrfBlocked`
+/// classification recorded during the exchange — which rmcp otherwise discards —
+/// can be read back), and runs the `initialize` handshake. No upfront SSRF
+/// classifier: the subrequest transport validates the dial target during the
+/// callout via `prepare_url_target`, so this path resolves DNS exactly once.
+///
+/// This does not apply a timeout; the caller bounds the handshake.
 #[expect(
     clippy::too_many_arguments,
-    reason = "trusted forwarded headers extend the existing API"
+    reason = "mirrors the tool-call boundary's forwarded-header + connector context inputs"
 )]
-#[expect(clippy::too_many_lines, reason = "transport setup + call follows list_tools pattern")]
+async fn open_tool_session(
+    server_url: &str,
+    headers: Option<&serde_json::Value>,
+    authorization: Option<&str>,
+    forwarded_header_names: &[http::HeaderName],
+    forwarded_headers: Option<&http::HeaderMap>,
+    connector_context: Option<&McpConnectorContext<'_>>,
+    timeout: Duration,
+    max_result_bytes: usize,
+    callout: &McpCallout,
+    display_url: &McpDisplayUrl,
+) -> Result<PooledSession, McpClientError> {
+    let mcp_client = subrequest_transport::McpSubrequestClient::for_tool(
+        callout.clone(),
+        timeout,
+        max_result_bytes,
+        connector_context.map(|context| context.owner.clone()),
+    );
+    let signal = mcp_client.signal_handle();
+    let signal_state = mcp_client.signal_state();
+    let transport = StreamableHttpClientTransport::with_client(
+        mcp_client,
+        build_transport_config_with_forwarded_headers(
+            server_url,
+            headers,
+            authorization,
+            forwarded_header_names,
+            forwarded_headers,
+            connector_context,
+        )?,
+    );
+    // A pre-serve initialization failure owns no `RunningService`; dropping the
+    // failed `serve` future drops its transport without starting the worker.
+    let service = Box::pin(().serve(transport)).await.map_err(|_source| {
+        transport_signal_error(&signal, display_url).unwrap_or_else(|| McpClientError::Connection {
+            url: display_url.clone(),
+        })
+    })?;
+    signal_state.finish_exchange(&signal);
+    Ok(PooledSession::new(service, signal_state, max_result_bytes))
+}
+
+/// Issue one `tools/call` on an already-initialized session without closing it.
+///
+/// `initialize` uses the control ceiling; the `tools/call` result is bounded to
+/// the configured `max_result_bytes` cap (expanded for worst-case JSON string
+/// escaping) before deserialization, applied inside the session's transport.
+async fn invoke_tool(
+    session: &PooledSession,
+    signal: &Arc<OnceLock<subrequest_transport::TransportSignal>>,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    display_url: &McpDisplayUrl,
+) -> Result<rmcp::model::CallToolResult, McpClientError> {
+    let parsed_args = match arguments {
+        serde_json::Value::Object(obj) => Some(obj),
+        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&s).ok(),
+        _ => None,
+    };
+    let mut params = CallToolRequestParams::new(tool_name.to_owned());
+    if let Some(args_obj) = parsed_args {
+        params = params.with_arguments(args_obj);
+    }
+    Box::pin(session.service().call_tool(params)).await.map_err(|_source| {
+        transport_signal_error(signal, display_url).unwrap_or_else(|| McpClientError::CallTool {
+            url: display_url.clone(),
+            tool_name: tool_name.to_owned(),
+        })
+    })
+}
+
+/// Call `tools/call` with an additional trusted, operator-allowlisted header
+/// set, optionally reusing an initialized session from `pool` (#1019).
+///
+/// Forwarded values override same-named client tool-entry headers.
+///
+/// When `pool` is `Some((pool, key))`, a warm session for
+/// that exact identity is reused (skipping the handshake) and returned to the
+/// pool after a clean call. A failure on a *reused* session evicts (closes) it
+/// and surfaces the error **without** a fresh retry: rmcp already reinitializes
+/// and retries a server-invalidated (404 `SessionExpired`) session transparently,
+/// so any error observed here is a genuine failure of unknown delivery — a
+/// timeout or 5xx cannot prove the tool was not already executed, and blindly
+/// retrying would risk duplicating a non-idempotent side effect. The single
+/// reused attempt is bounded by one `timeout`, so a logical call never exceeds
+/// its configured deadline. A restarted server that rejects the old session
+/// with a non-404 status therefore surfaces an error rather than opening a fresh
+/// session automatically. Fresh sessions are pooled on success and closed on any
+/// error; a `None` pool never reuses or retains a session.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "trusted forwarded headers and optional pooling extend the existing API"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "reuse attempt and fresh open share one boundary with distinct cleanup on each exit"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "rmcp service setup and explicit success/error cleanup remain in one async ownership boundary"
+)]
 pub(crate) async fn call_tool_with_forwarded_headers(
+    pool: Option<(&McpSessionPool, &McpPoolKey)>,
     server_url: &str,
     headers: Option<&serde_json::Value>,
     authorization: Option<&str>,
@@ -488,74 +603,109 @@ pub(crate) async fn call_tool_with_forwarded_headers(
     max_result_bytes: usize,
     callout: &McpCallout,
 ) -> Result<rmcp::model::CallToolResult, McpClientError> {
-    // No upfront SSRF classifier: the subrequest transport validates the
-    // dial target during the callout via `prepare_url_target`, so this path
-    // resolves DNS exactly once. `initialize` uses the control ceiling; the
-    // `tools/call` result is bounded to the configured `max_result_bytes` cap
-    // (expanded for worst-case JSON string escaping) before deserialization.
     let display_url = parse_display_url(server_url);
-    let mcp_client = subrequest_transport::McpSubrequestClient::for_tool(
-        callout.clone(),
-        timeout,
-        max_result_bytes,
-        connector_context.map(|context| context.owner.clone()),
-    );
-    // Take the signal handle before the client is moved into the rmcp
-    // transport, so a `ResponseTooLarge` or `SsrfBlocked` classification
-    // recorded during the exchange (which rmcp otherwise discards) can be
-    // read back below.
-    let signal = mcp_client.signal_handle();
-    let transport = StreamableHttpClientTransport::with_client(
-        mcp_client,
-        build_transport_config_with_forwarded_headers(
+    let deadline = tokio::time::Instant::now() + timeout;
+    // 1. Reuse a warm session for this exact identity, if one exists. A reused session only ever existed after a prior
+    //    clean success. Checkout rejects closed, expired, or limit-mismatched sessions before any request is sent;
+    //    those sessions are explicitly closed in the background so their DELETE cannot consume this call's delivery
+    //    deadline, and a miss safely falls through to a fresh open. Each attempt installs a fresh transport signal so
+    //    an idle GET-stream failure cannot poison this call.
+    if let Some((pool, key)) = pool {
+        let checkout = pool.checkout(key, max_result_bytes);
+        session_pool::close_sessions_in_background(checkout.rejected);
+        if let Some(session) = checkout.session {
+            let signal = session.begin_call();
+            let outcome = tokio::time::timeout_at(
+                deadline,
+                invoke_tool(&session, &signal, tool_name, arguments, &display_url),
+            )
+            .await;
+            session.finish_call(&signal);
+            return match outcome {
+                Ok(Ok(result)) => {
+                    let rejected = pool.checkin(key.clone(), session);
+                    session_pool::close_sessions_in_background(rejected);
+                    Ok(result)
+                },
+                // A reused session's failure is evicted, never retried: rmcp already transparently reinitializes a 404
+                // `SessionExpired` session, so any error surfaced here is genuine and of unknown delivery — retrying a
+                // timeout or 5xx could execute a non-idempotent tool twice (at-most-once for the reused path).
+                Ok(Err(err)) => {
+                    session.close_before(deadline).await;
+                    Err(err)
+                },
+                Err(_elapsed) => {
+                    // Read the signal (an oversized/SSRF exchange surfaced only when the deadline fired) before
+                    // closing.
+                    session.close_before(deadline).await;
+                    Err(classify_deadline(&signal, &display_url, timeout))
+                },
+            };
+        }
+    }
+
+    // 2. Fresh session: first use, a `None` pool, or the empty-fingerprint sentinel. Close (not drop) the service on
+    //    every post-serve exit so no background worker task is left holding our subrequest executor.
+    let mut session: Option<PooledSession> = None;
+    let mut call_signal = None;
+    let outcome = tokio::time::timeout_at(deadline, async {
+        let opened = open_tool_session(
             server_url,
             headers,
             authorization,
             forwarded_header_names,
             forwarded_headers,
             connector_context,
-        )?,
-    );
-
-    let mut running: Option<RunningService<RoleClient, ()>> = None;
-    let outcome = tokio::time::timeout(timeout, async {
-        let client = Box::pin(().serve(transport)).await.map_err(|_source| {
-            transport_signal_error(&signal, &display_url).unwrap_or_else(|| McpClientError::Connection {
-                url: display_url.clone(),
-            })
-        })?;
-        let client = running.insert(client);
-
-        let parsed_args = match arguments {
-            serde_json::Value::Object(obj) => Some(obj),
-            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&s).ok(),
-            _ => None,
-        };
-        let mut params = CallToolRequestParams::new(tool_name.to_owned());
-        if let Some(args_obj) = parsed_args {
-            params = params.with_arguments(args_obj);
-        }
-
-        Box::pin(client.call_tool(params)).await.map_err(|_source| {
-            transport_signal_error(&signal, &display_url).unwrap_or_else(|| McpClientError::CallTool {
-                url: display_url.clone(),
-                tool_name: tool_name.to_owned(),
-            })
-        })
+            timeout,
+            max_result_bytes,
+            callout,
+            &display_url,
+        )
+        .await?;
+        let opened = session.insert(opened);
+        let signal = opened.begin_call();
+        call_signal = Some(Arc::clone(&signal));
+        invoke_tool(opened, &signal, tool_name, arguments, &display_url).await
     })
     .await;
 
-    // Close (not drop) the service on every post-serve exit so no background
-    // worker task is left holding our subrequest executor. A pre-serve
-    // initialization failure owns no `RunningService`; dropping the failed
-    // `serve` future drops its transport without starting the service worker.
-    if let Some(mut client) = running {
-        drop(client.close().await);
+    if let (Some(session), Some(signal)) = (session.as_ref(), call_signal.as_ref()) {
+        session.finish_call(signal);
     }
 
     match outcome {
-        Ok(result) => result,
-        Err(_elapsed) => Err(classify_deadline(&signal, &display_url, timeout)),
+        Ok(Ok(result)) => {
+            match (pool, session.take()) {
+                (Some((pool, key)), Some(session)) => {
+                    let rejected = pool.checkin(key.clone(), session);
+                    session_pool::close_sessions_in_background(rejected);
+                },
+                (None, Some(session)) => session.close_before(deadline).await,
+                (_, None) => {},
+            }
+            Ok(result)
+        },
+        Ok(Err(err)) => {
+            if let Some(session) = session.take() {
+                session.close_before(deadline).await;
+            }
+            Err(err)
+        },
+        Err(_elapsed) => {
+            // Read the signal (if the handshake completed) before closing, so an
+            // oversized/SSRF exchange surfaced only when the deadline fired still
+            // maps to its typed error.
+            if let Some(session) = session.take() {
+                session.close_before(deadline).await;
+            }
+            Err(call_signal.map_or_else(
+                || McpClientError::Timeout {
+                    url: display_url.clone(),
+                    timeout,
+                },
+                |signal| classify_deadline(&signal, &display_url, timeout),
+            ))
+        },
     }
 }
 
@@ -612,7 +762,7 @@ async fn paginate_tools(
 /// response, surfaced only when the outer deadline fired) becomes its typed
 /// error (413 for a size breach); otherwise a generic timeout.
 fn classify_deadline(
-    signal: &std::sync::Arc<std::sync::OnceLock<subrequest_transport::TransportSignal>>,
+    signal: &Arc<OnceLock<subrequest_transport::TransportSignal>>,
     url: &McpDisplayUrl,
     timeout: Duration,
 ) -> McpClientError {
@@ -666,7 +816,7 @@ fn build_transport_config_with_forwarded_headers(
     // so construct via `default()` then set the public field.
     let mut backoff = rmcp::transport::common::client_side_sse::ExponentialBackoff::default();
     backoff.max_times = Some(3);
-    config.retry_config = std::sync::Arc::new(backoff);
+    config.retry_config = Arc::new(backoff);
     let mut header_map = HashMap::new();
 
     if let Some(headers_obj) = headers.and_then(serde_json::Value::as_object) {

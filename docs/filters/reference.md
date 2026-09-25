@@ -52,14 +52,21 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_response_store`](openai_response_store.md) | Persists Responses API responses to the configured response store backend. |
 | [`openai_responses_compact`](openai_responses_compact.md) | Summarizes conversation history when the token count exceeds a configured threshold. |
 | [`openai_responses_format`](openai_responses_format.md) | Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body. |
-| [`openai_responses_model_rewrite`](openai_responses_model_rewrite.md) | Rewrites the `model` field in Responses API request bodies. |
+| [`openai_responses_model_rewrite`](openai_responses_model_rewrite.md) | Rewrites the `model` field in Responses and Chat Completions request bodies. |
 | [`openai_responses_proxy`](openai_responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
 | [`openai_responses_rehydrate`](openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |
+| [`openai_responses_request`](openai_responses_request.md) | Processes the Responses create request body once and initializes state. |
 | [`openai_responses_validate`](openai_responses_validate.md) | Validates and enriches Responses API requests. |
 | [`openai_stream_events`](openai_stream_events.md) | Composes the current IRR execution into one logical Responses stream. |
 | [`openai_tool_parse`](openai_tool_parse.md) | Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body. |
 | [`openai_web_search`](openai_web_search.md) | Web search filter for model-driven `web_search_call` dispatch. |
 | [`responses_to_chat_completions`](responses_to_chat_completions.md) | Translates canonical Responses create requests for a Chat Completions backend. |
+
+### Vertex
+
+| Filter | Description |
+|--------|-------------|
+| [`openai_chat_completions_to_vertexai_gemini`](openai_chat_completions_to_vertexai_gemini.md) | Transforms OpenAI Chat Completions requests into Vertex AI Gemini `generateContent` format and translates responses back. |
 
 ## Cross-Provider Filters (praxis-ai-filters)
 

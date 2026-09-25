@@ -53,14 +53,21 @@ auto_permission_mode = "auto"
 # Praxis/vLLM does not implement Anthropic's server-side classifier protocol.
 # Force Claude Code to initiate classifier model requests through Praxis.
 auto_mode_server = "0"
+# Claude Code 2.1.278 reserves this fixed output budget for client-initiated
+# classifier requests, independently of max_output_tokens below. vLLM reports
+# an over-limit prompt as "at least" max_model_len - 2,112 + 1 tokens, so the
+# 14,273- and 16,321-token diagnostics observed at 16K and 18K were lower bounds,
+# not the classifier's true prompt size. Match the client's pinned 32K planning
+# window. The vLLM flags below reclaim CUDA-graph memory and dedicate the A10G to
+# this single-request acceptance workload so the window fits.
+auto_minimum_backend_context_tokens = 32768
 # Claude Code 2.1.278 otherwise asks for 32K output tokens. Pin its supported
 # environment overrides to the real vLLM window so the request is valid without
 # overcommitting the 24GB GPU. The acceptance task needs only short tool calls
 # and a final summary.
 max_output_tokens = 2048
-# Keep Claude Code's normal planning context so it does not compact after each
-# small tool result. Actual requests remain bounded by the 16K vLLM window and
-# the separate 2K output cap above.
+# Keep Claude Code's planning context aligned with the real backend window so it
+# does not compact after each small tool result.
 max_context_tokens = 32768
 flags = [
   "--tools", "Read,Edit,Bash",
@@ -93,18 +100,20 @@ served_model_name = "qwen3-8b"
 # pin, so it does not gate the nightly. A follow-up may additionally pass
 # `--revision <sha>` once recorded.
 model_revision = "TBD-at-qualification"
-# Serving parameters (mirror the GPU full suite).
+# Serving parameters. Claude auto-mode classification needs the full planning
+# window advertised to the client.
 tool_call_parser = "hermes"
-context_length = 16384
+context_length = 32768
 seed = 0
 
-# vLLM launch flags recorded for reproducibility, mirroring the GPU full suite's
-# launch so both jobs load identical Qwen3-8B weights from the shared on-disk HF
-# cache. Native Anthropic Messages serving is on by default in this image; no
-# extra flag enables it, and the default OpenAI Chat Completions surface remains
-# available for the transformed path. Thinking is disabled by default for this
-# deterministic coding task: otherwise Qwen3 can consume the entire Claude Code
-# turn budget reasoning about which tool to call without issuing the call.
+# vLLM launch flags recorded for reproducibility. They mirror the GPU full-suite
+# launch except for its single-request memory tuning, and both jobs load identical
+# Qwen3-8B weights from the shared on-disk HF cache. Native Anthropic Messages
+# serving is on by default in this image; no extra flag enables it, and the
+# default OpenAI Chat Completions surface remains available for the transformed
+# path. Thinking is disabled by default for this deterministic coding task:
+# otherwise Qwen3 can consume the entire Claude Code turn budget reasoning about
+# which tool to call without issuing the call.
 #
 # `--model` is REQUIRED: without it vLLM has no weights to load and never becomes
 # ready. Do NOT add `--served-model-name` or `--api-key` here; the CI container
@@ -113,12 +122,13 @@ seed = 0
 [vllm.launch]
 flags = [
   "--model", "Qwen/Qwen3-8B",
-  "--max-model-len", "16384",
+  "--max-model-len", "32768",
   "--enable-auto-tool-choice",
   "--tool-call-parser", "hermes",
   "--reasoning-parser", "qwen3",
   "--default-chat-template-kwargs", '{"enable_thinking":false}',
-  "--gpu-memory-utilization", "0.9",
+  "--gpu-memory-utilization", "0.97",
+  "--enforce-eager",
   "--seed", "0",
 ]
 

@@ -3,7 +3,10 @@
 
 //! Unit tests for the `openai_mcp_dispatch` filter.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use bytes::Bytes;
 use praxis_filter::FilterAction;
@@ -89,6 +92,10 @@ fn mcp_call_ids_must_be_present_nonempty_and_unique() {
 }
 
 fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecutionOptions<'static> {
+    // These tests dial unreachable/loopback targets so no call ever succeeds and
+    // nothing is ever pooled; a shared empty pool is inert here.
+    static POOL: OnceLock<crate::mcp_client::McpSessionPool> = OnceLock::new();
+    static NAMESPACE: OnceLock<crate::mcp_client::McpPoolNamespace> = OnceLock::new();
     McpExecutionOptions {
         parallel,
         max_parallel_calls: 8,
@@ -98,6 +105,8 @@ fn execution_options(parallel: bool, timeout: std::time::Duration) -> McpExecuti
         forwarded_header_names: &[],
         forwarded_headers: None,
         connector_identity: None,
+        session_pool: POOL.get_or_init(crate::mcp_client::McpSessionPool::new),
+        pool_namespace: *NAMESPACE.get_or_init(crate::mcp_client::McpPoolNamespace::new),
     }
 }
 

@@ -82,6 +82,7 @@ zstd = { workspace = true, optional = true }
 allocation-counter = { workspace = true }
 axum = { workspace = true }
 rcgen = { workspace = true }
+reqwest = { workspace = true }
 rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
 rustls = { workspace = true }
 schemars = { workspace = true }

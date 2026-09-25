@@ -50,15 +50,28 @@ Praxis AI targets FIPS 140-3 on Red Hat Enterprise Linux by performing all
 cryptography in the RHEL OpenSSL FIPS provider. The published build
 (`make release`, `make container`) enables every non-experimental filter.
 The FIPS build turns off what is known not to be compliant yet (the policy
-engine, AWS SigV4 signing, the response stores and the reqwest-based
-filters; the Makefile's FIPS section says why for each), so nobody has to
-know which features to pick. The feature set is defined once, as
+engine, the response stores and the reqwest-based filters; the Makefile's
+FIPS section says why for each), so nobody has to know which features to
+pick. The feature set is defined once, as
 `FIPS_FEATURES` in the `Makefile`:
 
 ```console
 make release-fips    # FIPS build, release profile, into target/fips
 make build-fips      # same, debug profile, without the crate manifest
 make container-fips  # FIPS runtime image on UBI 9, tagged praxis-ai:<version>-fips
+make lint-fips       # clippy and rustfmt for the FIPS feature set
+make test-fips       # unit tests for the FIPS feature set
+make test-integration-fips  # the integration suite as the FIPS build
+make test-schema-fips       # the schema suite as the FIPS build
+make test-fips-host  # the suites as the FIPS build, inside the UBI 9 toolchain image, on a FIPS host
+```
+
+On a RHEL 9 host in FIPS mode, two more targets give the runtime proof the
+hosted checks cannot ([FIPS 140-3](../fips.md#verifying-a-deployment)):
+
+```console
+make fips-host-check     # attest the host and the image's module build (target/fips/host-attestation.*)
+make fips-runtime-probe  # run the FIPS image under PRAXIS_REQUIRE_FIPS=1 and probe its listener
 ```
 
 Three targets check a build against the rules Red Hat's release scanner

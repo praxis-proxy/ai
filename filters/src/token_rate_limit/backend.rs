@@ -68,6 +68,12 @@ pub(super) enum BackendReserve {
         reservation_id: u64,
         /// Estimate actually reserved.
         estimate: u64,
+        /// Total committed usage in the current window (or tokens
+        /// consumed from the bucket) *after* this reservation was
+        /// placed. Used by the filter to evaluate graduated soft-limit
+        /// tiers (proposal S1) — tiers whose capacity threshold is at
+        /// or below this value fire their `inject` action.
+        usage_after: u64,
     },
     /// Request must be rejected before routing.
     Denied {
@@ -187,6 +193,7 @@ impl TokenRateLimitStateBackend for InMemoryTokenRateLimitBackend {
                 Decision::Admitted(reservation) => BackendReserve::Admitted {
                     reservation_id: reservation.id,
                     estimate: reservation.estimate,
+                    usage_after: reservation.usage_after,
                 },
                 Decision::Denied { retry_after_ms, .. } => BackendReserve::Denied { retry_after_ms },
             },
@@ -296,6 +303,7 @@ impl TokenRateLimitStateBackend for InMemoryTokenBucketBackend {
                 token_bucket_ledger::Decision::Admitted(reservation) => BackendReserve::Admitted {
                     reservation_id: reservation.id,
                     estimate: reservation.estimate,
+                    usage_after: reservation.usage_after,
                 },
                 token_bucket_ledger::Decision::Denied { retry_after_ms } => BackendReserve::Denied { retry_after_ms },
             },
@@ -404,6 +412,7 @@ if active_total >= max_active then
   return {0, max_window}
 end
 
+local max_usage = 0
 for i = 1, budget_count do
   local window = tonumber(ARGV[5 + (i * 2) - 1])
   local capacity = tonumber(ARGV[5 + (i * 2)])
@@ -420,7 +429,9 @@ for i = 1, budget_count do
     local sep = string.find(active_values[j + 1], '|')
     active_sum = active_sum + tonumber(string.sub(active_values[j + 1], 1, sep - 1))
   end
-  if settled_sum + active_sum + estimate > capacity then
+  local total_usage = settled_sum + active_sum + estimate
+  if total_usage > max_usage then max_usage = total_usage end
+  if total_usage > capacity then
     return {0, max_window}
   end
 end
@@ -434,7 +445,7 @@ redis.call('ZADD', KEYS[4], now_ms + ttl, KEYS[1])
 redis.call('PEXPIRE', settled, ttl)
 redis.call('PEXPIRE', active, ttl)
 redis.call('PEXPIRE', KEYS[1], ttl)
-return {1, id, estimate}
+return {1, id, estimate, max_usage}
 ";
 
 /// Atomically settle a prior reservation against actual usage -- the
@@ -855,9 +866,10 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
         );
         let response = self.valkey.eval(RESERVE_SCRIPT, &keys, &args).await?;
         match response.as_slice() {
-            [1, id, estimate] => Ok(BackendReserve::Admitted {
+            [1, id, estimate, usage_after] => Ok(BackendReserve::Admitted {
                 reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
                 estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
+                usage_after: u64::try_from(*usage_after).map_err(|_error| BackendError::InvalidResponse)?,
             }),
             [0, retry_after] => Ok(BackendReserve::Denied {
                 retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
@@ -974,6 +986,7 @@ if tokens < estimate then
 end
 
 tokens = tokens - estimate
+local usage_after = capacity - tokens
 local id = redis.call('INCR', KEYS[5])
 redis.call('HSET', KEYS[2], id, estimate .. '|' .. now_ms)
 redis.call('INCR', KEYS[4])
@@ -982,7 +995,7 @@ redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill_ms', now_ms)
 redis.call('ZADD', KEYS[3], now_ms + ttl, KEYS[1])
 redis.call('PEXPIRE', KEYS[1], ttl)
 redis.call('PEXPIRE', KEYS[2], ttl)
-return {1, id, estimate}
+return {1, id, estimate, usage_after}
 ";
 
 /// Atomically settle a prior token-bucket reservation against actual
@@ -1175,9 +1188,10 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
         ];
         let response = self.valkey.eval(TOKEN_BUCKET_RESERVE_SCRIPT, &keys, &args).await?;
         match response.as_slice() {
-            [1, id, estimate] => Ok(BackendReserve::Admitted {
+            [1, id, estimate, usage_after] => Ok(BackendReserve::Admitted {
                 reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
                 estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
+                usage_after: u64::try_from(*usage_after).map_err(|_error| BackendError::InvalidResponse)?,
             }),
             [0, retry_after] => Ok(BackendReserve::Denied {
                 retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,

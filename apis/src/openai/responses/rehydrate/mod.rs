@@ -1332,14 +1332,16 @@ fn bind_previous_tools_to_owner(listings: &mut [Value], owner: &StateOwner) {
     }
 }
 
+/// Deduplicate only listings for the same target and tool-name set.
+type McpListingKey = (String, Option<String>, Vec<String>);
+
 /// Append MCP tool listings from a sequence of response items.
-fn collect_mcp_tool_listings_from_items(
-    items: &[Value],
-    seen: &mut HashSet<(String, Vec<String>)>,
-    listings: &mut Vec<Value>,
-) {
+fn collect_mcp_tool_listings_from_items(items: &[Value], seen: &mut HashSet<McpListingKey>, listings: &mut Vec<Value>) {
     listings.extend(items.iter().filter_map(|item| {
-        if item.get("type").and_then(Value::as_str) != Some("mcp_list_tools") {
+        if !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("mcp_list_tools" | "praxis_mcp_cached_listing")
+        ) {
             return None;
         }
 
@@ -1349,14 +1351,15 @@ fn collect_mcp_tool_listings_from_items(
         names.sort();
         names.dedup();
 
-        if !seen.insert((label.to_owned(), names)) {
+        let url = item.get("server_url").and_then(Value::as_str);
+        if !seen.insert((label.to_owned(), url.map(str::to_owned), names)) {
             return None;
         }
 
         let mut map = serde_json::Map::new();
         map.insert("server_label".to_owned(), Value::String(label.to_owned()));
         map.insert("tools".to_owned(), Value::Array(tools.clone()));
-        if let Some(url) = item.get("server_url").and_then(Value::as_str) {
+        if let Some(url) = url {
             map.insert("server_url".to_owned(), Value::String(url.to_owned()));
         }
         Some(Value::Object(map))

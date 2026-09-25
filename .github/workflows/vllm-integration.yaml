@@ -431,13 +431,18 @@ jobs:
   # Parse the Claude Code + vLLM acceptance pin manifest on an ubuntu runner
   # (which ships Python 3.11+ so `tomllib` is available; the GPU AMI ships Python
   # 3.9 and cannot). Exports every pin the GPU acceptance job needs as job
-  # outputs. Runs on schedule + workflow_dispatch, the only events that can
-  # reach the GPU acceptance job.
+  # outputs. Runs on schedule, workflow_dispatch, and the explicit PR label that
+  # reaches the GPU acceptance job.
   # ----------------------------------------------------------------------------
 
   pins:
     name: Load Claude Code + vLLM acceptance pins
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.action == 'labeled' &&
+       github.event.label.name == 'vllm-full-suite')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -462,6 +467,25 @@ jobs:
           manifest = pathlib.Path("tests/integration/fixtures/claude-code-cli/pin.toml")
           data = tomllib.loads(manifest.read_text())
           claude, vllm = data["claude_code"], data["vllm"]
+          launch = claude["launch"]
+          flags = vllm["launch"]["flags"]
+          max_len_index = flags.index("--max-model-len") + 1
+          flag_context = int(flags[max_len_index])
+          context = int(vllm["context_length"])
+          auto_minimum = int(launch["auto_minimum_backend_context_tokens"])
+          client_context = int(launch["max_context_tokens"])
+          if flag_context != context:
+              raise SystemExit(
+                  "vllm.context_length must match --max-model-len in vllm.launch.flags"
+              )
+          if context < auto_minimum:
+              raise SystemExit(
+                  f"vLLM context {context} is below Claude auto-mode minimum {auto_minimum}"
+              )
+          if context < client_context:
+              raise SystemExit(
+                  f"vLLM context {context} is below Claude client context {client_context}"
+              )
           exported = {
               "claude_url": claude["url"],
               "claude_sha256": claude["sha256"],
@@ -469,7 +493,7 @@ jobs:
               "claude_platform": claude["platform"],
               "vllm_image": vllm["image"],
               "vllm_served_model": vllm["served_model_name"],
-              "vllm_flags": " ".join(vllm["launch"]["flags"]),
+              "vllm_flags": " ".join(flags),
           }
           with open(sys.argv[1], "a", encoding="utf-8") as out:
               for key, value in exported.items():

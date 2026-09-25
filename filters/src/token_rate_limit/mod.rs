@@ -54,7 +54,8 @@
 //! - **Configurable estimation (M3)**: implemented -- per-rule `estimation:` block with pluggable strategies (`fixed`,
 //!   `max_tokens`, `input_plus_max_tokens`, `model_scaled`). See [`config::EstimationConfig`].
 //! - **Multiple budgets per rule, soft-limit tiers**: the proposal allows several `token_budgets` (e.g. hourly + daily)
-//!   and graduated tiers per rule; this milestone admits exactly one budget per rule with a hard deny at capacity.
+//!   and graduated tiers per rule; this milestone supports one budget per rule with graduated soft-limit tiers
+//!   (`inject` action) and a hard deny at capacity (`deny` action) — see [`config::TierConfig`] and proposal S1.
 //! - **Observability (M7/M8) and metering (S3)**: out of scope here -- both are recommended to split into their own
 //!   follow-on proposals.
 //! - **Trust boundary, non-inference traffic scoping**: this filter assumes request identity has already been resolved
@@ -114,7 +115,7 @@ use metrics::{counter, gauge};
 use praxis_ai_apis::hash::Sha256;
 use praxis_filter::{
     AuthenticatedIdentity, BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
-    parse_filter_config,
+    TrustedHeaderMutation, parse_filter_config,
 };
 
 use self::{
@@ -125,8 +126,8 @@ use self::{
         ValkeyTokenRateLimitBackend,
     },
     config::{
-        BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, EstimationConfig, EstimationStrategy, KeySource,
-        MatchConfig, RuleAlgorithm, RuleConfig, TokenRateLimitConfig,
+        ActionType, BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, EstimationConfig, EstimationStrategy,
+        KeySource, MatchConfig, RuleAlgorithm, RuleConfig, TierConfig, TokenRateLimitConfig,
     },
     ledger::{Budget, Ledger, LedgerConfig},
     token_bucket_ledger::{TokenBucketConfig, TokenBucketLedger},
@@ -479,7 +480,7 @@ fn resolve_model_multiplier(
 // -----------------------------------------------------------------------------
 
 /// One `rules:` entry, fully resolved: its match condition (if any),
-/// backend, and estimation.
+/// backend, estimation, and graduated enforcement tiers (S1).
 struct CompiledRule {
     /// Human-readable identifier, used in metrics labels and error
     /// messages, and folded into Valkey key namespacing.
@@ -499,6 +500,36 @@ struct CompiledRule {
     /// Resolved per-type weights for this rule (filter defaults overlaid
     /// with the rule's `weights:`). Applied only at reconciliation.
     weights: TokenWeights,
+
+    /// Graduated enforcement tiers (proposal S1), sorted by ascending
+    /// capacity. The last tier may be a `deny` tier (matching the
+    /// algorithm's capacity). When empty, the rule has a single implicit
+    /// deny at the algorithm's capacity (the pre-S1 default).
+    tiers: Vec<CompiledTier>,
+
+    /// Unique header names used by any `inject` tier in this rule.
+    /// Stripped from inbound requests on admission so that clients
+    /// cannot spoof tier signals.
+    inject_header_names: Vec<HeaderName>,
+}
+
+/// One graduated enforcement tier, resolved at config time.
+struct CompiledTier {
+    /// Usage threshold at which this tier activates.
+    capacity: u64,
+    /// What happens when usage crosses this threshold.
+    action: CompiledAction,
+}
+
+/// Pre-validated action for one tier.
+enum CompiledAction {
+    /// Continue the request with these headers injected upstream.
+    Inject {
+        /// Header name-value pairs to set on the upstream request.
+        headers: Vec<(HeaderName, http::HeaderValue)>,
+    },
+    /// Hard-reject with 429 (identical to the existing M6 behavior).
+    Deny,
 }
 
 impl CompiledRule {
@@ -829,6 +860,185 @@ fn validate_fallback_within_capacity(rule_name: &str, fallback: Option<u64>, cap
     Ok(())
 }
 
+/// Validate and compile the optional graduated tier list for one rule.
+///
+/// When `tiers` is `None`, returns an empty `Vec` — the pre-S1 default
+/// behavior (single implicit deny at the algorithm's `capacity`).
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if capacities are not strictly ascending, the
+/// deny tier is not the last, its capacity doesn't match the algorithm's
+/// capacity, an inject tier has no headers, or a header name is invalid.
+fn compile_tiers(
+    rule_name: &str,
+    tiers: Option<Vec<TierConfig>>,
+    algorithm_capacity: u64,
+) -> Result<Vec<CompiledTier>, FilterError> {
+    let Some(tiers) = tiers else {
+        return Ok(Vec::new());
+    };
+    if tiers.is_empty() {
+        return Err(format!("token_rate_limit: rule '{rule_name}': tiers must not be empty when specified").into());
+    }
+
+    let mut compiled = Vec::with_capacity(tiers.len());
+    let mut prev_capacity = 0_u64;
+    let mut saw_deny = false;
+
+    for (index, tier) in tiers.into_iter().enumerate() {
+        validate_tier_ordering(rule_name, index, tier.capacity, prev_capacity, saw_deny)?;
+        prev_capacity = tier.capacity;
+        let action = compile_tier_action(rule_name, index, &tier, algorithm_capacity, &mut saw_deny)?;
+        compiled.push(CompiledTier {
+            capacity: tier.capacity,
+            action,
+        });
+    }
+    Ok(compiled)
+}
+
+/// Collect the de-duplicated set of header names across all `inject`
+/// tiers. These are stripped from the inbound client request so that
+/// downstream schedulers never see a spoofed tier header.
+fn collect_inject_header_names(tiers: &[CompiledTier]) -> Vec<HeaderName> {
+    let mut names = Vec::new();
+    for tier in tiers {
+        if let CompiledAction::Inject { headers } = &tier.action {
+            for (name, _) in headers {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+    }
+    names
+}
+
+/// Check tier ordering invariants: strictly ascending, no tier after deny.
+fn validate_tier_ordering(
+    rule_name: &str,
+    index: usize,
+    capacity: u64,
+    prev_capacity: u64,
+    saw_deny: bool,
+) -> Result<(), FilterError> {
+    if saw_deny {
+        return Err(format!(
+            "token_rate_limit: rule '{rule_name}': deny tier must be the last tier \
+             (found tier at index {index} after deny)"
+        )
+        .into());
+    }
+    if capacity == 0 {
+        return Err(
+            format!("token_rate_limit: rule '{rule_name}': tier at index {index} must have capacity > 0").into(),
+        );
+    }
+    if index > 0 && capacity <= prev_capacity {
+        return Err(format!(
+            "token_rate_limit: rule '{rule_name}': tier capacities must be strictly ascending \
+             (tier at index {index} has capacity {capacity} <= previous {prev_capacity})"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Compile a single tier's action, validating headers and deny placement.
+#[expect(
+    clippy::too_many_lines,
+    reason = "validation for both inject (header parsing) and deny (capacity match) is a natural unit"
+)]
+fn compile_tier_action(
+    rule_name: &str,
+    index: usize,
+    tier: &TierConfig,
+    algorithm_capacity: u64,
+    saw_deny: &mut bool,
+) -> Result<CompiledAction, FilterError> {
+    match tier.action.action_type {
+        ActionType::Inject => {
+            if tier.capacity > algorithm_capacity {
+                return Err(format!(
+                    "token_rate_limit: rule '{rule_name}': inject tier at index {index} \
+                     has capacity ({}) above the algorithm's capacity ({algorithm_capacity}); \
+                     it would never fire",
+                    tier.capacity
+                )
+                .into());
+            }
+            if tier.action.headers.is_empty() {
+                return Err(format!(
+                    "token_rate_limit: rule '{rule_name}': inject tier at index {index} must have at least one header"
+                )
+                .into());
+            }
+            let headers = tier
+                .action
+                .headers
+                .iter()
+                .map(|(name, value)| {
+                    let header_name = HeaderName::try_from(name.as_str()).map_err(|error| {
+                        FilterError::from(format!(
+                            "token_rate_limit: rule '{rule_name}': invalid inject header '{name}': {error}"
+                        ))
+                    })?;
+                    let lower = header_name.as_str();
+                    if lower == http::header::HOST.as_str()
+                        || lower == http::header::CONTENT_LENGTH.as_str()
+                        || lower == http::header::TRANSFER_ENCODING.as_str()
+                        || praxis_core::reserved_headers::HOP_BY_HOP_HEADERS.contains(&lower)
+                        || praxis_core::reserved_headers::is_reserved(lower)
+                    {
+                        return Err(FilterError::from(format!(
+                            "token_rate_limit: rule '{rule_name}': inject tier at index {index} \
+                             uses reserved/hop-by-hop header '{lower}'"
+                        )));
+                    }
+                    let header_value = http::HeaderValue::from_str(value).map_err(|error| {
+                        FilterError::from(format!(
+                            "token_rate_limit: rule '{rule_name}': invalid inject header value for '{name}': {error}"
+                        ))
+                    })?;
+                    Ok((header_name, header_value))
+                })
+                .collect::<Result<Vec<_>, FilterError>>()?;
+
+            // Reject duplicate header names after case normalization.
+            // `BTreeMap<String, String>` keys are the raw YAML spelling,
+            // so `X-Token-Tier` and `x-token-tier` both pass syntax
+            // validation but map to the same `HeaderName`.
+            {
+                let mut seen = HashSet::with_capacity(headers.len());
+                for (name, _) in &headers {
+                    if !seen.insert(name.clone()) {
+                        return Err(format!(
+                            "token_rate_limit: rule '{rule_name}': inject tier at index {index} \
+                             has duplicate header '{name}' (after case normalization)"
+                        )
+                        .into());
+                    }
+                }
+            }
+
+            Ok(CompiledAction::Inject { headers })
+        },
+        ActionType::Deny => {
+            if tier.capacity != algorithm_capacity {
+                return Err(format!(
+                    "token_rate_limit: rule '{rule_name}': deny tier capacity ({}) \
+                     must equal the algorithm's capacity ({algorithm_capacity})",
+                    tier.capacity
+                )
+                .into());
+            }
+            *saw_deny = true;
+            Ok(CompiledAction::Deny)
+        },
+    }
+}
+
 /// Compile one YAML `rules:` entry into a [`CompiledRule`], validating
 /// and constructing its backend.
 ///
@@ -851,6 +1061,8 @@ fn compile_rule(
     let matcher = compile_matcher(&rule.name, rule.r#match)?;
     let loc = format!("rule '{}'", rule.name);
     let weights = filter_defaults.overlay(&rule.weights, &loc)?;
+    let tiers = compile_tiers(&rule.name, rule.tiers, capacity)?;
+    let inject_header_names = collect_inject_header_names(&tiers);
 
     Ok(CompiledRule {
         name: rule.name,
@@ -858,6 +1070,8 @@ fn compile_rule(
         backend,
         estimation,
         weights,
+        tiers,
+        inject_header_names,
     })
 }
 
@@ -1057,8 +1271,13 @@ impl TokenRateLimitFilter {
     }
 
     /// Turn a completed `reserve()` call into the `on_request` result:
-    /// record admission metadata/metrics, build the 429 rejection, or
-    /// fail closed (503) on a backend error.
+    /// record admission metadata/metrics, evaluate graduated tiers and
+    /// inject headers (S1), build the 429 rejection, or fail closed
+    /// (503) on a backend error.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the three outcome arms (admit+tiers / deny / error) are a natural unit"
+    )]
     fn handle_reserve_outcome(
         ctx: &mut HttpFilterContext<'_>,
         rule_index: usize,
@@ -1070,6 +1289,7 @@ impl TokenRateLimitFilter {
             Ok(BackendReserve::Admitted {
                 reservation_id,
                 estimate,
+                usage_after,
             }) => {
                 let admitted = AdmittedReservation {
                     key: pending.key,
@@ -1078,6 +1298,7 @@ impl TokenRateLimitFilter {
                 };
                 Self::record_admission(ctx, rule_index, rule, admitted);
                 ctx.set_metadata(META_ESTIMATE, pending.request_estimate.to_string());
+                Self::evaluate_tiers(ctx, rule, usage_after);
                 FilterAction::Continue
             },
             Ok(BackendReserve::Denied { retry_after_ms }) => {
@@ -1095,6 +1316,75 @@ impl TokenRateLimitFilter {
                 tracing::error!(%error, rule = rule.name, "token_rate_limit: admission backend failed, failing closed");
                 FilterAction::Reject(Rejection::status(503))
             },
+        }
+    }
+
+    /// Evaluate graduated soft-limit tiers (proposal S1) and inject
+    /// headers for every breached `inject` tier.
+    ///
+    /// Tiers are sorted by ascending `capacity` at compile time. We walk
+    /// from lowest to highest, injecting headers for every tier whose
+    /// threshold is at or below the current `usage_after`. The last tier
+    /// pushed for a given header name wins (Rust's `request_headers_to_set`
+    /// semantics), so a higher tier's header value naturally overrides a
+    /// lower one for the same name — exactly the behavior the proposal
+    /// specifies for overlapping header names across tiers.
+    ///
+    /// ## Client header stripping
+    ///
+    /// All configured inject header names are removed from the inbound
+    /// request *before* any tier values are set, preventing a client
+    /// below threshold from spoofing tier signals.
+    ///
+    /// ## Body-phase ordered mutations
+    ///
+    /// When the filter runs from `on_request_body` (body-dependent
+    /// estimation strategies) and an earlier filter already activated
+    /// the ordered `pre_read_mutations` log, injected headers are also
+    /// pushed there so Core's pre-read replay applies them. This
+    /// mirrors `state_owner_headers::queue_projection` and
+    /// `agentic_loop::queue_continuation_header`.
+    fn evaluate_tiers(ctx: &mut HttpFilterContext<'_>, rule: &CompiledRule, usage_after: u64) {
+        if rule.tiers.is_empty() {
+            return;
+        }
+
+        let ordered = !ctx.pre_read_mutations.is_empty();
+
+        // Strip all configured inject header names from the inbound
+        // request so a client cannot spoof tier signals.
+        for name in &rule.inject_header_names {
+            ctx.request_headers_to_remove.push(name.clone());
+            if ordered {
+                ctx.pre_read_mutations.push(TrustedHeaderMutation::Remove(name.clone()));
+            }
+        }
+
+        for tier in &rule.tiers {
+            if usage_after < tier.capacity {
+                break;
+            }
+            if let CompiledAction::Inject { headers } = &tier.action {
+                counter!(
+                    "praxis_ai_token_rate_limit_soft_tier_activations_total",
+                    "rule" => rule.name.clone(),
+                    "capacity" => tier.capacity.to_string(),
+                )
+                .increment(1);
+                Self::queue_tier_headers(ctx, headers, ordered);
+            }
+        }
+    }
+
+    /// Push inject-tier headers into the grouped queue and, when the
+    /// ordered pre-read mutation log is active, into that log as well.
+    fn queue_tier_headers(ctx: &mut HttpFilterContext<'_>, headers: &[(HeaderName, http::HeaderValue)], ordered: bool) {
+        for (name, value) in headers {
+            ctx.request_headers_to_set.push((name.clone(), value.clone()));
+            if ordered {
+                ctx.pre_read_mutations
+                    .push(TrustedHeaderMutation::Set(name.clone(), value.clone()));
+            }
         }
     }
 
@@ -1455,6 +1745,7 @@ mod backend_injection_tests {
             Ok(BackendReserve::Admitted {
                 reservation_id: 1,
                 estimate: 1,
+                usage_after: 1,
             })
         }
 
@@ -1487,6 +1778,8 @@ mod backend_injection_tests {
                 backend: std::sync::Arc::new(EnqueueAlwaysFailsBackend),
                 estimation: CompiledEstimation::Fixed { estimate: 1 },
                 weights: super::TokenWeights::UNITY,
+                tiers: Vec::new(),
+                inject_header_names: Vec::new(),
             }],
             needs_body: false,
             key_source: super::KeySource::Global,

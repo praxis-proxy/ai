@@ -5922,7 +5922,7 @@ fn namespace_custom_call_without_call_id_fails_closed() {
 }
 
 #[test]
-fn restore_snapshot_tools_removes_tool_choice_when_snapshot_null() {
+fn restore_snapshot_tools_normalizes_tool_choice_to_auto_when_snapshot_null() {
     let echo = ClientToolEcho {
         tools: vec![serde_json::json!({"type": "custom", "name": "run_python"})],
         tool_choice: serde_json::Value::Null,
@@ -5937,9 +5937,31 @@ fn restore_snapshot_tools_removes_tool_choice_when_snapshot_null() {
         response["tools"],
         serde_json::json!([{"type": "custom", "name": "run_python"}])
     );
-    assert!(
-        response.get("tool_choice").is_none(),
-        "null snapshot must remove tool_choice"
+    assert_eq!(
+        response["tool_choice"], "auto",
+        "null snapshot must normalize tool_choice to auto"
+    );
+}
+
+#[test]
+fn restore_snapshot_tools_normalizes_shell_tool_choice_to_auto_when_snapshot_null() {
+    let echo = ClientToolEcho {
+        tools: vec![serde_json::json!({"type": "shell", "environment": {"type": "local"}})],
+        tool_choice: serde_json::Value::Null,
+    };
+    let mut response = serde_json::json!({
+        "object": "response",
+        "tools": [{"type": "function", "name": "shell"}],
+        "tool_choice": "auto"
+    });
+    restore_snapshot_tools(&mut response, Some(&echo));
+    assert_eq!(
+        response["tools"],
+        serde_json::json!([{"type": "shell", "environment": {"type": "local"}}])
+    );
+    assert_eq!(
+        response["tool_choice"], "auto",
+        "null snapshot for shell tool must normalize tool_choice to auto"
     );
 }
 

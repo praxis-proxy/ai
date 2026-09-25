@@ -15,9 +15,10 @@ Pipeline overview for filters under `apis/src/openai/responses/`.
 - **`openai_response_store`** — Persists Responses API responses to the configured response store backend.
 - **`openai_responses_compact`** — Summarizes conversation history when the token count exceeds a configured threshold.
 - **`openai_responses_format`** — Classifies AI API request bodies and promotes routing facts to headers, metadata, and filter results without mutating the body.
-- **`openai_responses_model_rewrite`** — Rewrites the `model` field in Responses API request bodies.
+- **`openai_responses_model_rewrite`** — Rewrites the `model` field in Responses and Chat Completions request bodies.
 - **`openai_responses_proxy`** — Rebuilds the request body from `ResponsesState` when present.
 - **`openai_responses_rehydrate`** — Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input).
+- **`openai_responses_request`** — Processes the Responses create request body once and initializes state.
 - **`openai_responses_validate`** — Validates and enriches Responses API requests.
 - **`openai_stream_events`** — Composes the current IRR execution into one logical Responses stream.
 - **`openai_tool_parse`** — Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body.
@@ -43,7 +44,8 @@ Body-phase columns show `Access / Mode` when the hook is implemented.
 | `openai_responses_model_rewrite` | ✓ | ReadWrite / StreamBuffer | — | — |
 | `openai_responses_proxy` | ✓ | ReadWrite / StreamBuffer | — | — |
 | `openai_responses_rehydrate` | — | ReadOnly / StreamBuffer | ✓ | ReadWrite / Stream |
-| `openai_responses_validate` | — | ReadOnly / StreamBuffer | — | — |
+| `openai_responses_request` | — | ReadOnly / StreamBuffer | — | — |
+| `openai_responses_validate` | — | ReadOnly / StreamBuffer | — | ReadOnly / Stream |
 | `openai_stream_events` | ✓ | ReadOnly / Stream | ✓ | ReadWrite / Stream |
 | `openai_tool_parse` | ✓ | ReadOnly / StreamBuffer | — | — |
 | `openai_web_search` | — | ReadOnly / StreamBuffer | — | — |

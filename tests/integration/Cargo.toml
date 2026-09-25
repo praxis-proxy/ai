@@ -12,6 +12,9 @@ publish = false
 # default is `full` so a plain `cargo test -p <crate>` exercises every filter.
 default = ["full"]
 standard = ["praxis-ai-proxy/standard", "praxis-test-utils/standard"]
+# The signing filter alone, so the FIPS suite run can enable exactly the
+# feature set the FIPS binary ships (see FIPS_FEATURES in the Makefile).
+aws-sigv4-filter = ["praxis-ai-proxy/aws-sigv4-filter", "praxis-test-utils/aws-sigv4-filter"]
 openai-responses = ["praxis-ai-proxy/openai-responses", "praxis-test-utils/openai-responses"]
 openai-file-resolve-filter = ["openai-responses", "praxis-ai-proxy/openai-file-resolve-filter", "praxis-test-utils/openai-file-resolve-filter"]
 store = ["openai-responses", "praxis-ai-proxy/store", "praxis-test-utils/store"]
@@ -56,17 +59,24 @@ bytes = { workspace = true }
 http = { workspace = true }
 jsonschema = { workspace = true }
 nix = { workspace = true }
+# Digest oracles run on the same system OpenSSL the proxy signs with, so the
+# FIPS suite's test binary carries no RustCrypto primitives (was sha2).
+openssl = { workspace = true }
 praxis-core = { workspace = true }
 praxis-ai-proxy = { workspace = true }
 praxis-filter = { workspace = true }
 praxis-test-utils = { workspace = true }
+# The FIPS behavior tests build listener configs directly to observe what the
+# validated module refuses at load versus at first use.
+praxis-tls = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-sha2 = { workspace = true }
 sqlx = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "process"] }
 tokio-tungstenite = { workspace = true }
+rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }

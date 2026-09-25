@@ -58,8 +58,7 @@ listeners:
 filter_chains:
   - name: file-search-callout-pipeline
     filters:
-      - filter: openai_responses_format
-      - filter: openai_responses_validate
+      - filter: openai_responses_request
       - filter: openai_tool_parse
       - filter: iterative_request_router
         initial_step: inference

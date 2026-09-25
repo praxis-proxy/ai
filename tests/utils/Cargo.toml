@@ -12,6 +12,9 @@ publish = false
 # default is `full` so a plain `cargo test -p <crate>` exercises every filter.
 default = ["full"]
 standard = ["praxis-ai-proxy/standard"]
+# The signing filter alone, so the FIPS suites can enable exactly the
+# feature set the FIPS binary ships (see FIPS_FEATURES in the Makefile).
+aws-sigv4-filter = ["praxis-ai-proxy/aws-sigv4-filter"]
 openai-responses = ["praxis-ai-proxy/openai-responses"]
 openai-file-resolve-filter = ["openai-responses", "praxis-ai-proxy/openai-file-resolve-filter"]
 store = ["openai-responses", "praxis-ai-proxy/store", "praxis-ai-apis/store"]
@@ -50,6 +53,8 @@ praxis-tls = { workspace = true }
 h2 = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
+# Well-formed EC key shares for the raw TLS probes (tls_probe.rs).
+openssl = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 rand = { workspace = true }

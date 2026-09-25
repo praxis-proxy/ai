@@ -24,7 +24,33 @@ use futures::stream::{BoxStream, StreamExt as _};
 use praxis_filter::StreamingResponseBody;
 use sse_stream::{Error as SseError, Sse, SseStream};
 
-use super::subrequest_transport::TransportSignal;
+use super::subrequest_transport::{TransportSignal, TransportSignalState};
+
+/// Destination for an SSE size classification.
+pub(super) enum SseSignalTarget {
+    /// One POST response owns a fixed signal generation.
+    Fixed(Arc<OnceLock<TransportSignal>>),
+    /// A standalone GET stream reports only to the call active when it fails.
+    Active(Arc<TransportSignalState>),
+}
+
+impl SseSignalTarget {
+    /// Record one first-wins transport classification.
+    fn record(&self, classification: TransportSignal) {
+        match self {
+            Self::Fixed(signal) => {
+                signal.get_or_init(|| classification);
+            },
+            Self::Active(state) => state.record_active(classification),
+        }
+    }
+}
+
+impl From<Arc<OnceLock<TransportSignal>>> for SseSignalTarget {
+    fn from(signal: Arc<OnceLock<TransportSignal>>) -> Self {
+        Self::Fixed(signal)
+    }
+}
 
 /// Credential-safe failure surfaced from the SSE byte adapter.
 ///
@@ -168,7 +194,7 @@ struct ByteState {
     /// Per-event size limiter.
     per_event: SseEventSizeLimiter,
     /// Out-of-band signal for recording `ResponseTooLarge`.
-    signal: Arc<OnceLock<TransportSignal>>,
+    signal: SseSignalTarget,
 }
 
 /// Adapt `body` into an rmcp SSE stream, enforcing both byte budgets.
@@ -188,7 +214,7 @@ pub(super) fn sse_stream_from_body(
     per_event_cap: usize,
     operation_cap: usize,
     max_sse_event_size: usize,
-    signal: Arc<OnceLock<TransportSignal>>,
+    signal: SseSignalTarget,
 ) -> BoxStream<'static, Result<Sse, SseError>> {
     let effective_per_event = per_event_cap.min(max_sse_event_size);
     let state = ByteState {
@@ -206,14 +232,14 @@ pub(super) fn sse_stream_from_body(
                     // Per-event (per-message) ceiling, before parsing.
                     if st.per_event.observe(&chunk).is_err() {
                         let limit = st.per_event.max_size;
-                        st.signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
+                        st.signal.record(TransportSignal::ResponseTooLarge { limit });
                         return Err(SseByteStreamError::EventTooLarge { max_size: limit });
                     }
                     // Cumulative operation-stream ceiling.
                     st.emitted = st.emitted.saturating_add(chunk.len());
                     if st.emitted > st.operation_cap {
                         let limit = st.operation_cap;
-                        st.signal.get_or_init(|| TransportSignal::ResponseTooLarge { limit });
+                        st.signal.record(TransportSignal::ResponseTooLarge { limit });
                         return Err(SseByteStreamError::Ceiling { limit });
                     }
                     if chunk.is_empty() {
@@ -327,7 +353,7 @@ mod tests {
             cancelled_flag(),
         ));
         let signal = Arc::new(OnceLock::new());
-        let mut stream = sse_stream_from_body(body, 1_024, 4_096, 16 * 1024 * 1024, Arc::clone(&signal));
+        let mut stream = sse_stream_from_body(body, 1_024, 4_096, 16 * 1024 * 1024, Arc::clone(&signal).into());
 
         let first = stream.next().await.expect("one event").expect("ok event");
         assert_eq!(first.data.as_deref(), Some("{\"jsonrpc\":\"2.0\"}"));
@@ -343,7 +369,7 @@ mod tests {
             cancelled_flag(),
         ));
         let signal = Arc::new(OnceLock::new());
-        let mut stream = sse_stream_from_body(body, 1_024, 4, 16 * 1024 * 1024, Arc::clone(&signal));
+        let mut stream = sse_stream_from_body(body, 1_024, 4, 16 * 1024 * 1024, Arc::clone(&signal).into());
 
         // The underlying byte stream errors; SseStream surfaces it as an Err item.
         let mut saw_err = false;
@@ -368,7 +394,7 @@ mod tests {
             cancelled_flag(),
         ));
         let signal = Arc::new(OnceLock::new());
-        let mut stream = sse_stream_from_body(body, 8, 1_000_000, 16 * 1024 * 1024, Arc::clone(&signal));
+        let mut stream = sse_stream_from_body(body, 8, 1_000_000, 16 * 1024 * 1024, Arc::clone(&signal).into());
 
         let mut saw_err = false;
         while let Some(item) = stream.next().await {
@@ -392,7 +418,7 @@ mod tests {
             cancelled_flag(),
         ));
         let signal = Arc::new(OnceLock::new());
-        let mut stream = sse_stream_from_body(body, 1_000_000, 1_000_000, 8, Arc::clone(&signal));
+        let mut stream = sse_stream_from_body(body, 1_000_000, 1_000_000, 8, Arc::clone(&signal).into());
         let mut saw_err = false;
         while let Some(item) = stream.next().await {
             if item.is_err() {
@@ -414,7 +440,7 @@ mod tests {
             cancelled_flag(),
         ));
         let signal = Arc::new(OnceLock::new());
-        let mut stream = sse_stream_from_body(body, 1_024, 1_024, 16 * 1024 * 1024, Arc::clone(&signal));
+        let mut stream = sse_stream_from_body(body, 1_024, 1_024, 16 * 1024 * 1024, Arc::clone(&signal).into());
         let mut saw_err = false;
         while let Some(item) = stream.next().await {
             if item.is_err() {

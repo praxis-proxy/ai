@@ -3785,7 +3785,7 @@ async fn on_response_unarmed_keeps_stream_body_mode() {
 // -----------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_releases_when_not_armed() {
+async fn on_response_body_continues_when_not_armed() {
     let filter = build_test_filter();
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = make_owned_filter_context(&req);
@@ -3795,7 +3795,7 @@ async fn on_response_body_releases_when_not_armed() {
 
     let mut body = Some(Bytes::from_static(b"{}"));
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    assert!(matches!(action, FilterAction::Release));
+    assert!(matches!(action, FilterAction::Continue));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

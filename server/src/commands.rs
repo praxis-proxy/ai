@@ -34,6 +34,13 @@ pub(crate) fn validate_config_for_startup(config: &Config) -> Result<(), Box<dyn
     praxis_core::logging::validate_log_overrides(config)?;
     let subrequest_client = praxis_ai::create_subrequest_client(config);
     let registry = praxis_ai::build_full_registry(&subrequest_client);
+    // The same refusal the server makes at boot, so `--validate` under
+    // PRAXIS_REQUIRE_FIPS answers for the binary it runs as.
+    if praxis_tls::provider::required()
+        && let Some(reason) = praxis_ai::fips_blocker(&registry)
+    {
+        return Err(reason.into());
+    }
     let health_registry = praxis_core::health::build_health_registry(&config.clusters);
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
     praxis_ai::resolve_pipelines(config, &registry, &health_registry, &kv_stores, &subrequest_client)?;

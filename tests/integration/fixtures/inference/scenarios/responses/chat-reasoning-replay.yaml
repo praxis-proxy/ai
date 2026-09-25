@@ -1,0 +1,143 @@
+version: 1
+id: responses/chat-reasoning-replay
+description: Controlled assistant.reasoning field replay and explicit rejection of unsupported input.
+protocol: openai_responses
+example_config: openai/responses/responses-to-chat-completions-reasoning.yaml
+upstream_authority: 127.0.0.1:3001
+features:
+  - responses.chat.reasoning.replay
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type: [application/json]
+      body:
+        kind: json
+        value:
+          model: "${MODEL}"
+          input: "Pick a number."
+          store: true
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: continuation
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type: [application/json]
+      body:
+        kind: json
+        value:
+          model: "${MODEL}"
+          input: "Now answer."
+          store: false
+          stream: false
+          previous_response_id: "${PREVIOUS_RESPONSE_ID}"
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: trailing
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type: [application/json]
+      body:
+        kind: json
+        value:
+          model: "${MODEL}"
+          input:
+            - type: "reasoning"
+              content:
+                - type: "reasoning_text"
+                  text: "I picked 42."
+          store: false
+          stream: false
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: encrypted
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type: [application/json]
+      body:
+        kind: json
+        value:
+          model: "${MODEL}"
+          input:
+            - type: "reasoning"
+              encrypted_content: "opaque"
+              summary: []
+          store: false
+          stream: false
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ''
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: summary_only
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type: [application/json]
+      body:
+        kind: json
+        value:
+          model: "${MODEL}"
+          input:
+            - type: "reasoning"
+              summary: []
+          store: false
+          stream: false
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ''
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []
+  - name: malformed
+    request:
+      method: POST
+      path: /v1/responses
+      headers:
+        content-type: [application/json]
+      body:
+        kind: json
+        value:
+          model: "${MODEL}"
+          input:
+            - type: "reasoning"
+              content:
+                - type: "reasoning_text"
+                  text: null
+          store: false
+          stream: false
+    expect:
+      client_status: 400
+      client_body_kind: json
+      upstream_path: ''
+      upstream_body_kind: empty
+      client_sse_events: []
+      upstream_sse_events: []

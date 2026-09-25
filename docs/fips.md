@@ -22,9 +22,9 @@ to be FIPS compliant yet, so nobody has to know which features to pick:
 | | Standard | FIPS |
 |---|---|---|
 | Make targets | `release`, `container` | `release-fips`, `container-fips` |
-| Cargo features | `full` | `openai-responses` |
+| Cargo features | `full` | `openai-responses`, `aws-sigv4-filter` |
 | Responses API kernel (`openai_responses_*`, `responses_to_chat_completions`, agentic loop, file and web search dispatch) | yes | yes |
-| `aws_sigv4_sign` filter | yes | no: the `aws-sigv4` crate signs with pure-Rust `hmac`/`sha2` |
+| `aws_sigv4_sign` filter (AWS request signing) | yes | yes: SHA-256 and HMAC-SHA256 through OpenSSL |
 | `policy` filter (policy engine) | yes | no: its dependencies carry their own cryptography |
 | Response store (`store-postgres`), Conversations API, context compaction, MCP tools | yes | no: `sqlx` pulls `sha2` for migration checksums, and PostgreSQL authentication is pure Rust |
 | `openai_file_resolve`, `azure_ad`, `gcp_adc`, MCP tool dispatch | `full` / experimental | no: `reqwest` bundles its own TLS provider (`aws-lc-rs`) |
@@ -83,6 +83,13 @@ FIPS-approved. Upstream connections always require Extended Master Secret
 and share the same provider, so they are FIPS whenever the listeners are.
 Without the variable praxis-ai starts either way and only logs the status.
 
+The requirement also covers what the binary itself carries: a build that
+registers a filter whose dependencies do their own cryptography outside the
+system OpenSSL (the `policy` filter's plugins, the response store's sqlx)
+refuses `PRAXIS_REQUIRE_FIPS` outright, naming the filters, whatever the
+provider reports. Only the FIPS build, which compiles none of them, can
+honor the variable; the standard image is refused by design.
+
 ```console
 podman run --rm -e PRAXIS_REQUIRE_FIPS=1 ghcr.io/praxis-proxy/ai:0.3.0-fips
 ```
@@ -116,6 +123,13 @@ fatal: PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect: the OpenSSL pr
   `safety_identifier`, routing descriptor ids, MCP approval fingerprints,
   token-rate-limit bucket keys, overlay content hashes) go through OpenSSL's
   SHA-256 in every build. None of them is a security function.
+- **AWS request signing** (`aws_sigv4_sign`) is one: the payload and
+  canonical-request SHA-256, the four-step HMAC-SHA256 key derivation and
+  the signature all run through OpenSSL's EVP digest and signing APIs, so on
+  a FIPS host they execute inside the validated module. The `SigV4`
+  canonicalization itself is protocol text assembly in praxis-ai, checked
+  in its tests against the `aws-sigv4` crate, which the binary does not
+  link.
 
 ## Verifying a deployment
 
@@ -130,7 +144,31 @@ make fips-oc       # download the OpenShift CLI the scanner insists on, checksum
 make fips-scan     # run the scanner against the image, warnings fatal
 ```
 
-On the FIPS host, the two things only it can prove:
+On the FIPS host, what only it can prove (rootless podman required):
+
+```console
+make fips-host-check     # attest the host and the image's module build (target/fips/host-attestation.*)
+make test-fips-host      # the test suites as the FIPS build, inside the UBI 9 toolchain image, fail-closed on FIPS mode
+make fips-runtime-probe  # run the FIPS image under PRAXIS_REQUIRE_FIPS=1 and probe its listener from outside
+```
+
+`fips-host-check` states every fact the module's Security Policy requires of
+the host (the kernel flag, `fips=1` on the command line, the `FIPS` crypto
+policy, `fips-mode-setup --check`, the module the host's OpenSSL loads) and
+of the image (the crypto policy podman propagates into it, the build of
+`fips.so` it carries and whether that build is on a CMVP certificate), and
+writes the attestation to `target/fips/` to keep with the deployment record.
+`test-fips-host` runs the suites with `PRAXIS_FIPS_HOST=1`, so a green run
+cannot have happened outside FIPS mode. `fips-runtime-probe` starts the
+shipped image itself under `PRAXIS_REQUIRE_FIPS=1`, drives raw TLS probes
+against its listener (approved algorithms negotiated, ChaCha20-only and
+X25519-only clients refused), and checks the startup line. The CI `FIPS`
+workflow runs all three on a RHEL 9 runner in FIPS mode for every change;
+a release requires a recorded green `fips-host` run for the exact commit
+being released, and the release workflow attests and probes the exact
+pushed image, pulled back by digest, on the release run itself.
+
+A hand check of the shipped image remains a two-liner:
 
 ```console
 cat /proc/sys/crypto/fips_enabled                        # 1
@@ -145,10 +183,25 @@ TLS configurations are checked, and the startup line above is logged, when
 the real workload starts, so run it the same way with `PRAXIS_REQUIRE_FIPS=1`
 and keep that line as evidence.
 
-What the local checks cannot prove, and only a FIPS host can: the kernel flag
-and the positive `PRAXIS_REQUIRE_FIPS` path, RHEL's boot-time module
-integrity self-tests, and behaviour under the host-wide `FIPS` crypto policy
-(the local checks activate the provider, not the policy).
+## What is validated, and what is not
+
+FIPS 140-3 validates a cryptographic module, not an application. What the
+checks above prove is that praxis-ai routes its cryptography through the
+OpenSSL provider the image carries and behaves as a FIPS deployment must.
+Three facts stay outside what this repository can prove:
+
+- **The module build.** A certificate names one exact build of
+  `fips.so`. The pinned UBI 9 images carry a build rebuilt for a CVE fix
+  that is still in validation with NIST; `fips-host-check` says so on every
+  run (a warning, or a failure under `--require-certified`) rather than
+  letting the package name imply a certificate. See
+  `xtask/assets/fips/certified-modules.json` for the builds and sources.
+- **The operating environment.** The certificate lists tested operating
+  environments; running elsewhere relies on the CMVP porting rules.
+- **The architecture.** rustls performing the TLS handshake over the
+  validated provider is praxis's architecture, documented and tested here;
+  whether a compliance program accepts it is that program's judgment, not a
+  fact this repository can assert.
 
 ## Scope and exemptions
 
@@ -163,11 +216,11 @@ Every crypto-adjacent component in the FIPS image, and why it is compliant:
 | x509-parser, asn1-rs, der-parser, oid-registry (parsing only, no `verify` feature) | peer certificate fields in the Pingora fork | parse only |
 | subtle, zeroize, secrecy | constant-time comparison, wiping, secret wrappers | helpers |
 | policy engine (`policy` filter) | JWT, OAuth, Valkey builtins carry aws-lc, sha2 and hmac | not in the FIPS build |
-| `aws_sigv4_sign` filter | the `aws-sigv4` crate's hmac/sha2 | not in the FIPS build |
+| `aws_sigv4_sign` filter | SHA-256 and HMAC-SHA256 for `SigV4` through OpenSSL (`praxis_ai_apis::hash`) | compliant; the `aws-sigv4` crate (RustCrypto `hmac`/`sha2`) is a test-only dependency |
 | response stores, Conversations, compaction, MCP tools | sqlx's sha2 (migration checksums), sqlx-postgres' md-5/hmac/sha2/hkdf/rsa (SCRAM) | not in the FIPS build |
-| `openai_file_resolve`, `azure_ad`, `gcp_adc`, MCP tool dispatch | reqwest's bundled rustls provider (aws-lc-rs) | not in the FIPS build |
+| `openai_file_resolve`, `azure_ad`, `gcp_adc`, MCP tool dispatch | reqwest over rustls with no bundled provider (TLS through the installed OpenSSL-backed provider); MCP tool dispatch additionally requires the store | not in the FIPS build |
 | `basic_auth` filter (praxis core) | password hashing through OpenSSL's SHA-256 (EVP) | compliant; experimental in praxis-ai and off in every build unless enabled |
-| sha2, rcgen, aws-lc-rs | test utilities, fixtures and xtask | development only, absent from the shipped binary and its manifest |
+| sha2, hmac, aws-sigv4, rcgen (with ring) | test utilities, fixtures, xtask and the `SigV4` test oracle | development only, absent from the shipped binary and its manifest; aws-lc-rs itself is gone from every graph, the policy engine aside |
 
 The report and Red Hat's scanner both confirm the last row on every build:
 the embedded crate manifest lists none of the denied crates, and the binary

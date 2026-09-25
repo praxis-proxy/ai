@@ -923,6 +923,7 @@ impl ResponsesState {
         let persisted_messages = messages.clone();
         let tool_choice = body
             .get("tool_choice")
+            .filter(|v| !v.is_null())
             .cloned()
             .unwrap_or_else(|| serde_json::Value::String("auto".to_owned()));
 

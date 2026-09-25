@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.96"
 authors = ["Shane Utt <shaneutt@linux.com>"]
@@ -53,9 +53,19 @@ rand = "0.10.3"
 rcgen = "0.14.10"
 redis = { version = "1.7.0", default-features = false, features = ["tokio-comp"] }
 regex = "1.13.1"
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "stream"] }
-rmcp = { version = "3.4.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
-rustls = "0.23.45"
+# TLS through rustls without a compiled-in provider: reqwest's `rustls`
+# feature would compile aws-lc-rs into every consumer, a second cryptography
+# stack next to the system OpenSSL the process provider routes through. With
+# `rustls-no-provider` reqwest uses the provider the process installed
+# (praxis_tls::provider::install), so the FIPS suites' test binaries carry no
+# alternative provider a green run could have silently used. rmcp forwards
+# the same choice to its own reqwest edge.
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+rmcp = { version = "3.4.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+# Without default features: `aws_lc_rs` on by default would silently link
+# aws-lc-rs into every test binary, and `prefer-post-quantum` implies
+# `aws_lc_rs`. The provider is whatever the process installed.
+rustls = { version = "0.23.45", default-features = false, features = ["logging", "std", "tls12"] }
 schemars = "1.2.2"
 rustls-pemfile = "2.2.0"
 secrecy = { version = "0.10.3", features = ["serde"] }
@@ -73,7 +83,10 @@ thiserror = "2.0.20"
 tiktoken-rs = "0.12.0"
 tikv-jemallocator = "0.7.0"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
-tokio-rustls = "0.26.5"
+# Without its default `aws_lc_rs` feature, which would compile a second
+# crypto provider into every test binary; the harness installs the
+# OpenSSL-backed provider before building any TLS config.
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["logging", "tls12"] }
 tokio-tungstenite = "0.30.0"
 tokio-util = "0.7.19"
 url = "2.5.8"
@@ -109,13 +122,13 @@ praxis = { version = "0.7.0", package = "praxis-proxy", default-features = false
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer
-praxis-ai-llmd-ext-proc = { version = "0.3.0", path = "integrations/llmd/ext-proc" }
+praxis-ai-llmd-ext-proc = { version = "0.4.0", path = "integrations/llmd/ext-proc" }
 
 # Praxis AI workspace dependencies
-praxis-ai-proxy = { version = "0.3.0", path = "server", default-features = false }
-praxis-ai-filters = { version = "0.3.0", path = "filters", default-features = false }
-praxis-ai-apis = { version = "0.3.0", path = "apis", default-features = false }
-praxis-ai-build-support = { version = "0.3.0", path = "server/build_support" }
+praxis-ai-proxy = { version = "0.4.0", path = "server", default-features = false }
+praxis-ai-filters = { version = "0.4.0", path = "filters", default-features = false }
+praxis-ai-apis = { version = "0.4.0", path = "apis", default-features = false }
+praxis-ai-build-support = { version = "0.4.0", path = "server/build_support" }
 
 # Pingora (temporary fork), at the version praxis builds against; two versions
 # of the fork in one graph do not share types, and the older one carries its

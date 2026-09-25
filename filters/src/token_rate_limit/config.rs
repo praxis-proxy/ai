@@ -166,6 +166,56 @@ pub(super) struct RuleConfig {
     /// Omitted types inherit the filter defaults (then `1.0`).
     #[serde(default)]
     pub weights: super::weights::TokenTypeWeightsConfig,
+
+    /// Graduated enforcement tiers (proposal S1). Each tier defines a
+    /// usage threshold and an action (`inject` or `deny`). When the
+    /// backend admits a request, every tier whose `capacity` is at or
+    /// below the current usage level fires:
+    ///
+    /// - `inject`: the request continues and the tier's `headers` are set on the upstream request.
+    /// - `deny`: hard-reject with 429 (same as M6; must be the last tier).
+    ///
+    /// Tiers must have strictly ascending `capacity` values. At most one
+    /// `deny` tier is allowed, and it must be the last. Its `capacity`
+    /// must equal the algorithm's own `capacity`.
+    ///
+    /// When omitted, the rule behaves as before: a single hard deny at
+    /// the algorithm's `capacity`.
+    #[serde(default)]
+    pub tiers: Option<Vec<TierConfig>>,
+}
+
+/// One graduated enforcement tier (proposal S1).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TierConfig {
+    /// Usage threshold at which this tier activates.
+    pub capacity: u64,
+    /// What happens when usage crosses this tier's threshold.
+    pub action: ActionConfig,
+}
+
+/// Action to take when a tier's usage threshold is crossed.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ActionConfig {
+    /// Whether to continue with injected headers or hard-reject.
+    #[serde(rename = "type")]
+    pub action_type: ActionType,
+    /// Headers to inject on the upstream request (required for
+    /// `inject`, ignored for `deny`).
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+/// The type of enforcement a tier performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ActionType {
+    /// Continue the request and inject the configured headers.
+    Inject,
+    /// Hard-reject with 429 (the existing M6 behavior).
+    Deny,
 }
 
 /// Static header-value match condition for a [`RuleConfig`].
