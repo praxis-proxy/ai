@@ -146,6 +146,10 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
 
     fn on_response_body(
         &self,
+        #[cfg_attr(
+            not(feature = "openai-mcp-tools"),
+            expect(unused_variables, reason = "the response context only carries the MCP session pool")
+        )]
         ctx: &mut HttpFilterContext<'_>,
         _body: &mut Option<Bytes>,
         end_of_stream: bool,
