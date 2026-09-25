@@ -1,14 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Shared IP classification for outbound `OpenAI` HTTP clients.
+//! Shared IP classification for outbound HTTP clients and datastore targets.
+//!
+//! One canonical SSRF and private-range policy for every first-party consumer
+//! (outbound file fetches, callout targets, and the Postgres URL validator).
+//! SQL-free and dependency-light so the store leaf stays crypto-free.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use praxis_core::connectivity::normalize_mapped_ipv4;
+/// Convert IPv4-mapped IPv6 addresses (`::ffff:A.B.C.D`) to plain IPv4.
+///
+/// Native IPv4 and non-mapped IPv6 addresses pass through unchanged.
+fn normalize_mapped_ipv4(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 @ IpAddr::V4(_) => v4,
+    }
+}
 
 /// Return whether an IP targets a known cloud metadata or credential endpoint.
-pub(crate) fn is_cloud_metadata(ip: &IpAddr) -> bool {
+pub fn is_cloud_metadata(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             *v4 == Ipv4Addr::new(169, 254, 169, 254)
@@ -27,12 +39,12 @@ pub(crate) fn is_cloud_metadata(ip: &IpAddr) -> bool {
 }
 
 /// Return whether an IP is unsafe even for explicitly allowlisted file URLs.
-pub(crate) fn is_unconditionally_blocked(ip: &IpAddr) -> bool {
+fn is_unconditionally_blocked(ip: &IpAddr) -> bool {
     ip.is_unspecified() || ip.is_multicast() || is_cloud_metadata(ip)
 }
 
 /// Return whether an IP is not publicly routable under the shared policy.
-pub(crate) fn is_non_public_ip(ip: &IpAddr) -> bool {
+pub fn is_non_public_ip(ip: &IpAddr) -> bool {
     let ip = normalize_mapped_ipv4(*ip);
     if is_unconditionally_blocked(&ip) || is_private_or_special_use(&ip) {
         return true;
@@ -46,8 +58,7 @@ pub(crate) fn is_non_public_ip(ip: &IpAddr) -> bool {
 }
 
 /// Return whether an IP must be blocked for an untrusted `file_url` fetch.
-#[cfg(feature = "openai-file-resolve-filter")]
-pub(crate) fn is_file_url_ssrf_blocked(ip: &IpAddr, allow_private: bool) -> bool {
+pub fn is_file_url_ssrf_blocked(ip: &IpAddr, allow_private: bool) -> bool {
     let ip = normalize_mapped_ipv4(*ip);
     if is_unconditionally_blocked(&ip) {
         return true;
@@ -148,4 +159,110 @@ fn nat64_embedded_ipv4(v6: &Ipv6Addr) -> Option<Ipv4Addr> {
         let [.., a, b, c, d] = v6.octets();
         Ipv4Addr::new(a, b, c, d)
     })
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::panic, reason = "tests")]
+mod tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn cloud_metadata_endpoints_flagged() {
+        for s in [
+            "169.254.169.254",
+            "169.254.170.2",
+            "169.254.170.23",
+            "169.254.0.23",
+            "169.254.10.10",
+            "100.100.100.200",
+            "fd00:ec2::254",
+            "fd00:ec2::23",
+        ] {
+            assert!(is_cloud_metadata(&ip(s)), "{s} should be cloud metadata");
+            assert!(is_non_public_ip(&ip(s)), "{s} should be non-public");
+            assert!(
+                is_file_url_ssrf_blocked(&ip(s), true),
+                "{s} blocked even when private allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn private_and_loopback_ranges_are_non_public() {
+        for s in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fe80::1",
+            "fec0::1",
+            "fc00::1",
+        ] {
+            assert!(is_non_public_ip(&ip(s)), "{s} should be non-public");
+        }
+    }
+
+    #[test]
+    fn public_addresses_are_public() {
+        for s in ["8.8.8.8", "1.1.1.1", "2001:4860:4860::8888"] {
+            assert!(!is_non_public_ip(&ip(s)), "{s} should be public");
+            assert!(!is_file_url_ssrf_blocked(&ip(s), false), "{s} not blocked");
+        }
+    }
+
+    #[test]
+    fn allow_private_toggle_only_relaxes_private_ranges() {
+        // Private range: allowed when allow_private, blocked otherwise.
+        assert!(is_file_url_ssrf_blocked(&ip("10.0.0.1"), false));
+        assert!(!is_file_url_ssrf_blocked(&ip("10.0.0.1"), true));
+        // Unconditionally blocked (metadata/unspecified/multicast) ignores the toggle.
+        assert!(is_file_url_ssrf_blocked(&ip("0.0.0.0"), true));
+        assert!(is_file_url_ssrf_blocked(&ip("224.0.0.1"), true));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_is_normalized() {
+        assert!(is_non_public_ip(&ip("::ffff:127.0.0.1")));
+        assert!(is_file_url_ssrf_blocked(&ip("::ffff:127.0.0.1"), false));
+    }
+
+    #[test]
+    fn nat64_embedded_ipv4_is_reclassified() {
+        // 64:ff9b::/96 embedding a metadata / private v4 is blocked.
+        assert!(is_non_public_ip(&ip("64:ff9b::a9fe:a9fe"))); // 169.254.169.254
+        assert!(is_non_public_ip(&ip("64:ff9b::c0a8:1"))); // 192.168.0.1
+        // Embedding a public v4 stays public.
+        assert!(!is_non_public_ip(&ip("64:ff9b::808:808"))); // 8.8.8.8
+    }
+
+    #[test]
+    fn special_use_ranges_are_non_public() {
+        for s in [
+            "198.18.0.1",
+            "192.0.0.1",
+            "192.88.99.1",
+            "192.0.2.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "240.0.0.1",
+            "2001:db8::1",
+            "2002:c0a8:1::1",
+            "3fff::1",
+            "5f00::1",
+        ] {
+            assert!(is_non_public_ip(&ip(s)), "{s} should be non-public special-use");
+        }
+        // 192.0.0.9 and 192.0.0.10 are global exceptions inside 192.0.0.0/24.
+        assert!(!is_non_public_ip(&ip("192.0.0.9")));
+        assert!(!is_non_public_ip(&ip("192.0.0.10")));
+    }
 }

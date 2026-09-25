@@ -7,7 +7,7 @@ Handles all `/v1/conversations` endpoints locally.
 
 ## Configuration Notes
 
-All matched requests are served from the local store and never forwarded upstream. Unmatched paths pass through as `Continue`. `openai_operation` must precede this filter in the same chain.
+All matched requests are served from the owner-scoped store and never forwarded upstream. Unmatched paths pass through as `Continue`. The filter holds no state: it resolves the store from the per-request registry the serving runtime provisions, and takes an owner-bound handle at request time. `openai_operation` must precede this filter in the same chain.
 
 ## Configuration
 

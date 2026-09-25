@@ -3,9 +3,13 @@
 
 //! Request handlers for the `/v1/conversations` endpoints.
 
-use std::{borrow::Cow, collections::HashSet, fmt, marker::PhantomData};
+use std::{borrow::Cow, fmt, marker::PhantomData};
 
 use percent_encoding::percent_decode_str;
+#[cfg(test)]
+#[cfg(feature = "store-sqlite")]
+use praxis_ai_store::ConversationItemStore;
+use praxis_ai_store::{ConversationItemRecord, ConversationRecord, StoreError};
 use praxis_filter::{FilterAction, FilterError, HttpFilterContext, Rejection};
 use serde::{
     Deserializer as _, Serialize,
@@ -20,19 +24,20 @@ use tracing::warn;
 use super::{
     contracts::{
         ConversationItem, ConversationItemList, ConversationResource, CreateConversationItemsRequest,
-        CreateConversationRequest, DeletedConversationResource, InputItem, ItemOrder, MAX_ITEMS_PER_REQUEST, Metadata,
+        CreateConversationRequest, DeletedConversationResource, InputItem, ItemOrder, Metadata,
         UpdateConversationRequest,
     },
-    item_schema::validate_output_item,
     validate::{MetadataError, validate_metadata},
 };
+#[cfg(test)]
+#[cfg(feature = "store-sqlite")]
+use crate::state_owner::StateOwner;
 use crate::{
     openai::{
         include::{IncludeFields, decode_query_component_strict, parse_include, project_item},
         responses::store::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT},
     },
-    state_owner::{StateOwner, require_state_owner},
-    store::{ConversationItemRecord, ConversationItemStore, ConversationRecord, StoreError},
+    service::conversations::{ConversationsService, build_item_records, duplicate_item_id, validate_item_count},
 };
 
 // -----------------------------------------------------------------------------
@@ -83,13 +88,10 @@ impl Default for ItemListParams {
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 pub(super) async fn handle_create_conversation(
     ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    service: &ConversationsService,
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
+    let owner = service.owner();
     let input = if body.is_empty() {
         CreateConversationRequest::default()
     } else {
@@ -111,13 +113,15 @@ pub(super) async fn handle_create_conversation(
     let raw_id = ctx.id_generator.generate(ctx.time_source);
     let conversation_id = format!("conv_{raw_id}");
     let created_at = current_timestamp(ctx);
-    if let Err(msg) = validate_item_count(input.items.len()) {
-        return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
+    if let Err(e) = validate_item_count(input.items.len()) {
+        return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     let item_values = input.items.into_iter().map(InputItem::into_value);
-    let item_records = match build_item_records(ctx, owner, &conversation_id, created_at, 0, item_values) {
+    let item_records = match build_item_records(owner, &conversation_id, created_at, 0, item_values, || {
+        generated_item_id(ctx)
+    }) {
         Ok(records) => records,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+        Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     };
     if let Some(item_id) = duplicate_item_id(&item_records) {
         return Ok(FilterAction::Reject(invalid_input_response(
@@ -133,13 +137,11 @@ pub(super) async fn handle_create_conversation(
         messages: Value::Array(Vec::new()),
     };
 
-    if let Err(e) = store.upsert_conversation(&record).await {
+    if let Err(e) = service.upsert_conversation(&record).await {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     if !item_records.is_empty()
-        && let Err(e) = store
-            .create_items_and_sync_messages(owner, &conversation_id, &item_records)
-            .await
+        && let Err(e) = service.create_items(&conversation_id, &item_records).await
     {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
@@ -151,21 +153,16 @@ pub(super) async fn handle_create_conversation(
 
 /// Handle `GET /v1/conversations/{id}` — retrieve a conversation.
 pub(super) async fn handle_get_conversation(
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    service: &ConversationsService,
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
     };
     let conversation_id = conversation_id.as_ref();
 
-    match store.get_conversation(owner, conversation_id).await {
+    match service.get_conversation(conversation_id).await {
         Ok(Some(record)) => {
             let body = conversation_response(record);
             Ok(FilterAction::Reject(json_response(200, &body)?))
@@ -183,15 +180,10 @@ pub(super) async fn handle_get_conversation(
 /// Handle `POST /v1/conversations/{id}` — update a conversation.
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 pub(super) async fn handle_update_conversation(
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    service: &ConversationsService,
     conversation_id: &str,
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -219,7 +211,7 @@ pub(super) async fn handle_update_conversation(
         }));
     }
 
-    let existing = match store.get_conversation(owner, conversation_id).await {
+    let existing = match service.get_conversation(conversation_id).await {
         Ok(record) => record,
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     };
@@ -238,10 +230,7 @@ pub(super) async fn handle_update_conversation(
     // meantime and dropping those committed items from conversation-backed
     // rehydration (#1144). `created_at` is immutable, so the read above still
     // supplies it for the response.
-    match store
-        .update_conversation_metadata(owner, conversation_id, &metadata)
-        .await
-    {
+    match service.update_conversation_metadata(conversation_id, &metadata).await {
         Ok(true) => {},
         Ok(false) => {
             // The conversation was deleted between the read above and this write.
@@ -269,21 +258,16 @@ pub(super) async fn handle_update_conversation(
 /// its items; item cleanup belongs to item deletion or a separate retention
 /// policy, not this endpoint.
 pub(super) async fn handle_delete_conversation(
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    service: &ConversationsService,
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
     };
     let conversation_id = conversation_id.as_ref();
 
-    match store.delete_conversation(owner, conversation_id).await {
+    match service.delete_conversation(conversation_id).await {
         Ok(true) => {
             debug!(conversation_id, "conversation deleted");
             let body = DeletedConversationResource::deleted(conversation_id);
@@ -307,14 +291,11 @@ pub(super) async fn handle_delete_conversation(
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 pub(super) async fn handle_create_items(
     ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    service: &ConversationsService,
     conversation_id: &str,
     body: &[u8],
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
+    let owner = service.owner();
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -328,7 +309,7 @@ pub(super) async fn handle_create_items(
         Ok(includes) => includes,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    match store.get_conversation(owner, conversation_id).await {
+    match service.get_conversation(conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, "conversation not found for item create");
@@ -342,14 +323,16 @@ pub(super) async fn handle_create_items(
     let Some(items) = input.items else {
         return Ok(FilterAction::Reject(invalid_input_response("'items' is required")?));
     };
-    if let Err(msg) = validate_item_count(items.len()) {
-        return Ok(FilterAction::Reject(invalid_input_response(&msg)?));
+    if let Err(e) = validate_item_count(items.len()) {
+        return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     let item_values = items.into_iter().map(InputItem::into_value);
     let created_at = current_timestamp(ctx);
-    let item_records = match build_item_records(ctx, owner, conversation_id, created_at, 0, item_values) {
+    let item_records = match build_item_records(owner, conversation_id, created_at, 0, item_values, || {
+        generated_item_id(ctx)
+    }) {
         Ok(records) => records,
-        Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
+        Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     };
     if let Some(item_id) = duplicate_item_id(&item_records) {
         return Ok(FilterAction::Reject(invalid_input_response(
@@ -357,10 +340,7 @@ pub(super) async fn handle_create_items(
         )?));
     }
     let requested_ids: Vec<&str> = item_records.iter().map(|r| r.item_id.as_str()).collect();
-    let already_present = match store
-        .get_existing_conversation_item_ids(owner, conversation_id, &requested_ids)
-        .await
-    {
+    let already_present = match service.existing_item_ids(conversation_id, &requested_ids).await {
         Ok(ids) => ids,
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     };
@@ -370,10 +350,7 @@ pub(super) async fn handle_create_items(
         )?));
     }
 
-    if let Err(e) = store
-        .create_items_and_sync_messages(owner, conversation_id, &item_records)
-        .await
-    {
+    if let Err(e) = service.create_items(conversation_id, &item_records).await {
         return Ok(FilterAction::Reject(store_error_response(&e)?));
     }
     debug!(
@@ -390,13 +367,9 @@ pub(super) async fn handle_create_items(
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 pub(super) async fn handle_list_items(
     ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    service: &ConversationsService,
     conversation_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -410,7 +383,7 @@ pub(super) async fn handle_list_items(
         Ok(params) => params,
         Err(msg) => return Ok(FilterAction::Reject(invalid_input_response(&msg)?)),
     };
-    match store.get_conversation(owner, conversation_id).await {
+    match service.get_conversation(conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, "conversation not found for item list");
@@ -422,9 +395,8 @@ pub(super) async fn handle_list_items(
     }
 
     let limit = params.limit;
-    let rows = match store
-        .list_conversation_items(
-            owner,
+    let rows = match service
+        .list_items(
             conversation_id,
             params.after_item_id.as_deref(),
             limit.saturating_add(1),
@@ -447,14 +419,10 @@ pub(super) async fn handle_list_items(
 #[expect(clippy::too_many_lines, reason = "decode both path parameters then look up")]
 pub(super) async fn handle_get_item(
     ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    service: &ConversationsService,
     conversation_id: &str,
     item_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -469,7 +437,7 @@ pub(super) async fn handle_get_item(
         Err(action) => return action,
     };
     let item_id = item_id.as_ref();
-    match store.get_conversation(owner, conversation_id).await {
+    match service.get_conversation(conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, item_id, "conversation not found for item get");
@@ -479,7 +447,7 @@ pub(super) async fn handle_get_item(
         },
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     }
-    match store.get_conversation_item(owner, conversation_id, item_id).await {
+    match service.get_item(conversation_id, item_id).await {
         Ok(Some(record)) => {
             let mut item_data = record.item_data;
             project_item(&mut item_data, includes);
@@ -500,15 +468,10 @@ pub(super) async fn handle_get_item(
 #[expect(clippy::too_many_lines, reason = "sequential guard-clause pipeline")]
 #[expect(clippy::cognitive_complexity, reason = "tracing macros inflate complexity")]
 pub(super) async fn handle_delete_item(
-    ctx: &HttpFilterContext<'_>,
-    store: &dyn ConversationItemStore,
+    service: &ConversationsService,
     conversation_id: &str,
     item_id: &str,
 ) -> Result<FilterAction, FilterError> {
-    let owner = match require_state_owner(ctx) {
-        Ok(owner) => owner,
-        Err(action) => return Ok(action),
-    };
     let conversation_id = match decoded_path_param("conversation id", conversation_id) {
         Ok(id) => id,
         Err(action) => return action,
@@ -519,7 +482,7 @@ pub(super) async fn handle_delete_item(
         Err(action) => return action,
     };
     let item_id = item_id.as_ref();
-    match store.get_conversation(owner, conversation_id).await {
+    match service.get_conversation(conversation_id).await {
         Ok(Some(_)) => {},
         Ok(None) => {
             debug!(conversation_id, item_id, "conversation not found for item delete");
@@ -530,13 +493,10 @@ pub(super) async fn handle_delete_item(
         Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     };
 
-    match store
-        .delete_item_and_sync_messages(owner, conversation_id, item_id)
-        .await
-    {
+    match service.delete_item(conversation_id, item_id).await {
         Ok(true) => {
             debug!(conversation_id, item_id, "conversation item deleted");
-            match store.get_conversation(owner, conversation_id).await {
+            match service.get_conversation(conversation_id).await {
                 Ok(Some(record)) => {
                     let body = conversation_response(record);
                     Ok(FilterAction::Reject(json_response(200, &body)?))
@@ -583,156 +543,6 @@ impl<'de, T: DeserializeOwned> Visitor<'de> for JsonObjectVisitor<T> {
 
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
         T::deserialize(MapAccessDeserializer::new(map))
-    }
-}
-
-/// Validate the shared item-count bound after deserialization.
-fn validate_item_count(item_count: usize) -> Result<(), String> {
-    if item_count > MAX_ITEMS_PER_REQUEST {
-        return Err(format!("items may contain at most {MAX_ITEMS_PER_REQUEST} entries"));
-    }
-    Ok(())
-}
-
-/// Return the first duplicate item ID in a create request.
-fn duplicate_item_id(items: &[ConversationItemRecord]) -> Option<&str> {
-    let mut seen = HashSet::new();
-    for item in items {
-        if !seen.insert(item.item_id.as_str()) {
-            return Some(item.item_id.as_str());
-        }
-    }
-    None
-}
-
-/// Build store records for normalized conversation item JSON values.
-#[expect(clippy::too_many_arguments, reason = "factoring into struct would add indirection")]
-pub(super) fn build_item_records(
-    ctx: &HttpFilterContext<'_>,
-    owner: &StateOwner,
-    conversation_id: &str,
-    created_at: i64,
-    start_position: i64,
-    items: impl IntoIterator<Item = Value>,
-) -> Result<Vec<ConversationItemRecord>, String> {
-    items
-        .into_iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let (item_id, item_data) = normalize_item(ctx, item)?;
-            let offset = i64::try_from(index).unwrap_or(i64::MAX);
-            Ok(ConversationItemRecord {
-                item_id,
-                owner: owner.clone(),
-                conversation_id: conversation_id.to_owned(),
-                item_data,
-                created_at,
-                position: start_position.saturating_add(offset),
-            })
-        })
-        .collect()
-}
-
-/// Ensure an item is an object and has a usable ID.
-pub(super) fn normalize_item(ctx: &HttpFilterContext<'_>, item: Value) -> Result<(String, Value), String> {
-    let Value::Object(mut map) = item else {
-        return Err("each item must be a JSON object".to_owned());
-    };
-    let item_id = match map.get("id") {
-        Some(Value::String(id)) if !id.is_empty() => id.clone(),
-        Some(Value::String(_)) => return Err("item id must not be empty".to_owned()),
-        Some(Value::Null) | None => generated_item_id(ctx),
-        Some(_) => return Err("item id must be a string".to_owned()),
-    };
-    map.insert("id".to_owned(), Value::String(item_id.clone()));
-    normalize_message_item(&mut map)?;
-    default_item_status(&mut map);
-    let item = Value::Object(map);
-    validate_output_item(&item)?;
-    Ok((item_id, item))
-}
-
-/// Default a missing or `null` item `status` to `completed`.
-///
-/// The API contract requires a concrete status enum on returned items, but some
-/// backends emit `status: null` (or omit it) on output items such as reasoning.
-/// Treat a present-but-null status the same as an absent one so append-back does
-/// not fail closed on schema validation.
-fn default_item_status(map: &mut Map<String, Value>) {
-    if map.get("status").is_none_or(Value::is_null) {
-        map.insert("status".to_owned(), Value::String("completed".to_owned()));
-    }
-}
-
-/// Normalize easy SDK message inputs into conversation message response objects.
-fn normalize_message_item(map: &mut Map<String, Value>) -> Result<(), String> {
-    if map.get("type").and_then(Value::as_str) != Some("message") {
-        return Ok(());
-    }
-
-    let role = match map.get("role") {
-        Some(Value::String(role)) if !role.is_empty() => role.clone(),
-        Some(Value::String(_)) => return Err("message role must not be empty".to_owned()),
-        Some(_) => return Err("message role must be a string".to_owned()),
-        None => return Err("message role is required".to_owned()),
-    };
-
-    let content = map
-        .remove("content")
-        .ok_or_else(|| "message content is required".to_owned())?;
-    map.insert("content".to_owned(), normalize_message_content(&role, content)?);
-    map.entry("status".to_owned())
-        .or_insert_with(|| Value::String("completed".to_owned()));
-
-    Ok(())
-}
-
-/// Convert string message content to the list-form content returned by the API.
-fn normalize_message_content(role: &str, content: Value) -> Result<Value, String> {
-    match content {
-        Value::String(text) => {
-            let content_item = if role == "assistant" {
-                serde_json::json!({
-                    "type": "output_text",
-                    "text": text,
-                    "annotations": [],
-                    "logprobs": [],
-                })
-            } else {
-                serde_json::json!({
-                    "type": "input_text",
-                    "text": text,
-                })
-            };
-            Ok(Value::Array(vec![content_item]))
-        },
-        Value::Array(mut parts) => {
-            if role == "assistant" {
-                normalize_assistant_content_parts(&mut parts);
-            }
-            Ok(Value::Array(parts))
-        },
-        _ => Err("message content must be a string or array".to_owned()),
-    }
-}
-
-/// Fill in the optional `annotations` and `logprobs` fields that some backends
-/// omit or send as `null` on assistant `output_text` parts, so append-back
-/// matches the API contract.
-fn normalize_assistant_content_parts(parts: &mut [Value]) {
-    for part in parts {
-        let Some(part) = part.as_object_mut() else {
-            continue;
-        };
-        if part.get("type").and_then(Value::as_str) != Some("output_text") {
-            continue;
-        }
-        if part.get("annotations").is_none_or(Value::is_null) {
-            part.insert("annotations".to_owned(), Value::Array(Vec::new()));
-        }
-        if part.get("logprobs").is_none_or(Value::is_null) {
-            part.insert("logprobs".to_owned(), Value::Array(Vec::new()));
-        }
     }
 }
 
@@ -1156,57 +966,6 @@ mod tests {
 
     use super::*;
     use crate::store::SqliteResponseStore;
-
-    #[test]
-    fn assistant_output_text_normalizes_nullable_provider_fields() {
-        let normalized = normalize_message_content(
-            "assistant",
-            serde_json::json!([{
-                "type": "output_text",
-                "text": "hello",
-                "annotations": [],
-                "logprobs": null
-            }]),
-        )
-        .unwrap();
-
-        assert_eq!(normalized[0]["annotations"], serde_json::json!([]));
-        assert_eq!(normalized[0]["logprobs"], serde_json::json!([]));
-    }
-
-    #[test]
-    fn reasoning_item_with_null_status_normalizes_and_validates() {
-        // Backends such as vLLM emit `status: null` on reasoning output items;
-        // the status must be defaulted before it satisfies the item contract.
-        let mut map = serde_json::json!({
-            "type": "reasoning",
-            "id": "rs_1",
-            "summary": [],
-            "content": [{"type": "reasoning_text", "text": "\n\n"}],
-            "encrypted_content": null,
-            "status": null
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-
-        assert!(validate_output_item(&Value::Object(map.clone())).is_err());
-
-        default_item_status(&mut map);
-
-        assert_eq!(map["status"], serde_json::json!("completed"));
-        validate_output_item(&Value::Object(map)).unwrap();
-    }
-
-    #[test]
-    fn default_item_status_preserves_existing_status() {
-        let mut map = serde_json::json!({"status": "in_progress"})
-            .as_object()
-            .unwrap()
-            .clone();
-        default_item_status(&mut map);
-        assert_eq!(map["status"], serde_json::json!("in_progress"));
-    }
 
     // -------------------------------------------------------------------------
     // store_error_response

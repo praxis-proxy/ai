@@ -21,10 +21,11 @@ default = []
 openai-responses = []
 # openai_file_resolve: downloads referenced files (pinned reqwest client).
 openai-file-resolve-filter = ["openai-responses", "dep:reqwest"]
-# Response and conversation storage (SQL). Implies the Responses kernel it serves.
-store = ["openai-responses", "dep:sqlx", "dep:dashmap", "dep:zstd"]
-store-postgres = ["store", "sqlx/postgres", "sqlx/tls-native-tls"]
-store-sqlite = ["store", "sqlx/sqlite"]
+# Response and conversation storage. The SQL backends live in praxis-ai-store-backends
+# so a build without a backend carries no SQL client or crypto.
+store = ["openai-responses", "praxis-ai-store/compression"]
+store-postgres = ["store", "dep:praxis-ai-store-backends", "praxis-ai-store-backends/postgres"]
+store-sqlite = ["store", "dep:praxis-ai-store-backends", "praxis-ai-store-backends/sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 # Locally served Conversations API with JSON Schema item validation and the
 # generated implementation OpenAPI document.
@@ -46,13 +47,18 @@ workspace = true
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-dashmap = { workspace = true, optional = true }
 futures = { workspace = true }
 http = { workspace = true }
 jsonschema = { workspace = true, optional = true }
 openssl = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
+praxis-ai-store = { workspace = true }
+# Transitional: apis re-exports the SQL backends at crate::store::* so the
+# conversations and responses filters keep compiling. Removed once #1259b and
+# #1262 take those filters off concrete-store construction. default-features off
+# so a per-backend apis build forwards only the backend it selects.
+praxis-ai-store-backends = { path = "../store-backends", optional = true, default-features = false }
 praxis-core = { workspace = true }
 # iterative-request-router: IterationState / NextIterationBody (agentic loop,
 # web_search, file_search, MCP callouts). chain-binding: ChainBindingContext /
@@ -66,7 +72,6 @@ secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-sqlx = { workspace = true, optional = true }
 sse-stream = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tiktoken-rs = { workspace = true, optional = true }
@@ -74,11 +79,12 @@ tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tracing = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true, optional = true }
-zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 allocation-counter = { workspace = true }
+sqlx = { workspace = true, features = ["sqlite", "postgres", "tls-native-tls"] }
 axum = { workspace = true }
+praxis-ai-store = { workspace = true, features = ["test-support"] }
 rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
 schemars = { workspace = true }
 tempfile = { workspace = true }

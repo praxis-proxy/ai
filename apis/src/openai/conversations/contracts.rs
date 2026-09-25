@@ -23,7 +23,7 @@ use utoipa::{
 use super::item_schema::validate_input_item;
 
 /// Maximum number of items accepted by create operations.
-pub(super) const MAX_ITEMS_PER_REQUEST: usize = 20;
+pub(crate) const MAX_ITEMS_PER_REQUEST: usize = 20;
 
 /// Optional response fields supported by Conversation item endpoints.
 ///

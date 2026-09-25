@@ -1,0 +1,22 @@
+[package]
+name = "praxis-ai-store-lifecycle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+praxis-ai-store = { path = "../store" }
+dashmap = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+praxis-ai-store = { path = "../store", features = ["test-support"] }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

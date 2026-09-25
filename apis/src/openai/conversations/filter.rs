@@ -2,13 +2,12 @@
 // Copyright (c) 2026 Praxis Contributors
 
 //! [`OpenaiConversationsFilter`] handles all `/v1/conversations`
-//! endpoints locally via `FilterAction::Reject`, backed by the
-//! `ConversationItemStore` trait.
+//! endpoints locally via `FilterAction::Reject`, backed by an owner-scoped
+//! conversation store resolved from the per-listener registry the serving
+//! runtime provisions.
 //!
 //! The `openai_operation` filter must run earlier in the same chain. Its typed
 //! match is the sole runtime authority for Conversations dispatch.
-
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -17,28 +16,21 @@ use praxis_filter::{
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
-use secrecy::ExposeSecret as _;
 use serde_json::Value;
-use tokio::sync::OnceCell;
 use tracing::{debug, trace, warn};
 
-#[cfg(feature = "store-postgres")]
-use super::config::revalidate_postgres_host;
 use super::{
-    config::{ConversationsConfig, StorageBackend, validate_config},
+    CONVERSATIONS_STORE_NAME,
+    config::{ConversationsConfig, validate_config},
     handlers,
     routes::{APPLICATION_PROTOCOL, ConversationOperation, match_route},
 };
-#[cfg(feature = "store-postgres")]
-use crate::store::PostgresResponseStore;
-#[cfg(feature = "store-sqlite")]
-use crate::store::SqliteResponseStore;
 use crate::{
     openai::{operation_classifier::OpenAiOperationMatch, responses::state::ResponsesState},
     operation::Transport,
+    service::conversations::{ConversationsService, build_item_records},
     state_owner::{StateOwner, require_state_owner},
-    store::{ConversationItemStore, StoreError},
+    store::ResponseStoreRegistry,
 };
 
 // -----------------------------------------------------------------------------
@@ -47,8 +39,10 @@ use crate::{
 
 /// Handles all `/v1/conversations` endpoints locally.
 ///
-/// All matched requests are served from the local store and never
-/// forwarded upstream. Unmatched paths pass through as `Continue`.
+/// All matched requests are served from the owner-scoped store and never
+/// forwarded upstream. Unmatched paths pass through as `Continue`. The filter
+/// holds no state: it resolves the store from the per-request registry the
+/// serving runtime provisions, and takes an owner-bound handle at request time.
 /// `openai_operation` must precede this filter in the same chain.
 ///
 /// # YAML
@@ -62,12 +56,7 @@ use crate::{
 ///   items_table: conversation_items
 ///   allow_private_database_url: true
 /// ```
-pub struct OpenaiConversationsFilter {
-    /// Filter configuration (backend, database URL, table names).
-    config: ConversationsConfig,
-    /// Lazily-initialized store; `None` on permanent init failure (SQLite).
-    store: OnceCell<Option<Arc<dyn ConversationItemStore>>>,
-}
+pub struct OpenaiConversationsFilter;
 
 /// Per-request state used when another filter forces request-body pre-read
 /// before this filter's header hook has run.
@@ -100,8 +89,25 @@ fn capture_append_owner(ctx: &mut HttpFilterContext<'_>) -> Result<(), FilterAct
     Ok(())
 }
 
+/// Resolve the owner-scoped conversations service from the per-request registry.
+///
+/// Mirrors the response-store filter: the store is provisioned into the registry
+/// on the serving runtime, and the filter takes an owner-bound handle at request
+/// time and wraps it in the service. `None` when no registry is installed or the
+/// store is not provisioned.
+fn resolve_service(ctx: &HttpFilterContext<'_>, owner: &StateOwner) -> Option<ConversationsService> {
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .and_then(|registry| registry.get_scoped(CONVERSATIONS_STORE_NAME, owner))
+        .map(ConversationsService::new)
+}
+
 impl OpenaiConversationsFilter {
     /// Create a filter from parsed YAML config.
+    ///
+    /// The config is validated here so a malformed or unknown-backend config
+    /// fails at pipeline construction. The serving-runtime provisioner opens the
+    /// backend and registers it; the filter only resolves it at request time.
     ///
     /// # Errors
     ///
@@ -109,163 +115,17 @@ impl OpenaiConversationsFilter {
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ConversationsConfig = parse_filter_config("openai_conversations", config)?;
         validate_config(&cfg)?;
-        Ok(Box::new(Self::new(cfg)))
+        Ok(Box::new(Self))
     }
 
-    /// Wrap a validated config into a new filter instance.
-    fn new(config: ConversationsConfig) -> Self {
-        Self {
-            config,
-            store: OnceCell::new(),
-        }
-    }
-
-    /// Build a filter around a pre-initialized store for tests.
+    /// Resolve the owner-scoped service, or the fail-closed action to return.
     ///
-    /// Pre-seeding the `OnceCell` lets tests inject a fault-injecting store
-    /// (e.g. one whose `create_conversation_items` fails) without standing up a
-    /// real database, so append-back error handling can be exercised directly.
-    #[cfg(test)]
-    #[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
-    pub(super) fn with_store_for_test(config: ConversationsConfig, store: Arc<dyn ConversationItemStore>) -> Self {
-        Self {
-            config,
-            // Pre-initialize the cell so `get_or_init_store` returns this store
-            // without touching a real backend. The outer `Some` marks the cell
-            // initialized; the inner `Some` is the stored (available) store.
-            store: OnceCell::new_with(Some(Some(store))),
-        }
-    }
-
-    /// Build the configured store backend.
-    #[cfg_attr(
-        not(any(feature = "store-postgres", feature = "store-sqlite")),
-        expect(clippy::unused_async, reason = "only the SQL backends await during construction")
-    )]
-    async fn build_store(&self) -> Result<Arc<dyn ConversationItemStore>, StoreError> {
-        #[cfg_attr(
-            not(any(feature = "store-postgres", feature = "store-sqlite")),
-            expect(
-                unused_variables,
-                reason = "only the compiled-in backends read the responses table name"
-            )
-        )]
-        let responses_table = self.config.responses_table();
-        match self.config.backend {
-            #[cfg(feature = "store-sqlite")]
-            StorageBackend::Sqlite => self.build_sqlite_store(&responses_table).await,
-            #[cfg(not(feature = "store-sqlite"))]
-            StorageBackend::Sqlite => Err(StoreError::Unavailable(
-                "sqlite backend was not compiled; enable the 'store-sqlite' feature".to_owned(),
-            )),
-            #[cfg(feature = "store-postgres")]
-            StorageBackend::Postgres => Box::pin(self.build_postgres_store(&responses_table)).await,
-            #[cfg(not(feature = "store-postgres"))]
-            StorageBackend::Postgres => Err(StoreError::Unavailable(
-                "postgres backend was not compiled; enable the 'store-postgres' feature".to_owned(),
-            )),
-        }
-    }
-
-    /// Construct a SQLite-backed store.
-    #[cfg(feature = "store-sqlite")]
-    async fn build_sqlite_store(&self, responses_table: &str) -> Result<Arc<dyn ConversationItemStore>, StoreError> {
-        SqliteResponseStore::new(
-            self.config.database_url.expose_secret(),
-            responses_table,
-            &self.config.conversations_table,
-            Some(&self.config.items_table),
-            self.config.pool.as_ref(),
-            None,
-        )
-        .await
-        .map(|s| {
-            let arc: Arc<dyn ConversationItemStore> = Arc::new(s);
-            arc
-        })
-    }
-
-    /// Construct a Postgres-backed store.
-    #[cfg(feature = "store-postgres")]
-    async fn build_postgres_store(&self, responses_table: &str) -> Result<Arc<dyn ConversationItemStore>, StoreError> {
-        revalidate_postgres_host(&self.config)
-            .map_err(|e| StoreError::Unavailable(format!("postgres host validation failed before connect: {e}")))?;
-        let tls = self.config.tls_config();
-        PostgresResponseStore::new(
-            self.config.database_url.expose_secret(),
-            responses_table,
-            &self.config.conversations_table,
-            Some(&self.config.items_table),
-            &tls,
-            self.config.pool.as_ref(),
-            None,
-        )
-        .await
-        .map(|s| {
-            let arc: Arc<dyn ConversationItemStore> = Arc::new(s);
-            arc
-        })
-    }
-
-    /// Build the store and log the outcome.
-    async fn build_logged_store(&self) -> Result<Arc<dyn ConversationItemStore>, StoreError> {
-        let store = Box::pin(self.build_store()).await?;
-        debug!(
-            backend = ?self.config.backend,
-            conversations_table = %self.config.conversations_table,
-            items_table = %self.config.items_table,
-            "conversations store initialized"
-        );
-        Ok(store)
-    }
-
-    /// Build and cache the store permanently (SQLite path — no retry on failure).
-    async fn init_permanent_store(&self) -> Option<Arc<dyn ConversationItemStore>> {
-        match Box::pin(self.build_logged_store()).await {
-            Ok(store) => Some(store),
-            Err(e) => {
-                warn!(
-                    backend = ?self.config.backend,
-                    error = %e,
-                    "conversations store initialization failed (permanent)"
-                );
-                None
-            },
-        }
-    }
-
-    /// Return the cached store, initializing on first call.
-    async fn get_or_init_store(&self) -> Option<Arc<dyn ConversationItemStore>> {
-        if matches!(self.config.backend, StorageBackend::Postgres) {
-            match self
-                .store
-                .get_or_try_init(|| async { Box::pin(self.build_logged_store()).await.map(Some) })
-                .await
-            {
-                Ok(store) => store.as_ref().map(Arc::clone),
-                Err(e) => {
-                    warn!(
-                        backend = ?self.config.backend,
-                        error = %e,
-                        "conversations store initialization failed (will retry)"
-                    );
-                    None
-                },
-            }
-        } else {
-            self.store
-                .get_or_init(|| async { Box::pin(self.init_permanent_store()).await })
-                .await
-                .as_ref()
-                .map(Arc::clone)
-        }
-    }
-
-    /// Return the store or a 500 rejection if unavailable.
-    async fn require_store(&self) -> Result<Arc<dyn ConversationItemStore>, FilterError> {
-        self.get_or_init_store()
-            .await
-            .ok_or_else(|| FilterError::from("openai_conversations: store unavailable"))
+    /// The owner is server-set from trusted request context; the returned service
+    /// binds every store operation to it. A missing owner yields the auth action;
+    /// an unprovisioned store yields a 500 rejection.
+    fn scoped_service(ctx: &HttpFilterContext<'_>) -> Result<ConversationsService, FilterAction> {
+        let owner = require_state_owner(ctx)?;
+        resolve_service(ctx, owner).ok_or_else(|| FilterAction::Reject(reject_store_unavailable()))
     }
 
     /// Mark the request phase complete and return any body captured earlier.
@@ -364,22 +224,22 @@ impl OpenaiConversationsFilter {
     /// Dispatch a matched body to the appropriate local handler.
     async fn handle_body_operation(
         ctx: &HttpFilterContext<'_>,
-        store: &dyn ConversationItemStore,
+        service: &ConversationsService,
         matched: OpenAiOperationMatch,
         operation: ConversationOperation,
         body: &[u8],
     ) -> Result<FilterAction, FilterError> {
         match operation {
-            ConversationOperation::CreateConversation => handlers::handle_create_conversation(ctx, store, body).await,
+            ConversationOperation::CreateConversation => handlers::handle_create_conversation(ctx, service, body).await,
             ConversationOperation::UpdateConversation => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched update route missing id"))?;
-                handlers::handle_update_conversation(ctx, store, id, body).await
+                handlers::handle_update_conversation(service, id, body).await
             },
             ConversationOperation::CreateConversationItems => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched item create route missing id"))?;
-                handlers::handle_create_items(ctx, store, id, body).await
+                handlers::handle_create_items(ctx, service, id, body).await
             },
             ConversationOperation::GetConversation
             | ConversationOperation::DeleteConversation
@@ -405,17 +265,11 @@ impl OpenaiConversationsFilter {
         let Some(body) = Self::mark_request_filters_ran(ctx) else {
             return Ok(FilterAction::Continue);
         };
-        let Some(store) = self.get_or_init_store().await else {
-            return Ok(FilterAction::Reject(reject_store_unavailable()));
+        let service = match Self::scoped_service(ctx) {
+            Ok(service) => service,
+            Err(action) => return Ok(action),
         };
-        Box::pin(Self::handle_body_operation(
-            ctx,
-            store.as_ref(),
-            matched,
-            operation,
-            &body,
-        ))
-        .await
+        Box::pin(Self::handle_body_operation(ctx, &service, matched, operation, &body)).await
     }
 
     /// Dispatch a bodyless conversation operation to its local handler.
@@ -426,32 +280,32 @@ impl OpenaiConversationsFilter {
         matched: OpenAiOperationMatch,
         operation: ConversationOperation,
     ) -> Result<FilterAction, FilterError> {
+        let service = match Self::scoped_service(ctx) {
+            Ok(service) => service,
+            Err(action) => return Ok(action),
+        };
         match operation {
             ConversationOperation::GetConversation => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched get route missing id"))?;
-                let store = self.require_store().await?;
-                handlers::handle_get_conversation(ctx, store.as_ref(), id).await
+                handlers::handle_get_conversation(&service, id).await
             },
             ConversationOperation::ListConversationItems => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched list route missing id"))?;
-                let store = self.require_store().await?;
-                handlers::handle_list_items(ctx, store.as_ref(), id).await
+                handlers::handle_list_items(ctx, &service, id).await
             },
             ConversationOperation::GetConversationItem => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing id"))?;
                 let item_id = Self::path_parameter(ctx, &matched, "item_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched get item route missing item id"))?;
-                let store = self.require_store().await?;
-                handlers::handle_get_item(ctx, store.as_ref(), id, item_id).await
+                handlers::handle_get_item(ctx, &service, id, item_id).await
             },
             ConversationOperation::DeleteConversation => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
                     .ok_or_else(|| FilterError::from("openai_conversations: matched delete route missing id"))?;
-                let store = self.require_store().await?;
-                handlers::handle_delete_conversation(ctx, store.as_ref(), id).await
+                handlers::handle_delete_conversation(&service, id).await
             },
             ConversationOperation::DeleteConversationItem => {
                 let id = Self::path_parameter(ctx, &matched, "conversation_id")
@@ -459,8 +313,7 @@ impl OpenaiConversationsFilter {
                 let item_id = Self::path_parameter(ctx, &matched, "item_id").ok_or_else(|| {
                     FilterError::from("openai_conversations: matched delete item route missing item id")
                 })?;
-                let store = self.require_store().await?;
-                handlers::handle_delete_item(ctx, store.as_ref(), id, item_id).await
+                handlers::handle_delete_item(&service, id, item_id).await
             },
             ConversationOperation::CreateConversation
             | ConversationOperation::UpdateConversation
@@ -471,23 +324,20 @@ impl OpenaiConversationsFilter {
     }
 
     /// Persist conversation items synchronously using `block_in_place`.
+    ///
+    /// The service is resolved for the captured append owner, so the handle is
+    /// bound to the same owner the exchange authenticated as.
     fn append_items_blocking(
-        &self,
         owner: &StateOwner,
         conversation_id: &str,
         ctx: &HttpFilterContext<'_>,
         items: Vec<Value>,
     ) -> Result<(), FilterError> {
-        let store = self
-            .store
-            .get()
-            .and_then(Option::as_ref)
+        let service = resolve_service(ctx, owner)
             .ok_or_else(|| FilterError::from("openai_conversations: store unavailable for append-back"))?;
 
         let handle = tokio::runtime::Handle::current();
-        tokio::task::block_in_place(|| {
-            handle.block_on(persist_items(store.as_ref(), owner, conversation_id, ctx, items))
-        })
+        tokio::task::block_in_place(|| handle.block_on(persist_items(&service, conversation_id, ctx, items)))
     }
 }
 
@@ -540,9 +390,6 @@ impl HttpFilter for OpenaiConversationsFilter {
                 // forwarding here would silently bypass local handling.
                 return Ok(FilterAction::Reject(reject_classifier_unavailable()));
             }
-            if should_append_back(ctx) {
-                drop(self.get_or_init_store().await);
-            }
             return Ok(FilterAction::Continue);
         };
 
@@ -589,17 +436,11 @@ impl HttpFilter for OpenaiConversationsFilter {
 
         let empty: &[u8] = &[];
         let bytes = body.as_ref().map_or(empty, |b| b.as_ref());
-        let Some(store) = self.get_or_init_store().await else {
-            return Ok(FilterAction::Reject(reject_store_unavailable()));
+        let service = match Self::scoped_service(ctx) {
+            Ok(service) => service,
+            Err(action) => return Ok(action),
         };
-        Box::pin(Self::handle_body_operation(
-            ctx,
-            store.as_ref(),
-            matched,
-            operation,
-            bytes,
-        ))
-        .await
+        Box::pin(Self::handle_body_operation(ctx, &service, matched, operation, bytes)).await
     }
 
     #[expect(
@@ -641,7 +482,6 @@ impl HttpFilter for OpenaiConversationsFilter {
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
                 max_bytes: Some(MAX_JSON_BODY_BYTES),
             });
-            drop(self.get_or_init_store().await);
         } else {
             ctx.insert_filter_state(ConversationResponseState { append_owner: None });
         }
@@ -690,7 +530,7 @@ impl HttpFilter for OpenaiConversationsFilter {
         // the pipeline logs this error and converts it to Continue, releasing the
         // body even though items were lost. Transactional item insertion and cache
         // rebuild failures reach this `?` before any append-back bytes are released.
-        self.append_items_blocking(&items.owner, &conv_id, ctx, items.all_items)
+        Self::append_items_blocking(&items.owner, &conv_id, ctx, items.all_items)
             .inspect_err(|e| warn!(error = %e, conversation_id = %conv_id, "conversation append-back failed"))?;
 
         Ok(FilterAction::Continue)
@@ -779,25 +619,29 @@ fn merge_input_output_items(ctx: &HttpFilterContext<'_>, bytes: &[u8]) -> Option
 }
 
 /// Persist items and refresh the denormalized message cache.
+///
+/// Records are built with the handle's bound owner, so the owner-scoped write
+/// path accepts them; a record under any other owner would be rejected.
 async fn persist_items(
-    store: &dyn ConversationItemStore,
-    owner: &StateOwner,
+    service: &ConversationsService,
     conversation_id: &str,
     ctx: &HttpFilterContext<'_>,
     items: Vec<Value>,
 ) -> Result<(), FilterError> {
     let created_at = handlers::current_timestamp(ctx);
 
-    let records = handlers::build_item_records(ctx, owner, conversation_id, created_at, 0, items)
-        .map_err(|e| -> FilterError { e.into() })?;
+    let records = build_item_records(service.owner(), conversation_id, created_at, 0, items, || {
+        handlers::generated_item_id(ctx)
+    })
+    .map_err(|e| -> FilterError { Box::new(e) })?;
 
     if records.is_empty() {
         return Ok(());
     }
 
     let count = records.len();
-    store
-        .create_items_and_sync_messages(owner, conversation_id, &records)
+    service
+        .create_items(conversation_id, &records)
         .await
         .map_err(|e| -> FilterError { Box::new(e) })?;
 

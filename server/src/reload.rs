@@ -5,6 +5,8 @@
 
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "store")]
+use praxis_ai_apis::store::{CONVERSATIONS_STORE_FILTER_NAME, RESPONSE_STORE_FILTER_NAME};
 use praxis_core::{
     config::Config,
     health::{HealthRegistry, build_health_registry},
@@ -14,7 +16,8 @@ use praxis_protocol::ListenerPipelines;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::pipelines::resolve_pipelines;
+#[cfg(feature = "store")]
+use crate::pipelines::resolve_pipelines_with_stores;
 
 // -----------------------------------------------------------------------------
 // Reload
@@ -52,12 +55,28 @@ pub(crate) fn reload_pipelines(
     health_shutdown: &Arc<Mutex<CancellationToken>>,
     kv_stores: &praxis_core::kv::KvStoreRegistry,
     subrequest_client: &praxis_core::subrequest::SubRequestClient,
+    store_registries: &crate::StoreRegistries,
+    health_slot: &crate::SharedHealthRegistry,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(not(feature = "store"))]
+    let _ = store_registries;
     info!("building new pipelines from reloaded config");
 
     if let Err(e) = praxis_core::logging::validate_log_overrides(new_config) {
         error!(error = %e, "config reload failed: invalid log_overrides");
         return Err(e.into());
+    }
+
+    // A store config change is restart-required: pools bind to the serving
+    // runtime while reload runs on the watcher runtime. Reject the reload so the
+    // running pipeline keeps serving against its provisioned backends, rather
+    // than swap in one whose store registry is stale or empty and returns 500s.
+    #[cfg(feature = "store")]
+    if store_filter_configs(new_config) != store_filter_configs(old_config) {
+        error!(
+            "config reload rejected: response store configuration changed; restart required to re-provision backends"
+        );
+        return Err("response store configuration changed; restart required to re-provision".into());
     }
 
     let health_registry = build_health_registry(&new_config.clusters);
@@ -68,7 +87,22 @@ pub(crate) fn reload_pipelines(
         new_ceiling,
     );
 
-    let new_pipelines = match resolve_pipelines(new_config, registry, &health_registry, kv_stores, &updated_client) {
+    // Reuse the serving-runtime-provisioned store registries: the reloaded
+    // pipeline shares the same backends. Store pools bind to the serving
+    // runtime, and reload runs on the watcher runtime, so a changed store
+    // config is restart-required rather than re-provisioned here.
+    #[cfg(feature = "store")]
+    let build = resolve_pipelines_with_stores(
+        new_config,
+        registry,
+        &health_registry,
+        kv_stores,
+        &updated_client,
+        store_registries,
+    );
+    #[cfg(not(feature = "store"))]
+    let build = crate::pipelines::resolve_pipelines(new_config, registry, &health_registry, kv_stores, &updated_client);
+    let new_pipelines = match build {
         Ok(p) => p,
         Err(e) => {
             error!(error = %e, "config reload failed: pipeline build error");
@@ -95,6 +129,9 @@ pub(crate) fn reload_pipelines(
     }
 
     respawn_health_checks(new_config, &health_registry, health_shutdown);
+    // Publish the freshly built registry so the readiness endpoint reflects the
+    // reloaded cluster health instead of the startup snapshot.
+    *health_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&health_registry);
 
     info!(
         swapped = ?swapped,
@@ -157,6 +194,19 @@ fn log_restart_required_changes(old: &Config, new: &Config) {
     detect_compression_additions(old, new);
     detect_tls_toggles(old, new);
     detect_subrequest_connector_changes(old, new);
+}
+
+/// Collect the response-store and conversations-store filter configs across all
+/// chains, for comparison.
+#[cfg(feature = "store")]
+fn store_filter_configs(config: &Config) -> Vec<&serde_yaml::Value> {
+    config
+        .filter_chains
+        .iter()
+        .flat_map(|c| c.filters.iter())
+        .filter(|e| e.filter_type == RESPONSE_STORE_FILTER_NAME || e.filter_type == CONVERSATIONS_STORE_FILTER_NAME)
+        .map(|e| &e.config)
+        .collect()
 }
 
 /// Detect listener additions, removals, and address rebinds.
@@ -369,6 +419,7 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::*;
+    use crate::pipelines::resolve_pipelines;
 
     #[test]
     fn valid_reload_swaps_pipeline() {
@@ -384,6 +435,8 @@ mod tests {
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &crate::StoreRegistries::default(),
+            &crate::SharedHealthRegistry::default(),
         );
 
         assert!(result.is_ok(), "valid reload should succeed");
@@ -418,6 +471,8 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &crate::StoreRegistries::default(),
+            &crate::SharedHealthRegistry::default(),
         );
         assert!(result.is_err(), "invalid filter should return Err");
 
@@ -439,6 +494,8 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &crate::StoreRegistries::default(),
+            &crate::SharedHealthRegistry::default(),
         )
         .unwrap();
 
@@ -462,6 +519,8 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &crate::StoreRegistries::default(),
+            &crate::SharedHealthRegistry::default(),
         )
         .unwrap();
 
@@ -500,6 +559,8 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &crate::StoreRegistries::default(),
+            &crate::SharedHealthRegistry::default(),
         );
         assert!(
             !old_token.is_cancelled(),
@@ -537,6 +598,8 @@ filter_chains:
             &shutdown,
             &empty_kv_stores(),
             &test_client(),
+            &crate::StoreRegistries::default(),
+            &crate::SharedHealthRegistry::default(),
         );
         assert!(result.is_ok(), "reload with new listener should succeed");
         assert!(

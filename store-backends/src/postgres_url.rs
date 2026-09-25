@@ -15,9 +15,8 @@ use std::{
 };
 
 use percent_encoding::percent_decode_str;
+use praxis_ai_store::url_security::is_non_public_ip;
 use praxis_filter::{FilterError, has_dot_dot_traversal};
-
-use crate::openai::url_security::is_non_public_ip;
 
 // -----------------------------------------------------------------------------
 // Public API
@@ -31,7 +30,13 @@ use crate::openai::url_security::is_non_public_ip;
 ///
 /// `filter_name` is used as a prefix in error messages so each
 /// consuming filter reports its own name.
-pub(crate) fn validate_postgres_database_url(
+///
+/// # Errors
+///
+/// Returns an error if the URL scheme is not `postgres`/`postgresql`, if a
+/// `host` or `hostaddr` targets an SSRF-sensitive address (unless
+/// `allow_private`), or if no explicit host is present.
+pub fn validate_postgres_database_url(
     filter_name: &str,
     database_url: &str,
     allow_private: bool,
@@ -73,11 +78,12 @@ pub(crate) fn validate_postgres_database_url(
 /// by re-checking the SSRF-sensitive host rules on every retry without
 /// redundantly re-validating immutable fields (table names, SSL config,
 /// URL scheme).
-pub(crate) fn revalidate_postgres_host(
-    filter_name: &str,
-    database_url: &str,
-    allow_private: bool,
-) -> Result<(), FilterError> {
+///
+/// # Errors
+///
+/// Returns an error if a `host` or `hostaddr` in the URL targets an
+/// SSRF-sensitive address (unless `allow_private`).
+pub fn revalidate_postgres_host(filter_name: &str, database_url: &str, allow_private: bool) -> Result<(), FilterError> {
     let Some(after_scheme) = postgres_url_after_scheme(database_url) else {
         return Ok(());
     };

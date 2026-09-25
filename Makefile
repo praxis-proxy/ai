@@ -90,7 +90,7 @@ container-run: | require-container-engine
 # -------------------------------------------------------------------
 
 test:
-	cargo test --workspace $(_NOCAPTURE)
+	cargo test --workspace --features $(STORE_ALL_WORKSPACE_FEATURES) $(_NOCAPTURE)
 
 test-unit:
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
@@ -254,7 +254,7 @@ audit:
 coverage-check:
 	cargo llvm-cov --workspace --features $(STORE_ALL_WORKSPACE_FEATURES) --json \
 		--exclude xtask \
-		--ignore-filename-regex '(target/|tests/|store/postgres\.rs)' \
+		--ignore-filename-regex '(target/|tests/|store-backends/src/postgres\.rs)' \
 		--output-path coverage.json
 	@LINE_PCT=$$(jq '.data[0].totals.lines.percent' coverage.json); \
 	echo "Line coverage: $${LINE_PCT}%"; \

@@ -1,0 +1,33 @@
+[package]
+name = "praxis-ai-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# Reusable cross-crate contract-test harness and its dependencies. Off by
+# default so the normal build carries only the contracts and the registry.
+test-support = []
+# Optional payload compression (zstd) for stored JSON columns. zstd is a
+# compression codec, not a cryptographic module, so a FIPS build that leaves
+# this feature off carries no additional crypto and no zstd.
+compression = ["dep:zstd", "dep:tokio"]
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dashmap = { workspace = true }
+zstd = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+serde_yaml = { workspace = true }

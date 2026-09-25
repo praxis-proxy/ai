@@ -5,6 +5,7 @@
 
 use std::{
     path::PathBuf,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -17,8 +18,7 @@ use serde_json::json;
 
 use super::{
     ListParams, MAX_PAGE_LIMIT, Order, ResponseStoreFilter,
-    config::{ResponseStoreConfig, revalidate_postgres_host, validate_config},
-    input_items::DEFAULT_PAGE_LIMIT,
+    config::{ResponseStoreConfig, validate_config},
     list_input_items,
 };
 use crate::{
@@ -26,7 +26,11 @@ use crate::{
         include::{IncludeField, IncludeFields},
         responses::state::ResponsesState,
     },
-    store::{ResponseRecord, ResponseStore as _, ResponseStoreRegistry, SqliteResponseStore},
+    service::responses::input_items::DEFAULT_PAGE_LIMIT,
+    store::{
+        DEFAULT_STORE_NAME, PersistedStateBackend, ResponseRecord, ResponseStore as _, ResponseStoreRegistry,
+        SqliteResponseStore,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -305,6 +309,7 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() 
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.set_metadata("openai_responses_format.stream", "false");
 
@@ -325,79 +330,6 @@ async fn on_request_selects_bounded_stream_buffer_for_non_streaming_responses() 
 // -----------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_does_not_initialize_store_without_format_metadata() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue when format metadata is absent"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not initialize before request classification is available"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_does_not_initialize_store_for_non_responses_format() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat/completions");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_chat_completions");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue for non-responses format"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not initialize for non-Responses traffic"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_does_not_initialize_store_when_store_is_false() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.store", "false");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue when store is false"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not initialize when persistence and rehydrate are both unnecessary"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_initializes_store_for_streaming_requests() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.stream", "true");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue for streaming requests"
-    );
-    assert!(
-        filter.store.get().is_some(),
-        "store should initialize for streaming requests to enable persistence at EOS"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_request_skips_for_get_to_unrelated_path() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/models");
@@ -408,10 +340,6 @@ async fn on_request_skips_for_get_to_unrelated_path() {
     assert!(
         matches!(action, FilterAction::Continue),
         "should skip for GET to unrelated path"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not be initialized for non-responses GET paths"
     );
 }
 
@@ -426,36 +354,32 @@ async fn on_request_skips_delete_on_unrelated_path() {
         matches!(action, FilterAction::Continue),
         "DELETE to unrelated path should continue"
     );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not be initialized for unrelated DELETE"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_initializes_store_for_openai_responses_format() {
+async fn on_request_rejects_persistable_request_when_store_not_provisioned() {
+    // The filter resolves the provisioned store from the context registry. A
+    // persistable Responses create with no store provisioned fails fast with a
+    // 500 rather than running inference it cannot persist.
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
 
     let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue after initializing store"
-    );
-    let store_opt = filter.store.get().expect("store OnceCell should be initialized");
-    assert!(
-        store_opt.is_some(),
-        "store should be Some for valid sqlite::memory: config"
+    let rejection = expect_reject(action);
+    assert_eq!(
+        rejection.status, 500,
+        "a persistable request without a provisioned store must reject with 500"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_initializes_store_for_previous_response_id_even_when_store_false() {
+async fn on_request_continues_for_previous_response_id_with_store_provisioned() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.set_metadata("openai_responses_format.store", "false");
     ctx.set_metadata("openai_responses_format.has_previous_response_id", "true");
@@ -463,94 +387,7 @@ async fn on_request_initializes_store_for_previous_response_id_even_when_store_f
     let action = filter.on_request(&mut ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
-        "should continue after initializing the store for rehydrate"
-    );
-    assert!(
-        filter.store.get().and_then(Option::as_ref).is_some(),
-        "store should initialize when previous_response_id requires rehydrate"
-    );
-}
-
-// -----------------------------------------------------------------------------
-// on_request Registry
-// -----------------------------------------------------------------------------
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_registers_store_in_response_stores() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    let registry = ResponseStoreRegistry::new();
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue after registering store"
-    );
-    assert!(
-        registry.contains("default"),
-        "store should be registered as 'default' in response_stores"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_skips_registration_when_no_registry() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "should continue even without registry"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_body_registers_store_for_previous_response_id_even_when_store_false() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    let registry = ResponseStoreRegistry::new();
-    ctx.extensions.insert(registry.clone());
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.store", "false");
-    ctx.set_metadata("openai_responses_format.has_previous_response_id", "true");
-    let mut body = Some(Bytes::from_static(
-        br#"{"model":"gpt-4.1","input":"Hi","store":false,"previous_response_id":"resp_prev"}"#,
-    ));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "request body phase should continue after registering the store"
-    );
-    assert!(
-        registry.contains("default"),
-        "store should register so rehydrate can fetch previous_response_id"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_body_does_not_initialize_store_for_store_false_without_previous_response() {
-    let filter = make_filter();
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-    ctx.set_metadata("openai_responses_format.store", "false");
-    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","input":"Hi","store":false}"#));
-
-    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    assert!(
-        matches!(action, FilterAction::Continue),
-        "request body phase should continue for store=false without rehydrate"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not initialize when neither persistence nor rehydrate needs it"
+        "rehydrate with a provisioned store should continue"
     );
 }
 
@@ -567,7 +404,7 @@ async fn on_request_body_arms_persistence_for_persisted_response() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.extensions.insert(ResponseStoreRegistry::new());
+    install_store(&mut ctx).await;
     // openai_responses_validate creates ResponsesState earlier in this body phase.
     ctx.extensions.insert(ResponsesState::default());
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
@@ -610,15 +447,14 @@ async fn on_request_body_does_not_arm_persistence_when_store_false() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_request_body_does_not_arm_persistence_for_rehydrate_only() {
-    // A store=false request with previous_response_id registers the store so
-    // rehydrate can read history, but it will not persist a new response, so it
-    // must not arm persistence. Arming on registration alone would resurrect the
+    // A store=false request with previous_response_id needs the store so rehydrate
+    // can read history, but it will not persist a new response, so it must not arm
+    // persistence. Arming on store presence alone would resurrect the
     // pipeline-scoped bug this marker exists to fix.
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    let registry = ResponseStoreRegistry::new();
-    ctx.extensions.insert(registry.clone());
+    install_store(&mut ctx).await;
     ctx.extensions.insert(ResponsesState::default());
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.set_metadata("openai_responses_format.store", "false");
@@ -631,10 +467,6 @@ async fn on_request_body_does_not_arm_persistence_for_rehydrate_only() {
     assert!(
         matches!(action, FilterAction::Continue),
         "request body phase should continue"
-    );
-    assert!(
-        registry.contains("default"),
-        "rehydrate still needs the store registered"
     );
     assert!(
         !ctx.extensions.get::<ResponsesState>().unwrap().store_persist_armed,
@@ -774,32 +606,6 @@ async fn on_response_continues_for_event_stream_200() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_request_rejects_when_store_unavailable_for_persist() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite:///nonexistent/path/that/will/fail.db"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    let rejection = expect_reject(action);
-    assert_eq!(
-        rejection.status, 500,
-        "should reject with 500 when store is unavailable for a persistable request"
-    );
-}
-
 // -----------------------------------------------------------------------------
 // on_response_body
 // -----------------------------------------------------------------------------
@@ -885,12 +691,10 @@ async fn on_response_body_persists_streaming_response_at_eos() {
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     let owner = crate::StateOwner::from_trusted_parts("tenant-stream", "issuer-a", "alice").unwrap();
     ctx.extensions.insert(owner.clone());
+    let store = install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.set_metadata("openai_responses_format.stream", "true");
     run_request_phase(&filter, &mut ctx).await;
-
-    let store_opt = filter.store.get().expect("store OnceCell should be initialized");
-    assert!(store_opt.is_some(), "store should be initialized for streaming");
 
     let response_json = json!({
         "id": "resp_stream_unit",
@@ -912,7 +716,6 @@ async fn on_response_body_persists_streaming_response_at_eos() {
         "should continue after persisting streaming response"
     );
 
-    let store = store_opt.as_ref().unwrap();
     let record = store
         .get_response(&owner, "resp_stream_unit")
         .await
@@ -949,31 +752,9 @@ async fn on_response_body_persists_streaming_response_at_eos() {
     );
 }
 
-#[test]
-fn build_record_from_state_returns_none_for_null_response_object() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.extensions.insert(ResponsesState::default());
-
-    let result = super::filter::build_record_from_state(&ctx, crate::test_utils::test_owner("default"), None);
-    assert!(result.is_none(), "should return None when response_object is null");
-}
-
-#[test]
-fn build_record_from_state_returns_none_for_missing_fields() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.extensions.insert(ResponsesState {
-        response_object: json!({"id": "resp_1"}),
-        ..Default::default()
-    });
-
-    let result = super::filter::build_record_from_state(&ctx, crate::test_utils::test_owner("default"), None);
-    assert!(
-        result.is_none(),
-        "should return None when required fields (created_at, model) are missing"
-    );
-}
+// Record-assembly unit tests (null / missing-field / streaming-history cases)
+// moved to the service layer: `crate::service::responses` tests, where they run
+// against plain values with no pipeline or database.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_releases_when_skip_persist_is_true() {
@@ -997,6 +778,7 @@ async fn on_response_body_releases_streaming_request_before_eos() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.set_metadata("openai_responses_format.stream", "true");
     let request_action = filter.on_request(&mut ctx).await.unwrap();
@@ -1116,14 +898,14 @@ impl crate::store::ResponseStore for RecordingResponseStore {
     }
 }
 
-/// Install a [`RecordingResponseStore`] before the request phase so
-/// `get_or_init_store` keeps it instead of building a real backend.
-fn install_recording_store(filter: &ResponseStoreFilter, store: std::sync::Arc<RecordingResponseStore>) {
-    let dyn_store: std::sync::Arc<dyn crate::store::ResponseStore> = store;
-    assert!(
-        filter.store.set(Some(dyn_store)).is_ok(),
-        "store OnceCell should be empty before the request phase"
-    );
+/// Register a store as the default store in the request context so the filter
+/// resolves it instead of a real backend.
+fn install_recording_store(ctx: &mut HttpFilterContext<'_>, store: Arc<dyn PersistedStateBackend>) {
+    let registry = ResponseStoreRegistry::new();
+    registry
+        .register(&Arc::from(DEFAULT_STORE_NAME), store)
+        .expect("recording store should register");
+    ctx.extensions.insert(registry);
 }
 
 /// Build a streaming request context whose accumulated state carries a canonical
@@ -1140,10 +922,12 @@ fn install_recording_store(filter: &ResponseStoreFilter, store: std::sync::Arc<R
 async fn armed_streaming_ctx<'a>(
     filter: &ResponseStoreFilter,
     req: &'a praxis_filter::Request,
+    store: Arc<dyn PersistedStateBackend>,
     response_id: &str,
     terminal_emitted: bool,
 ) -> HttpFilterContext<'a> {
     let mut ctx = crate::test_utils::make_owned_filter_context(req);
+    install_recording_store(&mut ctx, store);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.set_metadata("openai_responses_format.stream", "true");
     run_request_phase(filter, &mut ctx).await;
@@ -1166,11 +950,11 @@ async fn armed_streaming_ctx<'a>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_terminal_frame_persists_before_eos_release() {
     let filter = make_filter();
-    let store = std::sync::Arc::new(RecordingResponseStore::new(false));
-    install_recording_store(&filter, std::sync::Arc::clone(&store));
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = armed_streaming_ctx(&filter, &req, "resp_937_terminal", true).await;
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_937_terminal", true).await;
 
     // The deferred terminal `response.completed` frame arrives as a
     // non-end-of-stream chunk. It must be persisted BEFORE it is released.
@@ -1213,11 +997,11 @@ async fn streaming_terminal_frame_persists_before_eos_release() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_terminal_frame_persist_failure_fails_closed() {
     let filter = make_filter();
-    let store = std::sync::Arc::new(RecordingResponseStore::new(true));
-    install_recording_store(&filter, std::sync::Arc::clone(&store));
+    let store = Arc::new(RecordingResponseStore::new(true));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = armed_streaming_ctx(&filter, &req, "resp_937_failclosed", true).await;
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_937_failclosed", true).await;
 
     let mut terminal = Some(Bytes::from_static(
         b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
@@ -1242,13 +1026,14 @@ async fn streaming_terminal_frame_propagates_persist_rejection() {
     // rejection instead of unconditionally releasing `response.completed`, so a
     // client never observes completion for a record that was refused persistence.
     let filter = make_filter();
-    let store = std::sync::Arc::new(RecordingResponseStore::new(false));
-    install_recording_store(&filter, std::sync::Arc::clone(&store));
+    let store = Arc::new(RecordingResponseStore::new(false));
 
     // Deliberately skip the request phase so no `ResponseStoreRequestState`
     // (owner + input) is captured; streaming persistence then fails closed.
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    install_recording_store(&mut ctx, store_dyn);
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.set_metadata("openai_responses_format.stream", "true");
     ctx.extensions.insert(ResponsesState {
@@ -1282,13 +1067,13 @@ async fn streaming_terminal_frame_propagates_persist_rejection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_without_terminal_signal_persists_only_at_eos() {
     let filter = make_filter();
-    let store = std::sync::Arc::new(RecordingResponseStore::new(false));
-    install_recording_store(&filter, std::sync::Arc::clone(&store));
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     // No terminal frame observed through this filter (e.g. a plain single-round
     // stream): the signal stays unset and the EOS fallback still persists.
-    let mut ctx = armed_streaming_ctx(&filter, &req, "resp_937_fallback", false).await;
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_937_fallback", false).await;
 
     let mut chunk = Some(Bytes::from_static(b"event: response.output_text.delta\n\n"));
     let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
@@ -1352,6 +1137,7 @@ async fn on_response_body_continues_when_terminal_body_is_none() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
 
     drop(filter.on_request(&mut ctx).await.unwrap());
@@ -1458,12 +1244,11 @@ async fn on_response_body_persists_valid_response() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store = install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
-    let store_opt = filter.store.get().expect("store OnceCell should be initialized");
-    assert!(store_opt.is_some(), "store should be initialized");
 
     let body_json = json!({
         "id": "resp_test123",
@@ -1481,7 +1266,6 @@ async fn on_response_body_persists_valid_response() {
         "should continue after spawning persist task"
     );
 
-    let store = store_opt.as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_test123")
         .await
@@ -1519,12 +1303,11 @@ async fn on_response_body_persists_string_input_as_message_item() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store = install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
 
     drop(filter.on_request(&mut ctx).await.unwrap());
 
-    let store_opt = filter.store.get().expect("store OnceCell should be initialized");
-    assert!(store_opt.is_some(), "store should be initialized");
 
     let body_json = json!({
         "id": "resp_string_input",
@@ -1542,7 +1325,6 @@ async fn on_response_body_persists_string_input_as_message_item() {
         "should continue after spawning persist task"
     );
 
-    let store = store_opt.as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_string_input")
         .await
@@ -1568,6 +1350,7 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store = install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     ctx.current_filter_id = Some(7);
 
@@ -1583,8 +1366,6 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
         "request body phase should capture input and continue"
     );
 
-    let store_opt = filter.store.get().expect("store OnceCell should be initialized");
-    assert!(store_opt.is_some(), "store should be initialized");
 
     let response_json = json!({
         "id": "resp_no_echoed_input",
@@ -1602,7 +1383,6 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
         "response body phase should persist and continue"
     );
 
-    let store = store_opt.as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_no_echoed_input")
         .await
@@ -1627,98 +1407,10 @@ async fn on_response_body_uses_request_input_when_response_omits_input() {
     );
 }
 
-#[test]
-fn streaming_record_uses_request_input_when_state_messages_are_empty() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-
-    let request_input = json!([{"role": "user", "content": "Captured streaming input"}]);
-    let response_json = json!({
-        "id": "resp_stream_no_state_messages",
-        "created_at": 1_719_900_000,
-        "model": "gpt-4.1",
-        "status": "completed",
-        "output": [{"type": "message", "content": "Stored streaming output"}]
-    });
-    ctx.extensions.insert(ResponsesState {
-        response_object: response_json.clone(),
-        ..Default::default()
-    });
-
-    let record = super::filter::build_record_from_state(
-        &ctx,
-        crate::test_utils::test_owner("default"),
-        Some(request_input.clone()),
-    )
-    .expect("streaming state should build a record");
-
-    assert_eq!(
-        record.input, request_input,
-        "stored input should come from the original streaming request"
-    );
-    assert_eq!(
-        record.messages,
-        json!([
-            {"role": "user", "content": "Captured streaming input"},
-            {"type": "message", "content": "Stored streaming output"}
-        ]),
-        "empty default ResponsesState messages should not hide request input"
-    );
-}
-
-#[test]
-fn streaming_record_preserves_mcp_metadata_from_persisted_messages() {
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-
-    let mcp_item = json!({
-        "id": "mcpl_1",
-        "type": "mcp_list_tools",
-        "server_label": "weather",
-        "tools": [{"name": "get_weather", "description": "d", "input_schema": {}}]
-    });
-    let response_json = json!({
-        "id": "resp_stream_mcp",
-        "created_at": 1_719_900_000,
-        "model": "gpt-4.1",
-        "status": "completed",
-        "output": [{"type": "message", "role": "assistant", "content": "Next answer"}]
-    });
-
-    ctx.extensions.insert(ResponsesState {
-        response_object: response_json,
-        messages: vec![
-            json!({"role": "user", "content": "Hello"}),
-            json!({"type": "message", "role": "assistant", "content": "Tools loaded"}),
-            json!({"role": "user", "content": "What next?"}),
-        ],
-        persisted_messages: vec![
-            json!({"role": "user", "content": "Hello"}),
-            mcp_item.clone(),
-            json!({"type": "message", "role": "assistant", "content": "Tools loaded"}),
-            json!({"role": "user", "content": "What next?"}),
-        ],
-        ..Default::default()
-    });
-
-    let request_input = json!([{"role": "user", "content": "What next?"}]);
-    let record =
-        super::filter::build_record_from_state(&ctx, crate::test_utils::test_owner("default"), Some(request_input))
-            .expect("streaming state should build a record");
-
-    assert_eq!(
-        record.messages,
-        json!([
-            {"role": "user", "content": "Hello"},
-            {"id": "mcpl_1", "type": "mcp_list_tools", "server_label": "weather",
-             "tools": [{"name": "get_weather", "description": "d", "input_schema": {}}]},
-            {"type": "message", "role": "assistant", "content": "Tools loaded"},
-            {"role": "user", "content": "What next?"},
-            {"type": "message", "role": "assistant", "content": "Next answer"}
-        ]),
-        "streaming record should preserve MCP metadata from persisted_messages, not drop it via messages"
-    );
-}
+// `streaming_record_uses_request_input_when_state_messages_are_empty` and
+// `streaming_record_preserves_mcp_metadata_from_persisted_messages` moved to the
+// service layer: `crate::service::responses` tests exercise `build_record`
+// directly against plain values.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_persists_after_format_request_body_classification() {
@@ -1740,6 +1432,7 @@ async fn pipeline_persists_after_format_request_body_classification() {
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(file_store_registry(&db_url).await);
 
     let request_json = json!({
         "model": "gpt-4.1",
@@ -1846,6 +1539,8 @@ async fn pipeline_persists_chunked_response_with_unarmed_conversations_filter() 
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    // Provision the store the registry-only filter resolves at request time.
+    ctx.extensions.insert(file_store_registry(&db_url).await);
     let request_json = json!({
         "model": "gpt-4.1",
         "input": [{"role": "user", "content": "Hello"}]
@@ -1943,6 +1638,7 @@ async fn pipeline_persists_streaming_response_from_accumulated_state() {
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(file_store_registry(&db_url).await);
 
     let request_json = json!({
         "model": "gpt-4.1",
@@ -2136,7 +1832,7 @@ async fn pipeline_persists_rehydrated_messages_when_response_omits_input() {
     .unwrap();
     let registry = crate::test_utils::make_ai_registry();
     let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
-    pipeline.add_pipeline_extension(Box::new(ResponseStoreRegistry::new()));
+    pipeline.add_pipeline_extension(Box::new(file_store_registry(&db_url).await));
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -2266,7 +1962,7 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
     .unwrap();
     let registry = crate::test_utils::make_ai_registry();
     let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
-    pipeline.add_pipeline_extension(Box::new(ResponseStoreRegistry::new()));
+    pipeline.add_pipeline_extension(Box::new(file_store_registry(&db_url).await));
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -2348,166 +2044,6 @@ async fn pipeline_persists_fallback_mcp_metadata_for_future_rehydrate() {
     drop(store);
     drop(pipeline);
     cleanup_sqlite_file(&db_path);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn store_init_failure_is_permanent() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite:///nonexistent/path/that/will/fail.db"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
-
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    let rejection = expect_reject(action);
-    assert_eq!(rejection.status, 500, "first request should reject with 500");
-
-    let store_opt = filter
-        .store
-        .get()
-        .expect("store OnceCell should be initialized after first attempt");
-    assert!(store_opt.is_none(), "store should be None after failed init");
-
-    let mut ctx2 = crate::test_utils::make_owned_filter_context(&req);
-    ctx2.set_metadata("openai_responses_format.format", "openai_responses");
-
-    let action2 = filter.on_request(&mut ctx2).await.unwrap();
-    let rejection2 = expect_reject(action2);
-    assert_eq!(rejection2.status, 500, "second request should also reject with 500");
-
-    let store_opt2 = filter.store.get().expect("store OnceCell should still be initialized");
-    assert!(
-        store_opt2.is_none(),
-        "store should remain None on second request (failure is permanent)"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn postgres_store_init_failure_is_not_cached() {
-    let socket_dir = std::env::temp_dir().join(format!(
-        "praxis_missing_postgres_socket_{}_{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos()
-    ));
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host={}"
-responses_table: responses
-conversations_table: conversations
-allow_private_database_url: true
-"#,
-        socket_dir.display()
-    ))
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
-
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    let rejection = expect_reject(action);
-    assert_eq!(
-        rejection.status, 500,
-        "failed postgres initialization should reject with 500"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "failed postgres initialization should leave OnceCell unset for retry"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn postgres_store_init_failure_is_not_cached_on_get() {
-    let socket_dir = std::env::temp_dir().join(format!(
-        "praxis_missing_postgres_socket_{}_{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos()
-    ));
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host={}"
-responses_table: responses
-conversations_table: conversations
-allow_private_database_url: true
-"#,
-        socket_dir.display()
-    ))
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
-
-    let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_test123");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-
-    drop(filter.on_request(&mut ctx).await.unwrap());
-
-    assert!(
-        filter.store.get().is_none(),
-        "failed postgres initialization on GET should leave OnceCell unset for retry"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn postgres_store_init_failure_is_not_cached_on_delete() {
-    let socket_dir = std::env::temp_dir().join(format!(
-        "praxis_missing_postgres_socket_{}_{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after epoch")
-            .as_nanos()
-    ));
-    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host={}"
-responses_table: responses
-conversations_table: conversations
-allow_private_database_url: true
-"#,
-        socket_dir.display()
-    ))
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
-
-    let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_test123");
-    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
-
-    let action = filter.on_request(&mut ctx).await.unwrap();
-    let rejection = expect_reject(action);
-    assert_eq!(
-        rejection.status, 500,
-        "DELETE with failed postgres init should reject with 500"
-    );
-    assert!(
-        filter.store.get().is_none(),
-        "failed postgres initialization on DELETE should leave OnceCell unset for retry"
-    );
 }
 
 // -----------------------------------------------------------------------------
@@ -3680,16 +3216,11 @@ fn postgres_config_rejects_empty_host() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_returns_200_when_found() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
-        "resp_found",
-        "default",
-        json!([{"id": "item_1", "type": "message"}]),
-    )
-    .await;
+    let registry = init_store_and_seed("resp_found", "default", json!([{"id": "item_1", "type": "message"}])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_found");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3706,10 +3237,11 @@ async fn get_response_returns_200_when_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_returns_404_when_not_found() {
     let filter = make_filter();
-    init_store(&filter).await;
+    let registry = store_registry().await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_nonexistent");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3726,10 +3258,11 @@ async fn get_response_returns_404_when_not_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_tenant_isolation() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_tenant", "tenant_a", json!([])).await;
+    let registry = init_store_and_seed("resp_tenant", "tenant_a", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_tenant");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3744,8 +3277,7 @@ async fn response_endpoints_hide_same_tenant_cross_owner_resources() {
     let filter = make_filter();
     let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
     let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
-    init_store_and_seed_owner(
-        &filter,
+    let registry = init_store_and_seed_owner(
         "resp_owner_private",
         owner.clone(),
         json!([{"id": "item_private", "type": "message"}]),
@@ -3760,6 +3292,7 @@ async fn response_endpoints_hide_same_tenant_cross_owner_resources() {
         let req = crate::test_utils::make_request(method, path);
         let mut ctx = crate::test_utils::make_filter_context(&req);
         ctx.extensions.insert(other.clone());
+        ctx.extensions.insert(registry.clone());
         let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
         assert_eq!(rejection.status, 404, "wrong-owner access must look absent: {path}");
     }
@@ -3767,6 +3300,7 @@ async fn response_endpoints_hide_same_tenant_cross_owner_resources() {
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_owner_private");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.extensions.insert(owner);
+    ctx.extensions.insert(registry);
     let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
     assert_eq!(rejection.status, 200, "wrong-owner delete must not mutate the response");
 }
@@ -3774,9 +3308,10 @@ async fn response_endpoints_hide_same_tenant_cross_owner_resources() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn response_state_access_fails_closed_without_an_owner() {
     let filter = make_filter();
-    init_store(&filter).await;
+    let registry = store_registry().await;
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_private");
     let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let rejection = expect_reject(filter.on_request(&mut ctx).await.unwrap());
 
@@ -3791,15 +3326,17 @@ async fn unauthorized_and_missing_responses_are_externally_identical() {
     let empty_filter = make_filter();
     let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
     let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
-    init_store_and_seed_owner(&owned_filter, "resp_indistinguishable", owner, json!([])).await;
-    init_store(&empty_filter).await;
+    let seeded = init_store_and_seed_owner("resp_indistinguishable", owner, json!([])).await;
+    let empty = store_registry().await;
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_indistinguishable");
 
     let mut unauthorized_ctx = crate::test_utils::make_filter_context(&req);
     unauthorized_ctx.extensions.insert(other.clone());
+    unauthorized_ctx.extensions.insert(seeded);
     let unauthorized = expect_reject(owned_filter.on_request(&mut unauthorized_ctx).await.unwrap());
     let mut missing_ctx = crate::test_utils::make_filter_context(&req);
     missing_ctx.extensions.insert(other);
+    missing_ctx.extensions.insert(empty);
     let missing = expect_reject(empty_filter.on_request(&mut missing_ctx).await.unwrap());
 
     assert_eq!(unauthorized.status, missing.status);
@@ -3810,10 +3347,11 @@ async fn unauthorized_and_missing_responses_are_externally_identical() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_trailing_slash_handled() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_slash", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_slash", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_slash/");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3840,10 +3378,11 @@ async fn get_unrelated_path_continues() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_rejects_stream_true() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_stream", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_stream", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_stream?stream=true");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3855,13 +3394,14 @@ async fn get_response_rejects_stream_true() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_rejects_include() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_inc", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_inc", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(
         http::Method::GET,
         "/v1/responses/resp_inc?include%5B%5D=reasoning.encrypted_content",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3873,16 +3413,11 @@ async fn get_response_rejects_include() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_accepts_stream_false() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
-        "resp_sf",
-        "default",
-        json!([{"id": "item_1", "type": "message"}]),
-    )
-    .await;
+    let registry = init_store_and_seed("resp_sf", "default", json!([{"id": "item_1", "type": "message"}])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_sf?stream=false");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3893,16 +3428,11 @@ async fn get_response_accepts_stream_false() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_response_no_query_still_returns_200() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
-        "resp_nq",
-        "default",
-        json!([{"id": "item_1", "type": "message"}]),
-    )
-    .await;
+    let registry = init_store_and_seed("resp_nq", "default", json!([{"id": "item_1", "type": "message"}])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_nq");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3916,8 +3446,7 @@ async fn get_response_no_query_still_returns_200() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_returns_200_when_found() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_items",
         "default",
         json!([
@@ -3929,6 +3458,7 @@ async fn get_input_items_returns_200_when_found() {
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_items/input_items");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3944,10 +3474,11 @@ async fn get_input_items_returns_200_when_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_returns_404_when_not_found() {
     let filter = make_filter();
-    init_store(&filter).await;
+    let registry = store_registry().await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_missing/input_items");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3960,10 +3491,11 @@ async fn get_input_items_returns_404_when_not_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_rejects_invalid_query_params() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_qp", "default", json!(["hello"])).await;
+    let registry = init_store_and_seed("resp_qp", "default", json!(["hello"])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_qp/input_items?limit=abc");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3975,10 +3507,11 @@ async fn get_input_items_rejects_invalid_query_params() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_rejects_key_only_query_param() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_ko", "default", json!(["hello"])).await;
+    let registry = init_store_and_seed("resp_ko", "default", json!(["hello"])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_ko/input_items?limit");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -3990,8 +3523,7 @@ async fn get_input_items_rejects_key_only_query_param() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_limit_and_order() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_page",
         "default",
         json!([
@@ -4008,6 +3540,7 @@ async fn get_input_items_with_limit_and_order() {
         "/v1/responses/resp_page/input_items?limit=2&order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4026,8 +3559,7 @@ async fn get_input_items_with_limit_and_order() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_cursor() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_cursor",
         "default",
         json!([
@@ -4044,6 +3576,7 @@ async fn get_input_items_with_cursor() {
         "/v1/responses/resp_cursor/input_items?after=item_2&limit=2&order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4060,8 +3593,7 @@ async fn get_input_items_with_cursor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_malformed_cursor_returns_400() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_bad_cursor",
         "default",
         json!([
@@ -4076,6 +3608,7 @@ async fn get_input_items_with_malformed_cursor_returns_400() {
         "/v1/responses/resp_bad_cursor/input_items?after=not-a-cursor",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4101,13 +3634,14 @@ async fn get_input_items_last_id_falls_back_to_numeric_cursor_for_non_object_ite
     // Plain string entries can't carry a synthetic `id` (there's no
     // object to attach it to), so `last_id` must fall back to the
     // page's numeric cursor instead of staying `null`.
-    init_store_and_seed(&filter, "resp_non_object", "default", json!(["first", "second"])).await;
+    let registry = init_store_and_seed("resp_non_object", "default", json!(["first", "second"])).await;
 
     let req = crate::test_utils::make_request(
         http::Method::GET,
         "/v1/responses/resp_non_object/input_items?limit=1&order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
     assert_eq!(rejection.status, 200);
@@ -4123,8 +3657,7 @@ async fn get_input_items_last_id_falls_back_to_numeric_cursor_for_non_object_ite
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_pagination_usable_for_id_less_array_items() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_no_ids",
         "default",
         json!([
@@ -4139,6 +3672,7 @@ async fn get_input_items_pagination_usable_for_id_less_array_items() {
         "/v1/responses/resp_no_ids/input_items?limit=1&order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
     assert_eq!(rejection.status, 200);
@@ -4154,6 +3688,7 @@ async fn get_input_items_pagination_usable_for_id_less_array_items() {
         &format!("/v1/responses/resp_no_ids/input_items?limit=1&order=asc&after={last_id}"),
     );
     let mut follow_up_ctx = crate::test_utils::make_owned_filter_context(&follow_up);
+    follow_up_ctx.extensions.insert(registry);
     let follow_up_action = filter.on_request(&mut follow_up_ctx).await.unwrap();
     let follow_up_rejection = expect_reject(follow_up_action);
     assert_eq!(follow_up_rejection.status, 200);
@@ -4169,8 +3704,7 @@ async fn get_input_items_pagination_usable_for_id_less_array_items() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_hides_compaction_items() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_compact_hidden",
         "default",
         json!([
@@ -4185,6 +3719,7 @@ async fn get_input_items_hides_compaction_items() {
         "/v1/responses/resp_compact_hidden/input_items?order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
     assert_eq!(rejection.status, 200);
@@ -4208,10 +3743,11 @@ async fn get_input_items_hides_compaction_items() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_existing_response_returns_200() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_del1", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_del1", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_del1");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4231,10 +3767,11 @@ async fn delete_existing_response_returns_200() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_nonexistent_response_returns_404() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_exists", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_exists", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_missing");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4258,15 +3795,17 @@ async fn delete_nonexistent_response_returns_404() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_is_idempotent() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_idem", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_idem", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_idem");
     let mut ctx1 = crate::test_utils::make_owned_filter_context(&req);
+    ctx1.extensions.insert(registry.clone());
     let action1 = filter.on_request(&mut ctx1).await.unwrap();
     let r1 = expect_reject(action1);
     assert_eq!(r1.status, 200, "first delete should return 200");
 
     let mut ctx2 = crate::test_utils::make_owned_filter_context(&req);
+    ctx2.extensions.insert(registry);
     let action2 = filter.on_request(&mut ctx2).await.unwrap();
     let r2 = expect_reject(action2);
     assert_eq!(r2.status, 404, "second delete should return 404");
@@ -4275,10 +3814,11 @@ async fn delete_is_idempotent() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_cross_tenant_returns_404() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_tenant", "tenant_a", json!([])).await;
+    let registry = init_store_and_seed("resp_tenant", "tenant_a", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_tenant");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -4288,10 +3828,11 @@ async fn delete_cross_tenant_returns_404() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_uses_trusted_owner_context() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_tmeta", "tenant_x", json!([])).await;
+    let registry = init_store_and_seed("resp_tmeta", "tenant_x", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_tmeta");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
     ctx.extensions.insert(crate::test_utils::test_owner("tenant_x"));
 
     let action = filter.on_request(&mut ctx).await.unwrap();
@@ -4301,18 +3842,7 @@ async fn delete_uses_trusted_owner_context() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_rejects_when_store_unavailable() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite:///nonexistent/path/that/will/fail.db"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
+    let filter = make_filter();
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_gone");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -4327,18 +3857,7 @@ conversations_table: conversations
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_continues_when_store_unavailable() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite:///nonexistent/path/that/will/fail.db"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
+    let filter = make_filter();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/resp_abc/cancel");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -4364,18 +3883,7 @@ conversations_table: conversations
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn input_tokens_continues_when_store_unavailable() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite:///nonexistent/path/that/will/fail.db"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
+    let filter = make_filter();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -4401,18 +3909,7 @@ conversations_table: conversations
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compact_continues_when_store_unavailable() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite:///nonexistent/path/that/will/fail.db"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    let filter = ResponseStoreFilter::new(cfg);
+    let filter = make_filter();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/compact");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
@@ -4439,10 +3936,11 @@ conversations_table: conversations
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_response_has_json_content_type() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_ct", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_ct", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::DELETE, "/v1/responses/resp_ct");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5218,10 +4716,6 @@ async fn on_request_body_non_end_of_stream_does_not_process() {
         matches!(action, FilterAction::Continue),
         "non-EOS request body should just continue"
     );
-    assert!(
-        filter.store.get().is_none(),
-        "store should not initialize before end of stream"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5236,7 +4730,6 @@ async fn on_request_body_non_post_at_eos_does_not_extract_input() {
         matches!(action, FilterAction::Continue),
         "non-POST request body at EOS should continue"
     );
-    assert!(filter.store.get().is_none(), "store should not initialize for non-POST");
 }
 
 // -----------------------------------------------------------------------------
@@ -5248,6 +4741,7 @@ async fn on_response_body_persists_response_with_null_output() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store = install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -5263,7 +4757,6 @@ async fn on_response_body_persists_response_with_null_output() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_null_output")
         .await
@@ -5281,6 +4774,7 @@ async fn on_response_body_persists_response_with_no_output_field() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store = install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -5295,7 +4789,6 @@ async fn on_response_body_persists_response_with_no_output_field() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_no_output")
         .await
@@ -5313,6 +4806,7 @@ async fn on_response_body_persists_response_with_non_array_output() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store = install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -5328,7 +4822,6 @@ async fn on_response_body_persists_response_with_non_array_output() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_object_output")
         .await
@@ -5349,6 +4842,7 @@ async fn on_response_body_persists_response_with_object_input() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store = install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -5364,7 +4858,6 @@ async fn on_response_body_persists_response_with_object_input() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_object_input")
         .await
@@ -5385,6 +4878,7 @@ async fn on_response_body_persists_response_with_null_input() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store = install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -5400,7 +4894,6 @@ async fn on_response_body_persists_response_with_null_input() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_null_input")
         .await
@@ -5418,6 +4911,7 @@ async fn on_response_body_persists_response_with_no_input_field() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store = install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     drop(filter.on_request(&mut ctx).await.unwrap());
 
@@ -5432,7 +4926,6 @@ async fn on_response_body_persists_response_with_no_input_field() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&crate::test_utils::test_owner("default"), "resp_missing_input")
         .await
@@ -5451,6 +4944,7 @@ async fn on_response_body_persists_uses_trusted_owner_context() {
     let filter = make_filter();
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    let store = install_store(&mut ctx).await;
     ctx.set_metadata("openai_responses_format.format", "openai_responses");
     let owner = crate::StateOwner::from_trusted_parts("custom_tenant", "issuer-a", "alice").unwrap();
     ctx.extensions.insert(owner.clone());
@@ -5470,7 +4964,6 @@ async fn on_response_body_persists_uses_trusted_owner_context() {
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
     assert!(matches!(action, FilterAction::Continue));
 
-    let store = filter.store.get().unwrap().as_ref().unwrap();
     let record = store
         .get_response(&owner, "resp_tenant_body")
         .await
@@ -5495,8 +4988,7 @@ async fn on_response_body_persists_uses_trusted_owner_context() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_trailing_slash_handled() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_slash_items",
         "default",
         json!([{"id": "item_1", "type": "message"}]),
@@ -5505,6 +4997,7 @@ async fn get_input_items_trailing_slash_handled() {
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_slash_items/input_items/");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5514,10 +5007,11 @@ async fn get_input_items_trailing_slash_handled() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_scalar_input() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_scalar", "default", json!("hello world")).await;
+    let registry = init_store_and_seed("resp_scalar", "default", json!("hello world")).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_scalar/input_items");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5552,8 +5046,7 @@ async fn get_input_items_with_scalar_input() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_default_descending_order() {
     let filter = make_filter();
-    init_store_and_seed(
-        &filter,
+    let registry = init_store_and_seed(
         "resp_desc",
         "default",
         json!([
@@ -5566,6 +5059,7 @@ async fn get_input_items_default_descending_order() {
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_desc/input_items");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5581,10 +5075,11 @@ async fn get_input_items_default_descending_order() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_with_empty_input() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_empty_input", "default", json!([])).await;
+    let registry = init_store_and_seed("resp_empty_input", "default", json!([])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_empty_input/input_items");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5600,10 +5095,11 @@ async fn get_input_items_with_empty_input() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_tenant_isolation() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_tenant_items", "tenant_a", json!([{"id": "item_1"}])).await;
+    let registry = init_store_and_seed("resp_tenant_items", "tenant_a", json!([{"id": "item_1"}])).await;
 
     let req = crate::test_utils::make_request(http::Method::GET, "/v1/responses/resp_tenant_items/input_items");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5642,13 +5138,14 @@ fn include_fixture_input() -> serde_json::Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_omits_include_gated_fields_when_not_requested() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_include_default", "default", include_fixture_input()).await;
+    let registry = init_store_and_seed("resp_include_default", "default", include_fixture_input()).await;
 
     let req = crate::test_utils::make_request(
         http::Method::GET,
         "/v1/responses/resp_include_default/input_items?order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5674,7 +5171,7 @@ async fn get_input_items_omits_include_gated_fields_when_not_requested() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_include_reveals_requested_field_for_both_sdk_encodings() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_include_reveal", "default", include_fixture_input()).await;
+    let registry = init_store_and_seed("resp_include_reveal", "default", include_fixture_input()).await;
 
     for query in [
         "include=reasoning.encrypted_content&order=asc",
@@ -5683,6 +5180,7 @@ async fn get_input_items_include_reveals_requested_field_for_both_sdk_encodings(
         let path = format!("/v1/responses/resp_include_reveal/input_items?{query}");
         let req = crate::test_utils::make_request(http::Method::GET, &path);
         let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.extensions.insert(registry.clone());
 
         let action = filter.on_request(&mut ctx).await.unwrap();
         let rejection = expect_reject(action);
@@ -5704,13 +5202,14 @@ async fn get_input_items_include_reveals_requested_field_for_both_sdk_encodings(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_include_applies_to_paginated_window() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_include_page", "default", include_fixture_input()).await;
+    let registry = init_store_and_seed("resp_include_page", "default", include_fixture_input()).await;
 
     let req = crate::test_utils::make_request(
         http::Method::GET,
         "/v1/responses/resp_include_page/input_items?include=reasoning.encrypted_content&limit=1&order=asc",
     );
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry);
 
     let action = filter.on_request(&mut ctx).await.unwrap();
     let rejection = expect_reject(action);
@@ -5737,7 +5236,7 @@ async fn get_input_items_include_applies_to_paginated_window() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_input_items_rejects_malformed_include_values() {
     let filter = make_filter();
-    init_store_and_seed(&filter, "resp_include_bad", "default", include_fixture_input()).await;
+    let registry = init_store_and_seed("resp_include_bad", "default", include_fixture_input()).await;
 
     for (query, expected) in [
         ("include=future.secret_field", "unsupported include value"),
@@ -5747,6 +5246,7 @@ async fn get_input_items_rejects_malformed_include_values() {
         let path = format!("/v1/responses/resp_include_bad/input_items?{query}");
         let req = crate::test_utils::make_request(http::Method::GET, &path);
         let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+        ctx.extensions.insert(registry.clone());
 
         let action = filter.on_request(&mut ctx).await.unwrap();
         let rejection = expect_reject(action);
@@ -5949,95 +5449,6 @@ conversations_table: conversations
 }
 
 #[test]
-fn revalidate_postgres_host_accepts_non_postgres_url() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite::memory:"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    let result = revalidate_postgres_host(&cfg);
-    assert!(
-        result.is_ok(),
-        "revalidate_postgres_host should return Ok for non-postgres URLs"
-    );
-}
-
-#[test]
-fn revalidate_postgres_host_rejects_loopback_host() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@127.0.0.1:5432/praxis"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    let result = revalidate_postgres_host(&cfg);
-    assert!(result.is_err(), "revalidate_postgres_host should reject loopback host");
-}
-
-#[test]
-fn revalidate_postgres_host_rejects_hostaddr_query_param() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@1.2.3.4:5432/praxis?hostaddr=127.0.0.1"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    let result = revalidate_postgres_host(&cfg);
-    assert!(
-        result.is_err(),
-        "revalidate_postgres_host should reject loopback hostaddr query param"
-    );
-}
-
-#[test]
-fn revalidate_postgres_host_accepts_public_ip() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@1.2.3.4:5432/praxis"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    let result = revalidate_postgres_host(&cfg);
-    assert!(result.is_ok(), "revalidate_postgres_host should accept public IP");
-}
-
-#[test]
-fn revalidate_postgres_host_rejects_host_query_param_loopback() {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: postgres
-database_url: "postgres://user:pass@1.2.3.4:5432/praxis?host=127.0.0.1"
-responses_table: responses
-conversations_table: conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    let result = revalidate_postgres_host(&cfg);
-    assert!(
-        result.is_err(),
-        "revalidate_postgres_host should reject loopback host query param"
-    );
-}
-
-#[test]
 fn postgres_config_rejects_hostaddr_with_invalid_ip() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
@@ -6074,21 +5485,51 @@ fn postgres_config_rejects_ipv6_link_local() {
 // -----------------------------------------------------------------------------
 
 fn make_filter() -> ResponseStoreFilter {
-    let yaml: serde_yaml::Value = serde_yaml::from_str(
-        r#"
-backend: sqlite
-database_url: "sqlite::memory:"
-responses_table: test_responses
-conversations_table: test_conversations
-"#,
-    )
-    .unwrap();
-    let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", &yaml).unwrap();
-    validate_config(&cfg).unwrap();
-    ResponseStoreFilter::new(cfg)
+    ResponseStoreFilter
+}
+
+/// Build an in-memory default store plus a registry holding it, without touching
+/// a context. The filter resolves the same backend once the registry is
+/// installed into a request context, mirroring serving-runtime provisioning.
+async fn empty_registry() -> (ResponseStoreRegistry, Arc<dyn PersistedStateBackend>) {
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(
+        SqliteResponseStore::new(
+            "sqlite::memory:",
+            "test_responses",
+            "test_conversations",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("in-memory sqlite store should build"),
+    );
+    let registry = ResponseStoreRegistry::new();
+    registry
+        .register(&Arc::from(DEFAULT_STORE_NAME), Arc::clone(&store))
+        .expect("default store should register");
+    (registry, store)
+}
+
+/// A registry holding an empty in-memory default store.
+async fn store_registry() -> ResponseStoreRegistry {
+    empty_registry().await.0
+}
+
+/// Install an empty in-memory default store into the context, returning the
+/// backing store for direct seeding.
+async fn install_store(ctx: &mut HttpFilterContext<'_>) -> Arc<dyn PersistedStateBackend> {
+    let (registry, store) = empty_registry().await;
+    ctx.extensions.insert(registry);
+    store
 }
 
 async fn run_request_phase(filter: &ResponseStoreFilter, ctx: &mut HttpFilterContext<'_>) {
+    // The happy path needs a provisioned store; install an empty one unless the
+    // test already installed (and possibly seeded) its own.
+    if ctx.extensions.get::<ResponseStoreRegistry>().is_none() {
+        install_store(ctx).await;
+    }
     let action = filter.on_request(ctx).await.unwrap();
     assert!(
         matches!(action, FilterAction::Continue),
@@ -6111,28 +5552,34 @@ fn cleanup_sqlite_file(db_path: &PathBuf) {
     drop(std::fs::remove_file(format!("{}-wal", db_path.display())));
 }
 
-async fn init_store(filter: &ResponseStoreFilter) {
-    filter
-        .store
-        .get_or_init(|| async { Box::pin(filter.build_store()).await.ok() })
-        .await;
+/// A registry whose default store is backed by the file at `db_url`, matching a
+/// pipeline test's `test_responses`/`test_conversations` tables so a store opened
+/// separately for verification observes the same rows.
+async fn file_store_registry(db_url: &str) -> ResponseStoreRegistry {
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(
+        SqliteResponseStore::new(db_url, "test_responses", "test_conversations", None, None, None)
+            .await
+            .expect("file-backed sqlite store should build"),
+    );
+    let registry = ResponseStoreRegistry::new();
+    registry
+        .register(&Arc::from(DEFAULT_STORE_NAME), store)
+        .expect("default store should register");
+    registry
 }
 
-async fn init_store_and_seed(filter: &ResponseStoreFilter, id: &str, tenant_id: &str, input: serde_json::Value) {
-    init_store_and_seed_owner(filter, id, crate::test_utils::test_owner(tenant_id), input).await;
+/// A registry whose default store is seeded with one completed response owned by
+/// `tenant_id`. Install it into a request context to expose the record.
+async fn init_store_and_seed(id: &str, tenant_id: &str, input: serde_json::Value) -> ResponseStoreRegistry {
+    init_store_and_seed_owner(id, crate::test_utils::test_owner(tenant_id), input).await
 }
 
 async fn init_store_and_seed_owner(
-    filter: &ResponseStoreFilter,
     id: &str,
     owner: crate::StateOwner,
     input: serde_json::Value,
-) {
-    let store_opt = filter
-        .store
-        .get_or_init(|| async { Box::pin(filter.build_store()).await.ok() })
-        .await;
-    let store = store_opt.as_ref().expect("store should be initialized");
+) -> ResponseStoreRegistry {
+    let (registry, store) = empty_registry().await;
     let record = ResponseRecord {
         id: id.to_owned(),
         owner,
@@ -6146,6 +5593,7 @@ async fn init_store_and_seed_owner(
         .upsert_response(&record)
         .await
         .expect("seed response should succeed");
+    registry
 }
 
 fn expect_reject(action: FilterAction) -> praxis_filter::Rejection {
@@ -6268,4 +5716,170 @@ conversations_table: openai_conversations
         ResponseStoreFilter::from_config(&yaml).is_ok(),
         "SQLite compares names case-insensitively, so uppercase must still be accepted"
     );
+}
+
+/// The response-store filter only exercises the response half, so this recording
+/// double leaves the conversation-item surface unsupported.
+#[async_trait::async_trait]
+impl crate::store::ConversationItemStore for RecordingResponseStore {
+    async fn upsert_conversation(
+        &self,
+        _record: &crate::store::ConversationRecord,
+    ) -> Result<(), crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn update_conversation_messages(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _messages: &serde_json::Value,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn update_conversation_metadata(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _metadata: &serde_json::Value,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn compare_and_swap_conversation_messages(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _expected_messages: &serde_json::Value,
+        _messages: &serde_json::Value,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_conversation(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<Option<crate::store::ConversationRecord>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_conversation(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn create_conversation_items(
+        &self,
+        _items: &[crate::store::ConversationItemRecord],
+    ) -> Result<(), crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn list_conversation_items(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _after_item_id: Option<&str>,
+        _limit: u32,
+        _ascending: bool,
+    ) -> Result<Vec<crate::store::ConversationItemRecord>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_existing_conversation_item_ids(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_ids: &[&str],
+    ) -> Result<Vec<String>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_conversation_item(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<crate::store::ConversationItemRecord>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn conversation_item_position(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<i64>, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn max_item_position(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+    ) -> Result<i64, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn create_items_and_sync_messages(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _items: &[crate::store::ConversationItemRecord],
+    ) -> Result<(), crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        _owner: &crate::StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, crate::store::StoreError> {
+        Err(crate::store::StoreError::Unavailable(
+            "recording store has no conversation items".to_owned(),
+        ))
+    }
 }

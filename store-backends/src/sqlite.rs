@@ -4,6 +4,7 @@
 //! [`SqliteResponseStore`] — `SQLite` backend for the response store.
 
 use async_trait::async_trait;
+use praxis_ai_store::StateOwner;
 use sqlx::{
     AssertSqlSafe, Row as _, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -11,17 +12,16 @@ use sqlx::{
 use tracing::info;
 
 use super::{
+    ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, PoolConfig,
+    ResponseRecord, ResponseStore, StoreError,
     compression::{StoreCompressionConfig, decode, run_blocking},
-    pool::{PoolConfig, apply_pool_config},
+    pool::apply_pool_config,
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
         check_schema, expected_tables, generate_ddl, pending_approvals_table, schema_version_table,
         sqlite_key_column_folding,
     },
-    trait_def::{ConversationItemStore, ResponseStore},
-    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
 };
-use crate::StateOwner;
 
 // -----------------------------------------------------------------------------
 // SqliteResponseStore
@@ -113,6 +113,14 @@ impl SqliteResponseStore {
             tables,
             compression: compression.cloned().unwrap_or_default(),
         })
+    }
+
+    /// Close the connection pool, releasing its connections.
+    ///
+    /// Called when the backend is retired from the process-wide cache so a
+    /// reload does not leak pools.
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     /// Insert or update a conversation row shared by both store traits.

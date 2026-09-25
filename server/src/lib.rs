@@ -4,8 +4,12 @@
 //! Server bootstrap for Praxis AI.
 
 pub(crate) mod pipelines;
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+pub mod readiness;
 pub(crate) mod reload;
 mod server;
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+pub mod store_provision;
 mod subrequest;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
@@ -15,6 +19,23 @@ pub use server::{
     check_root_privilege, fatal, install_crypto_provider, resolve_config_path, run_server, run_server_with_registry,
 };
 pub use subrequest::create_subrequest_client;
+
+/// Per-listener response-store registries threaded through serve, reload, and
+/// pipeline resolution. The real map only when the store feature is on; a unit
+/// placeholder otherwise, so the serve and watch signatures stay feature-free.
+#[cfg(feature = "store")]
+pub(crate) type StoreRegistries = std::collections::HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry>;
+/// Feature-off placeholder for [`StoreRegistries`], so serve and watch keep
+/// feature-free signatures. Not a unit struct and not `Copy`, so it trips no
+/// lint when defaulted or passed by reference.
+#[cfg(not(feature = "store"))]
+#[derive(Clone, Default)]
+pub(crate) struct StoreRegistries(std::marker::PhantomData<()>);
+
+/// A shared, swappable handle to the current cluster health registry. Reload
+/// stores a freshly built registry here so the readiness endpoint reads current
+/// cluster health rather than the snapshot captured at startup.
+pub(crate) type SharedHealthRegistry = std::sync::Arc<std::sync::Mutex<praxis_core::health::HealthRegistry>>;
 
 // -----------------------------------------------------------------------------
 // Constants

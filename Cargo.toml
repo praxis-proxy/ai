@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
+    "store",
+    "store-backends",
+    "store-lifecycle",
     "server",
     "server/build_support",
     "filters",
@@ -114,6 +117,9 @@ praxis-ai-llmd-ext-proc = { version = "0.4.0", path = "integrations/llmd/ext-pro
 # Praxis AI workspace dependencies
 praxis-ai-proxy = { version = "0.4.0", path = "server", default-features = false }
 praxis-ai-filters = { version = "0.4.0", path = "filters", default-features = false }
+praxis-ai-store = { version = "0.4.0", path = "store" }
+praxis-ai-store-backends = { version = "0.4.0", path = "store-backends" }
+praxis-ai-store-lifecycle = { version = "0.4.0", path = "store-lifecycle" }
 praxis-ai-apis = { version = "0.4.0", path = "apis", default-features = false }
 praxis-ai-build-support = { version = "0.4.0", path = "server/build_support" }
 

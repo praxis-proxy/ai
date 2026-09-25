@@ -5,7 +5,7 @@
 
 use serde::Deserialize;
 
-use super::{ResponseRecord, StoreError};
+use crate::{ResponseRecord, StoreError};
 
 /// zstd frame magic number (little-endian `0xFD2FB528`).
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -58,7 +58,11 @@ pub struct StoreCompressionConfig {
 
 impl StoreCompressionConfig {
     /// Reject values that would fail or silently no-op at runtime.
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the first invalid field.
+    pub fn validate(&self) -> Result<(), String> {
         match self.algorithm {
             CompressionAlgorithm::None => {
                 if self.level.is_some() {
@@ -90,7 +94,7 @@ impl StoreCompressionConfig {
     ///
     /// Returns [`StoreError::Serialization`] if a field cannot be serialized,
     /// exceeds the size limit, or zstd compression fails.
-    pub(crate) async fn encode(&self, record: &ResponseRecord) -> Result<[Vec<u8>; 3], StoreError> {
+    pub async fn encode(&self, record: &ResponseRecord) -> Result<[Vec<u8>; 3], StoreError> {
         let [response_object, input, messages] = [&record.response_object, &record.input, &record.messages]
             .map(|value| serde_json::to_vec(value).map_err(|e| StoreError::Serialization(e.to_string())));
         let fields = [response_object?, input?, messages?];
@@ -132,7 +136,12 @@ impl StoreCompressionConfig {
 }
 
 /// Run owned store codec work outside the async executor.
-pub(crate) async fn run_blocking<T: Send + 'static>(
+///
+/// # Errors
+///
+/// Returns [`StoreError::Unavailable`] if the blocking worker panics or is
+/// cancelled, or the error the codec work itself returns.
+pub async fn run_blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, StoreError> + Send + 'static,
 ) -> Result<T, StoreError> {
     tokio::task::spawn_blocking(work)
@@ -153,7 +162,7 @@ pub(crate) async fn run_blocking<T: Send + 'static>(
 /// Returns [`StoreError::Serialization`] if a zstd frame is corrupt, the
 /// decompressed payload exceeds the size limit, or the bytes are not valid
 /// JSON.
-pub(crate) fn decode(stored: &[u8]) -> Result<serde_json::Value, StoreError> {
+pub fn decode(stored: &[u8]) -> Result<serde_json::Value, StoreError> {
     if stored.starts_with(&ZSTD_MAGIC) {
         use std::io::Read as _;
 
@@ -183,11 +192,12 @@ pub(crate) fn decode(stored: &[u8]) -> Result<serde_json::Value, StoreError> {
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(clippy::unwrap_used, reason = "tests")]
+#[allow(clippy::expect_used, clippy::unwrap_used, reason = "tests")]
 mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::StateOwner;
 
     #[tokio::test(flavor = "current_thread")]
     async fn codec_work_runs_off_the_async_worker() {
@@ -372,7 +382,7 @@ mod tests {
     fn response_record() -> ResponseRecord {
         ResponseRecord {
             id: "resp_codec".to_owned(),
-            owner: crate::test_utils::test_owner("tenant_codec"),
+            owner: StateOwner::from_trusted_parts("tenant_codec", "issuer", "subject").expect("owner"),
             created_at: 1000,
             model: "test".to_owned(),
             response_object: json!({"output": "x".repeat(65_536)}),

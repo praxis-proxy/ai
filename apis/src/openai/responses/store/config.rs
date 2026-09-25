@@ -4,13 +4,14 @@
 //! Configuration types for the response store filter.
 
 use percent_encoding::percent_decode_str;
+use praxis_ai_store::{PoolConfig, SslMode, validate_table_identifier};
 use praxis_filter::{FilterError, has_dot_dot_traversal};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
+use crate::store::StoreCompressionConfig;
 #[cfg(feature = "store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
-use crate::store::{PoolConfig, SslMode, StoreCompressionConfig, validate_table_identifier};
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_response_store";
@@ -233,21 +234,6 @@ fn validate_sqlite_database_url(database_url: &str) -> Result<(), FilterError> {
         return Err(format!("{FILTER_NAME}: database_url must not contain '..' path traversal").into());
     }
     Ok(())
-}
-
-/// Re-validate only the `PostgreSQL` host/IP portions of the
-/// connection URL immediately before `SQLx` resolves and connects.
-///
-/// Full config validation runs once at construction time in
-/// [`validate_config`]. This narrower check guards against DNS
-/// rebinding between validation and connection by re-checking
-/// the SSRF-sensitive host rules on every retry without
-/// redundantly re-validating immutable fields (table names, SSL
-/// config, URL scheme).
-#[cfg(feature = "store-postgres")]
-pub(crate) fn revalidate_postgres_host(cfg: &ResponseStoreConfig) -> Result<(), FilterError> {
-    let database_url = cfg.database_url.expose_secret();
-    postgres_url::revalidate_postgres_host(FILTER_NAME, database_url, cfg.allow_private_database_url)
 }
 
 /// Validate `PostgreSQL` TLS options.

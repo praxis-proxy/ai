@@ -26,6 +26,8 @@ pub mod openai;
 pub mod operation;
 mod project_state_owner_headers;
 pub mod promotion;
+#[cfg(feature = "store")]
+pub(crate) mod service;
 mod state_owner;
 #[cfg(feature = "store")]
 pub mod store;
@@ -35,8 +37,9 @@ pub mod vertex;
 pub(crate) mod web_search;
 
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
+pub use praxis_ai_store::{StateOwner, StateOwnerError};
 pub use project_state_owner_headers::ProjectStateOwnerHeadersFilter;
-pub use state_owner::{StateOwner, StateOwnerError, StateOwnerFilter, project_state_owner};
+pub use state_owner::{StateOwnerFilter, project_state_owner};
 
 /// Whether a `Content-Type` header value indicates `text/event-stream`,
 /// ignoring parameters (e.g. `; charset=utf-8`) and ASCII case.
@@ -163,7 +166,14 @@ pub(crate) mod test_utils {
     }
 
     /// Build a stable owner for tests that previously supplied only a tenant.
-    #[cfg(feature = "store")]
+    #[cfg(any(feature = "store-sqlite", feature = "store-postgres"))]
+    #[cfg_attr(
+        not(feature = "store-sqlite"),
+        allow(
+            dead_code,
+            reason = "store test helpers run against the sqlite in-process backend; a postgres-only build compiles this unused"
+        )
+    )]
     pub(crate) fn test_owner(tenant_id: &str) -> crate::StateOwner {
         crate::StateOwner::from_trusted_parts(tenant_id, "test-issuer", "test-subject")
             .expect("test owner should be valid")

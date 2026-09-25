@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Praxis Contributors
+
+[package]
+name = "praxis-ai-store-backends"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "praxis_ai_store_backends"
+
+[features]
+# The SQL client crypto (sqlx TLS) is compiled in only when a backend is
+# selected. A consumer that omits this crate ships no SQL crypto at all.
+default = ["all"]
+postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/tls-native-tls"]
+sqlite = ["dep:sqlx", "sqlx/sqlite"]
+all = ["postgres", "sqlite"]
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+percent-encoding = { workspace = true }
+praxis-ai-store = { workspace = true, features = ["compression"] }
+praxis-filter = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt", "time", "net"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+praxis-ai-store = { workspace = true, features = ["test-support"] }
+praxis-ai-store-lifecycle = { path = "../store-lifecycle" }
+serde_yaml = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

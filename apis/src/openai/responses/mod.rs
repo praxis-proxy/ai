@@ -185,7 +185,7 @@ impl io::Write for BoundedJsonCounter {
 /// Default store name used when registering the response store in the
 /// per-request registry.
 #[cfg(feature = "store")]
-pub(crate) const DEFAULT_STORE_NAME: &str = "default";
+pub const DEFAULT_STORE_NAME: &str = "default";
 
 /// Legacy test tenant value retained for fixture compatibility.
 #[cfg(test)]
@@ -733,9 +733,9 @@ pub(crate) fn append_stored_input_items(messages: &mut Vec<serde_json::Value>, i
 
 /// Check whether this is an explicit `POST /v1/responses/compact` request.
 ///
-/// Shared by the store filter (best-effort store init) and the compaction
-/// filter, so neither optional filter depends on the other.
-#[cfg(feature = "store")]
+/// Used by the compaction filter to detect an explicit compact request. The
+/// store filter no longer needs it since migrating to registry-only resolution.
+#[cfg(feature = "openai-compact")]
 pub(crate) fn is_explicit_compact_request(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.request.method == http::Method::POST && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
 }

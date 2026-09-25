@@ -38,7 +38,7 @@ workspace = true
 arc-swap = { workspace = true }
 base64 = { workspace = true }
 praxis = { workspace = true }
-praxis-ai-apis = { workspace = true }
+praxis-ai-apis = { workspace = true, features = ["store"] }
 praxis-ai-proxy = { workspace = true }
 praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }

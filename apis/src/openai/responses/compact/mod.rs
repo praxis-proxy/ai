@@ -59,8 +59,9 @@ use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
 use super::{error::responses_error_rejection, is_explicit_compact_request, state::ResponsesState};
 use crate::{
     callout_policy::OnFailure,
+    service::responses::ResponsesService,
     state_owner::{StateOwner, require_state_owner},
-    store::{OwnerScopedResponseStore, ResponseRecord, ResponseStoreRegistry},
+    store::{ResponseRecord, ResponseStoreRegistry},
     subrequest::{self, SubRequest, SubRequestClient},
 };
 
@@ -328,12 +329,12 @@ impl CompactFilter {
         body: &Option<Bytes>,
     ) -> Result<FilterAction, FilterAction> {
         let req = parse_compact_request_body(body)?;
-        let (store, owner) = resolve_store_and_owner(ctx)?;
-        let messages = collect_compact_messages(&store, &req).await?;
+        let (service, owner) = resolve_service_and_owner(ctx)?;
+        let messages = collect_compact_messages(&service, &req).await?;
         let writer = CompactionWriter {
             filter: self,
             ctx,
-            store: &store,
+            service: &service,
             owner: &owner,
             req: &req,
             messages: &messages,
@@ -611,17 +612,16 @@ fn parse_compact_input(input: Option<&Value>) -> Vec<Value> {
     }
 }
 
-/// Look up the store and immutable owner from the request context.
-fn resolve_store_and_owner(
-    ctx: &HttpFilterContext<'_>,
-) -> Result<(OwnerScopedResponseStore, StateOwner), FilterAction> {
+/// Look up the service and immutable owner from the request context.
+fn resolve_service_and_owner(ctx: &HttpFilterContext<'_>) -> Result<(ResponsesService, StateOwner), FilterAction> {
     let owner = require_state_owner(ctx)?.clone();
-    let store = ctx
+    let service = ctx
         .extensions
         .get::<ResponseStoreRegistry>()
         .and_then(|r| r.get_scoped("default", &owner))
+        .map(ResponsesService::new)
         .ok_or_else(|| reject_compact(500, "server_error", "response store not available"))?;
-    Ok((store, owner))
+    Ok((service, owner))
 }
 
 /// Assemble the conversation to compact from stored history and inline input.
@@ -629,12 +629,12 @@ fn resolve_store_and_owner(
 /// When `previous_response_id` is set, its stored messages are loaded
 /// first and the inline `input` items are appended after.
 async fn collect_compact_messages(
-    store: &OwnerScopedResponseStore,
+    service: &ResponsesService,
     req: &ExplicitCompactRequest,
 ) -> Result<Vec<Value>, FilterAction> {
     let mut messages = Vec::new();
     if let Some(prev) = req.previous_response_id.as_deref() {
-        let record = fetch_response(store, prev).await?;
+        let record = fetch_response(service, prev).await?;
         messages.extend(stored_message_array(record.messages));
     }
     messages.extend(req.input.iter().cloned());
@@ -645,8 +645,8 @@ async fn collect_compact_messages(
 }
 
 /// Fetch a stored response by id.
-async fn fetch_response(store: &OwnerScopedResponseStore, response_id: &str) -> Result<ResponseRecord, FilterAction> {
-    match store.get_response(response_id).await {
+async fn fetch_response(service: &ResponsesService, response_id: &str) -> Result<ResponseRecord, FilterAction> {
+    match service.get(response_id).await {
         Ok(Some(r)) => Ok(r),
         Ok(None) => Err(reject_compact(404, "not_found_error", "response not found")),
         Err(e) => {
@@ -671,8 +671,8 @@ struct CompactionWriter<'a> {
     filter: &'a CompactFilter,
     /// Request context, used for id and timestamp generation.
     ctx: &'a HttpFilterContext<'a>,
-    /// Response store the compaction record is persisted to.
-    store: &'a OwnerScopedResponseStore,
+    /// Responses service the compaction record is persisted through.
+    service: &'a ResponsesService,
     /// Immutable owner the record is scoped to.
     owner: &'a StateOwner,
     /// The parsed explicit compact request (supplies the response model).
@@ -741,7 +741,7 @@ impl CompactionWriter<'_> {
             input: stored_messages.clone(),
             messages: stored_messages,
         };
-        self.store.upsert_response(&record).await.map_err(|e| {
+        self.service.upsert(&record).await.map_err(|e| {
             warn!(error = %e, "failed to persist explicit compaction response");
             reject_compact(500, "server_error", "failed to persist compaction response")
         })?;

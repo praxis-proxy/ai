@@ -8,10 +8,9 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::{
-    CompressionAlgorithm, ConversationItemRecord, ConversationRecord, PendingApprovalRecord, PgTlsConfig,
-    PostgresResponseStore, ResponseRecord, ResponseStoreRegistry, SqliteResponseStore, SslMode, StoreCompressionConfig,
-    StoreError,
-    trait_def::{ConversationItemStore, ResponseStore},
+    CompressionAlgorithm, ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord,
+    PersistedStateBackend, PgTlsConfig, PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+    SqliteResponseStore, SslMode, StoreCompressionConfig, StoreError,
 };
 use crate::openai::{
     include::IncludeFields,
@@ -3082,7 +3081,7 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
 #[tokio::test]
 async fn registry_register_and_get_scoped() {
     let registry = ResponseStoreRegistry::new();
-    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(make_store().await);
     registry
         .register(&Arc::from("primary"), Arc::clone(&store))
         .expect("register should succeed");
@@ -3095,7 +3094,7 @@ async fn registry_register_and_get_scoped() {
 #[tokio::test]
 async fn registry_scoped_handle_rejects_a_record_from_another_owner() {
     let registry = ResponseStoreRegistry::new();
-    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(make_store().await);
     registry.register(&Arc::from("primary"), store).unwrap();
     let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
     let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
@@ -3122,7 +3121,7 @@ fn registry_get_missing_returns_none() {
 #[tokio::test]
 async fn registry_duplicate_registration_fails() {
     let registry = ResponseStoreRegistry::new();
-    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(make_store().await);
     let name = Arc::from("dup");
     registry
         .register(&name, Arc::clone(&store))
@@ -3318,24 +3317,26 @@ fn pg_ssl_mode_deserializes_verified_modes() {
 fn pg_ssl_mode_converts_to_pg_ssl_mode() {
     use sqlx::postgres::PgSslMode;
 
+    use super::to_pg_ssl_mode;
+
     assert!(
-        matches!(PgSslMode::from(SslMode::Disable), PgSslMode::Disable),
+        matches!(to_pg_ssl_mode(SslMode::Disable), PgSslMode::Disable),
         "Disable should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::Prefer), PgSslMode::Prefer),
+        matches!(to_pg_ssl_mode(SslMode::Prefer), PgSslMode::Prefer),
         "Prefer should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::Require), PgSslMode::Require),
+        matches!(to_pg_ssl_mode(SslMode::Require), PgSslMode::Require),
         "Require should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::VerifyCa), PgSslMode::VerifyCa),
+        matches!(to_pg_ssl_mode(SslMode::VerifyCa), PgSslMode::VerifyCa),
         "VerifyCa should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::VerifyFull), PgSslMode::VerifyFull),
+        matches!(to_pg_ssl_mode(SslMode::VerifyFull), PgSslMode::VerifyFull),
         "VerifyFull should map"
     );
 }
@@ -5076,4 +5077,21 @@ fn make_response_record(id: &str, tenant_id: &str, created_at: i64) -> ResponseR
         input: json!("test input"),
         messages: json!([{"role": "user", "content": "hello"}]),
     }
+}
+
+/// The SQLite backend satisfies the shared persisted-state contract suite,
+/// proving it adopted the praxis-ai-store traits (the #1258 SQL-adopt check).
+#[tokio::test]
+async fn sqlite_backend_satisfies_the_store_contract() {
+    let store = SqliteResponseStore::new(
+        "sqlite::memory:",
+        "contract_responses",
+        "contract_conversations",
+        Some("contract_items"),
+        None,
+        None,
+    )
+    .await
+    .expect("store creation should succeed");
+    praxis_ai_store::contract_tests::run_contract_suite(&store).await;
 }

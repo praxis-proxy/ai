@@ -71,9 +71,15 @@ praxis-main = ["praxis-ai-filters/praxis-main"]
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 clap = { workspace = true }
+http = { workspace = true }
 notify = { workspace = true }
+pingora-core = { workspace = true }
 praxis-ai-filters = { workspace = true }
+praxis-ai-apis = { workspace = true }
+praxis-ai-store = { workspace = true }
+praxis-ai-store-lifecycle = { workspace = true }
 praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }
 # spiffe: enables the peer_identity_trust security builtin, required as the first
@@ -83,6 +89,7 @@ praxis-filter = { workspace = true, features = ["spiffe"] }
 praxis-protocol = { workspace = true, features = ["admin-api", "config-reload"] }
 praxis-tls = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "fs"] }
 tokio-util = { workspace = true }

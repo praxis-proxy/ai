@@ -5,13 +5,11 @@
 
 use std::net::{IpAddr, SocketAddr};
 
+use praxis_ai_store::url_security::{is_cloud_metadata, is_file_url_ssrf_blocked};
 use praxis_core::connectivity::normalize_mapped_ipv4;
 
 use super::resolve::{ResolveError, ResolvedFile, max_content_bytes_for_data_url};
-use crate::openai::{
-    responses::content_parts::infer_mime_from_filename,
-    url_security::{is_cloud_metadata, is_file_url_ssrf_blocked},
-};
+use crate::openai::responses::content_parts::infer_mime_from_filename;
 
 /// A validated, normalized origin (scheme + host + port) for allowlist matching.
 #[derive(Clone, Debug, Eq, PartialEq)]

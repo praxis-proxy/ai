@@ -24,7 +24,6 @@ pub(crate) mod sse;
     reason = "Responses translation helpers are wired into the HTTP filter in a later stack entry"
 )]
 pub(crate) mod translation;
-pub(crate) mod url_security;
 
 pub use chat_completions::routes::{
     ChatCompletionsOperation, ChatCompletionsOperationSpec, operation_specs as chat_completions_operation_specs,

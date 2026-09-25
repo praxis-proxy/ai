@@ -985,7 +985,7 @@ fn parse_compact_request_body_with_previous_response_id() {
 #[tokio::test]
 #[cfg(feature = "store-sqlite")]
 async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
-    let backend: std::sync::Arc<dyn crate::store::ResponseStore> = std::sync::Arc::new(
+    let backend: std::sync::Arc<dyn crate::store::PersistedStateBackend> = std::sync::Arc::new(
         crate::store::SqliteResponseStore::new("sqlite::memory:", "responses", "conversations", None, None, None)
             .await
             .unwrap(),
@@ -1011,14 +1011,14 @@ async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
     )))
     .unwrap();
 
-    let wrong_store = registry.get_scoped("default", &other).unwrap();
-    let Err(FilterAction::Reject(rejection)) = collect_compact_messages(&wrong_store, &request).await else {
+    let wrong_service = ResponsesService::new(registry.get_scoped("default", &other).unwrap());
+    let Err(FilterAction::Reject(rejection)) = collect_compact_messages(&wrong_service, &request).await else {
         panic!("wrong-owner compaction must fail before its callout");
     };
     assert_eq!(rejection.status, 404);
 
-    let owner_store = registry.get_scoped("default", &owner).unwrap();
-    let messages = collect_compact_messages(&owner_store, &request).await.unwrap();
+    let owner_service = ResponsesService::new(registry.get_scoped("default", &owner).unwrap());
+    let messages = collect_compact_messages(&owner_service, &request).await.unwrap();
     assert_eq!(messages, vec![json!({"role": "user", "content": "private"})]);
 }
 

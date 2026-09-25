@@ -10,10 +10,9 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use praxis_ai_store::url_security::is_non_public_ip;
 use praxis_core::connectivity::normalize_mapped_ipv4;
 use praxis_filter::FilterError;
-
-use crate::openai::url_security::is_non_public_ip;
 
 /// Whether a configured callout may connect to non-public addresses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

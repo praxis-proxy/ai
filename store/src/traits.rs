@@ -6,8 +6,10 @@
 
 use async_trait::async_trait;
 
-use super::types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError};
-use crate::StateOwner;
+use crate::{
+    owner::StateOwner,
+    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
+};
 
 // -----------------------------------------------------------------------------
 // ResponseStore Trait
@@ -473,3 +475,18 @@ pub trait ConversationItemStore: Send + Sync {
         item_id: &str,
     ) -> Result<bool, StoreError>;
 }
+
+// -----------------------------------------------------------------------------
+// PersistedStateBackend
+// -----------------------------------------------------------------------------
+
+/// A backend that provides both response and conversation-item persistence.
+///
+/// The unified registry stores this combined handle, so a resolved backend
+/// provably implements both halves and a Conversations-requiring caller can
+/// never receive a response-only backend. Any type implementing both traits
+/// satisfies it through the blanket impl; responses-only callers upcast to
+/// `dyn ResponseStore`.
+pub trait PersistedStateBackend: ResponseStore + ConversationItemStore {}
+
+impl<T: ResponseStore + ConversationItemStore> PersistedStateBackend for T {}

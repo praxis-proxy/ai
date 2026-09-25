@@ -3522,12 +3522,13 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bytes",
- "dashmap",
  "futures",
  "http 1.5.0",
  "jsonschema",
  "openssl",
  "percent-encoding",
+ "praxis-ai-store",
+ "praxis-ai-store-backends",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-tls",
@@ -3549,7 +3550,6 @@ dependencies = [
  "url",
  "utoipa",
  "yaml_serde",
- "zstd 0.14.0",
 ]
 
 [[package]]
@@ -3643,21 +3643,26 @@ dependencies = [
 name = "praxis-ai-proxy"
 version = "0.4.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "cargo_metadata",
  "clap",
  "http 1.5.0",
  "nix",
  "notify",
+ "praxis-ai-apis",
  "praxis-ai-build-support",
  "praxis-ai-filters",
  "praxis-ai-llmd-ext-proc",
+ "praxis-ai-store",
+ "praxis-ai-store-lifecycle",
  "praxis-proxy-core",
  "praxis-proxy-filter",
  "praxis-proxy-protocol",
  "praxis-proxy-tls",
  "quixotic-plecostomus-core",
  "serde",
+ "serde_json",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
@@ -3665,6 +3670,49 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "yaml_serde",
+]
+
+[[package]]
+name = "praxis-ai-store"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "yaml_serde",
+ "zstd 0.14.0",
+]
+
+[[package]]
+name = "praxis-ai-store-backends"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "percent-encoding",
+ "praxis-ai-store",
+ "praxis-ai-store-lifecycle",
+ "praxis-proxy-filter",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "yaml_serde",
+]
+
+[[package]]
+name = "praxis-ai-store-lifecycle"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "praxis-ai-store",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

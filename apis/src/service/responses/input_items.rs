@@ -24,7 +24,7 @@ pub(crate) const MAX_PAGE_LIMIT: u32 = 100;
 
 /// Sort order for input item listing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum Order {
+pub(crate) enum Order {
     /// Oldest first (natural input order).
     Ascending,
 
@@ -39,7 +39,7 @@ pub enum Order {
 
 /// Cursor-based pagination parameters for input item listing.
 #[derive(Debug, Clone)]
-pub struct ListParams {
+pub(crate) struct ListParams {
     /// Opaque cursor for the next page. `None` starts from the
     /// beginning.
     pub cursor: Option<String>,
@@ -74,7 +74,7 @@ impl ListParams {
 // -----------------------------------------------------------------------------
 
 /// A page of input items from an `OpenAI` Responses API response.
-pub struct InputItemPage {
+pub(crate) struct InputItemPage {
     /// Input items as JSON values (heterogeneous types).
     pub data: Vec<serde_json::Value>,
 
@@ -105,7 +105,7 @@ pub struct InputItemPage {
     clippy::too_many_lines,
     reason = "pagination logic benefits from single-function locality"
 )]
-pub fn list_input_items(
+pub(crate) fn list_input_items(
     record: &ResponseRecord,
     params: &ListParams,
     includes: IncludeFields,
