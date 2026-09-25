@@ -371,6 +371,11 @@ filter_chains:
             cluster: "embeddings-api"
           - path_prefix: "/v1/files"
             cluster: "files-api"
+          # Conversations is gateway-owned in this example. Bind it to a
+          # managed cluster so the provider-gated bound-body filter runs and
+          # terminates the request locally before the IRR.
+          - path_prefix: "/v1/conversations"
+            cluster: "inference-backend"
           - path: "/v1/responses"
             headers:
               upgrade: "websocket"
@@ -555,6 +560,22 @@ filter_chains:
           - unless:
               bound_upstream:
                 application_provider: openai
+
+      # Local store operations above serve the managed GET/DELETE resource
+      # endpoints. Any other managed Responses subpath (for example /cancel)
+      # is unsupported and must not fall through into the inference IRR.
+      # Provider-owned OpenAI traffic already left through direct-openai.
+      - filter: static_response
+        status: 404
+        body: '{"error":{"message":"unsupported managed Responses operation","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}'
+        headers:
+          - name: Content-Type
+            value: application/json
+        conditions:
+          - when:
+              path_prefix: "/v1/responses"
+          - unless:
+              path: "/v1/responses"
 
       # Gateway-owned Responses requests flow here after both terminal direct
       # branches have been considered. The IRR runs the agentic model-tool-model loop: each round

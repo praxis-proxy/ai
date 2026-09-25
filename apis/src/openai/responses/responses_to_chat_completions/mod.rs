@@ -39,6 +39,7 @@ use self::{
 };
 use super::{
     body_limits::rewritten_body_too_large_rejection,
+    enforce_agentic_stream_guard,
     error::{responses_error_body, responses_error_rejection},
     state::ResponsesState,
 };
@@ -473,6 +474,9 @@ impl HttpFilter for ResponsesToChatCompletionsFilter {
         *body = Some(Bytes::from(serialized));
         ctx.set_metadata(ARMED_KEY, "true");
         select_terminal_response_mode(ctx, body);
+        if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
+            return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
+        }
         let now = ctx.time_source.now().as_secs();
         let created_at = ctx
             .extensions

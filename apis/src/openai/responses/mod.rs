@@ -112,12 +112,12 @@ use std::io;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-#[cfg(feature = "openai-responses")]
-use praxis_filter::BoundUpstreamBodyOutcome;
 use praxis_filter::{
     BodyAccess, BodyMode, ErrorResponseFormatterHandle, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     body::MAX_JSON_BODY_BYTES, builtins::http::payload_processing::OnInvalidBehavior, parse_filter_config,
 };
+#[cfg(feature = "openai-responses")]
+use praxis_filter::{BoundUpstreamBodyOutcome, Rejection, SubRequestResponseMode};
 use tracing::{debug, trace};
 
 use self::config::{ResponsesFormatConfig, build_config};
@@ -147,6 +147,43 @@ pub(crate) fn bound_body_outcome(action: FilterAction) -> Result<BoundUpstreamBo
             Err("terminal response is invalid during bound-upstream body processing".into())
         },
     }
+}
+
+/// Per-round marker set by `openai_agentic_loop` before the selected protocol
+/// adapter chooses the effective response transport.
+#[cfg(feature = "openai-responses")]
+const AGENTIC_STREAM_GUARD_KEY: &str = "responses.agentic_stream_guard";
+
+/// Arm the agentic streaming safety check for the current IRR round.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn arm_agentic_stream_guard(ctx: &mut HttpFilterContext<'_>) {
+    ctx.set_metadata(AGENTIC_STREAM_GUARD_KEY, "true");
+}
+
+/// Enforce the agentic streaming safety check after transport selection.
+///
+/// Protocol adapters select their transport in the selected-upstream body
+/// phase, after request-header filters have run. `openai_agentic_loop` arms the
+/// check during its request hook; the selected adapter consumes it here once
+/// the effective outbound `stream` bit is known. This still rejects before any
+/// backend dispatch while allowing the adapter to run after upstream selection.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn enforce_agentic_stream_guard(ctx: &mut HttpFilterContext<'_>) -> Option<Rejection> {
+    if ctx.get_metadata(AGENTIC_STREAM_GUARD_KEY) != Some("true") {
+        return None;
+    }
+
+    ctx.set_metadata(AGENTIC_STREAM_GUARD_KEY, "false");
+    let stream_events_armed = ctx.get_metadata("responses.logical_stream") == Some("true");
+    ctx.set_metadata("responses.logical_stream", "false");
+
+    (ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming && !stream_events_armed).then(|| {
+        error::responses_error_rejection(
+            500,
+            "server_error",
+            "openai_agentic_loop with a streaming protocol adapter requires openai_stream_events in the same step so loop-terminal errors can reach the client",
+        )
+    })
 }
 
 /// Count compact JSON bytes without retaining the serialized representation.

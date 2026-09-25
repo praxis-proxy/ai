@@ -51,7 +51,10 @@ use serde::{
 use tracing::debug;
 
 use self::config::{ResponsesProxyConfig, build_config};
-use super::{body_limits::reject_rewritten_body_too_large, error::responses_error_rejection, state::ResponsesState};
+use super::{
+    body_limits::reject_rewritten_body_too_large, enforce_agentic_stream_guard, error::responses_error_rejection,
+    state::ResponsesState,
+};
 use crate::{classifier::is_responses_create, json_body::SerializedJson};
 
 // -----------------------------------------------------------------------------
@@ -215,12 +218,18 @@ impl HttpFilter for ResponsesProxyFilter {
         }
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             select_terminal_response_mode(ctx, body);
+            if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
+                return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
+            }
             debug!("no ResponsesState in extensions, passthrough");
             return Ok(SelectedUpstreamBodyOutcome::Continue);
         };
 
         if !request_needs_rebuild(state) {
             select_terminal_response_mode(ctx, body);
+            if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
+                return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
+            }
             debug!("ResponsesState does not require an outbound rewrite, passthrough");
             return Ok(SelectedUpstreamBodyOutcome::Continue);
         }
@@ -233,6 +242,9 @@ impl HttpFilter for ResponsesProxyFilter {
 
         SerializedJson::from_bytes(serialized).commit(body, self.name(), "body");
         select_terminal_response_mode(ctx, body);
+        if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
+            return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
+        }
 
         Ok(SelectedUpstreamBodyOutcome::Continue)
     }
