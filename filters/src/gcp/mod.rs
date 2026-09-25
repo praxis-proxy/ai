@@ -8,8 +8,9 @@
 //! configuration surface may change between releases.
 //!
 //! Token acquisition for the metadata-server sources (`adc`, `metadata`)
-//! is implemented; `key_file` is not yet (needs `JWT` signing) — see
-//! [`GcpAdcFilter`] for the current behavior.
+//! mints through the GCE/GKE metadata endpoint; the `key_file` source
+//! signs a `JWT` assertion with the service-account private key and
+//! exchanges it at Google's `OAuth2` token endpoint — see [`GcpAdcFilter`].
 //!
 //! Classic GKE Workload Identity is the metadata server (ADC), not
 //! STS/WIF. Vertex AI needs an `OAuth2` access token with a **scope**,

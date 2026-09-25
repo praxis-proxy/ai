@@ -9,9 +9,9 @@ Injects a GCP `OAuth2` access token into outbound requests.
 
 Experimental: requires the `gcp-adc-filter` cargo feature, which is off by default and activates the `experimental` marker. This filter is a work in progress and its configuration surface may change between releases.
 
-Acquires a token via Application Default Credentials (GKE metadata server) and injects `Authorization: Bearer <token>` on every proxied request, keeping GCP credentials invisible to the downstream client. There is no background refresh thread: caching is cache-through, the same as [`crate::azure::azure_ad`] — see [`praxis_ai_apis::token_cache::TokenCache`] for the exact contract.
+Acquires a token via Application Default Credentials (GKE metadata server, or a service-account key file) and injects `Authorization: Bearer <token>` on every proxied request, keeping GCP credentials invisible to the downstream client. There is no background refresh thread: caching is cache-through, the same as [`crate::azure::azure_ad`] — see [`praxis_ai_apis::token_cache::TokenCache`] for the exact contract.
 
-**Service-account key file (`source: key_file`) token fetch is not implemented yet** — it needs `JWT` signing, which this workspace does not currently depend on. Config parsing, file resolution, and validation for `key_file` all work; `on_request` fails closed with a clear "not implemented" reason instead of silently 503ing forever.
+For `source: key_file`, the filter mints tokens itself: it signs a `JWT` assertion with the key file's private key and exchanges it at Google's `OAuth2` token endpoint. The `token_uri` inside the key file is validated at construct time to `https://oauth2.googleapis.com` (or a loopback test fixture), so a tampered key file cannot redirect the signed assertion elsewhere. Key files missing `client_email`, `private_key`, or `token_uri` are rejected as configuration errors.
 
 Credential-source resolution happens at construct time: `GOOGLE_APPLICATION_CREDENTIALS` is read once when the pipeline is built (reload the config to pick up changes), and a `gcloud` user credential file (`authorized_user`) is rejected as a configuration error rather than silently falling through the ADC chain.
 

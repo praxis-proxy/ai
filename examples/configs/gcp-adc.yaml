@@ -7,9 +7,12 @@
 # stale fetches a fresh token inline before proceeding); the
 # downstream client never sees GCP credentials.
 #
-# source: key_file (a service-account key JSON file) is not
-# implemented yet -- it needs JWT signing -- and fails closed with
-# a clear "not implemented" reason.
+# source: key_file signs a JWT assertion with a service-account key
+# JSON file (client_email, private_key, token_uri) and exchanges it at
+# Google's OAuth2 token endpoint. The token_uri is validated to
+# https://oauth2.googleapis.com so a tampered key file cannot redirect
+# the signed assertion elsewhere; mount the file from a Secret and
+# never commit it.
 #
 # This filter only injects Authorization — it does NOT set Host
 # or path. Point the cluster at your Vertex regional endpoint

@@ -39,6 +39,7 @@ pub(super) enum GcpAdcSource {
 /// filter: gcp_adc
 /// source: adc
 /// scope: https://www.googleapis.com/auth/cloud-platform
+/// clusters: [vertex] # optional; only inject credentials after routing to these clusters
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,6 +65,13 @@ pub(super) struct GcpAdcConfig {
     /// `GOOGLE_APPLICATION_CREDENTIALS` instead).
     #[serde(default)]
     pub credentials_file: Option<String>,
+
+    /// Optional logical upstream clusters that receive GCP credentials.
+    /// When omitted or empty, the filter applies to every request in its
+    /// chain. Use this after a router in a multi-provider chain so a GCP
+    /// bearer token is not sent to non-GCP providers.
+    #[serde(default)]
+    pub clusters: Vec<String>,
 
     /// GCE/GKE metadata server host. Defaults to the real metadata
     /// server; the only other accepted value is a `127.0.0.1` loopback
@@ -106,10 +114,24 @@ pub(super) fn validate_config(config: &GcpAdcConfig) -> Result<(), FilterError> 
     }
     validate_url_component("metadata_host", &config.metadata_host)?;
     validate_metadata_host(&config.metadata_host)?;
+    validate_clusters(&config.clusters)?;
     match config.source {
         GcpAdcSource::KeyFile => validate_key_file_fields(config),
         GcpAdcSource::Metadata | GcpAdcSource::Adc => validate_metadata_fields(config),
     }
+}
+
+/// Validate the optional cluster scope used to gate credential injection.
+fn validate_clusters(clusters: &[String]) -> Result<(), FilterError> {
+    for (index, cluster) in clusters.iter().enumerate() {
+        if cluster.trim().is_empty() {
+            return Err(format!("gcp_adc: clusters[{index}] must not be empty").into());
+        }
+        if clusters.iter().take(index).any(|existing| existing == cluster) {
+            return Err(format!("gcp_adc: duplicate cluster '{cluster}'").into());
+        }
+    }
+    Ok(())
 }
 
 /// Reject a config value that could break out of its URL component —

@@ -42,17 +42,20 @@ const TOKEN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// between releases.
 ///
 /// Acquires a token via Application Default Credentials (GKE metadata
-/// server) and injects `Authorization: Bearer <token>` on every proxied
-/// request, keeping GCP credentials invisible to the downstream client.
-/// There is no background refresh thread: caching is cache-through, the
-/// same as [`crate::azure::azure_ad`] — see
+/// server, or a service-account key file) and injects `Authorization:
+/// Bearer <token>` on every proxied request, keeping GCP credentials
+/// invisible to the downstream client. There is no background refresh
+/// thread: caching is cache-through, the same as
+/// [`crate::azure::azure_ad`] — see
 /// [`praxis_ai_apis::token_cache::TokenCache`] for the exact contract.
 ///
-/// **Service-account key file (`source: key_file`) token fetch is not
-/// implemented yet** — it needs `JWT` signing, which this workspace does
-/// not currently depend on. Config parsing, file resolution, and
-/// validation for `key_file` all work; `on_request` fails closed with a
-/// clear "not implemented" reason instead of silently 503ing forever.
+/// For `source: key_file`, the filter mints tokens itself: it signs a
+/// `JWT` assertion with the key file's private key and exchanges it at
+/// Google's `OAuth2` token endpoint. The `token_uri` inside the key file
+/// is validated at construct time to `https://oauth2.googleapis.com`
+/// (or a loopback test fixture), so a tampered key file cannot redirect
+/// the signed assertion elsewhere. Key files missing `client_email`,
+/// `private_key`, or `token_uri` are rejected as configuration errors.
 ///
 /// Credential-source resolution happens at construct time:
 /// `GOOGLE_APPLICATION_CREDENTIALS` is read once when the pipeline is
@@ -88,6 +91,9 @@ pub struct GcpAdcFilter {
     /// Resolved credential source.
     source: TokenSource,
 
+    /// Optional logical upstream cluster allowlist for credential injection.
+    clusters: Vec<String>,
+
     /// `OAuth2` scope requested with the access token.
     scope: String,
 
@@ -114,6 +120,7 @@ impl GcpAdcFilter {
         Ok(Self {
             cache: TokenCache::new(EXPIRY_SKEW),
             source,
+            clusters: config.clusters.clone(),
             scope: config.scope.clone(),
             metadata_host: config.metadata_host.clone(),
             failing: AtomicBool::new(false),
@@ -135,6 +142,11 @@ impl GcpAdcFilter {
                 .map(std::path::Path::new),
         )?))
     }
+
+    /// Whether this filter should inject credentials for the selected upstream.
+    fn cluster_is_in_scope(&self, cluster: Option<&str>) -> bool {
+        self.clusters.is_empty() || cluster.is_some_and(|selected| self.clusters.iter().any(|name| name == selected))
+    }
 }
 
 #[async_trait::async_trait]
@@ -155,6 +167,10 @@ impl praxis_filter::HttpFilter for GcpAdcFilter {
         &self,
         ctx: &mut praxis_filter::HttpFilterContext<'_>,
     ) -> Result<praxis_filter::FilterAction, FilterError> {
+        if !self.cluster_is_in_scope(ctx.cluster_name()) {
+            return Ok(praxis_filter::FilterAction::Continue);
+        }
+
         let fetched = self
             .cache
             .get_or_refresh(|| {

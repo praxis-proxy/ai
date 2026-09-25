@@ -48,8 +48,9 @@ http-callout-filter = ["experimental", "dep:serde_json_path"]
 azure-ad-filter = ["experimental", "dep:reqwest"]
 # Experimental: the gcp_adc (Application Default Credentials) upstream
 # authentication filter. Work in progress; the config surface may change.
-# Activates the `experimental` marker.
-gcp-adc-filter = ["experimental", "dep:reqwest"]
+# Activates the `experimental` marker. `jsonwebtoken` signs the service-
+# account `JWT` assertion for `source: key_file`.
+gcp-adc-filter = ["experimental", "dep:reqwest", "dep:jsonwebtoken"]
 # Experimental: the token_rate_limit filter. Its parent proposal
 # (00121_token-rate-limiting in praxis-proxy/enhancements) is not yet
 # `accepted`, and open design questions remain (bucket-keying strategy,
@@ -88,6 +89,7 @@ praxis-filter = { workspace = true, features = ["chain-binding"] }
 praxis-tls = { workspace = true }
 redis = { workspace = true, optional = true }
 rand = { workspace = true }
+jsonwebtoken = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
