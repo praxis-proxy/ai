@@ -5,6 +5,10 @@
 
 Persists Responses API responses to the configured response store backend.
 
+## Configuration Notes
+
+Rejects `background: true` whenever this filter executes: locally served retrieval cannot observe a provider's asynchronous lifecycle. Provider-owned passthrough should condition this filter out with `unless: bound_upstream` rather than allowing it to initialize or intercept lifecycle operations.
+
 ## Configuration
 
 | Field | Type | Required | Description |

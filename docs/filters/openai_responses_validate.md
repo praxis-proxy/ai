@@ -7,16 +7,20 @@ Validates and enriches Responses API requests.
 
 ## Configuration Notes
 
-Parses the body as [`serde_json::Value`] for targeted field extraction. Does not deserialize the full body into a typed struct or validate other provider-owned parameter combinations. The preceding classifier rejects unsupported `background=true` requests before this filter runs.
+In a legacy `openai_responses_format` chain, parses the body as [`serde_json::Value`] for targeted field extraction. After `openai_responses_request`, uses its initialized [`ResponsesState`] without parsing again. Does not validate other provider-owned parameter combinations. Rejects `background=true` because locally managed pipelines cannot observe a provider-owned asynchronous lifecycle. A provider-aware pipeline may condition this filter with `unless: { bound_upstream: { application_provider: openai } }`; Praxis then runs the same validation once at the bound-upstream body barrier and skips it for OpenAI-owned passthrough.
 
-Must be placed after `openai_responses_format` in the filter chain. Skips non-Responses API requests (those not classified as `openai_responses`).
+Must be placed after `openai_responses_format` or `openai_responses_request` in the filter chain. Skips non-Responses API requests (those not classified as `openai_responses`).
 
 Generates metadata: `responses.response_id` (format: `resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, `responses.stream`.
 
-This filter has no configuration, body buffering is handled by the upstream `openai_responses_format` classifier.
+This filter has no filter-specific configuration. Request conditions may gate it on `bound_upstream`; body buffering is shared with the preceding Responses request classifier.
 
 ## Example
 
 ```yaml
 filter: openai_responses_validate
+conditions:
+  - unless:
+      bound_upstream:
+        application_provider: openai
 ```

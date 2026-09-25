@@ -96,9 +96,51 @@ when any of these hold:
 - `has_conversation` is true
 - `has_prompt_id` is true
 
-Requests with `background: true` are rejected before mode
-classification because Praxis does not implement the
-asynchronous Responses lifecycle.
+The Responses request classifier preserves `background: true` and publishes
+the intent as `openai_responses_format.background`. An unconditioned
+`openai_responses_validate` rejects it before routing or upstream contact
+because a gateway-managed pipeline cannot implement the asynchronous Responses
+lifecycle.
+
+Provider-aware pipelines bind the logical upstream before request-scoped body
+policy and condition both validation and local storage out for OpenAI:
+
+```yaml
+- filter: openai_responses_request
+- filter: router
+  # routes bind clusters whose load-balancers declare application_provider
+- filter: openai_responses_validate
+  conditions:
+    - unless:
+        bound_upstream:
+          application_provider: openai
+- filter: openai_response_store
+  # backend configuration omitted
+  conditions:
+    - unless:
+      bound_upstream:
+        application_provider: openai
+- filter: load_balancer
+  cluster_source: bound_upstream
+  clusters:
+    - name: inference
+      http:
+        application_provider: openai
+      endpoints: ["api.openai.com:443"]
+```
+
+Praxis automatically runs each dual-phase body filter exactly once: ordinary
+pipelines use the pre-read phase, while a `bound_upstream` condition defers the
+same operation to the logical-binding barrier. The OpenAI path skips both
+filters and forwards the original body directly. Managed providers execute
+them; the validator rejects background before the store, IRR, or backend. If an
+ungated local response store does execute for a background request, it also
+rejects because local polling cannot observe provider state transitions.
+
+Allowing the create request proves only that its selected destination
+can own background execution. Routes for later retrieval and
+cancellation requests must bind and dispatch to the same OpenAI lifecycle owner;
+those requests do not carry the create body's `background` field.
 
 Stateful mode influences routing decisions (e.g.
 directing to clusters with response store access).

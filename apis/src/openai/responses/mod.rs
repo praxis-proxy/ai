@@ -14,8 +14,6 @@
 //! discriminator is a Responses request rather than unknown JSON. A
 //! `GET /v1/responses` `WebSocket` upgrade is classified from the method,
 //! path, and upgrade headers without inferring body-derived facts.
-//! Create requests with `background=true` are rejected because Praxis does not
-//! implement the asynchronous Responses lifecycle.
 //! Promotes classification facts to configurable headers, durable
 //! metadata, and filter results for routing. Does not mutate the
 //! request body.
@@ -222,9 +220,6 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 /// and mode facts remain absent. An ordinary bodyless `GET /v1/responses`
 /// remains unclassified.
 ///
-/// Requests with `background=true` are rejected because Praxis does not
-/// implement the asynchronous Responses lifecycle.
-///
 /// Routing mode for supported Responses API requests: `stateful` when the
 /// request contains `previous_response_id`, non-empty `tools`, `store=true`
 /// (default when omitted), `conversation`, or `prompt.id`;
@@ -319,10 +314,6 @@ impl HttpFilter for ResponsesFormatFilter {
             return Ok(action);
         }
 
-        if let Some(action) = handle_unsupported_background(&classified) {
-            return Ok(action);
-        }
-
         let mode = if websocket_handshake {
             None
         } else {
@@ -414,22 +405,6 @@ fn handle_invalid_format(format: AiRequestFormat, config: &ResponsesFormatConfig
             )))
         },
     }
-}
-
-/// Reject Responses create requests that request background execution.
-///
-/// Praxis does not implement the asynchronous Responses lifecycle
-/// (schedule, poll, cancel), so `background=true` is rejected uniformly
-/// before routing or upstream contact with an OpenAI-shaped 400.
-fn handle_unsupported_background(classified: &ClassifiedRequest) -> Option<FilterAction> {
-    if classified.format == AiRequestFormat::Responses && classified.background == Some(true) {
-        return Some(FilterAction::Reject(error::responses_error_rejection(
-            400,
-            "invalid_request_error",
-            "background mode is not supported",
-        )));
-    }
-    None
 }
 
 /// Determine the routing mode for a Responses API request.

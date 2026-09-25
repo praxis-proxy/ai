@@ -147,22 +147,40 @@ async fn a_model_only_create_is_classified_from_the_endpoint() {
     );
 }
 
-/// Background rejection keys off the published format, so a body without a
-/// discriminator must not slip past it.
+/// Background intent is classification data, even when the endpoint is the
+/// only Responses discriminator.
 #[tokio::test]
-async fn a_model_only_background_create_is_still_rejected() {
+async fn a_model_only_background_create_is_preserved_and_published() {
     let filter = default_filter();
     let request = create_request();
-    let action = run(
-        filter.as_ref(),
-        &request,
-        &json!({"model": "gpt-5", "background": true}),
-    )
-    .await;
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-5", "background": true})).unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(
-        matches!(action, FilterAction::Reject(_)),
-        "an undiscriminated create body must not bypass the background rejection"
+        matches!(action, FilterAction::Release),
+        "classification must not own background lifecycle policy"
+    );
+    assert_eq!(
+        ctx.get_metadata("openai_responses_format.background"),
+        Some("true"),
+        "the existing classification metadata must publish background intent"
+    );
+    assert_eq!(
+        ctx.get_metadata("responses.background"),
+        Some("true"),
+        "request state must preserve background intent for downstream policy"
+    );
+    assert_eq!(
+        ctx.extensions
+            .get::<ResponsesState>()
+            .and_then(|state| state.request_body.get("background"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "the provider-visible field must remain unchanged"
     );
 }
 
@@ -277,20 +295,21 @@ async fn conflicting_history_selectors_are_rejected() {
 }
 
 #[tokio::test]
-async fn background_mode_is_rejected_before_upstream_contact() {
+async fn background_mode_is_preserved_for_the_policy_filter() {
     let filter = default_filter();
     let request = create_request();
-    let action = run(
-        filter.as_ref(),
-        &request,
-        &json!({"model": "gpt-4.1", "input": "hi", "background": true}),
-    )
-    .await;
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi", "background": true})).unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
     assert!(
-        matches!(action, FilterAction::Reject(_)),
-        "Praxis does not implement the asynchronous Responses lifecycle"
+        matches!(action, FilterAction::Release),
+        "the request processor must leave lifecycle enforcement to the validator"
     );
+    assert_eq!(ctx.get_metadata("openai_responses_format.background"), Some("true"));
 }
 
 #[tokio::test]

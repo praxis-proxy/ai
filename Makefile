@@ -532,30 +532,44 @@ fips-scanner: | require-go
 # Praxis path override (test against local ../praxis)
 # -------------------------------------------------------------------
 
+PRAXIS_PATCH_GIT := https://github.com/praxis-proxy/praxis
+PRAXIS_PATCH_REV := a1b529e522bccb40f7bba6e2d5bc8558334f3a14
+
 patch-praxis:
 	@if [ ! -d "../praxis" ]; then \
 		echo "ERROR: ../praxis not found — clone praxis core as a sibling directory first"; \
 		exit 1; \
 	fi
-	@if grep -q '\[patch\.crates-io\]' Cargo.toml; then \
-		echo "Already patched — run 'make unpatch-praxis' first"; \
-		exit 1; \
+	@if grep -q 'praxis-proxy-core = { path = "../praxis/crates/core" }' Cargo.toml; then \
+		echo "Already patched to use ../praxis"; \
+	else \
+		if ! grep -q 'praxis-proxy-core = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }' Cargo.toml; then \
+			echo "ERROR: expected pinned Praxis patch not found in Cargo.toml"; \
+			exit 1; \
+		fi; \
+		sed -i.bak \
+			-e 's|^praxis-proxy = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }$$|praxis-proxy = { path = "../praxis/crates/server" }|' \
+			-e 's|^praxis-proxy-core = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }$$|praxis-proxy-core = { path = "../praxis/crates/core" }|' \
+			-e 's|^praxis-proxy-filter = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }$$|praxis-proxy-filter = { path = "../praxis/crates/filter" }|' \
+			-e 's|^praxis-proxy-protocol = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }$$|praxis-proxy-protocol = { path = "../praxis/crates/protocol" }|' \
+			-e 's|^praxis-proxy-tls = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }$$|praxis-proxy-tls = { path = "../praxis/crates/tls" }|' \
+			Cargo.toml && rm -f Cargo.toml.bak; \
+		echo "Patched Cargo.toml to use ../praxis path dependencies"; \
 	fi
-	@printf '\n[patch.crates-io]\n\
-	praxis-proxy-core = { path = "../praxis/core" }\n\
-	praxis-proxy-filter = { path = "../praxis/filter" }\n\
-	praxis-proxy-protocol = { path = "../praxis/protocol" }\n\
-	praxis-proxy-tls = { path = "../praxis/tls" }\n\
-	praxis-proxy = { path = "../praxis/server" }\n' >> Cargo.toml
-	@echo "Patched Cargo.toml to use ../praxis path dependencies"
 
 unpatch-praxis:
-	@if ! grep -q '\[patch\.crates-io\]' Cargo.toml; then \
+	@if ! grep -q 'praxis-proxy-core = { path = "../praxis/crates/core" }' Cargo.toml; then \
 		echo "Nothing to unpatch"; \
-		exit 0; \
+	else \
+		sed -i.bak \
+			-e 's|^praxis-proxy = { path = "../praxis/crates/server" }$$|praxis-proxy = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }|' \
+			-e 's|^praxis-proxy-core = { path = "../praxis/crates/core" }$$|praxis-proxy-core = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }|' \
+			-e 's|^praxis-proxy-filter = { path = "../praxis/crates/filter" }$$|praxis-proxy-filter = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }|' \
+			-e 's|^praxis-proxy-protocol = { path = "../praxis/crates/protocol" }$$|praxis-proxy-protocol = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }|' \
+			-e 's|^praxis-proxy-tls = { path = "../praxis/crates/tls" }$$|praxis-proxy-tls = { git = "$(PRAXIS_PATCH_GIT)", rev = "$(PRAXIS_PATCH_REV)" }|' \
+			Cargo.toml && rm -f Cargo.toml.bak; \
+		echo "Restored the pinned Praxis git dependencies"; \
 	fi
-	@sed -i.bak '/^\[patch\.crates-io\]/,$$d' Cargo.toml && rm -f Cargo.toml.bak
-	@echo "Removed [patch.crates-io] from Cargo.toml"
 
 # -------------------------------------------------------------------
 # Dev Setup

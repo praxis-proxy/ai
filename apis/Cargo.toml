@@ -55,10 +55,12 @@ percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
 praxis-core = { workspace = true }
 # iterative-request-router: IterationState / NextIterationBody (agentic loop,
-# web_search, file_search, MCP callouts). chain-binding: ChainBindingContext /
-# bind_chain for outbound callout chains. Both are off-by-default experimental
-# features in praxis 0.7.0 that carry no extra dependencies.
-praxis-filter = { workspace = true, features = ["iterative-request-router", "chain-binding"] }
+# web_search, file_search, MCP callouts). bound-upstream-request-body: the
+# request-scoped application-policy body barrier. chain-binding:
+# ChainBindingContext / bind_chain for outbound callout chains. These are
+# off-by-default experimental features in Praxis that carry no extra
+# dependencies.
+praxis-filter = { workspace = true, features = ["iterative-request-router", "bound-upstream-request-body", "chain-binding"] }
 praxis-tls = { workspace = true }
 reqwest = { workspace = true, optional = true }
 rmcp = { workspace = true, optional = true }

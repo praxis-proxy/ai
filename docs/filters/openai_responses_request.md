@@ -7,11 +7,11 @@ Processes the Responses create request body once and initializes state.
 
 ## Configuration Notes
 
-Replaces the `openai_responses_format` and `openai_responses_validate` pair for create requests. Configuration is unchanged from `openai_responses_format`, so a chain that ran both swaps them for this one filter and keeps the same `on_invalid` and `headers` settings.
+Replaces the classification, parsing, and state-initialization work of the `openai_responses_format` and `openai_responses_validate` pair for create requests. Configuration is unchanged from `openai_responses_format`. Pipelines that enforce background lifecycle policy retain a following `openai_responses_validate`, which does not parse the initialized state again.
 
 The operation is recognized from the request head, so only `POST /v1/responses` is processed. Every other request — including Conversations API traffic and the `WebSocket` handshake at the same path — is released untouched, and `on_invalid` governs only bodies that fail to parse.
 
-Rejects `background=true` with a 400, matching `openai_responses_format`, because Praxis does not implement the asynchronous Responses lifecycle.
+Preserves `background=true` and publishes it under the existing `openai_responses_format` and `responses` metadata namespaces. A following `openai_responses_validate` filter owns any request-scoped rejection.
 
 Promotes `openai_responses_format.*` metadata and filter results, and generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, and `responses.stream`.
 

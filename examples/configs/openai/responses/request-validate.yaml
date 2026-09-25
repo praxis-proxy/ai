@@ -12,7 +12,8 @@
 # request as Responses API, promotes model/stream/store/background to
 # openai_responses_format.* metadata, extracts conversation.id when present,
 # generates response and conversation IDs, and writes responses.* metadata
-# for downstream pipeline filters.
+# for downstream pipeline filters. openai_responses_validate then owns the
+# fail-closed background lifecycle policy without parsing that state again.
 #
 # Valid supported JSON requests are forwarded to the upstream backend with
 # the original body unchanged. Invalid JSON and unsupported background-mode
@@ -41,6 +42,7 @@ filter_chains:
     filters:
       - filter: openai_responses_request
         on_invalid: reject
+      - filter: openai_responses_validate
       - filter: router
         routes:
           - path: "/v1/responses"
@@ -50,6 +52,5 @@ filter_chains:
           - name: inference
             endpoints:
               - "127.0.0.1:8000"
-
 insecure_options:
   allow_private_endpoints: true # example proxies to local backends

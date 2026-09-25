@@ -13,8 +13,6 @@ Classification formats: `openai_responses`, `openai_chat_completions`, `unknown_
 
 A `GET /v1/responses` request with valid HTTP `WebSocket` upgrade headers is classified as `openai_responses` without inspecting a body. This handshake classification promotes only the format: model, stream, store, and mode facts remain absent. An ordinary bodyless `GET /v1/responses` remains unclassified.
 
-Requests with `background=true` are rejected because Praxis does not implement the asynchronous Responses lifecycle.
-
 Routing mode for supported Responses API requests: `stateful` when the request contains `previous_response_id`, non-empty `tools`, `store=true` (default when omitted), `conversation`, or `prompt.id`; `stateless` when `store=false` with no other stateful markers.
 
 Use with branch chains to route stateful and stateless requests to different clusters.

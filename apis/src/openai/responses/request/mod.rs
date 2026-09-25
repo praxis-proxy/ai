@@ -10,13 +10,14 @@
 //! metadata, the promoted headers and filter results, the proxy-owned
 //! identifiers, and [`ResponsesState`].
 //!
-//! Create requests with `background=true` are rejected, because Praxis does not
-//! implement the asynchronous Responses lifecycle.
+//! The original `background` field is preserved and published as request
+//! classification metadata. Request-scoped lifecycle policy belongs to
+//! `openai_responses_validate`, not this classifier/state initializer.
 //!
-//! This replaces the pair of `openai_responses_format` and
-//! `openai_responses_validate` for create requests. Those two each parsed the
-//! same body independently, so routing facts, proxy-owned defaults, and state
-//! could be derived from different parses of one request.
+//! This replaces the duplicate parsing and state initialization previously
+//! split between `openai_responses_format` and `openai_responses_validate`.
+//! A following validator may still enforce request-scoped lifecycle policy; it
+//! recognizes the initialized [`ResponsesState`] and does not parse again.
 //!
 //! Metadata and filter results keep the `openai_responses_format` namespace.
 //! Twelve downstream filters read those keys, and renaming them is a separate
@@ -62,18 +63,21 @@ const FILTER_NAME: &str = "openai_responses_request";
 
 /// Processes the Responses create request body once and initializes state.
 ///
-/// Replaces the `openai_responses_format` and `openai_responses_validate` pair
-/// for create requests. Configuration is unchanged from
-/// `openai_responses_format`, so a chain that ran both swaps them for this one
-/// filter and keeps the same `on_invalid` and `headers` settings.
+/// Replaces the classification, parsing, and state-initialization work of the
+/// `openai_responses_format` and `openai_responses_validate` pair for create
+/// requests. Configuration is unchanged from `openai_responses_format`.
+/// Pipelines that enforce background lifecycle policy retain a following
+/// `openai_responses_validate`, which does not parse the initialized state
+/// again.
 ///
 /// The operation is recognized from the request head, so only `POST
 /// /v1/responses` is processed. Every other request — including Conversations
 /// API traffic and the `WebSocket` handshake at the same path — is released
 /// untouched, and `on_invalid` governs only bodies that fail to parse.
 ///
-/// Rejects `background=true` with a 400, matching `openai_responses_format`,
-/// because Praxis does not implement the asynchronous Responses lifecycle.
+/// Preserves `background=true` and publishes it under the existing
+/// `openai_responses_format` and `responses` metadata namespaces. A following
+/// `openai_responses_validate` filter owns any request-scoped rejection.
 ///
 /// Promotes `openai_responses_format.*` metadata and filter results, and
 /// generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG),
@@ -142,10 +146,6 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             Ok(pair) => pair,
             Err(format) => return handle_unclassifiable(ctx, format, &self.config),
         };
-
-        if let Some(action) = super::handle_unsupported_background(&classified) {
-            return Ok(action);
-        }
 
         if let Some(action) = reject_conflicting_history_selectors(&parsed) {
             return Ok(action);

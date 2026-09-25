@@ -291,6 +291,16 @@ fn request_body_access_is_read_only() {
 }
 
 #[test]
+fn bound_upstream_request_body_access_is_read_only() {
+    let filter = make_filter();
+    assert_eq!(
+        filter.bound_upstream_request_body_access(),
+        BodyAccess::ReadOnly,
+        "the store must support provider-gated request-scoped policy"
+    );
+}
+
+#[test]
 fn response_body_mode_defaults_to_stream() {
     let filter = make_filter();
     assert_eq!(
@@ -338,6 +348,27 @@ async fn on_request_does_not_initialize_store_without_format_metadata() {
     assert!(
         filter.store.get().is_none(),
         "store should not initialize before request classification is available"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executing_store_rejects_background_create() {
+    let filter = make_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_responses_format.background", "true");
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1","background":true}"#));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let rejection = expect_reject(action);
+    assert_eq!(rejection.status, 400);
+    let error: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["message"], "background mode is not supported");
+    assert!(
+        filter.store.get().is_none(),
+        "rejection must happen before store initialization"
     );
 }
 

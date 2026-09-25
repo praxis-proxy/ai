@@ -13,7 +13,8 @@
 //! - **`on_request`**: reads classifier metadata to decide whether the request needs the store (persistable POST or
 //!   `previous_response_id`). Lazily initializes the store backend when needed. Rejects with a 500 response on store
 //!   init failure for any request that requires the store (persistence or rehydration). `GET` and `DELETE` endpoints
-//!   owned by the store also reject rather than falling through to the upstream.
+//!   owned by the store also reject rather than falling through to the upstream. A background create is rejected when
+//!   this filter executes because local retrieval cannot observe a provider-owned asynchronous lifecycle.
 //!
 //! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx
 //!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and bail
@@ -48,7 +49,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
+    BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection,
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
@@ -82,6 +83,11 @@ use crate::{
 };
 
 /// Persists Responses API responses to the configured response store backend.
+///
+/// Rejects `background: true` whenever this filter executes: locally served
+/// retrieval cannot observe a provider's asynchronous lifecycle. Provider-owned
+/// passthrough should condition this filter out with `unless: bound_upstream`
+/// rather than allowing it to initialize or intercept lifecycle operations.
 ///
 /// # YAML
 ///
@@ -353,6 +359,43 @@ impl ResponseStoreFilter {
         persist_response_blocking(store, &record, &pending_approvals)?;
         Ok(FilterAction::Continue)
     }
+
+    /// Process one complete request body in either supported body phase.
+    async fn process_complete_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+    ) -> Result<FilterAction, FilterError> {
+        if ctx.request.method != http::Method::POST {
+            return Ok(FilterAction::Continue);
+        }
+        if background_requested(ctx) {
+            debug!("rejecting background create owned by local response store");
+            return Ok(FilterAction::Reject(reject_background()));
+        }
+        if let Err(action) = capture_persistence_owner(ctx) {
+            return Ok(action);
+        }
+        if !should_skip(ctx)
+            && let Some(input) = extract_request_input(body)
+        {
+            capture_request_input(ctx, input);
+        }
+        if should_init_store_for_request(ctx) {
+            match &self.get_or_init_store().await {
+                Some(store) => register_store_in_context(ctx, store),
+                None => return Ok(FilterAction::Reject(reject_store_error())),
+            }
+            // Publish the exchange-scoped persistence-armed marker so a
+            // downstream approval pause (mcp_dispatch) can tell that THIS
+            // response will be persisted, not merely that a store is registered
+            // somewhere in the pipeline.
+            arm_persistence_if_persisting(ctx);
+        } else {
+            self.try_init_store_for_compact(ctx).await;
+        }
+        Ok(FilterAction::Continue)
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -532,6 +575,12 @@ fn should_skip(ctx: &HttpFilterContext<'_>) -> bool {
         || is_non_responses_format(ctx)
         || is_store_disabled(ctx)
         || !is_responses_create(&ctx.request.method, ctx.request.uri.path())
+}
+
+/// Whether this store is executing for a background Responses create.
+fn background_requested(ctx: &HttpFilterContext<'_>) -> bool {
+    is_responses_create(&ctx.request.method, ctx.request.uri.path())
+        && ctx.get_metadata("openai_responses_format.background") == Some("true")
 }
 
 /// Check whether this request should initialize the store.
@@ -807,6 +856,10 @@ impl HttpFilter for ResponseStoreFilter {
         BodyAccess::ReadOnly
     }
 
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
     fn response_body_access(&self) -> BodyAccess {
         BodyAccess::ReadOnly
     }
@@ -879,31 +932,21 @@ impl HttpFilter for ResponseStoreFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream || ctx.request.method != http::Method::POST {
+        if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
-        if let Err(action) = capture_persistence_owner(ctx) {
-            return Ok(action);
-        }
-        if !should_skip(ctx)
-            && let Some(input) = extract_request_input(body)
-        {
-            capture_request_input(ctx, input);
-        }
-        if should_init_store_for_request(ctx) {
-            match &self.get_or_init_store().await {
-                Some(store) => register_store_in_context(ctx, store),
-                None => return Ok(FilterAction::Reject(reject_store_error())),
-            }
-            // Publish the exchange-scoped persistence-armed marker so a
-            // downstream approval pause (mcp_dispatch) can tell that THIS
-            // response will be persisted, not merely that a store is registered
-            // somewhere in the pipeline.
-            arm_persistence_if_persisting(ctx);
-        } else {
-            self.try_init_store_for_compact(ctx).await;
-        }
-        Ok(FilterAction::Continue)
+        self.process_complete_request_body(ctx, body).await
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        Ok(match self.process_complete_request_body(ctx, body).await? {
+            FilterAction::Reject(rejection) => BoundUpstreamBodyOutcome::Reject(rejection),
+            _ => BoundUpstreamBodyOutcome::Continue,
+        })
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -1338,6 +1381,11 @@ fn reject_not_found(id: &str) -> Rejection {
 /// Build a 400 rejection for invalid client-supplied parameters.
 fn reject_invalid_input(message: &str) -> Rejection {
     responses_error_rejection(400, "invalid_request_error", message)
+}
+
+/// Reject a lifecycle that local retrieval cannot observe.
+fn reject_background() -> Rejection {
+    responses_error_rejection(400, "invalid_request_error", "background mode is not supported")
 }
 
 /// Build a 500 rejection for internal store failures.
