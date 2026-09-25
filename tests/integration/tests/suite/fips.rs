@@ -631,17 +631,31 @@ fn the_binary_serves_under_require_fips_exactly_on_a_fips_host() {
     let addr = format!("127.0.0.1:{port}");
     let client = certs.client_config();
 
+    // The suite's features mirror the spawned binary's (the PRAXIS_AI_BIN
+    // contract): with the policy engine (`standard`) or the store compiled
+    // in, the binary refuses PRAXIS_REQUIRE_FIPS even on a FIPS host,
+    // naming the filters (the server's fips_blocker), because their
+    // dependencies do their own cryptography outside the system OpenSSL.
+    let carries_non_fips_filters = cfg!(any(feature = "standard", feature = "store"));
+
     match start_binary(&config, &addr, &client, &[("PRAXIS_REQUIRE_FIPS", "1")]) {
         Startup::Exited { success, stderr } => {
-            assert!(
-                !in_fips_mode,
-                "on a FIPS host the binary must serve under PRAXIS_REQUIRE_FIPS, but it exited: {stderr}"
-            );
             assert!(!success, "the refusal is an error exit");
-            assert!(
-                stderr.contains("PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect"),
-                "the refusal names the variable and the state, got: {stderr}"
-            );
+            if in_fips_mode {
+                assert!(
+                    carries_non_fips_filters,
+                    "on a FIPS host the FIPS build must serve under PRAXIS_REQUIRE_FIPS, but it exited: {stderr}"
+                );
+                assert!(
+                    stderr.contains("run the FIPS build"),
+                    "the refusal on a FIPS host names the non-FIPS filters, got: {stderr}"
+                );
+            } else {
+                assert!(
+                    stderr.contains("PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect"),
+                    "the refusal names the variable and the state, got: {stderr}"
+                );
+            }
         },
         Startup::Ready(running) => {
             let (status, body) = https_get(&addr, "/", &client);
@@ -649,6 +663,10 @@ fn the_binary_serves_under_require_fips_exactly_on_a_fips_host() {
             assert!(
                 in_fips_mode,
                 "the binary served under PRAXIS_REQUIRE_FIPS on a host that is not in FIPS mode"
+            );
+            assert!(
+                !carries_non_fips_filters,
+                "a binary carrying non-FIPS filters served under PRAXIS_REQUIRE_FIPS on a FIPS host"
             );
             assert_eq!((status, body.as_str()), (200, "fips"));
             let line = log
