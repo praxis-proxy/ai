@@ -7,7 +7,7 @@
 # `openai_operation` classifies Chat Completions from the request head
 # without reading the body. `anthropic_messages_format` classifies every
 # request body and promotes `x-praxis-ai-format` for router-based cluster
-# selection. `openai_responses_format` runs for its own filter results
+# selection. `openai_format` runs for its own filter results
 # but does not promote a format header (avoids overwriting).
 
 listeners:
@@ -41,7 +41,7 @@ filter_chains:
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: ~

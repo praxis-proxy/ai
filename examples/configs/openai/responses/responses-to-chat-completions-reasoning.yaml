@@ -5,7 +5,7 @@
 # backend that returns raw reasoning in choices[].message.reasoning. The reasoning
 # dialect promotes that raw reasoning into a Responses reasoning output item.
 #
-# Reasoning dialect contract (see the responses_to_chat_completions filter):
+# Reasoning dialect contract (see the openai_responses_to_chat_completions filter):
 #   - dialect: vllm reads message.reasoning (the current vLLM field) and
 #     falls back to the deprecated message.reasoning_content alias
 #     for older backends, emitting it as a reasoning item whose content is
@@ -34,28 +34,28 @@ listeners:
 filter_chains:
   - name: responses-chat-reasoning-translation
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
-      - filter: responses_to_chat_completions
+      - filter: openai_responses_to_chat_completions
         max_rewritten_body_bytes: 67108864
         reasoning:
           dialect: vllm

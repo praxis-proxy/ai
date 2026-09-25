@@ -62,13 +62,13 @@ async fn a_create_request_publishes_classification_metadata() {
     // Published under the namespace downstream filters already read.
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.format")
+            .get("openai_format.format")
             .map(String::as_str),
         Some("openai_responses")
     );
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.stream")
+            .get("openai_format.stream")
             .map(String::as_str),
         Some("true")
     );
@@ -136,7 +136,7 @@ async fn a_model_only_create_is_classified_from_the_endpoint() {
     assert!(matches!(action, FilterAction::Release));
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.format")
+            .get("openai_format.format")
             .map(String::as_str),
         Some("openai_responses"),
         "body heuristics find no discriminator, but the create endpoint decides"
@@ -180,7 +180,7 @@ async fn a_positively_classified_body_is_not_relabelled() {
 
     assert_eq!(
         ctx.filter_metadata
-            .get("openai_responses_format.format")
+            .get("openai_format.format")
             .map(String::as_str),
         Some("openai_chat_completions"),
         "only unknown bodies are upgraded by endpoint authority"
@@ -236,7 +236,7 @@ async fn a_non_create_responses_operation_is_left_alone() {
         "a bodyless operation must not initialize create state"
     );
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.format"),
+        !ctx.filter_metadata.contains_key("openai_format.format"),
         "identity comes from the request head, so nothing is published here"
     );
 }
@@ -313,7 +313,7 @@ async fn an_unclassifiable_body_follows_on_invalid_continue() {
         assert!(matches!(action, FilterAction::Release), "{label} body should forward");
         let published = ctx
             .filter_metadata
-            .get("openai_responses_format.format")
+            .get("openai_format.format")
             .map(String::as_str);
         assert!(
             published == Some("non_json") || published == Some("invalid_json"),

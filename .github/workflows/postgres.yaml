@@ -20,8 +20,8 @@ on:
       - "tests/integration/Cargo.toml"
       - "tests/utils/Cargo.toml"
       - "tests/utils/src/net/postgres.rs"
-      - "tests/integration/tests/suite/examples/openai_response_store_postgres.rs"
-      - "tests/integration/tests/suite/examples/openai_response_store_postgres_mtls.rs"
+      - "tests/integration/tests/suite/examples/openai_store_postgres.rs"
+      - "tests/integration/tests/suite/examples/openai_store_postgres_mtls.rs"
       - "tests/integration/tests/suite/examples/openai_conversations_postgres_mtls.rs"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -43,8 +43,8 @@ on:
       - "tests/integration/Cargo.toml"
       - "tests/utils/Cargo.toml"
       - "tests/utils/src/net/postgres.rs"
-      - "tests/integration/tests/suite/examples/openai_response_store_postgres.rs"
-      - "tests/integration/tests/suite/examples/openai_response_store_postgres_mtls.rs"
+      - "tests/integration/tests/suite/examples/openai_store_postgres.rs"
+      - "tests/integration/tests/suite/examples/openai_store_postgres_mtls.rs"
       - "tests/integration/tests/suite/examples/openai_conversations_postgres_mtls.rs"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -105,8 +105,8 @@ jobs:
             'tests/integration/Cargo.toml' \
             'tests/utils/Cargo.toml' \
             'tests/utils/src/net/postgres.rs' \
-            'tests/integration/tests/suite/examples/openai_response_store_postgres.rs' \
-            'tests/integration/tests/suite/examples/openai_response_store_postgres_mtls.rs' \
+            'tests/integration/tests/suite/examples/openai_store_postgres.rs' \
+            'tests/integration/tests/suite/examples/openai_store_postgres_mtls.rs' \
             'tests/integration/tests/suite/examples/openai_conversations_postgres_mtls.rs' \
             'Cargo.toml' \
             'Cargo.lock' \

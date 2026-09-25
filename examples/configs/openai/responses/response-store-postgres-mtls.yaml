@@ -40,13 +40,13 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
 
       - filter: state_owner
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: postgres
         # No password: the client authenticates with a certificate.
         database_url: "postgres://praxis@db.internal:5432/praxis"

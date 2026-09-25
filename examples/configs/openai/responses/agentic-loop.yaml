@@ -6,9 +6,9 @@
 #
 # The iterative_request_router (IRR) repeatedly runs one inference step.
 # Three request-phase dispatchers execute the loop owner's assigned calls:
-# `openai_web_search` runs web searches against an external provider,
+# `openai_web_search_dispatch` runs web searches against an external provider,
 # `openai_mcp_dispatch` runs MCP calls against the server URL supplied in the
-# request, and `openai_file_search_callout` runs hosted file searches against
+# request, and `openai_file_search_dispatch` runs hosted file searches against
 # the vector store. Each dispatches results back to the model via the loop.
 # Client-side function calls resolve to no dispatcher and are returned to the
 # client without looping.
@@ -30,18 +30,18 @@
 #   Filters listed first in the YAML run last in the response phase.
 #
 # Pipeline ordering (pre-IRR, runs once):
-#   1. openai_responses_format — classifies body, promotes metadata
-#   2. openai_responses_validate — validates parameters, generates IDs
-#   3. openai_response_store — registers the store backend
-#   4. openai_responses_rehydrate — loads previous_response_id context
+#   1. openai_format — classifies body, promotes metadata
+#   2. openai_validate — validates parameters, generates IDs
+#   3. openai_store — registers the store backend
+#   4. openai_rehydrate — loads previous_response_id context
 #
 # IRR inference filter chain (canonical #1046 order):
 #   Request phase (forward):
-#     openai_stream_events → openai_web_search → openai_mcp_dispatch
-#       → openai_file_search_callout → openai_agentic_loop
-#       → openai_responses_proxy → router → load_balancer
+#     openai_stream_events → openai_web_search_dispatch → openai_mcp_dispatch
+#       → openai_file_search_dispatch → openai_agentic_loop
+#       → openai_proxy → router → load_balancer
 #   Response phase (reverse):
-#     load_balancer → router → openai_responses_proxy → openai_agentic_loop
+#     load_balancer → router → openai_proxy → openai_agentic_loop
 #       → (dispatchers have no response phase) → openai_stream_events
 #   openai_agentic_loop is the sole response parser: it extracts completed
 #   function calls, web_search_call, file_search_call, and hosted
@@ -153,14 +153,14 @@ listeners:
 filter_chains:
   - name: agentic-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: openai_tool_parse
 
@@ -168,13 +168,13 @@ filter_chains:
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
       - filter: openai_mcp_tool_resolve
         connectors:
@@ -200,7 +200,7 @@ filter_chains:
               # cannot cap ctx.upstream (load_balancer has not run). Pair with
               # cluster read_timeout_ms below for idle backends.
               #
-              # REQUIRED because `openai_responses_proxy` below selects typed
+              # REQUIRED because `openai_proxy` below selects typed
               # streaming automatically for an effective `"stream": true`
               # request. Typed streaming commits `response.completed` to the
               # client as it arrives, so a loop-terminal error detected by
@@ -217,7 +217,7 @@ filter_chains:
 
               # Request-phase dispatcher: runs first on re-entry to execute
               # web_search_call assignments prepared by the loop owner.
-              - filter: openai_web_search
+              - filter: openai_web_search_dispatch
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
                 max_calls_per_round: 32
@@ -262,7 +262,7 @@ filter_chains:
               # ResponsesState.accumulated_output. It never parses the response
               # body and never decides whether another round runs, so it is inert
               # unless the model emits a hosted file_search_call.
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 vector_store_url: http://127.0.0.1:8001
                 # Every vector-store sub-request runs through this chain. It
                 # must be inline ({ name, filters }): this filter runs inside an
@@ -287,7 +287,7 @@ filter_chains:
                 max_infer_iters: 10
               # Selects typed streaming automatically when the effective
               # outbound body carries `"stream": true`; otherwise buffers.
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
               - filter: router
                 routes:
                   - path_prefix: "/"
@@ -305,7 +305,7 @@ filter_chains:
               # openai_agentic_loop is the sole loop authority (issue #1046): it
               # parses each model response, records assignments for the
               # request-phase dispatchers (web_search, mcp_dispatch,
-              # file_search_callout), and publishes the single continuation
+              # file_search_dispatch), and publishes the single continuation
               # signal. The IRR transitions only on the owner's action, never on
               # a dispatcher's.
               - filter: openai_agentic_loop

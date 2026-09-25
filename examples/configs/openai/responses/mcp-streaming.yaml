@@ -71,7 +71,7 @@ filter_chains:
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
@@ -94,7 +94,7 @@ filter_chains:
               # known. Stays before openai_agentic_loop so response-phase reverse
               # order lets the loop parse the raw SSE.
               #
-              # REQUIRED because `openai_responses_proxy` below selects typed
+              # REQUIRED because `openai_proxy` below selects typed
               # streaming automatically for an effective `"stream": true`
               # request.
               - filter: openai_stream_events
@@ -130,7 +130,7 @@ filter_chains:
 
               # Selects typed streaming automatically when the effective
               # outbound body carries `"stream": true`.
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
 
               - filter: router
                 routes:

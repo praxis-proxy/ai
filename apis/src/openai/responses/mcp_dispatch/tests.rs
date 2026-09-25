@@ -33,7 +33,7 @@ use crate::{
             },
             config::{McpDispatchConfig, build_config},
         },
-        openai_mcp_tool_resolve::{McpToolIndex, encode_function_name},
+        mcp_tool_resolve::{McpToolIndex, encode_function_name},
         state::{DeferredMcpConnector, McpApprovalState, McpConnectorContextPolicy, ResponsesState},
     },
     store::{PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore},
@@ -1921,7 +1921,7 @@ async fn streaming_deferred_discovery_failure_emits_canonical_sse_lifecycle() {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
     ctx.current_filter_id = Some(0);
-    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_format.stream", "true");
     ctx.set_metadata("responses.response_id", "resp_deferred_listing_failure");
 
     let body_json = json!({

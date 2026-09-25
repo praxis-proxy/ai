@@ -50,7 +50,7 @@ const FILE_SEARCH_FUNCTION_DESCRIPTION: &str = "Search the configured vector sto
 
 /// Maximum number of vector stores a single hosted file-search tool may target.
 ///
-/// `openai_file_search_callout` issues an upstream vector-store query per id on
+/// `openai_file_search_dispatch` issues an upstream vector-store query per id on
 /// every inference round, so an unbounded array would amplify one inbound
 /// request into many outbound searches. The OpenAI API currently caps this at
 /// 1; a small generous bound keeps proxy fan-out finite without enforcing the
@@ -1081,7 +1081,7 @@ fn validate_web_search_tools(tools: &[Value]) -> Result<(), TranslationError> {
 /// Reject ambiguous or structurally unusable file-search declarations.
 ///
 /// Shared by the Chat Completions translation and the native
-/// `openai_file_search_callout` lowering so both paths reject identical
+/// `openai_file_search_dispatch` lowering so both paths reject identical
 /// malformed hosted-tool declarations (collisions, duplicates, bad fields).
 pub(crate) fn validate_file_search_tools(tools: &[Value]) -> Result<(), TranslationError> {
     let mut file_search_count = 0_usize;
@@ -1124,7 +1124,7 @@ fn validate_web_search_tool(tool: &Map<String, Value>) -> Result<(), Translation
     for field in tool.keys() {
         if !matches!(field.as_str(), "type" | "search_context_size" | "user_location") {
             return Err(TranslationError::InvalidWebSearchTool(format!(
-                "field `{field}` is not supported by openai_web_search"
+                "field `{field}` is not supported by openai_web_search_dispatch"
             )));
         }
     }
@@ -1148,7 +1148,7 @@ fn validate_web_search_tool(tool: &Map<String, Value>) -> Result<(), Translation
     Ok(())
 }
 
-/// Validate fields required later by `openai_file_search_callout`.
+/// Validate fields required later by `openai_file_search_dispatch`.
 fn validate_file_search_tool(tool: &Map<String, Value>) -> Result<(), TranslationError> {
     validate_vector_store_ids(tool)?;
 
@@ -1294,7 +1294,7 @@ fn synthesized_file_search_tool() -> Value {
 /// `/v1/responses` backend that cannot consume the hosted `file_search` tool. It
 /// shares the description and parameters schema with the Chat Completions
 /// [`synthesized_file_search_tool`] so the two never diverge; the native lowering
-/// in `openai_file_search_callout` substitutes it into the outbound request.
+/// in `openai_file_search_dispatch` substitutes it into the outbound request.
 pub(crate) fn synthesized_file_search_tool_responses() -> Value {
     json!({
         "type": "function",
@@ -1311,7 +1311,7 @@ pub(crate) fn synthesized_file_search_tool_responses() -> Value {
 /// Returns the flat function choice to substitute, or `None` when the choice
 /// needs no change (strings and object choices that do not target file search).
 /// Mirrors [`build_object_tool_choice`]'s file-search rules so the native
-/// lowering in `openai_file_search_callout` and the Chat translation reject the
+/// lowering in `openai_file_search_dispatch` and the Chat translation reject the
 /// same mismatched choices. Callers must confirm a hosted `file_search` tool is
 /// declared before invoking this.
 pub(crate) fn responses_file_search_tool_choice_lowering(

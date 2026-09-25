@@ -13,16 +13,16 @@
 # run inside an `iterative_request_router` step; placing it anywhere
 # else fails closed at request time. A `stream: true` request arms it.
 # It must sit after `load_balancer` in that step so IRR body hooks see the
-# selected peer when needed; `openai_responses_proxy` buffers the request
+# selected peer when needed; `openai_proxy` buffers the request
 # body, so IRR otherwise runs that phase before load balancing.
 #
-# The `openai_response_store` filter runs pre-IRR (registering the
+# The `openai_store` filter runs pre-IRR (registering the
 # store backend) and persists the accumulated ResponsesState once the
 # logical stream terminates. Response body filters run in reverse
 # config order, so the store persists after the step composes the
 # terminal event.
 #
-# `openai_responses_proxy` automatically selects Praxis's
+# `openai_proxy` automatically selects Praxis's
 # typed streaming transport for the effective `stream: true` request, so
 # each SSE chunk reaches `openai_stream_events` incrementally.
 #
@@ -82,7 +82,7 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
@@ -98,7 +98,7 @@ filter_chains:
         steps:
           - name: inference
             filters:
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
 
               - filter: headers
                 request_set:
@@ -120,7 +120,7 @@ filter_chains:
                       - "127.0.0.1:8000"
 
               # After load_balancer so IRR body hooks see the selected peer.
-              # openai_responses_proxy buffers the request body, so IRR runs
+              # openai_proxy buffers the request body, so IRR runs
               # that phase before load balancing; an earlier placement never
               # sees ctx.upstream. timeout_secs is an absolute deadline from
               # the first SSE chunk (default 300). Each chunk recaps leftover

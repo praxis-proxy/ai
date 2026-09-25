@@ -209,10 +209,10 @@ const TOOL_SEARCH_DEFAULT_QUERY_DESCRIPTION: &str = "A concise description of th
 /// Hosted-tool call NAMES a downstream filter silently re-routes by name, so a
 /// client tool may not lower to any of them (see [`reject_reserved_hosted_tool_name`]).
 /// A backend `function_call` named `file_search` is rewritten into a hosted
-/// `file_search_call` (`agentic_loop` → `file_search_callout`); one named
+/// `file_search_call` (`agentic_loop` → `file_search_dispatch`); one named
 /// `web_search` trips the Chat-Completions web-search collision reject and aliases
 /// the proxy's synthesized web-search bridge. These mirror the un-centralized
-/// sentinels in `translation/chat_completions.rs` and `file_search_callout`.
+/// sentinels in `translation/chat_completions.rs` and `file_search_dispatch`.
 const RESERVED_HOSTED_TOOL_NAMES: [&str; 2] = ["file_search", "web_search"];
 
 // -----------------------------------------------------------------------------
@@ -241,10 +241,10 @@ const RESERVED_HOSTED_TOOL_NAMES: [&str; 2] = ["file_search", "web_search"];
 /// serialized, and restores after the upstream body is captured and before the
 /// agentic loop parses it. The outbound serializer is either:
 ///
-/// - `openai_responses_proxy` for a native Responses backend — the proxy serializes its body from `state.request_body`,
-///   which already holds the lowered tools; or
-/// - `responses_to_chat_completions` for a function-only **Chat Completions** backend (§ issue #1206) — r2c reads the
-///   outbound tools through `ResponsesState::request_tools` / `request_tool_choice`, which return the lowered
+/// - `openai_proxy` for a native Responses backend — the proxy serializes its body from `state.request_body`, which
+///   already holds the lowered tools; or
+/// - `openai_responses_to_chat_completions` for a function-only **Chat Completions** backend (§ issue #1206) — r2c
+///   reads the outbound tools through `ResponsesState::request_tools` / `request_tool_choice`, which return the lowered
 ///   `request_body` view, so the backend receives valid `function` declarations while canonical `state.tools` stays
 ///   rich for restore.
 ///
@@ -488,7 +488,7 @@ impl HttpFilter for ClientToolCompatFilter {
 
     fn request_body_access(&self) -> BodyAccess {
         // Lowering mutates `ResponsesState`; the outbound body is serialized by
-        // `openai_responses_proxy`. The raw request bytes are not needed here.
+        // `openai_proxy`. The raw request bytes are not needed here.
         BodyAccess::ReadOnly
     }
 
@@ -682,7 +682,7 @@ fn enforce_rewrite_cap(
     original_tool_choice: &Value,
     max_rewritten_body_bytes: usize,
 ) -> Result<Vec<Value>, FilterAction> {
-    let outbound_len = match super::openai_responses_proxy::serialized_outbound_body_len(state) {
+    let outbound_len = match super::responses_proxy::serialized_outbound_body_len(state) {
         Ok(len) => len,
         Err(error) => {
             restore_request_tools_and_choice(state, original_tools, original_tool_choice);
@@ -716,7 +716,7 @@ fn restore_request_tools_and_choice(state: &mut ResponsesState, tools: Vec<Value
 /// Return the client's stream preference: the classifier metadata first, falling
 /// back to the request body's `stream` flag.
 fn request_is_streaming(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream").map_or_else(
+    ctx.get_metadata("openai_format.stream").map_or_else(
         || {
             ctx.extensions
                 .get::<ResponsesState>()
@@ -1084,7 +1084,7 @@ fn lower_history_only(state: &mut ResponsesState, max_rewritten_body_bytes: usiz
 /// history is not rolled back: the request is rejected before any upstream call,
 /// so the mutated state is discarded rather than sent.
 fn enforce_history_rewrite_cap(state: &ResponsesState, max_rewritten_body_bytes: usize) -> Result<(), FilterAction> {
-    let outbound_len = super::openai_responses_proxy::serialized_outbound_body_len(state).map_err(|error| {
+    let outbound_len = super::responses_proxy::serialized_outbound_body_len(state).map_err(|error| {
         FilterAction::Reject(responses_error_rejection(
             500,
             "server_error",
@@ -2744,7 +2744,7 @@ fn reject_reserved_top_level_name(tool: &Value) -> Result<(), FilterAction> {
 /// silently re-routes by name ([`RESERVED_HOSTED_TOOL_NAMES`]).
 ///
 /// A backend `function_call` named `file_search` is normalized into a hosted
-/// `file_search_call` by the agentic loop (`file_search_callout`), and one named
+/// `file_search_call` by the agentic loop (`file_search_dispatch`), and one named
 /// `web_search` both trips the Chat-Completions web-search collision reject and
 /// aliases the proxy's synthesized web-search bridge. Lowering a client tool to
 /// either bare name would let a client-owned call be misclassified as hosted. Each

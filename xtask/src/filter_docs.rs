@@ -2711,7 +2711,7 @@ mod tests {
         let shared_items = parse_shared_config_items(&root);
         let filters = discover_all_filters(&root, &shared_items);
 
-        for filter_name in ["anthropic_web_search", "openai_web_search"] {
+        for filter_name in ["anthropic_web_search", "openai_web_search_dispatch"] {
             let filter = filters
                 .iter()
                 .find(|entry| entry.filter.name == filter_name)

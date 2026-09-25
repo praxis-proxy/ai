@@ -87,8 +87,7 @@ use self::{
     resolve_url::{FileUrlResolver, NormalizedOrigin},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, openai_responses_proxy::serialized_outbound_body_len,
-    state::ResponsesState,
+    body_limits::reject_rewritten_body_too_large, responses_proxy::serialized_outbound_body_len, state::ResponsesState,
 };
 use crate::{
     callout_headers::effective_body_callout_headers,
@@ -385,7 +384,7 @@ impl HttpFilter for FileResolveFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
+        if ctx.get_metadata("openai_format.format") != Some("openai_responses") {
             trace!("skipping non-responses request");
             return Ok(FilterAction::Release);
         }
@@ -538,7 +537,7 @@ fn reject_missing_callout_context(slot: &str) -> FilterAction {
 }
 
 /// Enforce the resolver's body limit against the exact request shape
-/// that `openai_responses_proxy` will later serialize from state.
+/// that `openai_proxy` will later serialize from state.
 fn reject_oversized_state_body(
     ctx: &HttpFilterContext<'_>,
     max_rewritten_body_bytes: usize,

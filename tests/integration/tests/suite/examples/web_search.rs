@@ -5,7 +5,7 @@
 //!
 //! These tests verify that the example config parses, the filter
 //! pipeline builds correctly, and requests pass through unchanged.
-//! The `openai_web_search` filter is a scaffolded passthrough — it validates
+//! The `openai_web_search_dispatch` filter is a scaffolded passthrough — it validates
 //! config at startup but does not execute searches at runtime.
 //!
 //! The example config uses `${WEB_SEARCH_API_KEY}` for the API key.
@@ -69,7 +69,7 @@ fn web_search_example_passthrough() {
     assert_eq!(
         parse_body(&raw),
         "inference",
-        "openai_web_search filter is a passthrough — request should reach inference backend"
+        "openai_web_search_dispatch filter is a passthrough — request should reach inference backend"
     );
 }
 
@@ -92,7 +92,7 @@ fn web_search_unresolvable_outbound_chain_fails_build() {
 }
 
 /// #958 follow-up: `outbound_chain` is optional (matching
-/// `openai_file_search_callout`). A config that omits it must build
+/// `openai_file_search_dispatch`). A config that omits it must build
 /// successfully — the filter binds an empty inline chain (pure passthrough) and
 /// the provider callout still runs through the shared executor, which enforces
 /// destination authority, DNS/SSRF, TLS/SNI, and `Host` centrally.

@@ -3549,7 +3549,7 @@ fn legitimate_namespace_member_is_not_rejected_by_the_reserved_prefix() {
 fn top_level_tool_named_a_reserved_hosted_tool_fails_closed() {
     // `file_search` and `web_search` are function-call NAMES downstream filters
     // silently re-route: a `function_call` named `file_search` is rewritten into a
-    // hosted `file_search_call` (agentic_loop → file_search_callout), and
+    // hosted `file_search_call` (agentic_loop → file_search_dispatch), and
     // `web_search` both trips the Chat-Completions `WebSearchFunctionNameCollision`
     // reject and aliases the proxy's synthesized web-search bridge. A client tool
     // lowered to either bare name would be misclassified as hosted, so the filter
@@ -5672,7 +5672,7 @@ async fn streaming_rich_request_rejects_without_arming() {
     let filter = filter();
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(&req);
-    ctx.set_metadata("openai_responses_format.stream", "true".to_owned());
+    ctx.set_metadata("openai_format.stream", "true".to_owned());
     ctx.extensions.insert(ResponsesState::from_request_body(json!({
         "stream": true,
         "tools": [{"type": "custom", "name": "run_python", "description": "d", "format": {"type": "text"}}],

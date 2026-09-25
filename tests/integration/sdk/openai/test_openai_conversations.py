@@ -266,7 +266,7 @@ def _chunked_response_store_filters(db_path: str, port: int) -> tuple[dict, dict
 
     conversations = {"filter": "openai_conversations", **store, **tables}
     response_store = {
-        "filter": "openai_response_store",
+        "filter": "openai_store",
         **store,
         "responses_table": f"chunked_{port}_responses",
         "conversations_table": tables["conversations_table"],
@@ -294,7 +294,7 @@ def _write_chunked_response_config(port: int, backend_port: int, db_path: str) -
                         "header": OWNER_HEADER,
                     },
                     conversations_filter,
-                    {"filter": "openai_responses_format"},
+                    {"filter": "openai_format"},
                     response_store_filter,
                     {
                         "filter": "router",

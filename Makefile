@@ -148,15 +148,15 @@ test-postgres-unit:
 
 # Every PostgreSQL integration test is #[ignore]d (each spawns its own
 # container), so it runs only when named here. Enumerate every module explicitly:
-# a bare substring filter such as `openai_response_store_postgres` incidentally
+# a bare substring filter such as `openai_store_postgres` incidentally
 # matches the response-store mTLS variant (a prefix) but cannot select the
 # Conversations certificate-auth module, silently dropping it from CI. Filters
 # must follow `--` so libtest treats each as an OR filter. Add every new
 # PostgreSQL integration module to this list.
 test-postgres-integration:
 	cargo test -p praxis-tests-integration --test suite -- --ignored \
-		openai_response_store_postgres \
-		openai_response_store_postgres_mtls \
+		openai_store_postgres \
+		openai_store_postgres_mtls \
 		openai_conversations_postgres_mtls $(if $(V),--nocapture)
 
 test-token-rate-limit-valkey-unit:

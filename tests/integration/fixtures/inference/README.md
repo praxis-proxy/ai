@@ -42,26 +42,26 @@ The manifest declares **40 features** across **6 scopes**, linked to **41 scenar
 | `responses_native_passthrough` | `responses.native.tool_call` | `live_covered` | `responses/native-tool-call` | `openai`: `live_covered`<br>`vllm`: `live_covered` |
 | `responses_native_passthrough` | `responses.request.background_unsupported` | `synthetic_only` | `responses/background-unsupported` | `synthetic`: `synthetic_only` |
 | `responses_native_passthrough` | `responses.native.continuation` | `synthetic_only` | `responses/native-continuation`<br>`responses/native-continuation-stream` | `synthetic`: `synthetic_only` |
-| `responses_to_chat_completions` | `responses.chat.request` | `synthetic_only` | `responses/chat-basic-nonstream`<br>`responses/chat-basic-stream` | `synthetic`: `synthetic_only` |
-| `responses_to_chat_completions` | `responses.chat.response.text` | `synthetic_only` | `responses/chat-basic-nonstream`<br>`responses/chat-basic-stream` | `synthetic`: `synthetic_only` |
-| `responses_to_chat_completions` | `responses.chat.web_search` | `synthetic_only` | `responses/chat-web-search`<br>`responses/chat-web-search-stream` | `synthetic`: `synthetic_only` |
-| `responses_to_chat_completions` | `responses.chat.file_search` | `synthetic_only` | `responses/chat-file-search` | `synthetic`: `synthetic_only` |
+| `openai_responses_to_chat_completions` | `responses.chat.request` | `synthetic_only` | `responses/chat-basic-nonstream`<br>`responses/chat-basic-stream` | `synthetic`: `synthetic_only` |
+| `openai_responses_to_chat_completions` | `responses.chat.response.text` | `synthetic_only` | `responses/chat-basic-nonstream`<br>`responses/chat-basic-stream` | `synthetic`: `synthetic_only` |
+| `openai_responses_to_chat_completions` | `responses.chat.web_search` | `synthetic_only` | `responses/chat-web-search`<br>`responses/chat-web-search-stream` | `synthetic`: `synthetic_only` |
+| `openai_responses_to_chat_completions` | `responses.chat.file_search` | `synthetic_only` | `responses/chat-file-search` | `synthetic`: `synthetic_only` |
 | `responses_agentic_loop` | `responses.agentic.parallel_tool_calls` | `synthetic_only` | `responses/agentic-parallel-tool-calls` | `synthetic`: `synthetic_only` |
 | `responses_agentic_loop` | `responses.agentic.status_less_function_call` | `synthetic_only` | `responses/agentic-status-less-function-call` | `synthetic`: `synthetic_only` |
 | `responses_agentic_loop` | `responses.agentic.irr_terminal_streaming` | `synthetic_only` | `responses/irr-terminal-streaming` | `synthetic`: `synthetic_only` |
 | `responses_agentic_loop` | `responses.agentic.deferred_mcp_connectors` | `synthetic_only` | `responses/agentic-deferred-mcp-connectors` | `synthetic`: `synthetic_only` |
-| `responses_to_chat_completions` | `responses.chat.continuation` | `synthetic_only` | `responses/chat-basic-nonstream` | `synthetic`: `synthetic_only` |
-| `responses_to_chat_completions` | `responses.chat.reasoning.request` | `live_covered` | `responses/chat-reasoning-nonstream` | `vllm`: `live_covered` |
-| `responses_to_chat_completions` | `responses.chat.reasoning.response` | `live_covered` | `responses/chat-reasoning-nonstream` | `vllm`: `live_covered` |
-| `responses_to_chat_completions` | `responses.chat.malformed_compaction` | `synthetic_only` | `responses/chat-malformed-compaction` | `synthetic`: `synthetic_only` |
-| `responses_to_chat_completions` | `responses.chat.unrepresentable_parameters` | `synthetic_only` | `responses/chat-unrepresentable-parameters` | `synthetic`: `synthetic_only` |
-| `responses_to_chat_completions` | `responses.chat.tools.function_echo` | `synthetic_only` | `responses/chat-tool-echo` | `synthetic`: `synthetic_only` |
-| `responses_to_chat_completions` | `responses.chat.reasoning.replay` | `synthetic_only` | `responses/chat-reasoning-replay`<br>`responses/chat-reasoning-disabled` | `synthetic`: `synthetic_only` |
-| `responses_to_chat_completions` | `responses.chat.structured_output_with_tools` | `synthetic_only` | `responses/chat-structured-output-with-tools` | `synthetic`: `synthetic_only` |
+| `openai_responses_to_chat_completions` | `responses.chat.continuation` | `synthetic_only` | `responses/chat-basic-nonstream` | `synthetic`: `synthetic_only` |
+| `openai_responses_to_chat_completions` | `responses.chat.reasoning.request` | `live_covered` | `responses/chat-reasoning-nonstream` | `vllm`: `live_covered` |
+| `openai_responses_to_chat_completions` | `responses.chat.reasoning.response` | `live_covered` | `responses/chat-reasoning-nonstream` | `vllm`: `live_covered` |
+| `openai_responses_to_chat_completions` | `responses.chat.malformed_compaction` | `synthetic_only` | `responses/chat-malformed-compaction` | `synthetic`: `synthetic_only` |
+| `openai_responses_to_chat_completions` | `responses.chat.unrepresentable_parameters` | `synthetic_only` | `responses/chat-unrepresentable-parameters` | `synthetic`: `synthetic_only` |
+| `openai_responses_to_chat_completions` | `responses.chat.tools.function_echo` | `synthetic_only` | `responses/chat-tool-echo` | `synthetic`: `synthetic_only` |
+| `openai_responses_to_chat_completions` | `responses.chat.reasoning.replay` | `synthetic_only` | `responses/chat-reasoning-replay`<br>`responses/chat-reasoning-disabled` | `synthetic`: `synthetic_only` |
+| `openai_responses_to_chat_completions` | `responses.chat.structured_output_with_tools` | `synthetic_only` | `responses/chat-structured-output-with-tools` | `synthetic`: `synthetic_only` |
 | `responses_client_tool_compat` | `responses.client_tool_compat.lower_restore` | `synthetic_only` | `responses/client-tool-compat` | `synthetic`: `synthetic_only` |
 | `responses_client_tool_compat` | `responses.client_tool_compat.stream_restore` | `synthetic_only` | `responses/client-tool-compat-stream` | `synthetic`: `synthetic_only` |
-| `responses_client_tool_compat`<br>`responses_to_chat_completions` | `responses.client_tool_compat.chat_lower_restore` | `synthetic_only` | `responses/client-tool-compat-chat` | `synthetic`: `synthetic_only` |
-| `responses_client_tool_compat`<br>`responses_to_chat_completions` | `responses.client_tool_compat.chat_stream_restore` | `synthetic_only` | `responses/client-tool-compat-chat-stream` | `synthetic`: `synthetic_only` |
+| `responses_client_tool_compat`<br>`openai_responses_to_chat_completions` | `responses.client_tool_compat.chat_lower_restore` | `synthetic_only` | `responses/client-tool-compat-chat` | `synthetic`: `synthetic_only` |
+| `responses_client_tool_compat`<br>`openai_responses_to_chat_completions` | `responses.client_tool_compat.chat_stream_restore` | `synthetic_only` | `responses/client-tool-compat-chat-stream` | `synthetic`: `synthetic_only` |
 | `messages_to_chat_completions` | `messages.response.stop_sequence` | `live_covered` | `messages/stop-sequence-nonstream`<br>`messages/stop-sequence-stream` | `vllm`: `live_covered` |
 <!-- END GENERATED INFERENCE COVERAGE -->
 

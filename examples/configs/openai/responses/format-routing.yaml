@@ -5,7 +5,7 @@
 # the HTTP method and path alone, without reading the body. Chat Completions
 # traffic branches on `application_protocol: openai_chat_completions`.
 #
-# The `openai_responses_format` filter parses JSON request bodies and
+# The `openai_format` filter parses JSON request bodies and
 # classifies them as `openai_responses` (Responses API) or `unknown` (valid
 # JSON but unrecognized format). Chat Completions routing no longer depends
 # on body heuristics for `/v1/chat/completions`.
@@ -52,7 +52,7 @@ filter_chains:
                         cluster: "chat-backend"
             rejoin: shared_load_balancer
 
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format

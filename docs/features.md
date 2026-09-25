@@ -68,11 +68,11 @@ lists what is left out and why.
 | Feature | Filters it adds | Notable dependencies |
 |---------|-----------------|----------------------|
 | `aws-sigv4-filter` (part of `standard`) | `aws_sigv4_sign` | `aws-credential-types`; the signature is computed by the system OpenSSL |
-| `openai-responses` | `openai_responses_validate`, `openai_responses_proxy`, `openai_stream_events`, `responses_to_chat_completions`, `openai_doc_extract`, `openai_client_tool_compat`, `openai_agentic_loop`, `openai_file_search_callout`, `openai_web_search` | none beyond the default build |
+| `openai-responses` | `openai_validate`, `openai_proxy`, `openai_stream_events`, `openai_responses_to_chat_completions`, `openai_doc_extract`, `openai_client_tool_compat`, `openai_agentic_loop`, `openai_file_search_dispatch`, `openai_web_search_dispatch` | none beyond the default build |
 | `openai-file-resolve-filter` | `openai_file_resolve` | `reqwest` |
-| `store-postgres`, `store-sqlite`, `store-all` | `openai_response_store`, `openai_responses_rehydrate`, and the SQL backends | `sqlx` (PostgreSQL adds native TLS through the system OpenSSL) |
+| `store-postgres`, `store-sqlite`, `store-all` | `openai_store`, `openai_rehydrate`, and the SQL backends | `sqlx` (PostgreSQL adds native TLS through the system OpenSSL) |
 | `openai-conversations` | `openai_conversations` | `jsonschema`, `utoipa`, a store backend |
-| `openai-compact` | `openai_responses_compact` | `tiktoken-rs`, a store backend |
+| `openai-compact` | `openai_compact` | `tiktoken-rs`, a store backend |
 | `openai-mcp-tools` | `openai_mcp_tool_resolve`, `openai_mcp_dispatch`, `openai_mcp_streaming_selector` | `rmcp`, a store backend |
 | `openai-all` | every OpenAI group above, without choosing a store backend | |
 | `full` | `standard`, `openai-all`, and `store-postgres` | |

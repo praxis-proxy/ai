@@ -56,10 +56,10 @@ mod harness;
 mod inference_fixtures;
 mod mcp;
 mod mcp_broker;
+mod openai_format;
 #[cfg(feature = "store-sqlite")]
 mod openai_mcp_tool_resolve;
-mod openai_responses_format;
-mod openai_responses_model_rewrite;
+mod openai_model_rewrite;
 mod openai_tool_parse;
 mod prompt_enrich;
 mod responses_routing;

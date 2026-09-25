@@ -4,7 +4,7 @@
 //! Shared `PostgreSQL` TLS and certificate-authentication configuration.
 //!
 //! [`PgTlsConfig`] is the single carrier for the TLS-related connection
-//! settings used by both the `openai_response_store` and `openai_conversations`
+//! settings used by both the `openai_store` and `openai_conversations`
 //! filters. It is validated once at filter construction (fail-before-serving)
 //! and then handed to the store constructor, so the two filters cannot drift in
 //! how they interpret TLS options or the certificate-authentication compliance

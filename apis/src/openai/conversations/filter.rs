@@ -661,7 +661,7 @@ impl HttpFilter for OpenaiConversationsFilter {
 
         let Some(append_owner) = append_owner else {
             // This filter is composed with other response-body consumers, such
-            // as `openai_response_store`. Releasing here drains a shared
+            // as `openai_store`. Releasing here drains a shared
             // StreamBuffer before those filters see end-of-stream, which can
             // turn a complete chunked response into several unpersistable
             // chunks (#1265). A filter that has no work for this exchange must
@@ -700,10 +700,10 @@ impl HttpFilter for OpenaiConversationsFilter {
 /// Whether this request should trigger conversation append-back on
 /// the response path.
 fn should_append_back(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.has_conversation") == Some("true")
+    ctx.get_metadata("openai_format.has_conversation") == Some("true")
         && ctx.get_metadata("responses.conversation_id").is_some()
-        && ctx.get_metadata("openai_responses_format.stream") != Some("true")
-        && ctx.get_metadata("openai_responses_format.background") != Some("true")
+        && ctx.get_metadata("openai_format.stream") != Some("true")
+        && ctx.get_metadata("openai_format.background") != Some("true")
 }
 
 // -----------------------------------------------------------------------------

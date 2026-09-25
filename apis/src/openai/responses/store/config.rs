@@ -13,7 +13,7 @@ use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifier
 use crate::store::{PoolConfig, SslMode, StoreCompressionConfig, validate_table_identifier};
 
 /// Filter name used in SSRF validation error messages.
-const FILTER_NAME: &str = "openai_response_store";
+const FILTER_NAME: &str = "openai_store";
 
 // -----------------------------------------------------------------------------
 // StorageBackend

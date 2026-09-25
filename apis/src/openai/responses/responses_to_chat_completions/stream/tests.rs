@@ -510,7 +510,7 @@ fn hosted_web_search_stream_emits_only_canonical_items() {
 #[test]
 fn streaming_file_search_echo_uses_hosted_tools_after_backend_lowering() {
     // The streamed response object echoes tools/tool_choice on response.created
-    // and response.completed. openai_file_search_callout lowers request_body to a
+    // and response.completed. openai_file_search_dispatch lowers request_body to a
     // private `function` for the backend, while state.tools/state.tool_choice
     // retain the client's hosted declaration; the client-visible stream must echo
     // the hosted form, never the private shim.

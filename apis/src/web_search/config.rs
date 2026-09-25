@@ -165,7 +165,7 @@ pub(crate) struct WebSearchFilterConfig {
     /// Messages requests. When enabled, the terminal inference response is
     /// streamed incrementally as one coherent client-visible SSE lifecycle
     /// while intermediate tool/search transitions stay internal. This knob is
-    /// anthropic-only; `openai_web_search` does not accept it.
+    /// anthropic-only; `openai_web_search_dispatch` does not accept it.
     #[serde(default)]
     pub(crate) terminal_streaming: bool,
 }
@@ -178,7 +178,7 @@ pub(crate) struct WebSearchFilterConfig {
 // the shared `build_config` via `into_shared`. Keep the remaining fields in
 // sync with `WebSearchFilterConfig`.
 
-/// Reads the request body but never rewrites it, so `openai_web_search`
+/// Reads the request body but never rewrites it, so `openai_web_search_dispatch`
 /// exposes no `max_body_bytes` knob: raw request body size is governed by the
 /// pipeline's `body_limits`, not a per-filter limit (which praxis core merges
 /// to the largest sibling buffer and would therefore be bypassable).
@@ -249,7 +249,7 @@ fn default_outbound_chain() -> ChainRef {
 impl OpenAiWebSearchConfig {
     /// Convert into the shared [`WebSearchFilterConfig`] for validation reuse.
     ///
-    /// `max_body_bytes` is fixed to `None`: `openai_web_search` defers raw
+    /// `max_body_bytes` is fixed to `None`: `openai_web_search_dispatch` defers raw
     /// request body size to the pipeline's `body_limits` and buffers to the
     /// absolute JSON ceiling, so it carries no per-filter raw-body cap.
     pub(crate) fn into_shared(self) -> WebSearchFilterConfig {
@@ -262,7 +262,7 @@ impl OpenAiWebSearchConfig {
             max_body_bytes: None,
             base_url: self.base_url,
             outbound_chain: self.outbound_chain,
-            // `openai_web_search` has no terminal_streaming knob; its own
+            // `openai_web_search_dispatch` has no terminal_streaming knob; its own
             // deny_unknown_fields config never accepts the field, so the
             // shared validated form is always off for it.
             terminal_streaming: false,
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn parse_config_defaults_missing_outbound_chain_to_empty_inline() {
         // `outbound_chain` is optional: omitting it defaults to an empty inline
-        // chain (pure passthrough), matching `openai_file_search_callout`. The
+        // chain (pure passthrough), matching `openai_file_search_dispatch`. The
         // callout still runs through the shared executor, which enforces
         // destination authority, DNS/SSRF, TLS/SNI, and `Host` centrally.
         let yaml = serde_yaml::from_str("provider: you\napi_key: k").unwrap();
@@ -480,7 +480,7 @@ mod tests {
         // The OpenAI-specific config carries its own `#[serde(default)]`, so it
         // must default identically when `outbound_chain` is omitted.
         let yaml = serde_yaml::from_str("provider: brave\napi_key: k").unwrap();
-        let raw = parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search", &yaml)
+        let raw = parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search_dispatch", &yaml)
             .expect("omitting outbound_chain must parse via the default");
         match &raw.outbound_chain {
             ChainRef::Inline { filters, .. } => assert!(
@@ -493,17 +493,17 @@ mod tests {
 
     #[cfg(feature = "openai-responses")]
     #[test]
-    fn openai_web_search_rejects_terminal_streaming() {
+    fn openai_web_search_dispatch_rejects_terminal_streaming() {
         let yaml = serde_yaml::from_str("provider: you\napi_key: k\nterminal_streaming: true").unwrap();
         assert!(
-            parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search", &yaml).is_err(),
-            "terminal_streaming is anthropic-only; openai_web_search must reject the unknown field"
+            parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search_dispatch", &yaml).is_err(),
+            "terminal_streaming is anthropic-only; openai_web_search_dispatch must reject the unknown field"
         );
     }
 
     #[test]
     fn build_config_applies_defaults() {
-        let cfg = build_config("openai_web_search", &base_config()).unwrap();
+        let cfg = build_config("openai_web_search_dispatch", &base_config()).unwrap();
         assert_eq!(cfg.provider, SearchProvider::Brave);
         assert_eq!(cfg.api_key.expose_secret(), "test-key-123");
         assert_eq!(cfg.default_context_size, SearchContextSize::Medium);
@@ -515,7 +515,7 @@ mod tests {
     fn build_config_rejects_empty_api_key() {
         let mut cfg = base_config();
         cfg.api_key = SecretString::from(String::new());
-        assert!(build_config("openai_web_search", &cfg).is_err());
+        assert!(build_config("openai_web_search_dispatch", &cfg).is_err());
     }
 
     #[test]
@@ -536,7 +536,7 @@ mod tests {
     fn build_config_rejects_zero_timeout() {
         let mut cfg = base_config();
         cfg.timeout_ms = Some(0);
-        assert!(build_config("openai_web_search", &cfg).is_err());
+        assert!(build_config("openai_web_search_dispatch", &cfg).is_err());
     }
 
     #[test]
@@ -544,7 +544,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.default_context_size = Some("xlarge".into());
         assert!(
-            build_config("openai_web_search", &cfg).is_err(),
+            build_config("openai_web_search_dispatch", &cfg).is_err(),
             "unknown default_context_size should be rejected"
         );
     }
@@ -554,7 +554,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.default_context_size = Some("high".into());
         cfg.timeout_ms = Some(15_000);
-        let validated = build_config("openai_web_search", &cfg).unwrap();
+        let validated = build_config("openai_web_search_dispatch", &cfg).unwrap();
         assert_eq!(validated.default_context_size, SearchContextSize::High);
         assert_eq!(validated.timeout_ms, 15_000);
     }
@@ -563,13 +563,13 @@ mod tests {
     fn build_config_base_url_threaded_through() {
         let mut cfg = base_config();
         cfg.base_url = Some("http://localhost:9999".into());
-        let validated = build_config("openai_web_search", &cfg).unwrap();
+        let validated = build_config("openai_web_search_dispatch", &cfg).unwrap();
         assert_eq!(validated.base_url.as_deref(), Some("http://localhost:9999"));
     }
 
     #[test]
     fn build_config_base_url_none_by_default() {
-        let validated = build_config("openai_web_search", &base_config()).unwrap();
+        let validated = build_config("openai_web_search_dispatch", &base_config()).unwrap();
         assert!(validated.base_url.is_none());
     }
 
@@ -589,7 +589,7 @@ mod tests {
             let mut cfg = base_config();
             cfg.base_url = Some(url.into());
             assert!(
-                build_config("openai_web_search", &cfg).is_ok(),
+                build_config("openai_web_search_dispatch", &cfg).is_ok(),
                 "private base_url `{url}` must pass structural validation; SSRF is enforced at connect time"
             );
         }
@@ -600,7 +600,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.base_url = Some("file:///etc/passwd".into());
         assert!(
-            build_config("openai_web_search", &cfg).is_err(),
+            build_config("openai_web_search_dispatch", &cfg).is_err(),
             "non-http(s) base_url scheme must be rejected"
         );
     }
@@ -610,7 +610,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.base_url = Some("http://user:pass@8.8.8.8".into());
         assert!(
-            build_config("openai_web_search", &cfg).is_err(),
+            build_config("openai_web_search_dispatch", &cfg).is_err(),
             "base_url with embedded credentials must be rejected (structural check)"
         );
     }
@@ -619,7 +619,7 @@ mod tests {
     fn build_config_allows_public_ip_base_url() {
         let mut cfg = base_config();
         cfg.base_url = Some("https://8.8.8.8".into());
-        let validated = build_config("openai_web_search", &cfg).unwrap();
+        let validated = build_config("openai_web_search_dispatch", &cfg).unwrap();
         assert_eq!(
             validated.base_url.as_deref(),
             Some("https://8.8.8.8"),
@@ -631,31 +631,31 @@ mod tests {
     fn build_config_allows_private_base_url() {
         let mut cfg = base_config();
         cfg.base_url = Some("http://127.0.0.1:9999".into());
-        let validated = build_config("openai_web_search", &cfg).unwrap();
+        let validated = build_config("openai_web_search_dispatch", &cfg).unwrap();
         assert_eq!(validated.base_url.as_deref(), Some("http://127.0.0.1:9999"));
     }
 
     #[test]
     fn resolve_literal_api_key() {
-        let result = resolve_api_key("openai_web_search", "my-literal-key").unwrap();
+        let result = resolve_api_key("openai_web_search_dispatch", "my-literal-key").unwrap();
         assert_eq!(result, "my-literal-key");
     }
 
     #[test]
     fn resolve_literal_api_key_trimmed() {
-        let result = resolve_api_key("openai_web_search", "  spaced-key  ").unwrap();
+        let result = resolve_api_key("openai_web_search_dispatch", "  spaced-key  ").unwrap();
         assert_eq!(result, "spaced-key");
     }
 
     #[test]
     fn resolve_env_var_syntax_detected() {
-        let result = resolve_api_key("openai_web_search", "${DEFINITELY_NOT_SET_KEY_12345}");
+        let result = resolve_api_key("openai_web_search_dispatch", "${DEFINITELY_NOT_SET_KEY_12345}");
         assert!(result.is_err(), "missing env var should fail");
     }
 
     #[test]
     fn resolve_partial_env_syntax_treated_as_literal() {
-        let result = resolve_api_key("openai_web_search", "${INCOMPLETE").unwrap();
+        let result = resolve_api_key("openai_web_search_dispatch", "${INCOMPLETE").unwrap();
         assert_eq!(result, "${INCOMPLETE", "unclosed brace should be literal");
     }
 
@@ -664,7 +664,7 @@ mod tests {
         let mut cfg = base_config();
         cfg.max_body_bytes = Some(0);
         assert!(
-            build_config("openai_web_search", &cfg).is_err(),
+            build_config("openai_web_search_dispatch", &cfg).is_err(),
             "max_body_bytes=0 should be rejected"
         );
     }
@@ -674,14 +674,14 @@ mod tests {
         let mut cfg = base_config();
         cfg.max_body_bytes = Some(999_999_999_999);
         assert!(
-            build_config("openai_web_search", &cfg).is_err(),
+            build_config("openai_web_search_dispatch", &cfg).is_err(),
             "max_body_bytes above limit should be rejected"
         );
     }
 
     #[test]
     fn debug_impl_redacts_api_key() {
-        let cfg = build_config("openai_web_search", &base_config()).unwrap();
+        let cfg = build_config("openai_web_search_dispatch", &base_config()).unwrap();
         let debug_output = format!("{cfg:?}");
         assert!(
             debug_output.contains("[REDACTED]"),
@@ -760,8 +760,8 @@ mod tests {
     fn openai_config_threads_user_credential_through_into_shared() {
         // Locks that `into_shared` does not drop the slot id on the OpenAI path.
         let yaml = serde_yaml::from_str("provider: brave\napi_key: k\nuser_credential: brave").unwrap();
-        let raw = parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search", &yaml).unwrap();
-        let validated = build_config("openai_web_search", &raw.into_shared()).unwrap();
+        let raw = parse_filter_config::<OpenAiWebSearchConfig>("openai_web_search_dispatch", &yaml).unwrap();
+        let validated = build_config("openai_web_search_dispatch", &raw.into_shared()).unwrap();
         assert_eq!(validated.user_credential.as_deref(), Some("brave"));
     }
 }

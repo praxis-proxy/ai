@@ -10,8 +10,8 @@
 //! Classifies each round's output by dispatch target to make the
 //! loop decision, but does **not** execute any call — MCP execution
 //! is handled by `openai_mcp_dispatch`, web search by
-//! `openai_web_search`, and file search by
-//! `openai_file_search_callout`. As the sole owner it runs before
+//! `openai_web_search_dispatch`, and file search by
+//! `openai_file_search_dispatch`. As the sole owner it runs before
 //! every dispatcher in the response phase, so it is the central
 //! authority that decides loop-vs-done; dispatchers only consume the
 //! calls the owner has already routed to them.
@@ -45,8 +45,8 @@
 //! items are **not** valid `OpenResponses` input (issue #808), so they
 //! never enter `state.messages`; `web_search_call`s remain in
 //! `state.web_search_calls` and `file_search_call`s are reached by index
-//! through `state.file_search_assignments`, for `openai_web_search` /
-//! `openai_file_search_callout` to dispatch and bridge into backend
+//! through `state.file_search_assignments`, for `openai_web_search_dispatch` /
+//! `openai_file_search_dispatch` to dispatch and bridge into backend
 //! history, and reach the client only through `state.accumulated_output`.
 //!
 //! For streaming responses, `stream_events` populates
@@ -62,9 +62,9 @@
 //!
 //! # Filter order
 //!
-//! For tool execution, it must appear after `openai_web_search`,
-//! `openai_mcp_dispatch`, and `openai_file_search_callout` and before
-//! `openai_responses_proxy`. Response filters execute in reverse
+//! For tool execution, it must appear after `openai_web_search_dispatch`,
+//! `openai_mcp_dispatch`, and `openai_file_search_dispatch` and before
+//! `openai_proxy`. Response filters execute in reverse
 //! order, so the owner parses and classifies each round's output
 //! *before* the dispatchers run, routing every call to the vector the
 //! matching dispatcher consumes. Because the owner is the sole filter
@@ -79,14 +79,14 @@
 //! steps:
 //!   - name: inference
 //!     filters:
-//!       - filter: openai_web_search
+//!       - filter: openai_web_search_dispatch
 //!         provider: brave
 //!         api_key: ${WEB_SEARCH_API_KEY}
 //!       - filter: openai_mcp_dispatch
-//!       - filter: openai_file_search_callout
+//!       - filter: openai_file_search_dispatch
 //!       - filter: openai_agentic_loop
 //!         max_infer_iters: 10
-//!       - filter: openai_responses_proxy
+//!       - filter: openai_proxy
 //!       - filter: router
 //!         routes:
 //!           - cluster: model-backend
@@ -107,7 +107,7 @@
 //!
 //! Requires [`ResponsesState`] in request extensions. Without it
 //! the filter passes through silently. State is created by
-//! `openai_responses_validate` for every Responses API create
+//! `openai_validate` for every Responses API create
 //! request.
 
 mod config;
@@ -139,7 +139,7 @@ use tracing::{debug, trace};
 use self::config::{AgenticLoopConfig, build_config};
 use super::{
     error::responses_error_rejection,
-    file_search_callout::{
+    file_search_dispatch::{
         ensure_public_output_item_ids_in_response, has_file_search_tool, is_file_search_function_call,
         is_pending_file_search_call, translate_function_calls_to_file_search,
     },
@@ -149,13 +149,13 @@ use super::{
     },
     stream_events::{encode_local_completion, encode_local_error},
     usage::merge_usage,
-    web_search::configured_max_calls_per_round as configured_web_max_calls,
+    web_search_dispatch::configured_max_calls_per_round as configured_web_max_calls,
 };
 #[cfg(feature = "openai-mcp-tools")]
 use super::{
     mcp_classify::{McpDisposition, classify_mcp},
     mcp_dispatch::{configured_max_calls_per_round as configured_mcp_max_calls, prepare_response_round},
-    openai_mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
+    mcp_tool_resolve::{McpToolIndex, has_pending_deferred_discovery},
 };
 use crate::http_hop::{connection_nominates_header, is_hop_by_hop};
 
@@ -265,12 +265,12 @@ impl HttpFilter for AgenticLoopFilter {
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         // Fail closed on an unsafe terminal-streaming configuration *before* any
         // upstream dispatch. Within each IRR round this filter's `on_request`
-        // runs after `openai_responses_proxy` has selected the typed transport
+        // runs after `openai_proxy` has selected the typed transport
         // and after `openai_stream_events` has published whether a logical-stream
         // finalizer is armed, so both facts are observable here.
         //
         // When the sub-request will commit a typed stream (an effective
-        // `"stream": true` request, for which `openai_responses_proxy` selects
+        // `"stream": true` request, for which `openai_proxy` selects
         // streaming automatically) but no `openai_stream_events` logical-stream
         // finalizer is present, a loop-terminal error detected later in
         // `on_response_body` cannot reach the client: typed streaming has already
@@ -291,7 +291,7 @@ impl HttpFilter for AgenticLoopFilter {
                 return Ok(FilterAction::Reject(responses_error_rejection(
                     500,
                     "server_error",
-                    "openai_agentic_loop with a streaming openai_responses_proxy sub-request requires \
+                    "openai_agentic_loop with a streaming openai_proxy sub-request requires \
                      openai_stream_events in the same step so loop-terminal errors can reach the client",
                 )));
             }
@@ -320,7 +320,7 @@ impl HttpFilter for AgenticLoopFilter {
             return convert_dispatch_failure(ctx, state, &failure);
         }
 
-        // A request-phase dispatcher (e.g. `openai_file_search_callout`) that failed
+        // A request-phase dispatcher (e.g. `openai_file_search_dispatch`) that failed
         // records a shared terminal outcome instead of committing a second terminal
         // response. The sole loop owner converts it here — before preparing another
         // inference request — into a buffered JSON rejection (pre-commitment) or a
@@ -972,7 +972,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
             Some("web_search_call") => {
                 // A hosted web_search_call is not a valid OpenResponses input
                 // item (issue #808), so it must not enter `messages`. The
-                // openai_web_search dispatch consumes `web_search_calls` and
+                // openai_web_search_dispatch dispatch consumes `web_search_calls` and
                 // appends a backend-valid function_call/function_call_output
                 // bridge for the next inference step.
                 state.web_search_calls.push(item.clone());
@@ -992,7 +992,7 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
                 // Like a hosted web_search_call, a file_search_call is not valid
                 // OpenResponses input, so it must not enter `messages`. The sole
                 // parse owner records its absolute index as a
-                // `FileSearchAssignment`; openai_file_search_callout drains those
+                // `FileSearchAssignment`; openai_file_search_dispatch drains those
                 // at request-body EOS, runs the vector-store callouts, and mutates
                 // the indexed accumulator item in place.
                 state.persisted_messages.push(item.clone());
@@ -1120,7 +1120,7 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
             Some("web_search_call") => {
                 // Mirror `collect_output_items`: a hosted web_search_call is not
                 // a valid OpenResponses input item (issue #808), so it must not
-                // enter `messages`. The openai_web_search dispatch consumes
+                // enter `messages`. The openai_web_search_dispatch dispatch consumes
                 // `web_search_calls` and appends a backend-valid
                 // function_call/function_call_output bridge for the next round.
                 state.web_search_calls.push(item.clone());

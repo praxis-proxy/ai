@@ -233,7 +233,7 @@ async fn skips_non_responses_request() {
         "/v1/chat/completions",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_chat_completions");
+    ctx.set_metadata("openai_format.format", "openai_chat_completions");
     let mut body = Some(Bytes::from(r#"{"messages":[]}"#));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -251,7 +251,7 @@ async fn skips_non_create_responses_endpoint() {
         "/v1/responses/compact",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
     let mut body = Some(Bytes::from(
         r#"{"input":[{"type":"message","role":"user","content":[{"type":"input_file","file_id":"file-abc"}]}]}"#,
     ));
@@ -288,7 +288,7 @@ async fn releases_missing_body() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
     let mut body: Option<Bytes> = None;
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -306,7 +306,7 @@ async fn releases_invalid_json() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
     let mut body = Some(Bytes::from("not json"));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
@@ -324,7 +324,7 @@ async fn continues_on_no_file_id() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
     let original = r#"{"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}"#;
     let mut body = Some(Bytes::from(original));
 
@@ -358,7 +358,7 @@ async fn string_input_passes_through() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
     let original = r#"{"input":"Hello, world!"}"#;
     let mut body = Some(Bytes::from(original));
 
@@ -468,7 +468,7 @@ timeout_ms: 2000"#
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
     let request_body = json!({
         "model": "gpt-4o",
         "input": [{
@@ -565,7 +565,7 @@ async fn resolves_history_when_current_input_has_no_file_id() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
 
     let request_body = json!({
         "input": [{
@@ -622,7 +622,7 @@ async fn missing_scoped_credential_rejects_before_file_id_dispatch() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
     let request_body = json!({
         "input": [{
             "type": "message",
@@ -661,7 +661,7 @@ async fn scoped_credential_arrives_on_file_id_metadata_and_content_requests() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
     let request_body = json!({
         "input": [{
             "type": "message",
@@ -719,7 +719,7 @@ async fn two_user_file_id_contexts_are_isolated() {
             "/v1/responses",
         )));
         let mut ctx = crate::test_utils::make_filter_context(req);
-        ctx.set_metadata("openai_responses_format.format", "openai_responses");
+        ctx.set_metadata("openai_format.format", "openai_responses");
         let request_body = json!({
             "input": [{
                 "type": "message",
@@ -806,7 +806,7 @@ async fn scoped_file_id_credential_is_not_replayed_to_redirect_authority() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
     let request_body = json!({
         "input": [{
             "type": "message",
@@ -897,7 +897,7 @@ async fn rejects_resolved_history_when_rebuilt_body_exceeds_limit() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from(serde_json::to_vec(&request_body).unwrap()));
 
@@ -923,7 +923,7 @@ async fn max_resolved_bytes_bounds_individual_content_independent_of_rewritten_l
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
 
     let request_body = json!({
         "input": [{
@@ -956,7 +956,7 @@ async fn max_resolved_bytes_default_allows_resolution() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
 
     let request_body = json!({
         "input": [{
@@ -997,7 +997,7 @@ async fn rejects_unresolvable_history_when_configured_to_reject() {
         "/v1/responses",
     )));
     let mut ctx = crate::test_utils::make_filter_context(req);
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
 
     let request_body = json!({"input": "continue"});
     let history = json!({

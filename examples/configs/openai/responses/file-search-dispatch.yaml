@@ -1,0 +1,137 @@
+# File Search Callout Filter
+# Requires `--features openai-responses` because these filters are opt-in.
+#
+# Demonstrates hosted `file_search` execution under the unified agentic loop
+# (#1046). `openai_agentic_loop` is the sole loop owner: it parses each model
+# response, records the `file_search_call` items it sees as assignments, and
+# publishes the single continuation signal (`action=loop|done`).
+# `openai_file_search_dispatch` is a pure request-phase dispatcher: at request-
+# body EOS on each IRR re-entry it executes the assigned calls against the
+# vector store and reconciles each item in place, then the owner prepares the
+# next inference request. The dispatcher never parses the response body and
+# never decides whether another round runs.
+#
+# The dispatcher validates its URL, timeout, and response-size settings at
+# startup. Model responses that combine `file_search_call` with a client-
+# executed `function_call` are rejected (the owner fails closed before any
+# server-side dispatch).
+#
+# Configuration (dispatcher):
+#   vector_store_url:         Vector store API base URL. Structural validation at
+#                             startup rejects a non-http(s) scheme, userinfo, or a
+#                             query/fragment. Private/loopback targets (literal or
+#                             resolved) are gated at connect time and permitted
+#                             only when insecure_options.allow_private_upstreams
+#                             is set.
+#   outbound_chain:           Filter chain every vector-store sub-request runs
+#                             through (cross-cutting concerns such as credential
+#                             injection). Must be inline ({ name, filters }); a
+#                             named filter_chains reference cannot resolve inside
+#                             the iterative_request_router step this filter runs
+#                             in. The destination comes from vector_store_url, so
+#                             the chain never selects an upstream.
+#   timeout_ms:               Whole-call timeout in milliseconds
+#   max_response_bytes:       Maximum response bytes retained per callout
+#   max_total_response_bytes: Maximum successful bytes across one fan-out
+#   on_failure:               closed (fail closed) or open (fail open)
+#   forward_headers:          Headers to forward from the client request
+#                             (e.g. Authorization) to the vector store API
+#
+# Transition rule (evaluated after each step's response-body):
+#   openai_agentic_loop.action = "loop" → next: inference
+#   default                             → done (exit to client)
+#
+# Shared sub-request connector settings under `runtime` are restart-required.
+# When `runtime.subrequest_circuit_breaker` is set, client-aware filters such
+# as the dispatcher inherit peer-level failure isolation from the shared client:
+#
+# runtime:
+#   subrequest_circuit_breaker:
+#     consecutive_failures: 5
+#     recovery_window_secs: 30
+
+listeners:
+  - name: ai-gateway
+    address: "127.0.0.1:8080"
+    filter_chains: [file-search-dispatch-pipeline]
+
+filter_chains:
+  - name: file-search-dispatch-pipeline
+    filters:
+      - filter: openai_responses_request
+      - filter: openai_tool_parse
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 8
+        timeout_ms: 120000
+        step_timeout_ms: 60000
+        max_response_bytes: 67108864
+        # Retains one 64 MiB request plus one 64 MiB response and metadata.
+        max_state_bytes: 136314880
+        steps:
+          - name: inference
+            filters:
+              # Request-phase dispatcher: at request-body EOS on each IRR
+              # re-entry it executes the file_search_call items the loop owner
+              # assigned in the prior response, mutating each in place inside
+              # ResponsesState.accumulated_output. It never parses the response
+              # body and never decides whether another round runs.
+              - filter: openai_file_search_dispatch
+                vector_store_url: http://127.0.0.1:8001
+                # Every vector-store sub-request runs through this chain. It must
+                # be inline ({ name, filters }): this filter runs inside an
+                # iterative_request_router step, whose pipeline is built with an
+                # empty named-chain map, so a top-level filter_chains reference
+                # cannot resolve here. The destination comes from
+                # vector_store_url, so the chain never selects an upstream.
+                outbound_chain:
+                  name: vector-store-outbound
+                  filters:
+                    - filter: headers
+                      request_set:
+                        - name: X-Vector-Store-Client
+                          value: praxis-ai-gateway
+                timeout_ms: 5000
+                max_response_bytes: 10485760
+                max_total_response_bytes: 67108864
+                # The filter and the enclosing iterative router may use
+                # different values; the smaller limit wins at runtime.
+                max_state_bytes: 136314880
+                on_failure: closed
+                forward_headers:
+                  - authorization
+              # Sole loop owner: parses each model response, records file-search
+              # assignments for the dispatcher, and publishes the single
+              # continuation signal (action=loop|done). max_infer_iters must stay
+              # below the IRR max_iterations safety cap (7 + 1 = 8).
+              - filter: openai_agentic_loop
+                max_infer_iters: 7
+              - filter: openai_proxy
+                name: inference
+              - filter: headers
+                request_set:
+                  - name: Content-Type
+                    value: application/json
+              - filter: router
+                routes:
+                  - path_prefix: "/"
+                    cluster: "inference"
+              - filter: load_balancer
+                clusters:
+                  - name: "inference"
+                    endpoints:
+                      - "127.0.0.1:3001"
+            on_result:
+              - filter: openai_agentic_loop
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
+  # Central SSRF control for outbound callouts: permits the vector_store_url's
+  # resolved address to be private/loopback at connect time. Required only when
+  # the vector store runs on a private network (e.g. local development).
+  allow_private_upstreams: true

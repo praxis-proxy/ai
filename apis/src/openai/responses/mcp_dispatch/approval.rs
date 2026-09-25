@@ -25,8 +25,7 @@ use std::{
 use secrecy::{ExposeSecret as _, SecretString};
 
 use crate::{
-    StateOwner, hash::Sha256, openai::responses::openai_mcp_tool_resolve::encode_function_name,
-    store::PendingApprovalRecord,
+    StateOwner, hash::Sha256, openai::responses::mcp_tool_resolve::encode_function_name, store::PendingApprovalRecord,
 };
 
 // -----------------------------------------------------------------------------

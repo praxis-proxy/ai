@@ -1,6 +1,6 @@
 # PostgreSQL Cryptographic Boundary
 
-The `openai_response_store` and `openai_conversations` filters can
+The `openai_store` and `openai_conversations` filters can
 persist state to PostgreSQL. This document defines the cryptographic
 boundary of those connections: which cryptographic operations run inside
 the platform TLS provider, which run application-side, and how the
@@ -245,7 +245,7 @@ Two ignored (container-gated) integration tests exercise the full
 boundary against a real PostgreSQL server started with the `pg_hba.conf`
 above:
 
-- `tests/integration/tests/suite/examples/openai_response_store_postgres_mtls.rs`
+- `tests/integration/tests/suite/examples/openai_store_postgres_mtls.rs`
 - `tests/integration/tests/suite/examples/openai_conversations_postgres_mtls.rs`
 
 Each test generates a fresh CA that signs both the server certificate

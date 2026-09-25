@@ -20,7 +20,7 @@
 //! metadata, and filter results for routing. Does not mutate the
 //! request body.
 //!
-//! The `openai_responses_validate` filter runs after the classifier
+//! The `openai_validate` filter runs after the classifier
 //! to validate JSON syntax, reject conflicting history selectors, and
 //! extract additional fields without rejecting provider-owned parameter
 //! combinations.
@@ -41,21 +41,20 @@ pub(crate) mod error;
 pub(crate) mod file_resolve;
 /// Executes hosted file-search calls against an OGX vector store API.
 #[cfg(feature = "openai-responses")]
-pub(crate) mod file_search_callout;
+pub(crate) mod file_search_dispatch;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_classify;
 #[cfg(feature = "openai-mcp-tools")]
 pub(crate) mod mcp_dispatch;
+#[cfg(feature = "openai-mcp-tools")]
+pub(crate) mod mcp_tool_resolve;
 pub(crate) mod model_rewrite;
 /// Lowers rich client-owned tools to private functions for a function-only
 /// Responses backend and restores the typed items on the response (#1131).
 #[cfg(feature = "openai-responses")]
 pub(crate) mod openai_client_tool_compat;
-#[cfg(feature = "openai-mcp-tools")]
-pub(crate) mod openai_mcp_tool_resolve;
 #[cfg(feature = "openai-responses")]
-pub(crate) mod openai_responses_proxy;
-pub(crate) mod openai_tool_parse;
+pub(crate) mod responses_proxy;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod responses_to_chat_completions;
 #[expect(clippy::allow_attributes, reason = "dead_code expect unfulfilled on module")]
@@ -70,6 +69,7 @@ pub(crate) mod state;
 pub(crate) mod store;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod stream_events;
+pub(crate) mod tool_parse;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod usage;
 
@@ -78,17 +78,17 @@ pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
 pub use file_resolve::FileResolveFilter;
 #[cfg(feature = "openai-responses")]
-pub use file_search_callout::FileSearchCalloutFilter;
+pub use file_search_dispatch::FileSearchDispatchFilter;
 #[cfg(feature = "openai-mcp-tools")]
 pub use mcp_dispatch::McpDispatchFilter;
+#[cfg(feature = "openai-mcp-tools")]
+pub use mcp_tool_resolve::McpToolResolveFilter;
 pub use model_rewrite::ModelRewriteFilter;
 #[cfg(feature = "openai-responses")]
 pub use openai_client_tool_compat::ClientToolCompatFilter;
-#[cfg(feature = "openai-mcp-tools")]
-pub use openai_mcp_tool_resolve::McpToolResolveFilter;
-pub use openai_tool_parse::ToolParseFilter;
 #[cfg(feature = "store")]
 pub use store::ResponseStoreFilter;
+pub use tool_parse::ToolParseFilter;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -236,13 +236,13 @@ pub(crate) const DEFAULT_TENANT_ID: &str = "default";
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_responses_format
+/// filter: openai_format
 /// ```
 ///
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: openai_responses_format
+/// filter: openai_format
 /// on_invalid: continue
 /// headers:
 ///   format: x-praxis-ai-format
@@ -264,8 +264,8 @@ impl ResponsesFormatFilter {
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: ResponsesFormatConfig = parse_filter_config("openai_responses_format", config)?;
-        let validated = build_config("openai_responses_format", cfg)?;
+        let cfg: ResponsesFormatConfig = parse_filter_config("openai_format", config)?;
+        let validated = build_config("openai_format", cfg)?;
         Ok(Box::new(Self { config: validated }))
     }
 }
@@ -273,7 +273,7 @@ impl ResponsesFormatFilter {
 #[async_trait]
 impl HttpFilter for ResponsesFormatFilter {
     fn name(&self) -> &'static str {
-        "openai_responses_format"
+        "openai_format"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -453,12 +453,12 @@ fn compute_mode(classified: &ClassifiedRequest) -> Option<&'static str> {
 
 /// Write durable metadata that persists across all Pingora lifecycle phases.
 fn write_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest, mode: Option<&str>) {
-    ctx.set_metadata("openai_responses_format.format", classified.format.as_str());
+    ctx.set_metadata("openai_format.format", classified.format.as_str());
     write_optional_metadata(ctx, classified);
     write_boolean_metadata(ctx, classified);
 
     if let Some(m) = mode {
-        ctx.set_metadata("openai_responses_format.mode", m);
+        ctx.set_metadata("openai_format.mode", m);
     }
 }
 
@@ -467,45 +467,39 @@ fn write_optional_metadata(ctx: &mut HttpFilterContext<'_>, classified: &Classif
     if let Some(model) = &classified.model
         && is_promotable_value(model)
     {
-        ctx.set_metadata("openai_responses_format.model", model.clone());
+        ctx.set_metadata("openai_format.model", model.clone());
     }
 
     if let Some(stream) = classified.stream {
-        ctx.set_metadata("openai_responses_format.stream", if stream { "true" } else { "false" });
+        ctx.set_metadata("openai_format.stream", if stream { "true" } else { "false" });
     }
 
     if let Some(store) = classified.store {
-        ctx.set_metadata("openai_responses_format.store", if store { "true" } else { "false" });
+        ctx.set_metadata("openai_format.store", if store { "true" } else { "false" });
     }
 
     if let Some(background) = classified.background {
-        ctx.set_metadata(
-            "openai_responses_format.background",
-            if background { "true" } else { "false" },
-        );
+        ctx.set_metadata("openai_format.background", if background { "true" } else { "false" });
     }
 
     if let Some(max_output_tokens) = classified.max_output_tokens {
-        ctx.set_metadata(
-            "openai_responses_format.max_output_tokens",
-            max_output_tokens.to_string(),
-        );
+        ctx.set_metadata("openai_format.max_output_tokens", max_output_tokens.to_string());
     }
 }
 
 /// Write boolean presence flags to metadata.
 fn write_boolean_metadata(ctx: &mut HttpFilterContext<'_>, classified: &ClassifiedRequest) {
     if classified.has_previous_response_id {
-        ctx.set_metadata("openai_responses_format.has_previous_response_id", "true");
+        ctx.set_metadata("openai_format.has_previous_response_id", "true");
     }
     if classified.has_conversation {
-        ctx.set_metadata("openai_responses_format.has_conversation", "true");
+        ctx.set_metadata("openai_format.has_conversation", "true");
     }
     if classified.has_tools {
-        ctx.set_metadata("openai_responses_format.has_tools", "true");
+        ctx.set_metadata("openai_format.has_tools", "true");
     }
     if classified.has_prompt_id {
-        ctx.set_metadata("openai_responses_format.has_prompt_id", "true");
+        ctx.set_metadata("openai_format.has_prompt_id", "true");
     }
 }
 
@@ -552,7 +546,7 @@ fn promote_filter_results(
     classified: &ClassifiedRequest,
     mode: Option<&'static str>,
 ) -> Result<(), FilterError> {
-    let results = ctx.filter_results.entry("openai_responses_format").or_default();
+    let results = ctx.filter_results.entry("openai_format").or_default();
 
     results.set("format", classified.format.as_str())?;
     promote_optional_results(results, classified)?;
@@ -757,7 +751,7 @@ pub(crate) mod request;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod validate;
 #[cfg(feature = "openai-responses")]
-pub(crate) mod web_search;
+pub(crate) mod web_search_dispatch;
 
 #[cfg(feature = "openai-responses")]
 pub use agentic_loop::AgenticLoopFilter;
@@ -768,6 +762,6 @@ pub use rehydrate::RehydrateFilter;
 #[cfg(feature = "openai-responses")]
 pub use request::OpenaiResponsesRequestFilter;
 #[cfg(feature = "openai-responses")]
-pub use validate::OpenaiResponsesValidateFilter;
+pub use validate::ResponsesValidateFilter;
 #[cfg(feature = "openai-responses")]
-pub use web_search::WebSearchFilter;
+pub use web_search_dispatch::WebSearchDispatchFilter;

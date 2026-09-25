@@ -23,7 +23,7 @@ to be FIPS compliant yet, so nobody has to know which features to pick:
 |---|---|---|
 | Make targets | `release`, `container` | `release-fips`, `container-fips` |
 | Cargo features | `full` | `openai-responses`, `aws-sigv4-filter` |
-| Responses API kernel (`openai_responses_*`, `responses_to_chat_completions`, agentic loop, file and web search dispatch) | yes | yes |
+| Responses API kernel (`openai_responses_*`, `openai_responses_to_chat_completions`, agentic loop, file and web search dispatch) | yes | yes |
 | `aws_sigv4_sign` filter (AWS request signing) | yes | yes: SHA-256 and HMAC-SHA256 through OpenSSL |
 | `policy` filter (policy engine) | yes | no: its dependencies carry their own cryptography |
 | Response store (`store-postgres`), Conversations API, context compaction, MCP tools | yes | no: `sqlx` pulls `sha2` for migration checksums, and PostgreSQL authentication is pure Rust |

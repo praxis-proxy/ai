@@ -574,7 +574,7 @@ listeners:
 filter_chains:
   - name: mcp-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -584,7 +584,7 @@ filter_chains:
       - filter: openai_mcp_tool_resolve
         timeout_ms: 5000
         outbound_chain: mcp-egress
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
       - filter: router
         routes:
           - path: "/v1/responses"
@@ -652,7 +652,7 @@ listeners:
 filter_chains:
   - name: mcp-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -662,7 +662,7 @@ filter_chains:
       - filter: openai_mcp_tool_resolve
         timeout_ms: 5000
         outbound_chain: mcp-egress
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
       - filter: router
         routes:
           - path: "/v1/responses"
@@ -750,7 +750,7 @@ listeners:
 filter_chains:
   - name: mcp-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -760,7 +760,7 @@ filter_chains:
       - filter: openai_mcp_tool_resolve
         timeout_ms: 5000
         outbound_chain: mcp-egress
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
       - filter: router
         routes:
           - path: "/v1/responses"
