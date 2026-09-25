@@ -1,0 +1,112 @@
+{
+  "version": 1,
+  "scenario_id": "messages/model-provider-map",
+  "protocol": "anthropic_messages",
+  "provenance": {
+    "kind": "synthetic",
+    "provider": "synthetic",
+    "model": "claude-sonnet-4-5",
+    "source_id": "controlled-model-provider-target-rewrite"
+  },
+  "normalization": {
+    "version": 1,
+    "linked_ids": {
+      "msg_synthetic_mapping_1": "msg_recorded_0001"
+    }
+  },
+  "turns": [
+    {
+      "name": "initial",
+      "client": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": "Reply with one word.",
+                  "role": "user"
+                }
+              ],
+              "model": "claude-sonnet-4-5"
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "content": [
+                {
+                  "text": "Hello.",
+                  "type": "text"
+                }
+              ],
+              "id": "msg_recorded_0001",
+              "model": "vertex/claude-sonnet-4-5",
+              "type": "message"
+            }
+          }
+        }
+      },
+      "upstream": {
+        "request": {
+          "method": "POST",
+          "path": "/v1/messages",
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "messages": [
+                {
+                  "content": "Reply with one word.",
+                  "role": "user"
+                }
+              ],
+              "model": "vertex/claude-sonnet-4-5"
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {
+            "content-type": [
+              "application/json"
+            ]
+          },
+          "body": {
+            "kind": "json",
+            "value": {
+              "content": [
+                {
+                  "text": "Hello.",
+                  "type": "text"
+                }
+              ],
+              "id": "msg_recorded_0001",
+              "model": "vertex/claude-sonnet-4-5",
+              "type": "message"
+            }
+          }
+        }
+      }
+    }
+  ]
+}
