@@ -144,6 +144,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.model_provider.request_target
+    scopes:
+      - messages_native_passthrough
+    status: synthetic_only
+    scenarios:
+      - messages/model-provider-map
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.native.request
     scopes:
       - responses_native_passthrough

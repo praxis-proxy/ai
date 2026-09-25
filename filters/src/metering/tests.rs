@@ -149,6 +149,39 @@ fn captured_model_wins_over_default_model() {
 }
 
 #[test]
+fn provider_resolved_public_model_wins_over_rewritten_body_model() {
+    let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\ndefault_model: \"unknown\"\n");
+    let req = make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
+    ctx.filter_metadata
+        .insert(META_METERING_MODEL.to_owned(), "vertex/claude-sonnet-4-5".to_owned());
+    let state = state_for("alice", "");
+
+    assert_eq!(filter.resolve_report_model(&ctx, &state), "claude-sonnet-4-5");
+}
+
+#[tokio::test]
+async fn provider_resolved_public_model_is_used_for_balance_check() {
+    let filter = filter_from_yaml(
+        "metering_url: \"http://127.0.0.1:1\"\ndefault_username: \"alice\"\ndefault_model: \"unknown\"\n",
+    );
+    let req = make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata(MODEL_PROVIDER_CLIENT_MODEL_METADATA, "claude-sonnet-4-5");
+
+    let action = filter.on_request(&mut ctx).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    let state = ctx
+        .filter_state
+        .values()
+        .find_map(|value| value.downcast_ref::<MeteringState>())
+        .expect("on_request stores metering state");
+    assert_eq!(state.model, "claude-sonnet-4-5");
+}
+
+#[test]
 fn empty_model_without_default_stays_empty() {
     let filter = filter_from_yaml("metering_url: \"http://metering:8080\"\n");
     let req = make_request(http::Method::POST, "/v1/chat/completions");

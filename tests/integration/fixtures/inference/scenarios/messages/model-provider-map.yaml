@@ -1,0 +1,30 @@
+version: 1
+id: messages/model-provider-map
+description: Stable client model ID is routed to its provider with a provider-specific request model.
+protocol: anthropic_messages
+example_config: model-to-provider.yaml
+upstream_authority: 127.0.0.1:9001
+features:
+  - messages.model_provider.request_target
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: claude-sonnet-4-5
+          messages:
+            - role: user
+              content: "Reply with one word."
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/messages
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

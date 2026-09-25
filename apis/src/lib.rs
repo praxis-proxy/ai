@@ -34,6 +34,13 @@ pub mod token_cache;
 pub mod vertex;
 pub(crate) mod web_search;
 
+/// Internal route selector set by `model_to_provider` and provider adapters.
+/// Client-supplied `x-praxis-*` headers are rejected at the protocol boundary.
+pub const MODEL_PROVIDER_HEADER: &str = "x-praxis-ai-provider";
+
+/// Request metadata carrying the client model ID across a provider target rewrite.
+pub const MODEL_PROVIDER_CLIENT_MODEL_METADATA: &str = "model_to_provider.client_model";
+
 pub use callout_credentials::{CalloutCredentials, CalloutCredentialsFilter};
 pub use project_state_owner_headers::ProjectStateOwnerHeadersFilter;
 pub use state_owner::{StateOwner, StateOwnerError, StateOwnerFilter, project_state_owner};
