@@ -509,6 +509,52 @@ async fn openai_responses_metadata_preserves_prompt_template_in_rebuilt_state() 
 }
 
 #[tokio::test]
+async fn native_openai_backend_preserves_provider_compaction_in_rebuilt_state() {
+    let pipeline = make_prompt_pipeline(Some("openai_responses"), Some("openai"), "127.0.0.1:443");
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    let provider_compaction = json!({
+        "type": "compaction",
+        "id": "cmp_provider",
+        "encrypted_content": "provider-opaque-state",
+        "provider_field": {"opaque": true}
+    });
+    let mut state = ResponsesState::from_request_body(json!({
+        "model": "gpt-4.1",
+        "input": [{"type": "message", "role": "user", "content": "continue"}],
+        "previous_response_id": "resp_provider"
+    }));
+    state.history_rehydrated = true;
+    state.messages = vec![
+        provider_compaction.clone(),
+        json!({
+            "type": "message",
+            "role": "user",
+            "content": "continue"
+        }),
+    ];
+    ctx.extensions.insert(state);
+    let mut body = Some(Bytes::from_static(
+        br#"{"model":"gpt-4.1","input":[{"type":"message","role":"user","content":"continue"}],"previous_response_id":"resp_provider"}"#,
+    ));
+
+    assert!(matches!(
+        pipeline.execute_http_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    let action = pipeline
+        .execute_http_request_body(&mut ctx, &mut body, true)
+        .await
+        .unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let rebuilt: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
+    assert_eq!(rebuilt["input"][0], provider_compaction);
+    assert_eq!(rebuilt["input"][1]["content"], "continue");
+    assert!(rebuilt.get("previous_response_id").is_none());
+}
+
+#[tokio::test]
 async fn prompt_template_requires_openai_responses_protocol_and_provider() {
     for (protocol, provider) in [
         (None, Some("openai")),
@@ -1120,7 +1166,7 @@ fn messages_for_backend_borrows_when_no_compaction() {
         json!({"role": "user", "content": "hello"}),
         json!({"role": "assistant", "content": "hi"}),
     ];
-    let result = super::messages_for_backend(&msgs);
+    let result = super::messages_for_backend(&msgs, false);
     assert!(
         matches!(result, std::borrow::Cow::Borrowed(_)),
         "should borrow when no compaction items"
@@ -1132,7 +1178,7 @@ fn messages_for_backend_borrows_when_no_compaction() {
 fn messages_for_backend_translates_compaction_item() {
     let encoded = base64::engine::general_purpose::STANDARD.encode("summary text");
     let msgs = vec![json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded})];
-    let result = super::messages_for_backend(&msgs);
+    let result = super::messages_for_backend(&msgs, false);
     assert!(
         matches!(result, std::borrow::Cow::Owned(_)),
         "summary insertion must return an owned input array"
@@ -1152,10 +1198,31 @@ fn messages_for_backend_mixed_items() {
         json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded}),
         json!({"role": "user", "content": "hello"}),
     ];
-    let result = super::messages_for_backend(&msgs);
+    let result = super::messages_for_backend(&msgs, false);
     assert_eq!(result.len(), 2);
     assert_eq!(result[0]["role"], "assistant");
     assert_eq!(result[1]["role"], "user");
+}
+
+#[test]
+fn messages_for_native_backend_preserves_provider_compaction_item() {
+    let item = json!({
+        "type": "compaction",
+        "id": "cmp_provider",
+        "encrypted_content": "provider-opaque-state",
+        "provider_field": {"opaque": true}
+    });
+    let msgs = vec![item.clone(), json!({"role": "user", "content": "continue"})];
+    let result = super::messages_for_backend(&msgs, true);
+
+    assert!(
+        matches!(result, std::borrow::Cow::Borrowed(_)),
+        "native Responses backends must receive the original item array"
+    );
+    assert_eq!(
+        result[0], item,
+        "provider compaction state must remain byte-equivalent as JSON"
+    );
 }
 
 #[tokio::test]
