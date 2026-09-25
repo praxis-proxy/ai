@@ -74,15 +74,13 @@ filter_chains:
         mode: trusted_owner
         header: x-authenticated-state-owner
 
-      - filter: openai_responses_format
+      - filter: openai_responses_request
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
-
-      - filter: openai_responses_validate
 
       - filter: openai_response_store
         backend: sqlite

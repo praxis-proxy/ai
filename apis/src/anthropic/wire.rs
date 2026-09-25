@@ -11,6 +11,14 @@ use serde_json::{Map, Value};
 /// Fallback error body used only if Serde serialization fails.
 const ERROR_SERIALIZATION_FALLBACK: &[u8] = br#"{"type":"error","error":{"type":"api_error","message":"failed to serialize error response"},"request_id":null}"#;
 
+/// Return whether an Anthropic tool-use identifier satisfies the wire schema.
+pub(crate) fn is_valid_tool_use_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 /// Complete Anthropic Messages response.
 #[derive(Serialize)]
 pub(crate) struct MessageResponse<'a> {

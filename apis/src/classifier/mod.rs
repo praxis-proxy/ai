@@ -178,6 +178,33 @@ pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
         return empty_result(AiRequestFormat::InvalidJson);
     };
 
+    // This parse is a throwaway owned by this function, so the model string is
+    // moved out rather than copied.
+    let model = take_string(obj, "model");
+    classify_fields(obj, model)
+}
+
+/// Extract routing facts from an already-parsed request object.
+///
+/// Callers that parsed the body for their own reasons use this instead of
+/// [`classify_request_body`], so one request is deserialized once rather than
+/// once per consumer.
+///
+/// Borrows the object rather than taking ownership of fields out of it: a
+/// caller that reuses the same parsed value afterwards — to build request
+/// state, say — must still see the body the client actually sent. That costs
+/// one copy of the model string, which the owned path above avoids.
+#[cfg(feature = "openai-responses")]
+pub(crate) fn classify_object(obj: &serde_json::Map<String, serde_json::Value>) -> ClassifiedRequest {
+    let model = copy_string(obj, "model");
+    classify_fields(obj, model)
+}
+
+/// Extract the remaining facts once the model has been obtained.
+///
+/// Split out so the owned and borrowed entry points differ only in how they
+/// get the model string, and cannot otherwise drift.
+fn classify_fields(obj: &serde_json::Map<String, serde_json::Value>, model: Option<String>) -> ClassifiedRequest {
     let format = classify_format(obj);
 
     ClassifiedRequest {
@@ -195,7 +222,7 @@ pub(crate) fn classify_request_body(body: &[u8]) -> ClassifiedRequest {
             .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty())),
         max_output_tokens: obj.get("max_output_tokens").and_then(serde_json::Value::as_u64),
         max_tokens: obj.get("max_tokens").and_then(serde_json::Value::as_u64),
-        model: take_string(obj, "model"),
+        model,
         store: obj.get("store").and_then(serde_json::Value::as_bool),
         stream: obj.get("stream").and_then(serde_json::Value::as_bool),
     }
@@ -289,12 +316,29 @@ pub(crate) fn empty_result(format: AiRequestFormat) -> ClassifiedRequest {
 /// Take a string field out of a JSON object, converting numbers/booleans
 /// to their string representation.
 ///
-/// Moves the owned `String` out of the parsed body instead of cloning it,
-/// leaving an empty string in its place. Callers must not read `key` again
-/// afterwards.
+/// Moves the owned `String` out of the parsed body instead of copying it,
+/// leaving an empty string in its place. Only for a parse the caller owns and
+/// discards; `copy_string` is the variant for a shared parse, and only
+/// exists when the Responses filters that share a parse are compiled in.
 fn take_string(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
     obj.get_mut(key).and_then(|v| match v {
         serde_json::Value::String(s) => Some(std::mem::take(s)),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    })
+}
+
+/// Copy a string field out of a JSON object, converting numbers/booleans to
+/// their string representation.
+///
+/// Copies rather than moves, because the caller reuses the same parsed value
+/// afterwards. Moving would leave an empty string behind and forward a request
+/// the client never sent.
+#[cfg(feature = "openai-responses")]
+fn copy_string(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    obj.get(key).and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s.clone()),
         serde_json::Value::Number(n) => Some(n.to_string()),
         serde_json::Value::Bool(b) => Some(b.to_string()),
         _ => None,
@@ -317,6 +361,30 @@ fn take_string(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str) 
     reason = "tests"
 )]
 mod tests {
+
+    #[test]
+    fn the_owned_path_moves_the_model_out_of_its_throwaway_parse() {
+        let body = br#"{"model":"gpt-4.1","input":"hi"}"#;
+        assert_eq!(classify_request_body(body).model.as_deref(), Some("gpt-4.1"));
+    }
+
+    #[cfg(feature = "openai-responses")]
+    #[test]
+    fn the_borrowed_path_leaves_the_caller_s_value_intact() {
+        // A shared parse is reused afterwards to build request state, so the
+        // model must survive classification rather than be moved out.
+        let mut value: serde_json::Value = serde_json::from_slice(br#"{"model":"gpt-4.1","input":"hi"}"#).unwrap();
+        let obj = value.as_object_mut().unwrap();
+
+        let classified = classify_object(obj);
+
+        assert_eq!(classified.model.as_deref(), Some("gpt-4.1"));
+        assert_eq!(
+            obj.get("model").and_then(serde_json::Value::as_str),
+            Some("gpt-4.1"),
+            "classification must not empty the caller's model field"
+        );
+    }
     use super::*;
 
     #[test]

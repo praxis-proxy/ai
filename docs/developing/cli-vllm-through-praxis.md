@@ -44,10 +44,12 @@ model name. A keyed local server can be started with:
 export VLLM_API_KEY="$(openssl rand -hex 32)"
 vllm serve Qwen/Qwen3-8B \
   --served-model-name qwen3-8b \
-  --max-model-len 16384 \
+  --max-model-len 32768 \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
   --reasoning-parser deepseek_r1 \
+  --gpu-memory-utilization 0.97 \
+  --enforce-eager \
   --api-key "$VLLM_API_KEY"
 ```
 
@@ -68,10 +70,12 @@ docker run --rm --name vllm \
   docker.io/vllm/vllm-openai:latest \
   --model Qwen/Qwen3-8B \
   --served-model-name qwen3-8b \
-  --max-model-len 16384 \
+  --max-model-len 32768 \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
-  --reasoning-parser deepseek_r1
+  --reasoning-parser deepseek_r1 \
+  --gpu-memory-utilization 0.97 \
+  --enforce-eager
 ```
 
 With Podman, replace `--gpus all` with `--device nvidia.com/gpu=all` and leave
@@ -81,6 +85,14 @@ run downloads a multi-gigabyte image plus the model weights, and the Hugging
 Face cache mount keeps the weights for later runs.
 
 Use `VLLM_URL=http://127.0.0.1:8000` for either local server.
+
+The 32,768-token window is intentional for Claude Code auto mode. Its
+client-initiated safety classifier reserves 2,112 output tokens independently
+of the main Claude Code output-token setting and includes a large client-owned
+prompt; 16K and 18K servers reject later classifier turns before inference. On
+an A10G, eager execution reclaims CUDA-graph memory and the 0.97 utilization is
+reserved for this single-user development workload. If you lower the window or
+share the GPU, do not use auto mode unless the classifier request still fits.
 
 ## 2. Point a Praxis example at vLLM
 

@@ -14,8 +14,8 @@ Starts Praxis with the shipped `messages-to-openai` example, retargeted at a
 local stub backend that records the translated request, and verifies through
 the official Anthropic Python SDK that unmapped fields reach the backend, that
 `metadata.user_id` becomes a hashed `safety_identifier`, that `thinking` is dropped,
-and that fields the translation cannot honor are rejected before any backend
-call.
+that fields the translation cannot honor are rejected before any backend call,
+and that malformed streamed tool calls fail closed at the client boundary.
 
 Usage:
     cargo build -p praxis-ai-proxy
@@ -35,7 +35,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
-from anthropic import Anthropic, BadRequestError
+from anthropic import APIStatusError, Anthropic, BadRequestError
 
 CONFIG_PATH = "examples/configs/anthropic/messages-to-openai.yaml"
 MODEL = "stub-model"
@@ -81,6 +81,10 @@ class RecordingBackend(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length", "0"))
         body = json.loads(self.rfile.read(length))
         RecordingBackend.bodies.append(body)
+        if body.get("stream"):
+            self._send_invalid_tool_id_stream()
+            return
+
         choice = {
             "index": 0,
             "message": {"role": "assistant", "content": "4"},
@@ -105,6 +109,63 @@ class RecordingBackend(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(reply)))
         self.end_headers()
         self.wfile.write(reply)
+
+    def _send_invalid_tool_id_stream(self):
+        valid_prefix = {
+            "id": "chatcmpl-stub",
+            "object": "chat.completion.chunk",
+            "created": 1_700_000_000,
+            "model": MODEL,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "content": "prefix"},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        invalid_tool_call = {
+            "id": "chatcmpl-stub",
+            "object": "chat.completion.chunk",
+            "created": 1_700_000_000,
+            "model": MODEL,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call.bad",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_weather",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        chunks = [
+            f"data: {json.dumps(valid_prefix)}\n\n".encode(),
+            f"data: {json.dumps(invalid_tool_call)}\n\n".encode(),
+        ]
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("content-length", str(sum(map(len, chunks))))
+        self.end_headers()
+
+        # Flush a valid event first so the invalid tool call is encountered
+        # after the downstream streaming response has begun.
+        self.wfile.write(chunks[0])
+        self.wfile.flush()
+        time.sleep(0.1)
+        self.wfile.write(chunks[1])
+        self.wfile.flush()
 
     def log_message(self, format, *args):
         pass
@@ -264,6 +325,36 @@ class TestResponseUsage:
         # key to None too, so check the wire payload actually carried it.
         assert "output_tokens_details" in response.usage.model_fields_set
         assert response.usage.output_tokens_details is None
+
+
+class TestStreamingResponseValidation:
+    def test_invalid_tool_id_aborts_incomplete_stream(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        events = []
+
+        with pytest.raises(APIStatusError) as excinfo:
+            with anthropic_client.messages.stream(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "Use the weather tool"}],
+            ) as stream:
+                events.extend(stream)
+
+        error = excinfo.value
+        assert error.body.get("type") == "error"
+        assert error.body.get("error", {}).get("type") == "api_error"
+        assert (
+            error.body.get("error", {}).get("message")
+            == "upstream response could not be transformed"
+        )
+        assert not any(event.type == "message_stop" for event in events)
+        assert not any(
+            event.type == "content_block_start"
+            and event.content_block.type == "tool_use"
+            for event in events
+        )
+        [upstream] = RecordingBackend.bodies
+        assert upstream["stream"] is True
 
 
 if __name__ == "__main__":
