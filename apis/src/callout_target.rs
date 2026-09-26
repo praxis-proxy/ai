@@ -281,4 +281,92 @@ mod tests {
             "IPv4-mapped loopback answers should be rejected"
         );
     }
+
+    #[cfg(feature = "callout-rustls")]
+    #[allow(clippy::too_many_lines, reason = "test helper: cert generation + server setup")]
+    fn spawn_tls_server() -> (u16, reqwest::Certificate, tokio::task::JoinHandle<()>) {
+        use std::sync::Arc;
+
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name.push(rcgen::DnType::CommonName, "test-ca");
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let mut server_params = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        server_params.is_ca = rcgen::IsCa::NoCa;
+        let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+        let rustls_certs = vec![
+            rustls::pki_types::CertificateDer::from(server_cert.der().to_vec()),
+            rustls::pki_types::CertificateDer::from(ca_cert.der().to_vec()),
+        ];
+        let rustls_key = rustls::pki_types::PrivateKeyDer::try_from(server_key.serialize_der()).unwrap();
+
+        let tls_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(rustls_certs, rustls_key)
+                .unwrap(),
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+
+            let mut buf = vec![0_u8; 4096];
+            let n = tls.read(&mut buf).await.unwrap();
+            assert!(n > 0, "expected HTTP request bytes");
+
+            let body = "OK";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            tls.write_all(response.as_bytes()).await.unwrap();
+            tls.shutdown().await.unwrap();
+        });
+
+        let root_cert = reqwest::Certificate::from_der(ca_cert.der()).unwrap();
+        (port, root_cert, handle)
+    }
+
+    #[cfg(feature = "callout-rustls")]
+    #[tokio::test]
+    async fn pinned_client_completes_tls_handshake() {
+        praxis_tls::provider::install();
+
+        let (port, root_cert, server_handle) = spawn_tls_server();
+
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(5))
+            .tls_certs_only([root_cert])
+            .resolve_to_addrs("localhost", &[addr])
+            .build()
+            .unwrap();
+
+        let resp = client
+            .get(format!("https://localhost:{port}/healthz"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "OK");
+
+        server_handle.await.unwrap();
+    }
 }

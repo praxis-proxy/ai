@@ -38,6 +38,8 @@ full = ["dev"]
 store-postgres = ["dev", "praxis-ai/store-postgres", "praxis-ai-apis/store-postgres", "praxis-test-utils/store-postgres"]
 store-sqlite = ["dev", "praxis-ai/store-sqlite", "praxis-ai-apis/store-sqlite", "praxis-test-utils/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
+callout-rustls = ["praxis-ai/callout-rustls", "praxis-ai-apis/callout-rustls", "praxis-test-utils/callout-rustls"]
+callout-native-tls = ["praxis-ai/callout-native-tls", "praxis-ai-apis/callout-native-tls", "praxis-test-utils/callout-native-tls"]
 
 [lints]
 workspace = true

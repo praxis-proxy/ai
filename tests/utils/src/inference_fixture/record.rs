@@ -1068,7 +1068,7 @@ fn generate_recorder_capability() -> Result<HeaderValue, FixtureError> {
     Ok(capability)
 }
 
-/// Builds a redirect-free Reqwest client pinned to the Rustls backend.
+/// Builds a redirect-free Reqwest client pinned to the active TLS backend.
 fn build_provider_client(root: Option<reqwest::Certificate>) -> Result<reqwest::Client, FixtureError> {
     build_provider_client_with_timeout(root, PROVIDER_REQUEST_TIMEOUT)
 }
@@ -1080,7 +1080,6 @@ fn build_provider_client_with_timeout(
 ) -> Result<reqwest::Client, FixtureError> {
     let mut builder = crate::inference_fixture::http_client_builder()
         .no_proxy()
-        .use_rustls_tls()
         .connect_timeout(Duration::from_secs(10))
         .timeout(request_timeout)
         .redirect(reqwest::redirect::Policy::none());

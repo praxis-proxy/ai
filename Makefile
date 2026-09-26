@@ -18,6 +18,7 @@ FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filt
 INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter
 # Features for `make release`; `full` matches the published container image.
 PRAXIS_AI_FEATURES ?= full
+CALLOUT_TLS := callout-rustls
 # Crates that must never enter the default (standard) praxis-ai-proxy graph.
 # openssl-sys is not on the list: praxis performs all cryptography through the
 # system OpenSSL, so its bindings are part of every build by design.
@@ -34,7 +35,7 @@ endif
 
 .PHONY: all build release check clean \
 	test test-unit test-schema test-integration test-inference-fixtures \
-	test-store-features \
+	test-store-features test-callout-tls-features \
 	test-postgres-unit test-postgres-integration test-environment \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
@@ -109,19 +110,19 @@ test-unit:
 
 test-store-features:
 	cargo check -p praxis-ai-proxy
-	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
-	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-all
+	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite,$(CALLOUT_TLS)
+	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-all,$(CALLOUT_TLS)
 	@# Lint each opt-in group on its own so a gate leak in a partial feature set
 	@# cannot hide behind the lean and full builds that other targets cover.
 	@for group in openai-responses openai-file-resolve-filter store store-sqlite \
 		openai-conversations openai-compact openai-mcp-tools; do \
 		echo "clippy: standard + $$group"; \
 		cargo clippy -p praxis-ai-apis -p praxis-ai-filters -p praxis-ai-proxy --all-targets \
-			--no-default-features --features praxis-ai-proxy/standard,praxis-ai-proxy/$$group \
+			--no-default-features --features praxis-ai-proxy/standard,praxis-ai-proxy/$(CALLOUT_TLS),praxis-ai-proxy/$$group \
 			-- -D warnings || exit 1; \
 	done
-	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-sqlite $(_NOCAPTURE)
-	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-all $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-sqlite,$(CALLOUT_TLS) $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --no-default-features --features openai-all,store-all,$(CALLOUT_TLS) $(_NOCAPTURE)
 	@if cargo tree -p praxis-ai-proxy --features full --edges normal | grep -q libsqlite3-sys; then \
 		echo "ERROR: full proxy dependency graph contains libsqlite3-sys"; \
 		exit 1; \
@@ -132,6 +133,39 @@ test-store-features:
 		echo "ERROR: full proxy SQLx graph contains a rustls TLS backend"; \
 		exit 1; \
 	fi
+
+test-callout-tls-features:
+	cargo check -p praxis-ai-proxy
+	cargo check -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-postgres,callout-native-tls
+	@cargo tree -p praxis-ai-proxy --features full --edges features -i reqwest | grep -qE 'feature "rustls"( |$$)' || \
+		(echo "ERROR: full proxy reqwest does not enable rustls"; exit 1)
+	@if cargo tree -p praxis-ai-proxy --features full --edges features -i reqwest | grep -q 'native-tls'; then \
+		echo "ERROR: full proxy reqwest contains native-tls backend"; \
+		exit 1; \
+	fi
+	@cargo tree -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-postgres,callout-native-tls \
+		--edges features -i reqwest | grep -q 'native-tls' || \
+		(echo "ERROR: callout-native-tls proxy reqwest does not enable native-tls"; exit 1)
+	@if cargo tree -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-postgres,callout-native-tls \
+		--edges features -i reqwest | grep -qE 'feature "rustls"( |$$)'; then \
+		echo "ERROR: callout-native-tls proxy reqwest contains rustls backend"; \
+		exit 1; \
+	fi
+	cargo test -p praxis-ai-apis --no-default-features \
+		--features openai-file-resolve-filter,callout-rustls \
+		callout_target::tests::pinned_client_completes_tls_handshake $(_NOCAPTURE)
+
+test-feature-isolation:
+	@for group in openai-file-resolve-filter openai-mcp-tools; do \
+		echo "check: $$group (default TLS backend)"; \
+		cargo check -p praxis-ai-proxy --features $$group || exit 1; \
+	done
+	@for group in azure-ad-filter gcp-adc-filter; do \
+		echo "check: $$group (default TLS backend)"; \
+		cargo check -p praxis-ai-proxy --features $$group || exit 1; \
+	done
+	cargo check -p praxis-test-utils --no-default-features --features callout-native-tls
+	cargo check -p praxis-test-utils --no-default-features --features callout-rustls
 
 test-schema:
 	cargo test -p praxis-tests-schema --features store-all $(_NOCAPTURE)
@@ -154,7 +188,7 @@ test-inference-fixtures:
 	cargo test -p praxis-tests-integration --features store-all --test suite inference_fixtures $(_NOCAPTURE)
 
 test-postgres-unit:
-	cargo test -p praxis-ai-apis --no-default-features --features store-all store::tests::pg_ -- --ignored $(_NOCAPTURE)
+	cargo test -p praxis-ai-apis --no-default-features --features store-all,$(CALLOUT_TLS) store::tests::pg_ -- --ignored $(_NOCAPTURE)
 
 # Every PostgreSQL integration test is #[ignore]d (each spawns its own
 # container), so it runs only when named here. Enumerate every module explicitly:
@@ -740,6 +774,7 @@ help:
 	@echo "  test                 run all tests"
 	@echo "  test-unit            unit tests (providers, filters, server)"
 	@echo "  test-store-features   check the lean and store builds and lint each feature group alone"
+	@echo "  test-callout-tls-features  check rustls-only and native-tls-only callout TLS builds"
 	@echo "  test-schema          schema validation tests"
 	@echo "  test-integration     integration tests"
 	@echo "  test-inference-fixtures  inference fixture and replay tests"

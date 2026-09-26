@@ -209,6 +209,7 @@ impl ScenarioRunner {
     /// Returns an error for invalid target/scenario/config state, provider or
     /// client transport failure, incomplete recorder accounting, expectation
     /// mismatch, sanitization failure, or unsafe fixture content.
+    #[cfg(any(feature = "callout-rustls", feature = "callout-native-tls"))]
     pub async fn record_live(
         scenario: &InferenceScenario,
         target: super::ProviderTarget,
@@ -223,6 +224,7 @@ impl ScenarioRunner {
     ///
     /// Returns the same errors as [`Self::record_live`], plus errors caused by
     /// invalid custom redaction rules.
+    #[cfg(any(feature = "callout-rustls", feature = "callout-native-tls"))]
     pub async fn record_live_with_rules(
         scenario: &InferenceScenario,
         target: super::ProviderTarget,
