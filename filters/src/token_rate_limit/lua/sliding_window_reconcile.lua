@@ -23,31 +23,19 @@ local now = redis.call('TIME')
 local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
 redis.call('ZADD', KEYS[2], now_ms, 'settled:' .. ARGV[1] .. ':' .. actual)
 
-local key_remaining = nil
+-- Reconcile stays O(1): the key's published balance moves by the settled
+-- delta and is recomputed exactly on that key's next reservation.
 local max_window = 0
+local min_capacity = nil
 for i = 1, budget_count do
   local window = tonumber(ARGV[4 + (i * 2) - 1])
   local capacity = tonumber(ARGV[4 + (i * 2)])
   if window > max_window then max_window = window end
-  redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now_ms - window)
-  local settled_sum = 0
-  local entries = redis.call('ZRANGE', KEYS[2], now_ms - window, '+inf', 'BYSCORE')
-  for j = 1, #entries do
-    local amount = string.match(entries[j], ':(%d+)$')
-    if amount then settled_sum = settled_sum + tonumber(amount) end
-  end
-  local active_sum = 0
-  local active_values = redis.call('HGETALL', KEYS[3])
-  for j = 1, #active_values, 2 do
-    local value_sep = string.find(active_values[j + 1], '|')
-    active_sum = active_sum + tonumber(string.sub(active_values[j + 1], 1, value_sep - 1))
-  end
-  local available = math.max(0, capacity - settled_sum - active_sum)
-  if key_remaining == nil or available < key_remaining then key_remaining = available end
+  if min_capacity == nil or capacity < min_capacity then min_capacity = capacity end
 end
 if redis.call('ZSCORE', KEYS[10], KEYS[1]) ~= false then
   local previous = tonumber(redis.call('HGET', KEYS[11], KEYS[1]) or '0')
-  local next_remaining = key_remaining or 0
+  local next_remaining = math.min(min_capacity or 0, math.max(0, previous + estimate - actual))
   redis.call('INCRBY', KEYS[12], next_remaining - previous)
   redis.call('HSET', KEYS[11], KEYS[1], next_remaining)
 end

@@ -88,7 +88,9 @@ use serde::Deserialize;
 /// With the `valkey` backend every replica exports the rule-wide value it
 /// last observed from the shared store, so aggregate replicas with `max`;
 /// a replica that stops seeing traffic for a rule keeps exporting its last
-/// observation until it does.
+/// observation until it does. Valkey applies expiry incrementally on each
+/// admission, so its counts can briefly include entries that have just
+/// expired.
 ///
 /// Admissions, denials, reconciliations, and backend failures also emit
 /// structured records on the `praxis_ai::token_rate_limit::accounting`

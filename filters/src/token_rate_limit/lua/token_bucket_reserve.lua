@@ -23,7 +23,11 @@ local function update_remaining(value)
   redis.call('HSET', KEYS[10], KEYS[1], value)
 end
 
-local expired_rule = redis.call('ZRANGE', KEYS[8], '-inf', now_ms, 'BYSCORE')
+-- Expired entries are drained a batch at a time so one admission never
+-- blocks the server on a large backlog; later admissions finish the job.
+local SWEEP_BATCH = 128
+
+local expired_rule = redis.call('ZRANGE', KEYS[8], '-inf', now_ms, 'BYSCORE', 'LIMIT', 0, SWEEP_BATCH)
 for i = 1, #expired_rule do
   local member = expired_rule[i]
   local split = string.find(member, '|')
@@ -41,7 +45,7 @@ for i = 1, #expired_rule do
 end
 redis.call('SET', KEYS[7], rule_active_total)
 
-local expired_global = redis.call('ZRANGE', KEYS[6], '-inf', now_ms, 'BYSCORE')
+local expired_global = redis.call('ZRANGE', KEYS[6], '-inf', now_ms, 'BYSCORE', 'LIMIT', 0, SWEEP_BATCH)
 for i = 1, #expired_global do
   local member = expired_global[i]
   local split = string.find(member, '|')
@@ -62,7 +66,7 @@ for i = 1, #expired_global do
 end
 redis.call('SET', KEYS[4], active_total)
 
-local expired_keys = redis.call('ZRANGE', KEYS[9], '-inf', now_ms, 'BYSCORE')
+local expired_keys = redis.call('ZRANGE', KEYS[9], '-inf', now_ms, 'BYSCORE', 'LIMIT', 0, SWEEP_BATCH)
 for i = 1, #expired_keys do
   local previous = tonumber(redis.call('HGET', KEYS[10], expired_keys[i]) or '0')
   redis.call('INCRBY', KEYS[11], -previous)
