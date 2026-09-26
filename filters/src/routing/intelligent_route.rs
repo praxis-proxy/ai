@@ -33,7 +33,9 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use http::{HeaderName, HeaderValue};
-use praxis_filter::{FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config};
+use praxis_filter::{
+    AuthenticatedIdentity, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+};
 use serde::Deserialize;
 
 use super::{
@@ -45,7 +47,7 @@ use super::{
         set_credential_metadata,
     },
     overlay::{self, ExpectedOverlayScope, OverlayReloadHandle, PickerPolicy, RouteSnapshot},
-    picker,
+    picker::{self, Eligibility},
 };
 
 // -----------------------------------------------------------------------------
@@ -63,6 +65,9 @@ const MAX_TTL_SECS: u64 = 86_400;
 
 /// Maximum number of configured management-path skip prefixes.
 const MAX_SKIP_PATHS: usize = 64;
+
+/// Maximum number of claim gates on one filter.
+const MAX_MATCH_CLAIMS: usize = 16;
 
 /// Maximum length of a single management-path skip prefix.
 const MAX_SKIP_PATH_LEN: usize = 256;
@@ -164,6 +169,31 @@ struct IntelligentRouteConfig {
 
     /// Session affinity configuration (disabled by default).
     session_affinity: Option<SessionAffinityConfig>,
+
+    /// Claim gates that fence candidates by an entitlement (residency, tier,
+    /// and so on). Each gate reads one claim off the authenticated identity and
+    /// keeps only candidates whose matching label equals it. Empty by default,
+    /// which leaves selection unchanged.
+    ///
+    /// The fence is routing-time only: it constrains selections this filter
+    /// makes. It does not gate discovery paths (`skip_paths` bypass it) and does
+    /// not apply when an earlier filter already set `ctx.cluster`. A gate on a
+    /// claim the mapper reserves (`sub`, `roles`, `teams`) never resolves and so
+    /// always denies.
+    #[serde(default)]
+    match_claims: Vec<ClaimGate>,
+}
+
+/// One claim-to-label gate: keep only candidates whose `label` equals the
+/// caller's `claim` value.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimGate {
+    /// Custom-claim name read from the authenticated identity (e.g. `grid_region`).
+    claim: String,
+
+    /// Candidate label the claim value must match (e.g. `region`).
+    label: String,
 }
 
 /// Hot reload settings for overlay file watching.
@@ -339,6 +369,12 @@ enum AffinityOutcome<'a> {
 /// `admission_state=none` is never eligible. `existing_only` is eligible only
 /// through an already-bound session affinity entry.
 ///
+/// **Entitlement fencing:** `match_claims` keeps only candidates whose `label`
+/// equals the caller's matching claim, before the pick. Adding a dimension
+/// (region, tier) is config, not code. Fails closed: no identity, a missing
+/// claim, or no in-scope candidate denies, and the fenced case returns 404 (not
+/// distinguishable from unknown). Affinity reuse and weighted selection respect it.
+///
 /// **Metadata:** on successful selection, bounded in-process filter
 /// metadata is written under the `intelligent_route.` namespace (`kind`, `name`,
 /// `site`, `cluster`, `local_site`, `stable_id`, `admission_state`, and
@@ -458,6 +494,8 @@ pub struct IntelligentRouteFilter {
     session_affinity: Option<SessionAffinity>,
     /// Atomic snapshot of routing state (candidates + `local_site`).
     snapshot: Arc<ArcSwap<RouteSnapshot>>,
+    /// Claim gates fencing candidates by entitlement (empty = ungated).
+    match_claims: Vec<ClaimGate>,
 }
 
 impl IntelligentRouteFilter {
@@ -486,6 +524,7 @@ impl IntelligentRouteFilter {
         let (snapshot, reload_handle) = build_route_snapshot(&mut cfg)?;
         let session_affinity = build_session_affinity(cfg.session_affinity)?;
         let provider_hop_clusters = validate_provider_hop_clusters(cfg.provider_hop_clusters)?;
+        let match_claims = validate_match_claims(cfg.match_claims)?;
 
         Ok(Box::new(Self {
             model_header,
@@ -495,7 +534,32 @@ impl IntelligentRouteFilter {
             provider_hop_clusters,
             session_affinity,
             snapshot,
+            match_claims,
         }))
+    }
+
+    /// Resolve per-request candidate eligibility from the configured claim gates.
+    ///
+    /// With no gate, every candidate is eligible. With a gate, the request must
+    /// carry an authenticated identity and every gated claim, or it is denied
+    /// (`403`): a residency or entitlement fence fails closed, never open.
+    fn resolve_eligibility(&self, ctx: &HttpFilterContext<'_>) -> Result<Eligibility, FilterAction> {
+        if self.match_claims.is_empty() {
+            return Ok(Eligibility::All);
+        }
+        let Some(identity) = ctx.extensions.get::<AuthenticatedIdentity>() else {
+            tracing::debug!("intelligent_route: claim gate set but request has no authenticated identity; denying");
+            return Err(FilterAction::Reject(Rejection::status(403)));
+        };
+        let mut required = Vec::with_capacity(self.match_claims.len());
+        for gate in &self.match_claims {
+            let Some(value) = identity.custom_claims().get(&gate.claim) else {
+                tracing::debug!(claim = %gate.claim, "intelligent_route: request missing gated claim; denying");
+                return Err(FilterAction::Reject(Rejection::status(403)));
+            };
+            required.push((gate.label.clone(), value.clone()));
+        }
+        Ok(Eligibility::Gated(required))
     }
 
     /// Handle a management/discovery path that bypasses model resolution.
@@ -537,6 +601,10 @@ impl IntelligentRouteFilter {
         kind: CapabilityKind,
         name: &str,
     ) -> Result<FilterAction, FilterError> {
+        let eligible = match self.resolve_eligibility(ctx) {
+            Ok(eligible) => eligible,
+            Err(action) => return Ok(action),
+        };
         let session_key = self.session_affinity.as_ref().and_then(|a| extract_session_key(a, ctx));
         let outcome = resolve_affinity(
             self.session_affinity.as_ref(),
@@ -544,6 +612,7 @@ impl IntelligentRouteFilter {
             &snap.candidates,
             kind,
             name,
+            &eligible,
         );
         if let AffinityOutcome::Reused(c) = outcome {
             return apply_reused(
@@ -556,9 +625,16 @@ impl IntelligentRouteFilter {
             );
         }
         let failover = matches!(outcome, AffinityOutcome::Failover);
-        let Some((c, selection_group)) =
-            picker::select_candidate(&snap.candidates, &snap.group_index, kind, name, snap.selection_mode)
-        else {
+        let Some((c, selection_group)) = picker::select_candidate(
+            &snap.candidates,
+            &snap.group_index,
+            kind,
+            name,
+            snap.selection_mode,
+            &eligible,
+        ) else {
+            // A fenced-out capability returns the same 404 as an unknown one, so a
+            // caller cannot probe which out-of-entitlement capabilities exist.
             tracing::debug!(kind = kind.as_str(), name = %name, "intelligent_route: no candidate");
             return Ok(FilterAction::Reject(Rejection::status(404)));
         };
@@ -685,6 +761,19 @@ fn validate_provider_hop_clusters(clusters: Vec<String>) -> Result<BTreeSet<Stri
         }
     }
     Ok(validated)
+}
+
+/// Validate the claim gates: bounded count, non-blank claim and label names.
+fn validate_match_claims(gates: Vec<ClaimGate>) -> Result<Vec<ClaimGate>, FilterError> {
+    if gates.len() > MAX_MATCH_CLAIMS {
+        return Err(format!("intelligent_route: match_claims exceeds maximum of {MAX_MATCH_CLAIMS}").into());
+    }
+    for gate in &gates {
+        if gate.claim.trim().is_empty() || gate.label.trim().is_empty() {
+            return Err("intelligent_route: match_claims entries require a non-blank claim and label".into());
+        }
+    }
+    Ok(gates)
 }
 
 /// Validate the optional management-path cluster.
@@ -1011,12 +1100,17 @@ fn extract_cookie_value(ctx: &HttpFilterContext<'_>, name: &str) -> Option<Strin
 }
 
 /// Resolve session affinity state for the current request.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "affinity resolution needs the request keys plus eligibility"
+)]
 fn resolve_affinity<'a>(
     affinity: Option<&SessionAffinity>,
     session_key: Option<&str>,
     candidates: &'a [RouteCandidate],
     kind: CapabilityKind,
     name: &str,
+    eligible: &Eligibility,
 ) -> AffinityOutcome<'a> {
     let Some(aff) = affinity else {
         return AffinityOutcome::Inactive;
@@ -1024,16 +1118,21 @@ fn resolve_affinity<'a>(
     let Some(key) = session_key else {
         return AffinityOutcome::NoKey;
     };
-    lookup_binding(aff, key, candidates, kind, name)
+    lookup_binding(aff, key, candidates, kind, name, eligible)
 }
 
 /// Look up an existing binding and find its candidate.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "binding lookup needs the request keys plus eligibility"
+)]
 fn lookup_binding<'a>(
     affinity: &SessionAffinity,
     key: &str,
     candidates: &'a [RouteCandidate],
     kind: CapabilityKind,
     name: &str,
+    eligible: &Eligibility,
 ) -> AffinityOutcome<'a> {
     let Some(binding) = affinity.bindings.get(key) else {
         return AffinityOutcome::New;
@@ -1049,7 +1148,9 @@ fn lookup_binding<'a>(
         if c.kind != kind || &*c.name != name || *c.stable_id != *stable {
             continue;
         }
-        if c.admission_state == AdmissionState::Excluded {
+        // A bound endpoint the current request may no longer reach (excluded, or
+        // fenced out by a claim gate) fails over to a fresh eligible pick.
+        if c.admission_state == AdmissionState::Excluded || !eligible.allows(c) {
             return AffinityOutcome::Failover;
         }
         return AffinityOutcome::Reused(c);
@@ -2003,6 +2104,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
+            match_claims: Vec::new(),
         };
 
         assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-v1"));
@@ -2157,6 +2259,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity: None,
             snapshot: Arc::clone(&shared),
+            match_claims: Vec::new(),
         };
         assert_eq!(route_model(&filter, "llama").await.as_deref(), Some("cluster-a"));
 
@@ -2863,6 +2966,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::from(["provider-gateway".to_owned()]),
             session_affinity: Some(make_test_affinity()),
             snapshot,
+            match_claims: Vec::new(),
         };
 
         let mut first = crate::test_utils::make_request(Method::POST, "/chat");
@@ -2911,6 +3015,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::from(["cluster-a".to_owned()]),
             session_affinity: None,
             snapshot: shared,
+            match_claims: Vec::new(),
         };
         let mut req = crate::test_utils::make_request(Method::POST, "/chat");
         req.headers.insert("X-Model", HeaderValue::from_static("model-a"));
@@ -3106,6 +3211,7 @@ mod tests {
                     name: "llama".to_owned(),
                     site: site1.to_owned(),
                     traffic_weight: None,
+                    labels: std::collections::BTreeMap::new(),
                 },
                 CandidateConfig {
                     cluster: cluster2.to_owned(),
@@ -3115,6 +3221,7 @@ mod tests {
                     name: "llama".to_owned(),
                     site: site2.to_owned(),
                     traffic_weight: None,
+                    labels: std::collections::BTreeMap::new(),
                 },
             ])
             .unwrap(),
@@ -3132,6 +3239,7 @@ mod tests {
                 name: "llama".to_owned(),
                 site: "site-a".to_owned(),
                 traffic_weight: None,
+                labels: std::collections::BTreeMap::new(),
             }])
             .unwrap(),
             Arc::from("site-a"),
@@ -3167,6 +3275,7 @@ mod tests {
             provider_hop_clusters: BTreeSet::new(),
             session_affinity,
             snapshot,
+            match_claims: Vec::new(),
         }
     }
 
@@ -3186,8 +3295,70 @@ mod tests {
                 selection_tier: None,
                 site: Arc::from("s"),
                 stable_id: descriptor::default_stable_id(CapabilityKind::InferenceModel, "llama", "s", cluster),
+                labels: std::collections::BTreeMap::new(),
             });
         }
         RouteSnapshot::from_static(route_candidates, Arc::from("site-a"))
+    }
+
+    fn make_gated_filter(gates: Vec<ClaimGate>) -> IntelligentRouteFilter {
+        IntelligentRouteFilter {
+            model_header: HeaderName::from_static("x-model"),
+            _reload_handle: None,
+            skip_paths: Vec::new(),
+            management_cluster: None,
+            provider_hop_clusters: BTreeSet::new(),
+            session_affinity: None,
+            snapshot: Arc::new(ArcSwap::from_pointee(make_snapshot("cluster-a"))),
+            match_claims: gates,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_claim_gate_denies_a_request_that_carries_no_authenticated_identity() {
+        let filter = make_gated_filter(vec![ClaimGate {
+            claim: "grid_region".to_owned(),
+            label: "region".to_owned(),
+        }]);
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        // No AuthenticatedIdentity on the request: a residency fence fails closed.
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Reject(r) if r.status == 403));
+    }
+
+    #[tokio::test]
+    async fn no_claim_gate_leaves_routing_unchanged() {
+        let filter = make_gated_filter(Vec::new());
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let action = filter.on_request(&mut ctx).await.unwrap();
+        assert!(matches!(action, FilterAction::Continue));
+        assert_eq!(ctx.cluster.as_deref(), Some("cluster-a"));
+    }
+
+    #[test]
+    fn match_claims_reject_a_blank_entry() {
+        let err = validate_match_claims(vec![ClaimGate {
+            claim: String::new(),
+            label: "region".to_owned(),
+        }])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("non-blank"), "{err}");
+    }
+
+    #[test]
+    fn match_claims_reject_too_many_gates() {
+        let gates = (0..=MAX_MATCH_CLAIMS)
+            .map(|i| ClaimGate {
+                claim: format!("c{i}"),
+                label: format!("l{i}"),
+            })
+            .collect();
+        let err = validate_match_claims(gates).unwrap_err().to_string();
+        assert!(err.contains("maximum"), "{err}");
     }
 }

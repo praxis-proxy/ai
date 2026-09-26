@@ -10,7 +10,10 @@
 //! This module defines the data model only. Scoring and route
 //! extraction logic live in the `intelligent_route` sibling module.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use praxis_ai_apis::hash::{self, Sha256};
 use praxis_filter::FilterError;
@@ -23,6 +26,12 @@ const MAX_CANDIDATES: usize = 1024;
 
 /// Maximum length for identifier strings.
 const MAX_NAME_LEN: usize = 256;
+
+/// Maximum number of labels per candidate.
+const MAX_LABELS: usize = 16;
+
+/// Maximum length for a label key or value.
+const MAX_LABEL_LEN: usize = 256;
 
 /// Header prefixes reserved for internal gateway/protocol metadata.
 pub(crate) const RESERVED_HEADER_PREFIXES: &[&str] = &["x-praxis-", "x-mcp-"];
@@ -164,6 +173,11 @@ pub(crate) struct CandidateConfig {
     /// Optional bounded weight used only by weighted selection.
     #[serde(default)]
     pub traffic_weight: Option<u32>,
+
+    /// Attributes a request claim may fence on (e.g. `region: eu-west-1`).
+    /// Empty unless the deployment gates routing on an entitlement.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// Default freshness state for candidates.
@@ -229,6 +243,17 @@ pub(crate) struct RouteCandidate {
 
     /// Deterministic identifier for session affinity binding.
     pub stable_id: Arc<str>,
+
+    /// Attributes a request claim may fence on. Empty when the deployment
+    /// gates nothing.
+    pub labels: BTreeMap<String, String>,
+}
+
+impl RouteCandidate {
+    /// Value of the label `key`, if the candidate carries it.
+    pub(crate) fn label(&self, key: &str) -> Option<&str> {
+        self.labels.get(key).map(String::as_str)
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -281,6 +306,7 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
         validate_name(&format!("candidates[{i}].site"), &c.site)?;
         validate_name(&format!("candidates[{i}].cluster"), &c.cluster)?;
         validate_credential(i, c.credential.as_ref())?;
+        validate_labels(i, &c.labels)?;
 
         if !seen.insert((c.kind, c.name.clone(), c.site.clone(), c.cluster.clone())) {
             return Err(format!(
@@ -307,10 +333,29 @@ pub(crate) fn validate_candidates(raw: Vec<CandidateConfig>) -> Result<Vec<Route
             selection_tier: None,
             site: Arc::from(c.site.as_str()),
             stable_id,
+            labels: c.labels,
         });
     }
 
     Ok(candidates)
+}
+
+/// Validate a candidate's label map: bounded count, non-blank bounded keys and
+/// values. Labels are matched verbatim against request claims, so they carry no
+/// header-safety constraint.
+fn validate_labels(index: usize, labels: &BTreeMap<String, String>) -> Result<(), FilterError> {
+    if labels.len() > MAX_LABELS {
+        return Err(format!("routing: candidates[{index}].labels exceeds maximum of {MAX_LABELS}").into());
+    }
+    for (key, value) in labels {
+        if key.is_empty() || key.len() > MAX_LABEL_LEN {
+            return Err(format!("routing: candidates[{index}].labels has a blank or oversized key").into());
+        }
+        if value.is_empty() || value.len() > MAX_LABEL_LEN {
+            return Err(format!("routing: candidates[{index}].labels['{key}'] is blank or oversized").into());
+        }
+    }
+    Ok(())
 }
 
 /// Validate credential reference fields on a candidate entry.
@@ -685,6 +730,33 @@ mod tests {
             name: name.to_owned(),
             site: site.to_owned(),
             traffic_weight: None,
+            labels: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn labels_carry_through_validation() {
+        let mut c = candidate("inference_model", "m", "s", "clr");
+        c.labels.insert("region".to_owned(), "eu-west-1".to_owned());
+        let validated = validate_candidates(vec![c]).unwrap();
+        assert_eq!(validated[0].label("region"), Some("eu-west-1"));
+    }
+
+    #[test]
+    fn labels_reject_a_blank_value() {
+        let mut c = candidate("inference_model", "m", "s", "clr");
+        c.labels.insert("region".to_owned(), String::new());
+        let err = validate_candidates(vec![c]).unwrap_err().to_string();
+        assert!(err.contains("blank") || err.contains("oversized"), "{err}");
+    }
+
+    #[test]
+    fn labels_reject_too_many_entries() {
+        let mut c = candidate("inference_model", "m", "s", "clr");
+        for i in 0..=MAX_LABELS {
+            c.labels.insert(format!("k{i}"), "v".to_owned());
+        }
+        let err = validate_candidates(vec![c]).unwrap_err().to_string();
+        assert!(err.contains("maximum"), "{err}");
     }
 }
