@@ -3595,6 +3595,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "url",
  "wiremock",
  "yaml_serde",

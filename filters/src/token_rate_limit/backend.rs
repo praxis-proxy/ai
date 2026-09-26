@@ -472,10 +472,6 @@ const RECONCILE_SCRIPT: &str = include_str!("lua/sliding_window_reconcile.lua");
 /// already been sent) -- it's counted and logged so operators can audit
 /// it, and the reservation still expires and gets conservatively charged
 /// via `reservation_timeout` regardless.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the bounded retry loop keeps success, retry, and final failure handling together"
-)]
 async fn run_reconcile_worker<B>(worker: B, mut receiver: mpsc::Receiver<ReconcileRequest>)
 where
     B: TokenRateLimitStateBackend + 'static,
@@ -494,18 +490,7 @@ where
                     tokio::time::sleep(Duration::from_millis(25 * attempts)).await;
                 },
                 Err(error) => {
-                    super::record_backend_error_metric(worker.rule_name(), worker.backend_name());
-                    tracing::warn!(
-                        target: "praxis_ai::token_rate_limit::accounting",
-                        phase = "reconciliation",
-                        rule = worker.rule_name(),
-                        algorithm = worker.algorithm_name(),
-                        backend = worker.backend_name(),
-                        result = "failed",
-                        error = %error,
-                        "token rate limit accounting"
-                    );
-                    tracing::error!(%error, "token-rate-limit reconciliation abandoned after retries");
+                    record_abandoned_reconciliation(&worker, &error);
                     break;
                 },
             }
@@ -516,11 +501,33 @@ where
 /// Publish one completed Valkey reconciliation through the same metrics and
 /// accounting helpers as the synchronous in-memory path.
 fn record_completed_reconciliation(backend: &impl TokenRateLimitStateBackend, settlement: &BackendSettlement) {
-    counter!("praxis_ai_token_rate_limit_backend_reconciliation_total", "backend" => "valkey", "result" => "completed")
-        .increment(1);
+    counter!(
+        "praxis_trl_backend_reconciliation_total",
+        "backend" => backend.backend_name(),
+        "result" => "completed",
+        "rule" => backend.rule_name().to_owned(),
+    )
+    .increment(1);
     super::record_settlement_metrics(backend.rule_name(), settlement);
     super::record_accounting_settlement(backend.rule_name(), backend, settlement);
     super::record_state_metrics(backend.rule_name(), backend);
+}
+
+/// Count and log one reconciliation given up after its retries; the
+/// reservation still expires and is charged at its estimate.
+fn record_abandoned_reconciliation(backend: &impl TokenRateLimitStateBackend, error: &BackendError) {
+    super::record_backend_error_metric(backend.rule_name(), backend.backend_name());
+    tracing::warn!(
+        target: "praxis_ai::token_rate_limit::accounting",
+        phase = "reconciliation",
+        rule = backend.rule_name(),
+        algorithm = backend.algorithm_name(),
+        backend = backend.backend_name(),
+        result = "failed",
+        error = %error,
+        "token rate limit accounting"
+    );
+    tracing::error!(%error, "token-rate-limit reconciliation abandoned after retries");
 }
 
 /// Shared Valkey connection handling for every Valkey-backed algorithm:

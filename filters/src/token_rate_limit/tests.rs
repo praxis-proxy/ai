@@ -3,6 +3,8 @@
 
 //! Tests for the `token_rate_limit` filter.
 
+use std::future::Future;
+
 use praxis_filter::{FilterAction, HttpFilter};
 
 use super::TokenRateLimitFilter;
@@ -2911,5 +2913,485 @@ async fn tier_headers_join_pre_read_mutations_when_ordered_log_is_active() {
             praxis_filter::TrustedHeaderMutation::Set(name, _) if name.as_str() == "x-token-tier"
         )),
         "inject header should also be in pre_read_mutations when ordered log is active"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Metrics, Accounting Records, and Spans
+// -----------------------------------------------------------------------------
+
+/// One tracing span or event captured by [`TracingCapture`], with every
+/// recorded field rendered as text.
+#[derive(Debug, Clone)]
+struct CapturedRecord {
+    /// Span name, or `"event"` for events.
+    name: &'static str,
+    target: String,
+    level: tracing::Level,
+    fields: std::collections::BTreeMap<&'static str, String>,
+}
+
+/// A `tracing` layer that records spans and events for assertions.
+///
+/// Install it with [`TracingCapture::install`] and keep the returned
+/// guard alive for the duration of the scenario; it is a thread-local
+/// default, so drive the code under test on the current thread.
+#[derive(Debug, Clone, Default)]
+struct TracingCapture {
+    events: std::sync::Arc<std::sync::Mutex<Vec<CapturedRecord>>>,
+    spans: std::sync::Arc<std::sync::Mutex<Vec<(u64, CapturedRecord)>>>,
+}
+
+impl TracingCapture {
+    /// Make this capture the default subscriber for the current thread.
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+    }
+
+    /// Every event recorded so far, oldest first.
+    fn events(&self) -> Vec<CapturedRecord> {
+        self.events.lock().expect("capture lock").clone()
+    }
+
+    /// Every span created so far, oldest first, with later
+    /// `Span::record` calls merged in.
+    fn spans(&self) -> Vec<CapturedRecord> {
+        self.spans
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .map(|(_, record)| record.clone())
+            .collect()
+    }
+}
+
+/// Renders every field value as text so tests compare strings only.
+#[derive(Default)]
+struct FieldText(std::collections::BTreeMap<&'static str, String>);
+
+impl tracing::field::Visit for FieldText {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name(), format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name(), value.to_owned());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name(), value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0.insert(field.name(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.0.insert(field.name(), value.to_string());
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TracingCapture {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = FieldText::default();
+        attrs.record(&mut fields);
+        let metadata = attrs.metadata();
+        self.spans.lock().expect("capture lock").push((
+            id.into_u64(),
+            CapturedRecord {
+                name: metadata.name(),
+                target: metadata.target().to_owned(),
+                level: *metadata.level(),
+                fields: fields.0,
+            },
+        ));
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut fields = FieldText::default();
+        values.record(&mut fields);
+        let mut spans = self.spans.lock().expect("capture lock");
+        if let Some((_, record)) = spans.iter_mut().find(|(span_id, _)| *span_id == id.into_u64()) {
+            record.fields.extend(fields.0);
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let mut fields = FieldText::default();
+        event.record(&mut fields);
+        let metadata = event.metadata();
+        self.events.lock().expect("capture lock").push(CapturedRecord {
+            name: "event",
+            target: metadata.target().to_owned(),
+            level: *metadata.level(),
+            fields: fields.0,
+        });
+    }
+}
+
+/// Run `scenario` on the current thread with a local metrics recorder and
+/// return every metric it emitted.
+fn metrics_emitted_by<F>(scenario: F) -> Vec<(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)>
+where
+    F: Future<Output = ()>,
+{
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    metrics::with_local_recorder(&recorder, || runtime.block_on(scenario));
+    snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .map(|(key, _, _, value)| (key, value))
+        .collect()
+}
+
+/// The value of the metric `name` whose labels include every pair in
+/// `labels`, if it was emitted.
+fn metric_value<'a>(
+    snapshot: &'a [(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)],
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<&'a metrics_util::debugging::DebugValue> {
+    snapshot
+        .iter()
+        .find(|(key, _)| {
+            key.key().name() == name
+                && labels.iter().all(|(label, expected)| {
+                    key.key()
+                        .labels()
+                        .any(|candidate| candidate.key() == *label && candidate.value() == *expected)
+                })
+        })
+        .map(|(_, value)| value)
+}
+
+fn counter_value(
+    snapshot: &[(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)],
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<u64> {
+    match metric_value(snapshot, name, labels) {
+        Some(metrics_util::debugging::DebugValue::Counter(value)) => Some(*value),
+        _ => None,
+    }
+}
+
+fn gauge_value(
+    snapshot: &[(metrics_util::CompositeKey, metrics_util::debugging::DebugValue)],
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<f64> {
+    match metric_value(snapshot, name, labels) {
+        Some(metrics_util::debugging::DebugValue::Gauge(value)) => Some(value.into_inner()),
+        _ => None,
+    }
+}
+
+/// Admit one 60-token request against a 100-token sliding window, deny the
+/// next one, then settle the first at 40 actual tokens.
+async fn admit_deny_and_settle(filter: &dyn HttpFilter) {
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut admitted = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut admitted).await.unwrap(), FilterAction::Continue),
+        "the first 60-token request fits a 100-token budget"
+    );
+    let mut denied = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut denied).await.unwrap(), FilterAction::Reject(_)),
+        "the second 60-token request exceeds the 40 tokens left"
+    );
+    admitted.set_metadata(META_TOKEN_TOTAL, "40");
+    let mut body = None;
+    drop(filter.on_response_body(&mut admitted, &mut body, true).unwrap());
+}
+
+#[test]
+fn metrics_carry_the_values_of_an_admission_a_denial_and_a_reconciliation() {
+    let snapshot = metrics_emitted_by(async {
+        let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60");
+        let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+        admit_deny_and_settle(filter.as_ref()).await;
+    });
+    let rule = ("rule", "default");
+
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_requests_total", &[rule, ("result", "admitted")]),
+        Some(1),
+        "one admission"
+    );
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_requests_total", &[rule, ("result", "denied")]),
+        Some(1),
+        "one budget denial"
+    );
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_tokens_reserved_total", &[rule]),
+        Some(60),
+        "the admitted estimate is the only reservation"
+    );
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_tokens_reconciled_total", &[rule]),
+        Some(40),
+        "actual usage reported at end of stream"
+    );
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_tokens_refunded_total", &[rule]),
+        Some(20),
+        "estimate 60 minus actual 40"
+    );
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_tokens_overage_total", &[rule]),
+        Some(0),
+        "no usage above the estimate"
+    );
+    assert_eq!(
+        counter_value(
+            &snapshot,
+            "praxis_trl_reservations_total",
+            &[rule, ("result", "reconciled")]
+        ),
+        Some(1),
+        "the admitted reservation was settled once"
+    );
+    assert_eq!(
+        gauge_value(
+            &snapshot,
+            "praxis_trl_budget_remaining",
+            &[rule, ("algorithm", "sliding_window")]
+        ),
+        Some(60.0),
+        "40 settled tokens leave 60 of 100"
+    );
+    assert_eq!(
+        gauge_value(&snapshot, "praxis_trl_reservations_active", &[rule]),
+        Some(0.0),
+        "nothing is pending after settlement"
+    );
+    assert_eq!(
+        gauge_value(&snapshot, "praxis_trl_active_keys", &[rule]),
+        Some(1.0),
+        "the global key is the only retained key"
+    );
+    assert!(
+        metric_value(&snapshot, "praxis_trl_unauthenticated_total", &[]).is_none(),
+        "global keying never rejects for a missing subject"
+    );
+    assert!(
+        metric_value(&snapshot, "praxis_trl_backend_errors_total", &[]).is_none(),
+        "the memory backend cannot fail"
+    );
+}
+
+#[test]
+fn unauthenticated_rejections_are_counted_apart_from_budget_decisions() {
+    let snapshot = metrics_emitted_by(async {
+        let yaml = single_rule_yaml_with(
+            "key: authenticated_subject",
+            "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60",
+        );
+        let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        match filter.on_request(&mut ctx).await.unwrap() {
+            FilterAction::Reject(rejection) => assert_eq!(rejection.status, 401, "no subject fails closed"),
+            other => panic!("expected a 401 rejection, got {other:?}"),
+        }
+    });
+
+    assert_eq!(
+        counter_value(&snapshot, "praxis_trl_unauthenticated_total", &[("rule", "default")]),
+        Some(1),
+        "the identity miss is counted on its own family"
+    );
+    assert!(
+        metric_value(&snapshot, "praxis_trl_requests_total", &[]).is_none(),
+        "a 401 is not a budget decision"
+    );
+}
+
+/// Field names an accounting record may carry; anything else would risk
+/// leaking request identity into the audit stream.
+const ACCOUNTING_FIELDS: &[&str] = &[
+    "message",
+    "phase",
+    "rule",
+    "algorithm",
+    "backend",
+    "result",
+    "estimate",
+    "outcome",
+    "actual",
+    "refund",
+    "overage",
+    "error",
+];
+
+fn accounting_records(capture: &TracingCapture) -> Vec<CapturedRecord> {
+    capture
+        .events()
+        .into_iter()
+        .filter(|event| event.target == "praxis_ai::token_rate_limit::accounting")
+        .collect()
+}
+
+fn field<'a>(record: &'a CapturedRecord, name: &str) -> Option<&'a str> {
+    record.fields.get(name).map(String::as_str)
+}
+
+#[tokio::test]
+async fn accounting_records_describe_admissions_denials_and_settlements_with_bounded_fields() {
+    let capture = TracingCapture::default();
+    let _guard = capture.install();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    admit_deny_and_settle(filter.as_ref()).await;
+
+    let records = accounting_records(&capture);
+    let [admission, denial, settlement] = records.as_slice() else {
+        panic!("expected one admission, one denial, and one settlement record, got {records:?}");
+    };
+    for record in &records {
+        assert_eq!(record.name, "event", "accounting records are events, not spans");
+        assert_eq!(record.level, tracing::Level::INFO, "routine records are informational");
+        assert_eq!(field(record, "rule"), Some("default"), "every record names its rule");
+        assert_eq!(field(record, "algorithm"), Some("sliding_window"));
+        assert_eq!(field(record, "backend"), Some("memory"));
+        for name in record.fields.keys() {
+            assert!(ACCOUNTING_FIELDS.contains(name), "unexpected accounting field {name}");
+        }
+    }
+    assert_eq!(field(admission, "phase"), Some("admission"));
+    assert_eq!(field(admission, "result"), Some("admitted"));
+    assert_eq!(field(admission, "outcome"), Some("reserved"));
+    assert_eq!(field(admission, "estimate"), Some("60"));
+    assert_eq!(field(denial, "phase"), Some("admission"));
+    assert_eq!(field(denial, "result"), Some("denied"));
+    assert_eq!(field(denial, "outcome"), Some("budget_exhausted"));
+    assert_eq!(field(settlement, "phase"), Some("reconciliation"));
+    assert_eq!(field(settlement, "result"), Some("applied"));
+    assert_eq!(field(settlement, "actual"), Some("40"));
+    assert_eq!(field(settlement, "refund"), Some("20"));
+    assert_eq!(field(settlement, "overage"), Some("0"));
+}
+
+#[tokio::test]
+async fn an_identity_miss_leaves_a_denied_accounting_record_without_the_subject() {
+    let capture = TracingCapture::default();
+    let _guard = capture.install();
+    let yaml = single_rule_yaml_with(
+        "key: authenticated_subject",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let records = accounting_records(&capture);
+    let [record] = records.as_slice() else {
+        panic!("expected exactly one rejection record, got {records:?}");
+    };
+    assert_eq!(field(record, "result"), Some("denied"));
+    assert_eq!(field(record, "outcome"), Some("missing_authenticated_subject"));
+    for name in record.fields.keys() {
+        assert!(ACCOUNTING_FIELDS.contains(name), "unexpected accounting field {name}");
+    }
+}
+
+#[cfg(not(feature = "opentelemetry"))]
+#[tokio::test]
+async fn no_decision_span_is_created_without_the_opentelemetry_feature() {
+    let capture = TracingCapture::default();
+    let _guard = capture.install();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+
+    admit_deny_and_settle(filter.as_ref()).await;
+
+    assert!(
+        capture.spans().iter().all(|span| span.name != "token_rate_limit"),
+        "the span is compiled out with the feature"
+    );
+}
+
+#[cfg(feature = "opentelemetry")]
+fn token_rate_limit_span(capture: &TracingCapture) -> CapturedRecord {
+    let spans: Vec<_> = capture
+        .spans()
+        .into_iter()
+        .filter(|span| span.name == "token_rate_limit")
+        .collect();
+    assert_eq!(spans.len(), 1, "exactly one decision span per request");
+    spans.into_iter().next().unwrap()
+}
+
+#[cfg(feature = "opentelemetry")]
+#[tokio::test]
+async fn the_decision_span_records_the_admission_and_the_actual_cost() {
+    let capture = TracingCapture::default();
+    let _guard = capture.install();
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    ctx.set_metadata(META_TOKEN_TOTAL, "40");
+    let mut body = None;
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let span = token_rate_limit_span(&capture);
+    assert_eq!(field(&span, "token_rate_limit.rule"), Some("default"));
+    assert_eq!(field(&span, "token_rate_limit.algorithm"), Some("sliding_window"));
+    assert_eq!(field(&span, "token_rate_limit.estimated_cost"), Some("60"));
+    assert_eq!(field(&span, "token_rate_limit.decision"), Some("admitted"));
+    assert_eq!(
+        field(&span, "token_rate_limit.actual_cost"),
+        Some("40"),
+        "actual usage is recorded on the same span at end of stream"
+    );
+    assert_eq!(span.fields.len(), 5, "no other field may be attached to the span");
+}
+
+#[cfg(feature = "opentelemetry")]
+#[tokio::test]
+async fn the_decision_span_distinguishes_an_identity_miss_from_a_budget_denial() {
+    let capture = TracingCapture::default();
+    let _guard = capture.install();
+    let yaml = single_rule_yaml_with(
+        "key: authenticated_subject",
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let span = token_rate_limit_span(&capture);
+    assert_eq!(field(&span, "token_rate_limit.decision"), Some("unauthenticated"));
+    assert_eq!(
+        field(&span, "token_rate_limit.actual_cost"),
+        None,
+        "a rejected request never reports usage"
     );
 }

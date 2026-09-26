@@ -39,6 +39,8 @@ use std::{
 
 use dashmap::DashMap;
 
+use super::remaining_total::RemainingTotal;
+
 /// Upper bound, in seconds, on `capacity / refill_rate` -- the time to
 /// fill an empty bucket from scratch.
 ///
@@ -268,8 +270,7 @@ pub(super) struct TokenBucketLedger {
     next_id: AtomicU64,
     key_count: AtomicUsize,
     active_reservations: AtomicUsize,
-    /// Sum of the last calculated remaining balance for every retained key.
-    remaining_total: Mutex<u128>,
+    remaining_total: RemainingTotal,
 }
 
 impl TokenBucketLedger {
@@ -283,7 +284,7 @@ impl TokenBucketLedger {
             next_id: AtomicU64::new(1),
             key_count: AtomicUsize::new(0),
             active_reservations: AtomicUsize::new(0),
-            remaining_total: Mutex::new(0),
+            remaining_total: RemainingTotal::default(),
         })
     }
 
@@ -304,41 +305,20 @@ impl TokenBucketLedger {
 
     /// Sum of the last calculated remaining balance for retained keys.
     pub(super) fn remaining_total(&self) -> u64 {
-        let total = match self.remaining_total.lock() {
-            Ok(total) => *total,
-            Err(poisoned) => *poisoned.into_inner(),
-        };
-        u64::try_from(total.min(u128::from(super::MAX_REPORTED_REMAINING))).unwrap_or(super::MAX_REPORTED_REMAINING)
+        self.remaining_total.reported()
     }
 
-    /// Add to the exact aggregate; only the exported snapshot is clamped.
-    fn add_remaining(&self, increase: u64) {
-        let mut total = match self.remaining_total.lock() {
-            Ok(total) => total,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *total += u128::from(increase);
-    }
-
-    /// Refresh one key's contribution to [`Self::remaining_total`].
+    /// Publish one key's whole-token balance, moving its contribution to
+    /// the aggregate.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "token balances are finite, non-negative, and bounded by validated capacity"
     )]
-    fn update_remaining(&self, state: &mut BucketState) {
+    fn publish_remaining(&self, state: &mut BucketState) {
         let remaining = state.tokens.floor() as u64;
         let previous = std::mem::replace(&mut state.reported_remaining, remaining);
-        if remaining >= previous {
-            self.add_remaining(remaining - previous);
-        } else {
-            let decrease = previous - remaining;
-            let mut total = match self.remaining_total.lock() {
-                Ok(total) => total,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *total = total.saturating_sub(u128::from(decrease));
-        }
+        self.remaining_total.replace(previous, remaining);
     }
 
     /// Reserve an estimate against one key's bucket: refill to `now_ms`,
@@ -366,7 +346,7 @@ impl TokenBucketLedger {
                         return Decision::Denied { retry_after_ms: 0 };
                     }
                     let state = Arc::new(Mutex::new(BucketState::new(self.config.capacity)));
-                    self.add_remaining(self.config.capacity);
+                    self.remaining_total.add(self.config.capacity);
                     entry.insert(state);
                 },
             }
@@ -381,7 +361,6 @@ impl TokenBucketLedger {
             self.reservations.remove(id);
         }
         self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
-        self.update_remaining(&mut state);
 
         #[expect(
             clippy::cast_precision_loss,
@@ -389,6 +368,7 @@ impl TokenBucketLedger {
         )]
         let estimate_f64 = estimate as f64;
         if estimate_f64 > state.tokens {
+            self.publish_remaining(&mut state);
             let deficit = estimate_f64 - state.tokens;
             let retry_after_ms = (deficit / self.config.refill_rate * 1000.0).ceil();
             #[expect(
@@ -406,6 +386,7 @@ impl TokenBucketLedger {
             })
             .is_err()
         {
+            self.publish_remaining(&mut state);
             return Decision::Denied {
                 retry_after_ms: self.config.reservation_timeout_ms,
             };
@@ -419,7 +400,7 @@ impl TokenBucketLedger {
             reason = "capacity is bounded by MAX_F64_SAFE_INTEGER, difference is non-negative and within u64 range"
         )]
         let usage_after = (self.config.capacity as f64 - state.tokens).max(0.0) as u64;
-        self.update_remaining(&mut state);
+        self.publish_remaining(&mut state);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         state.active.insert(
             id,
@@ -473,7 +454,7 @@ impl TokenBucketLedger {
                 state.tokens = (state.tokens - overage as f64).max(0.0);
             }
         }
-        self.update_remaining(&mut state);
+        self.publish_remaining(&mut state);
         drop(state);
         Settlement::Applied {
             actual,
@@ -508,7 +489,7 @@ impl TokenBucketLedger {
                 self.reservations.remove(id);
             }
             self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
-            self.update_remaining(&mut state);
+            self.publish_remaining(&mut state);
             let empty = state.is_empty(self.config.capacity);
             let reported_remaining = state.reported_remaining;
             drop(state);
@@ -526,11 +507,7 @@ impl TokenBucketLedger {
                     .is_some()
             {
                 self.key_count.fetch_sub(1, Ordering::Relaxed);
-                let mut total = match self.remaining_total.lock() {
-                    Ok(total) => total,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                *total = total.saturating_sub(u128::from(reported_remaining));
+                self.remaining_total.subtract(reported_remaining);
             }
         }
         orphaned
@@ -752,7 +729,7 @@ mod tests {
             .keys
             .insert("alice".into(), Arc::new(Mutex::new(BucketState::new(10))));
         ledger.key_count.store(1, Ordering::Relaxed);
-        ledger.add_remaining(10);
+        ledger.remaining_total.add(10);
 
         // `reserve` keeps this same DashMap entry guard while locking and
         // changing BucketState, so cleanup must not remove its key in-between.

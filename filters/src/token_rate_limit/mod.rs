@@ -100,6 +100,7 @@ mod tests;
 mod backend;
 mod config;
 mod ledger;
+mod remaining_total;
 mod token_bucket_ledger;
 mod weights;
 
@@ -1227,6 +1228,7 @@ impl TokenRateLimitFilter {
                 rule = rule.name,
                 "token_rate_limit: rejecting request (401), no authenticated subject"
             );
+            record_unauthenticated_metric(&rule.name);
             record_accounting_admission(rule, "denied", estimate, "missing_authenticated_subject");
         }
         key
@@ -1322,7 +1324,7 @@ impl TokenRateLimitFilter {
             Err(error) => {
                 record_backend_error_metric(&rule.name, rule.backend.backend_name());
                 record_accounting_failure(rule, "reserve", &error);
-                record_admission_span(ctx, rule, pending.request_estimate, "denied");
+                record_admission_span(ctx, rule, pending.request_estimate, "error");
                 tracing::error!(%error, rule = rule.name, "token_rate_limit: admission backend failed, failing closed");
                 FilterAction::Reject(Rejection::status(503))
             },
@@ -1376,7 +1378,7 @@ impl TokenRateLimitFilter {
             }
             if let CompiledAction::Inject { headers } = &tier.action {
                 counter!(
-                    "praxis_ai_token_rate_limit_soft_tier_activations_total",
+                    "praxis_trl_soft_tier_activations_total",
                     "rule" => rule.name.clone(),
                     "capacity" => tier.capacity.to_string(),
                 )
@@ -1500,6 +1502,13 @@ fn record_request_metric(rule_name: &str, result: &'static str) {
     .increment(1);
 }
 
+/// Count one request rejected before admission because no trusted
+/// subject could be resolved; `praxis_trl_requests_total` describes
+/// budget decisions only.
+fn record_unauthenticated_metric(rule_name: &str) {
+    counter!("praxis_trl_unauthenticated_total", "rule" => rule_name.to_owned()).increment(1);
+}
+
 /// Count tokens reserved at admission.
 fn record_reserved_metric(rule_name: &str, estimate: u64) {
     counter!("praxis_trl_tokens_reserved_total", "rule" => rule_name.to_owned()).increment(estimate);
@@ -1518,7 +1527,7 @@ fn record_backend_error_metric(rule_name: &str, backend: &'static str) {
 /// Emit gauges/counters for one rule's cleanup pass.
 fn record_cleanup_metrics(rule_name: &str, report: CleanupReport) {
     if report.orphaned > 0 {
-        counter!("praxis_ai_token_rate_limit_reservations_total", "result" => "orphaned", "rule" => rule_name.to_owned())
+        counter!("praxis_trl_reservations_total", "result" => "orphaned", "rule" => rule_name.to_owned())
             .increment(report.orphaned as u64);
     }
     #[expect(
@@ -1527,7 +1536,7 @@ fn record_cleanup_metrics(rule_name: &str, report: CleanupReport) {
     )]
     {
         gauge!("praxis_trl_reservations_active", "rule" => rule_name.to_owned()).set(report.active_reservations as f64);
-        gauge!("praxis_ai_token_rate_limit_active_keys", "rule" => rule_name.to_owned()).set(report.active_keys as f64);
+        gauge!("praxis_trl_active_keys", "rule" => rule_name.to_owned()).set(report.active_keys as f64);
     }
 }
 
@@ -1539,7 +1548,7 @@ fn record_settlement_metrics(rule_name: &str, settlement: &BackendSettlement) {
         overage,
     } = *settlement
     {
-        counter!("praxis_ai_token_rate_limit_reservations_total", "result" => "reconciled", "rule" => rule_name.to_owned())
+        counter!("praxis_trl_reservations_total", "result" => "reconciled", "rule" => rule_name.to_owned())
             .increment(1);
         counter!("praxis_trl_tokens_reconciled_total", "rule" => rule_name.to_owned()).increment(actual);
         counter!("praxis_trl_tokens_refunded_total", "rule" => rule_name.to_owned()).increment(refund);
@@ -1563,8 +1572,7 @@ fn record_state_metrics(rule_name: &str, backend: &dyn TokenRateLimitStateBacken
         .set(snapshot.budget_remaining as f64);
         gauge!("praxis_trl_reservations_active", "rule" => rule_name.to_owned())
             .set(snapshot.active_reservations as f64);
-        gauge!("praxis_ai_token_rate_limit_active_keys", "rule" => rule_name.to_owned())
-            .set(snapshot.active_keys as f64);
+        gauge!("praxis_trl_active_keys", "rule" => rule_name.to_owned()).set(snapshot.active_keys as f64);
     }
 }
 
@@ -1703,7 +1711,7 @@ impl HttpFilter for TokenRateLimitFilter {
             return Ok(FilterAction::Continue);
         };
         let Some(key) = self.resolve_key_or_record_rejection(ctx, rule, estimate) else {
-            record_admission_span(ctx, rule, estimate, "denied");
+            record_admission_span(ctx, rule, estimate, "unauthenticated");
             return Ok(FilterAction::Reject(Rejection::status(401)));
         };
         let outcome = rule
@@ -1744,7 +1752,7 @@ impl HttpFilter for TokenRateLimitFilter {
         };
 
         let Some(key) = self.resolve_key_or_record_rejection(ctx, rule, estimate) else {
-            record_admission_span(ctx, rule, estimate, "denied");
+            record_admission_span(ctx, rule, estimate, "unauthenticated");
             return Ok(FilterAction::Reject(Rejection::status(401)));
         };
         let outcome = rule
@@ -1880,7 +1888,7 @@ mod backend_injection_tests {
             TokenRateLimitStateBackend,
         },
         record_backend_error_metric, record_request_metric, record_reserved_metric, record_settlement_metrics,
-        record_state_metrics,
+        record_state_metrics, record_unauthenticated_metric,
     };
 
     /// A backend that admits every reservation but always fails to
@@ -1932,6 +1940,19 @@ mod backend_injection_tests {
         }
     }
 
+    /// A fixed-estimate rule over [`EnqueueAlwaysFailsBackend`].
+    fn enqueue_always_fails_rule(name: &str) -> CompiledRule {
+        CompiledRule {
+            name: name.to_owned(),
+            matcher: None,
+            backend: std::sync::Arc::new(EnqueueAlwaysFailsBackend),
+            estimation: CompiledEstimation::Fixed { estimate: 1 },
+            weights: super::TokenWeights::UNITY,
+            tiers: Vec::new(),
+            inject_header_names: Vec::new(),
+        }
+    }
+
     /// [`TokenRateLimitFilter::reconcile`] falls back to
     /// `enqueue_reconcile` when `reconcile_sync` returns `None` (the
     /// default, unimplemented by [`EnqueueAlwaysFailsBackend`]). When
@@ -1942,15 +1963,7 @@ mod backend_injection_tests {
     #[tokio::test]
     async fn reconcile_logs_rather_than_propagates_an_enqueue_reconcile_failure() {
         let filter = TokenRateLimitFilter {
-            rules: vec![CompiledRule {
-                name: "default".to_owned(),
-                matcher: None,
-                backend: std::sync::Arc::new(EnqueueAlwaysFailsBackend),
-                estimation: CompiledEstimation::Fixed { estimate: 1 },
-                weights: super::TokenWeights::UNITY,
-                tiers: Vec::new(),
-                inject_header_names: Vec::new(),
-            }],
+            rules: vec![enqueue_always_fails_rule("default")],
             needs_body: false,
             key_source: super::KeySource::Global,
             epoch: std::time::Instant::now(),
@@ -1981,18 +1994,10 @@ mod backend_injection_tests {
     #[test]
     #[expect(
         clippy::too_many_lines,
-        reason = "one contract test verifies all eight issue-defined metric families together"
+        reason = "one contract test verifies every metric family's label keys together"
     )]
     fn prometheus_contract_emits_all_issue_883_metric_families_with_bounded_labels() {
-        let rule = CompiledRule {
-            name: "engineering".to_owned(),
-            matcher: None,
-            backend: std::sync::Arc::new(EnqueueAlwaysFailsBackend),
-            estimation: CompiledEstimation::Fixed { estimate: 1 },
-            weights: super::TokenWeights::UNITY,
-            tiers: Vec::new(),
-            inject_header_names: Vec::new(),
-        };
+        let rule = enqueue_always_fails_rule("engineering");
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
@@ -2009,6 +2014,7 @@ mod backend_injection_tests {
             );
             record_state_metrics(&rule.name, rule.backend.as_ref());
             record_backend_error_metric(&rule.name, rule.backend.backend_name());
+            record_unauthenticated_metric(&rule.name);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -2033,16 +2039,18 @@ mod backend_injection_tests {
             vec![vec!["result".to_owned(), "rule".to_owned()]; 2]
         );
         for name in [
-            "praxis_ai_token_rate_limit_reservations_total",
+            "praxis_trl_reservations_total",
             "praxis_trl_tokens_reserved_total",
             "praxis_trl_tokens_reconciled_total",
             "praxis_trl_tokens_refunded_total",
             "praxis_trl_tokens_overage_total",
             "praxis_trl_reservations_active",
+            "praxis_trl_active_keys",
+            "praxis_trl_unauthenticated_total",
         ] {
             assert_eq!(
                 labels_for(name),
-                if name == "praxis_ai_token_rate_limit_reservations_total" {
+                if name == "praxis_trl_reservations_total" {
                     vec![vec!["result".to_owned(), "rule".to_owned()]]
                 } else {
                     vec![vec!["rule".to_owned()]]

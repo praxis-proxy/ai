@@ -49,7 +49,9 @@
 # contribute. Window aging/refill is lazy, so this is a snapshot. Build
 # with `opentelemetry` to add the request-scoped decision span. Structured
 # best-effort audit records use the dedicated
-# `praxis_ai::token_rate_limit::accounting` log target.
+# `praxis_ai::token_rate_limit::accounting` log target at INFO (one line
+# per admission or settlement); keep only failures with
+# `runtime.log_overrides: {"praxis_ai::token_rate_limit::accounting": "warn"}`.
 #
 # Deliberately not yet built (see filters/src/token_rate_limit/mod.rs
 # for the full rationale): arbitrary CEL/composite bucket keys and

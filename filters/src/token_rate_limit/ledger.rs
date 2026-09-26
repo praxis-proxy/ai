@@ -30,6 +30,8 @@ use std::{
 
 use dashmap::DashMap;
 
+use super::remaining_total::RemainingTotal;
+
 /// A positive rolling-window budget.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Budget {
@@ -227,8 +229,7 @@ pub(super) struct Ledger {
     next_id: AtomicU64,
     key_count: AtomicUsize,
     active_reservations: AtomicUsize,
-    /// Sum of the last calculated remaining balance for every retained key.
-    remaining_total: Mutex<u128>,
+    remaining_total: RemainingTotal,
 }
 
 impl Ledger {
@@ -242,7 +243,7 @@ impl Ledger {
             next_id: AtomicU64::new(1),
             key_count: AtomicUsize::new(0),
             active_reservations: AtomicUsize::new(0),
-            remaining_total: Mutex::new(0),
+            remaining_total: RemainingTotal::default(),
         })
     }
 
@@ -268,26 +269,12 @@ impl Ledger {
 
     /// Sum of the last calculated remaining balance for retained keys.
     pub(super) fn remaining_total(&self) -> u64 {
-        let total = match self.remaining_total.lock() {
-            Ok(total) => *total,
-            Err(poisoned) => *poisoned.into_inner(),
-        };
-        u64::try_from(total.min(u128::from(super::MAX_REPORTED_REMAINING))).unwrap_or(super::MAX_REPORTED_REMAINING)
+        self.remaining_total.reported()
     }
 
-    /// Add to the exact aggregate; only the exported snapshot is clamped.
-    fn add_remaining(&self, increase: u64) {
-        let mut total = match self.remaining_total.lock() {
-            Ok(total) => total,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *total += u128::from(increase);
-    }
-
-    /// Refresh one key's contribution to [`Self::remaining_total`].
-    fn update_remaining(&self, state: &mut KeyState, now_ms: u64) {
-        let remaining = self
-            .config
+    /// The smallest remaining balance across budgets for one key.
+    fn remaining_for(&self, state: &KeyState, now_ms: u64) -> u64 {
+        self.config
             .budgets
             .iter()
             .map(|budget| {
@@ -296,18 +283,19 @@ impl Ledger {
                     .saturating_sub(state.usage_in_window(now_ms, budget.window_ms))
             })
             .min()
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
+
+    /// Publish one key's balance, moving its contribution to the aggregate.
+    fn publish_remaining(&self, state: &mut KeyState, remaining: u64) {
         let previous = std::mem::replace(&mut state.reported_remaining, remaining);
-        if remaining >= previous {
-            self.add_remaining(remaining - previous);
-        } else {
-            let decrease = previous - remaining;
-            let mut total = match self.remaining_total.lock() {
-                Ok(total) => total,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            *total = total.saturating_sub(u128::from(decrease));
-        }
+        self.remaining_total.replace(previous, remaining);
+    }
+
+    /// Recompute and publish one key's balance.
+    fn refresh_remaining(&self, state: &mut KeyState, now_ms: u64) {
+        let remaining = self.remaining_for(state, now_ms);
+        self.publish_remaining(state, remaining);
     }
 
     /// Reserve an estimate atomically across all configured windows.
@@ -343,7 +331,7 @@ impl Ledger {
                         reported_remaining: initial_remaining,
                         ..KeyState::default()
                     }));
-                    self.add_remaining(initial_remaining);
+                    self.remaining_total.add(initial_remaining);
                     entry.insert(state);
                 },
             }
@@ -357,18 +345,23 @@ impl Ledger {
             self.reservations.remove(id);
         }
         self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
-        self.update_remaining(&mut state, now_ms);
 
         let mut max_usage = 0_u64;
+        let mut remaining = self.limit();
+        let mut exhausted = false;
         for budget in &self.config.budgets {
-            let usage = state.usage_in_window(now_ms, budget.window_ms).saturating_add(estimate);
+            let usage = state.usage_in_window(now_ms, budget.window_ms);
+            remaining = remaining.min(budget.capacity.saturating_sub(usage));
+            let usage = usage.saturating_add(estimate);
             max_usage = max_usage.max(usage);
-            if usage > budget.capacity {
-                return Decision::Denied {
-                    retry_after_ms: state.retry_after_ms(now_ms, &self.config),
-                    reason: DenialReason::WindowCapacity,
-                };
-            }
+            exhausted |= usage > budget.capacity;
+        }
+        if exhausted {
+            self.publish_remaining(&mut state, remaining);
+            return Decision::Denied {
+                retry_after_ms: state.retry_after_ms(now_ms, &self.config),
+                reason: DenialReason::WindowCapacity,
+            };
         }
         if self
             .active_reservations
@@ -377,6 +370,7 @@ impl Ledger {
             })
             .is_err()
         {
+            self.publish_remaining(&mut state, remaining);
             return Decision::Denied {
                 retry_after_ms: self.config.reservation_timeout_ms,
                 reason: DenialReason::ReservationCapacity,
@@ -391,7 +385,7 @@ impl Ledger {
                 created_at_ms: now_ms,
             },
         );
-        self.update_remaining(&mut state, now_ms);
+        self.publish_remaining(&mut state, remaining.saturating_sub(estimate));
         self.reservations.insert(id, key.to_owned());
         drop(state);
         drop(entry);
@@ -431,7 +425,7 @@ impl Ledger {
             self.reservations.remove(&expired_id);
             self.active_reservations.fetch_sub(1, Ordering::Relaxed);
         }
-        self.update_remaining(&mut state, now_ms);
+        self.refresh_remaining(&mut state, now_ms);
         drop(state);
         Settlement::Applied {
             actual,
@@ -464,7 +458,7 @@ impl Ledger {
                 self.reservations.remove(id);
             }
             self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
-            self.update_remaining(&mut state, now_ms);
+            self.refresh_remaining(&mut state, now_ms);
             let empty = state.is_empty();
             let reported_remaining = state.reported_remaining;
             drop(state);
@@ -482,11 +476,7 @@ impl Ledger {
                     .is_some()
             {
                 self.key_count.fetch_sub(1, Ordering::Relaxed);
-                let mut total = match self.remaining_total.lock() {
-                    Ok(total) => total,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                *total = total.saturating_sub(u128::from(reported_remaining));
+                self.remaining_total.subtract(reported_remaining);
             }
         }
         orphaned
@@ -566,7 +556,7 @@ mod tests {
             })),
         );
         ledger.key_count.store(1, Ordering::Relaxed);
-        ledger.add_remaining(10);
+        ledger.remaining_total.add(10);
 
         // `reserve` keeps this same DashMap entry guard while locking and
         // changing KeyState, so cleanup must not remove its key in-between.

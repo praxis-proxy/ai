@@ -109,4 +109,5 @@ aws-sigv4 = { workspace = true }
 metrics-util = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
 wiremock = { workspace = true }

@@ -5,12 +5,15 @@
 //!
 //! Praxis core owns subscriber installation, OTLP export, propagation,
 //! sampling, request lifecycle spans, and provider-hop client spans. AI owns
-//! only the semantic decisions made by `intelligent_route` (edge routing
-//! selection) and `provider_route` (provider-local backend resolution).
+//! only the semantic decisions it makes: `intelligent_route` (edge routing
+//! selection), `provider_route` (provider-local backend resolution), and the
+//! `token_rate_limit` admission decision.
 
 use std::sync::Arc;
 
 use tracing::field::Empty;
+
+use crate::routing::descriptor::RouteCandidate;
 
 /// Request-scoped token-rate-limit span retained until reconciliation.
 pub(crate) struct TokenRateLimitSpan(tracing::Span);
@@ -42,8 +45,6 @@ pub(crate) fn token_rate_limit_span(
         "token_rate_limit.decision" = decision,
     ))
 }
-
-use crate::routing::descriptor::RouteCandidate;
 
 /// Borrowed, validated attributes for a routing decision span.
 struct RoutingSelection<'a> {
