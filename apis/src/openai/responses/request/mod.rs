@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Single request-body processor for the Responses create operation.
+//! Single request-body processor for body-bearing Responses operations.
 //!
 //! Operation identity comes from the request head through the Responses
 //! registry, so the body is never inspected to decide whether this filter
-//! applies. A matched create request is then deserialized exactly once, and
+//! applies. A matched request is then deserialized exactly once, and
 //! that one parsed value produces every downstream fact: the classification
 //! metadata, the promoted headers and filter results, the proxy-owned
 //! identifiers, and [`ResponsesState`].
@@ -14,7 +14,7 @@
 //! implement the asynchronous Responses lifecycle.
 //!
 //! This replaces the pair of `openai_responses_format` and
-//! `openai_responses_validate` for create requests. Those two each parsed the
+//! `openai_responses_validate`. Those two each parsed the
 //! same body independently, so routing facts, proxy-owned defaults, and state
 //! could be derived from different parses of one request.
 //!
@@ -49,28 +49,29 @@ use super::{
     config::{ResponsesFormatConfig, build_config},
     error::responses_error_rejection_with_code,
     extract_conversation_id,
-    routes::{self as responses_routes, ResponsesOperation},
+    routes::{self as responses_routes},
     state::ResponsesState,
 };
 use crate::{
     classifier::{AiRequestFormat, ClassifiedRequest, classify_object, empty_result},
-    operation::Transport,
+    operation::{RequestBody, Transport},
 };
 
 /// Filter name as configured in a pipeline.
 const FILTER_NAME: &str = "openai_responses_request";
 
-/// Processes the Responses create request body once and initializes state.
+/// Processes a Responses request body once and initializes state.
 ///
-/// Replaces the `openai_responses_format` and `openai_responses_validate` pair
-/// for create requests. Configuration is unchanged from
-/// `openai_responses_format`, so a chain that ran both swaps them for this one
-/// filter and keeps the same `on_invalid` and `headers` settings.
+/// Replaces the `openai_responses_format` and `openai_responses_validate` pair.
+/// Configuration is unchanged from `openai_responses_format`, so a chain that
+/// ran both swaps them for this one filter and keeps the same `on_invalid` and
+/// `headers` settings.
 ///
-/// The operation is recognized from the request head, so only `POST
-/// /v1/responses` is processed. Every other request — including Conversations
-/// API traffic and the `WebSocket` handshake at the same path — is released
-/// untouched, and `on_invalid` governs only bodies that fail to parse.
+/// The operation is recognized from the request head, and the registry decides
+/// which operations carry a body worth parsing: create, compact, and input
+/// token counts. Bodyless operations — fetch, delete, cancel, list input items,
+/// and the `WebSocket` handshake — are released untouched, as is Conversations
+/// API traffic. `on_invalid` governs only bodies that fail to parse.
 ///
 /// Rejects `background=true` with a 400, matching `openai_responses_format`,
 /// because Praxis does not implement the asynchronous Responses lifecycle.
@@ -127,11 +128,22 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if !is_create_response(ctx) {
+        let Some(body_shape) = matched_request_body(ctx) else {
             trace!(
                 method = %ctx.request.method,
                 path = ctx.request.uri.path(),
-                "not the Responses create operation"
+                "not a body-bearing Responses operation"
+            );
+            return Ok(FilterAction::Release);
+        };
+
+        // An operation whose body the specification marks optional is complete
+        // without one, so an absent body is not an invalid body and must not
+        // reach `on_invalid`.
+        if !body_shape.is_required() && body.as_deref().is_none_or(<[u8]>::is_empty) {
+            trace!(
+                path = ctx.request.uri.path(),
+                "optional request body absent, nothing to parse"
             );
             return Ok(FilterAction::Release);
         }
@@ -279,15 +291,22 @@ fn classify_matched_operation(obj: &serde_json::Map<String, serde_json::Value>) 
     classified
 }
 
-/// Whether this request is the Responses create operation.
+/// The declared request-body shape when this is a body-bearing operation.
 ///
 /// Resolved from the request head through the shared registry — the same source
 /// of truth the `openai_operation` classifier uses — so no body heuristic
 /// decides whether this filter applies, and the filter works whether or not the
 /// classifier is present in the chain.
-fn is_create_response(ctx: &HttpFilterContext<'_>) -> bool {
+///
+/// The registry already records which operations declare a request body and
+/// whether it is required, so that declaration selects what is worth parsing
+/// rather than a hand-written path list that can drift from it. Bodyless
+/// operations — fetch, delete, cancel, list input items, and the `WebSocket`
+/// handshake — yield `None` and are released untouched.
+fn matched_request_body(ctx: &HttpFilterContext<'_>) -> Option<RequestBody> {
     responses_routes::match_route(ctx.request.method.as_str(), ctx.request.uri.path(), Transport::Http)
-        .is_some_and(|route| route.spec.operation == ResponsesOperation::CreateResponse)
+        .map(|route| route.spec.request_body())
+        .filter(|shape| shape.is_present())
 }
 
 /// Parse a create body once and extract its routing facts.

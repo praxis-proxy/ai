@@ -18,7 +18,7 @@ Pipeline overview for filters under `apis/src/openai/responses/`.
 - **`openai_responses_model_rewrite`** — Rewrites the `model` field in Responses and Chat Completions request bodies.
 - **`openai_responses_proxy`** — Rebuilds the request body from `ResponsesState` when present.
 - **`openai_responses_rehydrate`** — Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input).
-- **`openai_responses_request`** — Processes the Responses create request body once and initializes state.
+- **`openai_responses_request`** — Processes a Responses request body once and initializes state.
 - **`openai_responses_validate`** — Validates and enriches Responses API requests.
 - **`openai_stream_events`** — Composes the current IRR execution into one logical Responses stream.
 - **`openai_tool_parse`** — Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body.

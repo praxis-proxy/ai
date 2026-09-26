@@ -55,7 +55,7 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_responses_model_rewrite`](openai_responses_model_rewrite.md) | Rewrites the `model` field in Responses and Chat Completions request bodies. |
 | [`openai_responses_proxy`](openai_responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
 | [`openai_responses_rehydrate`](openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |
-| [`openai_responses_request`](openai_responses_request.md) | Processes the Responses create request body once and initializes state. |
+| [`openai_responses_request`](openai_responses_request.md) | Processes a Responses request body once and initializes state. |
 | [`openai_responses_validate`](openai_responses_validate.md) | Validates and enriches Responses API requests. |
 | [`openai_stream_events`](openai_stream_events.md) | Composes the current IRR execution into one logical Responses stream. |
 | [`openai_tool_parse`](openai_tool_parse.md) | Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body. |
