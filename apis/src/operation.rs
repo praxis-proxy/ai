@@ -406,7 +406,10 @@ fn is_parameter_segment(segment: &str) -> bool {
 /// Applies the shared policy: any query string is ignored, and exactly one
 /// trailing slash is tolerated on a non-root path. Callers that already pass a
 /// query-free path are unaffected.
-fn normalize_path(path: &str) -> &str {
+///
+/// Shared by the registry matchers and by filters that recognize an endpoint
+/// by path, so endpoint detection never diverges from routing normalization.
+pub fn normalize_path(path: &str) -> &str {
     let path = path.split('?').next().unwrap_or(path);
     path.strip_suffix('/').filter(|path| !path.is_empty()).unwrap_or(path)
 }
