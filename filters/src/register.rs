@@ -14,6 +14,8 @@ use crate::GcpAdcFilter;
 use crate::HttpCalloutFilter;
 #[cfg(feature = "aws-sigv4-filter")]
 use crate::Sigv4SignFilter;
+#[cfg(feature = "token-ceiling-filter")]
+use crate::TokenCeilingFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 use crate::TokenRateLimitFilter;
 use crate::{
@@ -180,6 +182,11 @@ fn register_token_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "token_rate_limit" => TokenRateLimitFilter::from_config
+    );
+    #[cfg(feature = "token-ceiling-filter")]
+    praxis_filter::register_filters!(
+        @register registry,
+        http "token_ceiling" => TokenCeilingFilter::from_config
     );
 }
 
@@ -753,6 +760,7 @@ provider:
         assert_experimental_registration(&names, "azure_ad", cfg!(feature = "azure-ad-filter"));
         assert_experimental_registration(&names, "gcp_adc", cfg!(feature = "gcp-adc-filter"));
         assert_experimental_registration(&names, "token_rate_limit", cfg!(feature = "token-rate-limit-filter"));
+        assert_experimental_registration(&names, "token_ceiling", cfg!(feature = "token-ceiling-filter"));
     }
 
     /// Every opt-in filter paired with whether its cargo feature is enabled.

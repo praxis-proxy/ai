@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+commit_msg_file=${1:?commit message file is required}
+
+if ! grep -Eq '^Signed-off-by: [^<[:space:]][^<]* <[^>[:space:]][^>]*>$' "$commit_msg_file"; then
+    echo "commit-msg: missing or invalid Signed-off-by trailer"
+    echo "commit-msg: create the commit with: git commit --signoff"
+    exit 1
+fi

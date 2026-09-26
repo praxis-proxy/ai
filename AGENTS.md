@@ -108,6 +108,16 @@ for handling `praxis-bot` automated review comments.
   final commit on the target branch is always clean
   regardless of intermediate fixup commits.
 
+## DCO
+
+- Every non-merge commit must include a `Signed-off-by:` trailer for the human
+  contributor responsible for the change. Create commits with `git commit
+  --signoff`.
+- Run `make setup-hooks` once per checkout. It installs the local `commit-msg`
+  hook, which rejects commits without a valid `Signed-off-by:` trailer.
+- Before pushing, verify the commits being submitted with:
+  `git log --format='%h %s%n%b' <base>..HEAD`.
+
 ## Test Requirements
 
 New capabilities require:

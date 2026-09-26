@@ -100,6 +100,8 @@ mod responses_to_chat_completions_reasoning;
 #[cfg(feature = "store-sqlite")]
 mod session_replay;
 mod time_to_first_token;
+#[cfg(feature = "token-ceiling-filter")]
+mod token_ceiling;
 mod token_count;
 mod token_counting;
 #[cfg(feature = "token-rate-limit-filter")]

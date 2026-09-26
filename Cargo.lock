@@ -3592,6 +3592,7 @@ dependencies = [
  "serde_json_path",
  "tempfile",
  "thiserror",
+ "tiktoken-rs",
  "tokio",
  "tokio-util",
  "tracing",

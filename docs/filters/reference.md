@@ -156,5 +156,6 @@ see the [Praxis core filter reference][core-ref].
 
 | Filter | Description |
 |--------|-------------|
+| [`token_ceiling`](token_ceiling.md) | Rejects provider-bound requests whose estimated prompt or requested output exceeds configured limits. Missing output-limit fields are rejected when `max_output_tokens` is configured; this strict behavior prevents providers from applying an unbounded model default. |
 | [`token_count`](token_count.md) | Extracts token usage from AI inference responses and writes unified counts to [`filter_metadata`]. |
 | [`token_usage_headers`](token_usage_headers.md) | Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [`filter_metadata`]. Also injects `Praxis-Token-Status` when usage capture failed (e.g. overflow), so an unavailable count is never silently indistinguishable from a genuine zero. |

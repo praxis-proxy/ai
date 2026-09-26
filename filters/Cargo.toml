@@ -59,6 +59,10 @@ gcp-adc-filter = ["experimental", "dep:reqwest"]
 # optional so the rest of the crate (and its consumers) don't compile the
 # Valkey client and its transitive deps unless this feature is on.
 token-rate-limit-filter = ["experimental", "dep:redis", "dep:thiserror"]
+# Experimental pre-forward input/output token ceiling guard.  Kept separate
+# from token-rate-limit-filter because static request admission must fail
+# closed independently of quota-backend health.
+token-ceiling-filter = ["experimental", "dep:tiktoken-rs"]
 # Marker feature activated transitively by any experimental feature, mirroring
 # praxis core's server crate. Lets consumers gate on "anything experimental".
 experimental = []
@@ -95,6 +99,7 @@ serde_json_canonicalizer = { workspace = true }
 serde_json_path = { workspace = true, optional = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true, optional = true }
+tiktoken-rs = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

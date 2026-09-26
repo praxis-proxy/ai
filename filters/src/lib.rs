@@ -29,6 +29,8 @@ pub mod prompt_enrich;
 mod register;
 pub mod routing;
 mod time_to_first_token;
+#[cfg(feature = "token-ceiling-filter")]
+mod token_ceiling;
 #[cfg(feature = "token-rate-limit-filter")]
 mod token_rate_limit;
 mod token_usage;
@@ -50,6 +52,8 @@ pub use prompt_enrich::PromptEnrichFilter;
 pub use register::{build_ai_registry, install_pipeline_extensions, register_ai_filters};
 pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteFilter};
 pub use time_to_first_token::TimeToFirstTokenFilter;
+#[cfg(feature = "token-ceiling-filter")]
+pub use token_ceiling::TokenCeilingFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 pub use token_rate_limit::TokenRateLimitFilter;
 pub use token_usage::{TokenCountFilter, TokenUsageHeadersFilter};

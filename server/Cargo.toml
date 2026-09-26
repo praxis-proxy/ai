@@ -61,6 +61,7 @@ gcp-adc-filter = ["praxis-ai-filters/gcp-adc-filter", "experimental"]
 basic-auth-filter = ["praxis-filter/basic-auth-filter", "experimental"]
 # Experimental: the token_rate_limit filter (see praxis-ai-filters).
 token-rate-limit-filter = ["praxis-ai-filters/token-rate-limit-filter", "experimental"]
+token-ceiling-filter = ["praxis-ai-filters/token-ceiling-filter", "experimental"]
 # Marker feature activated transitively by any experimental feature.
 experimental = ["praxis-ai-filters/experimental"]
 opentelemetry = ["praxis-ai-filters/opentelemetry"]
