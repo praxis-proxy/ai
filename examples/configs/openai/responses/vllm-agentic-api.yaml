@@ -18,7 +18,7 @@ listeners:
 filter_chains:
   - name: agentic-api-passthrough
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
         on_invalid: continue
 
       - filter: router

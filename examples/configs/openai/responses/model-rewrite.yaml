@@ -4,7 +4,7 @@
 # and Chat Completions request bodies before forwarding to the
 # inference backend.
 #
-# This pipeline uses `openai_responses_format` to classify the
+# This pipeline uses `openai_responses_request` to classify the
 # request, then `openai_responses_model_rewrite` to apply alias
 # mapping. The router uses the effective model header to select
 # the backend cluster, so routing reflects the rewritten model,
@@ -28,7 +28,7 @@ listeners:
 filter_chains:
   - name: model-rewrite-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
         on_invalid: continue
         headers:
           format: x-praxis-ai-format

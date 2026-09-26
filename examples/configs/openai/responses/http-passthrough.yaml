@@ -6,7 +6,7 @@
 # client may probe. This pipeline does the minimum work required
 # to classify and route the traffic:
 #
-#   1. `openai_responses_format` classifies the request and
+#   1. `openai_responses_request` classifies the request and
 #      promotes `x-praxis-ai-format: openai_responses` for the
 #      router. `on_invalid: continue` lets non-Responses traffic
 #      reach the router without being rejected.
@@ -40,7 +40,7 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
         on_invalid: continue
         headers:
           format: x-praxis-ai-format

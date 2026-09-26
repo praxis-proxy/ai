@@ -11,7 +11,7 @@
 #   GET  /v1/responses/{id}/input_items — paginated input items
 #   DELETE /v1/responses/{id}   — deleted from local store (200 or 404)
 #
-# The `openai_responses_format` filter must run before the store to classify
+# The `openai_responses_request` filter must run before the store to classify
 # the request body — `openai_response_store` reads its metadata to decide
 # whether to persist POST responses.
 #
@@ -21,7 +21,7 @@
 # boundary and the versioned assertion format.
 #
 # POST persistence:
-#   The `openai_responses_format` filter must run before the store to
+#   The `openai_responses_request` filter must run before the store to
 #   classify the request body — `openai_response_store` reads its
 #   metadata to decide whether to persist. Streaming responses
 #   (`stream: true`) are skipped; streaming persistence will be
@@ -47,7 +47,7 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
 
       - filter: state_owner
         mode: single_tenant
