@@ -791,6 +791,33 @@ class TestOpenAIConversations:
         assert item.content[0].type == "input_text"
         assert item.content[0].text == "hello"
 
+    def test_configuration_update_item_round_trip(self, openai_client):
+        conversation = openai_client.conversations.create()
+
+        created = openai_client.conversations.items.create(
+            conversation.id,
+            items=[
+                {
+                    "type": "configuration_update",
+                    "reasoning": {"effort": "high"},
+                },
+            ],
+        )
+
+        item = created.data[0]
+        assert item.id.startswith("item_")
+        assert item.type == "configuration_update"
+        assert item.reasoning.effort == "high"
+
+        page = openai_client.conversations.items.list(
+            conversation.id,
+            order="asc",
+        )
+        listed = page.data[0]
+        assert listed.id == item.id
+        assert listed.type == "configuration_update"
+        assert listed.reasoning.effort == "high"
+
     def test_item_create_returns_all_items(self, openai_client):
         conversation = openai_client.conversations.create()
 
