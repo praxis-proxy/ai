@@ -261,12 +261,14 @@ audit:
 	cargo audit
 	cargo deny check
 
-# The plain (uninstrumented) binary serves the suite's subprocess tests;
-# building it inside the coverage run would inherit llvm-cov's RUSTFLAGS
-# and target dir and rebuild the world mid-test (see praxis_ai_bin).
+# The suite's subprocess tests use the praxis-ai binary that cargo llvm-cov
+# builds anyway (the server crate has integration tests, so cargo builds its
+# bin target). The harness cannot find it on its own because llvm-cov sets
+# --target-dir on the command line rather than CARGO_TARGET_DIR, so name it
+# here; a separate uninstrumented build would recompile the whole workspace
+# a second time (see praxis_ai_bin).
 coverage-check:
-	cargo build -p praxis-ai-proxy --bin praxis-ai
-	PRAXIS_AI_BIN=$(abspath target/debug/praxis-ai) \
+	PRAXIS_AI_BIN=$(abspath target/llvm-cov-target/debug/praxis-ai) \
 	cargo llvm-cov --workspace --features $(STORE_ALL_WORKSPACE_FEATURES) --json \
 		--exclude xtask \
 		--ignore-filename-regex '(target/|tests/|store/postgres\.rs)' \
