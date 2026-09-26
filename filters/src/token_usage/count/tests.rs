@@ -1693,6 +1693,80 @@ async fn run_json_extraction(
     )
 }
 
+/// `StreamBuffer` chains deliver each raw chunk to filters *and* re-deliver the
+/// frozen full buffer at end-of-stream. JSON extraction must read the EOS
+/// buffer alone, not the concatenation of both views.
+#[tokio::test]
+async fn json_stream_buffer_double_delivery_extracts_once() {
+    let json = br#"{"usage":{"input_tokens":15,"output_tokens":42}}"#;
+    let filter = make_filter(ProviderKind::Anthropic);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    // The runtime upgrade a dialect-translation filter performs for JSON responses.
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let raw = Bytes::copy_from_slice(json);
+    let mut chunk = Some(raw.clone());
+    drop(filter.on_response_body(&mut ctx, &mut chunk, false).unwrap());
+
+    let mut frozen = Some(raw);
+    drop(filter.on_response_body(&mut ctx, &mut frozen, true).unwrap());
+
+    assert_eq!(
+        ctx.get_metadata("token.input"),
+        Some("15"),
+        "the EOS frozen buffer must be parsed exactly once"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.output"),
+        Some("42"),
+        "output tokens should match"
+    );
+}
+
+/// When a buffered chain releases its buffer mid-stream, the EOS call carries
+/// no body; extraction must then fall back to the hex-accumulated raw chunks.
+#[tokio::test]
+async fn json_stream_buffer_released_falls_back_to_chunks() {
+    let json = br#"{"usage":{"input_tokens":7,"output_tokens":11}}"#;
+    let filter = make_filter(ProviderKind::Anthropic);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/messages");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+
+    let mut resp = make_response_with_content_type("application/json");
+    ctx.response_header = Some(&mut resp);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+    ctx.response_header = None;
+
+    ctx.response_body_mode = BodyMode::StreamBuffer { max_bytes: None };
+
+    let mid = json.len() / 2;
+    let mut first = Some(Bytes::copy_from_slice(&json[..mid]));
+    drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+    let mut second = Some(Bytes::copy_from_slice(&json[mid..]));
+    drop(filter.on_response_body(&mut ctx, &mut second, false).unwrap());
+
+    let mut eos: Option<Bytes> = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
+
+    assert_eq!(
+        ctx.get_metadata("token.input"),
+        Some("7"),
+        "released buffers must still extract from the streamed chunks"
+    );
+    assert_eq!(
+        ctx.get_metadata("token.output"),
+        Some("11"),
+        "output tokens should match"
+    );
+}
+
 /// Run a full `on_response` -> `on_response_body` cycle and return the prompt
 /// cache breakdown metadata for either the JSON or the SSE path.
 async fn run_cache_extraction(
