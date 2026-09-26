@@ -105,6 +105,72 @@ allow_private_endpoint: true
     );
 }
 
+#[test]
+fn config_provider_parses() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+provider: "openai-prod"
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+
+    assert_eq!(filter.provider.as_deref(), Some("openai-prod"));
+}
+
+#[test]
+fn config_without_provider_leaves_it_unset() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(
+        r#"
+metering_url: "http://metering:8080"
+"#,
+    )
+    .unwrap();
+    let filter = build_filter(&yaml).unwrap();
+
+    assert!(filter.provider.is_none());
+}
+
+// -----------------------------------------------------------------------------
+// Provider Resolution
+// -----------------------------------------------------------------------------
+
+#[test]
+fn resolve_provider_prefers_configured_value() {
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str("metering_url: \"http://metering:8080\"\nprovider: \"configured\"\n").unwrap();
+    let filter = build_filter(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    // Even when a cluster is routed, the static config value wins.
+    ctx.cluster = Some(std::sync::Arc::from("routed-cluster"));
+
+    assert_eq!(filter.resolve_provider(&ctx), "configured");
+}
+
+#[test]
+fn resolve_provider_falls_back_to_cluster_name() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("metering_url: \"http://metering:8080\"\n").unwrap();
+    let filter = build_filter(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.cluster = Some(std::sync::Arc::from("routed-cluster"));
+
+    assert_eq!(filter.resolve_provider(&ctx), "routed-cluster");
+}
+
+#[test]
+fn resolve_provider_empty_when_neither_present() {
+    let yaml: serde_yaml::Value = serde_yaml::from_str("metering_url: \"http://metering:8080\"\n").unwrap();
+    let filter = build_filter(&yaml).unwrap();
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    // No configured provider and no routed cluster (the ext-proc data path).
+    let ctx = make_filter_context(&req);
+
+    assert_eq!(filter.resolve_provider(&ctx), "");
+}
+
 // -----------------------------------------------------------------------------
 // Fallback Runtime Behavior
 // -----------------------------------------------------------------------------
@@ -311,6 +377,7 @@ fn usage_event_has_correct_structure() {
         total: 150,
         cache_read: 80,
         cache_write: 20,
+        reasoning: 30,
     };
 
     let event = build_usage_event(&event_ctx("evt-1", &state), &tokens);
@@ -323,8 +390,57 @@ fn usage_event_has_correct_structure() {
     assert_eq!(event["data"]["total_tokens"], 150);
     assert_eq!(event["data"]["cached_input_tokens"], 80);
     assert_eq!(event["data"]["cache_creation_tokens"], 20);
+    assert_eq!(event["data"]["reasoning_tokens"], 30);
     assert_eq!(event["data"]["duration_ms"], 500);
     assert_eq!(event["data"]["model"], "gpt-4");
+}
+
+#[test]
+fn usage_event_carries_reasoning_tokens() {
+    let state = state_for("testuser", "o1");
+    let tokens = TokenCounts {
+        input: 10,
+        output: 90,
+        total: 100,
+        cache_read: 0,
+        cache_write: 0,
+        reasoning: 64,
+    };
+
+    let event = build_usage_event(&event_ctx("evt-r", &state), &tokens);
+
+    assert_eq!(
+        event["data"]["reasoning_tokens"], 64,
+        "reasoning tokens published by token_count must reach the usage CloudEvent"
+    );
+}
+
+#[test]
+fn token_counts_read_includes_reasoning() {
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let mut ctx = make_filter_context(&req);
+    ctx.filter_metadata
+        .insert(META_TOKEN_REASONING.to_owned(), "17".to_owned());
+
+    let tokens = TokenCounts::read(&ctx);
+
+    assert_eq!(
+        tokens.reasoning, 17,
+        "TokenCounts::read must pick up the token.reasoning key"
+    );
+}
+
+#[test]
+fn token_counts_read_defaults_reasoning_to_zero() {
+    let req = make_request(http::Method::POST, "/v1/chat/completions");
+    let ctx = make_filter_context(&req);
+
+    let tokens = TokenCounts::read(&ctx);
+
+    assert_eq!(
+        tokens.reasoning, 0,
+        "absent token.reasoning must read as zero, not error"
+    );
 }
 
 #[test]

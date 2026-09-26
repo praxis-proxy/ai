@@ -18,6 +18,7 @@ Tenant identity is resolved from the highest-trust source available: verified `{
 | `timeout_seconds` | integer | no | HTTP timeout in seconds for all metering calls. |
 | `feature_key` | string | no | Entitlement feature key used in balance check URL path. |
 | `source` | string | no | `CloudEvents` `source` field value. |
+| `provider` | string | no | Static provider name attributed to emitted `CloudEvents`. |
 | `fail_open` | bool | no | When `true` (default), requests proceed if the metering service is unavailable. When `false`, requests are rejected with 503. |
 | `identity_header_prefix` | string | no | Prefix for tenant identity headers to capture and strip. Expected headers: `{prefix}username`, `{prefix}group`, `{prefix}subscription`, `{prefix}model`. |
 | `identity_metadata_namespace` | string | no | Metadata namespace the `identity_header_guard` filter writes captured identity headers under. Must match that filter's `metadata_namespace` setting when both run in one pipeline. |
@@ -32,6 +33,7 @@ metering_url: "http://metering-service:8080"
 timeout_seconds: 5
 feature_key: "inference-tokens"
 source: "ai-gateway"
+provider: "openai"
 fail_open: true
 identity_header_prefix: "x-tenant-"
 identity_metadata_namespace: "identity"

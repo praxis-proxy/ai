@@ -31,6 +31,7 @@ const DEFAULT_IDENTITY_METADATA_NAMESPACE: &str = "identity";
 /// timeout_seconds: 5
 /// feature_key: "inference-tokens"
 /// source: "ai-gateway"
+/// provider: "openai"
 /// fail_open: true
 /// identity_header_prefix: "x-tenant-"
 /// identity_metadata_namespace: "identity"
@@ -60,6 +61,10 @@ pub(super) struct ExternalMeteringConfig {
     /// `CloudEvents` `source` field value.
     #[serde(default = "default_source")]
     pub source: String,
+
+    /// Static provider name attributed to emitted `CloudEvents`.
+    #[serde(default)]
+    pub provider: Option<String>,
 
     /// When `true` (default), requests proceed if the metering service
     /// is unavailable. When `false`, requests are rejected with 503.

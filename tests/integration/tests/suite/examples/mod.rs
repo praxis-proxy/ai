@@ -22,6 +22,7 @@ mod azure_translation;
 mod client_tool_compat_chat_completions;
 #[cfg(feature = "store-sqlite")]
 mod compact;
+mod credential_inject_parity;
 mod credential_injection;
 mod external_metering;
 mod file_search_callout;
