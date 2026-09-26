@@ -13,7 +13,9 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use pingora_core::server::{RunArgs, ShutdownSignal, ShutdownSignalWatch};
+use pingora_core::server::RunArgs;
+#[cfg(unix)]
+use pingora_core::server::{ShutdownSignal, ShutdownSignalWatch};
 use praxis_core::{
     config::{Config, Listener},
     server::RuntimeOptions,
@@ -185,11 +187,16 @@ pub fn build_pipeline(config: &Config) -> FilterPipeline {
 // -----------------------------------------------------------------------------
 
 /// Signals a Pingora server to shut down when notified.
+///
+/// Pingora exposes [`RunArgs::shutdown_signal`] only on Unix. Windows
+/// `main_loop` waits for Ctrl+C instead, so this watcher is Unix-only.
+#[cfg(unix)]
 struct NotifyShutdownWatch {
     /// Fires when the corresponding [`ProxyGuard`] is dropped.
     notify: Arc<Notify>,
 }
 
+#[cfg(unix)]
 #[async_trait::async_trait]
 impl ShutdownSignalWatch for NotifyShutdownWatch {
     async fn recv(&self) -> ShutdownSignal {
@@ -386,6 +393,20 @@ fn build_pingora_server(
     server
 }
 
+/// Address of the first configured listener.
+///
+/// # Panics
+///
+/// Panics if `config.listeners` is empty.
+fn first_listener_address(config: &Config) -> String {
+    config
+        .listeners
+        .first()
+        .expect("config must have at least one listener")
+        .address
+        .clone()
+}
+
 /// Build a [`ProxyGuard`] by spawning a Pingora server that
 /// shuts down when the guard is dropped.
 fn spawn_proxy_server(
@@ -393,12 +414,7 @@ fn spawn_proxy_server(
     registry: &FilterRegistry,
     client: &praxis_core::subrequest::SubRequestClient,
 ) -> ProxyGuard {
-    let addr = config
-        .listeners
-        .first()
-        .expect("config must have at least one listener")
-        .address
-        .clone();
+    let addr = first_listener_address(config);
     let server = build_pingora_server(config, registry, client);
 
     let notify = Arc::new(Notify::new());
@@ -406,9 +422,15 @@ fn spawn_proxy_server(
     let (completion_tx, completion) = mpsc::sync_channel(1);
 
     let handle = std::thread::spawn(move || {
+        #[cfg(unix)]
         server.run(RunArgs {
             shutdown_signal: Box::new(NotifyShutdownWatch { notify: watch_notify }),
         });
+        #[cfg(windows)]
+        {
+            let _ = watch_notify;
+            server.run(RunArgs::default());
+        }
         let _sent = completion_tx.send(());
     });
 
@@ -702,6 +724,7 @@ mod tests {
     use super::{ProxyGuard, ProxyShutdownError, simple_proxy_yaml, start_proxy};
     use crate::free_port_guard;
 
+    #[cfg(unix)]
     #[test]
     fn explicit_shutdown_joins_real_proxy_and_releases_listener() {
         let proxy_port = free_port_guard().release();
@@ -722,6 +745,7 @@ mod tests {
             .expect("explicit shutdown should be idempotent after join");
     }
 
+    #[cfg(unix)]
     #[test]
     fn drop_fallback_joins_real_proxy_and_releases_listener() {
         let proxy_port = free_port_guard().release();

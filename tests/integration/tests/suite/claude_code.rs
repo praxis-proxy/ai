@@ -299,9 +299,9 @@ fn content_contains(val: &serde_json::Value, needle: &str) -> bool {
     false
 }
 
-fn terminate_process_group(process_group_id: Option<u32>, child: &mut tokio::process::Child) {
+fn terminate_process_group(_process_group_id: Option<u32>, child: &mut tokio::process::Child) {
     #[cfg(unix)]
-    if let Some(id) = process_group_id {
+    if let Some(id) = _process_group_id {
         let id = i32::try_from(id).expect("child PID should fit in i32");
         match kill(Pid::from_raw(-id), Signal::SIGKILL) {
             Ok(()) | Err(Errno::ESRCH) => return,

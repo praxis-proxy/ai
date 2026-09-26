@@ -464,10 +464,14 @@ pub(super) async fn record_live(
         turns,
     };
     sanitize_fixture_preserving_structure(&mut fixture, rules)?;
+    // Credential and other commit-safety violations must be reported before
+    // turn expectations. A non-200 client status would otherwise hide a
+    // configured credential at `$/provenance/model` or other captured
+    // surfaces, which secret-scanning tests rely on as the recorded error.
+    validate_commit_safe_with_rules_and_credentials(&fixture, rules, &recorder.shared.target.outbound_headers)?;
     for (turn_index, (turn, expectation)) in fixture.turns.iter().zip(&expectations).enumerate() {
         validate_expectation(turn_index, turn, expectation)?;
     }
-    validate_commit_safe_with_rules_and_credentials(&fixture, rules, &recorder.shared.target.outbound_headers)?;
     Ok(fixture)
 }
 

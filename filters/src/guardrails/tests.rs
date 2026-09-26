@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
+use praxis_filter::{HttpFilter, HttpFilterContext};
+
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
     filter::AiGuardrailsFilter,
+    providers::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult},
 };
 
 // =============================================================================
@@ -12,7 +15,7 @@ use super::{
 
 /// Build an `ai_guardrails` filter configured with a `nemo` provider pointed
 /// at `endpoint`. Request phase enabled, response phase disabled (default).
-fn nemo_filter(endpoint: &str) -> Box<dyn praxis_filter::HttpFilter> {
+fn nemo_filter(endpoint: &str) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 provider:
@@ -25,7 +28,7 @@ provider:
 }
 
 /// Build an `ai_guardrails` filter with response phase enabled.
-fn nemo_filter_response(endpoint: &str) -> Box<dyn praxis_filter::HttpFilter> {
+fn nemo_filter_response(endpoint: &str) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(&format!(
         r#"
 provider:
@@ -38,6 +41,37 @@ phase:
     ))
     .unwrap();
     AiGuardrailsFilter::from_config(&yaml).unwrap()
+}
+
+/// Mount a JSON `/v1/checks` response on `mock_server`.
+async fn mount_nemo_checks_response(mock_server: &wiremock::MockServer, body: serde_json::Value) {
+    mount_nemo_checks_responses(mock_server, vec![body]).await;
+}
+
+/// Mount sequential JSON `/v1/checks` responses, one per callout.
+async fn mount_nemo_checks_responses(mock_server: &wiremock::MockServer, bodies: Vec<serde_json::Value>) {
+    use std::sync::Mutex;
+
+    use wiremock::{Mock, Request, Respond, ResponseTemplate, matchers::method};
+
+    struct SequentialJson(Mutex<std::vec::IntoIter<serde_json::Value>>);
+
+    impl Respond for SequentialJson {
+        fn respond(&self, _: &Request) -> ResponseTemplate {
+            let body = self
+                .0
+                .lock()
+                .expect("sequence mutex")
+                .next()
+                .expect("unexpected extra NeMo call");
+            ResponseTemplate::new(200).set_body_json(body)
+        }
+    }
+
+    Mock::given(method("POST"))
+        .respond_with(SequentialJson(Mutex::new(bodies.into_iter())))
+        .mount(mock_server)
+        .await;
 }
 
 /// A valid OpenAI Chat Completion response body for testing.
@@ -92,6 +126,79 @@ fn assert_error_body_json(body: &bytes::Bytes, expected_code: &str) {
         let error = json.get("error").expect("body should have an 'error' key");
         assert_eq!(error.get("code").and_then(|v| v.as_str()), Some(expected_code));
     }
+}
+
+/// Read a JSON string at `pointer`, or `None` if the path is missing or not a string.
+fn json_str<'a>(value: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
+    value.pointer(pointer).and_then(serde_json::Value::as_str)
+}
+
+/// Assert request-phase redaction recorded `redacted` and rewrote every listed user turn.
+fn assert_request_users_redacted(ctx: &HttpFilterContext<'_>, body: &bytes::Bytes, expected_messages: &[(&str, &str)]) {
+    assert_eq!(
+        ctx.filter_results.get("ai_guardrails").and_then(|r| r.get("status")),
+        Some("redacted")
+    );
+    assert_no_injected_content_length(ctx);
+    assert_forwarded_messages(body, expected_messages);
+}
+
+/// Assert the filter did not inject a `content-length` header.
+fn assert_no_injected_content_length(ctx: &HttpFilterContext<'_>) {
+    assert!(
+        ctx.extra_request_headers
+            .iter()
+            .all(|(k, _)| k.as_ref() != "content-length"),
+        "filter must not set content-length (core handles framing)"
+    );
+}
+
+/// Assert the forwarded request body matches `expected_messages` in order.
+fn assert_forwarded_messages(body: &bytes::Bytes, expected_messages: &[(&str, &str)]) {
+    let forwarded: serde_json::Value = serde_json::from_slice(body).expect("forwarded JSON");
+    assert_eq!(
+        json_str(&forwarded, "/model"),
+        Some("test"),
+        "non-message fields should be preserved"
+    );
+    let messages = forwarded
+        .get("messages")
+        .and_then(|value| value.as_array())
+        .expect("messages should be an array");
+    assert_eq!(messages.len(), expected_messages.len());
+    for (index, (role, content)) in expected_messages.iter().enumerate() {
+        assert_eq!(
+            messages.get(index).and_then(|message| json_str(message, "/role")),
+            Some(*role),
+            "message {index} role"
+        );
+        assert_eq!(
+            messages.get(index).and_then(|message| json_str(message, "/content")),
+            Some(*content),
+            "message {index} content"
+        );
+    }
+}
+
+/// Assert response-phase redaction rewrote assistant `content` and stayed valid JSON.
+fn assert_redacted_assistant_content(
+    ctx: &HttpFilterContext<'_>,
+    body: &bytes::Bytes,
+    original_len: usize,
+    expected: &str,
+) {
+    assert_eq!(body.len(), original_len, "must match original Content-Length");
+    assert_eq!(
+        ctx.filter_results.get("ai_guardrails").and_then(|r| r.get("status")),
+        Some("redacted")
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(body.trim_ascii_end()).expect("redacted body should remain valid JSON");
+    assert_eq!(
+        json_str(&json, "/choices/0/message/content"),
+        Some(expected),
+        "assistant content should be replaced with NeMo content"
+    );
 }
 
 /// Extract the [`praxis_filter::Rejection`] from a [`praxis_filter::FilterAction`],
@@ -504,33 +611,108 @@ async fn on_request_body_blocked_writes_filter_results() {
 }
 
 #[tokio::test]
-async fn on_request_body_modified_records_redaction_without_changing_body() {
-    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+async fn on_request_body_modified_rewrites_last_user_message() {
+    use wiremock::MockServer;
 
     let mock_server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "status": "modified",
-            "content": "masked",
-            "rail": "pii"
-        })))
-        .mount(&mock_server)
-        .await;
+    mount_nemo_checks_responses(
+        &mock_server,
+        vec![
+            serde_json::json!({"status": "passed", "content": "first"}),
+            serde_json::json!({"status": "modified", "content": "masked text", "rail": "pii"}),
+        ],
+    )
+    .await;
 
-    let endpoint = format!("{}/v1/checks", mock_server.uri());
-    let filter = nemo_filter(&endpoint);
+    let filter = nemo_filter(&format!("{}/v1/checks", mock_server.uri()));
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    let original = bytes::Bytes::from_static(br#"{"messages":[{"role":"user","content":"secret"}]}"#);
-    let mut body = Some(original.clone());
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"model":"test","messages":[{"role":"system","content":"Be helpful"},{"role":"user","content":"first"},{"role":"assistant","content":"ok"},{"role":"user","content":"my email is secret@example.com"}]}"#,
+    ));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
     assert!(matches!(action, praxis_filter::FilterAction::Continue));
-    assert_eq!(
-        ctx.filter_results.get("ai_guardrails").unwrap().get("status"),
-        Some("redacted")
+    assert_request_users_redacted(
+        &ctx,
+        body.as_ref().expect("forwarded body"),
+        &[
+            ("system", "Be helpful"),
+            ("user", "first"),
+            ("assistant", "ok"),
+            ("user", "masked text"),
+        ],
     );
-    assert_eq!(body, Some(original));
+}
+
+#[tokio::test]
+async fn on_request_body_modified_rewrites_all_user_messages() {
+    use wiremock::MockServer;
+
+    let mock_server = MockServer::start().await;
+    mount_nemo_checks_responses(
+        &mock_server,
+        vec![
+            serde_json::json!({"status": "modified", "content": "My mail is <EMAIL>", "rail": "pii"}),
+            serde_json::json!({"status": "modified", "content": "my credit card is <CREDIT-CARD>", "rail": "pii"}),
+        ],
+    )
+    .await;
+
+    let filter = nemo_filter(&format!("{}/v1/checks", mock_server.uri()));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"model":"test","messages":[{"role":"user","content":"My mail is xxx@gmail.com"},{"role":"assistant","content":"No."},{"role":"user","content":"my credit card is 1234-5678-92211"}]}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    assert_request_users_redacted(
+        &ctx,
+        body.as_ref().expect("forwarded body"),
+        &[
+            ("user", "My mail is <EMAIL>"),
+            ("assistant", "No."),
+            ("user", "my credit card is <CREDIT-CARD>"),
+        ],
+    );
+}
+
+/// Provider that always returns [`GuardResult::Redact`] so the rewrite
+/// path can be tested when `NeMo` would skip `/v1/checks` (no user turn).
+struct AlwaysRedactProvider;
+
+#[async_trait::async_trait]
+impl GuardProvider for AlwaysRedactProvider {
+    async fn evaluate(
+        &self,
+        _messages: Vec<serde_json::Value>,
+        _phase: GuardPhase,
+        _runtime: &GuardCalloutRuntime<'_>,
+    ) -> Result<GuardResult, praxis_filter::FilterError> {
+        Ok(GuardResult::Redact {
+            replacements: Vec::new(),
+            reason: "pii".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn on_request_body_modified_without_user_message_fails_closed() {
+    let filter =
+        AiGuardrailsFilter::with_provider(Box::new(AlwaysRedactProvider), PhaseConfig::default()).expect("test filter");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    let mut body = Some(bytes::Bytes::from_static(
+        br#"{"messages":[{"role":"system","content":"Be helpful"}]}"#,
+    ));
+
+    let result = filter.on_request_body(&mut ctx, &mut body, true).await;
+    assert!(
+        result.is_err(),
+        "modified with no user message to rewrite should fail closed"
+    );
 }
 
 #[tokio::test]
@@ -1241,4 +1423,29 @@ async fn on_response_body_blocked_replaces_body() {
         Some("blocked")
     );
     assert_blocked_body_json(&replaced, "toxicity");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_modified_rewrites_assistant_content() {
+    use wiremock::MockServer;
+
+    let mock_server = MockServer::start().await;
+    mount_nemo_checks_response(
+        &mock_server,
+        serde_json::json!({"status": "modified", "content": "My SSN is [REDACTED]", "rail": "pii"}),
+    )
+    .await;
+
+    let filter = nemo_filter_response(&format!("{}/v1/checks", mock_server.uri()));
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
+    let original = chat_completion_response("My SSN is 123-45-6789");
+    let original_len = original.len();
+    let mut body = Some(original);
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    let replaced = body.expect("body should be rewritten, not cleared");
+    assert_redacted_assistant_content(&ctx, &replaced, original_len, "My SSN is [REDACTED]");
 }

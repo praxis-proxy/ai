@@ -147,6 +147,42 @@ fn response_guardrails_block_replaces_body() {
     );
 }
 
+/// NeMo returns `"modified"` for the upstream response - the last assistant
+/// message is replaced with the masked text (status remains 200).
+#[test]
+fn response_guardrails_modified_rewrites_assistant_content() {
+    let backend = chat_backend("My SSN is 123-45-6789");
+    let nemo = nemo_mock(r#"{"status":"modified","content":"My SSN is [REDACTED]","rail":"pii"}"#);
+    let proxy_port = free_port();
+    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let proxy = start_proxy(&config);
+
+    let (status, body) = http_post(
+        proxy.addr(),
+        "/v1/chat/completions",
+        r#"{"model":"test","messages":[{"role":"user","content":"Hello"}]}"#,
+    );
+
+    assert_eq!(
+        status, 200,
+        "NeMo 'modified' should keep 200 and forward a rewritten body"
+    );
+    assert!(
+        !body.contains("123-45-6789"),
+        "original PII must not reach the client; got: {body}"
+    );
+    let json: serde_json::Value = serde_json::from_str(body.trim()).expect("redacted body should be valid JSON");
+    assert_eq!(
+        json.get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str()),
+        Some("My SSN is [REDACTED]"),
+        "assistant content should be replaced with NeMo content"
+    );
+}
+
 /// NeMo returns HTTP 500 for the upstream response - the body is replaced
 /// with an error JSON payload (not a 500).
 #[test]

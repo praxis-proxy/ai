@@ -7,6 +7,7 @@ use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use praxis_ai_apis::json_body::replace_json_body;
 use praxis_core::{
     config::InsecureOptions,
     subrequest::{DEPTH_HEADER, SubRequestClient},
@@ -20,7 +21,7 @@ use praxis_filter::{
 
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
-    providers::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult, nemo},
+    providers::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult, MessageRedaction, nemo},
 };
 
 /// Maximum request body size to buffer (1 MiB).
@@ -139,6 +140,20 @@ impl AiGuardrailsFilter {
         let cfg: AiGuardrailsConfig = parse_filter_config("ai_guardrails", config)?;
         let outbound = test_outbound_chain()?;
         Self::build(cfg, outbound, client)
+    }
+
+    /// Test-only constructor so fail-closed redaction can be exercised
+    /// without a live `NeMo` call. `NeMo` skips `/v1/checks` when there
+    /// is no phase-target message, which would otherwise never produce
+    /// [`GuardResult::Redact`].
+    #[cfg(test)]
+    pub(super) fn with_provider(provider: Box<dyn GuardProvider>, phase: PhaseConfig) -> Result<Self, FilterError> {
+        Ok(Self {
+            provider,
+            phase,
+            outbound: test_outbound_chain()?,
+            callout_timeout: std::time::Duration::from_secs(5),
+        })
     }
 
     /// Capture downstream identity, nesting, deadline, and the bound chain for a callout.
@@ -372,11 +387,128 @@ fn record_verdict(
             Ok(FilterAction::Continue)
         },
         GuardResult::Block { reason } => Ok(enforce_block(body, reason, phase, phase_label, verdict)),
-        GuardResult::Redact { reason, .. } => {
-            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict; forwarding unchanged until #49");
+        GuardResult::Redact { replacements, reason } => {
+            tracing::warn!(verdict, phase = phase_label, %reason, "ai_guardrails: verdict");
+            apply_redaction(body, replacements, phase)
+        },
+    }
+}
+
+/// Rewrite the buffered body with each `NeMo` masked turn and continue.
+///
+/// Request-phase framing is repaired by core via `mutated_request_body_len`.
+/// Response headers are already committed, so the rewritten JSON is fitted to
+/// the original body length.
+fn apply_redaction(
+    body: &mut Option<Bytes>,
+    replacements: Vec<MessageRedaction>,
+    phase: GuardPhase,
+) -> Result<FilterAction, FilterError> {
+    match phase {
+        GuardPhase::Request => {
+            apply_request_redaction(body, replacements)?;
+            Ok(FilterAction::Continue)
+        },
+        GuardPhase::Response => {
+            if let Err(error) = apply_response_redaction(body, replacements) {
+                tracing::error!(%error, "ai_guardrails: response-phase redaction failed");
+                replace_body_with_error(
+                    body,
+                    &format!("Guardrail redaction failed: {error}"),
+                    "guardrail_error",
+                    "evaluation_failed",
+                );
+            }
             Ok(FilterAction::Continue)
         },
     }
+}
+
+/// Replace each redacted user message's `content` with its masked text.
+fn apply_request_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageRedaction>) -> Result<(), FilterError> {
+    if replacements.is_empty() {
+        return Err("ai_guardrails: cannot redact: no message replacements".into());
+    }
+    let mut value = parse_json_body(body, "request")?;
+    let Some(messages) = value.get_mut("messages").and_then(serde_json::Value::as_array_mut) else {
+        return Err("ai_guardrails: request body does not contain recognizable messages".into());
+    };
+    apply_message_replacements(messages, replacements, "user")?;
+    replace_json_body(body, &value, "ai_guardrails", "messages")
+        .map_err(|e| -> FilterError { format!("ai_guardrails: failed to serialize redacted body: {e}").into() })?;
+    Ok(())
+}
+
+/// Replace each redacted choice message's `content` and keep the committed length.
+fn apply_response_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageRedaction>) -> Result<(), FilterError> {
+    if replacements.is_empty() {
+        return Err("ai_guardrails: cannot redact: no message replacements".into());
+    }
+    let mut value = parse_json_body(body, "response")?;
+    let Some(choices) = value.get_mut("choices").and_then(serde_json::Value::as_array_mut) else {
+        return Err("ai_guardrails: response body does not contain recognizable choices".into());
+    };
+    for replacement in replacements {
+        let Some(message) = choices
+            .get_mut(replacement.index)
+            .and_then(|choice| choice.get_mut("message"))
+        else {
+            return Err(format!(
+                "ai_guardrails: cannot redact: choice index {} has no message",
+                replacement.index
+            )
+            .into());
+        };
+        set_message_content(message, replacement.modified_text)?;
+    }
+    let serialized = serde_json::to_string(&value)
+        .map_err(|e| -> FilterError { format!("ai_guardrails: failed to serialize redacted body: {e}").into() })?;
+    *body = Some(fit_to_committed_length(serialized, body));
+    Ok(())
+}
+
+/// Apply each replacement to `messages[index]`, requiring `expected_role`.
+fn apply_message_replacements(
+    messages: &mut [serde_json::Value],
+    replacements: Vec<MessageRedaction>,
+    expected_role: &str,
+) -> Result<(), FilterError> {
+    for replacement in replacements {
+        let Some(message) = messages.get_mut(replacement.index) else {
+            return Err(format!(
+                "ai_guardrails: cannot redact: message index {} is out of range",
+                replacement.index
+            )
+            .into());
+        };
+        if message.get("role").and_then(serde_json::Value::as_str) != Some(expected_role) {
+            return Err(format!(
+                "ai_guardrails: cannot redact: message {} is not a {expected_role} turn",
+                replacement.index
+            )
+            .into());
+        }
+        set_message_content(message, replacement.modified_text)?;
+    }
+    Ok(())
+}
+
+/// Parse a buffered JSON body, labeling errors as `kind` (`request` or `response`).
+fn parse_json_body(body: &Option<Bytes>, kind: &str) -> Result<serde_json::Value, FilterError> {
+    let Some(raw) = body.as_ref() else {
+        return Err(format!("ai_guardrails: cannot redact a missing {kind} body").into());
+    };
+    serde_json::from_slice(raw)
+        .map_err(|e| -> FilterError { format!("ai_guardrails: {kind} body is not valid JSON: {e}").into() })
+}
+
+/// Set a chat message's `content` field to `modified_text`.
+fn set_message_content(message: &mut serde_json::Value, modified_text: String) -> Result<(), FilterError> {
+    let Some(object) = message.as_object_mut() else {
+        return Err("ai_guardrails: message is not a JSON object".into());
+    };
+    object.insert("content".to_owned(), serde_json::Value::String(modified_text));
+    Ok(())
 }
 
 /// Enforce a `Block` verdict for the given phase.
