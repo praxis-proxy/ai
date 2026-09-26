@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.96"
 authors = ["Shane Utt <shaneutt@linux.com>"]
@@ -122,13 +122,13 @@ praxis = { version = "0.7.0", package = "praxis-proxy", default-features = false
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer
-praxis-ai-llmd-ext-proc = { version = "0.4.0", path = "integrations/llmd/ext-proc" }
+praxis-ai-llmd-ext-proc = { version = "0.4.1", path = "integrations/llmd/ext-proc" }
 
 # Praxis AI workspace dependencies
-praxis-ai-proxy = { version = "0.4.0", path = "server", default-features = false }
-praxis-ai-filters = { version = "0.4.0", path = "filters", default-features = false }
-praxis-ai-apis = { version = "0.4.0", path = "apis", default-features = false }
-praxis-ai-build-support = { version = "0.4.0", path = "server/build_support" }
+praxis-ai-proxy = { version = "0.4.1", path = "server", default-features = false }
+praxis-ai-filters = { version = "0.4.1", path = "filters", default-features = false }
+praxis-ai-apis = { version = "0.4.1", path = "apis", default-features = false }
+praxis-ai-build-support = { version = "0.4.1", path = "server/build_support" }
 
 # Pingora (temporary fork), at the version praxis builds against; two versions
 # of the fork in one graph do not share types, and the older one carries its
