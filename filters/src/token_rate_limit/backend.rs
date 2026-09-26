@@ -7,12 +7,14 @@
 //! on nerdalert's `poc/distributed-token-rate-limit-demo` spike branch
 //! (<https://github.com/nerdalert/ai/tree/poc/distributed-token-rate-limit-demo>).
 //! `reserve`/`reconcile` are key-agnostic (`ReserveRequest`/`ReconcileRequest`
-//! carry a plain `String` key); this filter supplies a single fixed key
-//! (see `FALLBACK_KEY`) instead of the source branch's principal+model
-//! composite key, so no logic here was changed to adopt it.
+//! carry a plain `String` key); this filter supplies either a global key
+//! or a privacy-preserving hash of the authenticated subject.
 
 use std::{
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -35,7 +37,7 @@ const VALKEY_TIMEOUT: Duration = Duration::from_millis(500);
 /// Request to admit an estimated token cost against a key's budget.
 #[derive(Debug, Clone)]
 pub(super) struct ReserveRequest {
-    /// Opaque budget key (this milestone always uses `FALLBACK_KEY`).
+    /// Opaque budget key resolved by the filter's configured key source.
     pub(super) key: String,
     /// Estimated token cost to reserve if admitted.
     pub(super) estimate: u64,
@@ -98,6 +100,56 @@ pub(super) enum BackendSettlement {
     Noop,
 }
 
+/// Latest bounded state published by one rule backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct BackendSnapshot {
+    /// Sum of the last calculated remaining balances for retained keys.
+    pub(super) budget_remaining: u64,
+    /// Reservations still awaiting reconciliation.
+    pub(super) active_reservations: usize,
+    /// Distinct budget keys currently retained.
+    pub(super) active_keys: usize,
+}
+
+/// Shared last-observed Valkey state, updated from existing Lua replies.
+#[derive(Default)]
+struct ValkeyTelemetryState {
+    /// Last aggregate remaining balance returned by Lua.
+    budget_remaining: AtomicU64,
+    /// Last rule-level pending reservation count returned by Lua.
+    active_reservations: AtomicUsize,
+    /// Last rule-level retained-key count returned by Lua.
+    active_keys: AtomicUsize,
+}
+
+impl ValkeyTelemetryState {
+    /// Validate one Lua reply's telemetry suffix and publish it as a snapshot.
+    fn record_reply(&self, remaining: i64, active: i64, keys: i64) -> Result<(), BackendError> {
+        self.update(
+            u64::try_from(remaining).map_err(|_error| BackendError::InvalidResponse)?,
+            usize::try_from(active).map_err(|_error| BackendError::InvalidResponse)?,
+            usize::try_from(keys).map_err(|_error| BackendError::InvalidResponse)?,
+        );
+        Ok(())
+    }
+
+    /// Replace the complete last-observed snapshot.
+    fn update(&self, budget_remaining: u64, active_reservations: usize, active_keys: usize) {
+        self.budget_remaining.store(budget_remaining, Ordering::Relaxed);
+        self.active_reservations.store(active_reservations, Ordering::Relaxed);
+        self.active_keys.store(active_keys, Ordering::Relaxed);
+    }
+
+    /// Read the last-observed values without backend I/O.
+    fn snapshot(&self) -> BackendSnapshot {
+        BackendSnapshot {
+            budget_remaining: self.budget_remaining.load(Ordering::Relaxed),
+            active_reservations: self.active_reservations.load(Ordering::Relaxed),
+            active_keys: self.active_keys.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Failure modes shared by every [`TokenRateLimitStateBackend`] impl.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum BackendError {
@@ -131,6 +183,20 @@ pub(super) trait TokenRateLimitStateBackend: Send + Sync {
 
     /// The smallest configured budget capacity, for rate-limit headers.
     fn limit(&self) -> u64;
+
+    /// Latest rule-level state available without backend I/O.
+    fn snapshot(&self) -> BackendSnapshot;
+
+    /// Stable backend label used by bounded telemetry.
+    fn backend_name(&self) -> &'static str;
+
+    /// Stable algorithm label used by bounded telemetry.
+    fn algorithm_name(&self) -> &'static str;
+
+    /// Configured rule name. Required by background reconciliation telemetry.
+    fn rule_name(&self) -> &str {
+        ""
+    }
 
     /// Attempt an in-process, synchronous settlement (no I/O, no async
     /// dispatch) for a prior reservation.
@@ -231,6 +297,22 @@ impl TokenRateLimitStateBackend for InMemoryTokenRateLimitBackend {
         self.ledger.limit()
     }
 
+    fn snapshot(&self) -> BackendSnapshot {
+        BackendSnapshot {
+            budget_remaining: self.ledger.remaining_total(),
+            active_reservations: self.ledger.active_count(),
+            active_keys: self.ledger.key_count(),
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "memory"
+    }
+
+    fn algorithm_name(&self) -> &'static str {
+        "sliding_window"
+    }
+
     fn reconcile_sync(&self, request: &ReconcileRequest) -> Option<BackendSettlement> {
         Some(
             match self
@@ -323,6 +405,22 @@ impl TokenRateLimitStateBackend for InMemoryTokenBucketBackend {
         self.ledger.limit()
     }
 
+    fn snapshot(&self) -> BackendSnapshot {
+        BackendSnapshot {
+            budget_remaining: self.ledger.remaining_total(),
+            active_reservations: self.ledger.active_count(),
+            active_keys: self.ledger.key_count(),
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "memory"
+    }
+
+    fn algorithm_name(&self) -> &'static str {
+        "token_bucket"
+    }
+
     fn reconcile_sync(&self, request: &ReconcileRequest) -> Option<BackendSettlement> {
         Some(self.reconcile_ledger(request))
     }
@@ -342,133 +440,24 @@ impl TokenRateLimitStateBackend for InMemoryTokenBucketBackend {
 /// `KEYS`: `[1]` physical key, `[2]` settled zset, `[3]` active hash,
 /// `[4]` namespace keys zset, `[5]` namespace active-count string,
 /// `[6]` namespace reservation-id sequence, `[7]` namespace active-index
-/// zset (global reservation-expiry tracking). `ARGV`: reservation
-/// timeout (ms), max keys, max active reservations, estimate, budget
-/// count, then `(window_ms, capacity)` pairs. Returns
-/// `[1, id, estimate]` on admission or `[0, retry_after_ms]` on denial.
-const RESERVE_SCRIPT: &str = "
-local now = redis.call('TIME')
-local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-local timeout_ms = tonumber(ARGV[1])
-local max_keys = tonumber(ARGV[2])
-local max_active = tonumber(ARGV[3])
-local estimate = tonumber(ARGV[4])
-local budget_count = tonumber(ARGV[5])
-local settled = KEYS[2]
-local active = KEYS[3]
-
-local active_total = tonumber(redis.call('GET', KEYS[5]) or '0')
-local expired_global = redis.call('ZRANGE', KEYS[7], '-inf', now_ms, 'BYSCORE')
-for i = 1, #expired_global do
-  local member = expired_global[i]
-  local split = string.find(member, '|')
-  if split then
-    local physical = string.sub(member, 1, split - 1)
-    local reservation = string.sub(member, split + 1)
-    local active_key = physical .. ':active'
-    local value = redis.call('HGET', active_key, reservation)
-    if value then
-      local value_split = string.find(value, '|')
-      local amount = tonumber(string.sub(value, 1, value_split - 1))
-      local reserved_at = tonumber(string.sub(value, value_split + 1))
-      redis.call('ZADD', physical .. ':settled', reserved_at, 'expired:' .. reservation .. ':' .. amount)
-      redis.call('HDEL', active_key, reservation)
-      active_total = math.max(0, active_total - 1)
-    end
-  end
-  redis.call('ZREM', KEYS[7], member)
-end
-redis.call('SET', KEYS[5], active_total)
-
-local max_window = 0
-for i = 1, budget_count do
-  local window = tonumber(ARGV[5 + (i * 2) - 1])
-  if window > max_window then max_window = window end
-  redis.call('ZREMRANGEBYSCORE', settled, '-inf', now_ms - window)
-end
-
-local expired = {}
-local active_values = redis.call('HGETALL', active)
-for i = 1, #active_values, 2 do
-  local id = active_values[i]
-  local value = active_values[i + 1]
-  local sep = string.find(value, '|')
-  local reserved_at = tonumber(string.sub(value, sep + 1))
-  if now_ms - reserved_at >= timeout_ms then
-    local amount = tonumber(string.sub(value, 1, sep - 1))
-    redis.call('ZADD', settled, reserved_at, 'expired:' .. id .. ':' .. amount)
-    redis.call('HDEL', active, id)
-    active_total = math.max(0, active_total - 1)
-  end
-end
-redis.call('SET', KEYS[5], active_total)
-
-redis.call('ZREMRANGEBYSCORE', KEYS[4], '-inf', now_ms)
-local key_exists = redis.call('ZSCORE', KEYS[4], KEYS[1]) ~= false
-if not key_exists and redis.call('ZCARD', KEYS[4]) >= max_keys then
-  return {0, max_window}
-end
-if active_total >= max_active then
-  return {0, max_window}
-end
-
-local max_usage = 0
-for i = 1, budget_count do
-  local window = tonumber(ARGV[5 + (i * 2) - 1])
-  local capacity = tonumber(ARGV[5 + (i * 2)])
-  local settled_sum = 0
-  local entries = redis.call('ZRANGE', settled, now_ms - window, '+inf', 'BYSCORE', 'WITHSCORES')
-  for j = 1, #entries, 2 do
-    local member = entries[j]
-    local amount = string.match(member, ':(%d+)$')
-    if amount then settled_sum = settled_sum + tonumber(amount) end
-  end
-  local active_values = redis.call('HGETALL', active)
-  local active_sum = 0
-  for j = 1, #active_values, 2 do
-    local sep = string.find(active_values[j + 1], '|')
-    active_sum = active_sum + tonumber(string.sub(active_values[j + 1], 1, sep - 1))
-  end
-  local total_usage = settled_sum + active_sum + estimate
-  if total_usage > max_usage then max_usage = total_usage end
-  if total_usage > capacity then
-    return {0, max_window}
-  end
-end
-
-local id = redis.call('INCR', KEYS[6])
-redis.call('HSET', active, id, estimate .. '|' .. now_ms)
-redis.call('INCR', KEYS[5])
-redis.call('ZADD', KEYS[7], now_ms + timeout_ms, KEYS[1] .. '|' .. id)
-local ttl = math.max(max_window + timeout_ms, 1000)
-redis.call('ZADD', KEYS[4], now_ms + ttl, KEYS[1])
-redis.call('PEXPIRE', settled, ttl)
-redis.call('PEXPIRE', active, ttl)
-redis.call('PEXPIRE', KEYS[1], ttl)
-return {1, id, estimate, max_usage}
-";
+/// zset (global reservation-expiry tracking), followed by five rule-level
+/// telemetry keys: active count/index, retained keys, per-key balances,
+/// and aggregate remaining balance. `ARGV`: reservation timeout (ms),
+/// max keys, max active reservations, estimate, budget count, then
+/// `(window_ms, capacity)` pairs. Returns
+/// `[1, id, estimate, usage_after, remaining, active, keys]` on admission or
+/// `[0, retry_after_ms, remaining, active, keys]` on denial.
+const RESERVE_SCRIPT: &str = include_str!("lua/sliding_window_reserve.lua");
 
 /// Atomically settle a prior reservation against actual usage -- the
 /// Valkey/Lua analog of [`Ledger::reconcile`].
 ///
 /// `KEYS`: same layout as [`RESERVE_SCRIPT`]. `ARGV`: `[1]` reservation
-/// ID, `[2]` actual usage. Returns `[0]` if the reservation was already
-/// reconciled/expired (no-op), or `[1, actual, refund, overage]`.
-const RECONCILE_SCRIPT: &str = "
-local value = redis.call('HGET', KEYS[3], ARGV[1])
-if not value then return {0} end
-local sep = string.find(value, '|')
-local estimate = tonumber(string.sub(value, 1, sep - 1))
-local actual = tonumber(ARGV[2])
-redis.call('HDEL', KEYS[3], ARGV[1])
-local active_total = math.max(0, tonumber(redis.call('GET', KEYS[5]) or '0') - 1)
-redis.call('SET', KEYS[5], active_total)
-redis.call('ZREM', KEYS[7], KEYS[1] .. '|' .. ARGV[1])
-local now = redis.call('TIME')
-local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-redis.call('ZADD', KEYS[2], now_ms, 'settled:' .. ARGV[1] .. ':' .. actual)
-return {1, actual, math.max(0, estimate - actual), math.max(0, actual - estimate)}
-";
+/// ID, `[2]` actual usage, `[3]` budget count, `[4]` reservation timeout,
+/// then `(window_ms, capacity)` pairs. Returns `[0, remaining, active, keys]` if the reservation
+/// was already reconciled/expired (no-op), or
+/// `[1, actual, refund, overage, remaining, active, keys]`.
+const RECONCILE_SCRIPT: &str = include_str!("lua/sliding_window_reconcile.lua");
 
 /// Drain `receiver`, reconciling each request against `worker`'s backend
 /// with bounded retries, off the request/response path entirely.
@@ -491,9 +480,8 @@ where
         let mut attempts = 0;
         loop {
             match worker.reconcile(request.clone()).await {
-                Ok(_) => {
-                    counter!("praxis_ai_token_rate_limit_backend_reconciliation_total", "backend" => "valkey", "result" => "completed")
-                        .increment(1);
+                Ok(settlement) => {
+                    record_completed_reconciliation(&worker, &settlement);
                     break;
                 },
                 Err(error) if attempts < 2 => {
@@ -502,14 +490,44 @@ where
                     tokio::time::sleep(Duration::from_millis(25 * attempts)).await;
                 },
                 Err(error) => {
-                    counter!("praxis_ai_token_rate_limit_backend_errors_total", "backend" => "valkey", "operation" => "reconcile")
-                        .increment(1);
-                    tracing::error!(%error, "token-rate-limit reconciliation abandoned after retries");
+                    record_abandoned_reconciliation(&worker, &error);
                     break;
                 },
             }
         }
     }
+}
+
+/// Publish one completed Valkey reconciliation through the same metrics and
+/// accounting helpers as the synchronous in-memory path.
+fn record_completed_reconciliation(backend: &impl TokenRateLimitStateBackend, settlement: &BackendSettlement) {
+    counter!(
+        "praxis_trl_backend_reconciliation_total",
+        "backend" => backend.backend_name(),
+        "result" => "completed",
+        "rule" => backend.rule_name().to_owned(),
+    )
+    .increment(1);
+    super::record_settlement_metrics(backend.rule_name(), settlement);
+    super::record_accounting_settlement(backend.rule_name(), backend, settlement);
+    super::record_state_metrics(backend.rule_name(), backend);
+}
+
+/// Count and log one reconciliation given up after its retries; the
+/// reservation still expires and is charged at its estimate.
+fn record_abandoned_reconciliation(backend: &impl TokenRateLimitStateBackend, error: &BackendError) {
+    super::record_backend_error_metric(backend.rule_name(), backend.backend_name());
+    tracing::warn!(
+        target: "praxis_ai::token_rate_limit::accounting",
+        phase = "reconciliation",
+        rule = backend.rule_name(),
+        algorithm = backend.algorithm_name(),
+        backend = backend.backend_name(),
+        result = "failed",
+        error = %error,
+        "token rate limit accounting"
+    );
+    tracing::error!(%error, "token-rate-limit reconciliation abandoned after retries");
 }
 
 /// Shared Valkey connection handling for every Valkey-backed algorithm:
@@ -730,6 +748,8 @@ pub(super) struct ValkeyTokenRateLimitBackend {
     limit: u64,
     /// Shared background-reconciliation scaffolding, see [`ReconcileWorker`].
     worker: ReconcileWorker,
+    /// Last state returned by this rule's Lua operations, shared with its worker clone.
+    telemetry: Arc<ValkeyTelemetryState>,
 }
 
 /// Construction parameters for [`ValkeyTokenRateLimitBackend`].
@@ -770,6 +790,7 @@ impl ValkeyTokenRateLimitBackend {
             max_active_reservations: config.max_active_reservations,
             limit,
             worker: ReconcileWorker::new(),
+            telemetry: Arc::new(ValkeyTelemetryState::default()),
         }
     }
 
@@ -787,6 +808,7 @@ impl ValkeyTokenRateLimitBackend {
             max_active_reservations: self.max_active_reservations,
             limit: self.limit,
             worker: ReconcileWorker::detached(),
+            telemetry: Arc::clone(&self.telemetry),
         }
     }
 
@@ -805,7 +827,21 @@ impl ValkeyTokenRateLimitBackend {
     }
 
     /// Deterministic per-key Valkey key names for this rule/namespace.
-    fn key_parts(&self, key: &str) -> [String; 7] {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the key layout is kept in one place so Lua KEYS indexes remain auditable"
+    )]
+    fn key_parts(&self, key: &str) -> [String; 12] {
+        let mut rule_digest = Sha256::new();
+        rule_digest.update(self.namespace.as_bytes());
+        rule_digest.update(&[0]);
+        rule_digest.update(self.rule.as_bytes());
+        let rule_hash = rule_digest
+            .finish()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let rule_prefix = format!("{}:v1:rule:{rule_hash}", self.namespace);
         let mut digest = Sha256::new();
         digest.update(self.namespace.as_bytes());
         digest.update(&[0]);
@@ -826,6 +862,11 @@ impl ValkeyTokenRateLimitBackend {
             format!("{}:active-count", self.namespace),
             format!("{}:reservation-seq", self.namespace),
             format!("{}:active-index", self.namespace),
+            format!("{rule_prefix}:active-count"),
+            format!("{rule_prefix}:active-index"),
+            format!("{rule_prefix}:keys"),
+            format!("{rule_prefix}:balances"),
+            format!("{rule_prefix}:remaining-total"),
         ]
     }
 }
@@ -866,14 +907,20 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
         );
         let response = self.valkey.eval(RESERVE_SCRIPT, &keys, &args).await?;
         match response.as_slice() {
-            [1, id, estimate, usage_after] => Ok(BackendReserve::Admitted {
-                reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
-                estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
-                usage_after: u64::try_from(*usage_after).map_err(|_error| BackendError::InvalidResponse)?,
-            }),
-            [0, retry_after] => Ok(BackendReserve::Denied {
-                retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
-            }),
+            [1, id, estimate, usage_after, remaining, active, keys] => {
+                self.telemetry.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendReserve::Admitted {
+                    reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
+                    estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
+                    usage_after: u64::try_from(*usage_after).map_err(|_error| BackendError::InvalidResponse)?,
+                })
+            },
+            [0, retry_after, remaining, active, keys] => {
+                self.telemetry.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendReserve::Denied {
+                    retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
+                })
+            },
             _ => Err(BackendError::InvalidResponse),
         }
     }
@@ -881,15 +928,30 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
     async fn reconcile(&self, request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
         let keys = self.key_parts(&request.key);
         let actual = request.actual.unwrap_or(request.estimate);
-        let args = [request.reservation_id.to_string(), actual.to_string()];
+        let mut args = vec![
+            request.reservation_id.to_string(),
+            actual.to_string(),
+            self.budgets.len().to_string(),
+            self.reservation_timeout_ms.to_string(),
+        ];
+        for budget in &self.budgets {
+            args.push(budget.window_ms.to_string());
+            args.push(budget.capacity.to_string());
+        }
         let response = self.valkey.eval(RECONCILE_SCRIPT, &keys, &args).await?;
         match response.as_slice() {
-            [0] => Ok(BackendSettlement::Noop),
-            [1, actual, refund, overage] => Ok(BackendSettlement::Applied {
-                actual: u64::try_from(*actual).map_err(|_error| BackendError::InvalidResponse)?,
-                refund: u64::try_from(*refund).map_err(|_error| BackendError::InvalidResponse)?,
-                overage: u64::try_from(*overage).map_err(|_error| BackendError::InvalidResponse)?,
-            }),
+            [0, remaining, active, keys] => {
+                self.telemetry.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendSettlement::Noop)
+            },
+            [1, actual, refund, overage, remaining, active, keys] => {
+                self.telemetry.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendSettlement::Applied {
+                    actual: u64::try_from(*actual).map_err(|_error| BackendError::InvalidResponse)?,
+                    refund: u64::try_from(*refund).map_err(|_error| BackendError::InvalidResponse)?,
+                    overage: u64::try_from(*overage).map_err(|_error| BackendError::InvalidResponse)?,
+                })
+            },
             _ => Err(BackendError::InvalidResponse),
         }
     }
@@ -901,6 +963,22 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
 
     fn limit(&self) -> u64 {
         self.limit
+    }
+
+    fn snapshot(&self) -> BackendSnapshot {
+        self.telemetry.snapshot()
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "valkey"
+    }
+
+    fn algorithm_name(&self) -> &'static str {
+        "sliding_window"
+    }
+
+    fn rule_name(&self) -> &str {
+        &self.rule
     }
 }
 
@@ -914,132 +992,28 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
 /// `KEYS`: `[1]` physical state hash (`tokens`, `last_refill_ms`), `[2]`
 /// active hash, `[3]` namespace keys zset, `[4]` namespace active-count
 /// string, `[5]` namespace reservation-id sequence, `[6]` namespace
-/// active-index zset. Deliberately namespaced with a `:tb:` segment
+/// active-index zset, followed by the equivalent five rule-level telemetry
+/// keys. Deliberately namespaced with a `:tb:` segment
 /// distinct from [`RESERVE_SCRIPT`]'s sliding-window keys (see
 /// [`ValkeyTokenBucketBackend::key_parts`]) so a `token_bucket` rule and
 /// a `sliding_window` rule can safely share one `namespace:` without
 /// either algorithm's bookkeeping corrupting the other's. `ARGV`: `[1]`
 /// capacity, `[2]` `refill_rate` (tokens/sec), `[3]` reservation timeout
 /// (ms), `[4]` max keys, `[5]` max active reservations, `[6]` estimate.
-/// Returns `[1, id, estimate]` on admission or `[0, retry_after_ms]` on
-/// denial.
-pub(super) const TOKEN_BUCKET_RESERVE_SCRIPT: &str = "
-local now = redis.call('TIME')
-local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-local capacity = tonumber(ARGV[1])
-local refill_rate = tonumber(ARGV[2])
-local timeout_ms = tonumber(ARGV[3])
-local max_keys = tonumber(ARGV[4])
-local max_active = tonumber(ARGV[5])
-local estimate = tonumber(ARGV[6])
-
-local active_total = tonumber(redis.call('GET', KEYS[4]) or '0')
-
-local expired_global = redis.call('ZRANGE', KEYS[6], '-inf', now_ms, 'BYSCORE')
-for i = 1, #expired_global do
-  local member = expired_global[i]
-  local split = string.find(member, '|')
-  if split then
-    local physical = string.sub(member, 1, split - 1)
-    local reservation = string.sub(member, split + 1)
-    local active_key = physical .. ':active'
-    local value = redis.call('HGET', active_key, reservation)
-    if value then
-      redis.call('HDEL', active_key, reservation)
-      active_total = math.max(0, active_total - 1)
-      -- Tokens for an abandoned reservation stay charged (already
-      -- decremented at reserve time under the immediate-decrement
-      -- design): no credit-back happens on expiry, only on reconcile.
-    end
-  end
-  redis.call('ZREM', KEYS[6], member)
-end
-redis.call('SET', KEYS[4], active_total)
-
-local state = redis.call('HMGET', KEYS[1], 'tokens', 'last_refill_ms')
-local tokens = tonumber(state[1])
-local last_refill_ms = tonumber(state[2])
-if tokens == nil then
-  tokens = capacity
-  last_refill_ms = now_ms
-end
-local elapsed_ms = math.max(0, now_ms - last_refill_ms)
-tokens = math.min(capacity, tokens + (elapsed_ms / 1000.0) * refill_rate)
-
-local ttl = math.max(math.ceil((capacity / refill_rate) * 1000) + timeout_ms, 1000)
-redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now_ms)
-local key_exists = redis.call('EXISTS', KEYS[1]) == 1
-if not key_exists and redis.call('ZCARD', KEYS[3]) >= max_keys then
-  redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill_ms', now_ms)
-  return {0, 1}
-end
-if active_total >= max_active then
-  redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill_ms', now_ms)
-  return {0, 1}
-end
-if tokens < estimate then
-  local deficit = estimate - tokens
-  local retry_after_ms = math.max(1, math.ceil((deficit / refill_rate) * 1000))
-  redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill_ms', now_ms)
-  redis.call('PEXPIRE', KEYS[1], ttl)
-  return {0, retry_after_ms}
-end
-
-tokens = tokens - estimate
-local usage_after = capacity - tokens
-local id = redis.call('INCR', KEYS[5])
-redis.call('HSET', KEYS[2], id, estimate .. '|' .. now_ms)
-redis.call('INCR', KEYS[4])
-redis.call('ZADD', KEYS[6], now_ms + timeout_ms, KEYS[1] .. '|' .. id)
-redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill_ms', now_ms)
-redis.call('ZADD', KEYS[3], now_ms + ttl, KEYS[1])
-redis.call('PEXPIRE', KEYS[1], ttl)
-redis.call('PEXPIRE', KEYS[2], ttl)
-return {1, id, estimate, usage_after}
-";
+/// Returns `[1, id, estimate, usage_after, remaining, active, keys]` on admission or
+/// `[0, retry_after_ms, remaining, active, keys]` on denial.
+pub(super) const TOKEN_BUCKET_RESERVE_SCRIPT: &str = include_str!("lua/token_bucket_reserve.lua");
 
 /// Atomically settle a prior token-bucket reservation against actual
 /// usage -- the Valkey/Lua analog of [`TokenBucketLedger::reconcile`].
 ///
 /// `KEYS`: same layout as [`TOKEN_BUCKET_RESERVE_SCRIPT`]. `ARGV`: `[1]`
-/// reservation ID, `[2]` actual usage, `[3]` capacity, `[4]` `refill_rate`.
-/// Returns `[0]` if the reservation was already reconciled/expired
-/// (no-op), or `[1, actual, refund, overage]`.
-const TOKEN_BUCKET_RECONCILE_SCRIPT: &str = "
-local value = redis.call('HGET', KEYS[2], ARGV[1])
-if not value then return {0} end
-local sep = string.find(value, '|')
-local estimate = tonumber(string.sub(value, 1, sep - 1))
-local actual = tonumber(ARGV[2])
-local capacity = tonumber(ARGV[3])
-local refill_rate = tonumber(ARGV[4])
-redis.call('HDEL', KEYS[2], ARGV[1])
-local active_total = math.max(0, tonumber(redis.call('GET', KEYS[4]) or '0') - 1)
-redis.call('SET', KEYS[4], active_total)
-redis.call('ZREM', KEYS[6], KEYS[1] .. '|' .. ARGV[1])
-
-local now = redis.call('TIME')
-local now_ms = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000)
-local state = redis.call('HMGET', KEYS[1], 'tokens', 'last_refill_ms')
-local tokens = tonumber(state[1])
-local last_refill_ms = tonumber(state[2])
-if tokens == nil then
-  tokens = capacity
-  last_refill_ms = now_ms
-end
-local elapsed_ms = math.max(0, now_ms - last_refill_ms)
-tokens = math.min(capacity, tokens + (elapsed_ms / 1000.0) * refill_rate)
-
-local refund = math.max(0, estimate - actual)
-local overage = math.max(0, actual - estimate)
-if refund > 0 then
-  tokens = math.min(capacity, tokens + refund)
-elseif overage > 0 then
-  tokens = math.max(0, tokens - overage)
-end
-redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill_ms', now_ms)
-return {1, actual, refund, overage}
-";
+/// reservation ID, `[2]` actual usage, `[3]` capacity, `[4]` `refill_rate`,
+/// `[5]` reservation timeout.
+/// Returns `[0, remaining, active, keys]` if the reservation was already
+/// reconciled/expired (no-op), or
+/// `[1, actual, refund, overage, remaining, active, keys]`.
+const TOKEN_BUCKET_RECONCILE_SCRIPT: &str = include_str!("lua/token_bucket_reconcile.lua");
 
 /// Valkey/Redis-backed token-bucket state, shared across every gateway
 /// instance/replica pointed at the same `url`/`namespace`.
@@ -1062,6 +1036,8 @@ pub(super) struct ValkeyTokenBucketBackend {
     max_active_reservations: usize,
     /// Shared background-reconciliation scaffolding, see [`ReconcileWorker`].
     worker: ReconcileWorker,
+    /// Last state returned by this rule's Lua operations, shared with its worker clone.
+    telemetry: Arc<ValkeyTelemetryState>,
 }
 
 /// Construction parameters for [`ValkeyTokenBucketBackend`].
@@ -1112,6 +1088,7 @@ impl ValkeyTokenBucketBackend {
             max_keys: config.max_keys,
             max_active_reservations: config.max_active_reservations,
             worker: ReconcileWorker::new(),
+            telemetry: Arc::new(ValkeyTelemetryState::default()),
         })
     }
 
@@ -1127,6 +1104,7 @@ impl ValkeyTokenBucketBackend {
             max_keys: self.max_keys,
             max_active_reservations: self.max_active_reservations,
             worker: ReconcileWorker::detached(),
+            telemetry: Arc::clone(&self.telemetry),
         }
     }
 
@@ -1148,7 +1126,23 @@ impl ValkeyTokenBucketBackend {
     /// [`ValkeyTokenRateLimitBackend::key_parts`] -- see
     /// [`TOKEN_BUCKET_RESERVE_SCRIPT`]'s doc comment for why the two
     /// algorithms must never share bookkeeping keys.
-    fn key_parts(&self, key: &str) -> [String; 6] {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the key layout is kept in one place so Lua KEYS indexes remain auditable"
+    )]
+    fn key_parts(&self, key: &str) -> [String; 11] {
+        let mut rule_digest = Sha256::new();
+        rule_digest.update(self.namespace.as_bytes());
+        rule_digest.update(&[0]);
+        rule_digest.update(b"token_bucket");
+        rule_digest.update(&[0]);
+        rule_digest.update(self.rule.as_bytes());
+        let rule_hash = rule_digest
+            .finish()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let rule_prefix = format!("{}:v1:tb:rule:{rule_hash}", self.namespace);
         let mut digest = Sha256::new();
         digest.update(self.namespace.as_bytes());
         digest.update(&[0]);
@@ -1170,6 +1164,11 @@ impl ValkeyTokenBucketBackend {
             format!("{}:tb:active-count", self.namespace),
             format!("{}:tb:reservation-seq", self.namespace),
             format!("{}:tb:active-index", self.namespace),
+            format!("{rule_prefix}:active-count"),
+            format!("{rule_prefix}:active-index"),
+            format!("{rule_prefix}:keys"),
+            format!("{rule_prefix}:balances"),
+            format!("{rule_prefix}:remaining-total"),
         ]
     }
 }
@@ -1188,14 +1187,20 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
         ];
         let response = self.valkey.eval(TOKEN_BUCKET_RESERVE_SCRIPT, &keys, &args).await?;
         match response.as_slice() {
-            [1, id, estimate, usage_after] => Ok(BackendReserve::Admitted {
-                reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
-                estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
-                usage_after: u64::try_from(*usage_after).map_err(|_error| BackendError::InvalidResponse)?,
-            }),
-            [0, retry_after] => Ok(BackendReserve::Denied {
-                retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
-            }),
+            [1, id, estimate, usage_after, remaining, active, keys] => {
+                self.telemetry.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendReserve::Admitted {
+                    reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
+                    estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
+                    usage_after: u64::try_from(*usage_after).map_err(|_error| BackendError::InvalidResponse)?,
+                })
+            },
+            [0, retry_after, remaining, active, keys] => {
+                self.telemetry.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendReserve::Denied {
+                    retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
+                })
+            },
             _ => Err(BackendError::InvalidResponse),
         }
     }
@@ -1208,15 +1213,22 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
             actual.to_string(),
             self.capacity.to_string(),
             self.refill_rate.to_string(),
+            self.reservation_timeout_ms.to_string(),
         ];
         let response = self.valkey.eval(TOKEN_BUCKET_RECONCILE_SCRIPT, &keys, &args).await?;
         match response.as_slice() {
-            [0] => Ok(BackendSettlement::Noop),
-            [1, actual, refund, overage] => Ok(BackendSettlement::Applied {
-                actual: u64::try_from(*actual).map_err(|_error| BackendError::InvalidResponse)?,
-                refund: u64::try_from(*refund).map_err(|_error| BackendError::InvalidResponse)?,
-                overage: u64::try_from(*overage).map_err(|_error| BackendError::InvalidResponse)?,
-            }),
+            [0, remaining, active, keys] => {
+                self.telemetry.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendSettlement::Noop)
+            },
+            [1, actual, refund, overage, remaining, active, keys] => {
+                self.telemetry.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendSettlement::Applied {
+                    actual: u64::try_from(*actual).map_err(|_error| BackendError::InvalidResponse)?,
+                    refund: u64::try_from(*refund).map_err(|_error| BackendError::InvalidResponse)?,
+                    overage: u64::try_from(*overage).map_err(|_error| BackendError::InvalidResponse)?,
+                })
+            },
             _ => Err(BackendError::InvalidResponse),
         }
     }
@@ -1228,6 +1240,22 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
 
     fn limit(&self) -> u64 {
         self.capacity
+    }
+
+    fn snapshot(&self) -> BackendSnapshot {
+        self.telemetry.snapshot()
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "valkey"
+    }
+
+    fn algorithm_name(&self) -> &'static str {
+        "token_bucket"
+    }
+
+    fn rule_name(&self) -> &str {
+        &self.rule
     }
 }
 
@@ -1253,6 +1281,24 @@ mod tests {
         })
         .unwrap();
         InMemoryTokenRateLimitBackend::new(ledger)
+    }
+
+    #[test]
+    fn valkey_telemetry_reply_updates_one_snapshot_and_rejects_negative_values() {
+        let telemetry = ValkeyTelemetryState::default();
+        telemetry.record_reply(90, 2, 3).unwrap();
+        assert_eq!(
+            telemetry.snapshot(),
+            BackendSnapshot {
+                budget_remaining: 90,
+                active_reservations: 2,
+                active_keys: 3,
+            }
+        );
+        assert!(matches!(
+            telemetry.record_reply(-1, 0, 0),
+            Err(BackendError::InvalidResponse)
+        ));
     }
 
     #[tokio::test]
@@ -1971,6 +2017,396 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the gated live test constructs, exercises, and verifies one complete backend snapshot"
+    )]
+    async fn live_valkey_telemetry_reply_matches_the_backend_contract() {
+        let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+            return;
+        };
+        let backend = ValkeyTokenRateLimitBackend::new(ValkeyBackendConfig {
+            valkey: ValkeyEval::new(url).unwrap(),
+            namespace: format!("praxis:test:telemetry:{}", std::process::id()),
+            rule: "engineering".into(),
+            budgets: vec![Budget {
+                window_ms: 60_000,
+                capacity: 100,
+            }],
+            reservation_timeout_ms: 1_000,
+            max_keys: 8,
+            max_active_reservations: 8,
+        });
+
+        let outcome = backend
+            .reserve(ReserveRequest {
+                key: "alice".into(),
+                estimate: 10,
+                now_ms: 0,
+            })
+            .await;
+        assert!(outcome.is_ok(), "Valkey reserve failed: {outcome:?}");
+        assert_eq!(
+            backend.snapshot(),
+            BackendSnapshot {
+                budget_remaining: 90,
+                active_reservations: 1,
+                active_keys: 1,
+            }
+        );
+
+        let keys = backend.key_parts("alice");
+        let mut connection = backend.valkey.connection().await.unwrap();
+        for key in &keys[7..] {
+            let ttl_ms: i64 = redis::cmd("PTTL").arg(key).query_async(&mut connection).await.unwrap();
+            assert!(ttl_ms > 0, "rule telemetry key {key} must expire, got PTTL={ttl_ms}");
+            assert!(
+                ttl_ms <= 61_000,
+                "rule telemetry key {key} outlived its state: PTTL={ttl_ms}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_valkey_remaining_total_stays_saturated_across_key_updates() {
+        let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+            return;
+        };
+        let backend = ValkeyTokenRateLimitBackend::new(ValkeyBackendConfig {
+            valkey: ValkeyEval::new(url).unwrap(),
+            namespace: format!("praxis:test:saturated-telemetry:{}", std::process::id()),
+            rule: "engineering".into(),
+            budgets: vec![Budget {
+                window_ms: 60_000,
+                capacity: token_bucket_ledger::MAX_F64_SAFE_INTEGER,
+            }],
+            reservation_timeout_ms: 1_000,
+            max_keys: 8,
+            max_active_reservations: 8,
+        });
+
+        for key in ["alice", "bob"] {
+            let outcome = backend
+                .reserve(ReserveRequest {
+                    key: key.into(),
+                    estimate: 1,
+                    now_ms: 0,
+                })
+                .await;
+            assert!(outcome.is_ok(), "Valkey reserve failed: {outcome:?}");
+            assert_eq!(
+                backend.snapshot().budget_remaining,
+                super::super::MAX_REPORTED_REMAINING
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the live upgrade-compatibility test constructs legacy reservation bookkeeping before reconciliation"
+    )]
+    async fn live_valkey_sliding_window_reconcile_does_not_create_balance_for_an_unretained_key() {
+        let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+            return;
+        };
+        let backend = ValkeyTokenRateLimitBackend::new(ValkeyBackendConfig {
+            valkey: ValkeyEval::new(url).unwrap(),
+            namespace: format!("praxis:test:sw-legacy-reconcile:{}", std::process::id()),
+            rule: "engineering".into(),
+            budgets: vec![Budget {
+                window_ms: 60_000,
+                capacity: 100,
+            }],
+            reservation_timeout_ms: 1_000,
+            max_keys: 8,
+            max_active_reservations: 8,
+        });
+        let BackendReserve::Admitted { reservation_id, .. } = backend
+            .reserve(ReserveRequest {
+                key: "alice".into(),
+                estimate: 20,
+                now_ms: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected admission")
+        };
+
+        let keys = backend.key_parts("alice");
+        let mut connection = backend.valkey.connection().await.unwrap();
+        let _: i64 = redis::cmd("ZREM")
+            .arg(&keys[9])
+            .arg(&keys[0])
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let _: i64 = redis::cmd("HDEL")
+            .arg(&keys[10])
+            .arg(&keys[0])
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(&keys[11])
+            .arg(0)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+
+        backend
+            .reconcile(ReconcileRequest {
+                key: "alice".into(),
+                reservation_id,
+                actual: Some(20),
+                estimate: 20,
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(backend.snapshot().budget_remaining, 0);
+        let balance: Option<String> = redis::cmd("HGET")
+            .arg(&keys[10])
+            .arg(&keys[0])
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            balance.is_none(),
+            "reconcile must not create a balance outside the retained-key zset"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the gated live test verifies saturation and TTLs for every rule telemetry key"
+    )]
+    async fn live_valkey_token_bucket_telemetry_is_saturated_and_expiring() {
+        let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+            return;
+        };
+        let backend = ValkeyTokenBucketBackend::new(ValkeyTokenBucketConfig {
+            valkey: ValkeyEval::new(url).unwrap(),
+            namespace: format!("praxis:test:tb-saturated-telemetry:{}", std::process::id()),
+            rule: "engineering".into(),
+            capacity: token_bucket_ledger::MAX_F64_SAFE_INTEGER,
+            refill_rate: 10_000_000.0,
+            reservation_timeout_ms: 1_000,
+            max_keys: 8,
+            max_active_reservations: 8,
+        })
+        .unwrap();
+
+        for key in ["alice", "bob"] {
+            let outcome = backend
+                .reserve(ReserveRequest {
+                    key: key.into(),
+                    estimate: 1,
+                    now_ms: 0,
+                })
+                .await;
+            assert!(outcome.is_ok(), "Valkey reserve failed: {outcome:?}");
+            assert_eq!(
+                backend.snapshot().budget_remaining,
+                super::super::MAX_REPORTED_REMAINING
+            );
+        }
+
+        let keys = backend.key_parts("alice");
+        let mut connection = backend.valkey.connection().await.unwrap();
+        for key in &keys[6..] {
+            let ttl_ms: i64 = redis::cmd("PTTL").arg(key).query_async(&mut connection).await.unwrap();
+            assert!(ttl_ms > 0, "rule telemetry key {key} must expire, got PTTL={ttl_ms}");
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the live upgrade-compatibility test constructs legacy reservation bookkeeping before reconciliation"
+    )]
+    async fn live_valkey_token_bucket_reconcile_does_not_create_balance_for_an_unretained_key() {
+        let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+            return;
+        };
+        let backend = ValkeyTokenBucketBackend::new(ValkeyTokenBucketConfig {
+            valkey: ValkeyEval::new(url).unwrap(),
+            namespace: format!("praxis:test:tb-legacy-reconcile:{}", std::process::id()),
+            rule: "engineering".into(),
+            capacity: 100,
+            refill_rate: 1.0,
+            reservation_timeout_ms: 1_000,
+            max_keys: 8,
+            max_active_reservations: 8,
+        })
+        .unwrap();
+        let BackendReserve::Admitted { reservation_id, .. } = backend
+            .reserve(ReserveRequest {
+                key: "alice".into(),
+                estimate: 20,
+                now_ms: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected admission")
+        };
+
+        let keys = backend.key_parts("alice");
+        let mut connection = backend.valkey.connection().await.unwrap();
+        let _: i64 = redis::cmd("ZREM")
+            .arg(&keys[8])
+            .arg(&keys[0])
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let _: i64 = redis::cmd("HDEL")
+            .arg(&keys[9])
+            .arg(&keys[0])
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let _: () = redis::cmd("SET")
+            .arg(&keys[10])
+            .arg(0)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+
+        backend
+            .reconcile(ReconcileRequest {
+                key: "alice".into(),
+                reservation_id,
+                actual: Some(20),
+                estimate: 20,
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(backend.snapshot().budget_remaining, 0);
+        let balance: Option<String> = redis::cmd("HGET")
+            .arg(&keys[9])
+            .arg(&keys[0])
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(
+            balance.is_none(),
+            "reconcile must not create a balance outside the retained-key zset"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the gated live test verifies repeated denials and the physical-key invariant"
+    )]
+    async fn live_valkey_token_bucket_denials_do_not_create_unretained_keys() {
+        let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+            return;
+        };
+        let backend = ValkeyTokenBucketBackend::new(ValkeyTokenBucketConfig {
+            valkey: ValkeyEval::new(url).unwrap(),
+            namespace: format!("praxis:test:tb-denied-key:{}", std::process::id()),
+            rule: "engineering".into(),
+            capacity: 100,
+            refill_rate: 1.0,
+            reservation_timeout_ms: 1_000,
+            max_keys: 1,
+            max_active_reservations: 8,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            backend
+                .reserve(ReserveRequest {
+                    key: "alice".into(),
+                    estimate: 1,
+                    now_ms: 0,
+                })
+                .await,
+            Ok(BackendReserve::Admitted { .. })
+        ));
+
+        for _ in 0..2 {
+            assert!(matches!(
+                backend
+                    .reserve(ReserveRequest {
+                        key: "bob".into(),
+                        estimate: 1,
+                        now_ms: 0,
+                    })
+                    .await,
+                Ok(BackendReserve::Denied { .. })
+            ));
+        }
+        assert_eq!(backend.snapshot().active_keys, 1);
+
+        let bob_keys = backend.key_parts("bob");
+        let mut connection = backend.valkey.connection().await.unwrap();
+        let exists: i64 = redis::cmd("EXISTS")
+            .arg(&bob_keys[0])
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(exists, 0, "a denied new key must not leave a physical hash behind");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the gated live test verifies max-active denial leaves no new physical key"
+    )]
+    async fn live_valkey_token_bucket_max_active_denial_does_not_create_a_new_key() {
+        let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+            return;
+        };
+        let backend = ValkeyTokenBucketBackend::new(ValkeyTokenBucketConfig {
+            valkey: ValkeyEval::new(url).unwrap(),
+            namespace: format!("praxis:test:tb-denied-active:{}", std::process::id()),
+            rule: "engineering".into(),
+            capacity: 100,
+            refill_rate: 1.0,
+            reservation_timeout_ms: 1_000,
+            max_keys: 8,
+            max_active_reservations: 1,
+        })
+        .unwrap();
+
+        assert!(matches!(
+            backend
+                .reserve(ReserveRequest {
+                    key: "alice".into(),
+                    estimate: 1,
+                    now_ms: 0,
+                })
+                .await,
+            Ok(BackendReserve::Admitted { .. })
+        ));
+        assert!(matches!(
+            backend
+                .reserve(ReserveRequest {
+                    key: "bob".into(),
+                    estimate: 1,
+                    now_ms: 0,
+                })
+                .await,
+            Ok(BackendReserve::Denied { .. })
+        ));
+
+        let bob_keys = backend.key_parts("bob");
+        let mut connection = backend.valkey.connection().await.unwrap();
+        let exists: i64 = redis::cmd("EXISTS")
+            .arg(&bob_keys[0])
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(exists, 0, "a max-active denial for a new key must not create its hash");
+    }
+
     #[test]
     fn worker_enqueue_fails_once_its_receiver_is_gone() {
         let worker = ReconcileWorker::detached();
@@ -2007,6 +2443,18 @@ mod tests {
 
         fn limit(&self) -> u64 {
             0
+        }
+
+        fn snapshot(&self) -> BackendSnapshot {
+            BackendSnapshot::default()
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "test"
+        }
+
+        fn algorithm_name(&self) -> &'static str {
+            "test"
         }
     }
 

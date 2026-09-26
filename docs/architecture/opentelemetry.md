@@ -53,12 +53,19 @@ Provider Praxis core request span
   |
   +-- provider.route          (Praxis AI, provider_route)
   `-- upstream hop            (Praxis core)
+
+Either request span, when its pipeline runs token_rate_limit
+  |
+  +-- token_rate_limit        (Praxis AI; admission until the response body ends)
+  `-- ...
 ```
 
-Each semantic decision span is short-lived and is a sibling of the later
-transport span within the same request. When trace context is propagated
-between gateways, Praxis core connects the edge provider-hop client span to
-the provider request span.
+The routing decision spans are short-lived siblings of the later transport
+span within the same request. The `token_rate_limit` span is the exception:
+it opens at admission and is closed when the response body ends, because its
+`actual_cost` field is only known once provider usage has been read (see
+below). When trace context is propagated between gateways, Praxis core
+connects the edge provider-hop client span to the provider request span.
 
 Praxis core owns the complete HTTP span lifetime and transport boundaries at
 both the edge and the provider-local listener. Praxis AI records only the
@@ -71,3 +78,27 @@ into isolated web-search, OGX file-search, OGX file-resolution, and MCP child
 requests. Praxis core then emits the same `x-request-id` and W3C trace ID with a
 fresh span ID for every outbound hop. No ambient request extensions, provider
 credentials, or MCP authorization assertions are copied into trace fields.
+
+## Token rate limiting
+
+When the experimental `token_rate_limit` filter and the `opentelemetry`
+feature are both enabled, every request that reaches a matching rule gets a
+request-scoped `token_rate_limit` span. It records these bounded fields:
+
+- `token_rate_limit.rule`: configured rule name.
+- `token_rate_limit.algorithm`: `sliding_window` or `token_bucket`.
+- `token_rate_limit.estimated_cost`: tokens reserved or considered at admission.
+- `token_rate_limit.decision`: `admitted` (reservation made), `denied` (429,
+  budget exhausted), `unauthenticated` (401, no trusted subject to key the
+  budget on), or `error` (503, the backend failed and the filter failed
+  closed).
+- `token_rate_limit.actual_cost`: provider-reported weighted usage, recorded
+  when the response body ends. Absent when the decision was not `admitted`
+  or no usage metadata was produced.
+
+The span is created at admission and dropped when the response body ends,
+so its lifetime covers the streamed response. It does not contain the
+authenticated subject, internal budget key, prompt, body, model, or other
+request-specific identity. Valkey reconciliation runs asynchronously after
+response processing; its success or failure is exposed through metrics and
+accounting logs rather than extending the span further.

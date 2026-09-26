@@ -11,11 +11,13 @@
 #
 # This is the agreed M1/M2/M6 core of the token rate limiting proposal
 # (00121_token-rate-limiting.md in praxis-proxy/enhancements, tracked by
-# epic ai#121), plus M3 estimation and M4 token-type weights:
+# epic ai#121), plus M3 estimation, M4 token-type weights, and the M7
+# observability contract from ai#883:
 #   - M1: a single sliding-window budget (one catch-all rule)
 #   - M2: reservation-based admission, reconciled against actual usage
 #   - M4: per-type weights at reconciliation (cached input cheaper, etc.)
 #   - M6: 429 responses with token-denominated rate limit headers
+#   - M7: group-level Prometheus metrics, request spans, and accounting logs
 #
 # `rules:` (per `ai#789`/`praxis#551`) lets each rule pick its own
 # admission algorithm and match condition; a rule with no `match:` is a
@@ -40,9 +42,20 @@
 # on OpenAI/Anthropic and additive on Google. Omitted types default to
 # 1.0. Admission still reserves `reserved_tokens` unweighted (M3).
 #
+# Observability requires no filter configuration. Metrics use bounded
+# rule/algorithm/result/backend labels and never identify a user. The
+# budget_remaining gauge is the sum of the latest calculated balances
+# across retained keys in a rule; active_keys shows how many balances
+# contribute. Window aging/refill is lazy, so this is a snapshot. Build
+# with `opentelemetry` to add the request-scoped decision span. Structured
+# best-effort audit records use the dedicated
+# `praxis_ai::token_rate_limit::accounting` log target at INFO (one line
+# per admission or settlement); keep only failures with
+# `runtime.log_overrides: {"praxis_ai::token_rate_limit::accounting": "warn"}`.
+#
 # Deliberately not yet built (see filters/src/token_rate_limit/mod.rs
-# for the full rationale): arbitrary CEL/composite bucket keys, and
-# observability/metering (M7/M8/S3).
+# for the full rationale): arbitrary CEL/composite bucket keys and
+# billing-grade metering (S3).
 #
 # token_rate_limit is declared *before* token_count: response hooks
 # run in reverse declared order, so token_count's on_response_body

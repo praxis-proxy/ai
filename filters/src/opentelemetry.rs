@@ -5,14 +5,46 @@
 //!
 //! Praxis core owns subscriber installation, OTLP export, propagation,
 //! sampling, request lifecycle spans, and provider-hop client spans. AI owns
-//! only the semantic decisions made by `intelligent_route` (edge routing
-//! selection) and `provider_route` (provider-local backend resolution).
+//! only the semantic decisions it makes: `intelligent_route` (edge routing
+//! selection), `provider_route` (provider-local backend resolution), and the
+//! `token_rate_limit` admission decision.
 
 use std::sync::Arc;
 
 use tracing::field::Empty;
 
 use crate::routing::descriptor::RouteCandidate;
+
+/// Request-scoped token-rate-limit span retained until reconciliation.
+pub(crate) struct TokenRateLimitSpan(tracing::Span);
+
+impl TokenRateLimitSpan {
+    /// Record actual weighted token cost once response usage is available.
+    pub(crate) fn record_actual(&self, actual: u64) {
+        self.0.record("token_rate_limit.actual_cost", actual);
+    }
+}
+
+/// Create a bounded per-request span for one token-rate-limit decision.
+///
+/// Rule and algorithm come from bounded configuration. No budget key,
+/// authenticated subject, model, prompt, body, credential, or raw request
+/// identifier is recorded.
+pub(crate) fn token_rate_limit_span(
+    rule: &str,
+    algorithm: &'static str,
+    estimated_cost: u64,
+    decision: &'static str,
+) -> TokenRateLimitSpan {
+    TokenRateLimitSpan(tracing::info_span!(
+        "token_rate_limit",
+        "token_rate_limit.rule" = rule,
+        "token_rate_limit.algorithm" = algorithm,
+        "token_rate_limit.estimated_cost" = estimated_cost,
+        "token_rate_limit.actual_cost" = Empty,
+        "token_rate_limit.decision" = decision,
+    ))
+}
 
 /// Borrowed, validated attributes for a routing decision span.
 struct RoutingSelection<'a> {
@@ -170,7 +202,7 @@ pub(crate) fn record_provider_route_selection(
 mod tests {
     use std::sync::Arc;
 
-    use super::{ProviderRouteSelection, RoutingSelection, record_provider_route_selection};
+    use super::{ProviderRouteSelection, RoutingSelection, record_provider_route_selection, token_rate_limit_span};
     use crate::routing::descriptor::{AdmissionState, CapabilityKind, RouteCandidate};
 
     #[test]
@@ -240,6 +272,12 @@ mod tests {
         let fields = ProviderRouteSelection::new(&provider_id, &cluster, &model, "candidate-a", None);
 
         assert_eq!(fields.revision, None);
+    }
+
+    #[test]
+    fn token_rate_limit_span_accepts_its_bounded_decision_and_actual_cost_fields() {
+        let span = token_rate_limit_span("engineering", "sliding_window", 500, "admitted");
+        span.record_actual(120);
     }
 
     // -------------------------------------------------------------------------
