@@ -1292,6 +1292,79 @@ fn terminal_streaming_reassembles_fragmented_message_start() {
 }
 
 #[test]
+fn terminal_streaming_forwards_multiline_data_delta() {
+    let filter = terminal_streaming_filter();
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = streaming_response_context(&request);
+
+    feed_chunk(&*filter, &mut ctx, sse_message_start("msg_1"), false);
+    let start = Bytes::from(
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+    );
+    feed_chunk(&*filter, &mut ctx, start, false);
+    // SSE-spec multiline `data:` lines join with a newline; the resulting JSON
+    // is still a valid content_block_delta and must be forwarded, not dropped.
+    let multiline = Bytes::from(
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\ndata: \"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+    );
+    let forwarded = feed_chunk(&*filter, &mut ctx, multiline, false);
+    let forwarded = String::from_utf8(forwarded.expect("multiline delta reaches the client").to_vec()).unwrap();
+    assert!(
+        forwarded.contains("event: content_block_delta"),
+        "multiline data is parsed into a forwarded delta"
+    );
+    assert!(
+        forwarded.contains("\"text\":\"Hello\""),
+        "joined multiline JSON preserves the text payload"
+    );
+    assert!(
+        forwarded.contains("\"index\":0"),
+        "a first-round text block keeps client index 0"
+    );
+    assert!(
+        forwarded.ends_with("\n\n"),
+        "the forwarded event keeps the canonical SSE delimiter"
+    );
+}
+
+#[test]
+fn terminal_streaming_remaps_text_index_after_suppressed_search() {
+    let filter = terminal_streaming_filter();
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = streaming_response_context(&request);
+
+    feed_chunk(&*filter, &mut ctx, sse_message_start("msg_1"), false);
+    let suppressed = feed_chunk(&*filter, &mut ctx, sse_web_search_block(0, "toolu_ws", "potato"), false);
+    assert!(
+        suppressed.is_none(),
+        "the managed WebSearch tool_use block is fully suppressed"
+    );
+
+    let forwarded = feed_chunk(&*filter, &mut ctx, sse_text_block(1, "Searching..."), false);
+    let forwarded = String::from_utf8(forwarded.expect("text after search is forwarded").to_vec()).unwrap();
+    assert!(
+        forwarded.contains("event: content_block_start"),
+        "the client-owned text block is forwarded"
+    );
+    assert!(
+        forwarded.contains("\"text\":\"Searching...\""),
+        "the text delta payload is forwarded"
+    );
+    assert!(
+        forwarded.contains("\"index\":0"),
+        "dense remapping assigns the first visible block client index 0"
+    );
+    assert!(
+        !forwarded.contains("\"index\":1"),
+        "the suppressed WebSearch must not leave a hole in client-visible indices"
+    );
+    assert!(
+        forwarded.ends_with("\n\n"),
+        "remapped events keep the canonical SSE delimiter"
+    );
+}
+
+#[test]
 fn accounted_previous_response_recovers_complete_assistant_content() {
     let content = json!([
         {"type":"text","text":"I will search first."},

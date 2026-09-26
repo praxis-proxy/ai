@@ -29,11 +29,9 @@ use std::{
 
 use serde_json::{Value, json};
 
-/// A parsed SSE event: its type and decoded JSON `data` payload.
+/// A parsed SSE event: the decoded JSON `data` payload.
 #[derive(Debug)]
 pub(super) struct SseEvent {
-    /// Event type, taken from the payload's `type` field.
-    pub(super) event_type: String,
     /// Decoded JSON `data` payload.
     pub(super) data: Value,
 }
@@ -300,20 +298,18 @@ fn parse_event_block(block: &str) -> Result<Option<SseEvent>, StreamError> {
         return Ok(None);
     }
     let data: Value = serde_json::from_str(&data).map_err(|_invalid_json| StreamError::MalformedEvent)?;
-    let event_type = data
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or(StreamError::MalformedEvent)?
-        .to_owned();
-    Ok(Some(SseEvent { event_type, data }))
+    if data.get("type").and_then(Value::as_str).is_none() {
+        return Err(StreamError::MalformedEvent);
+    }
+    Ok(Some(SseEvent { data }))
 }
 
 /// Concatenate an SSE block's `data` field lines, or `None` if it carries none.
 ///
 /// Joins multiple `data:` lines with a newline per the SSE specification and
 /// accepts the `data`, `data:value`, and `data: value` field forms.
-fn collect_data_field(block: &str) -> Option<String> {
-    let mut data: Option<String> = None;
+fn collect_data_field(block: &str) -> Option<Cow<'_, str>> {
+    let mut data: Option<Cow<'_, str>> = None;
     for line in block.lines() {
         let field = if line == "data" {
             Some("")
@@ -324,10 +320,11 @@ fn collect_data_field(block: &str) -> Option<String> {
         if let Some(field) = field {
             match &mut data {
                 Some(existing) => {
+                    let existing = existing.to_mut();
                     existing.push('\n');
                     existing.push_str(field);
                 },
-                None => data = Some(field.to_owned()),
+                None => data = Some(Cow::Borrowed(field)),
             }
         }
     }
@@ -511,35 +508,35 @@ impl LogicalStream {
             if self.failed {
                 break;
             }
-            self.process_event(&event, &mut output)?;
+            self.process_event(event, &mut output)?;
         }
         Ok(output)
     }
 
     /// Reconstruct and forward one parsed SSE event.
-    fn process_event(&mut self, event: &SseEvent, output: &mut Vec<u8>) -> Result<(), StreamError> {
-        match event.event_type.as_str() {
-            "message_start" => {
-                self.on_message_start(event, output);
+    fn process_event(&mut self, event: SseEvent, output: &mut Vec<u8>) -> Result<(), StreamError> {
+        match event_kind(&event.data) {
+            EventKind::MessageStart => {
+                self.on_message_start(&event.data, output);
                 Ok(())
             },
-            "content_block_start" => self.on_block_start(event, output),
-            "content_block_delta" => self.on_block_delta(event, output),
-            "content_block_stop" => self.on_block_stop(event, output),
-            "message_delta" => {
-                self.on_message_delta(event);
+            EventKind::ContentBlockStart => self.on_block_start(event.data, output),
+            EventKind::ContentBlockDelta => self.on_block_delta(event.data, output),
+            EventKind::ContentBlockStop => self.on_block_stop(event.data, output),
+            EventKind::MessageDelta => {
+                self.on_message_delta(&event.data);
                 Ok(())
             },
             // Keep-alives are forwarded so the client connection stays live while
             // intermediate rounds run.
-            "ping" => {
+            EventKind::Ping => {
                 emit_event(output, "ping", &event.data);
                 Ok(())
             },
             // An upstream `error` after HTTP 200 is a real backend failure: forward
             // it verbatim and poison the stream so `finish_round` never fabricates a
             // synthetic success terminal in its place.
-            "error" => {
+            EventKind::Error => {
                 emit_event(output, "error", &event.data);
                 self.failed = true;
                 Ok(())
@@ -548,18 +545,18 @@ impl LogicalStream {
             // forwarded per round (the terminal lifecycle is emitted once by
             // `finish_round`), but it is recorded so a round truncated before it
             // arrives fails closed instead of fabricating a successful terminal.
-            "message_stop" => {
+            EventKind::MessageStop => {
                 self.round.message_stopped = true;
                 Ok(())
             },
             // Every other unmodeled event is deferred without forwarding.
-            _ => Ok(()),
+            EventKind::Other => Ok(()),
         }
     }
 
     /// Capture the base message and forward the client-visible `message_start`.
-    fn on_message_start(&mut self, event: &SseEvent, output: &mut Vec<u8>) {
-        if let Some(message) = event.data.get("message") {
+    fn on_message_start(&mut self, data: &Value, output: &mut Vec<u8>) {
+        if let Some(message) = data.get("message") {
             if let Some(usage) = message.get("usage") {
                 self.capture_round_usage(usage);
             }
@@ -567,7 +564,7 @@ impl LogicalStream {
         }
         if !self.message_started {
             self.message_started = true;
-            emit_event(output, "message_start", &event.data);
+            emit_event(output, "message_start", data);
         }
     }
 
@@ -589,8 +586,8 @@ impl LogicalStream {
     /// The managed `WebSearch` `tool_use` block is suppressed entirely: it is
     /// neither forwarded nor assigned a client output index, so its subsequent
     /// delta and stop frames are dropped as well.
-    fn on_block_start(&mut self, event: &SseEvent, output: &mut Vec<u8>) -> Result<(), StreamError> {
-        let index = block_index(&event.data)?;
+    fn on_block_start(&mut self, data: Value, output: &mut Vec<u8>) -> Result<(), StreamError> {
+        let index = block_index(&data)?;
         // Content blocks are dense and sequential in the Anthropic wire format. A
         // backend-controlled index that skips ahead would force an unbounded
         // sparse allocation, so a non-sequential index fails closed instead.
@@ -599,36 +596,36 @@ impl LogicalStream {
         }
         // Reconstruct every block, including the suppressed managed call, so the
         // finished message can be classified exactly as the buffered loop would.
-        let block = event.data.get("content_block").cloned().unwrap_or(Value::Null);
+        let block = data.get("content_block").cloned().unwrap_or(Value::Null);
         self.round.content.push(block);
         // Track every started block by index (suppressed calls included) so a
         // block left open by a truncated stream is detected at round end. The
         // index is fresh: it was validated equal to the pre-push content length.
         self.round.open_blocks.insert(index);
-        if is_web_search_tool_use(&event.data) {
+        if is_web_search_tool_use(&data) {
             self.round.suppressed_web_search = Some(index);
             return Ok(());
         }
         let output_index = self.next_output_index;
         self.next_output_index += 1;
         self.round.forwarded.insert(index, output_index);
-        emit_remapped(output, "content_block_start", &event.data, output_index);
+        emit_remapped(output, "content_block_start", data, output_index);
         Ok(())
     }
 
     /// Reconstruct and, for forwarded blocks, forward a content-block delta.
-    fn on_block_delta(&mut self, event: &SseEvent, output: &mut Vec<u8>) -> Result<(), StreamError> {
-        let index = block_index(&event.data)?;
-        self.accumulate_delta(index, &event.data)?;
-        if let Some(&output_index) = self.round.forwarded.get(&index) {
-            emit_remapped(output, "content_block_delta", &event.data, output_index);
+    fn on_block_delta(&mut self, data: Value, output: &mut Vec<u8>) -> Result<(), StreamError> {
+        let index = block_index(&data)?;
+        self.accumulate_delta(index, &data)?;
+        if let Some(output_index) = self.round.forwarded.get(&index).copied() {
+            emit_remapped(output, "content_block_delta", data, output_index);
         }
         Ok(())
     }
 
     /// Finalize text and tool input and, for forwarded blocks, forward a stop.
-    fn on_block_stop(&mut self, event: &SseEvent, output: &mut Vec<u8>) -> Result<(), StreamError> {
-        let index = block_index(&event.data)?;
+    fn on_block_stop(&mut self, data: Value, output: &mut Vec<u8>) -> Result<(), StreamError> {
+        let index = block_index(&data)?;
         // A stop must close a currently-open block. A stray (never-started) or
         // duplicate stop is rejected so it cannot silently cancel a different
         // genuinely-open block and mask a truncated round from the completeness
@@ -655,23 +652,22 @@ impl LogicalStream {
         {
             block["input"] = input;
         }
-        if let Some(&output_index) = self.round.forwarded.get(&index) {
-            emit_remapped(output, "content_block_stop", &event.data, output_index);
+        if let Some(output_index) = self.round.forwarded.get(&index).copied() {
+            emit_remapped(output, "content_block_stop", data, output_index);
         }
         Ok(())
     }
 
     /// Capture the round's stop reason and output-token count; do not forward.
-    fn on_message_delta(&mut self, event: &SseEvent) {
-        if let Some(stop_reason) = event
-            .data
+    fn on_message_delta(&mut self, data: &Value) {
+        if let Some(stop_reason) = data
             .get("delta")
             .and_then(|delta| delta.get("stop_reason"))
             .and_then(Value::as_str)
         {
             self.round.stop_reason = Some(stop_reason.to_owned());
         }
-        if let Some(usage) = event.data.get("usage") {
+        if let Some(usage) = data.get("usage") {
             if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_u64) {
                 self.round.round_output_tokens = tokens;
             }
@@ -947,13 +943,49 @@ fn block_index(data: &Value) -> Result<usize, StreamError> {
         .ok_or(StreamError::MalformedEvent)
 }
 
-/// Emit an SSE event with its content-block `index` remapped to the client index.
-fn emit_remapped(output: &mut Vec<u8>, event_type: &str, data: &Value, output_index: u64) {
-    let mut data = data.clone();
-    if let Some(object) = data.as_object_mut() {
-        object.insert("index".to_owned(), Value::from(output_index));
+#[derive(Clone, Copy)]
+enum EventKind {
+    MessageStart,
+    ContentBlockStart,
+    ContentBlockDelta,
+    ContentBlockStop,
+    MessageDelta,
+    Ping,
+    Error,
+    MessageStop,
+    Other,
+}
+
+fn event_kind(data: &Value) -> EventKind {
+    match data.get("type").and_then(Value::as_str) {
+        Some("message_start") => EventKind::MessageStart,
+        Some("content_block_start") => EventKind::ContentBlockStart,
+        Some("content_block_delta") => EventKind::ContentBlockDelta,
+        Some("content_block_stop") => EventKind::ContentBlockStop,
+        Some("message_delta") => EventKind::MessageDelta,
+        Some("ping") => EventKind::Ping,
+        Some("error") => EventKind::Error,
+        Some("message_stop") => EventKind::MessageStop,
+        _ => EventKind::Other,
     }
+}
+
+/// Emit an SSE event with its content-block `index` remapped to the client index.
+fn emit_remapped(output: &mut Vec<u8>, event_type: &str, mut data: Value, output_index: u64) {
+    remap_index(&mut data, output_index);
     emit_event(output, event_type, &data);
+}
+
+fn remap_index(data: &mut Value, output_index: u64) {
+    let Some(object) = data.as_object_mut() else {
+        return;
+    };
+    match object.get_mut("index") {
+        Some(index) => *index = Value::from(output_index),
+        None => {
+            object.insert("index".to_owned(), Value::from(output_index));
+        },
+    }
 }
 
 /// Encode a fail-closed terminal Anthropic `error` SSE event for a stream error.
@@ -999,11 +1031,34 @@ fn anthropic_error(error: &StreamError) -> (&'static str, &'static str) {
 
 /// Encode one canonical single-line Anthropic SSE event.
 fn emit_event(output: &mut Vec<u8>, event_type: &str, data: &Value) {
+    emit_framed_event(output, event_type, |out| serde_json::to_writer(out, data));
+}
+
+fn emit_framed_event<E>(
+    output: &mut Vec<u8>,
+    event_type: &str,
+    write_payload: impl FnOnce(&mut Vec<u8>) -> Result<(), E>,
+) {
+    let start = output.len();
     output.extend_from_slice(b"event: ");
     output.extend_from_slice(event_type.as_bytes());
     output.extend_from_slice(b"\ndata: ");
-    output.extend_from_slice(data.to_string().as_bytes());
+    if write_json_or_rollback(output, write_payload).is_err() {
+        output.truncate(start);
+        return;
+    }
     output.extend_from_slice(b"\n\n");
+}
+
+fn write_json_or_rollback<E>(output: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u8>) -> Result<(), E>) -> Result<(), E> {
+    let json_start = output.len();
+    match write(output) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            output.truncate(json_start);
+            Err(error)
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1016,6 +1071,8 @@ fn emit_event(output: &mut Vec<u8>, event_type: &str, data: &Value) {
     reason = "tests"
 )]
 mod tests {
+    use std::borrow::Cow;
+
     use serde_json::json;
 
     use super::*;
@@ -1123,7 +1180,6 @@ mod tests {
         let events = parser.push(chunk, false, MAX_PARTIAL).unwrap();
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "message_start");
         assert_eq!(events[0].data["type"], "message_start");
     }
 
@@ -1144,7 +1200,7 @@ mod tests {
             .push(b"t_block_delta\",\"index\":0}\n\n", false, MAX_PARTIAL)
             .unwrap();
         assert_eq!(second.len(), 1);
-        assert_eq!(second[0].event_type, "content_block_delta");
+        assert_eq!(second[0].data["type"], "content_block_delta");
         assert_eq!(second[0].data["index"], 0);
     }
 
@@ -1214,7 +1270,7 @@ mod tests {
         let events = parser.push(chunk, false, MAX_PARTIAL).unwrap();
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "message_stop");
+        assert_eq!(events[0].data["type"], "message_stop");
     }
 
     #[test]
@@ -1235,7 +1291,7 @@ mod tests {
         let second = parser.push(b"\n", false, MAX_PARTIAL).unwrap();
 
         assert_eq!(second.len(), 1);
-        assert_eq!(second[0].event_type, "message_stop");
+        assert_eq!(second[0].data["type"], "message_stop");
     }
 
     #[test]
@@ -1251,7 +1307,7 @@ mod tests {
         }
 
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "content_block_delta");
+        assert_eq!(events[0].data["type"], "content_block_delta");
         assert_eq!(events[0].data["index"], 0);
     }
 
@@ -1321,8 +1377,8 @@ mod tests {
         let events = parser.push(chunk, false, MAX_PARTIAL).unwrap();
 
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, "ping");
-        assert_eq!(events[1].event_type, "message_stop");
+        assert_eq!(events[0].data["type"], "ping");
+        assert_eq!(events[1].data["type"], "message_stop");
     }
 
     #[test]
@@ -2149,6 +2205,365 @@ mod tests {
         assert_eq!(
             event["usage"]["cache_read_input_tokens"], 5,
             "cache-read tokens aggregate 2 + 3"
+        );
+    }
+
+    #[test]
+    fn collect_data_field_single_line_borrows_input() {
+        let block = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0}";
+        let collected = collect_data_field(block).expect("data line present");
+        assert!(
+            matches!(collected, Cow::Borrowed(_)),
+            "a single data line must borrow the input block"
+        );
+        let expected = "{\"type\":\"content_block_delta\",\"index\":0}";
+        assert_eq!(&*collected, expected);
+        let data_line = block.split_once("data: ").expect("data prefix").1;
+        assert!(
+            std::ptr::eq(collected.as_ptr(), data_line.as_ptr()),
+            "borrowed data must retain the caller's buffer"
+        );
+    }
+
+    #[test]
+    fn collect_data_field_borrows_data_value_without_space() {
+        let block = "data:{\"type\":\"ping\"}";
+        let collected = collect_data_field(block).expect("data line present");
+        assert!(
+            matches!(collected, Cow::Borrowed(_)),
+            "the data:value form must borrow the input block"
+        );
+        assert_eq!(&*collected, "{\"type\":\"ping\"}");
+        let data_line = block.strip_prefix("data:").expect("data prefix");
+        assert!(
+            std::ptr::eq(collected.as_ptr(), data_line.as_ptr()),
+            "borrowed data:value payload must retain the caller's buffer"
+        );
+    }
+
+    #[test]
+    fn collect_data_field_joins_multiline_data() {
+        let block = "data: {\"type\":\"x\",\ndata: \"i\":1}";
+        let collected = collect_data_field(block).expect("data lines present");
+        assert!(
+            matches!(collected, Cow::Owned(_)),
+            "multiple data lines must allocate a joined payload"
+        );
+        assert_eq!(&*collected, "{\"type\":\"x\",\n\"i\":1}");
+    }
+
+    #[test]
+    fn parses_multiline_data_payload() {
+        let mut parser = SseParser::default();
+        let chunk = b"data: {\"type\":\"ping\",\ndata: \"k\":1}\n\n";
+
+        let events = parser.push(chunk, false, MAX_PARTIAL).unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["type"], "ping");
+        assert_eq!(events[0].data["k"], 1);
+    }
+
+    #[test]
+    fn fails_closed_on_malformed_multiline_json() {
+        let mut parser = SseParser::default();
+        let error = parser
+            .push(b"data: {\"type\":\"ping\",\ndata: not-json}\n\n", false, MAX_PARTIAL)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            StreamError::MalformedEvent,
+            "joined multiline data that is not JSON fails closed"
+        );
+    }
+
+    #[test]
+    fn forwarded_ping_bytes_match_canonical_sse() {
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        text_output(&mut stream, &message_start("msg_1"), false);
+        let payload = json!({"type": "ping"});
+        let out = stream.on_chunk(&sse("ping", &payload), false).unwrap();
+        let mut expected = Vec::new();
+        emit_event(&mut expected, "ping", &payload);
+        assert_eq!(out, expected, "forwarded ping bytes must match canonical SSE framing");
+        assert!(
+            out.ends_with(b"\n\n"),
+            "canonical SSE delimiter is a trailing blank line"
+        );
+    }
+
+    fn stream_ready_for_second_round_text() -> LogicalStream {
+        let mut stream = LogicalStream::new(MAX_BODY, MAX_PARTIAL);
+        text_output(&mut stream, &message_start("msg_1"), false);
+        text_output(&mut stream, &text_block(0, "first"), false);
+        stream.begin_round();
+        text_output(&mut stream, &message_start("msg_2"), false);
+        stream
+    }
+
+    #[test]
+    fn remapped_block_start_preserves_payload_except_index() {
+        let mut stream = stream_ready_for_second_round_text();
+        let start = sse(
+            "content_block_start",
+            &json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        );
+        let start_out = stream.on_chunk(&start, false).unwrap();
+        let start_payload = parse_event(&start_out, "content_block_start");
+        assert_eq!(start_payload["index"], 1, "round 1 continues at client index 1");
+        assert_eq!(start_payload["type"], "content_block_start");
+        assert_eq!(start_payload["content_block"]["type"], "text");
+        assert!(
+            std::str::from_utf8(&start_out).unwrap().ends_with("\n\n"),
+            "remapped start keeps the SSE delimiter"
+        );
+    }
+
+    #[test]
+    fn remapped_delta_preserves_payload_except_index() {
+        let mut stream = stream_ready_for_second_round_text();
+        text_output(
+            &mut stream,
+            &sse(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""}
+                }),
+            ),
+            false,
+        );
+        let delta = sse(
+            "content_block_delta",
+            &json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "second"}
+            }),
+        );
+        let delta_out = stream.on_chunk(&delta, false).unwrap();
+        let delta_payload = parse_event(&delta_out, "content_block_delta");
+        assert_eq!(delta_payload["index"], 1, "delta index is remapped densely");
+        assert_eq!(delta_payload["type"], "content_block_delta");
+        assert_eq!(delta_payload["delta"]["text"], "second");
+        assert!(
+            std::str::from_utf8(&delta_out).unwrap().ends_with("\n\n"),
+            "remapped delta keeps the SSE delimiter"
+        );
+    }
+
+    #[test]
+    fn emit_event_matches_legacy_to_string_format_bytes() {
+        let data = json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "text_delta", "text": "hello"}
+        });
+        let mut output = Vec::new();
+        emit_event(&mut output, "content_block_delta", &data);
+        let data_str = serde_json::to_string(&data).unwrap_or_default();
+        let expected = format!("event: content_block_delta\ndata: {data_str}\n\n");
+        assert_eq!(
+            output,
+            expected.as_bytes(),
+            "direct Vec writes must match to_string SSE bytes"
+        );
+    }
+
+    #[test]
+    fn write_json_or_rollback_discards_partial_bytes_on_failure() {
+        let mut output = b"event: content_block_delta\ndata: ".to_vec();
+        let prefix = output.clone();
+        let result = write_json_or_rollback(&mut output, |out| {
+            out.extend_from_slice(br#"{"type":"content_block_delta""#);
+            Err(std::io::Error::other("injected write failure"))
+        });
+        assert!(
+            result.is_err(),
+            "injected failure must surface so emit_event can roll back"
+        );
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::Other,
+            "rollback must preserve the original write error"
+        );
+        assert_eq!(
+            output, prefix,
+            "a failed payload write must not leave partial JSON in the SSE buffer"
+        );
+    }
+
+    #[test]
+    fn emit_event_rolls_back_entire_event_on_serialization_failure() {
+        let mut output = b"event: ping\ndata: {\"type\":\"ping\"}\n\n".to_vec();
+        let prefix = output.clone();
+        emit_framed_event(&mut output, "content_block_delta", |out| {
+            out.extend_from_slice(br#"{"type":"content_block_delta""#);
+            Err(std::io::Error::other("injected write failure"))
+        });
+        assert_eq!(
+            output, prefix,
+            "serialization failure must roll back the event prefix and skip the delimiter"
+        );
+    }
+
+    fn emit_event_legacy(output: &mut Vec<u8>, event_type: &str, data: &Value) {
+        output.extend_from_slice(b"event: ");
+        output.extend_from_slice(event_type.as_bytes());
+        output.extend_from_slice(b"\ndata: ");
+        output.extend_from_slice(data.to_string().as_bytes());
+        output.extend_from_slice(b"\n\n");
+    }
+
+    fn collect_data_field_legacy(block: &str) -> Option<String> {
+        let mut data: Option<String> = None;
+        for line in block.lines() {
+            let field = if line == "data" {
+                Some("")
+            } else {
+                line.strip_prefix("data:")
+                    .map(|value| value.strip_prefix(' ').unwrap_or(value))
+            };
+            if let Some(field) = field {
+                match &mut data {
+                    Some(existing) => {
+                        existing.push('\n');
+                        existing.push_str(field);
+                    },
+                    None => data = Some(field.to_owned()),
+                }
+            }
+        }
+        data
+    }
+
+    fn emit_remapped_legacy(output: &mut Vec<u8>, event_type: &str, data: &Value, output_index: u64) {
+        let mut data = data.clone();
+        if let Some(object) = data.as_object_mut() {
+            object.insert("index".to_owned(), Value::from(output_index));
+        }
+        emit_event_legacy(output, event_type, &data);
+    }
+
+    fn representative_delta(text: &str, index: u64) -> Value {
+        json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "text_delta", "text": text}
+        })
+    }
+
+    #[test]
+    fn emit_event_allocates_less_than_legacy_to_string() {
+        let payload = representative_delta(&"x".repeat(4096), 0);
+        let capacity = serde_json::to_vec(&payload).unwrap().len() + 64;
+        let mut via_writer = Vec::with_capacity(capacity);
+        let mut via_string = Vec::with_capacity(capacity);
+        let writer = allocation_counter::measure(|| {
+            emit_event(&mut via_writer, "content_block_delta", &payload);
+        });
+        let string = allocation_counter::measure(|| {
+            emit_event_legacy(&mut via_string, "content_block_delta", &payload);
+        });
+        assert_eq!(
+            via_writer, via_string,
+            "content_block_delta SSE bytes must stay equivalent while measuring allocations"
+        );
+        assert!(
+            writer.bytes_total < string.bytes_total,
+            "to_writer must allocate fewer bytes than to_string: writer={} string={}",
+            writer.bytes_total,
+            string.bytes_total
+        );
+    }
+
+    #[test]
+    fn collect_data_field_single_line_allocates_less_than_legacy_to_owned() {
+        let block = concat!(
+            "data: {\"type\":\"content_block_delta\",\"index\":0,",
+            "\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}",
+        );
+        let optimized = allocation_counter::measure(|| {
+            std::hint::black_box(collect_data_field(block));
+        });
+        let legacy = allocation_counter::measure(|| {
+            std::hint::black_box(collect_data_field_legacy(block));
+        });
+        assert_eq!(
+            collect_data_field(block).as_deref(),
+            collect_data_field_legacy(block).as_deref(),
+            "borrowed and owned collection must yield the same payload"
+        );
+        assert!(
+            optimized.bytes_total < legacy.bytes_total,
+            "single-line collect must allocate fewer bytes than always-to_owned: optimized={} legacy={}",
+            optimized.bytes_total,
+            legacy.bytes_total
+        );
+    }
+
+    #[test]
+    fn remap_index_avoids_deep_clone_of_delta_payload() {
+        let payload = representative_delta(&"x".repeat(8192), 0);
+
+        let clone_source = payload.clone();
+        let cloned = allocation_counter::measure(|| {
+            let mut data = clone_source.clone();
+            if let Some(object) = data.as_object_mut() {
+                object.insert("index".to_owned(), Value::from(1_u64));
+            }
+            std::hint::black_box(data);
+        });
+
+        let mut owned = payload.clone();
+        let mutated = allocation_counter::measure(|| {
+            remap_index(&mut owned, 1);
+            std::hint::black_box(&owned);
+        });
+
+        assert_eq!(owned["index"], 1, "in-place remap must rewrite the client index");
+        assert_eq!(owned["delta"]["text"], payload["delta"]["text"]);
+        assert!(
+            cloned.bytes_total >= 8192,
+            "deep-cloning a delta payload must copy the text, allocated {}",
+            cloned.bytes_total
+        );
+        assert!(
+            mutated.bytes_total < cloned.bytes_total,
+            "in-place remap must allocate fewer bytes than cloning: mutate={} clone={}",
+            mutated.bytes_total,
+            cloned.bytes_total
+        );
+    }
+
+    #[test]
+    fn remapped_delta_emit_allocates_less_than_legacy_clone() {
+        let payload = representative_delta(&"x".repeat(4096), 0);
+        let capacity = serde_json::to_vec(&payload).unwrap().len() + 64;
+        let mut optimized_out = Vec::with_capacity(capacity);
+        let mut legacy_out = Vec::with_capacity(capacity);
+
+        let owned = payload.clone();
+        let optimized = allocation_counter::measure(|| {
+            emit_remapped(&mut optimized_out, "content_block_delta", owned, 1);
+        });
+        let legacy = allocation_counter::measure(|| {
+            emit_remapped_legacy(&mut legacy_out, "content_block_delta", &payload, 1);
+        });
+        assert_eq!(
+            optimized_out, legacy_out,
+            "in-place remap must emit the same SSE bytes as the clone baseline"
+        );
+        assert!(
+            optimized.bytes_total < legacy.bytes_total,
+            "owned remap+to_writer must allocate fewer bytes than clone+to_string: optimized={} legacy={}",
+            optimized.bytes_total,
+            legacy.bytes_total
         );
     }
 }
