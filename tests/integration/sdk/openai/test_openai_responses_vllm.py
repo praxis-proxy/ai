@@ -2822,10 +2822,14 @@ class TestResponsesReasoningVLLM:
             reasoning={"effort": "low"},
             temperature=0,
             store=True,
-            max_output_tokens=256,
+            # The continuation contract accepts only completed stored
+            # responses. Leave enough room for Qwen3's reasoning block and
+            # terminal answer instead of treating a token-capped response as a
+            # valid continuation parent.
+            max_output_tokens=1024,
         )
 
-        assert response.status in ("completed", "incomplete"), response.status
+        assert response.status == "completed", response.status
         output_types = [item.type for item in response.output]
         assert output_types, "response must carry at least one output item"
 
