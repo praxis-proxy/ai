@@ -528,6 +528,10 @@ async fn check_schema_version(pool: &sqlx::PgPool, tables: &TableNames) -> Resul
 }
 
 #[async_trait]
+#[expect(
+    clippy::too_many_lines,
+    reason = "owner-scoped SQL methods keep all bindings explicit"
+)]
 impl ResponseStore for PostgresResponseStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
         let [response_object, input, messages] = self.compression.encode(record).await?;
@@ -840,14 +844,19 @@ impl ResponseStore for PostgresResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        for (index, approval_id) in approval_ids.iter().enumerate() {
+        // Lock rows in a deterministic (id-sorted) order so two concurrent
+        // resumes overlapping in opposite order cannot deadlock (see trait doc);
+        // the returned index stays the caller-slice position.
+        let mut ordered: Vec<(usize, &str)> = approval_ids.iter().copied().enumerate().collect();
+        ordered.sort_unstable_by_key(|&(_, id)| id);
+        for (index, approval_id) in ordered {
             let result = sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(consumed_at)
                 .bind(owner.tenant_id())
                 .bind(owner.issuer())
                 .bind(owner.subject())
                 .bind(response_id)
-                .bind(*approval_id)
+                .bind(approval_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StoreError::Database(e.to_string()))?;

@@ -1457,6 +1457,13 @@ fn make_scoped_dispatch_filter() -> Box<dyn praxis_filter::HttpFilter> {
     McpDispatchFilter::from_config(&yaml).unwrap()
 }
 
+/// A dispatch filter whose per-round MCP cap — and therefore the accepted
+/// approval-response batch size — is `max_calls`.
+fn make_dispatch_filter_with_max_calls(max_calls: usize) -> Box<dyn praxis_filter::HttpFilter> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&format!("max_calls_per_round: {max_calls}")).unwrap();
+    McpDispatchFilter::from_config(&yaml).unwrap()
+}
+
 /// A dispatch filter whose bound outbound pipeline permits private/loopback
 /// upstreams, mirroring a deployment with `insecure_options.allow_private_upstreams`.
 ///
@@ -2851,11 +2858,14 @@ async fn resume_approval_wrong_previous_response_id_is_rejected() {
 
 #[tokio::test]
 async fn resume_approval_batch_exceeding_cap_is_rejected() {
-    // The agentic loop issues exactly one function call per round, so a resume
-    // turn carries a single approval. A larger batch is rejected before any
-    // store work: it both violates that invariant and, left unbounded, could
-    // exceed PostgreSQL's 16-bit Bind parameter ceiling in the consume query.
-    let filter = make_dispatch_filter();
+    // A single round can emit at most `max_calls_per_round` approval requests, so
+    // a resume batch carrying more approval responses than that is a client error
+    // rejected before any store work. Bounding by the per-round cap also holds the
+    // server-owned pending-approval load query (`get_pending_approvals`, one
+    // `IN (...)` placeholder per approval id) far under PostgreSQL's 16-bit Bind
+    // parameter ceiling. This filter caps a round at one call, so a two-approval
+    // batch exceeds it.
+    let filter = make_dispatch_filter_with_max_calls(1);
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_owned_filter_context(&req);
     let store = make_approval_store().await;
@@ -2915,6 +2925,199 @@ async fn resume_approval_batch_exceeding_cap_is_rejected() {
         state2.accumulated_output.len(),
         1,
         "the compliant retry executes the approved call exactly once"
+    );
+}
+
+#[tokio::test]
+async fn resume_applies_multiple_approvals_in_one_batch() {
+    // A round can emit multiple approval requests (batched/parallel tool calls),
+    // so a resume turn may legitimately carry several matching approval responses.
+    // The default per-round cap (32) comfortably admits a two-approval batch: both
+    // are atomically loaded, resolved, consumed, and applied.
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_1", "{}").await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_2", "{}").await;
+    register_store(&mut ctx, Arc::clone(&store));
+
+    ctx.extensions.insert(ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![
+            approval_response("call_1", true, None),
+            approval_response("call_2", true, None),
+        ],
+        ..ResponsesState::default()
+    });
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a batch within the per-round cap must resume, not reject"
+    );
+
+    // Both approved calls were admitted and executed: the loopback target refuses
+    // the dial, so each yields exactly one error result output item.
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state.accumulated_output.len(),
+        2,
+        "both approved calls in the batch must execute"
+    );
+
+    // Both approvals were single-use consumed: replaying either one now fails
+    // closed rather than executing again.
+    for id in ["call_1", "call_2"] {
+        let replay_req = make_request(http::Method::POST, "/v1/responses");
+        let mut replay_ctx = make_owned_filter_context(&replay_req);
+        register_store(&mut replay_ctx, Arc::clone(&store));
+        replay_ctx.extensions.insert(ResponsesState {
+            mcp_tool_map: approval_tool_map(),
+            previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+            messages: vec![approval_response(id, true, None)],
+            ..ResponsesState::default()
+        });
+        let mut replay_body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+        let rejection = expect_reject(
+            filter
+                .on_request_body(&mut replay_ctx, &mut replay_body, true)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            rejection.status, 400,
+            "a consumed approval replay is a client error for {id}"
+        );
+        assert!(
+            reject_message(&rejection).contains("already been used"),
+            "the replay error should state the approval was consumed for {id}: {}",
+            reject_message(&rejection)
+        );
+    }
+}
+
+#[tokio::test]
+async fn resume_applies_mixed_approve_and_deny_batch() {
+    // A batch may mix verdicts: an approved call is injected for execution while a
+    // denied call resumes inference with a truthful function_call_output denial.
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_1", "{}").await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_2", "{}").await;
+    register_store(&mut ctx, Arc::clone(&store));
+
+    ctx.extensions.insert(ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![
+            approval_response("call_1", true, None),
+            approval_response("call_2", false, Some("not allowed")),
+        ],
+        ..ResponsesState::default()
+    });
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a mixed-verdict batch must resume"
+    );
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    // Only the approved call executes (loopback dial refused → one error result).
+    assert_eq!(
+        state.accumulated_output.len(),
+        1,
+        "only the approved call in the batch executes"
+    );
+    // The denial is fed back to the model as a function_call_output for call_2.
+    let denial = state.messages.iter().find(|m| {
+        m.get("type").and_then(serde_json::Value::as_str) == Some("function_call_output")
+            && m.get("call_id").and_then(serde_json::Value::as_str) == Some("call_2")
+    });
+    let denial = denial.expect("a denial function_call_output must be recorded for the denied call");
+    assert!(
+        denial
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|o| o.contains("denied") && o.contains("not allowed")),
+        "the denial must carry the user's reason: {denial:?}"
+    );
+    // The client-supplied approval_response items are stripped from backend-bound
+    // messages regardless of verdict.
+    assert!(
+        !state.messages.iter().any(is_approval_response),
+        "approval_response items must not be forwarded to the backend"
+    );
+}
+
+#[tokio::test]
+async fn resume_rejects_duplicate_approval_response_id() {
+    // A well-formed resume names each approval at most once. A batch repeating one
+    // approval_request_id is ambiguous and rejected before any store access, so a
+    // single genuine approval stays claimable by a corrected retry.
+    let filter = make_dispatch_filter();
+    let req = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = make_owned_filter_context(&req);
+    let store = make_approval_store().await;
+    seed_weather_approval(store.as_ref(), APPROVAL_PREV_ID, "call_1", "{}").await;
+    register_store(&mut ctx, Arc::clone(&store));
+
+    ctx.extensions.insert(ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![
+            approval_response("call_1", true, None),
+            approval_response("call_1", true, None),
+        ],
+        ..ResponsesState::default()
+    });
+
+    let mut body = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let rejection = expect_reject(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+    assert_eq!(rejection.status, 400, "a duplicated approval id is a client error");
+    assert!(
+        reject_message(&rejection).contains("repeat approval_request_id"),
+        "the error should name the duplicated approval id: {}",
+        reject_message(&rejection)
+    );
+
+    // Nothing was consumed: a corrected single-approval retry still resumes.
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert!(
+        state.tool_calls.is_empty(),
+        "no tool call may be injected for a duplicate batch"
+    );
+    assert!(
+        state.accumulated_output.is_empty(),
+        "no tool may run for a duplicate batch"
+    );
+
+    let req2 = make_request(http::Method::POST, "/v1/responses");
+    let mut ctx2 = make_owned_filter_context(&req2);
+    register_store(&mut ctx2, Arc::clone(&store));
+    ctx2.extensions.insert(ResponsesState {
+        mcp_tool_map: approval_tool_map(),
+        previous_response_id: Some(APPROVAL_PREV_ID.to_owned()),
+        messages: vec![approval_response("call_1", true, None)],
+        ..ResponsesState::default()
+    });
+    let mut body2 = Some(Bytes::from_static(br#"{"model":"gpt-4.1"}"#));
+    let action = filter.on_request_body(&mut ctx2, &mut body2, true).await.unwrap();
+    assert!(
+        matches!(action, FilterAction::Continue),
+        "a corrected single-approval retry resumes after the duplicate was rejected"
+    );
+    let state2 = ctx2.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(
+        state2.accumulated_output.len(),
+        1,
+        "the corrected retry executes the approved call exactly once"
     );
 }
 
