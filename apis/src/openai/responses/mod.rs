@@ -472,6 +472,23 @@ fn handle_invalid_format(format: AiRequestFormat, config: &ResponsesFormatConfig
     }
 }
 
+/// Reject Responses create requests that request background execution.
+///
+/// The consolidated gateway-owned request processor uses this check. The
+/// standalone classifier deliberately does not, so provider-owned traffic can
+/// retain the field until routing decides whether the gateway owns validation.
+#[cfg(feature = "openai-responses")]
+fn handle_unsupported_background(classified: &ClassifiedRequest) -> Option<FilterAction> {
+    if classified.format == AiRequestFormat::Responses && classified.background == Some(true) {
+        return Some(FilterAction::Reject(error::responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "background mode is not supported",
+        )));
+    }
+    None
+}
+
 /// Determine the routing mode for a Responses API request.
 ///
 /// Returns `Some("stateful")` when the request needs orchestration

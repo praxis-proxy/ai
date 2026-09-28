@@ -147,7 +147,7 @@ fn streaming_with_reasoning_dialect_is_rejected() {
 
     let action = reject_incompatible_reasoning(&request, &vllm, true)
         .expect_err("streaming must be rejected while a reasoning dialect is enabled");
-    assert!(matches!(action, FilterAction::Reject(_)));
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Reject(_)));
 }
 
 #[test]
