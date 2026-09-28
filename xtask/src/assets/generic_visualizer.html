@@ -66,7 +66,9 @@
   .loader{display:flex; align-items:center; gap:.5rem; font-size:.8rem; color:var(--fg-dim)}
   .loader label{cursor:pointer; border:1px dashed var(--line2); border-radius:8px; padding:.28rem .6rem; color:var(--fg-dim)}
   .loader label:hover{border-color:var(--accent); color:var(--fg)}
-  .loader input{display:none}
+  .loader label{position:relative;display:inline-block}
+  .loader input{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}
+  .loader label:focus-within{outline:2px solid var(--accent);outline-offset:4px}
   main{max-width:1080px; margin:0 auto; padding:1.4rem}
   .drop-hint{
     display:none; position:fixed; inset:0; z-index:20; align-items:center; justify-content:center;
@@ -120,19 +122,40 @@
   .legend{display:flex; flex-wrap:wrap; gap:.5rem 1rem; font-size:.78rem; color:var(--fg-dim); margin:.2rem 0 1.4rem}
   .legend .swatch{display:inline-block; width:.8rem; height:.8rem; border-radius:3px; vertical-align:middle; margin-right:.35rem}
   footer{max-width:1080px; margin:2rem auto 0; padding:1rem 1.4rem 0; border-top:1px solid var(--line); color:var(--fg-faint); font-size:.78rem}
+
+  /* Shared Praxis visual language, no fonts or assets fetched from the network. */
+  :root{color-scheme:dark;--bg:#080d19;--bg2:#101a2b;--bg3:#152238;--fg:#eef3ff;--fg-dim:#b0bdd3;--fg-faint:#899ab5;--line:#23314b;--line2:#334664;--accent:#94eaff;--accent2:#b5a0ff;--ok:#84dfc1;--code-bg:#080f1c;--radius:12px}
+  html{scroll-behavior:smooth;scroll-padding-top:100px}body{background:radial-gradient(ellipse at 85% 4%,#24234588,transparent 40%),radial-gradient(ellipse at 10% 0%,#102b4966,transparent 30%),var(--bg);font-size:14px;-webkit-font-smoothing:antialiased}
+  [hidden]{display:none!important}:focus-visible{outline:2px solid var(--accent);outline-offset:4px}
+  .skip-link{position:fixed;left:20px;top:-100px;z-index:40;background:var(--accent);color:var(--bg);padding:10px 20px;border-radius:8px}.skip-link:focus{top:10px}
+  header.top{height:76px;padding:0 max(32px,calc((100vw - 1456px)/2));align-items:center;justify-content:space-between;background:#080d19e8;border-color:#ffffff0e;backdrop-filter:blur(18px)}
+  .brand{display:flex;align-items:center;gap:12px;color:var(--fg);text-decoration:none}.brand svg{width:40px;height:40px}.brand strong{font-size:24px;letter-spacing:-1px}.brand strong span{font-weight:400;color:var(--accent);margin-left:5px}.brand-divider{width:1px;height:20px;background:var(--line2);margin:0 9px}.brand-label{font-size:13px;color:var(--fg-dim)}
+  .loader{gap:22px}.loader label{font-size:12px;color:var(--fg);border:1px solid var(--line2);background:#16223a;border-radius:8px;padding:9px 15px}.offline{color:var(--fg-dim);font:10px var(--mono)}.offline:before{content:"";display:inline-block;width:6px;height:6px;background:var(--ok);border-radius:50%;margin-right:8px}
+  .page{max-width:1520px;margin:auto;padding:0 32px}.hero{padding:48px 0 30px;position:relative;overflow:hidden}.hero:after{content:"»";position:absolute;right:6%;top:-105px;font:500 420px var(--sans);color:#94eaff0a;transform:rotate(-12deg);pointer-events:none;z-index:-1}
+  .eyebrow{font:10px/1.5 var(--mono);letter-spacing:2px;color:var(--accent)}h1{font:600 clamp(40px,4.5vw,64px)/1.07 var(--sans);letter-spacing:-2.8px;margin:18px 0}h1 span{background:linear-gradient(100deg,#94eaff,#b5a0ff);background-clip:text;color:transparent}.hero>p{max-width:62ch;color:var(--fg-dim);font-size:15px;line-height:1.7;margin:0}.source{display:flex;align-items:baseline;gap:14px;margin:22px 0;color:var(--fg-dim);font:11px var(--mono)}.source>span{font-size:9px;color:var(--fg-faint);letter-spacing:1px}.source code{overflow-wrap:anywhere}
+  .metrics{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:14px;background:linear-gradient(110deg,#131e32,#0d1424);margin-top:30px;overflow:hidden}.metric{padding:18px 24px;border-left:1px solid var(--line);display:flex;flex-direction:column;gap:5px}.metric:first-child{border:0}.metric strong{font:500 29px/1.2 var(--sans);letter-spacing:-.8px}.metric span{font:10px var(--mono);color:var(--fg-dim)}
+  .explorer{display:grid;grid-template-columns:230px minmax(0,1fr);gap:40px;align-items:start;padding-top:6px}.sidebar{position:sticky;top:104px;max-height:calc(100vh - 125px);overflow:auto;padding:10px 0}.sidebar>.eyebrow{padding:0 12px 18px;font-size:9px}.sidebar nav{display:flex;flex-direction:column;gap:5px}.nav-item{display:flex;align-items:center;justify-content:space-between;gap:10px;text-decoration:none;font-size:12px;color:var(--fg-dim);border:1px solid transparent;padding:10px 12px;border-radius:8px;overflow-wrap:anywhere}.nav-item:hover,.nav-item[aria-current]{background:#94eaff0b;border-color:#94eaff22;color:var(--accent)}.nav-count{font:10px var(--mono);color:var(--fg-faint);flex-shrink:0;background:#ffffff06;padding:2px 6px;border-radius:4px}.nav-heading{padding:22px 12px 8px;font:9px var(--mono);letter-spacing:1.5px;color:var(--fg-faint)}.sidebar-note{border-top:1px solid var(--line);margin:28px 12px 0;padding-top:20px;font-size:11px;line-height:1.9;color:var(--fg-dim)}.sidebar-note span{color:var(--fg-faint)}
+  main{max-width:none;margin:0;padding:0;min-width:0}.toolbar{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:14px;border:1px solid var(--line);background:#101a2b;border-radius:10px;padding:12px 16px;margin-bottom:18px}.search-label{font-size:12px;font-weight:500;white-space:nowrap}.search{border:0;border-left:1px solid var(--line2);border-radius:0;background:none;padding:4px 14px;min-width:0;width:100%;color:var(--fg);font:12px var(--sans)}.search::placeholder{color:var(--fg-faint)}.search-status{font:10px var(--mono);color:var(--accent);white-space:nowrap}.legend{margin:0 0 28px;gap:10px 18px;font-size:10px}.legend .swatch{width:6px;height:6px;border-radius:50%}
+  section.block{margin-bottom:32px;scroll-margin-top:100px}h2.sec{font:600 17px var(--sans);letter-spacing:-.3px;color:var(--fg);text-transform:none;margin-bottom:16px;padding-bottom:12px;overflow-wrap:anywhere}.grid{gap:12px}.card{padding:20px;background:linear-gradient(120deg,#131f31,#0e1727);border-color:var(--line)}.card.filter{position:relative;border-left-width:2px}.card.filter:before{content:"";position:absolute;top:-13px;left:29px;height:12px;width:1px;background:var(--line2)}.card.filter:first-child:before{display:none}.card.filter.nested{margin-left:26px}.fhead{gap:8px 12px;align-items:center}.ord{background:#ffffff06;border:1px solid var(--line);padding:3px 6px;border-radius:5px;font-size:10px;color:var(--fg-dim)}.ftype{font-size:13px;overflow-wrap:anywhere}.fname{font-size:11px;overflow-wrap:anywhere}.badge{font:9px var(--mono);letter-spacing:.3px;padding:3px 7px}.badge.known{color:var(--accent2);border-color:#b5a0ff55}.desc{font-size:13px;line-height:1.7;margin-top:12px;max-width:100ch}.desc.unavailable{font-style:normal;font-size:12px}.kv{grid-template-columns:minmax(100px,max-content) minmax(0,1fr);margin-top:12px}.kv dt,.kv dd{font-size:11px;line-height:1.7}.branch{border-radius:10px;padding:14px;margin-top:6px;background:#0b1423}.bname{font-size:12px;overflow-wrap:anywhere}.bchain{font-size:11px;overflow-wrap:anywhere}.bcount{font-size:11px;margin-top:14px}details.cfg{margin-top:14px}details.cfg summary{font-size:11px;color:var(--fg-dim);width:fit-content;padding:4px 0}pre.json{font-size:11px;line-height:1.75;padding:16px;margin-top:10px}.empty{font-style:normal;font-size:12px;border:1px dashed var(--line2);border-radius:10px;padding:22px;color:var(--fg-dim)}.no-results{border-color:var(--accent)}.err{border:1px solid var(--danger);background:#f4713b0a;padding:18px;border-radius:10px;overflow-wrap:anywhere}
+  footer{max-width:1456px;margin:30px auto 0;padding:22px 0;color:var(--fg-faint);font-size:11px}
+  @media(max-width:1000px){.explorer{grid-template-columns:180px minmax(0,1fr);gap:24px}.toolbar{grid-template-columns:auto 1fr}.search-status{grid-column:1/-1}.brand-label,.brand-divider{display:none}.offline{display:none}footer{margin:30px 32px 0}}
+  @media(max-width:720px){header.top{padding:0 18px;height:64px;flex-wrap:nowrap}.brand strong{font-size:21px}.brand svg{width:32px;height:32px}.loader label{font-size:10px;padding:8px 10px}.page{padding:0 18px}.hero{padding-top:34px}h1{font-size:43px;letter-spacing:-1.8px}.hero>p{font-size:14px}.source{align-items:flex-start;flex-direction:column;gap:7px}.metrics{grid-template-columns:repeat(2,1fr)}.metric{padding:16px}.metric:nth-child(3){border-left:0;border-top:1px solid var(--line)}.metric:nth-child(4){border-top:1px solid var(--line)}.metric span{font-size:9px}.explorer{grid-template-columns:minmax(0,1fr);gap:18px}.sidebar{position:static;max-height:none;padding:0}.sidebar>.eyebrow,.sidebar-note,.nav-heading{display:none}.sidebar nav{flex-direction:row;overflow-x:auto;gap:6px;padding-bottom:10px}.nav-item{flex:none;border-color:var(--line);font-size:11px;max-width:240px}.toolbar{gap:10px;padding:12px}.search-label{font-size:11px}.search{font-size:11px;padding-left:10px}.card{padding:16px}.card.filter.nested{margin-left:14px}.ftype{font-size:12px}.kv{grid-template-columns:minmax(0,1fr)}.kv dd{margin-bottom:8px}.legend{line-height:1.7}footer{margin:30px 18px 0}}
+  @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*::before,*::after{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body>
 <div class="drop-hint">Drop a Praxis config document-model (.json)…</div>
+<a class="skip-link" href="#app">Skip to config explorer</a>
 <header class="top">
-  <h1>Praxis config flow</h1>
-  <span class="src" id="src"></span>
-  <span class="spacer"></span>
-  <span class="loader">
-    <label>Load model .json<input type="file" id="file" accept="application/json,.json"></label>
-  </span>
+  <a class="brand" href="#top"><svg viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M13 6h22l7 7v22l-7 7H13l-7-7V13Z" fill="#121d38" stroke="#829aff"/><path d="m15 16 8 8-8 8m12-16 8 8-8 8" stroke="#94eaff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg><strong>praxis<span>ai</span></strong><span class="brand-divider"></span><span class="brand-label">Config explorer</span></a>
+  <div class="loader"><span class="offline">Offline ready</span><label for="file">↗ Open model .json<input type="file" id="file" accept="application/json,.json"></label></div>
 </header>
-<main id="app"></main>
+<div class="page" id="top">
+  <section class="hero" aria-labelledby="page-title"><div class="eyebrow">CONFIGURATION / EXPLORER</div><h1 id="page-title">Your gateway.<br><span>In full view.</span></h1><p>From listeners to the last filter. Explore the structure of your configuration, inspect branches, and see how the pieces connect.</p><div class="source"><span>SOURCE</span><code id="src"></code></div><div id="metrics" class="metrics" aria-label="Configuration summary"></div></section>
+  <p id="load-error" class="err" role="alert" hidden></p>
+  <div class="explorer"><aside class="sidebar"><div class="eyebrow">EXPLORE</div><nav id="chain-nav" aria-label="Configuration sections"></nav><div class="sidebar-note">Structure from your config.<br>Descriptions from source.<br><span>Everything stays on this page.</span></div></aside>
+  <main id="app" tabindex="-1"></main></div>
+</div>
 <footer>
   Structure parsed by <code>praxis_core</code>; semantics shown only for filters this repository defines.
   Generated by <code>cargo xtask visualize-config</code>. Offline &amp; self-contained.
@@ -257,6 +280,7 @@ function renderBranches(branches){
 function renderFilter(f){
   const known = !!f.known;
   const c = el('div', 'card filter ' + (known ? 'known' : 'unknown') + (f.depth ? ' nested' : ''));
+  c.dataset.search = JSON.stringify(f).toLocaleLowerCase();
   const h = el('div', 'fhead');
   h.appendChild(el('span', 'ord', '#' + f.order));
   h.appendChild(el('span', 'ftype', f.filter_type || '(unknown)'));
@@ -292,7 +316,8 @@ function renderFilter(f){
 }
 
 function renderChain(chain){
-  const s = section('Filter chain · ' + chain.name);
+  const s = section(chain.name || 'Unnamed chain');
+  s.classList.add('chain-section');
   if (!chain.filters || !chain.filters.length){ s.appendChild(el('p', 'empty', 'Empty chain.')); return s; }
   const grid = el('div', 'grid');
   for (const f of chain.filters) grid.appendChild(renderFilter(f));
@@ -328,19 +353,65 @@ function renderLegend(){
 }
 
 function render(model){
-  document.getElementById('src').textContent = model.source || '(embedded model)';
-  document.title = 'Praxis config · ' + (model.source || 'flow');
-  const app = document.getElementById('app');
-  app.textContent = '';
   const chains = model.chains || [];
   const filterCount = chains.reduce((n, c) => n + ((c.filters || []).length), 0);
-  const summary = el('p', 'note', chains.length + ' filter chain(s), ' + filterCount + ' filter node(s) after IRR flattening.');
-  app.appendChild(summary);
+  const app = document.getElementById('app');
+  const nav = document.getElementById('chain-nav');
+  const metrics = document.getElementById('metrics');
+  document.getElementById('load-error').hidden = true;
+  document.getElementById('src').textContent = model.source || '(embedded model)';
+  document.title = 'Praxis config · ' + (model.source || 'flow');
+  app.replaceChildren(); nav.replaceChildren(); metrics.replaceChildren();
+  for (const [count, label] of [[(model.listeners || []).length, 'Listeners'], [chains.length, 'Filter chains'], [filterCount, 'Filter nodes · IRR flattened'], [(model.clusters || []).length, 'Top-level clusters']]){
+    const metric = el('div', 'metric');
+    metric.append(el('strong', null, String(count).padStart(2, '0')), el('span', null, label));
+    metrics.appendChild(metric);
+  }
+  const toolbar = el('div', 'toolbar');
+  const label = el('label', 'search-label', 'Find a filter');
+  label.htmlFor = 'filter-search';
+  const search = el('input', 'search');
+  search.id = 'filter-search'; search.type = 'search'; search.placeholder = 'Name, type, branch, or config value…';
+  const status = el('span', 'search-status');
+  status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
+  toolbar.append(label, search, status); app.appendChild(toolbar);
   app.appendChild(renderLegend());
-  app.appendChild(renderListeners(model));
-  app.appendChild(renderClusters(model));
-  for (const chain of chains) app.appendChild(renderChain(chain));
-  for (const g of renderGlobals(model)) app.appendChild(g);
+  let sectionIndex = 0;
+  const addSection = (section, label, count) => {
+    const id = 'config-section-' + sectionIndex++;
+    section.id = id;
+    const link = el('a', 'nav-item', label); link.href = '#' + id;
+    if (count != null) link.appendChild(el('span', 'nav-count', String(count)));
+    link.addEventListener('click', () => {
+      nav.querySelectorAll('a').forEach(a => a.removeAttribute('aria-current'));
+      link.setAttribute('aria-current', 'location');
+    });
+    nav.appendChild(link); app.appendChild(section);
+  };
+  addSection(renderListeners(model), 'Listeners', (model.listeners || []).length);
+  addSection(renderClusters(model), 'Clusters', (model.clusters || []).length);
+  nav.appendChild(el('div', 'nav-heading', 'FILTER CHAINS'));
+  for (const chain of chains) addSection(renderChain(chain), chain.name || 'Unnamed chain', (chain.filters || []).length);
+  for (const global of renderGlobals(model)) addSection(global, global.querySelector('h2').textContent);
+  const noResults = el('p', 'empty no-results', 'No matching filters. Try a different name, type, or config value.');
+  noResults.hidden = true; app.appendChild(noResults);
+  const applySearch = () => {
+    const query = search.value.trim().toLocaleLowerCase();
+    let visible = 0;
+    app.querySelectorAll('.card.filter').forEach(card => {
+      card.hidden = !!query && !card.dataset.search.includes(query);
+      if (!card.hidden) visible++;
+    });
+    app.querySelectorAll('.chain-section').forEach(chain => {
+      chain.hidden = !!query && !Array.from(chain.querySelectorAll('.card.filter')).some(card => !card.hidden);
+      const link = nav.querySelector('a[href="#' + chain.id + '"]');
+      if (link) link.hidden = chain.hidden;
+    });
+    // Infrastructure stays visible, search is explicitly scoped to filters.
+    status.textContent = query ? visible + ' of ' + filterCount + ' filters' : filterCount + ' filters';
+    noResults.hidden = !query || visible > 0;
+  };
+  search.addEventListener('input', applySearch); applySearch();
 }
 
 // -- load another model (drag/drop or picker); JSON only, never YAML ----------
@@ -353,16 +424,15 @@ function loadText(text){
   render(parsed);
 }
 function showError(msg){
-  const app = document.getElementById('app');
-  app.textContent = '';
-  const s = section('Could not load model');
-  s.appendChild(el('pre', 'err', msg));
-  app.appendChild(s);
+  const error = document.getElementById('load-error');
+  error.textContent = msg;
+  error.hidden = false;
 }
 function readFile(file){
   if (!file) return;
   const r = new FileReader();
   r.onload = () => loadText(String(r.result));
+  r.onerror = () => showError("Could not read this file. Try selecting it again.");
   r.readAsText(file);
 }
 function wireLoaders(){

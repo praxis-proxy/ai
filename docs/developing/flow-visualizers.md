@@ -14,6 +14,24 @@ The canonical example documents the Responses API full-flow agentic gateway:
 The HTML is **generated**, not hand-maintained. This document explains how, and
 how to change it safely.
 
+## Exploring the pages
+
+The curated page opens on **Topology**, with separate **Filters**, **Wire
+exchange**, and **Timeline** views. Select a scenario to update all four views;
+switching views preserves the selection. **Play trace** opens the filter view
+and follows active filters in order. The phase control opens the topology and
+emphasizes request or response arcs. These are illustrations of the selected
+scenario, not live traffic monitoring.
+
+Scenario controls and view tabs support arrow keys, Home, and End. Motion
+respects the system's reduced-motion preference. On narrow screens, diagrams
+scroll horizontally to keep their labels readable.
+
+The generic config explorer provides section navigation and a filter search
+covering names, types, branch details, and redacted configuration values.
+Listeners and clusters stay visible while filtering. Open a document-model
+JSON with the file picker or drag it onto the page to explore another config.
+
 ## The three inputs
 
 The generated HTML is a deterministic function of three checked-in inputs plus

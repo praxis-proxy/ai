@@ -47,7 +47,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI Gateway · Full-Flow Agentic Pipeline · Blueprint</title>
+<title>Praxis · Agentic flow studio</title>
 <style>
   :root{
     /* Okabe-Ito–derived base (8 hues) plus three added categories. Not a pure
@@ -183,9 +183,7 @@
   /* ---- on-the-wire payloads (example request / response per scenario) ---- */
   .wire{margin:14px 0 2px;border:1px solid var(--stroke-lit);border-radius:10px;
     background:linear-gradient(180deg,#0c1319,#0a1015);box-shadow:0 12px 30px rgba(0,0,0,.28);overflow:hidden}
-  /* No single request/response applies to the "all / overview" view — hide the
-     wire + timeline panels until a concrete scenario is selected. */
-  body:not(.scenario) #wire,body:not(.scenario) #timeline{display:none}
+  /* Overview renders an explanatory empty state inside each payload view. */
   .wire .wh{display:flex;align-items:center;gap:10px;padding:11px 15px;border-bottom:1px solid var(--stroke);
     cursor:pointer;user-select:none}
   .wire.collapsed .wh{border-bottom:none}
@@ -461,21 +459,76 @@
     *{animation:none !important;transition:none !important}
     .bk.live .dot{animation:none}
   }
+
+  /* ---- Flow studio visual shell ---- */
+  :root{color-scheme:dark;--bg:#080d19;--bg2:#0d1424;--panel:#111b2c;--ink:#eef3ff;--ink-dim:#b0bdd3;--ink-faint:#899ab5;--stroke:#23314b;--stroke-lit:#334664;--accent:#94eaff;--sans:Inter,ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  html{scroll-behavior:smooth;scroll-padding-top:90px}
+  body{padding:0;font:14px/1.6 var(--sans);background:radial-gradient(ellipse at 85% 6%,#24234566,transparent 36%),radial-gradient(ellipse at 8% 0%,#102b4966,transparent 35%),var(--bg)}
+  button{touch-action:manipulation}
+  [hidden]{display:none!important}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:4px}
+  .skip-link{position:fixed;top:-100px;left:20px;z-index:100;background:var(--accent);color:var(--bg);padding:10px 20px;border-radius:8px}
+  .skip-link:focus{top:10px}
+  .appbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;gap:20px;height:76px;padding:0 max(32px,calc((100vw - 1536px)/2));background:#080d19e8;border-bottom:1px solid #ffffff0e;backdrop-filter:blur(18px)}
+  .brand{display:flex;align-items:center;gap:12px;text-decoration:none;color:var(--ink)}
+  .brand svg{width:40px;height:40px}.brand strong{font-size:24px;letter-spacing:-1px}.brand strong span{font-weight:400;color:var(--accent);margin-left:5px}
+  .brand-divider{height:20px;width:1px;background:var(--stroke-lit);margin:0 9px}.brand-label{font-size:13px;color:var(--ink-dim)}
+  .offline{font:10px var(--mono);letter-spacing:.5px;color:var(--ink-dim);display:flex;align-items:center;gap:9px}.offline i{width:6px;height:6px;border-radius:50%;background:var(--ok)}
+  .sheet{max-width:1600px;padding:0 32px 36px;border:0;border-radius:0;background:none;box-shadow:none}.xhair{display:none}
+  header.hero{display:grid;grid-template-columns:1.4fr 1fr;gap:24px 40px;border:0;padding:48px 0 30px;align-items:center}
+  .eyebrow{font:10px/1.5 var(--mono);letter-spacing:2px;color:var(--accent);display:flex;align-items:center;gap:10px}.eyebrow>span{width:20px;height:1px;background:var(--accent)}
+  h1{font:600 clamp(38px,4.5vw,66px)/1.07 var(--sans);letter-spacing:-3px;margin:18px 0}
+  h1>span{background:linear-gradient(100deg,#94eaff,#b5a0ff);color:transparent;background-clip:text}
+  .sub{font:15px/1.7 var(--sans);letter-spacing:0;max-width:61ch;margin:0;color:var(--ink-dim)}
+  .features{max-width:65ch;font:12px/1.7 var(--sans);margin-top:18px}.features summary{cursor:pointer;color:var(--ink-dim);width:fit-content}.features summary span{color:var(--accent);padding-left:6px}.features p{margin:10px 0}.features code{display:block;padding:10px;font:11px/1.7 var(--mono)}
+  .hero-art{height:260px;position:relative;display:grid;place-items:center;overflow:hidden;background:radial-gradient(ellipse,#7184ff20,transparent 68%);isolation:isolate}
+  .gateway-mark{width:128px;filter:drop-shadow(0 0 28px #6a8eff38);transform:rotate(-9deg);animation:arrive .8s ease both}.gateway-mark svg{width:100%;display:block}
+  .orbit{position:absolute;width:260px;height:160px;border:1px solid #668eff30;border-radius:50%;transform:rotate(-28deg);z-index:-1}.orbit-two{width:340px;height:215px;transform:rotate(28deg);border-style:dashed;border-color:#94eaff22}
+  .orbit:after{content:"";position:absolute;top:20px;left:33px;width:6px;height:6px;background:var(--accent);box-shadow:0 0 15px var(--accent);border-radius:50%}
+  .orbit-label{position:absolute;background:#0d1729;border:1px solid #334664;padding:5px 10px;border-radius:6px;color:var(--ink-dim);font:9px var(--mono);letter-spacing:1px}.orbit-label-a{left:8%;top:42px}.orbit-label-b{right:5%;top:124px}.orbit-label-c{left:15%;bottom:31px}.art-caption{position:absolute;bottom:0;font:9px var(--mono);letter-spacing:3px;color:var(--ink-faint)}
+  .tiles{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,1fr);gap:0;border:1px solid var(--stroke);border-radius:14px;background:linear-gradient(110deg,#131e32,#0d1424);margin-top:8px;overflow:hidden}
+  .tile{border:0;border-left:1px solid var(--stroke);border-radius:0;padding:18px 24px;background:none;min-width:0;display:flex;flex-direction:column-reverse;gap:4px}.tile:first-child{border-left:0}.tile .v{font:500 29px/1.2 var(--sans);letter-spacing:-.8px}.tile .v small{font-size:12px}.tile .k{font:10px var(--mono);letter-spacing:1px;color:var(--ink-dim)}
+  .section-intro{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px}.muted{color:var(--ink-faint);font-size:11px}
+  .controls{gap:14px;margin:16px 0}.chips{width:100%;gap:7px}.chips>.lbl{display:none}
+  .chip{font:12px var(--sans);letter-spacing:0;padding:9px 12px;border-radius:8px;background:#111b2b;border-color:var(--stroke)}.chip .tag{font:9px var(--mono);letter-spacing:0}.chip.active{background:#94eaff18;color:var(--accent);border-color:#94eaff88;box-shadow:0 0 20px #94eaff08}.chip.active .tag{color:var(--accent)}
+  .segbtns{border-radius:8px}.segbtns button{font:11px var(--sans);padding:9px 14px}.segbtns button.on{background:#94eaff18;color:var(--accent)}.seghint{font:11px/1.5 var(--sans);letter-spacing:0;max-width:none}.seg .lbl{font-size:9px}
+  .play{margin-left:auto;font:600 12px var(--sans);padding:10px 16px;background:var(--accent);border-color:var(--accent);border-radius:8px;box-shadow:0 4px 24px #94eaff13}
+  .narr{margin:18px 0 26px;padding:16px 20px;font-size:13px;letter-spacing:0;border-color:#334664;background:linear-gradient(110deg,#94eaff08,#b5a0ff06);border-left-color:var(--accent);border-radius:10px}.narr .rounds{font:11px var(--mono)}
+  .workspace-bar{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--stroke);gap:20px;scroll-margin-top:90px}.view-tabs{display:flex;gap:24px}.view-tabs button{border:0;border-bottom:2px solid transparent;background:none;color:var(--ink-faint);font:500 13px var(--sans);padding:15px 0;cursor:pointer;white-space:nowrap}.view-tabs button:hover{color:var(--ink)}.view-tabs [aria-selected=true]{color:var(--ink);border-bottom-color:var(--accent)}.tab-num{font:9px var(--mono);margin-right:7px;color:var(--ink-faint)}.view-tabs [aria-selected=true] .tab-num{color:var(--accent)}.workspace-hint{font-size:11px;color:var(--ink-faint)}
+  .layout{grid-template-columns:minmax(0,1fr) 282px;gap:24px;margin-top:24px}#flow{min-width:0}.view-panel{animation:arrive .24s ease}.view-panel:focus{outline-offset:6px}.rail{position:static;gap:14px}
+  .panel{border-color:var(--stroke);border-radius:12px;background:linear-gradient(140deg,#121c2d,#0e1625);box-shadow:none;padding:17px}.panel h3{font:500 11px var(--sans);letter-spacing:.5px;color:var(--ink)}.panel h3:after{display:none}.lg{font-size:12px;letter-spacing:0;margin:7px 0}.lg .st{font:9px var(--mono)}.lg i{width:8px;height:8px;border-radius:50%}.linekey .row{font-size:11px}.skbadge{font:9px var(--mono)}.capnote{font-size:11px}
+  .bk{padding:10px 9px}.bk .bh{flex-wrap:wrap}.bk .nm{font:11px var(--mono);overflow-wrap:anywhere}.bk .ep{font:10px var(--mono)}.bk .from{font-size:11px;letter-spacing:0}.svc{flex-wrap:wrap;font-size:11px}.bk.live .dot{animation:none}
+  .band-lbl{font:600 15px var(--sans);color:var(--ink);text-transform:none;letter-spacing:-.2px;flex-wrap:wrap;gap:10px;margin:28px 0 14px}.band-lbl:first-child{margin-top:0}.band-lbl .n{font:10px var(--mono);padding:4px 7px;border-radius:5px}.band-lbl .hint{font:11px/1.5 var(--sans);letter-spacing:0;flex-basis:100%;padding-left:38px}.band-lbl:after{display:none}
+  .svgwrap{padding:16px 8px;border-color:var(--stroke);border-radius:14px;background:radial-gradient(ellipse at 50% 0%,#22315433,transparent 75%),#0b1321;overflow:auto}.diagram{min-width:760px}.svgcap{font-size:12px;margin:14px 2px;color:var(--ink-dim)}
+  svg.diagram rect[fill="#0c1319"],svg.diagram rect[fill="#101820"]{fill:#111c2f}svg.diagram text[fill="#6d8492"]{fill:#97abc5}svg .flt.on rect{filter:none;stroke-width:1.5}
+  .node{grid-template-columns:210px 30px minmax(0,1fr)}.card{padding:18px;background:linear-gradient(120deg,#131f31,#0e1727);border-color:var(--stroke);border-left-color:var(--gc,var(--accent));box-shadow:none;border-radius:12px;min-width:0}.card .nm{font:500 14px/1.5 var(--mono);overflow-wrap:anywhere}.card .sm,.card .scnote{font-size:13px}.card .ord,.card .id,.card .statebadge{font-family:var(--mono)}.card .id{font-size:9px;letter-spacing:.5px}.card .detail{font:12px/1.6 var(--mono)}.card .kvrow{flex-wrap:wrap}.card .exbtn{font:11px var(--sans);padding:7px 11px}.card.st-active.hl{box-shadow:none;border-top-color:var(--stroke-lit)}.card.dimmed{opacity:.8}.gutter .glbl{font:9px var(--mono)}.gutter .kv{font:11px/1.65 var(--mono)}.grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,320px),1fr));gap:14px}
+  .wire{margin:0;border-color:var(--stroke);border-radius:14px;background:#0e1727;box-shadow:none}.wire .wh{padding:18px}.wire .wh .wt{font:600 14px var(--sans);text-transform:none;letter-spacing:0;color:var(--ink)}.wire .wh .wsub{font:11px var(--sans);letter-spacing:0}.wire .pane{padding:20px}.wire .hdrs{font:11px/1.7 var(--mono)}.wire .reqline,.wire .status{font:12px var(--mono)}.wire pre{font-size:12px;line-height:1.7;padding:16px;background:#080f1c;max-height:560px}.wire .copy{font:10px var(--sans);padding:5px 10px}.wire .wfoot{font-size:12px;padding:18px}.wire .empty{padding:48px 24px;font-size:14px}
+  .tlist{padding:16px 20px}.tstep{padding:12px 0}.timeline .tsummary{padding:18px 20px;font-size:12px}.tbody>summary{font:11px var(--sans);text-transform:none;letter-spacing:0}.tnote{font-size:12px}.tprov code{font-size:10px;overflow-wrap:anywhere}.wire .wfoot .prov code{font-size:10px;overflow-wrap:anywhere}.footnote{font-size:11px;color:var(--ink-faint);margin-top:32px}.titleblock{display:none}
+  @keyframes arrive{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+  @media(min-width:1600px){.sheet{padding-left:40px;padding-right:40px}}
+  @media(max-width:1100px){.layout{grid-template-columns:minmax(0,1fr)}.rail{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}.workspace-hint{display:none}.hero-art{height:240px}.orbit-label-a{left:0}.orbit-label-b{right:0}}
+  @media(max-width:720px){.appbar{padding:0 18px;height:64px}.brand-label,.brand-divider,.offline{display:none}.sheet{padding:0 18px 28px}header.hero{grid-template-columns:1fr;padding-top:34px;gap:18px}.hero-art{display:none}h1{letter-spacing:-1.8px;font-size:43px}.sub{font-size:14px}.tiles{grid-template-columns:repeat(2,1fr)}.tile{padding:16px}.tile:nth-child(3){border-left:0;border-top:1px solid var(--stroke)}.tile:nth-child(4){border-top:1px solid var(--stroke)}.tile .v{font-size:25px}.section-intro .muted{display:none}.chips{gap:6px}.chip{font-size:11px;padding:9px}.seghint{display:none}.play{margin-left:0}.narr{padding:14px;font-size:12px}.view-tabs{width:100%;gap:0;justify-content:space-between}.view-tabs button{font-size:11px}.tab-num{display:none}.layout{margin-top:20px}.node{grid-template-columns:minmax(0,1fr)}.gutter{text-align:left;padding:8px 0 0}.rail-line{display:none}.card .nm{font-size:12px}.wire .wh{flex-wrap:wrap;padding:14px}.wire .wh .wsub{order:3;flex-basis:100%}.wire .pane{padding:14px}.band-lbl .hint{padding-left:0}.rail{grid-template-columns:minmax(0,1fr)}}
+  @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*::before,*::after{animation:none!important;transition:none!important}}
 </style>
 </head>
 <body class="phase-request">
-<div class="sheet">
+<a class="skip-link" href="#workspace">Skip to flow explorer</a>
+<div class="appbar"><a class="brand" href="#top"><svg viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M13 6h22l7 7v22l-7 7H13l-7-7V13Z" fill="#121d38" stroke="#829aff"/><path d="m15 16 8 8-8 8m12-16 8 8-8 8" stroke="#94eaff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg><strong>praxis<span>ai</span></strong><span class="brand-divider"></span><span class="brand-label">Flow studio</span></a><span class="offline"><i></i> Self-contained · Offline ready</span></div>
+<div class="sheet" id="top">
   <span class="xhair tl"></span><span class="xhair tr"></span><span class="xhair bl"></span><span class="xhair br"></span>
 
-  <header>
-    <div>
-      <h1>PRAXIS <span class="tick">/</span> AI GATEWAY <span class="tick">·</span> FULL-FLOW AGENTIC PIPELINE</h1>
-      <div class="sub">Responses API gateway serving the agentic model→tool→model loop, the Conversations API, and the dedicated prompts / embeddings / files / vector_stores services behind one listener. Per-user credentials are scoped into typed slots and the request's trace identity threads through every callout with a fresh span per hop. Select a scenario to trace the exact path a request takes.</div>
-      <div class="features">Build: <code>--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite</code></div>
+  <header class="hero">
+    <div class="hero-copy">
+      <div class="eyebrow"><span></span> OPENAI RESPONSES / AGENTIC PIPELINE</div>
+      <h1>Every request.<br><span>The whole journey.</span></h1>
+      <p class="sub">Explore the gateway from the first request to the final response. Follow state, routing, and the model → tool → model loop, one scenario at a time.</p>
+      <details class="features"><summary>About this configuration <span>↗</span></summary><p>One listener serves Responses, Conversations, prompts, embeddings, files, and vector stores. Typed credential slots scope per-user credentials; each callout carries trace identity with a fresh span.</p><code>--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite</code></details>
     </div>
-    <div class="tiles" id="tiles" aria-hidden="true"></div>
+    <div class="hero-art" aria-hidden="true"><div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="gateway-mark"><svg viewBox="0 0 48 48" fill="none" aria-hidden="true"><path d="M13 6h22l7 7v22l-7 7H13l-7-7V13Z" fill="#121d38" stroke="#829aff"/><path d="m15 16 8 8-8 8m12-16 8 8-8 8" stroke="#94eaff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg></div><span class="orbit-label orbit-label-a">REQUEST</span><span class="orbit-label orbit-label-b">TOOL CALL</span><span class="orbit-label orbit-label-c">RESPONSE</span><div class="art-caption">ONE GATEWAY. EVERY HOP.</div></div>
+    <div class="tiles" id="tiles" aria-label="Configuration summary"></div>
   </header>
 
+  <div class="section-intro"><span class="eyebrow">01 / CHOOSE A SCENARIO</span><span class="muted">Examples grounded in repository fixtures</span></div>
   <div class="controls">
     <div class="chips" id="chips" role="radiogroup" aria-label="Request scenario">
       <span class="lbl" aria-hidden="true">Scenario</span>
@@ -486,39 +539,24 @@
         <button type="button" data-phase="request" class="on" aria-pressed="true">Request ▶</button>
         <button type="button" data-phase="response" aria-pressed="false">◀ Response</button>
       </div>
-      <span class="seghint">emphasizes forward vs. return arcs in the agentic-loop diagram (band 03)</span>
+      <span class="seghint">Highlight the request or response path in the topology.</span>
     </div>
     <button type="button" class="play" id="play" aria-label="Animate the selected request end to end"><span class="ico"></span><span id="playtxt">Play trace</span></button>
   </div>
 
   <p class="narr" id="narr" role="status" aria-live="polite"></p>
 
-  <section class="wire" id="wire" aria-label="Example request and response for the selected scenario">
-    <div class="wh" id="wireToggle" role="button" tabindex="0" aria-expanded="true" aria-controls="wireBody">
-      <span class="wt">On the wire</span>
-      <span class="wsub" id="wireSub">example request &amp; response — pick a scenario</span>
-      <span class="caret" aria-hidden="true">▾</span>
-    </div>
-    <div class="wbody" id="wireBody"></div>
-  </section>
-
-  <section class="wire timeline" id="timeline" aria-label="Round-by-round agentic-loop chronology for the selected scenario">
-    <div class="wh" id="tlToggle" role="button" tabindex="0" aria-expanded="true" aria-controls="tlBody">
-      <span class="wt">Inside the loop</span>
-      <span class="wsub" id="tlSub">round-by-round chronology — pick a scenario</span>
-      <span class="caret" aria-hidden="true">▾</span>
-    </div>
-    <div class="wbody" id="tlBody"></div>
-  </section>
-
+<div class="workspace-bar" id="workspace" tabindex="-1"><div class="view-tabs" role="tablist" aria-label="Explore the flow">
+<button type="button" role="tab" id="tab-topology" aria-controls="view-topology" aria-selected="true" tabindex="0" data-view="topology"><span class="tab-num">01</span>Topology</button>
+<button type="button" role="tab" id="tab-filters" aria-controls="view-filters" aria-selected="false" tabindex="-1" data-view="filters"><span class="tab-num">02</span>Filters</button>
+<button type="button" role="tab" id="tab-exchange" aria-controls="view-exchange" aria-selected="false" tabindex="-1" data-view="exchange"><span class="tab-num">03</span>Wire exchange</button>
+<button type="button" role="tab" id="tab-timeline" aria-controls="view-timeline" aria-selected="false" tabindex="-1" data-view="timeline"><span class="tab-num">04</span>Timeline</button>
+</div><span class="workspace-hint">Explore the structure. Inspect the details.</span></div>
   <div class="layout">
     <!-- ============ FLOW COLUMN ============ -->
     <main id="flow">
 
-      <div class="band-lbl"><span class="n">01</span> Pre-IRR spine <span class="hint">— sequential filters run once; state accumulates in the left gutter</span></div>
-      <div class="spine" id="spine"></div>
-
-      <div class="band-lbl"><span class="n">02</span> Route fork <span class="hint">— bypass unless-gate vs. the Internal Request Router</span></div>
+<section class="view-panel" id="view-topology" role="tabpanel" aria-labelledby="tab-topology" tabindex="0">      <div class="band-lbl"><span class="n">02</span> Route fork <span class="hint">— bypass unless-gate vs. the Internal Request Router</span></div>
       <div class="svgwrap">
         <svg class="diagram" viewBox="0 0 980 260" role="img" aria-label="Route fork: the bypass branch (dedicated services, WebSocket, and 404 route-miss) versus the Internal Request Router entering the agentic loop">
           <defs>
@@ -648,11 +686,36 @@
           </g>
         </svg>
       </div>
-      <p class="svgcap"><b>How to read this:</b> a semantic hub view — the loop owner directs the three request-phase dispatchers and the proxy. The arcs show the request vs. response <em>phases</em>, not the linear filter order. The canonical request-phase order (project_state_owner_headers → openai_stream_events → dispatchers → openai_agentic_loop → headers → router → load_balancer → openai_responses_proxy) is shown below in band 04.</p>
+      <p class="svgcap"><b>How to read this:</b> a semantic hub view — the loop owner directs the three request-phase dispatchers and the proxy. The arcs show the request vs. response <em>phases</em>, not the linear filter order. The canonical request-phase order (project_state_owner_headers → openai_stream_events → dispatchers → openai_agentic_loop → headers → router → load_balancer → openai_responses_proxy) is shown in the Filters view.</p>
+
+</section>
+<section class="view-panel" id="view-filters" role="tabpanel" aria-labelledby="tab-filters" tabindex="0" hidden>      <div class="band-lbl"><span class="n">01</span> Pre-IRR spine <span class="hint">— sequential filters run once; state accumulates in the left gutter</span></div>
+      <div class="spine" id="spine"></div>
 
       <div class="band-lbl"><span class="n">04</span> IRR step filters <span class="hint">— the inference-step chain in canonical order; annotations update per scenario</span></div>
       <div class="grid" id="irrgrid"></div>
 
+</section>
+<section class="view-panel" id="view-exchange" role="tabpanel" aria-labelledby="tab-exchange" tabindex="0" hidden>  <section class="wire" id="wire" aria-label="Example request and response for the selected scenario">
+    <div class="wh" id="wireToggle" role="button" tabindex="0" aria-expanded="true" aria-controls="wireBody">
+      <span class="wt">On the wire</span>
+      <span class="wsub" id="wireSub">example request &amp; response — pick a scenario</span>
+      <span class="caret" aria-hidden="true">▾</span>
+    </div>
+    <div class="wbody" id="wireBody"></div>
+  </section>
+
+</section>
+<section class="view-panel" id="view-timeline" role="tabpanel" aria-labelledby="tab-timeline" tabindex="0" hidden>  <section class="wire timeline" id="timeline" aria-label="Round-by-round agentic-loop chronology for the selected scenario">
+    <div class="wh" id="tlToggle" role="button" tabindex="0" aria-expanded="true" aria-controls="tlBody">
+      <span class="wt">Inside the loop</span>
+      <span class="wsub" id="tlSub">round-by-round chronology — pick a scenario</span>
+      <span class="caret" aria-hidden="true">▾</span>
+    </div>
+    <div class="wbody" id="tlBody"></div>
+  </section>
+
+</section>
     </main>
 
     <!-- ============ RIGHT RAIL ============ -->
@@ -709,8 +772,8 @@
 
 <script>
 /* ============================================================================
-   PIPELINE — hand-synced snapshot of full-flow-agentic.yaml. The YAML is the
-   source of truth; this is a manually maintained copy. All rendering, tracing,
+   PIPELINE — generated from full-flow-agentic.yaml and its curated sidecar.
+   The YAML is the structural source of truth. All rendering, tracing,
    and tooltips are driven from this object.
    ========================================================================= */
 const PIPELINE = @@PIPELINE@@;
@@ -1191,9 +1254,11 @@ function renderTimeline(scen){
   if(!t||!t.steps||!t.steps.length){
     sub.textContent="round-by-round chronology";
     const e=el("div","empty");
-    e.innerHTML=(sdef&&sdef.entersIRR)
-      ? "This scenario runs a <b>single inference round</b> with no tool callout — the full request and response are shown in <b>On the wire</b> above."
-      : "This scenario does <b>not</b> enter the agentic loop; it is answered or bypassed before the IRR.";
+    e.innerHTML=scen==="overview"
+      ? "Select a scenario to explore its <b>round-by-round timeline</b>."
+      : (sdef&&sdef.entersIRR)
+        ? "This scenario runs a <b>single inference round</b> with no tool callout. Inspect the full request and response in the <b>Wire exchange</b> view."
+        : "This scenario does <b>not</b> enter the agentic loop; it is answered or bypassed before the IRR.";
     wrap.appendChild(e);
     return;
   }
@@ -1351,6 +1416,29 @@ chipEls.forEach((btn,i)=>{
   });
 });
 
+/* ---- focused workspace views ---- */
+const viewTabs=Array.from(document.querySelectorAll("[role=tab][data-view]"));
+function setView(view){
+  viewTabs.forEach(tab=>{
+    const selected=tab.dataset.view===view;
+    tab.setAttribute("aria-selected",String(selected));
+    tab.tabIndex=selected?0:-1;
+    document.getElementById(tab.getAttribute("aria-controls")).hidden=!selected;
+  });
+}
+viewTabs.forEach((tab,index)=>{
+  tab.addEventListener("click",()=>{stopPlay();setView(tab.dataset.view);});
+  tab.addEventListener("keydown",event=>{
+    let next=index;
+    if(event.key==="ArrowRight")next=(index+1)%viewTabs.length;
+    else if(event.key==="ArrowLeft")next=(index-1+viewTabs.length)%viewTabs.length;
+    else if(event.key==="Home")next=0;
+    else if(event.key==="End")next=viewTabs.length-1;
+    else return;
+    event.preventDefault();stopPlay();setView(viewTabs[next].dataset.view);viewTabs[next].focus();
+  });
+});
+
 /* ---- phase toggle ---- */
 document.getElementById("phase").addEventListener("click",e=>{
   const b=e.target.closest("button[data-phase]");if(!b)return;
@@ -1358,6 +1446,7 @@ document.getElementById("phase").addEventListener("click",e=>{
   b.classList.add("on");b.setAttribute("aria-pressed","true");
   body.classList.remove("phase-request","phase-response");
   body.classList.add("phase-"+b.dataset.phase);
+  stopPlay();setView("topology");
 });
 
 /* ============================================================================
@@ -1373,6 +1462,7 @@ function stopPlay(){
   document.querySelectorAll(".card.pulse").forEach(c=>c.classList.remove("pulse"));
 }
 function startPlay(){
+  setView("filters");
   const scen=currentScen==="overview"?"S1":currentScen;
   if(currentScen==="overview")selectChip(chipEls.find(c=>c.dataset.scen==="S1"));
   playing=true;playBtn.classList.add("playing");playTxt.textContent="Stop";
@@ -1428,9 +1518,7 @@ playBtn.addEventListener("click",()=>{ if(playing)stopPlay(); else startPlay(); 
 /* ============================================================================
    INIT
    ========================================================================= */
-/* Land on a concrete, populated scenario (Stateful create) rather than the
-   "all / overview" view, so the "On the wire" + "Inside the loop" panels show a
-   real example on first paint. The overview chip remains one click away. */
+/* Select a concrete scenario so every view has an example ready to inspect. */
 selectChip(chipEls.find(c=>c.dataset.scen==="S1")||chipEls[0]);
 </script>
 </body>
