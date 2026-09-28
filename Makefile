@@ -566,13 +566,13 @@ test-schema-fips:
 # exactly the shipped FIPS feature set, fails closed unless the host and
 # provider report FIPS mode, and exercises a write/read round trip with a
 # password-less URL against a server whose only TCP rule is `hostssl ... cert`.
+# A second peer selects SCRAM and must receive the fork's explicit
+# password-authentication-disabled refusal before any exchange begins.
 test-postgres-fips-host: | require-podman
 	PRAXIS_FIPS_HOST=1 PRAXIS_REQUIRE_FIPS=1 PRAXIS_TEST_FIPS_PROVIDER=1 \
 	cargo test --target-dir $(FIPS_TARGET_DIR) -p praxis-tests-integration \
 		--no-default-features --features $(FIPS_FEATURES) \
-		--test suite \
-		examples::openai_response_store_postgres_mtls::response_store_persists_over_certificate_authenticated_tls \
-		-- --ignored --exact $(if $(V),--nocapture)
+		--test suite -- --ignored openai_response_store_postgres_mtls $(if $(V),--nocapture)
 
 # The same unit tests with the RHEL FIPS provider active in every test
 # process: OPENSSL_CONF names xtask/assets/fips/fips-provider.cnf (the file

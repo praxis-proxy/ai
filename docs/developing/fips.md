@@ -184,7 +184,10 @@ the database boundary that needs access to the host's rootless podman. It
 resolves the same FIPS feature set directly on the declared FIPS host, starts
 a sibling PostgreSQL container with only `hostssl ... cert` TCP rules, and
 performs a Responses write/read round trip over SQLx native TLS without a
-password. The composite action runs it immediately after `test-fips-host`.
+password. A second TLS peer selects SCRAM; the test requires the
+certificate-only SQLx build to refuse it as disabled before beginning a
+password exchange. The composite action runs both immediately after
+`test-fips-host`.
 
 On a developer machine that is not in FIPS mode, `make test-integration-fips`
 and `make test-schema-fips` still run the same suites as the FIPS build; the

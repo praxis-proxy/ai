@@ -173,7 +173,9 @@ cannot have happened outside FIPS mode. `test-postgres-fips-host` resolves
 the same feature set on that host and performs a Responses write/read round
 trip against a PostgreSQL container whose only TCP authentication rule is
 `hostssl ... cert`; the URL contains no password and the client presents its
-certificate through native TLS. `fips-runtime-probe` starts the shipped image
+certificate through native TLS. It also connects to a TLS peer that selects
+SCRAM and requires SQLx to return its password-authentication-disabled error
+without beginning an exchange. `fips-runtime-probe` starts the shipped image
 itself under `PRAXIS_REQUIRE_FIPS=1`, drives raw TLS probes
 against its listener (approved algorithms negotiated, ChaCha20-only and
 X25519-only clients refused), and checks the startup line. The CI `FIPS`
