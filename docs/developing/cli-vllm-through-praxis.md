@@ -145,6 +145,8 @@ export VLLM_API_KEY="${VLLM_API_KEY:-$(openssl rand -hex 32)}"
 export GATEWAY_AUTH_PASSWORD="$(openssl rand -hex 24)"
 ```
 
+### Run Praxis from source
+
 Build and start Praxis. Running it in the background keeps the two generated
 values in the shell that will launch the client. The SQLite feature enables the
 local response store used by the native Codex example and is harmless for the
@@ -157,6 +159,140 @@ export PRAXIS_PID=$!
 ```
 
 Praxis listens at `http://127.0.0.1:8080`.
+
+### Run Praxis from the official container image
+
+Released images are published to
+[`ghcr.io/praxis-proxy/ai`](https://ghcr.io/praxis-proxy/ai). Pin a released
+tag rather than tracking `main` or `nightly`:
+
+```console
+docker pull ghcr.io/praxis-proxy/ai:0.4
+```
+
+The image entrypoint is `praxis-ai`, its working directory is `/etc/praxis`,
+and it runs as the unprivileged `praxis` user (UID 100). Mounting the config at
+`/etc/praxis/praxis.yaml` is enough — the binary falls back to `praxis.yaml` in
+the working directory — but passing `-c` is clearer and works for any mount
+path. `GATEWAY_AUTH_PASSWORD` and `VLLM_API_KEY` are read from the *proxy
+process* environment at pipeline build time, so they must be forwarded into the
+container, not merely exported on the host. The `z` mount suffix relabels the
+config for SELinux hosts such as Fedora and RHEL; drop it elsewhere.
+
+Host networking is the closest match to the source build and needs no config
+edits at all, because `127.0.0.1` inside the container is the host loopback for
+both the listener and the vLLM backend:
+
+```console
+docker run -d --rm --name praxis-vllm \
+  --network host \
+  -e VLLM_API_KEY -e GATEWAY_AUTH_PASSWORD \
+  -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
+  ghcr.io/praxis-proxy/ai:0.4 -c /etc/praxis/praxis.yaml
+```
+
+Praxis listens at `http://127.0.0.1:8080`, and sections 3 and 4 apply
+unchanged. Docker's `--network host` is Linux-only.
+
+To publish a port instead of sharing the host network stack, make three edits
+to the copied config:
+
+1. Change the listener to `address: "0.0.0.0:8080"`. A listener bound to
+   `127.0.0.1` inside the container's own namespace is unreachable through a
+   published port.
+2. Change the local vLLM endpoint from `127.0.0.1:8000` to
+   `host.docker.internal:8000`, and pass
+   `--add-host=host.docker.internal:host-gateway` on the command line.
+3. Add `allow_private_upstreams: true` beside the existing
+   `allow_private_endpoints: true`. The existing option covers literal private
+   endpoints written in the config; the new one is needed because that
+   hostname *resolves* to a private address, and without it the request fails
+   with `upstream hostname resolved to private/reserved IP address`.
+
+```console
+docker run -d --rm --name praxis-vllm \
+  -p 8080:8080 \
+  --add-host=host.docker.internal:host-gateway \
+  -e VLLM_API_KEY -e GATEWAY_AUTH_PASSWORD \
+  -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
+  ghcr.io/praxis-proxy/ai:0.4 -c /etc/praxis/praxis.yaml
+```
+
+With Podman, both commands work unchanged. Podman also resolves
+`host.containers.internal` on its own, so the published-port config can use
+that name and drop `--add-host`.
+
+The on-demand GPU endpoint needs no backend-specific container handling: the
+tunnel hostname is public, so the `endpoints` and `tls.sni` edits above are the
+only vLLM-side change with either networking mode.
+
+Follow startup with `docker logs -f praxis-vllm`. For an explicit readiness
+probe, add an admin listener to the copied config:
+
+```yaml
+admin:
+  address: "127.0.0.1:9901"
+```
+
+The admin endpoint must bind loopback unless
+`insecure_options.allow_public_admin: true` is set, so query it from inside the
+container with
+`docker exec praxis-vllm wget -qO- http://127.0.0.1:9901/healthy` (or directly
+from the host under `--network host`). When finished, replace the `kill` in
+section 4 with `docker rm -f praxis-vllm`.
+
+#### The native Codex example needs a rebuilt image
+
+The published image is built with `PRAXIS_AI_FEATURES=full`, and `full` does
+not include `store-sqlite` (it selects `store-postgres` as the store backend).
+`client-tool-compat.yaml` — the preferred native Codex example — therefore
+cannot run on the stock image; `--validate` rejects it up front:
+
+```text
+invalid configuration: openai_response_store: backend 'sqlite' is unavailable; rebuild with the 'store-sqlite' feature
+```
+
+The other three examples in this section have no store filter and run on the
+published image unchanged. For the native Codex path, build the image locally
+with SQLite compiled in:
+
+```console
+docker build -f Containerfile \
+  --build-arg PRAXIS_AI_FEATURES=full,store-sqlite \
+  -t praxis-ai:sqlite .
+```
+
+Then give the store a writable path. The image's `/etc/praxis` working
+directory is root-owned while the process runs as `praxis`, so the example's
+relative `sqlite://responses.db?mode=rwc` cannot be created: the proxy starts,
+and the first `/v1/responses` request fails with HTTP 500 and
+`unable to open database file`. Point `database_url` at a mounted directory the
+container user can write instead:
+
+```yaml
+- filter: openai_response_store
+  backend: sqlite
+  database_url: "sqlite:///data/responses.db?mode=rwc"
+```
+
+```console
+mkdir -m 0777 -p "$PWD/praxis-responses"
+docker run -d --rm --name praxis-vllm \
+  --network host \
+  -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
+  -v "$PWD/praxis-responses:/data:z" \
+  praxis-ai:sqlite -c /etc/praxis/praxis.yaml
+```
+
+The permissive mode is what lets UID 100 create the database in a host
+directory owned by your user; a directory `chown`ed to UID 100 works too.
+Podman can use a named volume instead, with the `:U` suffix asking it to chown
+the volume to the container user: `-v praxis-responses:/data:U`.
+
+The published image can also serve this example with `backend: postgres`,
+`allow_private_database_url: true`, and a reachable PostgreSQL instance — see
+`examples/configs/openai/responses/response-store-postgres-mtls.yaml` — but for
+a single-developer CLI loop the locally built SQLite image is less setup.
 
 ## 3. Connect Codex
 
