@@ -113,11 +113,12 @@ use std::io;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, ErrorResponseFormatterHandle, FilterAction, FilterError, HttpFilter, HttpFilterContext,
-    body::MAX_JSON_BODY_BYTES, builtins::http::payload_processing::OnInvalidBehavior, parse_filter_config,
+    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, ErrorResponseFormatterHandle, FilterAction, FilterError,
+    HttpFilter, HttpFilterContext, body::MAX_JSON_BODY_BYTES, builtins::http::payload_processing::OnInvalidBehavior,
+    parse_filter_config,
 };
 #[cfg(feature = "openai-responses")]
-use praxis_filter::{BoundUpstreamBodyOutcome, Rejection, SubRequestResponseMode};
+use praxis_filter::{Rejection, SubRequestResponseMode};
 use tracing::{debug, trace};
 
 use self::config::{ResponsesFormatConfig, build_config};
@@ -136,7 +137,6 @@ use crate::{
 /// `Release` and `BodyDone` both mean that processing may continue. Terminal
 /// responses are invalid at this lifecycle point; callers that need one must
 /// stash the required state and emit it from their later header hook.
-#[cfg(feature = "openai-responses")]
 pub(crate) fn bound_body_outcome(action: FilterAction) -> Result<BoundUpstreamBodyOutcome, FilterError> {
     match action {
         FilterAction::Continue | FilterAction::Release | FilterAction::BodyDone => {

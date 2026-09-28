@@ -66,10 +66,11 @@
 #      initializes ResponsesState, and rejects gateway-unsupported fields such
 #      as background=true only on managed routes.
 #
-#   4. openai_tool_parse parses the tools array and tool_choice from
-#      Responses API requests and promotes summary facts (has_tools,
-#      has_web_search, tool_choice, function_count, etc.) to metadata and
-#      filter results. Does not mutate the request body.
+#   4. On managed routes, openai_tool_parse parses the tools array and
+#      tool_choice from Responses API requests and promotes summary facts
+#      (has_tools, has_web_search, tool_choice, function_count, etc.) to
+#      metadata and filter results. It does not mutate the request body and is
+#      skipped with the other gateway-owned body work on direct OpenAI routes.
 #
 #   5. openai_response_store persists responses to SQLite and registers
 #      the store backend so downstream filters (rehydrate, compact) can
@@ -370,8 +371,6 @@ filter_chains:
           stream: x-praxis-ai-stream
           mode: x-praxis-responses-mode
 
-      - filter: openai_tool_parse
-
       # Bind one logical destination before any provider-owned body work. The
       # classifier overwrites the reserved x-praxis-ai-model header from the
       # parsed body, so clients cannot spoof a different promoted value. This
@@ -479,6 +478,12 @@ filter_chains:
       # The filters below participate in the once-per-request bound-body phase.
       # OpenAI owns these capabilities on its direct path, so the condition
       # suppresses their request, response, and response-body lifecycle hooks.
+      - filter: openai_tool_parse
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
+
       - filter: openai_responses_validate
         conditions:
           - unless:
