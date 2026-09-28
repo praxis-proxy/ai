@@ -6,6 +6,8 @@
 use praxis_filter::FilterError;
 use serde::Deserialize;
 
+use crate::identity::{DEFAULT_IDENTITY_HEADER_PREFIX, DEFAULT_IDENTITY_METADATA_NAMESPACE};
+
 /// Default HTTP timeout for metering service calls (5 seconds).
 const DEFAULT_TIMEOUT_SECONDS: u64 = 5;
 
@@ -14,13 +16,6 @@ const DEFAULT_FEATURE_KEY: &str = "inference-tokens";
 
 /// Default `CloudEvents` `source` field.
 const DEFAULT_SOURCE: &str = "ai-gateway";
-
-/// Default header prefix for tenant identity headers.
-const DEFAULT_IDENTITY_HEADER_PREFIX: &str = "x-tenant-";
-
-/// Default metadata namespace the `identity_header_guard` filter writes
-/// captured identity headers under.
-const DEFAULT_IDENTITY_METADATA_NAMESPACE: &str = "identity";
 
 /// Deserialized YAML config for the `external_metering` filter.
 ///

@@ -20,6 +20,7 @@ use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
     IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
     ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    TokenUsageMetricsFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -179,6 +180,10 @@ fn register_token_filters(registry: &mut FilterRegistry) {
     praxis_filter::register_filters!(
         @register registry,
         http "token_usage_headers" => TokenUsageHeadersFilter::from_config
+    );
+    praxis_filter::register_filters!(
+        @register registry,
+        http "token_usage_metrics" => TokenUsageMetricsFilter::from_config
     );
     #[cfg(feature = "token-rate-limit-filter")]
     praxis_filter::register_filters!(
@@ -657,6 +662,8 @@ mod tests {
             "anthropic_validate",
             "anthropic_web_search",
             "request_id",
+            "token_usage_headers",
+            "token_usage_metrics",
             "openai_chat_completions_to_azureai_chat_completions",
             "openai_chat_completions_to_vertexai_gemini",
         ];
