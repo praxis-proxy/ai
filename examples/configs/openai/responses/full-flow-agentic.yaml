@@ -474,13 +474,13 @@ filter_chains:
       # The filters below participate in the once-per-request bound-body phase.
       # OpenAI owns these capabilities on its direct path, so the condition
       # suppresses their request, response, and response-body lifecycle hooks.
-      - filter: openai_tool_parse
+      - filter: openai_responses_validate
         conditions:
           - unless:
               bound_upstream:
                 application_provider: openai
 
-      - filter: openai_responses_validate
+      - filter: openai_tool_parse
         conditions:
           - unless:
               bound_upstream:

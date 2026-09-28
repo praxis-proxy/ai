@@ -146,6 +146,23 @@ fn route_conversations_to_openai(yaml: &str) -> String {
 // Tests
 // -----------------------------------------------------------------------------
 
+#[test]
+fn full_flow_validates_before_parsing_tools() {
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
+        .expect("example config should exist");
+    let validate = yaml
+        .find("      - filter: openai_responses_validate")
+        .expect("full-flow config should validate managed requests");
+    let tool_parse = yaml
+        .find("      - filter: openai_tool_parse")
+        .expect("full-flow config should parse tools for managed requests");
+
+    assert!(
+        validate < tool_parse,
+        "managed requests must be validated before tool metadata is derived"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_flow_resolves_rehydrated_files_before_proxy() {
     let files_api_port = start_files_api_stub();
