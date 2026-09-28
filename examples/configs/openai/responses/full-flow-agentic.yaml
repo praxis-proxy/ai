@@ -353,6 +353,9 @@ filter_chains:
       # binding router. On Responses requests this filter remains inert until
       # managed validation publishes a canonical conversation ID; the direct
       # OpenAI path never publishes one and therefore cannot append locally.
+      # Do not add a bound_upstream condition here: no binding exists before
+      # the router, and deferring this dual-phase filter to the binding barrier
+      # would make body-carrying Conversations CRUD hit the router's 404 first.
       - filter: openai_conversations
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
