@@ -392,6 +392,16 @@ kill "$PRAXIS_PID"
 - `400` with `maximum context length is 32768 tokens` and a requested output
   count near 21,000: Claude Code's default output budget does not fit the
   window. Set `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192` as shown in section 4.
+- `400` with `maximum context length is 32768 tokens` on the first turn, with a
+  reported input count near 28,000 and a modest output count: the output cap
+  from the previous entry is already in effect and the startup prompt itself is
+  the problem. Claude Code loads MCP tool definitions, plugin skills, and
+  `CLAUDE.md` before the session begins, so an empty conversation can consume
+  most of the window. Run `/context` for the breakdown; it is a local command
+  and still works while every request is failing. Start Claude Code with
+  `--strict-mcp-config` to drop globally configured MCP servers, disable
+  unneeded plugins with `/plugin`, and prefer a working directory whose
+  `CLAUDE.md` is small or absent.
 - TLS or connection failure: use only the tunnel hostname in the endpoint and
   `tls.sni`; do not include `https://` in Praxis's `endpoints` entry.
 - Connection refused on 8080 from another machine, while vLLM on 8000 answers:
