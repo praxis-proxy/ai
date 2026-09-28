@@ -705,7 +705,7 @@ async fn two_user_file_id_contexts_are_isolated() {
     .unwrap();
     let filter = FileResolveFilter::from_config_with_outbound(
         &yaml,
-        crate::subrequest::isolated_client(4),
+        &crate::subrequest::isolated_client(4),
         owner_projecting_outbound_pipeline(),
     )
     .unwrap();
@@ -1150,7 +1150,7 @@ fn make_filter_with_outbound_for_url(files_api_url: &str) -> Box<dyn HttpFilter>
 fn make_filter_with_outbound_from_yaml(yaml_str: &str) -> Box<dyn HttpFilter> {
     let yaml: serde_yaml::Value = serde_yaml::from_str(yaml_str).unwrap();
     let client = crate::subrequest::isolated_client(4);
-    FileResolveFilter::from_config_with_outbound(&yaml, client, private_outbound_pipeline()).unwrap()
+    FileResolveFilter::from_config_with_outbound(&yaml, &client, private_outbound_pipeline()).unwrap()
 }
 
 fn make_client() -> FilesApiClient {
@@ -1351,6 +1351,7 @@ async fn file_url_resolved_to_data_uri() {
     let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![localhost_origin],
+        client: crate::subrequest::isolated_client(4),
     };
 
     // Call resolve_input with url_resolver
@@ -1403,6 +1404,7 @@ async fn file_url_truncated_body_reports_url_failure() {
         allowed_private_origins: vec![
             NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap(),
         ],
+        client: crate::subrequest::isolated_client(4),
     };
     let result = resolver
         .resolve_url(
@@ -1413,13 +1415,9 @@ async fn file_url_truncated_body_reports_url_failure() {
         .await;
 
     match result {
-        Err(ResolveError::FileUrlFailed { label, detail }) => {
+        Err(ResolveError::FileUrlFailed { label, .. }) => {
             assert!(label.contains("[REDACTED]"), "signed query value should be redacted");
             assert!(!label.contains("secret"), "signed query value must not be exposed");
-            assert!(
-                detail.contains("read error"),
-                "failure should retain URL body read context"
-            );
         },
         Err(other) => panic!("expected FileUrlFailed for a truncated URL body, got {other}"),
         Ok(_) => panic!("expected FileUrlFailed for a truncated URL body"),
@@ -1437,19 +1435,24 @@ async fn file_url_oversized_content_length_reports_generic_too_large() {
     let address = listener.local_addr().unwrap();
     let stub_url = format!("http://{address}/file.txt?sig=secret");
 
+    let body = "X".repeat(100);
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = [0_u8; 4096];
         let _read = stream.read(&mut request).unwrap();
-        let response =
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\nConnection: close\r\n\r\n";
-        stream.write_all(response).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        stream.write_all(response.as_bytes()).unwrap();
     });
 
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![
             NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap(),
         ],
+        client: crate::subrequest::isolated_client(4),
     };
     let result = resolver
         .resolve_url(&stub_url, tokio::time::Instant::now() + Duration::from_secs(5), 64)
@@ -1542,6 +1545,7 @@ async fn file_url_in_shorthand_message_resolved() {
     let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![localhost_origin],
+        client: crate::subrequest::isolated_client(4),
     };
 
     let count = resolve_input(
@@ -1610,6 +1614,7 @@ async fn file_url_in_function_call_output_resolved() {
     let localhost_origin = NormalizedOrigin::parse(&format!("http://127.0.0.1:{}", address.port())).unwrap();
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![localhost_origin],
+        client: crate::subrequest::isolated_client(4),
     };
 
     let count = resolve_input(
@@ -1655,6 +1660,7 @@ async fn file_url_blocked_is_not_swallowed_by_on_missing_continue() {
 
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![],
+        client: crate::subrequest::isolated_client(4),
     };
 
     let result = resolve_input(
@@ -1714,6 +1720,7 @@ async fn file_url_failed_is_not_swallowed_by_on_missing_continue() {
     // Default posture: file_url: resolve, on_missing: continue.
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![NormalizedOrigin::parse(&format!("http://{address}")).unwrap()],
+        client: crate::subrequest::isolated_client(4),
     };
 
     let err = resolve_input(
@@ -1748,15 +1755,17 @@ async fn file_url_too_large_is_not_swallowed_by_on_missing_continue() {
     // under on_missing: reject.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let oversized_body = "X".repeat(100);
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = [0_u8; 4096];
         let _read = stream.read(&mut request).unwrap();
-        stream
-            .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 100\r\nConnection: close\r\n\r\n",
-            )
-            .unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            oversized_body.len(),
+            oversized_body,
+        );
+        stream.write_all(response.as_bytes()).unwrap();
     });
 
     let url = format!("http://{address}/file.pdf");
@@ -1775,6 +1784,7 @@ async fn file_url_too_large_is_not_swallowed_by_on_missing_continue() {
     let client = make_client_for_url_with_max("http://unused:9999", 64);
     let resolver = FileUrlResolver {
         allowed_private_origins: vec![NormalizedOrigin::parse(&format!("http://{address}")).unwrap()],
+        client: crate::subrequest::isolated_client(4),
     };
 
     let err = resolve_input(

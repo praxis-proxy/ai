@@ -13,14 +13,14 @@ publish = false
 name = "praxis_ai_apis"
 
 [features]
-default = ["callout-rustls"]
+default = []
 # Stateful OpenAI Responses subsystem: request state kernel, validation, body
 # rebuild, stream composition, Chat Completions translation filter, document
 # extraction, client-tool compatibility, agentic loop, file search and web
 # search dispatch. Adds no crates; gated because of its size and coupling.
 openai-responses = []
-# openai_file_resolve: downloads referenced files (pinned reqwest client).
-openai-file-resolve-filter = ["openai-responses", "dep:reqwest"]
+# openai_file_resolve: downloads referenced files via SubRequestClient.
+openai-file-resolve-filter = ["openai-responses"]
 # Response and conversation storage (SQL). Implies the Responses kernel it serves.
 store = ["openai-responses", "dep:sqlx", "dep:dashmap", "dep:zstd"]
 store-postgres = ["store", "sqlx/postgres", "sqlx/tls-native-tls"]
@@ -36,9 +36,7 @@ openai-mcp-tools = ["store", "dep:rmcp", "dep:sse-stream"]
 # Every OpenAI group, without choosing a store backend.
 openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
 # Every non-experimental opt-in; equals the pre-feature-split capability.
-full = ["openai-all", "store-postgres", "callout-rustls"]
-callout-rustls = ["reqwest?/rustls", "rmcp?/reqwest"]
-callout-native-tls = ["reqwest?/native-tls", "rmcp?/reqwest-native-tls"]
+full = ["openai-all", "store-postgres"]
 praxis-main = []
 
 [lints]
@@ -63,7 +61,6 @@ praxis-core = { workspace = true }
 # off-by-default experimental features in praxis 0.7.0.
 praxis-filter = { workspace = true, features = ["iterative-request-router", "bound-upstream-request-body", "chain-binding"] }
 praxis-tls = { workspace = true }
-reqwest = { workspace = true, optional = true }
 rmcp = { workspace = true, optional = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
@@ -82,12 +79,8 @@ zstd = { workspace = true, optional = true }
 [dev-dependencies]
 allocation-counter = { workspace = true }
 axum = { workspace = true }
-rcgen = { workspace = true }
-reqwest = { workspace = true }
 rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
-rustls = { workspace = true }
 schemars = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }

@@ -21,20 +21,20 @@ origin.
 | --- | --- | --- | --- | --- |
 | `openai_web_search`, `anthropic_web_search` | Provider default or configured `base_url`, executed through the `outbound_chain` filtered-subrequest executor | `insecure_options.allow_private_upstreams` (executor-gated on the bound outbound chain) | No-follow | Configured provider API key; validated origin only |
 | `openai_file_resolve` Files API | Configured `files_api_url` via `outbound_chain` | `allow_private_upstreams` | No-follow | Headers named by `forward_headers` plus `outbound_chain` mutations |
-| `openai_file_resolve` `file_url` fetch | Request-derived URL | Exact `allowed_file_url_origins` | No-follow | Anonymous; no downstream headers |
+| `openai_file_resolve` `file_url` fetch | Request-derived URL via `SubRequestClient` | Exact `allowed_file_url_origins` | No-follow | Anonymous; no downstream headers |
 | `openai_file_search_callout` | Configured `vector_store_url` | `allow_private_url` | No-follow | Only headers named by `forward_headers` |
 | `openai_responses_compact` | Configured `inference_url` | `allow_private_inference_url` | No-follow | Anonymous; no downstream or cluster headers |
 | `ai_guardrails` with NeMo | Configured `endpoint` | Global `allow_private_upstreams` | No-follow | Configured `outbound_chain`; no downstream headers by default |
 | `http_callout` | Configured `target.url` | `allow_private_addresses` | No-follow | Configured static headers plus allowed `forward_headers` |
 | MCP client | Request-derived server URL or configured connector | `allow_loopback` for loopback only | No-follow | Sanitized request-provided MCP authorization/headers |
-| `azure_ad` token fetch | Configured authority plus tenant | `allow_private_authority` | No-follow | Client secret in the token POST body |
-| `gcp_adc` metadata fetch | Protocol-owned metadata endpoint | Intrinsic to metadata mode | No-follow | `Metadata-Flavor` protocol header; returned token is not forwarded back to metadata |
+| `azure_ad` token fetch | Configured authority plus tenant via `SubRequestClient` | `allow_private_authority` | No-follow | Client secret in the token POST body |
+| `gcp_adc` metadata fetch | Protocol-owned metadata endpoint via `SubRequestClient` | Intrinsic to metadata mode | No-follow | `Metadata-Flavor` protocol header; returned token is not forwarded back to metadata |
 
 The request-derived `file_url` and MCP transports retain stricter policies:
-they pin one validated resolution set, do not follow redirects, and allow
-private access only through their narrow origin/loopback controls. GCP metadata
-also uses pinned resolution, no redirects, and no ambient proxy, but intentionally
-allows its protocol-owned private destination.
+they resolve once per attempt, validate every address against `AddressPolicy`,
+do not follow redirects, and allow private access only through their narrow
+origin/loopback controls. GCP metadata intentionally allows its protocol-owned
+private destination via `AddressPolicy::AllowPrivate`.
 
 Upstream cluster connections are not direct callouts. They use the core Praxis
 endpoint and TLS policy instead of these filter-level controls.
@@ -61,29 +61,15 @@ A new filter that opens an outbound HTTP connection must:
 
 ## TLS backend
 
-By default, outbound callout clients use **rustls** for TLS (the
-`callout-rustls` Cargo feature, enabled by default). The `callout-native-tls`
-feature switches all callout client builders to the platform's native TLS
-implementation (OpenSSL on Linux). This is the expected configuration for
-compliance-oriented builds on RHEL/OpenShift where the system FIPS provider
-enforces approved cipher suites.
+Production outbound callouts use `SubRequestClient`, which inherits TLS from
+the process-wide Pingora/praxis-tls provider installed at startup
+(`praxis_tls::provider::install`). No per-callout or per-filter TLS backend
+selection is needed — all callouts share the same validated TLS stack as
+upstream cluster connections.
 
-Build with the native TLS backend:
+On RHEL/OpenShift FIPS builds, the system OpenSSL provider enforces approved
+cipher suites and algorithms for every outbound connection automatically.
 
-```console
-cargo build -p praxis-ai-proxy --no-default-features \
-    --features store-postgres,callout-native-tls
-```
-
-The two features are mutually exclusive in intent. If both are activated, both
-backends compile in; the `test-callout-tls-features` Makefile target catches
-this configuration.
-
-The callout builders themselves (`build_pinned_reqwest_client`,
-`mcp_client::build_pinned_client`, `file_resolve::configure_pinned_client`) do
-not configure a TLS backend. They inherit whichever backend reqwest was
-compiled with. All SSRF, DNS-pinning, redirect, proxy, and timeout controls
-are preserved regardless of the TLS backend.
-
-Test TLS infrastructure (`tests/utils/src/net/tls.rs`) always uses rustls for
-mock servers and certificate generation, independent of the callout backend.
+`reqwest` is a dev/test-only dependency. Test TLS infrastructure
+(`tests/utils/src/net/tls.rs`) uses rustls for mock servers and certificate
+generation, independent of the production TLS backend.

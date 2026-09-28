@@ -72,8 +72,13 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use http::{HeaderValue, header};
-use praxis_ai_apis::token_cache::TokenCache;
+use praxis_ai_apis::{
+    callout_target::AddressPolicy,
+    subrequest::{SubRequest, SubRequestClient},
+    token_cache::TokenCache,
+};
 use praxis_filter::FilterError;
 use serde::Deserialize;
 use tracing::warn;
@@ -118,9 +123,18 @@ struct TokenResponse {
 /// Returns [`FilterError`] if the request fails, the endpoint returns a
 /// non-success status, the body cannot be parsed, or the returned token
 /// is not a valid header value.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the token endpoint parameters are individually meaningful and not worth grouping"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential request build, execute, parse — splitting would add indirection without clarity"
+)]
 async fn fetch_token(
-    client: &reqwest::Client,
+    client: &SubRequestClient,
     token_url: &str,
+    address_policy: AddressPolicy,
     client_id: &str,
     client_secret: &str,
     scope: &str,
@@ -132,26 +146,37 @@ async fn fetch_token(
         .append_pair("scope", scope)
         .finish();
 
-    let response = client
-        .post(token_url)
-        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| FilterError::from(format!("azure_ad: token request failed: {e}")))?;
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-www-form-urlencoded"),
+    );
+    let request = SubRequest {
+        method: http::Method::POST,
+        uri: http::Uri::default(),
+        headers,
+        body: Bytes::from(body),
+    };
 
-    let status = response.status();
+    let response = praxis_ai_apis::subrequest::execute_url(
+        client,
+        token_url,
+        request,
+        65_536,
+        TOKEN_REQUEST_TIMEOUT,
+        address_policy,
+    )
+    .await
+    .map_err(|e| FilterError::from(format!("azure_ad: token request failed: {e}")))?;
+
+    let status = http::StatusCode::from_u16(response.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
     if !status.is_success() {
-        // The error body can echo the request; surface only the status
-        // so a misconfigured secret never lands in logs verbatim.
         return Err(FilterError::from(format!(
             "azure_ad: token endpoint returned HTTP status {status}"
         )));
     }
 
-    let token: TokenResponse = response
-        .json()
-        .await
+    let token: TokenResponse = serde_json::from_slice(&response.body)
         .map_err(|e| FilterError::from(format!("azure_ad: failed to parse token response: {e}")))?;
 
     let mut authorization = HeaderValue::from_str(&format!("Bearer {}", token.access_token))
@@ -179,11 +204,14 @@ pub struct AzureAdFilter {
     /// [`praxis_ai_apis::token_cache`].
     cache: TokenCache<HeaderValue>,
 
+    /// Shared sub-request client for token endpoint callouts.
+    subrequest_client: SubRequestClient,
+
     /// Fully-formed token endpoint URL.
     token_url: String,
 
     /// Connect-time address policy for the authority endpoint.
-    address_policy: praxis_ai_apis::callout_target::AddressPolicy,
+    address_policy: AddressPolicy,
 
     /// Application (client) ID.
     client_id: String,
@@ -209,7 +237,7 @@ impl AzureAdFilter {
     /// Returns [`FilterError`] if `authority_host` or `tenant_id` contain
     /// URL-structural characters, the configured secret environment
     /// variable is unset or not UTF-8, or the HTTP client fails to build.
-    fn new(config: AzureAdConfig) -> Result<Self, FilterError> {
+    fn new(config: AzureAdConfig, subrequest_client: SubRequestClient) -> Result<Self, FilterError> {
         validate_config(&config)?;
 
         let client_secret = std::env::var(&config.client_secret_env_var).map_err(|e| {
@@ -223,11 +251,11 @@ impl AzureAdFilter {
             "https://{}/{}/oauth2/v2.0/token",
             config.authority_host, config.tenant_id
         );
-        let address_policy =
-            praxis_ai_apis::callout_target::AddressPolicy::from_allow_private(config.allow_private_authority);
+        let address_policy = AddressPolicy::from_allow_private(config.allow_private_authority);
         praxis_ai_apis::callout_target::validate_configured_http_target("azure_ad", &token_url, address_policy)?;
         Ok(Self {
             cache: TokenCache::new(EXPIRY_SKEW),
+            subrequest_client,
             token_url,
             address_policy,
             client_id: config.client_id,
@@ -237,7 +265,8 @@ impl AzureAdFilter {
         })
     }
 
-    /// Parse YAML config and build a boxed filter instance.
+    /// Parse YAML config and build a boxed filter instance with an
+    /// isolated [`SubRequestClient`].
     ///
     /// # Errors
     ///
@@ -245,7 +274,23 @@ impl AzureAdFilter {
     /// configured secret environment variable is unset.
     pub(crate) fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn praxis_filter::HttpFilter>, FilterError> {
         let config = parse_azure_ad_config(config)?;
-        Ok(Box::new(Self::new(config)?))
+        let client = crate::isolated_subrequest_client(4);
+        Ok(Box::new(Self::new(config, client)?))
+    }
+
+    /// Parse YAML config and build a boxed filter instance using the
+    /// shared [`SubRequestClient`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the config is malformed or the
+    /// configured secret environment variable is unset.
+    pub(crate) fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: SubRequestClient,
+    ) -> Result<Box<dyn praxis_filter::HttpFilter>, FilterError> {
+        let config = parse_azure_ad_config(config)?;
+        Ok(Box::new(Self::new(config, client)?))
     }
 }
 
@@ -274,16 +319,10 @@ impl praxis_filter::HttpFilter for AzureAdFilter {
         let fetched = self
             .cache
             .get_or_refresh(|| async {
-                let client = crate::pinned_client::build_pinned_reqwest_client(
-                    "azure_ad",
+                fetch_token(
+                    &self.subrequest_client,
                     &self.token_url,
                     self.address_policy,
-                    TOKEN_REQUEST_TIMEOUT,
-                )
-                .await?;
-                fetch_token(
-                    &client,
-                    &self.token_url,
                     &self.client_id,
                     &self.client_secret,
                     &self.scope,
@@ -409,6 +448,7 @@ mod tests {
     use std::io::{Read as _, Write as _};
 
     use http::Method;
+    use praxis_ai_apis::{callout_target::AddressPolicy, subrequest::SubRequestClient};
     use praxis_filter::{FilterAction, HttpFilter as _};
 
     use super::{AzureAdConfig, AzureAdFilter, fetch_token, parse_azure_ad_config, validate_url_component};
@@ -526,7 +566,7 @@ mod tests {
             authority_host: "login.microsoftonline.com@evil.com".to_owned(),
             allow_private_authority: false,
         };
-        match AzureAdFilter::new(cfg) {
+        match AzureAdFilter::new(cfg, test_client()) {
             Ok(_) => panic!("malicious authority_host must be rejected"),
             Err(err) => assert!(
                 format!("{err}").contains("authority_host"),
@@ -557,14 +597,24 @@ mod tests {
         (url, handle)
     }
 
+    fn test_client() -> SubRequestClient {
+        crate::isolated_subrequest_client(4)
+    }
+
     #[tokio::test]
     async fn fetch_token_parses_bearer_and_ttl() {
         let (url, server) = mock_token_endpoint(r#"{"access_token":"abc123","expires_in":3600}"#);
-        let client = reqwest::Client::new();
 
-        let (authorization, ttl) = fetch_token(&client, &url, "cid", "secret", "scope")
-            .await
-            .expect("mock token fetch must succeed");
+        let (authorization, ttl) = fetch_token(
+            &test_client(),
+            &url,
+            AddressPolicy::AllowPrivate,
+            "cid",
+            "secret",
+            "scope",
+        )
+        .await
+        .expect("mock token fetch must succeed");
 
         assert_eq!(authorization.to_str().unwrap(), "Bearer abc123");
         assert!(authorization.is_sensitive(), "bearer header must be marked sensitive");
@@ -586,10 +636,16 @@ mod tests {
                 .unwrap();
         });
 
-        let client = reqwest::Client::new();
-        let err = fetch_token(&client, &url, "cid", "secret", "scope")
-            .await
-            .expect_err("401 must produce an error");
+        let err = fetch_token(
+            &test_client(),
+            &url,
+            AddressPolicy::AllowPrivate,
+            "cid",
+            "secret",
+            "scope",
+        )
+        .await
+        .expect_err("401 must produce an error");
         assert!(format!("{err}").contains("401"), "error must carry the status: {err}");
         server.join().unwrap();
     }
@@ -644,8 +700,8 @@ mod tests {
              allow_private_authority: true\n",
         ))
         .expect("test config must parse");
-        let mut filter =
-            AzureAdFilter::new(config).expect("construction must succeed with an always-set secret env var");
+        let mut filter = AzureAdFilter::new(config, test_client())
+            .expect("construction must succeed with an always-set secret env var");
         filter.token_url = token_url.to_owned();
         filter
     }

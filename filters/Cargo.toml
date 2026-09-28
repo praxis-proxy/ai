@@ -13,7 +13,7 @@ publish = false
 name = "praxis_ai_filters"
 
 [features]
-default = ["standard", "callout-rustls"]
+default = ["standard"]
 # Default-on filters that sit behind a gate so minimal builds can drop them.
 standard = ["aws-sigv4-filter", "policy-engine"]
 # The `policy` filter from Praxis core. Kept explicit so no-default FIPS builds
@@ -39,19 +39,17 @@ openai-mcp-tools = ["store", "praxis-ai-apis/openai-mcp-tools"]
 # Every OpenAI group, without choosing a store backend.
 openai-all = ["openai-file-resolve-filter", "openai-conversations", "openai-compact", "openai-mcp-tools"]
 # Every non-experimental filter; equals the pre-feature-split capability.
-full = ["standard", "openai-all", "store-postgres", "callout-rustls"]
-callout-rustls = ["praxis-ai-apis/callout-rustls", "reqwest?/rustls"]
-callout-native-tls = ["praxis-ai-apis/callout-native-tls", "reqwest?/native-tls"]
+full = ["standard", "openai-all", "store-postgres"]
 # Experimental: the generic http_callout filter. Work in progress; the config
 # surface may change. Activates the `experimental` marker.
 http-callout-filter = ["experimental", "dep:serde_json_path"]
 # Experimental: the azure_ad (Entra ID) upstream authentication filter. Work in
 # progress; the config surface may change. Activates the `experimental` marker.
-azure-ad-filter = ["experimental", "dep:reqwest"]
+azure-ad-filter = ["experimental"]
 # Experimental: the gcp_adc (Application Default Credentials) upstream
 # authentication filter. Work in progress; the config surface may change.
 # Activates the `experimental` marker.
-gcp-adc-filter = ["experimental", "dep:reqwest"]
+gcp-adc-filter = ["experimental"]
 # Experimental: the token_rate_limit filter. Its parent proposal
 # (00121_token-rate-limiting in praxis-proxy/enhancements) is not yet
 # `accepted`, and open design questions remain (bucket-keying strategy,
@@ -91,7 +89,6 @@ praxis-filter = { workspace = true, features = ["chain-binding"] }
 praxis-tls = { workspace = true }
 redis = { workspace = true, optional = true }
 rand = { workspace = true }
-reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
