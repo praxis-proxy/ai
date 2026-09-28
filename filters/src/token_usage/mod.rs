@@ -10,11 +10,13 @@
 mod count;
 mod headers;
 mod providers;
+mod stream_usage;
 mod streaming;
 
 pub use count::TokenCountFilter;
 pub use headers::TokenUsageHeadersFilter;
 use praxis_filter::HttpFilterContext;
+pub use stream_usage::StreamUsageInjectFilter;
 
 /// Metadata key for the input token count.
 ///

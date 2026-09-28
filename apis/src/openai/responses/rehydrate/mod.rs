@@ -34,17 +34,18 @@ use std::collections::HashSet;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use praxis_filter::{
-    EmptyFilterConfig, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 
 #[cfg(feature = "openai-mcp-tools")]
 use super::mcp_dispatch::{OWNER_FINGERPRINT, owner_fingerprint};
 use super::{
-    DEFAULT_STORE_NAME, append_stored_input_items, canonical_openresponses_replay_item,
+    DEFAULT_STORE_NAME, append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
     error::responses_error_rejection, extract_conversation_id, state::ResponsesState,
 };
 use crate::{
@@ -83,7 +84,17 @@ const PREV_USAGE_TOTAL_KEY: &str = "responses.previous_usage_total_tokens";
 /// ```yaml
 /// filter: openai_responses_rehydrate
 /// ```
+#[derive(Default)]
 pub struct RehydrateFilter;
+
+/// Configuration for `openai_responses_rehydrate`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "an empty mapping accepts omitted config while deny_unknown_fields rejects stale options"
+)]
+struct RehydrateConfig {}
 
 impl RehydrateFilter {
     /// Create a filter from YAML config.
@@ -93,10 +104,7 @@ impl RehydrateFilter {
     /// Returns [`FilterError`] if the YAML config contains unknown
     /// fields.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        // The filter has no tunable options. Parsing still runs so that
-        // `deny_unknown_fields` rejects any config keys, including the removed
-        // `max_history_bytes` / `max_history_items` limits.
-        let _: EmptyFilterConfig = parse_filter_config("openai_responses_rehydrate", config)?;
+        let _: RehydrateConfig = parse_filter_config("openai_responses_rehydrate", config)?;
         Ok(Box::new(Self))
     }
 
@@ -187,6 +195,10 @@ impl HttpFilter for RehydrateFilter {
         BodyAccess::ReadOnly
     }
 
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
     /// `StreamBuffer` so the protocol layer assembles the complete
     /// request body before delivering it at end-of-stream.
     fn request_body_mode(&self) -> BodyMode {
@@ -235,6 +247,15 @@ impl HttpFilter for RehydrateFilter {
         }
 
         self.rehydrate(ctx, body).await
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {

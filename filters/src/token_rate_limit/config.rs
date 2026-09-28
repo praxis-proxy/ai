@@ -18,7 +18,7 @@ use serde::Deserialize;
 ///
 /// Experimental: requires the `token-rate-limit-filter` cargo feature,
 /// which is off by default and activates the `experimental` marker.
-/// This filter delivers the agreed M1/M2/M6 milestone scope, but its
+/// This filter delivers the agreed M1/M2/M6/M7 milestone scope, but its
 /// parent proposal is not yet `accepted` and open questions remain
 /// (HA/clustered-Valkey failure modes, and the relationship to
 /// Kuadrant's `TokenRateLimitPolicy` -- see `ai#127`). The
@@ -38,6 +38,70 @@ use serde::Deserialize;
 /// including probes and health checks. Scope rules with explicit
 /// `match:` conditions, or place an identity/auth filter earlier in
 /// the pipeline. Tracked as follow-on integration work in `grid#101`.
+///
+/// Observability is group-level by rule, never by user. Metrics carry only
+/// bounded `rule`, `algorithm`, `backend`, `result`, and `capacity` labels;
+/// accounting logs and optional OpenTelemetry spans likewise omit raw
+/// subject and bucket-key values. The Prometheus contract is:
+///
+/// - `praxis_trl_requests_total{rule,result}` (`admitted` or `denied`): budget decisions only. Requests rejected before
+///   a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and
+///   `praxis_trl_backend_errors_total` (503, fail closed) instead.
+///
+/// - `praxis_trl_unauthenticated_total{rule}`
+///
+/// - `praxis_trl_tokens_reserved_total{rule}`
+///
+/// - `praxis_trl_tokens_reconciled_total{rule}`
+///
+/// - `praxis_trl_tokens_refunded_total{rule}`
+///
+/// - `praxis_trl_tokens_overage_total{rule}`
+///
+/// - `praxis_trl_reservations_total{rule,result}` (`reconciled` or `orphaned`)
+///
+/// - `praxis_trl_soft_tier_activations_total{rule,capacity}`
+///
+/// - `praxis_trl_backend_errors_total{rule,backend}`: failed reservations (the 503 path) and reconciliations abandoned
+///   after their retries.
+///
+/// - `praxis_trl_backend_reconciliation_total{rule,backend,result}`: reconciliations completed by a Valkey worker.
+///
+/// - `praxis_trl_budget_remaining{rule,algorithm}`
+///
+/// - `praxis_trl_reservations_active{rule}`
+///
+/// - `praxis_trl_active_keys{rule}`
+///
+/// Every previous `praxis_ai_token_rate_limit_*` name has moved to this
+/// prefix; no compatibility aliases are emitted.
+///
+/// `budget_remaining` is the sum of the latest calculated remaining
+/// balances for the rule's retained keys, and `active_keys` is how many
+/// balances contribute. Window aging and refill are evaluated lazily during
+/// normal backend operations, so both are snapshots rather than
+/// continuously refreshed values. Like all Prometheus gauges they are f64
+/// and saturate at the largest exactly representable integer (2^53 - 1).
+///
+/// Gauge scope depends on the backend. With the `memory` backend every
+/// gauge describes this process only, so aggregate replicas with `sum`.
+/// With the `valkey` backend every replica exports the rule-wide value it
+/// last observed from the shared store, so aggregate replicas with `max`;
+/// a replica that stops seeing traffic for a rule keeps exporting its last
+/// observation until it does. Valkey applies expiry incrementally on each
+/// admission, so its counts can briefly include entries that have just
+/// expired.
+///
+/// Admissions, denials, reconciliations, and backend failures also emit
+/// structured records on the `praxis_ai::token_rate_limit::accounting`
+/// tracing target: `INFO` for admissions and settlements, `WARN` for
+/// failures. They are on by default at `INFO`, so every admitted or denied
+/// request produces one line in the operational log stream; keep only
+/// failures with `runtime.log_overrides:
+/// {"praxis_ai::token_rate_limit::accounting": "warn"}`, and separate them
+/// from other operational logs by filtering on the `target` field. The
+/// records contain bounded policy and token-count fields only. They are
+/// best-effort operational audit records, not a durable billing source.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TokenRateLimitConfig {

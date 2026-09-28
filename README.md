@@ -1,6 +1,4 @@
-<p align="center">
-  <img width="3159" height="540" alt="Praxis AI" src="https://github.com/user-attachments/assets/0c33e340-a3d4-42e5-93f3-c1e3817b8f35">
-</p>
+<img width="1200" height="400" alt="praxis-ai-banner" src="https://github.com/user-attachments/assets/2696dc84-22ad-4a34-81d8-962f7ace86c0" />
 
 [![Tests](https://github.com/praxis-proxy/ai/actions/workflows/tests.yaml/badge.svg)](https://github.com/praxis-proxy/ai/actions/workflows/tests.yaml)
 [![Coverage: ≥95%](https://img.shields.io/badge/Coverage-≥95%25-brightgreen.svg)](https://github.com/praxis-proxy/ai/actions/workflows/coverage.yaml)
@@ -119,19 +117,20 @@ Released container images are available from
 development instructions are in the [development guide].
 
 ```console
-docker pull ghcr.io/praxis-proxy/ai:0.2
+docker pull ghcr.io/praxis-proxy/ai:latest
 ```
 
 Podman can pull the same OCI image. See the [quickstart] for a source build
 and the [release documentation] for image contents and tagging. A FIPS 140-3
 build for Red Hat Enterprise Linux hosts is published under the same tags
-with a `-fips` suffix; see [FIPS 140-3](docs/fips.md).
+with a `-fips` suffix (for example `latest-fips`); see
+[FIPS 140-3](docs/fips.md).
 
 ## Contributing
 
 Contributions are welcome, from bug reports and documentation fixes to new
 filters and protocol support. Before opening a pull request, please read the
-[contributing guide](CONTRIBUTING.md) and
+[contributing guide](.github/CONTRIBUTING.md) and
 [development setup](docs/developing/getting-started.md).
 
 For larger changes, open a [feature request] and follow the
@@ -147,7 +146,7 @@ For larger changes, open a [feature request] and follow the
 [feature request]: https://github.com/praxis-proxy/ai/issues/new?template=feature-request.yml
 [quickstart]: docs/quickstart.md
 [release documentation]: docs/release.md
-[security policy]: SECURITY.md
+[security policy]: .github/SECURITY.md
 
 ## License
 

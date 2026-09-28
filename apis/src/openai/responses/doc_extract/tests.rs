@@ -132,13 +132,10 @@ fn from_config_zero_max_content_bytes_rejected() {
 // -- Body access tests --------------------------------------------------------
 
 #[test]
-fn body_access_is_read_write() {
+fn declares_dual_phase_body_access() {
     let filter = make_filter();
-    assert_eq!(
-        filter.request_body_access(),
-        BodyAccess::ReadWrite,
-        "doc_extract needs ReadWrite to rewrite the body"
-    );
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
 }
 
 #[test]

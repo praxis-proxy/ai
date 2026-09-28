@@ -52,7 +52,7 @@ pub use routing::{CredentialInjectFilter, IntelligentRouteFilter, ProviderRouteF
 pub use time_to_first_token::TimeToFirstTokenFilter;
 #[cfg(feature = "token-rate-limit-filter")]
 pub use token_rate_limit::TokenRateLimitFilter;
-pub use token_usage::{TokenCountFilter, TokenUsageHeadersFilter};
+pub use token_usage::{StreamUsageInjectFilter, TokenCountFilter, TokenUsageHeadersFilter};
 
 /// Build an isolated client after installing the process-wide crypto provider.
 ///
@@ -141,6 +141,7 @@ pub(crate) mod test_utils {
             downstream_tls: false,
             extensions: RequestExtensions::default(),
             executed_filter_indices: Vec::new(),
+            executed_branch_filters: Vec::new(),
             extra_request_headers: Vec::new(),
             request_headers_to_remove: Vec::new(),
             request_headers_to_set: Vec::new(),

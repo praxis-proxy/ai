@@ -180,8 +180,12 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/${{ github.repository }}
+          # latest=auto tags this release as latest-fips too, mirroring the
+          # standard image's latest tag. Only the Release workflow (on a
+          # version tag) does this; the nightly Publish workflow keeps
+          # latest=false so scheduled builds never move latest-fips.
           flavor: |
-            latest=false
+            latest=auto
             suffix=-fips
           tags: |
             type=sha

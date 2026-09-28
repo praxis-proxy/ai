@@ -129,8 +129,8 @@ Security is enforced at the lint level. See lints in
 - `cargo audit` and `cargo deny check` enforce supply
   chain safety (see [getting-started.md])
 
-[Cargo.toml]:Cargo.toml
-[getting-started.md]:docs/developing/getting-started.md
+[Cargo.toml]:../Cargo.toml
+[getting-started.md]:../docs/developing/getting-started.md
 
 ### Lint Suppression Policy
 
@@ -272,7 +272,7 @@ use std::io::Write;
   the human-readable size or meaning (e.g.
   `const MAX_BODY: usize = 10_485_760; // 10 MiB`).
 
-See also [Type Design](docs/developing/type-design.md) for serde patterns
+See also [Type Design](../docs/developing/type-design.md) for serde patterns
 and data modeling conventions.
 
 ## Code Responsibility

@@ -4,7 +4,7 @@
 //! Unit tests for the tool parse filter.
 
 use bytes::Bytes;
-use praxis_filter::{BodyAccess, BodyMode, FilterAction, HttpFilter};
+use praxis_filter::{BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, HttpFilter};
 
 use super::ToolParseFilter;
 
@@ -52,6 +52,11 @@ fn body_access_is_read_only() {
         filter.request_body_access(),
         BodyAccess::ReadOnly,
         "should use read-only body access"
+    );
+    assert_eq!(
+        filter.bound_upstream_request_body_access(),
+        BodyAccess::ReadOnly,
+        "should support provider-gated bound-body parsing"
     );
 }
 
@@ -673,6 +678,24 @@ async fn mixed_tools_all_metadata_set() {
         ctx.filter_metadata["openai_tool_parse.tool_choice"], "auto",
         "tool_choice"
     );
+}
+
+#[tokio::test]
+async fn bound_body_hook_promotes_tool_metadata() {
+    let filter = make_filter("{}");
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let req: &'static praxis_filter::Request = Box::leak(Box::new(req));
+    let mut ctx = crate::test_utils::make_filter_context(req);
+    let mut body = Some(Bytes::from(r#"{"tools":[{"type":"function","name":"lookup"}]}"#));
+
+    let outcome = filter
+        .on_bound_upstream_request_body(&mut ctx, &mut body)
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, BoundUpstreamBodyOutcome::Continue));
+    assert_eq!(ctx.get_metadata("openai_tool_parse.has_tools"), Some("true"));
+    assert_eq!(ctx.get_metadata("openai_tool_parse.function_count"), Some("1"));
 }
 
 // =============================================================================
