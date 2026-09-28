@@ -16,8 +16,8 @@
 # binding drives two mutually exclusive paths:
 #
 #   - application_provider=openai: a terminal branch forwards the original
-#     request directly. Validation, local state, hosted-tool resolution, and
-#     the IRR never run.
+#     Responses request directly. Managed validation, response state,
+#     persistence/rehydration, hosted-tool resolution, and the IRR never run.
 #   - every managed provider: the bound-body barrier runs provider-aware body
 #     filters once, then the IRR executes the agentic loop.
 #
@@ -46,10 +46,12 @@
 #   0. openai_operation publishes the typed registry match consumed by
 #      openai_conversations. It must remain earlier in this filter chain.
 #
-#   1. openai_conversations handles CRUD for the Conversations API
-#      (/v1/conversations). On the managed Responses response
-#      path it appends input+output items back to the conversation after
-#      a successful non-streaming response.
+#   1. openai_conversations handles the gateway-owned Conversations API
+#      (/v1/conversations) before routing. On the managed Responses response
+#      path it appends input+output items back to the conversation after a
+#      successful non-streaming response. Provider-owned Responses traffic
+#      never receives the managed conversation metadata that arms append-back,
+#      so this early filter remains inert on the direct OpenAI path.
 #
 #   2. openai_responses_format classifies the request and promotes
 #      format, model, stream, and mode to internal routing headers.
@@ -346,6 +348,17 @@ filter_chains:
 
       # Publishes the typed operation consumed by openai_conversations.
       - filter: openai_operation
+
+      # Conversations CRUD is gateway-owned and terminates locally before the
+      # binding router. On Responses requests this filter remains inert until
+      # managed validation publishes a canonical conversation ID; the direct
+      # OpenAI path never publishes one and therefore cannot append locally.
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        conversations_table: openai_conversations
+        items_table: openai_conversation_items
+
       - filter: openai_responses_format
         on_invalid: continue
         headers:
@@ -371,11 +384,6 @@ filter_chains:
             cluster: "embeddings-api"
           - path_prefix: "/v1/files"
             cluster: "files-api"
-          # Conversations is gateway-owned in this example. Bind it to a
-          # managed cluster so the provider-gated bound-body filter runs and
-          # terminates the request locally before the IRR.
-          - path_prefix: "/v1/conversations"
-            cluster: "inference-backend"
           - path: "/v1/responses"
             headers:
               upgrade: "websocket"
@@ -474,16 +482,6 @@ filter_chains:
               bound_upstream:
                 application_provider: openai
 
-      - filter: openai_conversations
-        backend: sqlite
-        database_url: "sqlite://responses.db?mode=rwc"
-        conversations_table: openai_conversations
-        items_table: openai_conversation_items
-        conditions:
-          - unless:
-              bound_upstream:
-                application_provider: openai
-
       - filter: openai_response_store
         backend: sqlite
         # In-memory:
@@ -554,9 +552,10 @@ filter_chains:
               bound_upstream:
                 application_provider: openai
 
-      # Local store operations above serve the managed GET/DELETE resource
-      # endpoints. Any other managed Responses subpath (for example /cancel)
-      # is unsupported and must not fall through into the inference IRR.
+      # The router needs a /v1/responses prefix route so managed GET/DELETE
+      # resource endpoints can reach the local store. That prefix also binds
+      # unknown subpaths. After recognized store operations have terminated,
+      # reject any remaining managed subpath here so it cannot enter the IRR.
       # Provider-owned OpenAI traffic already left through direct-openai.
       - filter: static_response
         status: 404
@@ -571,7 +570,11 @@ filter_chains:
               path: "/v1/responses"
 
       # Gateway-owned Responses requests flow here after both terminal direct
-      # branches have been considered. The IRR runs the agentic model-tool-model loop: each round
+      # branches have been considered. OpenAI-bound requests skip the IRR
+      # structurally because direct-openai rejoins at terminal above. Do not add
+      # a bound_upstream condition to IRR itself: IRR owns an ordinary pre-read
+      # body hook, which cannot be gated on metadata published later by the
+      # binding router. The IRR runs the agentic model-tool-model loop: each round
       # streams through openai_stream_events, the three request-phase
       # dispatchers execute the loop owner's assigned hosted-tool calls, and
       # openai_agentic_loop parses each response and publishes the single

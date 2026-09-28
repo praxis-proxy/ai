@@ -318,7 +318,8 @@ fn full_flow_openai_provider_is_direct_passthrough() {
         "model": "gpt-5",
         "input": "continue at the provider",
         "background": true,
-        "previous_response_id": "resp_provider_owned"
+        "previous_response_id": "resp_provider_owned",
+        "conversation": "conv_provider_owned"
     });
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &request.to_string()));
 
