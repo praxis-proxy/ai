@@ -94,6 +94,9 @@ an A10G, eager execution reclaims CUDA-graph memory and the 0.97 utilization is
 reserved for this single-user development workload. If you lower the window or
 share the GPU, do not use auto mode unless the classifier request still fits.
 
+The window is small enough that Claude Code's default output budget does not fit
+beside a working prompt, so section 4 also sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
+
 ## 2. Point a Praxis example at vLLM
 
 Choose one example and copy it outside `examples/`:
@@ -343,6 +346,8 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL="$VLLM_MODEL"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$VLLM_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$VLLM_MODEL"
 export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+# Keep the requested output budget inside the 32,768-token vLLM window.
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192
 # Required if you select Claude Code's auto permission mode with this backend.
 export CLAUDE_CODE_AUTO_MODE_SERVER=0
 
@@ -353,6 +358,18 @@ claude --model "$VLLM_MODEL"
 
 `GATEWAY_AUTH_PASSWORD` and `VLLM_API_KEY` must be present in the environment of
 the Praxis process. The other variables configure Claude Code.
+
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` is required for a 32,768-token server. Claude
+Code does not know the served model's real window, so it sends the default
+`max_tokens` for the Anthropic model name it believes it is calling — around
+21,000 tokens. vLLM reserves `max_tokens` against `--max-model-len` before
+inference, so that budget plus a modest prompt exceeds the window and the
+request fails with HTTP 400 even though the prompt itself is small. Capping the
+budget at 8192 leaves roughly 24K for input. Claude Code still sizes its own
+auto-compaction against the window it assumes, not the real one, so run
+`/compact` by hand if a long session creeps back into the limit. A larger window
+is the alternative, but Qwen3-8B is natively 32,768 tokens and anything beyond
+it needs `--rope-scaling` on `vllm serve`.
 
 Praxis and vLLM do not implement Anthropic's server-side auto-mode classifier
 protocol. `CLAUDE_CODE_AUTO_MODE_SERVER=0` makes Claude Code initiate the
@@ -372,6 +389,9 @@ kill "$PRAXIS_PID"
 - `401` from Praxis on the Claude path: verify the Basic authorization header.
 - `401` from vLLM: `VLLM_API_KEY` does not match the key passed to vLLM.
 - Model not found: use the exact slash-free served name, normally `qwen3-8b`.
+- `400` with `maximum context length is 32768 tokens` and a requested output
+  count near 21,000: Claude Code's default output budget does not fit the
+  window. Set `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192` as shown in section 4.
 - TLS or connection failure: use only the tunnel hostname in the endpoint and
   `tls.sni`; do not include `https://` in Praxis's `endpoints` entry.
 - Claude startup probes may call `/v1/messages/count_tokens`. Native vLLM
