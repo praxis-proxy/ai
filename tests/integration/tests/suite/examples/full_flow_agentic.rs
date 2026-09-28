@@ -130,6 +130,18 @@ fn load_full_flow_agentic_config(
     (config, db)
 }
 
+/// Select OpenAI ownership for the model-less Conversations API route.
+fn route_conversations_to_openai(yaml: &str) -> String {
+    const MANAGED: &str = "          - path_prefix: \"/v1/conversations\"\n            cluster: \"inference-backend\"";
+    const OPENAI: &str =
+        "          - path_prefix: \"/v1/conversations\"\n            cluster: \"openai-responses-backend\"";
+    assert!(
+        yaml.contains(MANAGED),
+        "full-flow config must declare the managed Conversations ownership route"
+    );
+    yaml.replacen(MANAGED, OPENAI, 1)
+}
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -219,6 +231,42 @@ async fn full_flow_resolves_rehydrated_files_before_proxy() {
         text.contains("Hello, world!"),
         "extracted text should include file content: {text}"
     );
+}
+
+#[test]
+fn full_flow_openai_provider_passes_conversations_through() {
+    let provider_response = json!({
+        "id": "conv_provider_owned",
+        "object": "conversation",
+        "metadata": {"owner": "openai"}
+    });
+    let backend = StatefulCapturingBackend::new(vec![(200, provider_response.to_string())]).start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_openai_conversations");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
+        .expect("example config should exist");
+    let yaml = route_conversations_to_openai(&yaml)
+        .replace("sqlite://responses.db?mode=rwc", db.url())
+        .replace("${WEB_SEARCH_API_KEY}", "test-key");
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3001", backend.port())]));
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+    let request = json!({"metadata": {"source": "client"}});
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/conversations", &request.to_string()));
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "OpenAI Conversations request should pass through"
+    );
+    let response: Value = serde_json::from_str(&parse_body(&raw)).expect("provider response should remain JSON");
+    assert_eq!(response, provider_response);
+    let requests = backend.requests();
+    assert_eq!(requests.len(), 1, "provider should receive exactly one request");
+    assert_eq!(requests[0].uri, "/v1/conversations");
+    let forwarded: Value = serde_json::from_str(&requests[0].body).expect("forwarded body should remain JSON");
+    assert_eq!(forwarded, request, "provider-owned request must remain unchanged");
 }
 
 #[test]

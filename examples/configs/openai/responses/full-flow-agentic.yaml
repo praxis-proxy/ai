@@ -46,12 +46,12 @@
 #   0. openai_operation publishes the typed registry match consumed by
 #      openai_conversations. It must remain earlier in this filter chain.
 #
-#   1. openai_conversations handles the gateway-owned Conversations API
-#      (/v1/conversations) before routing. On the managed Responses response
-#      path it appends input+output items back to the conversation after a
-#      successful non-streaming response. Provider-owned Responses traffic
-#      never receives the managed conversation metadata that arms append-back,
-#      so this early filter remains inert on the direct OpenAI path.
+#   1. openai_conversations handles the Conversations API only for managed
+#      providers. The router binds /v1/conversations first: an OpenAI binding
+#      takes the direct terminal branch, while a managed binding runs the
+#      Praxis CRUD implementation. On the managed Responses response path the
+#      filter also appends input+output items back to the conversation after a
+#      successful non-streaming response.
 #
 #   2. openai_responses_format classifies the request and promotes
 #      format, model, stream, and mode to internal routing headers.
@@ -350,19 +350,6 @@ filter_chains:
       # Publishes the typed operation consumed by openai_conversations.
       - filter: openai_operation
 
-      # Conversations CRUD is gateway-owned and terminates locally before the
-      # binding router. On Responses requests this filter remains inert until
-      # managed validation publishes a canonical conversation ID; the direct
-      # OpenAI path never publishes one and therefore cannot append locally.
-      # Do not add a bound_upstream condition here: no binding exists before
-      # the router, and deferring this dual-phase filter to the binding barrier
-      # would make body-carrying Conversations CRUD hit the router's 404 first.
-      - filter: openai_conversations
-        backend: sqlite
-        database_url: "sqlite://responses.db?mode=rwc"
-        conversations_table: openai_conversations
-        items_table: openai_conversation_items
-
       - filter: openai_responses_format
         on_invalid: continue
         headers:
@@ -386,6 +373,12 @@ filter_chains:
             cluster: "embeddings-api"
           - path_prefix: "/v1/files"
             cluster: "files-api"
+          # Conversations requests carry no model, so this route is the
+          # deployment's explicit ownership policy. The managed default below
+          # selects the Praxis implementation. Point it at
+          # openai-responses-backend to pass the API through to OpenAI instead.
+          - path_prefix: "/v1/conversations"
+            cluster: "inference-backend"
           - path: "/v1/responses"
             headers:
               upgrade: "websocket"
@@ -488,6 +481,16 @@ filter_chains:
                 application_provider: openai
 
       - filter: openai_responses_validate
+        conditions:
+          - unless:
+              bound_upstream:
+                application_provider: openai
+
+      - filter: openai_conversations
+        backend: sqlite
+        database_url: "sqlite://responses.db?mode=rwc"
+        conversations_table: openai_conversations
+        items_table: openai_conversation_items
         conditions:
           - unless:
               bound_upstream:
