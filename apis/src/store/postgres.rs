@@ -19,7 +19,7 @@ use super::{
     postgres_tls::PgTlsConfig,
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
-        check_schema, expected_tables, generate_ddl, pending_approvals_table, pg_key_column_folding,
+        check_schema, ddl_error, expected_tables, generate_ddl, pending_approvals_table, pg_key_column_folding,
         schema_version_table, validate_postgres_identifiers,
     },
     trait_def::{ConversationItemStore, ResponseStore},
@@ -123,7 +123,7 @@ impl PostgresResponseStore {
             sqlx::query(AssertSqlSafe(statement.as_str()))
                 .execute(&pool)
                 .await
-                .map_err(|e| StoreError::Database(e.to_string()))?;
+                .map_err(|e| ddl_error(statement, e))?;
         }
 
         validate_schema(&pool, &tables).await?;
@@ -1266,7 +1266,7 @@ impl ConversationItemStore for PostgresResponseStore {
              WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
              FOR UPDATE"
         );
-        sqlx::query(AssertSqlSafe(lock_sql.as_str()))
+        let locked = sqlx::query(AssertSqlSafe(lock_sql.as_str()))
             .bind(conversation_id)
             .bind(owner.tenant_id())
             .bind(owner.issuer())
@@ -1274,6 +1274,9 @@ impl ConversationItemStore for PostgresResponseStore {
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
+        if locked.is_none() {
+            return Err(StoreError::NotFound);
+        }
 
         let max_sql = format!(
             "SELECT COALESCE(MAX(position), 0) AS max_pos \
@@ -1345,7 +1348,7 @@ impl ConversationItemStore for PostgresResponseStore {
              WHERE conversation_id = $1 AND tenant_id = $2 AND owner_issuer = $3 AND owner_subject = $4 \
              FOR UPDATE"
         );
-        sqlx::query(AssertSqlSafe(lock_sql.as_str()))
+        let locked = sqlx::query(AssertSqlSafe(lock_sql.as_str()))
             .bind(conversation_id)
             .bind(owner.tenant_id())
             .bind(owner.issuer())
@@ -1353,6 +1356,9 @@ impl ConversationItemStore for PostgresResponseStore {
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
+        if locked.is_none() {
+            return Err(StoreError::NotFound);
+        }
 
         let delete_sql = format!(
             "DELETE FROM {items_table} \

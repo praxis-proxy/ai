@@ -721,6 +721,20 @@ class TestOpenAIConversations:
             )
         assert exc_info.value.status_code == 404
 
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.create(
+                conversation.id,
+                items=[{"type": "message", "role": "user", "content": "too late"}],
+            )
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.delete(
+                "item_keep",
+                conversation_id=conversation.id,
+            )
+        assert exc_info.value.status_code == 404
+
     def test_same_tenant_other_owner_cannot_access_state(
         self, openai_client, other_owner_client
     ):

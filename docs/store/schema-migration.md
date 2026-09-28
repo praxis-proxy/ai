@@ -14,13 +14,16 @@ column type is `BLOB` on SQLite and `BYTEA` on PostgreSQL.
 The proxy **refuses to start** against a database still stamped at
 version 2 — the store initialization fails with:
 
-```
+```text
 schema version mismatch in '<responses_table>_schema_version': stored
 version 2, expected 3; database migration required
 ```
 
 Migration is a one-time, operator-run step. It is not applied
-automatically on startup. Take a backup before running it.
+automatically on startup. Take a backup before running it. If an older
+pre-#570 database fails while creating the conversation item position index,
+[repair duplicate item positions](legacy-item-position-repair.md) before
+continuing with the other required schema migrations.
 
 Substitute your configured responses table name (`openai_responses` by
 default) for the `<responses_table>` placeholder below.

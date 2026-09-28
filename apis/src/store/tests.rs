@@ -47,6 +47,70 @@ async fn sqlite_store_initializes_schema() {
     assert!(result.is_none(), "empty store should return None");
 }
 
+#[tokio::test]
+async fn sqlite_pre_index_duplicate_positions_report_repair_at_startup() {
+    let dir = tempfile::tempdir().expect("tempdir should succeed");
+    let url = format!("sqlite://{}?mode=rwc", dir.path().join("legacy_items.db").display());
+    let initial = SqliteResponseStore::new(&url, "legacy_responses", "legacy_conversations", None, None, None)
+        .await
+        .expect("store without items should initialize");
+    drop(initial);
+
+    let tables = super::schemas::TableNames {
+        responses: "legacy_responses".to_owned(),
+        conversations: "legacy_conversations".to_owned(),
+        items: Some("legacy_items".to_owned()),
+    };
+    let ddl = super::schemas::generate_ddl(&tables, super::schemas::SqlDialect::Sqlite).unwrap();
+    let items_table = ddl
+        .iter()
+        .find(|statement| statement.starts_with("CREATE TABLE IF NOT EXISTS legacy_items "))
+        .expect("items DDL should be generated");
+    let pool = sqlx::SqlitePool::connect(&url)
+        .await
+        .expect("existing database should open");
+    sqlx::query(sqlx::AssertSqlSafe(items_table.as_str()))
+        .execute(&pool)
+        .await
+        .expect("legacy items table should be created without the new index");
+    for id in ["a", "b"] {
+        sqlx::query(
+            "INSERT INTO legacy_items \
+             (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
+             VALUES (?, 'tenant', 'issuer', 'subject', 'conv', '{}', 1, 1)",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("legacy store permitted duplicate positions");
+    }
+    pool.close().await;
+
+    let err = SqliteResponseStore::new(
+        &url,
+        "legacy_responses",
+        "legacy_conversations",
+        Some("legacy_items"),
+        None,
+        None,
+    )
+    .await
+    .err()
+    .expect("new unique index must reject duplicate legacy positions");
+    assert!(
+        err.to_string().contains("docs/store/legacy-item-position-repair.md"),
+        "startup must provide the repair path: {err}"
+    );
+    let pool = sqlx::SqlitePool::connect(&url)
+        .await
+        .expect("database should remain readable");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM legacy_items")
+        .fetch_one(&pool)
+        .await
+        .expect("legacy rows should still exist");
+    assert_eq!(count, 2, "failed startup must not discard legacy rows");
+}
+
 // -----------------------------------------------------------------------------
 // Response CRUD
 // -----------------------------------------------------------------------------
@@ -2378,10 +2442,7 @@ async fn create_items_and_sync_messages_missing_conversation_errors() {
         .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_gone", &items)
         .await
         .expect_err("create against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — no orphaned items may persist.
     let fetched = store
@@ -2483,10 +2544,7 @@ async fn delete_item_and_sync_messages_missing_conversation_errors() {
         .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_1", "item_a")
         .await
         .expect_err("delete-item sync against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — the item deletion must not persist.
     let remaining = store
@@ -4852,10 +4910,7 @@ async fn pg_create_items_and_sync_messages_missing_conversation_errors() {
         .create_items_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_missing", &items)
         .await
         .expect_err("create against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — no orphaned items may persist.
     let fetched = store
@@ -4899,10 +4954,7 @@ async fn pg_delete_item_and_sync_messages_missing_conversation_errors() {
         .delete_item_and_sync_messages(&crate::test_utils::test_owner("tenant_a"), "conv_del_missing", "item_a")
         .await
         .expect_err("delete-item sync against a missing conversation should error");
-    assert!(
-        matches!(&err, StoreError::Database(msg) if msg.contains("conversation disappeared during message sync")),
-        "unexpected error: {err:?}"
-    );
+    assert!(matches!(&err, StoreError::NotFound), "unexpected error: {err:?}");
 
     // The transaction must roll back — the item deletion must not persist.
     let remaining = store
