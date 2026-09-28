@@ -369,10 +369,7 @@ def _write_reasoning_config(praxis_port: int, db_path: str) -> str:
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
-    return path
+    return _persist_config(config)
 
 
 def _write_reasoning_backend_config(
@@ -396,10 +393,25 @@ def _write_reasoning_backend_config(
     config = config.replace("dialect: vllm", f"dialect: {dialect}")
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
-    return path
+    return _persist_config(config)
+
+
+def test_reasoning_config_writers_inherit_root_override(tmp_path, monkeypatch):
+    """Keep every reasoning fixture compatible with the root-run GPU worker."""
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    db_path = str(tmp_path / "responses.db")
+    paths = [
+        _write_reasoning_config(18_080, db_path),
+        _write_reasoning_backend_config(18_081, db_path, 18_082),
+    ]
+    try:
+        for path in paths:
+            with open(path) as config_file:
+                config = config_file.read()
+            assert config.count("allow_root: true") == 1, config
+    finally:
+        for path in paths:
+            os.unlink(path)
 
 
 def _write_compact_config(
@@ -2810,10 +2822,14 @@ class TestResponsesReasoningVLLM:
             reasoning={"effort": "low"},
             temperature=0,
             store=True,
-            max_output_tokens=256,
+            # The continuation contract accepts only completed stored
+            # responses. Leave enough room for Qwen3's reasoning block and
+            # terminal answer instead of treating a token-capped response as a
+            # valid continuation parent.
+            max_output_tokens=1024,
         )
 
-        assert response.status in ("completed", "incomplete"), response.status
+        assert response.status == "completed", response.status
         output_types = [item.type for item in response.output]
         assert output_types, "response must carry at least one output item"
 
@@ -7119,10 +7135,10 @@ def test_invalid_tool_choice_raises_bad_request(openai_client):
     assert "tool_choice" in str(exc_info.value).lower()
 
 
-@requires_vllm_compat
-def test_null_tool_choice_succeeds_sdk(openai_client):
-    """Verify explicit tool_choice=None succeeds via the OpenAI SDK and returns normalized tool_choice='auto'."""
-    response = openai_client.responses.create(
+def test_null_tool_choice_succeeds_sdk(chat_streaming_client):
+    """Verify null is omitted upstream and normalized to auto for the client."""
+    request_start = len(SimulatorBackendHandler.recorded_requests)
+    response = chat_streaming_client.responses.create(
         model=VLLM_MODEL,
         input="Hello",
         tools=[
@@ -7137,29 +7153,58 @@ def test_null_tool_choice_succeeds_sdk(openai_client):
     assert response.status == "completed"
     assert response.tool_choice == "auto"
 
+    if VLLM_TEST_BACKEND == "simulator":
+        recorded = [
+            body
+            for path, body in SimulatorBackendHandler.recorded_requests[request_start:]
+            if path.rstrip("/").endswith("/v1/chat/completions")
+        ]
+        assert len(recorded) == 1, recorded
+        translated = recorded[0]
+        assert "tool_choice" not in translated, translated
+        assert translated["tools"] == [
+            {
+                "type": "function",
+                "function": {
+                    "name": "test_tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
 
 @pytest.mark.parametrize(
-    "tool_choice,with_tools",
+    "choice_case,tool_choice,with_tools",
     [
-        (None, True),  # explicit null with tools
-        (None, False),  # explicit null without tools
-        ("none", True),
-        ("none", False),
-        ("auto", True),
-        ("auto", False),
-        ({"type": "function", "name": "test_tool"}, True),
+        pytest.param("null", None, True, id="null-with-tools"),
+        pytest.param("null", None, False, id="null-without-tools"),
+        pytest.param("omitted", None, True, id="omitted-with-tools"),
+        pytest.param("omitted", None, False, id="omitted-without-tools"),
+        pytest.param("value", "none", True, id="none-with-tools"),
+        pytest.param("value", "none", False, id="none-without-tools"),
+        pytest.param("value", "auto", True, id="auto-with-tools"),
+        pytest.param("value", "auto", False, id="auto-without-tools"),
+        pytest.param(
+            "value",
+            {"type": "function", "name": "test_tool"},
+            True,
+            id="forced-function-with-tools",
+        ),
     ],
 )
 @pytest.mark.parametrize("stream", [False, True])
 @requires_vllm_compat
-def test_valid_tool_choice_variants_raw_http(openai_client, tool_choice, with_tools, stream):
-    """Verify valid tool_choice variants (null, omitted, none, auto, forced) over raw HTTP in buffered and streaming modes."""
+def test_valid_tool_choice_variants_raw_http(
+    chat_streaming_client, choice_case, tool_choice, with_tools, stream
+):
+    """Verify translated tool_choice variants in buffered and streaming modes."""
     body = {
         "model": VLLM_MODEL,
         "input": "Hello",
         "stream": stream,
-        "tool_choice": tool_choice,
     }
+    if choice_case != "omitted":
+        body["tool_choice"] = tool_choice
     if with_tools:
         body["tools"] = [
             {
@@ -7170,14 +7215,17 @@ def test_valid_tool_choice_variants_raw_http(openai_client, tool_choice, with_to
         ]
 
     raw = httpx.post(
-        f"{str(openai_client.base_url).rstrip('/')}/responses",
-        headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
+        f"{str(chat_streaming_client.base_url).rstrip('/')}/responses",
+        headers={"Authorization": "Bearer test"},
         json=body,
         timeout=30,
     )
-    assert raw.status_code == 200, f"Failed for choice={tool_choice}, tools={with_tools}, stream={stream}: {raw.text}"
+    assert raw.status_code == 200, (
+        f"Failed for case={choice_case}, choice={tool_choice}, "
+        f"tools={with_tools}, stream={stream}: {raw.text}"
+    )
 
-    expected_choice = "auto" if tool_choice is None else tool_choice
+    expected_choice = "auto" if choice_case in {"null", "omitted"} else tool_choice
     if not stream:
         data = raw.json()
         assert data["tool_choice"] == expected_choice
@@ -7203,11 +7251,13 @@ def test_valid_tool_choice_variants_raw_http(openai_client, tool_choice, with_to
 )
 @pytest.mark.parametrize("stream", [False, True])
 @requires_vllm_compat
-def test_malformed_tool_choice_variants_raw_http(openai_client, malformed_choice, stream):
+def test_malformed_tool_choice_variants_raw_http(
+    chat_streaming_client, malformed_choice, stream
+):
     """Verify malformed tool_choice variants return 400 over raw HTTP in buffered and streaming modes."""
     raw = httpx.post(
-        f"{str(openai_client.base_url).rstrip('/')}/responses",
-        headers={"Authorization": "Bearer test", **TRUSTED_OWNER_HEADERS},
+        f"{str(chat_streaming_client.base_url).rstrip('/')}/responses",
+        headers={"Authorization": "Bearer test"},
         json={
             "model": VLLM_MODEL,
             "input": "Hello",

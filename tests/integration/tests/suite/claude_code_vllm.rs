@@ -677,32 +677,12 @@ impl Workspace {
             edit_result.text,
         );
 
-        let bash = trace
-            .tool_uses
-            .iter()
-            .find(|tool_use| {
-                tool_use.name == "Bash"
-                    && tool_use
-                        .input
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(|command| command.contains("verify.sh"))
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "client must call Bash to run verify.sh; tool calls observed: {:?}\nstdout:\n{stdout}",
-                    trace.tool_use_names(),
-                )
-            });
-        let bash_result = trace
-            .result_for(&bash.id)
-            .unwrap_or_else(|| panic!("the verify.sh Bash call must produce a tool_result"));
-        assert!(
-            !bash_result.is_error && bash_result.text.contains("verify: OK"),
-            "the verify.sh Bash tool_result for command {:?} must report success: {}",
-            bash.input.get("command").and_then(Value::as_str),
-            bash_result.text,
-        );
+        trace.successful_verify_bash().unwrap_or_else(|| {
+            panic!(
+                "client must successfully run verify.sh; Bash commands observed: {:?}\nstdout:\n{stdout}",
+                trace.bash_commands(),
+            )
+        });
 
         assert!(
             trace.final_summary.is_some(),
@@ -1050,6 +1030,30 @@ impl ToolTrace {
             .find(|result| result.tool_use_id == tool_use_id)
     }
 
+    /// Finds the Bash invocation whose correlated result proves verification
+    /// succeeded. The client may first inspect or chmod `verify.sh`; selecting
+    /// the first command that merely mentions the path would mistake that setup
+    /// call for the required execution.
+    fn successful_verify_bash(&self) -> Option<(&ToolUse, &ToolResult)> {
+        self.tool_uses.iter().find_map(|tool_use| {
+            let command = tool_use.input.get("command").and_then(Value::as_str)?;
+            if tool_use.name != "Bash" || !command.contains("verify.sh") {
+                return None;
+            }
+            let result = self.result_for(&tool_use.id)?;
+            (!result.is_error && result.text.contains("verify: OK")).then_some((tool_use, result))
+        })
+    }
+
+    /// The observed Bash command strings, for assertion failure messages.
+    fn bash_commands(&self) -> Vec<&str> {
+        self.tool_uses
+            .iter()
+            .filter(|tool_use| tool_use.name == "Bash")
+            .filter_map(|tool_use| tool_use.input.get("command").and_then(Value::as_str))
+            .collect()
+    }
+
     /// The observed tool-use names, for assertion failure messages.
     fn tool_use_names(&self) -> Vec<&str> {
         self.tool_uses.iter().map(|tool_use| tool_use.name.as_str()).collect()
@@ -1076,4 +1080,22 @@ fn flatten_content(content: Option<&Value>) -> String {
             .join("\n"),
         _ => String::new(),
     }
+}
+
+#[test]
+fn tool_trace_selects_successful_verify_call_after_setup_call() {
+    let stdout = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"setup","name":"Bash","input":{"command":"chmod +x ./verify.sh"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"setup","content":"Bash completed with no output"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"verify","name":"Bash","input":{"command":"./verify.sh"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"verify","content":"verify: OK"}]}}
+{"type":"result","result":"Task complete"}"#;
+
+    let trace = ToolTrace::parse(stdout);
+    let (tool_use, result) = trace
+        .successful_verify_bash()
+        .expect("the successful verify call should be selected");
+
+    assert_eq!(tool_use.id, "verify");
+    assert_eq!(result.text, "verify: OK");
+    assert_eq!(trace.bash_commands(), ["chmod +x ./verify.sh", "./verify.sh"]);
 }

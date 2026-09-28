@@ -412,9 +412,10 @@ fn translate_responses_request(
 
 /// Resolve and insert the Chat Completions `tool_choice`, when one applies.
 ///
-/// A synthesized canonical `auto` is omitted when the request carried no tools
-/// and no explicit choice of its own, so translation does not invent a field the
-/// caller never sent.
+/// `auto` is omitted when the translated request carries no tools because Chat
+/// Completions backends may reject any `tool_choice` without a matching `tools`
+/// field. The original Responses request remains available when the response
+/// resource is built, so the client still observes its intended `auto` value.
 fn insert_chat_tool_choice(
     obj: &Map<String, Value>,
     chat: &mut Map<String, Value>,
@@ -423,10 +424,8 @@ fn insert_chat_tool_choice(
     has_file_search: bool,
 ) -> Result<(), TranslationError> {
     let tool_choice = overrides.tool_choice.or_else(|| obj.get("tool_choice"));
-    let omit_synthesized_default = !chat.contains_key("tools")
-        && obj.get("tool_choice").is_none()
-        && overrides.tool_choice.and_then(Value::as_str) == Some("auto");
-    if !omit_synthesized_default
+    let omit_auto_without_tools = !chat.contains_key("tools") && tool_choice.and_then(Value::as_str) == Some("auto");
+    if !omit_auto_without_tools
         && let Some(tool_choice) = build_chat_tool_choice(tool_choice, has_web_search, has_file_search)?
     {
         chat.insert("tool_choice".to_owned(), tool_choice);

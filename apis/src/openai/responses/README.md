@@ -27,26 +27,26 @@ Pipeline overview for filters under `apis/src/openai/responses/`.
 
 ## Pipeline Hooks
 
-Body-phase columns show `Access / Mode` when the hook is implemented.
+Body-phase columns show `Access / Mode` when the hook is implemented. When ordinary and bound-upstream hooks are both present, Praxis selects exactly one phase from the filter's conditions; the filter does not run twice.
 
-| Filter | `on_request` | `on_request_body` | `on_response` | `on_response_body` |
-|--------|:------------:|:-----------------:|:--------------:|:------------------:|
-| `openai_agentic_loop` | ✓ | ReadOnly / StreamBuffer | — | ReadWrite / Stream |
-| `openai_client_tool_compat` | — | ReadOnly / Stream | — | ReadWrite / Stream |
-| `openai_doc_extract` | — | ReadWrite / StreamBuffer | — | — |
-| `openai_file_resolve` | — | ReadWrite / StreamBuffer | — | — |
-| `openai_file_search_callout` | — | ReadOnly / StreamBuffer | — | — |
-| `openai_mcp_dispatch` | ✓ | ReadOnly / StreamBuffer | — | — |
-| `openai_mcp_tool_resolve` | ✓ | ReadWrite / StreamBuffer | — | — |
-| `openai_response_store` | ✓ | ReadOnly / Stream | ✓ | ReadOnly / Stream |
-| `openai_responses_compact` | — | ReadOnly / StreamBuffer | — | — |
-| `openai_responses_format` | — | ReadOnly / StreamBuffer | — | — |
-| `openai_responses_model_rewrite` | ✓ | ReadWrite / StreamBuffer | — | — |
-| `openai_responses_proxy` | ✓ | ReadWrite / StreamBuffer | — | — |
-| `openai_responses_rehydrate` | — | ReadOnly / StreamBuffer | ✓ | ReadWrite / Stream |
-| `openai_responses_request` | — | ReadOnly / StreamBuffer | — | — |
-| `openai_responses_validate` | — | ReadOnly / StreamBuffer | — | ReadOnly / Stream |
-| `openai_stream_events` | ✓ | ReadOnly / Stream | ✓ | ReadWrite / Stream |
-| `openai_tool_parse` | ✓ | ReadOnly / StreamBuffer | — | — |
-| `openai_web_search` | — | ReadOnly / StreamBuffer | — | — |
-| `responses_to_chat_completions` | — | ReadWrite / StreamBuffer | ✓ | ReadWrite / Stream |
+| Filter | `on_request` | `on_request_body` | `on_bound_upstream_request_body` | `on_selected_upstream_request_body` | `on_response` | `on_response_body` |
+|--------|:------------:|:-----------------:|:--------------------------------:|:-----------------------------------:|:--------------:|:------------------:|
+| `openai_agentic_loop` | ✓ | ReadOnly / StreamBuffer | — | — | — | ReadWrite / Stream |
+| `openai_client_tool_compat` | — | ReadOnly / Stream | — | — | — | ReadWrite / Stream |
+| `openai_doc_extract` | — | ReadWrite / StreamBuffer | ReadWrite / StreamBuffer | — | — | — |
+| `openai_file_resolve` | — | ReadWrite / StreamBuffer | ReadWrite / StreamBuffer | — | — | — |
+| `openai_file_search_callout` | — | ReadOnly / StreamBuffer | — | — | — | — |
+| `openai_mcp_dispatch` | ✓ | ReadOnly / StreamBuffer | — | — | — | — |
+| `openai_mcp_tool_resolve` | ✓ | ReadWrite / StreamBuffer | ReadWrite / StreamBuffer | — | — | — |
+| `openai_response_store` | ✓ | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | ✓ | ReadOnly / Stream |
+| `openai_responses_compact` | — | ReadOnly / StreamBuffer | — | — | — | — |
+| `openai_responses_format` | — | ReadOnly / StreamBuffer | — | — | — | — |
+| `openai_responses_model_rewrite` | ✓ | ReadWrite / StreamBuffer | — | — | — | — |
+| `openai_responses_proxy` | — | — | — | ReadWrite / StreamBuffer | — | — |
+| `openai_responses_rehydrate` | — | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | ✓ | ReadWrite / Stream |
+| `openai_responses_request` | — | ReadOnly / StreamBuffer | — | — | — | — |
+| `openai_responses_validate` | — | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | — | ReadOnly / Stream |
+| `openai_stream_events` | ✓ | ReadOnly / Stream | — | — | ✓ | ReadWrite / Stream |
+| `openai_tool_parse` | ✓ | ReadOnly / StreamBuffer | ReadOnly / StreamBuffer | — | — | — |
+| `openai_web_search` | — | ReadOnly / StreamBuffer | — | — | — | — |
+| `responses_to_chat_completions` | — | — | — | ReadWrite / StreamBuffer | ✓ | ReadWrite / Stream |

@@ -117,19 +117,20 @@ Released container images are available from
 development instructions are in the [development guide].
 
 ```console
-docker pull ghcr.io/praxis-proxy/ai:0.2
+docker pull ghcr.io/praxis-proxy/ai:latest
 ```
 
 Podman can pull the same OCI image. See the [quickstart] for a source build
 and the [release documentation] for image contents and tagging. A FIPS 140-3
 build for Red Hat Enterprise Linux hosts is published under the same tags
-with a `-fips` suffix; see [FIPS 140-3](docs/fips.md).
+with a `-fips` suffix (for example `latest-fips`); see
+[FIPS 140-3](docs/fips.md).
 
 ## Contributing
 
 Contributions are welcome, from bug reports and documentation fixes to new
 filters and protocol support. Before opening a pull request, please read the
-[contributing guide](CONTRIBUTING.md) and
+[contributing guide](.github/CONTRIBUTING.md) and
 [development setup](docs/developing/getting-started.md).
 
 For larger changes, open a [feature request] and follow the
@@ -145,7 +146,7 @@ For larger changes, open a [feature request] and follow the
 [feature request]: https://github.com/praxis-proxy/ai/issues/new?template=feature-request.yml
 [quickstart]: docs/quickstart.md
 [release documentation]: docs/release.md
-[security policy]: SECURITY.md
+[security policy]: .github/SECURITY.md
 
 ## License
 

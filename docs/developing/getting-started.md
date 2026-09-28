@@ -24,7 +24,7 @@ cover code style, testing requirements, file
 organization, and security practices. Submissions
 that do not follow these conventions will be rejected.
 
-[CONTRIBUTING.md]:../../CONTRIBUTING.md
+[CONTRIBUTING.md]:../../.github/CONTRIBUTING.md
 
 ## Build
 
@@ -117,7 +117,7 @@ The workspace is split across `apis`, `filters`, `server`,
 `tests`, and `xtask`; shared dependencies are managed from the
 root `Cargo.toml`.
 
-See [SECURITY.md](../../SECURITY.md) for supported versions and
+See [SECURITY.md](../../.github/SECURITY.md) for supported versions and
 vulnerability reporting.
 
 ## Security: Binding Low Ports

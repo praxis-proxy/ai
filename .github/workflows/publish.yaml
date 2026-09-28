@@ -142,6 +142,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           context: ${{ inputs.commit != '' && 'git' || 'workflow' }}
+          # Nightly and dispatch builds never own latest-fips: only the
+          # Release workflow (on a version tag) moves latest and latest-fips.
           flavor: |
             latest=false
             suffix=-fips
