@@ -60,13 +60,17 @@ pub const PRAXIS_AI_BIN_ENV: &str = "PRAXIS_AI_BIN";
 ///
 /// Uses [`PRAXIS_AI_BIN_ENV`] when set, then `CARGO_BIN_EXE_praxis-ai`;
 /// otherwise resolves under `CARGO_TARGET_DIR` (including llvm-cov's
-/// alternate target dir) and builds the binary if it is not already present.
+/// alternate target dir). Never builds it: an in-test `cargo build`
+/// inherits whatever instrumentation and target-dir locks the outer run
+/// holds, and under coverage that turns a missing binary into a
+/// many-minute rebuild that times the job out. The Makefile targets that
+/// run this suite build the binary first and name it through
+/// [`PRAXIS_AI_BIN_ENV`].
 ///
 /// # Panics
 ///
 /// Panics if [`PRAXIS_AI_BIN_ENV`] names a file that does not exist, or if
-/// `cargo build` for the `praxis-ai` binary fails or the binary is still
-/// missing afterward.
+/// no binary is present at the resolved path.
 pub fn praxis_ai_bin() -> PathBuf {
     if let Some(explicit) = std::env::var_os(PRAXIS_AI_BIN_ENV) {
         let path = PathBuf::from(explicit);
@@ -79,23 +83,10 @@ pub fn praxis_ai_bin() -> PathBuf {
     }
 
     let path = resolve_praxis_ai_bin_path();
-    if path.exists() {
-        return path;
-    }
-
-    let status = std::process::Command::new(env!("CARGO"))
-        .args(["build", "-p", "praxis-ai-proxy", "--bin", "praxis-ai", "-q"])
-        .status()
-        .expect("spawn cargo build for the praxis-ai binary");
-    assert!(
-        status.success(),
-        "cargo build -p praxis-ai-proxy --bin praxis-ai failed"
-    );
-
-    let path = resolve_praxis_ai_bin_path();
     assert!(
         path.exists(),
-        "praxis-ai binary missing at {} after build",
+        "no praxis-ai binary at {}; build it first (cargo build -p praxis-ai-proxy --bin praxis-ai) \
+         or point {PRAXIS_AI_BIN_ENV} at one, as the make targets do",
         path.display()
     );
     path

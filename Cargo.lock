@@ -3505,7 +3505,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-apis"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "allocation-counter",
  "async-trait",
@@ -3544,7 +3544,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-benchmarks"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "criterion",
  "praxis-ai-apis",
@@ -3556,7 +3556,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-build-support"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "cargo_metadata",
  "tempfile",
@@ -3564,7 +3564,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-filters"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3595,6 +3595,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "url",
  "wiremock",
  "yaml_serde",
@@ -3603,7 +3604,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-llmd-ext-proc"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3631,7 +3632,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-ai-proxy"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bytes",
  "cargo_metadata",
@@ -3879,9 +3880,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1326e24a8e76ba27bf9a57cf2a704e077f921b746ccafdea1ecbfee8c3180e0"
+checksum = "17129b0b04fc21f0d9d9687d1fd5c697eafa866fa0085b18b7aeaa2790080b44"
 dependencies = [
  "cargo_metadata",
  "clap",
@@ -3901,9 +3902,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-core"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f8c42b4b7897a0e92e645257d296d2e715193e9fb72e03c51e5987d4151d68b"
+checksum = "ef5ed70124f3d5e89bcb61924fdcd0ad611f0c4c981a9b3e62bb45233bff8d53"
 dependencies = [
  "bytes",
  "chrono",
@@ -3927,9 +3928,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-filter"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1cf3501ed24494a5fbc33002bb51fe1c84b26990fa3b78d975f1c84fe9d8b85b"
+checksum = "561a7bf857ff1c673ae74362e18ed8f4c2ce903406b0d9fe093dc43705572c87"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3961,9 +3962,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-protocol"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0861180c42d285dcb8dafcf9cca73920ba3a0436f735b8a6330908f3439ec5c2"
+checksum = "023dcec07bb35f9cc15c892aa1b3f6ca0e4f44b3fdb610a2b6e69abf2a4a697f"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3990,9 +3991,9 @@ dependencies = [
 
 [[package]]
 name = "praxis-proxy-tls"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6c77916394e4aeb21ed7de2f1582e9b0f79e2e280cf0ffb02150449c0d632ca"
+checksum = "99a3391cc07ff6061392a8a77f926451953ed557daaa7cc6b117a6b7bf0975c1"
 dependencies = [
  "arc-swap",
  "notify",
@@ -4007,7 +4008,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-test-utils"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -4051,7 +4052,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-environment"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "praxis-ai-proxy",
  "praxis-proxy-core",
@@ -4061,7 +4062,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-integration"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -4091,7 +4092,7 @@ dependencies = [
 
 [[package]]
 name = "praxis-tests-schema"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "praxis-proxy-core",
  "praxis-proxy-filter",
@@ -5533,9 +5534,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.1"
+version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
+checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 dependencies = [
  "serde",
 ]
@@ -7033,7 +7034,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.23.1",
  "clap",

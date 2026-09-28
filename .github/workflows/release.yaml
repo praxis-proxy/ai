@@ -320,11 +320,14 @@ jobs:
       - uses: ./.github/actions/fips-runner-check
 
       - name: Pull the pushed FIPS image by digest and name it for the checks
+        # Not named IMAGE: an exported IMAGE overrides the Makefile's own
+        # IMAGE variable and corrupts FIPS_IMAGE_REF, the tag target
+        # (praxis-proxy/praxis hit exactly that on its v0.7.1 release).
         env:
-          IMAGE: ghcr.io/${{ github.repository }}@${{ needs.container-fips.outputs.fips-digest }}
+          FIPS_IMAGE_SOURCE: ghcr.io/${{ github.repository }}@${{ needs.container-fips.outputs.fips-digest }}
         run: |
-          podman pull "$IMAGE"
-          make fips-image-tag FIPS_IMAGE_SOURCE="$IMAGE"
+          podman pull "$FIPS_IMAGE_SOURCE"
+          make fips-image-tag FIPS_IMAGE_SOURCE="$FIPS_IMAGE_SOURCE"
 
       - uses: ./.github/actions/fips-host
         with:

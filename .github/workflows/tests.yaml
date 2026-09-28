@@ -62,12 +62,19 @@ jobs:
         run: make lint
 
   # ----------------------------------------------------------------------------
-  # Build + test
+  # Unit tests
+  #
+  # Split by crate so praxis-ai-apis, praxis-ai-filters, and praxis-ai-proxy
+  # compile their feature permutations in parallel. Run serially in one job (nine
+  # `cargo test` invocations recompiling the tree across feature sets), this was
+  # the workflow's ~38m long pole; as three jobs the wall-clock collapses to the
+  # heaviest crate (proxy, top of the dep graph). Each job takes its own
+  # cache-suffix; local `make test-unit` still runs all three serially.
   # ----------------------------------------------------------------------------
 
-  test:
+  test-apis:
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -78,10 +85,46 @@ jobs:
       - name: Setup Rust
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
         with:
-          cache-suffix: test-cargo
+          cache-suffix: test-unit-apis-cargo
 
-      - name: Unit tests
-        run: make test-unit
+      - name: Unit tests (apis + build-support)
+        run: make test-unit-apis
+
+  test-filters:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        with:
+          cache-suffix: test-unit-filters-cargo
+
+      - name: Unit tests (filters)
+        run: make test-unit-filters
+
+  test-proxy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        with:
+          cache-suffix: test-unit-proxy-cargo
+
+      - name: Unit tests (proxy)
+        run: make test-unit-proxy
 
   store-features:
     runs-on: ubuntu-24.04

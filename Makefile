@@ -33,7 +33,8 @@ ifneq ($(V),)
 endif
 
 .PHONY: all build release check clean \
-	test test-unit test-schema test-integration test-inference-fixtures \
+	test test-unit test-unit-apis test-unit-filters test-unit-proxy \
+	test-schema test-integration test-inference-fixtures \
 	test-store-features \
 	test-postgres-unit test-postgres-integration test-environment \
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
@@ -96,16 +97,26 @@ container-run: | require-container-engine
 test:
 	cargo test --workspace $(_NOCAPTURE)
 
-test-unit:
+# `make test-unit` runs every crate's permutations serially for local use; CI
+# splits these into the test-unit-{apis,filters,proxy} targets so the three
+# crates' feature permutations compile in parallel jobs instead of one serial
+# recompile chain (which was the ~38m long pole of the Tests workflow).
+test-unit: test-unit-apis test-unit-filters test-unit-proxy
+
+test-unit-apis:
 	cargo test -p praxis-ai-apis $(_NOCAPTURE)
 	cargo test -p praxis-ai-apis --features full $(_NOCAPTURE)
+	cargo test -p praxis-ai-build-support $(_NOCAPTURE)
+
+test-unit-filters:
 	cargo test -p praxis-ai-filters $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters --features full $(_NOCAPTURE)
 	cargo test -p praxis-ai-filters --features full,$(FILTER_EXPERIMENTAL_FEATURES) $(_NOCAPTURE)
+
+test-unit-proxy:
 	cargo test -p praxis-ai-proxy $(_NOCAPTURE)
 	cargo test -p praxis-ai-proxy --features full $(_NOCAPTURE)
 	cargo test -p praxis-ai-proxy --features full,basic-auth-filter $(_NOCAPTURE)
-	cargo test -p praxis-ai-build-support $(_NOCAPTURE)
 
 test-store-features:
 	cargo check -p praxis-ai-proxy
@@ -136,7 +147,13 @@ test-store-features:
 test-schema:
 	cargo test -p praxis-tests-schema --features store-all $(_NOCAPTURE)
 
+# The suite's subprocess tests need the praxis-ai binary prebuilt and named:
+# the harness refuses to build it from inside a test (see praxis_ai_bin in
+# tests/utils), because a nested cargo build inherits the outer run's
+# instrumentation and target-dir locks and can run for minutes.
 test-integration:
+	cargo build -p praxis-ai-proxy --bin praxis-ai
+	PRAXIS_AI_BIN=$(abspath target/debug/praxis-ai) \
 	cargo test -p praxis-tests-integration --features store-all $(_NOCAPTURE)
 	cargo test -p praxis-tests-integration --features store-all,$(INTEGRATION_EXPERIMENTAL_FEATURES) --test suite \
 		-- examples::azure_ad examples::gcp_adc examples::lakera_guard examples::token_rate_limit \
@@ -255,7 +272,14 @@ audit:
 	cargo audit
 	cargo deny check
 
+# The suite's subprocess tests use the praxis-ai binary that cargo llvm-cov
+# builds anyway (the server crate has integration tests, so cargo builds its
+# bin target). The harness cannot find it on its own because llvm-cov sets
+# --target-dir on the command line rather than CARGO_TARGET_DIR, so name it
+# here; a separate uninstrumented build would recompile the whole workspace
+# a second time (see praxis_ai_bin).
 coverage-check:
+	PRAXIS_AI_BIN=$(abspath target/llvm-cov-target/debug/praxis-ai) \
 	cargo llvm-cov --workspace --features $(STORE_ALL_WORKSPACE_FEATURES) --json \
 		--exclude xtask \
 		--ignore-filename-regex '(target/|tests/|store/postgres\.rs)' \

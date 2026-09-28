@@ -15,7 +15,8 @@
 # See token-rate-limit.yaml for the full rationale on reservation-based
 # admission (M2), reconciliation, M4 token-type weights, the `rules:`
 # schema, and what's still deliberately out of scope (composite/CEL
-# keys, observability/metering).
+# keys and billing-grade metering). Bounded observability is implemented
+# by ai#883 and requires no filter-level configuration.
 #
 # Supported token_count provider values:
 #   openai | anthropic | google | bedrock | azure

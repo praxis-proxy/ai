@@ -104,15 +104,17 @@ jobs:
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
-    # The four make test-* steps each build a distinct cargo feature
-    # permutation (default, EXPERIMENTAL_FEATURES, llmd-ext-proc), so this
-    # job serially recompiles large parts of the tree; the llmd-ext-proc
-    # gRPC/proto build lands last. Praxis 0.5.6 turns the policy filter on by
-    # default, pulling the praxis-policy-* / OPA / Cedar stack into every
-    # permutation, which pushed the serial recompile past 45m on slow runners.
-    # 75m gives headroom for cache-cold runs; warmed caches on later runs
-    # finish well inside this budget.
-    timeout-minutes: 75
+    # The make test-* steps here all build the store-all feature permutation
+    # (plus the experimental-filter subset), so the tree compiles once and the
+    # later steps reuse the warm target dir. The llmd-ext-proc permutation — a
+    # fresh gRPC/proto + policy/OPA/Cedar rebuild that shares no artifacts with
+    # store-all — used to run last in this job and added ~16m to a serial
+    # critical path; it now runs in parallel in the sibling `environment` job,
+    # which is what keeps this job off the ~45m path. Praxis 0.5.6 turns the
+    # policy filter on by default, so store-all still pulls the
+    # praxis-policy-* / OPA / Cedar stack; 50m leaves headroom for cache-cold
+    # runs while warmed caches finish well inside it.
+    timeout-minutes: 50
     permissions:
       contents: read
     steps:
@@ -143,7 +145,72 @@ jobs:
           PRAXIS_TEST_CLAUDE_CODE_BIN: claude
         run: make test-integration
 
+  # ----------------------------------------------------------------------------
+  # Environment / llmd ext-proc suite (llmd-ext-proc feature permutation)
+  #
+  # Split out of the `test` job so the llmd-ext-proc permutation — a fresh
+  # gRPC/proto + policy/OPA/Cedar rebuild that shares no target artifacts with
+  # store-all — compiles in parallel here instead of adding ~16m to the serial
+  # `test` critical path. Its own cache-suffix keeps that heavy graph in a
+  # dedicated rust-cache entry.
+  #
+  # On pull_request the suite runs only when ext-proc-relevant paths change
+  # (see the scope step); push and merge_group always run it, so the merge
+  # queue is the backstop before anything lands on main. The lean
+  # standard-feature llmd checks inside `make test-environment` are preserved
+  # verbatim, and the per-feature gate-leak matrix still lives in the
+  # store-features job in tests.yaml.
+  # ----------------------------------------------------------------------------
+
+  environment:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scope environment suite to ext-proc changes on pull_request
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$PR_BASE_SHA" HEAD -- \
+            'integrations/' \
+            'tests/environment/' \
+            'tests/utils/' \
+            'tests/integration/tests/suite/examples/llmd_ext_proc.rs' \
+            'Cargo.toml' \
+            'Cargo.lock' \
+            'Makefile' \
+            '.github/workflows/integration.yaml')
+          if [ -n "$CHANGED" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No ext-proc-relevant changes; skipping environment suite." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Setup Rust
+        if: steps.scope.outputs.run == 'true'
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        with:
+          cache-suffix: test-environment-cargo
+
       - name: Environment tests
+        if: steps.scope.outputs.run == 'true'
         run: make test-environment
 
   # ----------------------------------------------------------------------------
