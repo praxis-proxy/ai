@@ -3538,9 +3538,10 @@ async fn delete_item_returns_updated_conversation() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn filter_request_body_access_is_read_only() {
+fn filter_declares_dual_phase_request_body_access() {
     let filter = build_test_filter();
     assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
 }
 
 // -----------------------------------------------------------------------------

@@ -61,13 +61,10 @@ fn from_config_unknown_field_rejected() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn body_access_is_read_write() {
+fn declares_dual_phase_body_access() {
     let filter = make_filter();
-    assert_eq!(
-        filter.request_body_access(),
-        BodyAccess::ReadWrite,
-        "file_resolve must have read-write body access"
-    );
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
 }
 
 #[test]

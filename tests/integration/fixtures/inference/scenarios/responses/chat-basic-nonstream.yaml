@@ -8,6 +8,7 @@ features:
   - responses.chat.request
   - responses.chat.response.text
   - responses.chat.continuation
+  - responses.chat.auto_tool_choice_without_tools
 turns:
   - name: initial
     request:
@@ -23,6 +24,7 @@ turns:
           input: What is 2+2? Reply with just the number.
           store: true
           stream: false
+          tool_choice: auto
     expect:
       client_status: 200
       client_body_kind: json

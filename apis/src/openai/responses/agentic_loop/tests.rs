@@ -293,6 +293,43 @@ async fn on_request_allows_buffered_mode_without_logical_stream() {
     );
 }
 
+#[tokio::test]
+async fn selected_adapter_enforces_deferred_streaming_guard() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+
+    let rejection =
+        super::enforce_agentic_stream_guard(&mut ctx).expect("the selected adapter must reject unsafe typed streaming");
+    assert_eq!(rejection.status, 500);
+}
+
+#[tokio::test]
+async fn selected_adapter_accepts_deferred_streaming_with_logical_stream() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+    ctx.set_metadata("responses.logical_stream", "true");
+
+    assert!(matches!(
+        filter.on_request(&mut ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+
+    assert!(
+        super::enforce_agentic_stream_guard(&mut ctx).is_none(),
+        "an armed logical stream should satisfy the deferred guard"
+    );
+    assert_eq!(ctx.get_metadata("responses.logical_stream"), Some("false"));
+}
+
 // -----------------------------------------------------------------------------
 // on_request_body Bookkeeping
 // -----------------------------------------------------------------------------

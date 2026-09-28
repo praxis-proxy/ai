@@ -39,5 +39,5 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 - [Release process](release.md)
 - [FIPS 140-3](fips.md)
 - [Migrating to 0.2.0](migrating-to-0.2.md)
-- [Security policy](../SECURITY.md)
-- [Contributing](../CONTRIBUTING.md)
+- [Security policy](../.github/SECURITY.md)
+- [Contributing](../.github/CONTRIBUTING.md)

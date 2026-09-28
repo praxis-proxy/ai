@@ -41,6 +41,10 @@ struct PipelineHooks {
     on_request: bool,
     /// Filter implements `on_request_body`.
     on_request_body: bool,
+    /// Filter implements `on_bound_upstream_request_body`.
+    on_bound_upstream_request_body: bool,
+    /// Filter implements `on_selected_upstream_request_body`.
+    on_selected_upstream_request_body: bool,
     /// `on_response` does real work (ctx parameter is used).
     on_response: bool,
     /// Filter implements `on_response_body`.
@@ -57,6 +61,10 @@ struct FilterMeta {
     hooks: PipelineHooks,
     /// Request-side body access (`None`, `ReadOnly`, `ReadWrite`).
     request_body_access: String,
+    /// Bound-upstream request-side body access.
+    bound_upstream_request_body_access: String,
+    /// Selected-upstream request-side body access.
+    selected_upstream_request_body_access: String,
     /// Request-side body mode (`Stream`, `StreamBuffer`).
     request_body_mode: String,
     /// Response-side body access.
@@ -211,10 +219,14 @@ fn new_filter_meta(name: String, description: String) -> FilterMeta {
         hooks: PipelineHooks {
             on_request: false,
             on_request_body: false,
+            on_bound_upstream_request_body: false,
+            on_selected_upstream_request_body: false,
             on_response: false,
             on_response_body: false,
         },
         request_body_access: "None".to_owned(),
+        bound_upstream_request_body_access: "None".to_owned(),
+        selected_upstream_request_body_access: "None".to_owned(),
         request_body_mode: "Stream".to_owned(),
         response_body_access: "None".to_owned(),
         response_body_mode: "Stream".to_owned(),
@@ -227,9 +239,17 @@ fn classify_method(method: &syn::ImplItemFn, meta: &mut FilterMeta) {
     match method.sig.ident.to_string().as_str() {
         "on_request" => meta.hooks.on_request = !has_unused_ctx_param(&method.sig),
         "on_request_body" => meta.hooks.on_request_body = true,
+        "on_bound_upstream_request_body" => meta.hooks.on_bound_upstream_request_body = true,
+        "on_selected_upstream_request_body" => meta.hooks.on_selected_upstream_request_body = true,
         "on_response" => meta.hooks.on_response = !has_unused_ctx_param(&method.sig),
         "on_response_body" => meta.hooks.on_response_body = true,
         "request_body_access" => meta.request_body_access = extract_body_access_value(&method.block),
+        "bound_upstream_request_body_access" => {
+            meta.bound_upstream_request_body_access = extract_body_access_value(&method.block);
+        },
+        "selected_upstream_request_body_access" => {
+            meta.selected_upstream_request_body_access = extract_body_access_value(&method.block);
+        },
         "request_body_mode" => meta.request_body_mode = extract_body_mode_value(&method.block),
         "response_body_access" => meta.response_body_access = extract_body_access_value(&method.block),
         "response_body_mode" => meta.response_body_mode = extract_body_mode_value(&method.block),
@@ -438,18 +458,18 @@ fn write_pipeline_table(out: &mut String, filters: &[FilterMeta]) {
     writeln!(out).unwrap();
     writeln!(
         out,
-        "Body-phase columns show `Access / Mode` when the hook is implemented."
+        "Body-phase columns show `Access / Mode` when the hook is implemented. When ordinary and bound-upstream hooks are both present, Praxis selects exactly one phase from the filter's conditions; the filter does not run twice."
     )
     .unwrap();
     writeln!(out).unwrap();
     writeln!(
         out,
-        "| Filter | `on_request` | `on_request_body` | `on_response` | `on_response_body` |"
+        "| Filter | `on_request` | `on_request_body` | `on_bound_upstream_request_body` | `on_selected_upstream_request_body` | `on_response` | `on_response_body` |"
     )
     .unwrap();
     writeln!(
         out,
-        "|--------|:------------:|:-----------------:|:--------------:|:------------------:|"
+        "|--------|:------------:|:-----------------:|:--------------------------------:|:-----------------------------------:|:--------------:|:------------------:|"
     )
     .unwrap();
 
@@ -462,11 +482,21 @@ fn write_pipeline_table(out: &mut String, filters: &[FilterMeta]) {
 fn write_pipeline_row(out: &mut String, f: &FilterMeta) {
     let on_req = format_header_hook(f.hooks.on_request);
     let on_req_body = format_body_hook(f.hooks.on_request_body, &f.request_body_access, &f.request_body_mode);
+    let on_bound_req_body = format_body_hook(
+        f.hooks.on_bound_upstream_request_body,
+        &f.bound_upstream_request_body_access,
+        &f.request_body_mode,
+    );
+    let on_selected_req_body = format_body_hook(
+        f.hooks.on_selected_upstream_request_body,
+        &f.selected_upstream_request_body_access,
+        &f.request_body_mode,
+    );
     let on_resp = format_header_hook(f.hooks.on_response);
     let on_resp_body = format_body_hook(f.hooks.on_response_body, &f.response_body_access, &f.response_body_mode);
     writeln!(
         out,
-        "| `{name}` | {on_req} | {on_req_body} | {on_resp} | {on_resp_body} |",
+        "| `{name}` | {on_req} | {on_req_body} | {on_bound_req_body} | {on_selected_req_body} | {on_resp} | {on_resp_body} |",
         name = f.name
     )
     .unwrap();
@@ -611,12 +641,49 @@ mod tests {
         assert_eq!(meta.description, "Does something cool.");
         assert!(meta.hooks.on_request);
         assert!(meta.hooks.on_request_body);
+        assert!(!meta.hooks.on_bound_upstream_request_body);
+        assert!(!meta.hooks.on_selected_upstream_request_body);
         assert!(!meta.hooks.on_response);
         assert!(!meta.hooks.on_response_body);
         assert_eq!(meta.request_body_access, "ReadWrite");
+        assert_eq!(meta.bound_upstream_request_body_access, "None");
+        assert_eq!(meta.selected_upstream_request_body_access, "None");
         assert_eq!(meta.request_body_mode, "StreamBuffer");
         assert_eq!(meta.response_body_access, "None");
         assert_eq!(meta.response_body_mode, "Stream");
+    }
+
+    #[test]
+    fn extract_bound_and_selected_upstream_body_phases() {
+        let meta = parse_single_filter(
+            r#"
+            struct PhasedFilter;
+            impl HttpFilter for PhasedFilter {
+                fn name(&self) -> &'static str { "phased_filter" }
+                async fn on_bound_upstream_request_body(&self, ctx: &mut BodyCtx) -> Result<()> { Ok(()) }
+                async fn on_selected_upstream_request_body(&self, ctx: &mut BodyCtx) -> Result<()> { Ok(()) }
+                fn bound_upstream_request_body_access(&self) -> BodyAccess { BodyAccess::ReadOnly }
+                fn selected_upstream_request_body_access(&self) -> BodyAccess { BodyAccess::ReadWrite }
+                fn request_body_mode(&self) -> BodyMode { BodyMode::StreamBuffer { max_bytes: 1024 } }
+            }
+        "#,
+        );
+
+        assert!(!meta.hooks.on_request_body);
+        assert!(meta.hooks.on_bound_upstream_request_body);
+        assert!(meta.hooks.on_selected_upstream_request_body);
+        assert_eq!(meta.request_body_access, "None");
+        assert_eq!(meta.bound_upstream_request_body_access, "ReadOnly");
+        assert_eq!(meta.selected_upstream_request_body_access, "ReadWrite");
+        assert_eq!(meta.request_body_mode, "StreamBuffer");
+
+        let rendered = render_readme(&[meta]);
+        assert!(rendered.contains("`on_bound_upstream_request_body`"));
+        assert!(rendered.contains("`on_selected_upstream_request_body`"));
+        assert!(
+            rendered
+                .contains("| `phased_filter` | — | — | ReadOnly / StreamBuffer | ReadWrite / StreamBuffer | — | — |")
+        );
     }
 
     #[test]
