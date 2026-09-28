@@ -575,15 +575,34 @@ fn spawn_health_check_tasks(
 // Utility Functions
 // -----------------------------------------------------------------------------
 
+/// Whether the compiled response-store profile has had every cryptographic
+/// operation outside the system `OpenSSL` removed.
+///
+/// Cargo features are additive, so the certificate-authentication profile is
+/// safe only when none of the general-purpose backends or store-backed groups
+/// are also present. Those profiles either restore `SQLx` password
+/// authentication or have not yet had their additional dependency boundaries
+/// cleared for the FIPS build.
+const FIPS_SAFE_STORE_PROFILE: bool = cfg!(all(
+    feature = "store-postgres-cert-auth",
+    not(any(
+        feature = "store-postgres",
+        feature = "store-sqlite",
+        feature = "openai-conversations",
+        feature = "openai-compact",
+        feature = "openai-mcp-tools"
+    ))
+));
+
 /// Registered filter names whose dependencies do their own cryptography
 /// outside the system OpenSSL, so a binary that registers one cannot honor
 /// `PRAXIS_REQUIRE_FIPS` whatever the provider reports.
 ///
 /// - `policy`: the Praxis Policy Engine's JWT verification runs on aws-lc-rs (through jsonwebtoken) and its OAuth and
 ///   Valkey plugins use the pure-Rust `hmac` and `sha2` crates.
-/// - `openai_response_store`: registered exactly when the `store` feature is compiled in, whose sqlx brings `sha2`
-///   (and, with `PostgreSQL`, SCRAM's `md-5` and `hmac`). Every store-backed group (conversations, compact, MCP tools)
-///   implies `store`, so this one name covers them all.
+/// - `openai_response_store`: registered exactly when the `store` feature is compiled in. The general-purpose profiles
+///   bring cryptography outside the system `OpenSSL`; the isolated `store-postgres-cert-auth` profile does not, so
+///   [`fips_blocker`] excludes this name only for that exact profile.
 const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_response_store"];
 
 /// Why this binary cannot honor `PRAXIS_REQUIRE_FIPS`, if it cannot.
@@ -598,6 +617,7 @@ pub fn fips_blocker(registry: &FilterRegistry) -> Option<String> {
     let registered: Vec<String> = NON_FIPS_FILTERS
         .iter()
         .copied()
+        .filter(|name| *name != "openai_response_store" || !FIPS_SAFE_STORE_PROFILE)
         .filter(|name| available.contains(name))
         .map(|name| format!("`{name}` filter"))
         .collect();
@@ -763,14 +783,17 @@ mod tests {
             praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(1, None));
         let registry = crate::build_full_registry(&client);
         let blocker = super::fips_blocker(&registry);
-        if cfg!(any(feature = "policy-engine", feature = "store")) {
+        let store_is_blocked = cfg!(feature = "store") && !super::FIPS_SAFE_STORE_PROFILE;
+        if cfg!(feature = "policy-engine") || store_is_blocked {
             let reason = blocker.expect("a binary with non-FIPS filters is blocked");
             assert!(reason.contains("PRAXIS_REQUIRE_FIPS"), "{reason}");
             if cfg!(feature = "policy-engine") {
                 assert!(reason.contains("`policy` filter"), "{reason}");
             }
-            if cfg!(feature = "store") {
+            if store_is_blocked {
                 assert!(reason.contains("`openai_response_store` filter"), "{reason}");
+            } else {
+                assert!(!reason.contains("`openai_response_store` filter"), "{reason}");
             }
         } else {
             assert_eq!(blocker, None, "the FIPS feature set registers no blocked filter");

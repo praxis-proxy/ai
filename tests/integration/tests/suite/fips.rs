@@ -632,11 +632,15 @@ fn the_binary_serves_under_require_fips_exactly_on_a_fips_host() {
     let client = certs.client_config();
 
     // The suite's features mirror the spawned binary's (the PRAXIS_AI_BIN
-    // contract): with the policy engine (`standard`) or the store compiled
-    // in, the binary refuses PRAXIS_REQUIRE_FIPS even on a FIPS host,
-    // naming the filters (the server's fips_blocker), because their
-    // dependencies do their own cryptography outside the system OpenSSL.
-    let carries_non_fips_filters = cfg!(any(feature = "standard", feature = "store"));
+    // contract): with the policy engine (`standard`) or an uncleared store
+    // profile compiled in, the binary refuses PRAXIS_REQUIRE_FIPS even on a
+    // FIPS host, naming the filters (the server's fips_blocker), because their
+    // dependencies do their own cryptography outside the system OpenSSL. Ask
+    // the real blocker so this expectation cannot drift from its exact
+    // compile-time profile rules.
+    let registry_client = praxis_test_utils::test_subrequest_client();
+    let registry = praxis_ai::build_full_registry(&registry_client);
+    let carries_non_fips_filters = praxis_ai::fips_blocker(&registry).is_some();
 
     match start_binary(&config, &addr, &client, &[("PRAXIS_REQUIRE_FIPS", "1")]) {
         Startup::Exited { success, stderr } => {

@@ -282,7 +282,7 @@ fn workspace_root() -> PathBuf {
 mod tests {
     use super::*;
 
-    const FIPS_FEATURES: &str = "openai-responses,store-postgres-cert-auth";
+    const FIPS_FEATURES: &str = "openai-responses,aws-sigv4-filter,store-postgres-cert-auth";
 
     /// A context for the FIPS feature set.
     fn fips_context() -> Context {
