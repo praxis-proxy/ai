@@ -27,10 +27,6 @@ inputs:
     description: Value for vLLM's --gpu-memory-utilization flag.
     required: false
     default: "0.5"
-  dtype:
-    description: Value for vLLM's --dtype flag. The default defers to the checkpoint; Turing GPUs (T4, sm_75) have no bfloat16 and must be pinned to float16.
-    required: false
-    default: auto
 runs:
   using: composite
   steps:
@@ -44,7 +40,6 @@ runs:
         VLLM_PULL: ${{ inputs.pull }}
         VLLM_DEVICE_ARGS: ${{ inputs.device-args }}
         VLLM_GPU_MEMORY_UTILIZATION: ${{ inputs.gpu-memory-utilization }}
-        VLLM_DTYPE: ${{ inputs.dtype }}
       run: |
         # Pull the (multi-GB, model-baked) image and start the container in the
         # background so the pull + model load overlap the caller's next steps
@@ -72,7 +67,6 @@ runs:
             --enable-auto-tool-choice \
             --tool-call-parser hermes \
             --reasoning-parser deepseek_r1 \
-            --dtype "$VLLM_DTYPE" \
             --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION"
         ' > /tmp/vllm-start.log 2>&1 &
         echo $! > /tmp/vllm-start.pid
