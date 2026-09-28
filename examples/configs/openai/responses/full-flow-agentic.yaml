@@ -407,20 +407,36 @@ filter_chains:
       # prevents the remaining header chain, including IRR, from running. Both
       # layers are necessary. Endpoint selection consumes the frozen logical
       # binding rather than making a second routing decision.
+      #
+      # `headers` is used here only as a branch anchor; it does not modify any
+      # headers. Its condition makes the entry run only when the router bound
+      # the request to a cluster whose application_provider is `openai`.
       - filter: headers
         conditions:
           - when:
               bound_upstream:
                 application_provider: openai
+        # Branches are evaluated only when their host filter runs. This branch
+        # has no `on_result`, so it is unconditional once the OpenAI condition
+        # above matched.
         branch_chains:
           - name: direct-openai
+            # `terminal` means: run this branch, dispatch its selected upstream,
+            # and stop the parent chain. In particular, do not continue to the
+            # iterative_request_router near the end of this pipeline.
             rejoin: terminal
             chains:
               - name: direct-openai-dispatch
                 filters:
                   - filter: load_balancer
+                    # Reuse the cluster already chosen by the router. This must
+                    # not perform another routing decision based on a rewritten
+                    # request later in the pipeline.
                     cluster_source: bound_upstream
                     clusters:
+                      # This name must match the router-selected cluster. The
+                      # load balancer resolves that logical binding to a concrete
+                      # endpoint and forwards the original request there.
                       - name: "openai-responses-backend"
                         http:
                           application_protocol: openai_responses
