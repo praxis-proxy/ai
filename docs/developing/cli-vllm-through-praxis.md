@@ -394,6 +394,15 @@ kill "$PRAXIS_PID"
   window. Set `CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192` as shown in section 4.
 - TLS or connection failure: use only the tunnel hostname in the endpoint and
   `tls.sni`; do not include `https://` in Praxis's `endpoints` entry.
+- Connection refused on 8080 from another machine, while vLLM on 8000 answers:
+  every example in section 2 binds the listener to `127.0.0.1:8080`, so Praxis
+  is reachable only from its own host. This is independent of how Praxis runs —
+  `--network host` needs the same `address: "0.0.0.0:8080"` edit as the
+  published-port path, not just the port mapping. After that edit, open 8080 on
+  the host firewall; a loopback-only listener refuses the connection
+  immediately, whereas a blocked port usually hangs or reports no route. Binding
+  to `0.0.0.0` exposes the gateway to the network, so keep the authentication
+  filter in place.
 - Claude startup probes may call `/v1/messages/count_tokens`. Native vLLM
   supports it; the translated Chat path can return 404 and Claude degrades
   gracefully.
