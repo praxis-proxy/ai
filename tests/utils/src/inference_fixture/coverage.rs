@@ -1261,6 +1261,7 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
                 vec!["responses_client_tool_compat"],
                 vec!["responses_client_tool_compat"],
                 vec!["responses_client_tool_compat", "responses_to_chat_completions"],
@@ -1315,10 +1316,11 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
             ]
         );
-        assert_eq!(report.features_total, 41);
+        assert_eq!(report.features_total, 42);
         assert_eq!(report.scenarios_total, 42);
         assert_eq!(report.recordings_total, 47);
         assert_eq!(
@@ -1368,7 +1370,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 41);
+        assert_eq!(manifest.features.len(), 42);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1546,6 +1548,10 @@ mod tests {
                     &vec!["responses/chat-null-tool-choice".to_owned()]
                 ),
                 (
+                    &"responses.chat.auto_tool_choice_without_tools".to_owned(),
+                    &vec!["responses/chat-basic-nonstream".to_owned()]
+                ),
+                (
                     &"responses.chat.reasoning.replay".to_owned(),
                     &vec![
                         "responses/chat-reasoning-replay".to_owned(),
@@ -1693,7 +1699,7 @@ mod tests {
                 vec![("vllm", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[30..40] {
+        for feature in &manifest.features[30..41] {
             assert_eq!(
                 feature
                     .providers
@@ -1704,7 +1710,7 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[40]
+            manifest.features[41]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
@@ -1955,6 +1961,7 @@ mod tests {
                 "responses.chat.request",
                 "responses.chat.response.text",
                 "responses.chat.continuation",
+                "responses.chat.auto_tool_choice_without_tools",
             ]
         );
         assert_eq!(responses_chat.turns.len(), 2);
@@ -1973,7 +1980,8 @@ mod tests {
         assert_eq!(value["input"], "What is 2+2? Reply with just the number.");
         assert_eq!(value["store"], true);
         assert_eq!(value["stream"], false);
-        assert_eq!(value.as_object().map(serde_json::Map::len), Some(4));
+        assert_eq!(value["tool_choice"], "auto");
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(5));
         assert!(
             turn.expect.client_sse_events.is_empty(),
             "non-streaming initial turn must have no client SSE events"

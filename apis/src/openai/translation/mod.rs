@@ -208,6 +208,38 @@ mod tests {
     }
 
     #[test]
+    fn explicit_auto_tool_choice_is_omitted_without_tools() {
+        let mapped = map(&json!({
+            "model": "gpt-4.1-mini",
+            "input": "hello",
+            "tool_choice": "auto"
+        }));
+
+        assert!(mapped.get("tools").is_none());
+        assert!(
+            mapped.get("tool_choice").is_none(),
+            "Chat Completions backends may reject tool_choice when no tools are present"
+        );
+    }
+
+    #[test]
+    fn explicit_auto_tool_choice_is_preserved_with_tools() {
+        let mapped = map(&json!({
+            "model": "gpt-4.1-mini",
+            "input": "hello",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object"}
+            }],
+            "tool_choice": "auto"
+        }));
+
+        assert_eq!(mapped["tool_choice"], "auto");
+        assert_eq!(mapped["tools"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
     fn state_reasoning_item_is_replayed_into_the_assistant_turn() {
         let request = json!({"model": "m", "input": "hi"});
         let messages = vec![

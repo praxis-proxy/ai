@@ -37,7 +37,8 @@
               "input": "What is 2+2? Reply with just the number.",
               "model": "synthetic-chat-model",
               "store": true,
-              "stream": false
+              "stream": false,
+              "tool_choice": "auto"
             }
           }
         },

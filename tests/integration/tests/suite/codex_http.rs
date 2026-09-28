@@ -268,7 +268,11 @@ async fn run_live_codex_coding_workflow(live: &CodexLiveConfig, proxy_port: u16,
         verify_egress_isolation(namespace);
     }
 
-    let prompt = "Inspect input.json, copy its expected_content value into result.txt, run ./verify.sh, then summarize what you changed.";
+    let prompt = "Use the exec_command tool immediately; do not explain before calling it. \
+        (1) Read input.json. \
+        (2) Copy its exact expected_content value into result.txt with no surrounding whitespace. \
+        (3) You MUST use exec_command to run exactly ./verify.sh and wait for it to succeed. \
+        Do not give a final answer before that command succeeds. Then summarize what you changed. /no_think";
     let proxy_base_url = format!("http://{}:{}", live.listen_address, observer.port());
     let no_proxy = format!("127.0.0.1,localhost,{}", live.listen_address);
     let output = run_codex(
@@ -293,9 +297,9 @@ async fn run_live_codex_coding_workflow(live: &CodexLiveConfig, proxy_port: u16,
         stderr = output.stderr
     );
 
-    workspace.assert_successful_completion();
     observer.assert_http_only();
     assert_live_coding_codex_jsonl(&output.stdout);
+    workspace.assert_successful_completion();
 }
 
 /// Keep the live backend credential ephemeral rather than coupled to the example fixture.

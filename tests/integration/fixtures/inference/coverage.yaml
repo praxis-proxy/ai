@@ -337,6 +337,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.auto_tool_choice_without_tools
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.reasoning.replay
     scopes:
       - responses_to_chat_completions
