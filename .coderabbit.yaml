@@ -1,0 +1,79 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# CodeRabbit review configuration for this repository. Tracked here so
+# the review behavior is reviewed like any other change to the project.
+#
+# The review policy and the conventions shared across the organization
+# live in praxis-proxy/coderabbit, which CodeRabbit applies to every
+# repository in the organization. `inheritance: true` merges that
+# configuration with this one; without it, this file would replace it
+# entirely. Only guidance specific to this repository's layout belongs
+# here.
+#
+# Inherited from praxis-proxy/coderabbit: the review profile, the policy
+# that CodeRabbit never approves, gates, or authors code, tool
+# de-duplication against CI, the knowledge base, and the **/*, **/*.rs,
+# **/Cargo.toml, and .github/workflows/** instructions.
+#
+# Merge behavior: a scalar defined here wins, objects deep-merge, and
+# path_instructions entries are deduplicated by path — an entry here
+# with the same path as an organization-wide entry replaces it rather
+# than adding to it.
+#
+# CodeRabbit supplements human review; it does not replace it. Every
+# contributor remains responsible for the code they submit, per the Code
+# Responsibility section of .github/CONTRIBUTING.md.
+
+inheritance: true
+
+reviews:
+  # Recorded provider responses are large and mechanically maintained;
+  # reviewing them produces no signal. Cargo.lock, target/, and assets/
+  # are already excluded organization-wide.
+  path_filters:
+    - "!tests/integration/fixtures/inference/recordings/**"
+
+  path_instructions:
+    - path: "apis/src/openai/**"
+      instructions: |
+        Changes here require SDK-level integration tests exercised through the
+        OpenAI client where possible, under
+        tests/integration/sdk/openai/.
+
+    - path: "apis/src/anthropic/**"
+      instructions: |
+        Changes here require SDK-level integration tests exercised through the
+        Anthropic client where possible, under
+        tests/integration/sdk/anthropic/.
+
+    - path: "filters/src/**"
+      instructions: |
+        Filters follow classify -> route -> branch: classifier filters promote
+        facts to internal x-praxis-ai-* headers, and routing matches those
+        headers to select clusters. Flag filters that re-derive facts another
+        filter already promoted.
+
+        A new filter must be registered in praxis_ai_filters::register_ai_filters
+        (filters/src/register.rs) and ship with an example config and unit
+        tests, per docs/developing/adding-filters.md.
+
+    - path: "tests/integration/fixtures/inference/**"
+      instructions: |
+        A change in inference transformation behavior must update the scenario,
+        its focused tests, and tests/integration/fixtures/inference/coverage.yaml
+        (feature, scope, scenario, provider, and status links) in the same
+        change.
+
+        The generated coverage block in the fixture README is produced by
+        cargo xtask sync-inference-readme; flag hand edits to it. The manifest
+        is the coverage inventory, so the README should not enumerate Rust test
+        function names.
+
+        Recordings must retain truthful provider, model, and provenance
+        metadata.
+
+    - path: "examples/configs/**"
+      instructions: |
+        A new or renamed example config needs a functional integration test in
+        tests/integration/tests/suite/examples/ and an entry in
+        examples/README.md.
