@@ -268,11 +268,9 @@ async fn run_live_codex_coding_workflow(live: &CodexLiveConfig, proxy_port: u16,
         verify_egress_isolation(namespace);
     }
 
-    let prompt = "Use the exec_command tool immediately; do not explain before calling it. \
-        (1) Read input.json. \
-        (2) Copy its exact expected_content value into result.txt with no surrounding whitespace. \
-        (3) You MUST use exec_command to run exactly ./verify.sh and wait for it to succeed. \
-        Do not give a final answer before that command succeeds. Then summarize what you changed. /no_think";
+    let prompt = r#"Use exec_command immediately to run exactly this single command:
+python3 -c 'import json, pathlib; data = json.load(open("input.json")); pathlib.Path("result.txt").write_text(data["expected_content"])' && ./verify.sh
+Do not run a different command and do not answer before it succeeds. Then summarize what changed. /no_think"#;
     let proxy_base_url = format!("http://{}:{}", live.listen_address, observer.port());
     let no_proxy = format!("127.0.0.1,localhost,{}", live.listen_address);
     let output = run_codex(
