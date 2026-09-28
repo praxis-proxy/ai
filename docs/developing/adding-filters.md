@@ -20,5 +20,5 @@ first.
    renamed example configs.
 
 All testing requirements from
-[CONTRIBUTING.md](../../CONTRIBUTING.md#testing) apply. A
+[CONTRIBUTING.md](../../.github/CONTRIBUTING.md#testing) apply. A
 feature without tests and an example is not complete.

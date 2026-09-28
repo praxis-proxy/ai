@@ -26,7 +26,7 @@ Before tagging a release:
       or better than the previous release
 - [ ] Version in root `Cargo.toml` is bumped
 - [ ] `Cargo.lock` is regenerated with the new version
-- [ ] `SECURITY.md` lists the new minor version
+- [ ] `.github/SECURITY.md` lists the new minor version
 - [ ] Pull request labels produce useful generated release notes
 
 ## Tagging a Release
