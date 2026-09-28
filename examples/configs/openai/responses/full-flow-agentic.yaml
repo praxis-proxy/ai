@@ -407,10 +407,13 @@ filter_chains:
           - path_prefix: "/v1/vector_stores"
             cluster: "vector-stores-backend"
 
-      # Provider-owned Responses requests leave through a direct terminal
-      # branch. They never reach validation, persistence, rehydration, hosted
-      # tool resolution, or IRR. Endpoint selection still happens normally,
-      # but consumes the frozen logical binding rather than re-routing.
+      # Core runs the bound-body barrier immediately after the router and
+      # before evaluating this branch. Each gateway-owned body filter below
+      # therefore still needs its `unless application_provider: openai` gate.
+      # This terminal branch then dispatches the original request directly and
+      # prevents the remaining header chain, including IRR, from running. Both
+      # layers are necessary. Endpoint selection consumes the frozen logical
+      # binding rather than making a second routing decision.
       - filter: headers
         conditions:
           - when:
