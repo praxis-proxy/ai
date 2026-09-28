@@ -179,6 +179,13 @@ mode. The cargo home and target directory live in the named volumes
 run is incremental; the container runs as the invoking user
 (`--userns=keep-id`), because praxis-ai refuses to start as root.
 
+`make test-postgres-fips-host` complements those containerized suites with
+the database boundary that needs access to the host's rootless podman. It
+resolves the same FIPS feature set directly on the declared FIPS host, starts
+a sibling PostgreSQL container with only `hostssl ... cert` TCP rules, and
+performs a Responses write/read round trip over SQLx native TLS without a
+password. The composite action runs it immediately after `test-fips-host`.
+
 On a developer machine that is not in FIPS mode, `make test-integration-fips`
 and `make test-schema-fips` still run the same suites as the FIPS build; the
 FIPS behavior tests then assert their non-approved branch, so both sides of
@@ -190,7 +197,8 @@ The `fips-host` job of the `FIPS` workflow runs on a self-hosted RHEL 9
 runner in FIPS mode, selected by the labels `fips` and `rhel`. It tests the
 exact image the hosted `ubi-image` job built and scanned, handed over as an
 artifact and checked by image id, then runs `make fips-host-check`,
-`make test-fips-host` and `make fips-runtime-probe` through
+`make test-fips-host`, `make test-postgres-fips-host` and
+`make fips-runtime-probe` through
 `.github/actions/fips-host`; the release workflow requires a recorded green
 `fips-host` run for the exact commit being released (its `fips-proof` gate
 polls out a run still in flight) and runs the same composite action (without

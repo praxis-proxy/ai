@@ -158,6 +158,7 @@ On the FIPS host, what only it can prove (rootless podman required):
 ```console
 make fips-host-check     # attest the host and the image's module build (target/fips/host-attestation.*)
 make test-fips-host      # the test suites as the FIPS build, inside the UBI 9 toolchain image, fail-closed on FIPS mode
+make test-postgres-fips-host # certificate-authenticated store write/read through SQLx on the FIPS host
 make fips-runtime-probe  # run the FIPS image under PRAXIS_REQUIRE_FIPS=1 and probe its listener from outside
 ```
 
@@ -168,11 +169,15 @@ of the image (the crypto policy podman propagates into it, the build of
 `fips.so` it carries and whether that build is on a CMVP certificate), and
 writes the attestation to `target/fips/` to keep with the deployment record.
 `test-fips-host` runs the suites with `PRAXIS_FIPS_HOST=1`, so a green run
-cannot have happened outside FIPS mode. `fips-runtime-probe` starts the
-shipped image itself under `PRAXIS_REQUIRE_FIPS=1`, drives raw TLS probes
+cannot have happened outside FIPS mode. `test-postgres-fips-host` resolves
+the same feature set on that host and performs a Responses write/read round
+trip against a PostgreSQL container whose only TCP authentication rule is
+`hostssl ... cert`; the URL contains no password and the client presents its
+certificate through native TLS. `fips-runtime-probe` starts the shipped image
+itself under `PRAXIS_REQUIRE_FIPS=1`, drives raw TLS probes
 against its listener (approved algorithms negotiated, ChaCha20-only and
 X25519-only clients refused), and checks the startup line. The CI `FIPS`
-workflow runs all three on a RHEL 9 runner in FIPS mode for every change;
+workflow runs all four on a RHEL 9 runner in FIPS mode for every change;
 a release requires a recorded green `fips-host` run for the exact commit
 being released, and the release workflow attests and probes the exact
 pushed image, pulled back by digest, on the release run itself.

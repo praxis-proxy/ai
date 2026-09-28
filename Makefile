@@ -54,7 +54,7 @@ endif
 	patch-praxis unpatch-praxis \
 	require-podman require-go require-oc \
 	build-fips release-fips check-fips lint-fips test-fips test-fips-provider \
-	test-integration-fips test-schema-fips test-fips-host fips-toolchain fips-host-facts \
+	test-integration-fips test-schema-fips test-fips-host test-postgres-fips-host fips-toolchain fips-host-facts \
 	fips-host-check fips-runtime-probe fips-image-save fips-image-load fips-image-tag fips-version \
 	container-fips container-fips-run \
 	fips-check fips-check-ubi fips-deps fips-report fips-signature-store fips-verify-image \
@@ -559,6 +559,20 @@ test-integration-fips: build-fips
 test-schema-fips:
 	cargo test --target-dir $(FIPS_TARGET_DIR) -p praxis-tests-schema \
 		--no-default-features --features $(FIPS_FEATURES) $(FIPS_CARGO_EXTRA) $(_NOCAPTURE)
+
+# The certificate-authenticated PostgreSQL boundary on the actual FIPS host.
+# This runs outside the toolchain container because the test starts a sibling
+# PostgreSQL container through the host's rootless podman. It still resolves
+# exactly the shipped FIPS feature set, fails closed unless the host and
+# provider report FIPS mode, and exercises a write/read round trip with a
+# password-less URL against a server whose only TCP rule is `hostssl ... cert`.
+test-postgres-fips-host: | require-podman
+	PRAXIS_FIPS_HOST=1 PRAXIS_REQUIRE_FIPS=1 PRAXIS_TEST_FIPS_PROVIDER=1 \
+	cargo test --target-dir $(FIPS_TARGET_DIR) -p praxis-tests-integration \
+		--no-default-features --features $(FIPS_FEATURES) \
+		--test suite \
+		examples::openai_response_store_postgres_mtls::response_store_persists_over_certificate_authenticated_tls \
+		-- --ignored --exact $(if $(V),--nocapture)
 
 # The same unit tests with the RHEL FIPS provider active in every test
 # process: OPENSSL_CONF names xtask/assets/fips/fips-provider.cnf (the file
