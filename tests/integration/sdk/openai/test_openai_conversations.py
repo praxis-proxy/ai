@@ -15,9 +15,15 @@ then exercises the Conversations API using the official OpenAI Python
 SDK to verify wire-format compatibility.
 
 Usage:
-    cargo build -p praxis-ai-proxy --features full
-    cargo build -p praxis-test-utils --example conversations_tenant_proxy
-    uv run tests/integration/sdk/openai/test_openai_conversations.py -v
+    cargo build -p praxis-ai-proxy --features full,store-sqlite
+    cargo build -p praxis-test-utils --example conversations_tenant_proxy \
+        --features full,store-sqlite
+    PRAXIS_AI_BIN=target/debug/praxis-ai \
+        uv run tests/integration/sdk/openai/test_openai_conversations.py -v
+
+Both builds need `store-sqlite` explicitly: each crate's `full` feature selects
+`store-postgres` only, so the tenant-isolation proxy below would otherwise
+start with the SQLite backend compiled out and fail to bind.
 """
 
 import base64
