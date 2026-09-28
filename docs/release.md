@@ -68,6 +68,7 @@ The release workflow produces these tags per run:
 | `sha-<hash>` | `sha-abc1234` | Git commit SHA |
 | `<version>` | `0.1.0` | Full semver (from git tag) |
 | `<major>.<minor>` | `0.1` | Major.minor shorthand |
+| `latest` | `latest` | Most recent tagged release |
 | `nightly` | `nightly` | Latest scheduled build from `main` |
 | `<any of the above>-fips` | `0.1.0-fips` | Same runs, for the FIPS image |
 
