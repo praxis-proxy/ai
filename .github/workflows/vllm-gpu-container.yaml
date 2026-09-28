@@ -19,6 +19,8 @@ on:
       - "vllm/Containerfile"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
+      - ".github/actions/start-ec2-runner/**"
+      - ".github/actions/stop-ec2-runner/**"
       - ".github/workflows/vllm-gpu-container.yaml"
   pull_request:
     branches: [main]
@@ -27,18 +29,22 @@ on:
       - "vllm/Containerfile"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
+      - ".github/actions/start-ec2-runner/**"
+      - ".github/actions/stop-ec2-runner/**"
       - ".github/workflows/vllm-gpu-container.yaml"
   merge_group:
     branches: [main]
   workflow_dispatch:
     inputs:
       inference_model:
-        description: "Inference model (HuggingFace ID) — default is Qwen/Qwen3-8B-AWQ"
+        description: "Inference model (HuggingFace ID) — default is Qwen/Qwen3-8B"
         type: string
-      runner:
-        description: "GitHub Actions runner label for the GPU host"
+      gpu_instance_type:
+        description: >-
+          Optional EC2 GPU instance-type override for transient capacity
+          shortages (for example, g5.2xlarge).
         required: false
-        default: gpu-t4-4-core
+        default: g5.xlarge
         type: string
 
 concurrency:
@@ -51,17 +57,15 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/praxis-proxy/vllm-gpu
-  # Qwen3-8B, in the only form that fits the T4 runner. The bf16 checkpoint is
-  # 8.19B params = 15.3 GiB of weights, which does not fit a 16 GiB T4 before
-  # any KV cache, and the FP8 checkpoint needs sm_89+ hardware the T4 does not
-  # have. AWQ int4 is ~5.7 GiB and is a supported quantization on Turing, so it
-  # is the variant that leaves room for a usable KV cache.
-  INFERENCE_MODEL: ${{ inputs.inference_model || 'Qwen/Qwen3-8B-AWQ' }}
-  # The T4 is Turing (sm_75), which has no bfloat16. vLLM would downcast with a
-  # warning; pin it so the run is deterministic rather than dtype-dependent.
-  MODEL_DTYPE: float16
-  # ~5.7 GiB of int4 weights on a 16 GiB card. The CPU job runs at 0.5; giving
-  # vLLM 0.9 here leaves roughly 7 GiB of KV cache for the live suite.
+  # Same model the GPU jobs in vllm-integration.yaml serve (VLLM_GPU_MODEL), so
+  # the image this workflow publishes is the one that coverage is qualified on.
+  INFERENCE_MODEL: ${{ inputs.inference_model || 'Qwen/Qwen3-8B' }}
+  # Instance type for the ephemeral GPU runner, matching vllm-integration.yaml.
+  # g5.xlarge = A10G (24 GiB, compute capability 8.6), which holds the 15.3 GiB
+  # bf16 Qwen3-8B checkpoint with room for a KV cache and has FlashAttention-2.
+  GPU_INSTANCE_TYPE: "g5.xlarge"
+  # The CPU job runs at 0.5; 0.9 here matches what the GPU jobs in
+  # vllm-integration.yaml give vLLM on the same card.
   GPU_MEMORY_UTILIZATION: "0.9"
   # OGX + transformers pins live in tests/integration/ogx-constraints.txt (with
   # the rationale for each pin), single-sourced so the uv download cache key
@@ -99,17 +103,52 @@ jobs:
             echo "relevant=false" >> "$GITHUB_OUTPUT"
           fi
 
-  build-test:
+  # ----------------------------------------------------------------------------
+  # No GPU runner is standing by for this workflow, so provision an ephemeral
+  # EC2 instance for the run and tear it down unconditionally afterwards --
+  # the same pattern the nightly GPU jobs in vllm-integration.yaml use.
+  # ----------------------------------------------------------------------------
+
+  gpu-start-runner:
+    name: Start ephemeral EC2 GPU runner
     needs: [changes]
     if: |
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
-    # `inputs` is empty for push / pull_request / merge_group, so those events
-    # fall back to the default GPU label; workflow_dispatch can override it.
-    runs-on: ${{ inputs.runner || 'gpu-t4-4-core' }}
-    # Covers the CUDA base image pull, the model download baked into the build,
-    # the OGX dependency closure, a debug Praxis build, and the live suite.
-    timeout-minutes: 90
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      label: ${{ steps.start.outputs.label }}
+      ec2-instance-id: ${{ steps.start.outputs.ec2-instance-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Start EC2 GPU runner
+        id: start
+        uses: ./.github/actions/start-ec2-runner
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+          aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+          ami-id: ${{ vars.AWS_GPU_AMI_ID }}
+          subnet-id: ${{ vars.AWS_SUBNET_ID || vars.US_EAST_2A_SUBNET_ID }}
+          security-group-id: ${{ vars.AWS_SECURITY_GROUP_ID || vars.US_EAST_2_SG_ID }}
+          instance-type: ${{ inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
+          github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
+
+  build-test:
+    needs: [changes, gpu-start-runner]
+    if: |
+      !cancelled() && needs.gpu-start-runner.result == 'success'
+    # The dynamically generated label of the instance provisioned above; there
+    # is no statically registered GPU runner to fall back to.
+    runs-on: ${{ needs.gpu-start-runner.outputs.label }}
+    # Covers the CUDA base image pull, the ~16 GiB bf16 checkpoint baked into
+    # the build, the OGX dependency closure, a debug Praxis build, the live
+    # suite, and the GHCR push of the resulting image.
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -122,8 +161,8 @@ jobs:
       - name: Verify GPU and select container runtime
         run: |
           set -euo pipefail
-          # Fail here, before a 10+ GiB build, if the runner label resolved to a
-          # host without a usable GPU.
+          # Fail here, before a 10+ GiB build, if the provisioned instance came
+          # up without a usable GPU.
           nvidia-smi
           if command -v docker > /dev/null 2>&1 && docker info > /dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
@@ -139,15 +178,10 @@ jobs:
       - name: Free disk space
         run: |
           # The CUDA base image plus the baked model weights need tens of GiB.
-          # This assumes an ephemeral runner; the prune keeps the runner's own
-          # images so a self-hosted host is not left without them.
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
-          # Prefer the filtered prune so a runner's own images survive. Podman
-          # does not accept the `label!=` negation, so fall back to a plain
-          # prune there rather than silently skipping it and running out of disk.
-          "$CONTAINER_RUNTIME" system prune -af --filter "label!=com.github.actions.runner" \
-            || "$CONTAINER_RUNTIME" system prune -af \
-            || true
+          # The instance is ephemeral and the runner agent is a host service,
+          # not a container, so reclaiming every cached image on the AMI is
+          # safe -- nothing here outlives the job.
+          "$CONTAINER_RUNTIME" system prune -af || true
           df -h /
 
       - name: Setup Rust
@@ -156,9 +190,13 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
+          # The GPU AMI ships Python 3.9; ogx[starter] needs >=3.12, so pin the
+          # interpreter setup-uv provisions.
+          python-version: "3.12"
           # Key ONLY on the pins file, matching vllm-integration.yaml: setup-uv
           # has no restore-key fallback, so globbing anything else would force a
-          # cold multi-GB OGX re-download whenever this workflow is edited.
+          # cold multi-GB OGX re-download whenever this workflow is edited. The
+          # cache is repo-scoped, so it still warms across ephemeral runners.
           enable-cache: true
           cache-dependency-glob: |
             tests/integration/ogx-constraints.txt
@@ -166,7 +204,9 @@ jobs:
       - name: Build image
         env:
           DOCKER_BUILDKIT: "1"
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Same secret the other vLLM workflows read. Optional: it is only
+          # needed for gated checkpoints, and the default Qwen3-8B is not one.
+          HF_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
         run: |
           set -euo pipefail
           BUILD_ARGS=(
@@ -192,7 +232,6 @@ jobs:
           pull: "false"
           device-args: ${{ env.GPU_DEVICE_ARGS }}
           gpu-memory-utilization: ${{ env.GPU_MEMORY_UTILIZATION }}
-          dtype: ${{ env.MODEL_DTYPE }}
 
       - name: Pre-install OGX dependencies
         run: |
@@ -299,3 +338,28 @@ jobs:
             "$CONTAINER_RUNTIME" tag "${IMAGE_NAME}:${IMAGE_TAG}" "${IMAGE_NAME}:latest"
             "$CONTAINER_RUNTIME" push "${IMAGE_NAME}:latest"
           fi
+
+  gpu-stop-runner:
+    name: Stop ephemeral EC2 GPU runner
+    # MUST depend on every job that runs on the instance; otherwise the runner
+    # could be deregistered while build-test is still queued/running.
+    needs: [gpu-start-runner, build-test]
+    # Always tear down the instance, even on failure/cancel, but skip when the
+    # runner was never started.
+    if: always() && needs.gpu-start-runner.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Stop EC2 GPU runner
+        uses: ./.github/actions/stop-ec2-runner
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+          aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+          github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
+          label: ${{ needs.gpu-start-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.gpu-start-runner.outputs.ec2-instance-id }}
