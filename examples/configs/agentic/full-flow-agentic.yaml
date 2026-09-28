@@ -1,15 +1,14 @@
 # OpenAI Responses + Anthropic Messages — Unified Agentic Gateway
-# Requires `--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite` because these filters are opt-in.
+# Requires `--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite`
+# because these OpenAI filters and SQLite are opt-in.
 #
-# Runs the complete Responses API pipeline through an agentic
-# iterative_request_router that executes hosted file_search, web_search,
-# and MCP tool calls in a model-tool-model loop, persisting both buffered
-# and streaming (`stream: true`) responses. This is the single config an
-# operator would deploy for a Responses API gateway that must serve the
-# full agentic loop, the Conversations API, and the dedicated
-# prompts/embeddings/files/vector_stores services behind one listener. The
-# request trace is continued through every nested web-search, OGX, and MCP
-# callout with a fresh span ID per hop.
+# Runs OpenAI Responses and Anthropic Messages through one agentic
+# iterative_request_router, preserving each API's buffered and streaming
+# lifecycle while sharing one listener and one frozen logical-upstream binding.
+# The OpenAI path executes hosted file_search, web_search, and MCP calls; the
+# Anthropic path executes managed WebSearch calls. The request trace is
+# continued through every nested search, OGX, and MCP callout with a fresh
+# span ID per hop.
 #
 # The request is classified once, then a top-level router freezes one logical
 # cluster plus its application_provider/application_protocol metadata. That
