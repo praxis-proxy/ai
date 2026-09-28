@@ -1030,9 +1030,12 @@ async fn null_tool_choice_translates_as_absent() {
         br#"{"model":"gpt-4.1-mini","input":"hello","tool_choice":null}"#,
     ));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
     let state = context.extensions.get::<ResponsesState>().unwrap();
     assert_eq!(
         state.tool_choice,
@@ -2165,9 +2168,12 @@ async fn reasoning_summary_request_is_rejected_for_dialect_without_safe_summary(
         br#"{"model":"deepseek-r1","input":"hello","reasoning":{"summary":"auto"}}"#,
     ));
 
-    let action = filter.on_request_body(&mut context, &mut body, true).await.unwrap();
+    let action = filter
+        .on_selected_upstream_request_body(&mut context, &mut body)
+        .await
+        .unwrap();
 
-    let FilterAction::Reject(rejection) = action else {
+    let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
         panic!("expected rejection");
     };
     assert_eq!(rejection.status, 400);
@@ -2203,10 +2209,10 @@ async fn vllm_reasoning_content_is_extracted_end_to_end() {
         br#"{"model":"deepseek-r1","input":"hello","reasoning":{"effort":"medium"},"stream":false}"#,
     ));
     let request_action = filter
-        .on_request_body(&mut context, &mut request_body, true)
+        .on_selected_upstream_request_body(&mut context, &mut request_body)
         .await
         .unwrap();
-    assert!(matches!(request_action, FilterAction::Continue));
+    assert!(matches!(request_action, SelectedUpstreamBodyOutcome::Continue));
     let response = Box::leak(Box::new(crate::test_utils::make_response()));
     response.headers.insert(
         http::header::CONTENT_TYPE,
