@@ -317,7 +317,7 @@ jobs:
           cache-dependency-glob: tests/integration/sdk/anthropic/test_anthropic_messages_to_chat_completions.py
 
       - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy
+        run: cargo build -p praxis-ai-proxy --features store-all
 
       - name: Run Anthropic Python SDK tests
         run: uv run tests/integration/sdk/anthropic/test_anthropic_messages_to_chat_completions.py -s

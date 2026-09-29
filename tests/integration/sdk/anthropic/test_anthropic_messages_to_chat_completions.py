@@ -10,15 +10,14 @@
 Anthropic SDK tests for request-field handling in the Messages to Chat
 Completions translation.
 
-Starts Praxis with the shipped `messages-to-openai` example, retargeted at a
-local stub backend that records the translated request, and verifies through
-the official Anthropic Python SDK that unmapped fields reach the backend, that
-`metadata.user_id` becomes a hashed `safety_identifier`, that `thinking` is dropped,
-that fields the translation cannot honor are rejected before any backend call,
-and that malformed streamed tool calls fail closed at the client boundary.
+Starts Praxis with the shipped translation examples, retargeted at a local stub
+backend that records the translated request, and verifies through the official
+Anthropic Python SDK that the unified gateway's bound-body route translates,
+that request fields are handled faithfully, and that malformed streamed tool
+calls fail closed at the client boundary.
 
 Usage:
-    cargo build -p praxis-ai-proxy
+    cargo build -p praxis-ai-proxy --features store-all
     uv run tests/integration/sdk/anthropic/test_anthropic_messages_to_chat_completions.py -s -v
 """
 
@@ -38,6 +37,7 @@ import pytest
 from anthropic import APIStatusError, Anthropic, BadRequestError
 
 CONFIG_PATH = "examples/configs/anthropic/messages-to-openai.yaml"
+FULL_FLOW_CONFIG_PATH = "examples/configs/agentic/full-flow-agentic.yaml"
 MODEL = "stub-model"
 
 
@@ -187,6 +187,29 @@ def _write_config(proxy_port: int, backend_port: int) -> str:
     return path
 
 
+def _write_full_flow_config(
+    proxy_port: int, backend_port: int, directory: str
+) -> str:
+    with open(FULL_FLOW_CONFIG_PATH) as f:
+        config = f.read()
+    replacements = [
+        ("127.0.0.1:8080", f"127.0.0.1:{proxy_port}"),
+        ("127.0.0.1:8000", f"127.0.0.1:{backend_port}"),
+        (
+            "sqlite://responses.db?mode=rwc",
+            f"sqlite://{directory}/responses.db?mode=rwc",
+        ),
+        ("${WEB_SEARCH_API_KEY}", "not-used"),
+    ]
+    for old, new in replacements:
+        assert old in config, f"example drift: {old} not found in {FULL_FLOW_CONFIG_PATH}"
+        config = config.replace(old, new)
+    path = os.path.join(directory, "full-flow-agentic.yaml")
+    with open(path, "w") as f:
+        f.write(config)
+    return path
+
+
 @pytest.fixture(scope="module")
 def anthropic_client():
     backend_port = _free_port()
@@ -217,6 +240,63 @@ def anthropic_client():
             proc.wait()
         backend.shutdown()
         os.unlink(config_path)
+
+
+@pytest.fixture(scope="module")
+def bound_anthropic_client():
+    backend_port = _free_port()
+    backend = HTTPServer(("127.0.0.1", backend_port), RecordingBackend)
+    threading.Thread(target=backend.serve_forever, daemon=True).start()
+
+    proxy_port = _free_port()
+    with tempfile.TemporaryDirectory() as directory:
+        config_path = _write_full_flow_config(proxy_port, backend_port, directory)
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            _wait_for_proxy(proxy_port)
+            yield Anthropic(
+                base_url=f"http://127.0.0.1:{proxy_port}",
+                api_key="not-needed",
+                default_headers={
+                    "x-auth-tenant": "tenant-a",
+                    "x-auth-user": "user-a",
+                },
+                max_retries=0,
+                timeout=10.0,
+            )
+        finally:
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            backend.shutdown()
+
+
+class TestBoundBodyRoute:
+    def test_sdk_request_uses_bound_translation_path(self, bound_anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        response = bound_anthropic_client.messages.create(
+            model="vllm-chat",
+            max_tokens=64,
+            system="You are a helpful assistant.",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+        )
+
+        assert response.content[0].text == "4"
+        [upstream] = RecordingBackend.bodies
+        assert upstream["model"] == "vllm-chat"
+        assert upstream["max_completion_tokens"] == 64
+        assert upstream["messages"] == [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "What is 2+2?"},
+        ]
 
 
 class TestRequestFieldHandling:

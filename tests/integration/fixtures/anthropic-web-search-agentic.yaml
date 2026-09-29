@@ -1,0 +1,67 @@
+# Test-only Anthropic Messages agentic web-search pipeline.
+#
+# The public unified example is Claude Code-first and intentionally excludes
+# this non-MVP server-owned loop. This fixture retains end-to-end coverage for
+# buffered and streaming IRR re-entry, limits, failures, and cancellation.
+#
+# WEB_SEARCH_API_KEY and all loopback ports are replaced by the integration
+# suite before parsing.
+
+listeners:
+  - name: anthropic-full-flow-agentic
+    address: "127.0.0.1:8080"
+    filter_chains: [full-flow-agentic]
+
+filter_chains:
+  - name: full-flow-agentic
+    filters:
+      - filter: trace_context
+        # Establish typed correlation before IRR snapshots request extensions;
+        # Praxis core creates a fresh span ID for each search callout hop.
+
+      - filter: callout_credentials
+        # This filter establishes typed request context and strips the source
+        # header; the trusted boundary remains responsible for its provenance.
+        credentials:
+          - slot: you_search
+            source_header: x-user-you-key
+
+      - filter: anthropic_messages_format
+        on_invalid: reject
+      - filter: anthropic_validate
+      - filter: iterative_request_router
+        initial_step: inference
+        max_iterations: 6
+        timeout_ms: 90000
+        steps:
+          - name: inference
+            filters:
+              - filter: anthropic_web_search
+                provider: you
+                api_key: ${WEB_SEARCH_API_KEY}
+                # Require the per-user key captured before IRR. The secret is
+                # injected only at the exact resolved provider authority.
+                user_credential: you_search
+                default_context_size: medium
+                timeout_ms: 10000
+                terminal_streaming: true
+              - filter: anthropic_messages_protocol
+                default_version: "2023-06-01"
+              - filter: router
+                routes:
+                  - path_prefix: "/v1/messages"
+                    cluster: messages-backend
+              - filter: load_balancer
+                clusters:
+                  - name: messages-backend
+                    endpoints: ["127.0.0.1:8000"]
+            on_result:
+              - filter: anthropic_web_search
+                key: action
+                value: loop
+                next: inference
+              - default: true
+                done: true
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends
