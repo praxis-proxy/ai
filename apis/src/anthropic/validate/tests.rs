@@ -147,6 +147,8 @@ fn default_config_parses() {
         "anthropic_validate",
         "filter name should be anthropic_validate"
     );
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
 }
 
 #[test]

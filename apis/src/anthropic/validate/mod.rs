@@ -22,13 +22,14 @@ mod tests;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, Rejection, parse_filter_config,
+    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    Rejection, parse_filter_config,
 };
 use serde::de::IgnoredAny;
 use tracing::debug;
 
 use self::config::{AnthropicValidateConfig, build_config};
-use crate::anthropic::wire;
+use crate::anthropic::{bound_body_outcome, wire};
 
 // -----------------------------------------------------------------------------
 // AnthropicValidateFilter
@@ -70,6 +71,10 @@ impl HttpFilter for AnthropicValidateFilter {
         BodyAccess::ReadOnly
     }
 
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
     fn request_body_mode(&self) -> BodyMode {
         BodyMode::StreamBuffer {
             max_bytes: Some(self.config.max_body_bytes),
@@ -100,6 +105,15 @@ impl HttpFilter for AnthropicValidateFilter {
 
         debug!("anthropic request validation passed");
         Ok(FilterAction::Continue)
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 }
 

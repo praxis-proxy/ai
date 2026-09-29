@@ -60,7 +60,7 @@ before sending requests.
 
 | File | Description |
 | ------ | ------------- |
-| [full-flow-agentic.yaml](configs/agentic/full-flow-agentic.yaml) | Runs OpenAI Responses and Anthropic Messages through one agentic iterative_request_router, preserving each API's buffered and streaming lifecycle while sharing one listener and one frozen logical-upstream binding |
+| [full-flow-agentic.yaml](configs/agentic/full-flow-agentic.yaml) | Serves Claude Code's Anthropic Messages traffic and OpenAI Responses traffic on one listener |
 
 ### Anthropic
 

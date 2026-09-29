@@ -10,6 +10,7 @@ pub use test_utils::load_example_config;
 
 mod agentic_routing;
 #[cfg(feature = "store-sqlite")]
+// Unified Claude Code paths share the SQLite-enabled full-flow configuration.
 mod anthropic_full_flow_agentic;
 mod anthropic_messages;
 mod anthropic_messages_native_vllm;

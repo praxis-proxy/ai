@@ -1,24 +1,28 @@
-# OpenAI Responses + Anthropic Messages — Unified Agentic Gateway
+# Claude Code + OpenAI Responses Unified Gateway
 # Requires `--features openai-file-resolve-filter,openai-conversations,openai-mcp-tools,store-sqlite`
 # because these OpenAI filters and SQLite are opt-in.
 #
-# Runs OpenAI Responses and Anthropic Messages through one agentic
-# iterative_request_router, preserving each API's buffered and streaming
-# lifecycle while sharing one listener and one frozen logical-upstream binding.
-# The OpenAI path executes hosted file_search, web_search, and MCP calls; the
-# Anthropic path executes managed WebSearch calls. The request trace is
-# continued through every nested search, OGX, and MCP callout with a fresh
-# span ID per hop.
+# Serves Claude Code's Anthropic Messages traffic and OpenAI Responses traffic
+# on one listener. Anthropic requests either pass through unchanged to a native
+# Messages provider or translate to a Chat Completions provider. They never
+# enter the gateway-owned agentic loop: Claude Code owns its tool_use and
+# tool_result lifecycle. Managed OpenAI Responses requests retain the existing
+# hosted file_search, web_search, and MCP loop.
 #
 # The request is classified once, then a top-level router freezes one logical
 # cluster plus its application_provider/application_protocol metadata. That
-# binding drives two mutually exclusive paths:
+# binding drives mutually exclusive ownership paths:
 #
+#   - application_provider=anthropic: a terminal branch forwards the original
+#     Messages request and response without body translation.
+#   - application_protocol=openai_chat_completions on /v1/messages: the gateway
+#     translates Messages to Chat Completions and translates the response back,
+#     then terminates without entering the Responses IRR.
 #   - application_provider=openai: a terminal branch forwards the original
 #     Responses request directly. Managed validation, response state,
 #     persistence/rehydration, hosted-tool resolution, and the IRR never run.
-#   - every managed provider: the bound-body barrier runs provider-aware body
-#     filters once, then the IRR executes the agentic loop.
+#   - gateway-managed OpenAI providers: the bound-body barrier runs
+#     provider-aware body filters once, then the IRR executes the agentic loop.
 #
 # ResponsesState created on the managed path persists across all IRR
 # iterations via extension swapping:
@@ -34,10 +38,9 @@
 #      header provenance. The IRR carries the resulting typed request extension
 #      across iterations, while each callout explicitly selects its slot for its
 #      exact-authority provider destination.
-#      project_state_owner_headers then projects that context as x-tenant-id and
-#      x-user-id for OGX and explicitly allowlisted callouts. The raw ingress
-#      names are stripped, and the projection is repeated inside the IRR step
-#      because it owns a separate destination request lifecycle.
+#      Identity is projected only inside the managed OpenAI path and its
+#      explicit callout chains. It is not added to direct Anthropic or OpenAI
+#      provider requests.
 #      These adapters do not themselves change persistence predicates: this
 #      context-only configuration must be combined with owner-scoped store
 #      enforcement before it is exposed as a multi-owner state service.
@@ -107,11 +110,10 @@
 #      Projected identity headers are forwarded only to operator-configured
 #      connector_id targets, never arbitrary client-selected server_url values.
 #
-#   10. Two terminal branches consume the frozen binding before the IRR.
-#       One forwards provider-owned OpenAI Responses traffic unchanged; the
-#       other preserves the direct service/WebSocket routes. Both use
-#       `cluster_source: bound_upstream`, so no second routing decision can
-#       disagree with the provider selected for the request.
+#   10. Terminal branches consume native Anthropic, translated Anthropic,
+#       provider-owned OpenAI, and direct service/WebSocket bindings before the
+#       IRR. Each uses `cluster_source: bound_upstream`, so no second routing
+#       decision can disagree with the provider selected for the request.
 #
 #   11. The iterative_request_router owns the agentic loop for classified
 #      openai_responses create requests. For a native Responses upstream,
@@ -308,16 +310,10 @@ filter_chains:
         # creates a fresh span ID for each outbound hop.
 
       - filter: anthropic_messages_format
-        on_invalid: reject
+        on_invalid: continue
         conditions:
           - when:
-              path: "/v1/messages"
-              methods: [POST]
-
-      - filter: anthropic_validate
-        conditions:
-          - when:
-              path: "/v1/messages"
+              path_prefix: "/v1/messages"
               methods: [POST]
 
       - filter: state_owner
@@ -339,8 +335,6 @@ filter_chains:
         credentials:
           - slot: brave_search
             source_header: x-user-brave-key
-          - slot: you_search
-            source_header: x-user-you-key
           - slot: ogx_files
             source_header: x-user-ogx-key
           - slot: mcp_gateway
@@ -353,13 +347,6 @@ filter_chains:
           # connector_id destinations; the MCP Gateway decides authorization.
           - slot: mcp_gateway
             source_header: x-mcp-authorized
-
-      # Emit the normalized owner in the contract expected by OGX and by the
-      # explicitly configured downstream callouts below. Raw x-auth-* inputs
-      # are stripped and never used directly as destination assertions.
-      - filter: project_state_owner_headers
-        tenant_header: x-tenant-id
-        subject_header: x-user-id
 
       # Publishes the typed operation consumed by openai_conversations.
       - filter: openai_operation
@@ -378,14 +365,26 @@ filter_chains:
       # Bind one logical destination before any provider-owned body work. The
       # classifier overwrites the reserved x-praxis-ai-model header from the
       # parsed body, so clients cannot spoof a different promoted value. This
-      # example uses `gpt-5` for the direct OpenAI path, `vllm-chat` for a
-      # managed Chat Completions backend, and any other Responses model for a
-      # managed native-Responses backend. Deployments may replace this model
-      # policy with another trusted routing fact.
+      # example uses `vllm-chat` for Anthropic-to-Chat translation, native
+      # Anthropic for other Messages models, `gpt-5` for direct OpenAI, and the
+      # existing managed backends for other Responses models. Deployments may
+      # replace this illustrative model policy with another trusted fact.
       - filter: router
         routes:
           - path: "/v1/messages"
-            cluster: "messages-backend"
+            headers:
+              x-praxis-ai-format: "anthropic_messages"
+              x-praxis-ai-model: "vllm-chat"
+            cluster: "anthropic-chat-completions-backend"
+          - path: "/v1/messages/count_tokens"
+            headers:
+              x-praxis-ai-format: "anthropic_messages"
+              x-praxis-ai-model: "vllm-chat"
+            cluster: "anthropic-chat-completions-backend"
+          - path_prefix: "/v1/messages"
+            headers:
+              x-praxis-ai-format: "anthropic_messages"
+            cluster: "anthropic-messages-backend"
           - path_prefix: "/v1/prompts"
             cluster: "prompts-api"
           - path_prefix: "/v1/embeddings"
@@ -418,6 +417,116 @@ filter_chains:
             cluster: "inference-backend"
           - path_prefix: "/v1/vector_stores"
             cluster: "vector-stores-backend"
+
+      # Provider-owned body hooks run once after the router has frozen the
+      # logical upstream. Native Anthropic routes skip both hooks. The
+      # translated route validates the complete body and then converts it to
+      # Chat Completions before any request is dispatched.
+      - filter: anthropic_validate
+        conditions:
+          - when:
+              path: "/v1/messages"
+              methods: [POST]
+              bound_upstream:
+                application_protocol: openai_chat_completions
+
+      - filter: anthropic_messages_to_chat_completions
+        max_body_bytes: 1048576
+        conditions:
+          - when:
+              path: "/v1/messages"
+              methods: [POST]
+              bound_upstream:
+                application_protocol: openai_chat_completions
+
+      - filter: anthropic_messages_to_chat_completions_stream
+        max_partial_event_bytes: 10485760
+        max_tool_blocks: 10000
+        conditions:
+          - when:
+              path: "/v1/messages"
+              methods: [POST]
+              bound_upstream:
+                application_protocol: openai_chat_completions
+        response_conditions:
+          - when:
+              headers:
+                content-type: "text/event-stream"
+
+      - filter: path_rewrite
+        replace:
+          pattern: "^/v1/messages$"
+          replacement: "/v1/chat/completions"
+        conditions:
+          - when:
+              path: "/v1/messages"
+              methods: [POST]
+              bound_upstream:
+                application_protocol: openai_chat_completions
+
+      # Chat Completions has no count_tokens equivalent. Fail explicitly at the
+      # gateway instead of forwarding an Anthropic endpoint to that protocol.
+      - filter: static_response
+        status: 404
+        body: '{"type":"error","error":{"type":"not_found_error","message":"count_tokens is unavailable for Chat Completions upstreams"}}'
+        headers:
+          - name: Content-Type
+            value: application/json
+        conditions:
+          - when:
+              path: "/v1/messages/count_tokens"
+              bound_upstream:
+                application_protocol: openai_chat_completions
+
+      # Native Anthropic owns validation, tool execution, and token counting.
+      # The terminal branch preserves the caller's Messages wire format and
+      # prevents all Responses state and IRR filters from running.
+      - filter: headers
+        conditions:
+          - when:
+              bound_upstream:
+                application_provider: anthropic
+        branch_chains:
+          - name: direct-anthropic
+            rejoin: terminal
+            chains:
+              - name: direct-anthropic-dispatch
+                filters:
+                  - filter: load_balancer
+                    cluster_source: bound_upstream
+                    clusters:
+                      - name: "anthropic-messages-backend"
+                        http:
+                          application_protocol: anthropic_messages
+                          application_provider: anthropic
+                        endpoints:
+                          - "127.0.0.1:8000"
+
+      # Translated Claude Code traffic also terminates before the Responses
+      # IRR. The promoted format distinguishes it from managed OpenAI Responses
+      # requests that use the same Chat Completions protocol.
+      - filter: headers
+        conditions:
+          - when:
+              headers:
+                x-praxis-ai-format: "anthropic_messages"
+              bound_upstream:
+                application_protocol: openai_chat_completions
+        branch_chains:
+          - name: translated-anthropic
+            rejoin: terminal
+            chains:
+              - name: translated-anthropic-dispatch
+                filters:
+                  - filter: load_balancer
+                    cluster_source: bound_upstream
+                    clusters:
+                      - name: "anthropic-chat-completions-backend"
+                        http:
+                          application_protocol: openai_chat_completions
+                          application_provider: vllm
+                        endpoints:
+                          - "127.0.0.1:8000"
 
       # Core runs the bound-body barrier immediately after the router and
       # before evaluating this branch. Each gateway-owned body filter below
@@ -663,19 +772,6 @@ filter_chains:
         steps:
           - name: inference
             filters:
-              # Anthropic Messages and OpenAI Responses share the same frozen
-              # binding and IRR, while retaining protocol-specific loop owners.
-              - filter: anthropic_web_search
-                conditions:
-                  - when:
-                      path: "/v1/messages"
-                provider: you
-                api_key: ${WEB_SEARCH_API_KEY}
-                user_credential: you_search
-                default_context_size: medium
-                timeout_ms: 10000
-                terminal_streaming: true
-
               # Re-project inside the destination-owned subrequest. Core moves
               # the normalized StateOwner extension into each IRR step; this
               # strips any still-uncommitted raw ingress identity headers and
@@ -788,12 +884,6 @@ filter_chains:
                 request_set:
                   - name: Content-Type
                     value: application/json
-              - filter: anthropic_messages_protocol
-                conditions:
-                  - when:
-                      path: "/v1/messages"
-                default_version: "2023-06-01"
-
               # Select an endpoint from the request-level binding and publish
               # exchange-local application metadata. Every selected_upstream
               # condition below reads this fresh selection, so the matching
@@ -815,12 +905,6 @@ filter_chains:
                       application_provider: vllm
                     endpoints:
                       - "127.0.0.1:3001"
-                  - name: "messages-backend"
-                    http:
-                      application_protocol: anthropic_messages
-                      application_provider: vllm
-                    endpoints:
-                      - "127.0.0.1:8000"
 
               # ---- Protocol-adaptive body builders (run AFTER selection) ----
               # Exactly one branch fires, chosen by the selected upstream's
@@ -877,10 +961,6 @@ filter_chains:
                       path_prefix: "/v1/responses"
                       methods: [POST]
             on_result:
-              - filter: anthropic_web_search
-                key: action
-                value: loop
-                next: inference
               # openai_agentic_loop is the sole loop authority (issue #1046):
               # it parses each model response, records assignments for the
               # request-phase dispatchers (web_search, mcp_dispatch,

@@ -20,12 +20,13 @@ pub(crate) mod response;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, BoundUpstreamBodyOutcome, FilterAction, FilterError, HttpFilter, HttpFilterContext,
+    parse_filter_config,
 };
 use tracing::{debug, warn};
 
 use self::config::{AnthropicMessagesToChatCompletionsConfig, build_config};
-use crate::anthropic::wire;
+use crate::anthropic::{bound_body_outcome, wire};
 
 /// Metadata key selecting success or error response transformation.
 const RESPONSE_TRANSFORM_KEY: &str = "anthropic_messages_to_chat_completions.response_transform";
@@ -99,6 +100,10 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
     }
 
     fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadWrite
+    }
+
+    fn bound_upstream_request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadWrite
     }
 
@@ -179,6 +184,15 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
         };
 
         Ok(transform_request_body(body, transformed))
+    }
+
+    async fn on_bound_upstream_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+    ) -> Result<BoundUpstreamBodyOutcome, FilterError> {
+        let action = self.on_request_body(ctx, body, true).await?;
+        bound_body_outcome(action)
     }
 
     fn on_response_body(
@@ -442,6 +456,8 @@ mod tests {
             "anthropic_messages_to_chat_completions",
             "filter name should match"
         );
+        assert_eq!(filter.request_body_access(), BodyAccess::ReadWrite);
+        assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadWrite);
     }
 
     #[test]
