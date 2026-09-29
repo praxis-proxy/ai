@@ -4739,6 +4739,164 @@ class TestAgenticLoopVLLM:
         )
         assert {item.name for item in mcp_calls} == {"get_weather", "get_time"}
 
+    @requires_vllm_compat
+    def test_mcp_approval_batch_resume_executes_multiple_approved_tools(
+        self,
+        agentic_client,
+        agentic_proxy,
+    ):
+        """Issue #1146: two approval-gated MCP calls emitted in one model
+        round, both approved in a SINGLE resume batch, must both execute.
+
+        The pre-fix dispatcher rejected any ``mcp_approval_response`` batch
+        with more than one item, so this whole flow returned a 400.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "utilities",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather", "get_time"],
+                "require_approval": "always",
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        approval_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call both get_weather and get_time for Paris in the "
+                "same turn before answering. Do not omit either function. "
+                "/no_think"
+            ),
+            tools=tools,
+            parallel_tool_calls=True,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        approval_requests = [
+            item for item in approval_response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 2, (
+            "both approval-gated MCP calls should emit an approval request; "
+            f"got: {[item.type for item in approval_response.output]}"
+        )
+        assert {req.name for req in approval_requests} == {"get_weather", "get_time"}
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "no MCP tool must execute before approval"
+        )
+
+        final_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            previous_response_id=approval_response.id,
+            input=[
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": req.id,
+                    "approve": True,
+                }
+                for req in approval_requests
+            ],
+            tools=tools,
+            parallel_tool_calls=True,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        assert MCPHandler.tool_call_count() == calls_before + 2, (
+            "approving both requests in one batch must execute both MCP tools"
+        )
+        mcp_calls = [
+            item for item in final_response.output if item.type == "mcp_call"
+        ]
+        assert {item.name for item in mcp_calls} == {"get_weather", "get_time"}, (
+            "approved batch should contain both MCP results; got: "
+            f"{[item.type for item in final_response.output]}"
+        )
+
+    @requires_vllm_compat
+    def test_mcp_approval_batch_resume_mixed_approve_and_deny(
+        self,
+        agentic_client,
+        agentic_proxy,
+    ):
+        """Issue #1146: a resume batch that approves one call and denies the
+        other executes only the approved tool.
+
+        The denied call must not reach the MCP server; only the approved
+        ``get_weather`` produces an ``mcp_call`` in the resumed response.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "utilities",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather", "get_time"],
+                "require_approval": "always",
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        approval_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call both get_weather and get_time for Paris in the "
+                "same turn before answering. Do not omit either function. "
+                "/no_think"
+            ),
+            tools=tools,
+            parallel_tool_calls=True,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        by_name = {
+            item.name: item
+            for item in approval_response.output
+            if item.type == "mcp_approval_request"
+        }
+        assert set(by_name) == {"get_weather", "get_time"}, (
+            "both approval-gated MCP calls should emit an approval request; "
+            f"got: {[item.type for item in approval_response.output]}"
+        )
+
+        final_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            previous_response_id=approval_response.id,
+            input=[
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": by_name["get_weather"].id,
+                    "approve": True,
+                },
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": by_name["get_time"].id,
+                    "approve": False,
+                },
+            ],
+            tools=tools,
+            parallel_tool_calls=True,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "only the approved MCP tool must execute; the denied call must not "
+            "reach the server"
+        )
+        mcp_call_names = [
+            item.name for item in final_response.output if item.type == "mcp_call"
+        ]
+        assert mcp_call_names == ["get_weather"], (
+            "only the approved call should produce an mcp_call; got: "
+            f"{[item.type for item in final_response.output]}"
+        )
+
     def test_mcp_tool_streams_terminal_round_as_one_logical_response(
         self,
         agentic_client,

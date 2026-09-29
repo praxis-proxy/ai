@@ -755,14 +755,19 @@ impl ResponseStore for SqliteResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        for (index, approval_id) in approval_ids.iter().enumerate() {
+        // Lock rows in a deterministic (id-sorted) order, matching the Postgres
+        // backend for a uniform contract (SQLite serializes writers so it cannot
+        // itself deadlock); the returned index stays the caller-slice position.
+        let mut ordered: Vec<(usize, &str)> = approval_ids.iter().copied().enumerate().collect();
+        ordered.sort_unstable_by_key(|&(_, id)| id);
+        for (index, approval_id) in ordered {
             let result = sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(consumed_at)
                 .bind(owner.tenant_id())
                 .bind(owner.issuer())
                 .bind(owner.subject())
                 .bind(response_id)
-                .bind(*approval_id)
+                .bind(approval_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StoreError::Database(e.to_string()))?;

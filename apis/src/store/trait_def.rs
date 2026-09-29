@@ -200,6 +200,15 @@ pub trait ResponseStore: Send + Sync {
     /// concurrent callers race for the row and exactly one observes `None`. An
     /// empty slice is a no-op that returns `Ok(None)`.
     ///
+    /// Transactional backends **must** acquire the per-row locks in a
+    /// deterministic order independent of the caller's slice order (e.g. sorted
+    /// by `approval_id`). Two concurrent batches for the same
+    /// `(owner, response_id)` can list overlapping approvals in opposite order,
+    /// and locking them in caller order would let each transaction hold one row
+    /// while waiting on the other — a deadlock. A global lock order makes such a
+    /// cycle impossible. The returned index is always the position in the
+    /// caller's `approval_ids` slice regardless of the internal lock order.
+    ///
     /// [`get_pending_approvals`]: ResponseStore::get_pending_approvals
     ///
     /// # Errors

@@ -81,7 +81,10 @@ pub(crate) struct McpDispatchConfig {
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 
-    /// Hard cap on MCP calls processed from one model response (1..=1024; default: 32).
+    /// Hard cap on MCP calls processed from one model response, and the maximum
+    /// number of `mcp_approval_response` items accepted from a single resume
+    /// request — a resume batch cannot exceed what one round could have emitted
+    /// (1..=1024; default: 32).
     #[serde(default = "default_max_calls_per_round")]
     pub max_calls_per_round: usize,
 

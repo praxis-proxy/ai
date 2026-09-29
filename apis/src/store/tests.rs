@@ -642,6 +642,66 @@ async fn consume_approvals_concurrent_claims_exactly_once() {
     assert_eq!(rejected, 1, "exactly one concurrent caller must be rejected");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consume_approvals_opposite_order_batches_claim_once() {
+    // Two concurrent resumes consume the SAME two ids in OPPOSITE caller order.
+    // SQLite serializes writers so it cannot deadlock, but the deterministic
+    // id-sorted locking must still make exactly one batch claim both rows while
+    // the other is rejected, and the rejected batch must report an index into
+    // its OWN caller slice.
+    let dir = tempfile::tempdir().expect("temp dir should be created");
+    let db_path = dir.path().join("opposite_order_consume.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let store = Arc::new(
+        SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", None, None, None)
+            .await
+            .expect("store creation should succeed"),
+    );
+    seed_pending(store.as_ref(), "tenant_a", RESP, &["call_1", "call_2"]).await;
+
+    let store_a = Arc::clone(&store);
+    let store_b = Arc::clone(&store);
+    let task_a = tokio::spawn(async move {
+        store_a
+            .consume_approvals(
+                &crate::test_utils::test_owner("tenant_a"),
+                RESP,
+                &["call_1", "call_2"],
+                1000,
+            )
+            .await
+    });
+    let task_b = tokio::spawn(async move {
+        store_b
+            .consume_approvals(
+                &crate::test_utils::test_owner("tenant_a"),
+                RESP,
+                &["call_2", "call_1"],
+                1000,
+            )
+            .await
+    });
+
+    let a = task_a
+        .await
+        .expect("task a should join")
+        .expect("consume a should succeed");
+    let b = task_b
+        .await
+        .expect("task b should join")
+        .expect("consume b should succeed");
+
+    let claimed = usize::from(a.is_none()) + usize::from(b.is_none());
+    assert_eq!(claimed, 1, "exactly one opposite-order batch must claim both approvals");
+    // The loser rejects on the first id it locks (call_1, the sort minimum),
+    // which is index 0 in task a's slice and index 1 in task b's slice.
+    match (a, b) {
+        (Some(idx), None) => assert_eq!(idx, 0, "task a rejects at its own call_1 index"),
+        (None, Some(idx)) => assert_eq!(idx, 1, "task b rejects at its own call_1 index"),
+        other => panic!("exactly one opposite-order batch must win, got {other:?}"),
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Pending Approvals (server-owned correlation records)
 // -----------------------------------------------------------------------------
@@ -4080,6 +4140,66 @@ async fn pg_consume_approvals_batch_is_all_or_nothing_on_replay() {
         call_2.is_none(),
         "a rolled-back batch must not strand an otherwise-fresh sibling approval"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn pg_consume_approvals_opposite_order_batches_do_not_deadlock() {
+    // Two resumes for the same (owner, response) consume the same two ids in
+    // OPPOSITE caller order. Without a deterministic lock order the two
+    // transactions could each hold one row and block on the other, deadlocking
+    // (PostgreSQL aborts one with SQLSTATE 40P01, surfaced here as an error).
+    // consume_approvals sorts ids before locking, so both transactions take
+    // call_1 then call_2 and merely serialize: exactly one claims the batch, the
+    // other is rejected, and neither errors or hangs.
+    let store = Arc::new(make_pg_store().await);
+    seed_pending(store.as_ref(), "tenant_a", RESP, &["call_1", "call_2"]).await;
+
+    let store_a = Arc::clone(&store);
+    let store_b = Arc::clone(&store);
+    let task_a = tokio::spawn(async move {
+        store_a
+            .consume_approvals(
+                &crate::test_utils::test_owner("tenant_a"),
+                RESP,
+                &["call_1", "call_2"],
+                1000,
+            )
+            .await
+    });
+    let task_b = tokio::spawn(async move {
+        store_b
+            .consume_approvals(
+                &crate::test_utils::test_owner("tenant_a"),
+                RESP,
+                &["call_2", "call_1"],
+                1000,
+            )
+            .await
+    });
+
+    let (join_a, join_b) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        (task_a.await, task_b.await)
+    })
+    .await
+    .expect("opposite-order batches must not deadlock");
+    let a = join_a.expect("task a should join").expect("consume a should not error");
+    let b = join_b.expect("task b should join").expect("consume b should not error");
+
+    let claimed = usize::from(a.is_none()) + usize::from(b.is_none());
+    let rejected = usize::from(a.is_some()) + usize::from(b.is_some());
+    assert_eq!(claimed, 1, "exactly one opposite-order batch must claim both approvals");
+    assert_eq!(rejected, 1, "exactly one opposite-order batch must be rejected");
+
+    // Both ids are burned regardless of which batch won: the winner consumed the
+    // whole batch, so a fresh single-id consume of each now finds it gone.
+    for id in ["call_1", "call_2"] {
+        let replay = store
+            .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &[id], 2000)
+            .await
+            .expect("replay consume should succeed");
+        assert!(replay.is_some(), "the winning batch must have consumed {id}");
+    }
 }
 
 #[tokio::test]
