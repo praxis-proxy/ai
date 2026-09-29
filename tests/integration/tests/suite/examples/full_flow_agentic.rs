@@ -148,7 +148,7 @@ fn route_conversations_to_openai(yaml: &str) -> String {
 
 #[test]
 fn full_flow_validates_before_parsing_tools() {
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("agentic/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let validate = yaml
         .find("      - filter: openai_responses_validate")
@@ -260,7 +260,7 @@ fn full_flow_openai_provider_passes_conversations_through() {
     let backend = StatefulCapturingBackend::new(vec![(200, provider_response.to_string())]).start_with_shutdown();
     let proxy_port = free_port();
     let db = TempSqlite::new("full_flow_openai_conversations");
-    let yaml = std::fs::read_to_string(example_config_path("openai/responses/full-flow-agentic.yaml"))
+    let yaml = std::fs::read_to_string(example_config_path("agentic/full-flow-agentic.yaml"))
         .expect("example config should exist");
     let yaml = route_conversations_to_openai(&yaml)
         .replace("sqlite://responses.db?mode=rwc", db.url())
@@ -1622,7 +1622,7 @@ fn full_flow_agentic_irr_step_contains_all_hosted_tool_dispatchers() {
 
 #[test]
 fn full_flow_agentic_establishes_scoped_callout_credentials_before_irr() {
-    let path = example_config_path("openai/responses/full-flow-agentic.yaml");
+    let path = example_config_path("agentic/full-flow-agentic.yaml");
     let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let config: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("config should be valid YAML");
     let outer_filters = config["filter_chains"][0]["filters"]
