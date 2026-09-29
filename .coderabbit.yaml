@@ -329,17 +329,24 @@ reviews:
     # ---------------------------------------------------------------
     # Persisted-state layer (tenant isolation, SSRF, TLS)
     # ---------------------------------------------------------------
-    - path: "apis/src/store/**"
+    - path: "store/src/url_security.rs"
       instructions: |
-        Flag store-backend changes that skip SSRF validation of the connection
-        host: DNS hostnames, localhost, loopback, private, link-local, and
-        unspecified addresses must be rejected by default unless a narrow
-        opt-in (e.g. allow_private_database_url) is set, and host validation
-        must re-run on every connection attempt (not cached at construction) to
-        defend against DNS rebinding. Flag a config selecting a store backend
-        not compiled into the binary being accepted at request time instead of
-        rejected while the pipeline is built.
+        Store connection-host SSRF gate. DNS hostnames, localhost, loopback,
+        private, link-local, and unspecified addresses must be rejected by
+        default unless the narrow allow_private_database_url opt-in is set, and
+        host validation must re-run on every connection attempt (not cached at
+        construction) to defend against DNS rebinding. Flag weakening either
+        property.
 
+    - path: "store/src/factory.rs"
+      instructions: |
+        Flag a config selecting a store backend not compiled into the binary
+        being accepted at request time instead of rejected while the pipeline is
+        built — backend availability must fail closed at build, not at the first
+        request.
+
+    - path: "store-backends/**"
+      instructions: |
         For per-tenant data-row queries against the response, conversation,
         item, and approval tables, flag any statement (SELECT/UPDATE/DELETE/CAS/
         upsert) that does not scope by the full owner identity tenant_id AND
@@ -352,7 +359,7 @@ reviews:
         SQL string via format!/AssertSqlSafe instead of being passed as a bound
         ? parameter.
 
-    - path: "apis/src/store/postgres*.rs"
+    - path: "store-backends/src/postgres*.rs"
       instructions: |
         Preserve the certificate-authentication compliance profile. When
         require_certificate_authentication is set, PgTlsConfig::validate must
