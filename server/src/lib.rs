@@ -4,11 +4,19 @@
 //! Server bootstrap for Praxis AI.
 
 pub(crate) mod pipelines;
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+pub mod readiness;
 pub(crate) mod reload;
 mod server;
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+mod store_config;
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+pub mod store_provision;
 mod subrequest;
 pub(crate) mod watcher;
 pub use pipelines::resolve_pipelines;
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+pub use pipelines::validate_pipelines_with_store_wiring;
 pub use praxis_ai_filters::install_pipeline_extensions;
 pub use praxis_core::logging::init_tracing;
 pub use server::{
@@ -16,6 +24,26 @@ pub use server::{
     run_server_with_registry,
 };
 pub use subrequest::create_subrequest_client;
+
+/// Per-listener response-store registries threaded through serve, reload, and
+/// pipeline resolution.
+#[cfg(feature = "store")]
+pub(crate) type StoreRegistries = std::collections::HashMap<String, praxis_ai_apis::store::ResponseStoreRegistry>;
+
+/// Serving-runtime command handle used to provision store generations during
+/// config reload. Backend-free builds carry a placeholder because they have no
+/// concrete factory or pool lifecycle to drive.
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+pub(crate) type StoreReloadHandle = store_provision::StoreReloadHandle;
+/// Feature-off placeholder for [`StoreReloadHandle`].
+#[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+#[derive(Clone, Default)]
+pub(crate) struct StoreReloadHandle(std::marker::PhantomData<()>);
+
+/// A shared, swappable handle to the current cluster health registry. Reload
+/// stores a freshly built registry here so the readiness endpoint reads current
+/// cluster health rather than the snapshot captured at startup.
+pub(crate) type SharedHealthRegistry = std::sync::Arc<std::sync::Mutex<praxis_core::health::HealthRegistry>>;
 
 // -----------------------------------------------------------------------------
 // Constants

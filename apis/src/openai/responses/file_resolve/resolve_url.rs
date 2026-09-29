@@ -5,12 +5,13 @@
 
 use std::net::IpAddr;
 
+use praxis_ai_store::url_security::is_cloud_metadata;
 use praxis_core::connectivity::normalize_mapped_ipv4;
 
 use super::resolve::{ResolveError, ResolvedFile, max_content_bytes_for_data_url};
 use crate::{
     callout_target::AddressPolicy,
-    openai::{responses::content_parts::infer_mime_from_filename, url_security::is_cloud_metadata},
+    openai::responses::content_parts::infer_mime_from_filename,
     subrequest::{SubRequest, SubRequestClient},
 };
 
@@ -505,7 +506,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::openai::url_security::is_file_url_ssrf_blocked;
+    use praxis_ai_store::url_security::is_file_url_ssrf_blocked;
 
     fn test_client() -> SubRequestClient {
         crate::subrequest::isolated_client(4)

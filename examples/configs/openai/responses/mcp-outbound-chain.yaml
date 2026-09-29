@@ -53,7 +53,7 @@ listeners:
 filter_chains:
   - name: responses-pipeline
     filters:
-      - filter: openai_responses_format
+      - filter: openai_responses_request
         on_invalid: continue
         headers:
           format: x-praxis-ai-format

@@ -36,11 +36,11 @@ use praxis_ai_apis::{
     StateOwner,
     store::{
         CompressionAlgorithm, PgTlsConfig, PostgresResponseStore, ResponseRecord, ResponseStore, SqliteResponseStore,
-        SslMode, StoreCompressionConfig,
+        SslMode, StoreCompressionConfig, to_pg_ssl_mode,
     },
 };
 use serde_json::{Value, json};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 /// Payload scales exercised by every backend and compression setting.
 const SCALES: [usize; 3] = [1, 8, 64];
@@ -333,7 +333,7 @@ async fn drop_pg_tables(url: &str, tls: &PgTlsConfig<'_>, tables: &[&str]) {
     let options = url
         .parse::<PgConnectOptions>()
         .expect("parse database url")
-        .ssl_mode(PgSslMode::from(tls.ssl_mode.unwrap_or_default()));
+        .ssl_mode(to_pg_ssl_mode(tls.ssl_mode.unwrap_or_default()));
     let pool = PgPoolOptions::new()
         .connect_with(options)
         .await
@@ -431,7 +431,7 @@ async fn postgres_stored_bytes(url: &str, tls: &PgTlsConfig<'_>, table: &str, id
     let options = url
         .parse::<PgConnectOptions>()
         .expect("parse database url")
-        .ssl_mode(PgSslMode::from(tls.ssl_mode.unwrap_or_default()));
+        .ssl_mode(to_pg_ssl_mode(tls.ssl_mode.unwrap_or_default()));
     let pool = PgPoolOptions::new().connect_with(options).await.expect("size connect");
     let sql = format!(
         "SELECT (pg_column_size(response_object) + pg_column_size(input) + pg_column_size(messages))::bigint \

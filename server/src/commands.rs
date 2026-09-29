@@ -43,6 +43,15 @@ pub(crate) fn validate_config_for_startup(config: &Config) -> Result<(), Box<dyn
     }
     let health_registry = praxis_core::health::build_health_registry(&config.clusters);
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    praxis_ai::validate_pipelines_with_store_wiring(
+        config,
+        &registry,
+        &health_registry,
+        &kv_stores,
+        &subrequest_client,
+    )?;
+    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
     praxis_ai::resolve_pipelines(config, &registry, &health_registry, &kv_stores, &subrequest_client)?;
     Ok(())
 }
@@ -134,6 +143,108 @@ filter_chains:
         .unwrap();
         let result = validate_config_for_startup(&config);
         assert!(result.is_err(), "unknown filter type should fail validation");
+    }
+
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "complete conflicting listener fixture")]
+    fn validate_rejects_conflicting_listener_store_configs() {
+        praxis_ai::install_crypto_provider();
+        #[cfg(feature = "store-sqlite")]
+        let (backend, first_url, second_url) = ("sqlite", "sqlite:///first.db", "sqlite:///second.db");
+        #[cfg(all(not(feature = "store-sqlite"), feature = "store-postgres"))]
+        let (backend, first_url, second_url) = (
+            "postgres",
+            "postgresql://user:password@8.8.8.8/store",
+            "postgresql://user:password@1.1.1.1/store",
+        );
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_response_store
+        backend: {backend}
+        database_url: "{first_url}"
+        responses_table: responses
+        conversations_table: conversations
+      - filter: openai_response_store
+        backend: {backend}
+        database_url: "{second_url}"
+        responses_table: responses
+        conversations_table: conversations
+"#
+        ))
+        .expect("conflicting store config should parse");
+
+        let error =
+            validate_config_for_startup(&config).expect_err("CLI validation must match startup store validation");
+        assert!(error.to_string().contains("conflicting stores"), "got: {error}");
+    }
+
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "complete provider trust and store fixture")]
+    fn validate_preserves_first_position_provider_trust_with_store_gate() {
+        praxis_ai::install_crypto_provider();
+        #[cfg(feature = "store-sqlite")]
+        let (backend, database_url, backend_options) = ("sqlite", "sqlite::memory:", "");
+        #[cfg(all(not(feature = "store-sqlite"), feature = "store-postgres"))]
+        let (backend, database_url, backend_options) = (
+            "postgres",
+            "postgresql://user:password@8.8.8.8/store",
+            "        ssl_mode: disable\n",
+        );
+        let config = Config::from_yaml(&format!(
+            r#"
+listeners:
+  - name: provider
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+    tls:
+      certificates:
+        - cert_path: /tmp/provider-cert.pem
+          key_path: /tmp/provider-key.pem
+      client_ca:
+        ca_path: /tmp/provider-ca.pem
+      client_cert_mode: require
+filter_chains:
+  - name: main
+    filters:
+      - filter: peer_identity_trust
+        trusted_peers:
+          - organization: ai-grid
+      - filter: provider_route
+        provider_id: test-provider
+        routes:
+          - candidate_id: test-candidate
+            cluster: backend
+            model: test-model
+            paths: [/v1/responses]
+      - filter: state_owner
+        mode: single_tenant
+        tenant_id: test
+      - filter: openai_response_store
+        backend: {backend}
+        database_url: "{database_url}"
+{backend_options}        responses_table: responses
+        conversations_table: conversations
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints: ["127.0.0.1:12345"]
+insecure_options:
+  allow_private_endpoints: true
+  skip_pipeline_validation: true
+"#
+        ))
+        .expect("provider store config should parse");
+
+        validate_config_for_startup(&config).expect("the readiness gate must not displace first-position peer trust");
     }
 
     #[test]

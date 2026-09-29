@@ -1,115 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Connection pool tuning configuration shared by all store backends.
+//! Apply the SQL-free [`PoolConfig`] to a sqlx [`PoolOptions`].
+//!
+//! The config type and its validation live in the backend-free `praxis-ai-store`
+//! crate. This module keeps only the sqlx-dependent conversion.
 
-use std::time::Duration;
-
-use serde::Deserialize;
+use praxis_ai_store::PoolConfig;
 use sqlx::{Database, pool::PoolOptions};
-
-/// sqlx's implicit `max_connections` when the option is left unset.
-///
-/// Mirrors [`sqlx::pool::PoolOptions::new`], which starts every pool at
-/// 10. Validation reasons about this *effective* maximum so a
-/// `min_connections` above it is rejected even when `max_connections`
-/// is omitted — otherwise the runtime could never reach the requested
-/// prewarmed minimum.
-const DEFAULT_MAX_CONNECTIONS: u32 = 10;
-
-/// Connection pool tuning options for store backends.
-///
-/// All fields are optional. When omitted, the sqlx defaults apply:
-/// `max_connections = 10`, `min_connections = 0`,
-/// `idle_timeout = 600s (10 min)`, `acquire_timeout = 30s`.
-///
-/// `min_connections` must not exceed the *effective* maximum: the
-/// explicit `max_connections` when set, otherwise the sqlx default of
-/// 10. Requesting a larger minimum without also raising
-/// `max_connections` is rejected at config load.
-///
-/// # YAML
-///
-/// ```yaml
-/// pool:
-///   max_connections: 20
-///   min_connections: 2
-///   idle_timeout_secs: 600
-///   acquire_timeout_secs: 30
-/// ```
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PoolConfig {
-    /// Maximum number of connections in the pool.
-    #[serde(default)]
-    pub max_connections: Option<u32>,
-
-    /// Minimum number of idle connections to maintain.
-    #[serde(default)]
-    pub min_connections: Option<u32>,
-
-    /// Maximum time (in seconds) a connection can sit idle before
-    /// being closed. Set to `0` to disable idle timeout.
-    #[serde(default)]
-    pub idle_timeout_secs: Option<u64>,
-
-    /// Maximum time (in seconds) to wait when acquiring a connection
-    /// from the pool.
-    #[serde(default)]
-    pub acquire_timeout_secs: Option<u64>,
-}
-
-impl PoolConfig {
-    /// Reject invalid values that would cause confusing runtime
-    /// failures (e.g. a zero-connection pool that deadlocks on the
-    /// first query).
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.max_connections == Some(0) {
-            return Err("pool.max_connections must be at least 1".into());
-        }
-        if self.acquire_timeout_secs == Some(0) {
-            return Err(
-                "pool.acquire_timeout_secs must be at least 1 (use idle_timeout_secs: 0 to disable idle timeout)"
-                    .into(),
-            );
-        }
-        if let Some(min) = self.min_connections {
-            match self.max_connections {
-                Some(max) if min > max => {
-                    return Err(format!(
-                        "pool.min_connections ({min}) must not exceed pool.max_connections ({max})"
-                    ));
-                },
-                None if min > DEFAULT_MAX_CONNECTIONS => {
-                    return Err(format!(
-                        "pool.min_connections ({min}) must not exceed the default pool.max_connections \
-                         ({DEFAULT_MAX_CONNECTIONS}); set pool.max_connections explicitly to raise the maximum"
-                    ));
-                },
-                _ => {},
-            }
-        }
-        Ok(())
-    }
-
-    /// Convert `idle_timeout_secs` to a [`Duration`], treating `0`
-    /// as "no timeout" (returns `None`).
-    #[expect(clippy::option_option, reason = "three-valued: unset / disabled(0) / duration")]
-    pub(crate) fn idle_timeout(&self) -> Option<Option<Duration>> {
-        self.idle_timeout_secs.map(|secs| {
-            if secs == 0 {
-                None
-            } else {
-                Some(Duration::from_secs(secs))
-            }
-        })
-    }
-
-    /// Convert `acquire_timeout_secs` to a [`Duration`].
-    pub(crate) fn acquire_timeout(&self) -> Option<Duration> {
-        self.acquire_timeout_secs.map(Duration::from_secs)
-    }
-}
 
 /// Apply user-supplied pool tuning to a [`PoolOptions`].
 pub(crate) fn apply_pool_config<DB: Database>(
@@ -142,7 +40,27 @@ pub(crate) fn apply_pool_config<DB: Database>(
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::unwrap_used, reason = "tests")]
 mod tests {
-    use super::*;
+    use std::time::Duration;
+
+    use praxis_ai_store::{DEFAULT_MAX_CONNECTIONS, PoolConfig};
+
+    // The min-vs-implicit-max check hinges on `DEFAULT_MAX_CONNECTIONS`
+    // equaling sqlx's actual default. sqlx documents that value only as
+    // "see the source", so a future bump could change it silently and
+    // re-open the issue this validation closes. Pin it here, using
+    // whichever driver is compiled (both share the generic default).
+    #[cfg(any(feature = "postgres", feature = "sqlite"))]
+    #[test]
+    fn default_max_connections_matches_sqlx_default() {
+        #[cfg(feature = "postgres")]
+        let sqlx_default = sqlx::postgres::PgPoolOptions::new().get_max_connections();
+        #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+        let sqlx_default = sqlx::sqlite::SqlitePoolOptions::new().get_max_connections();
+        assert_eq!(
+            sqlx_default, DEFAULT_MAX_CONNECTIONS,
+            "sqlx default max_connections drifted from DEFAULT_MAX_CONNECTIONS; re-verify the issue #1253 fix"
+        );
+    }
 
     #[test]
     fn default_pool_config_has_no_overrides() {
@@ -343,24 +261,6 @@ acquire_timeout_secs: 30
         assert!(
             cfg.validate().is_ok(),
             "min_connections above the default is valid when an explicit larger max is set"
-        );
-    }
-
-    // The min-vs-implicit-max check hinges on `DEFAULT_MAX_CONNECTIONS`
-    // equaling sqlx's actual default. sqlx documents that value only as
-    // "see the source", so a future bump could change it silently and
-    // re-open the issue this validation closes — pin it here. Uses
-    // whichever driver is compiled (both share the generic default).
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
-    #[test]
-    fn default_max_connections_matches_sqlx_default() {
-        #[cfg(feature = "store-postgres")]
-        let sqlx_default = sqlx::postgres::PgPoolOptions::new().get_max_connections();
-        #[cfg(all(feature = "store-sqlite", not(feature = "store-postgres")))]
-        let sqlx_default = sqlx::sqlite::SqlitePoolOptions::new().get_max_connections();
-        assert_eq!(
-            sqlx_default, DEFAULT_MAX_CONNECTIONS,
-            "sqlx default max_connections drifted from DEFAULT_MAX_CONNECTIONS; re-verify the issue #1253 fix"
         );
     }
 

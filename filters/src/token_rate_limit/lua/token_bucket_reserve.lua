@@ -90,9 +90,9 @@ local function refresh_rule_telemetry_ttl()
 end
 redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now_ms)
 local key_exists = redis.call('EXISTS', KEYS[1]) == 1
-if not key_exists and redis.call('ZCARD', KEYS[3]) >= max_keys then
+if not key_exists and redis.call('ZCARD', KEYS[9]) >= max_keys then
   refresh_rule_telemetry_ttl()
-  return {0, 1, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[9])}
+  return {2, 1, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[9])}
 end
 if active_total >= max_active then
   if key_exists then

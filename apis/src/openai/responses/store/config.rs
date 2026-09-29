@@ -4,13 +4,14 @@
 //! Configuration types for the response store filter.
 
 use percent_encoding::percent_decode_str;
+use praxis_ai_store::{PoolConfig, SslMode, validate_table_identifier};
 use praxis_filter::{FilterError, has_dot_dot_traversal};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 
+use crate::store::StoreCompressionConfig;
 #[cfg(feature = "store-postgres")]
 use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifiers};
-use crate::store::{PoolConfig, SslMode, StoreCompressionConfig, validate_table_identifier};
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_response_store";
@@ -235,21 +236,6 @@ fn validate_sqlite_database_url(database_url: &str) -> Result<(), FilterError> {
     Ok(())
 }
 
-/// Re-validate only the `PostgreSQL` host/IP portions of the
-/// connection URL immediately before `SQLx` resolves and connects.
-///
-/// Full config validation runs once at construction time in
-/// [`validate_config`]. This narrower check guards against DNS
-/// rebinding between validation and connection by re-checking
-/// the SSRF-sensitive host rules on every retry without
-/// redundantly re-validating immutable fields (table names, SSL
-/// config, URL scheme).
-#[cfg(feature = "store-postgres")]
-pub(crate) fn revalidate_postgres_host(cfg: &ResponseStoreConfig) -> Result<(), FilterError> {
-    let database_url = cfg.database_url.expose_secret();
-    postgres_url::revalidate_postgres_host(FILTER_NAME, database_url, cfg.allow_private_database_url)
-}
-
 /// Validate `PostgreSQL` TLS options.
 #[cfg(feature = "store-postgres")]
 fn validate_postgres_ssl_config(cfg: &ResponseStoreConfig, database_url: &str) -> Result<(), FilterError> {
@@ -286,14 +272,21 @@ fn reject_postgres_fields(cfg: &ResponseStoreConfig) -> Result<(), FilterError> 
 
 /// Return whether a SQLite URL targets an in-memory database.
 fn is_memory_database_url(database_url: &str) -> bool {
-    let url = database_url.trim();
-    if url == "sqlite::memory:" || url == "sqlite://:memory:" {
+    let url = database_url
+        .trim()
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.trim().strip_prefix("sqlite:"))
+        .unwrap_or_else(|| database_url.trim());
+    let (database, query) = url.split_once('?').unwrap_or((url, ""));
+    let database = percent_decode_str(database).decode_utf8_lossy();
+    if matches!(database.as_ref(), ":memory:" | "file::memory:") {
         return true;
     }
-    url.split_once('?')
-        .map_or("", |(_, query)| query)
-        .split('&')
-        .any(|param| param == "mode=memory")
+    query.split('&').any(|param| {
+        percent_decode_str(param)
+            .decode_utf8_lossy()
+            .eq_ignore_ascii_case("mode=memory")
+    })
 }
 
 /// Extract the file path component from a SQLite URL.
