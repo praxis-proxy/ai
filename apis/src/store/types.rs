@@ -150,6 +150,7 @@ pub struct PendingApprovalRecord {
 /// Variants carry `String` payloads (not typed inner errors) to
 /// avoid coupling the trait to any specific database driver.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StoreError {
     /// No resource exists in the authorized owner scope.
     NotFound,
