@@ -35,7 +35,7 @@ backends and applies policy.
   and [Conversations example](examples/configs/openai/conversations/conversations.yaml).
 - **Connect tools and agents.** Run Responses tool loops with MCP, web search,
   and file search; route stateless MCP calls and A2A task follow-ups. See the
-  [agentic Responses](examples/configs/openai/responses/full-flow-agentic.yaml),
+  [agentic Responses](examples/configs/agentic/full-flow-agentic.yaml),
   [MCP broker](examples/configs/mcp-stateless-broker.yaml), and
   [A2A routing](examples/configs/a2a-task-routing.yaml) examples.
 - **Apply policy and measure usage.** Inject upstream credentials, enrich
