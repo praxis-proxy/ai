@@ -86,23 +86,13 @@ use crate::{
     callout_identity::{McpCalloutIdentity, stage_mcp_callout_identity},
     json_body::serialized_len,
     mcp_client,
+    service::responses::ResponsesService,
     state_owner::StateOwner,
-    store::{OwnerScopedResponseStore, PendingApprovalRecord, ResponseStoreRegistry},
+    store::{PendingApprovalRecord, ResponseStoreRegistry},
 };
 
 /// Step-local metadata carrying the configured response fan-out cap to the owner.
 const MAX_CALLS_METADATA: &str = "responses.mcp_max_calls_per_round";
-
-/// Maximum `mcp_approval_response` items accepted in one resume request.
-///
-/// A round may emit several `mcp_approval_request` items (batched or parallel
-/// tool calls), each persisted as its own server-owned pending record. Those are
-/// resumed one per follow-up request: a resume turn legitimately carries a single
-/// approval. Capping the batch bounds the fail-closed work per request and keeps
-/// the server-owned consume query within `PostgreSQL`'s 16-bit Bind parameter
-/// ceiling (it binds two scoping params plus one per approval id), which an
-/// unbounded batch could otherwise overflow into an HTTP 500.
-const MAX_APPROVAL_RESPONSES: usize = 1;
 
 /// Whether this internally resolved tool entry names a configured connector.
 ///
@@ -421,14 +411,22 @@ impl McpDispatchFilter {
             if responses.is_empty() {
                 return Ok(());
             }
-            // Bound the batch before any store work. Each round's approvals are
-            // resumed one per follow-up request, so a resume carries a single
-            // approval; a larger batch is a client error and, left unbounded,
-            // could overflow PostgreSQL's 16-bit Bind parameter ceiling in the
-            // consume query.
-            if responses.len() > MAX_APPROVAL_RESPONSES {
+            // Bound the batch before any store work. A single model round can emit
+            // several `mcp_approval_request` items (batched or parallel tool
+            // calls), so a resume turn legitimately carries several matching
+            // `mcp_approval_response` items. The per-round MCP cap already bounds
+            // how many approvals one round could have emitted, so it is the
+            // natural ceiling for the resume batch: it keeps the fail-closed work
+            // per request finite and holds the server-owned pending-approval load
+            // query (`get_pending_approvals`, one `IN (...)` placeholder per
+            // approval id in a single statement) far under PostgreSQL's 16-bit Bind
+            // parameter ceiling (max_calls_per_round is capped at 1024, versus the
+            // ~65k parameter limit). A larger batch than one round could have
+            // produced is a client error.
+            let max_batch = self.max_calls_per_round;
+            if responses.len() > max_batch {
                 let e = ApprovalError::Malformed(format!(
-                    "a request may carry at most {MAX_APPROVAL_RESPONSES} mcp_approval_response item(s), but {} were supplied",
+                    "a request may carry at most {max_batch} mcp_approval_response item(s) (max_calls_per_round), but {} were supplied",
                     responses.len()
                 ));
                 warn!(error = %e.message(), "mcp_dispatch: rejecting oversized approval-response batch");
@@ -457,6 +455,24 @@ impl McpDispatchFilter {
                     },
                 }
             }
+            // Reject a repeated approval_request_id before any store access. Each
+            // proxy-issued mcp_approval_request carries a unique id, so a batch that
+            // names one twice is ambiguous (which verdict wins?) and a client
+            // error. Failing closed here is clearer than letting the atomic
+            // all-or-nothing consume roll back the whole batch and misreport the
+            // repeat as an "already used" replay, and it keeps the store queries
+            // duplicate-free.
+            let mut seen_ids = HashSet::with_capacity(inputs.len());
+            for input in &inputs {
+                if !seen_ids.insert(input.approval_id.as_str()) {
+                    let e = ApprovalError::Malformed(format!(
+                        "an mcp_approval_response batch must not repeat approval_request_id '{}'",
+                        input.approval_id
+                    ));
+                    warn!(error = %e.message(), "mcp_dispatch: rejecting duplicate approval-response id");
+                    return Err(approval_rejection(&e));
+                }
+            }
             (inputs, previous_response_id)
         };
 
@@ -469,16 +485,17 @@ impl McpDispatchFilter {
         let owner = ctx.extensions.get::<StateOwner>().cloned().ok_or_else(|| {
             responses_error_rejection(401, "missing_state_owner", "trusted state owner assertion is required")
         })?;
-        let store = ctx
+        let service = ctx
             .extensions
             .get::<ResponseStoreRegistry>()
             .and_then(|registry| registry.get_scoped(DEFAULT_STORE_NAME, &owner))
+            .map(ResponsesService::new)
             .ok_or_else(|| {
                 warn!("mcp_dispatch: response store unavailable while resuming approvals");
                 responses_error_rejection(500, "server_error", "response store is not available")
             })?;
         let approval_ids: Vec<&str> = inputs.iter().map(|i| i.approval_id.as_str()).collect();
-        let pending_records = store
+        let pending_records = service
             .get_pending_approvals(&previous_response_id, &approval_ids)
             .await
             .map_err(|e| {
@@ -521,7 +538,7 @@ impl McpDispatchFilter {
         // approval was already consumed (replay) rather than never issued.
         let consumed_at = i64::try_from(ctx.time_source.now().as_millis()).unwrap_or(i64::MAX);
         let claim_ids: Vec<&str> = resolved.iter().map(|d| d.approval_id.as_str()).collect();
-        consume_batch(&store, &previous_response_id, &claim_ids, consumed_at).await?;
+        consume_batch(&service, &previous_response_id, &claim_ids, consumed_at).await?;
 
         // Phase 4: apply the decisions to request-scoped state.
         let Some(state) = ctx.extensions.get_mut::<ResponsesState>() else {
@@ -544,12 +561,12 @@ impl McpDispatchFilter {
 /// rejects the whole batch without consuming any id, so a corrected retry can
 /// still resume the legitimately approved calls.
 async fn consume_batch(
-    store: &OwnerScopedResponseStore,
+    service: &ResponsesService,
     response_id: &str,
     approval_ids: &[&str],
     consumed_at: i64,
 ) -> Result<(), Rejection> {
-    match store.consume_approvals(response_id, approval_ids, consumed_at).await {
+    match service.consume_approvals(response_id, approval_ids, consumed_at).await {
         Ok(None) => Ok(()),
         Ok(Some(index)) => {
             let approval_id = approval_ids.get(index).copied().unwrap_or_default();

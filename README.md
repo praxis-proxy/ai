@@ -5,29 +5,44 @@
 [![MSRV: 1.96](https://img.shields.io/badge/MSRV-1.96-brightgreen.svg)](https://blog.rust-lang.org/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**Praxis AI provides the components to build an AI Gateway.** It extends
-[Praxis](https://github.com/praxis-proxy/praxis) with provider-aware filters,
-agentic protocols, response storage, guardrails, and observability—all
-configured at the proxy layer.
-
-Use it to route requests by model or API format, translate between provider
-protocols, enrich prompts, manage OpenAI Responses state, broker MCP and A2A
-traffic, and expose token usage without coupling those concerns to every
-application.
+**Praxis AI is an AI gateway built on
+[Praxis](https://github.com/praxis-proxy/praxis).** It brings provider-aware
+routing, protocol translation, stateful OpenAI APIs, and agent traffic into a
+configurable proxy. Clients keep their API shape while the gateway selects
+backends and applies policy.
 
 ## What can it do?
 
-- **Route AI traffic** by model, provider format, tool composition, or other
-  facts extracted from a request.
-- **Bridge provider APIs** with support for OpenAI Responses and Conversations,
-  Anthropic Messages, and streaming event translation.
-- **Support agentic workloads** through MCP and A2A classification, brokering,
-  and routing.
-- **Add gateway capabilities** such as credential injection, prompt enrichment,
-  external guardrails, token accounting, and SQLite or PostgreSQL response
-  storage.
-- **Stay extensible** with custom Rust filters built on Praxis's `HttpFilter`
-  interface.
+- **Route by what a request contains.** Classify OpenAI Responses, Chat
+  Completions, and Anthropic Messages traffic; select backends by API format,
+  model, or MCP tool name. See the
+  [unified gateway](examples/configs/anthropic/unified-gateway.yaml) and
+  [intelligent routing](examples/configs/intelligent-route-all-capabilities.yaml)
+  examples.
+- **Proxy or translate provider APIs.** Forward native provider traffic or
+  serve Anthropic Messages and OpenAI Responses clients from Chat
+  Completions-compatible backends, including streaming responses. See the
+  [Anthropic](examples/configs/anthropic/messages-to-openai.yaml)
+  and [Responses](examples/configs/openai/responses/codex-http-chat-translation.yaml)
+  examples.
+- **Code harness support.** Run Codex through OpenAI Responses and Claude Code
+  through Anthropic Messages. The
+  [coding client guide](docs/developing/cli-vllm-through-praxis.md) shows both
+  clients reaching native vLLM endpoints or Chat Completions through translation.
+- **Manage OpenAI response state.** Persist and rehydrate Responses history,
+  serve Conversations endpoints locally, and use PostgreSQL or SQLite for
+  storage. See the [response store guide](docs/architecture/response-store.md)
+  and [Conversations example](examples/configs/openai/conversations/conversations.yaml).
+- **Connect tools and agents.** Run Responses tool loops with MCP, web search,
+  and file search; route stateless MCP calls and A2A task follow-ups. See the
+  [agentic Responses](examples/configs/openai/responses/full-flow-agentic.yaml),
+  [MCP broker](examples/configs/mcp-stateless-broker.yaml), and
+  [A2A routing](examples/configs/a2a-task-routing.yaml) examples.
+- **Apply policy and measure usage.** Inject upstream credentials, enrich
+  prompts, call external guardrails, expose token usage, and report metering
+  data. See the [feature overview](docs/features.md) for details.
+- **Extend the pipeline** with custom Rust filters built on Praxis's
+  `HttpFilter` interface.
 
 See the [complete feature overview](docs/features.md) and
 [filter reference](docs/filters/README.md) for the full list.
@@ -37,29 +52,16 @@ See the [complete feature overview](docs/features.md) and
 Clients keep their provider-native protocols while Praxis AI classifies,
 transforms, and routes traffic through one policy-driven gateway.
 
-![Praxis AI architecture](assets/praxis-ai-architecture.svg)
+![Codex and other OpenAI clients, Claude Code and other Anthropic clients, and MCP and A2A traffic flow through Praxis AI to inference and agent backends, with side services for tools, storage, guardrails, and metering](assets/praxis-ai-architecture.svg)
 
-### Why is this separate from praxis-proxy/praxis?
+### Praxis AI and Praxis
 
-The [praxis-proxy/praxis] repository is considered the "core" framework
-and standard server build for Praxis.
-
-The separation of repositories for clear contiguous themes in the Praxis
-organization is a **very explicit** choice at the core of Praxis architectural
-philosophy. We practice a very diligent separation of concerns. This
-particular separation provides:
-
-* This Cleanly separates different technical domains and competencies for
-  our contributors.
-* The `praxis-proxy/praxis` core repo no need for dependency on `ai`: we
-  explicitly support standard use cases without AI.
-* Reduces the tendency for overreach from one subsystem to another, which
-  encourages cleaner APIs and library surfaces.
-* AI capabilities generally move and change **much faster** than the standard
-  networking proxy technology in core, as that ecosystem is very mature.
-
-See our [conventions] for more details on our development practices and
-philosophies.
+[Praxis][praxis-proxy/praxis] supplies the proxy runtime, listeners, TLS, load
+balancing, and filter framework. Praxis AI packages the AI-specific filters
+and server on top of it. Keeping them in separate repositories lets the AI
+integrations evolve independently while Praxis remains useful for general
+proxy workloads. See our [conventions] for the project structure and
+development practices.
 
 [praxis-proxy/praxis]:https://github.com/praxis-proxy/praxis
 [conventions]:https://github.com/praxis-proxy/conventions

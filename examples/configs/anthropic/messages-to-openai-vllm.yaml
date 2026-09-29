@@ -37,10 +37,10 @@
 # The gateway password is resolved from `GATEWAY_AUTH_PASSWORD` at pipeline
 # build time; set it (and `VLLM_API_KEY`) in the proxy's environment.
 #
-# Note: `/v1/messages/count_tokens` has no Chat Completions equivalent, so it is
-# NOT rewritten (the `path_rewrite` pattern is anchored to `^/v1/messages$`) and
-# reaches the OpenAI backend as an unknown path. A Chat-Completions-only vLLM
-# returns 404 for it; Claude Code treats native token counting as best-effort
+# Note: `/v1/messages/count_tokens` has no Chat Completions equivalent, so
+# neither body translation nor path rewriting applies to it. A backend that
+# also serves the native endpoint can count tokens; a Chat-Completions-only
+# backend returns 404. Claude Code treats native token counting as best-effort
 # and degrades gracefully.
 
 listeners:
@@ -80,6 +80,9 @@ filter_chains:
       # non-streaming response body back into Anthropic Messages.
       - filter: anthropic_messages_to_chat_completions
         max_body_bytes: 1048576
+        conditions:
+          - when:
+              path: "/v1/messages"
 
       # Convert streaming Chat Completions SSE back into Anthropic SSE. Gated to
       # `text/event-stream` so buffered JSON responses stay on the non-streaming

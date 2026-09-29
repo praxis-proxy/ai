@@ -4,6 +4,8 @@
 //! [`SqliteResponseStore`] — `SQLite` backend for the response store.
 
 use async_trait::async_trait;
+use percent_encoding::percent_decode_str;
+use praxis_ai_store::StateOwner;
 use sqlx::{
     AssertSqlSafe, Row as _, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -11,17 +13,16 @@ use sqlx::{
 use tracing::info;
 
 use super::{
+    ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, PoolConfig,
+    ResponseRecord, ResponseStore, StoreError,
     compression::{StoreCompressionConfig, decode, run_blocking},
-    pool::{PoolConfig, apply_pool_config},
+    pool::apply_pool_config,
     schemas::{
         ActualKeyColumn, ActualTable, ActualUniqueIndex, SCHEMA_VERSION, SchemaCheck, SqlDialect, TableNames,
         check_schema, expected_tables, generate_ddl, pending_approvals_table, schema_version_table,
         sqlite_key_column_folding,
     },
-    trait_def::{ConversationItemStore, ResponseStore},
-    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
 };
-use crate::StateOwner;
 
 // -----------------------------------------------------------------------------
 // SqliteResponseStore
@@ -113,6 +114,14 @@ impl SqliteResponseStore {
             tables,
             compression: compression.cloned().unwrap_or_default(),
         })
+    }
+
+    /// Close the connection pool, releasing its connections.
+    ///
+    /// Called when the backend is retired from the process-wide cache so a
+    /// reload does not leak pools.
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     /// Insert or update a conversation row shared by both store traits.
@@ -212,15 +221,22 @@ fn sqlite_pool_options(database_url: &str, pool_config: Option<&PoolConfig>) -> 
 
 
 /// Return whether the database URL targets an in-memory `SQLite` database.
-fn is_memory_database_url(database_url: &str) -> bool {
-    let url = database_url.trim();
-    if url == "sqlite::memory:" || url == "sqlite://:memory:" {
+pub(crate) fn is_memory_database_url(database_url: &str) -> bool {
+    let url = database_url
+        .trim()
+        .strip_prefix("sqlite://")
+        .or_else(|| database_url.trim().strip_prefix("sqlite:"))
+        .unwrap_or_else(|| database_url.trim());
+    let (database, query) = url.split_once('?').unwrap_or((url, ""));
+    let database = percent_decode_str(database).decode_utf8_lossy();
+    if matches!(database.as_ref(), ":memory:" | "file::memory:") {
         return true;
     }
-    let query = url.split_once('?').map_or("", |(_, q)| q);
-    query
-        .split('&')
-        .any(|param| param == "mode=memory" || param.starts_with("mode=memory&"))
+    query.split('&').any(|param| {
+        percent_decode_str(param)
+            .decode_utf8_lossy()
+            .eq_ignore_ascii_case("mode=memory")
+    })
 }
 
 /// Fetch column names for a `SQLite` table via `PRAGMA table_info`.
@@ -457,7 +473,7 @@ async fn check_schema_version(pool: &SqlitePool, tables: &TableNames) -> Result<
         Some(v) if v == SCHEMA_VERSION => Ok(()),
         Some(v) => Err(StoreError::Database(format!(
             "schema version mismatch in '{vt}': stored version {v}, \
-             expected {SCHEMA_VERSION}; database migration required"
+             expected {SCHEMA_VERSION}; database recreation required"
         ))),
     }
 }
@@ -755,14 +771,19 @@ impl ResponseStore for SqliteResponseStore {
             .await
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        for (index, approval_id) in approval_ids.iter().enumerate() {
+        // Lock rows in a deterministic (id-sorted) order, matching the Postgres
+        // backend for a uniform contract (SQLite serializes writers so it cannot
+        // itself deadlock); the returned index stays the caller-slice position.
+        let mut ordered: Vec<(usize, &str)> = approval_ids.iter().copied().enumerate().collect();
+        ordered.sort_unstable_by_key(|&(_, id)| id);
+        for (index, approval_id) in ordered {
             let result = sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(consumed_at)
                 .bind(owner.tenant_id())
                 .bind(owner.issuer())
                 .bind(owner.subject())
                 .bind(response_id)
-                .bind(*approval_id)
+                .bind(approval_id)
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| StoreError::Database(e.to_string()))?;
@@ -1546,6 +1567,22 @@ mod tests {
             is_memory_database_url("sqlite://:memory:"),
             "slash-form memory URL should be detected"
         );
+    }
+
+    #[test]
+    fn memory_url_forms_with_query_parameters() {
+        for url in [
+            ":memory:",
+            "sqlite://file::memory:",
+            "sqlite://%3Amemory%3A",
+            "sqlite::memory:?cache=shared",
+            "sqlite://:memory:?cache=shared",
+        ] {
+            assert!(
+                is_memory_database_url(url),
+                "memory URL with query parameters should be detected: {url}"
+            );
+        }
     }
 
     #[test]

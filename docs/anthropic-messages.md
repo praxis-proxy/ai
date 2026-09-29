@@ -189,6 +189,50 @@ through the `run_claude_acceptance` workflow-dispatch input. Runtime pins must b
 complete; the job fails fast with an explanatory error if any required value is
 empty or still contains `TBD`.
 
+### Official Anthropic SDK against live vLLM
+
+[`tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py`](../tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py)
+uses the official Anthropic Python SDK against both committed vLLM examples.
+The text matrix checks non-streaming messages and usage, streamed event order
+and final text, `messages.count_tokens`, and automatic `tool_use` followed by a
+`tool_result` and final answer. The translated config can count tokens in this
+matrix because the shared vLLM server also exposes the native count-tokens
+endpoint; a Chat-Completions-only backend cannot. The live SDK step in
+[`vllm-integration.yaml`](../.github/workflows/vllm-integration.yaml) runs this
+matrix against the same Qwen3-8B instance as Claude Code acceptance.
+The first live run returned `end_turn` for a named tool-choice request on both
+routes. The SDK test records that stop-reason mismatch as an expected failure
+when a `tool_use` block is present; named tool-choice semantics remain
+unqualified.
+
+Positive image coverage uses Qwen3-VL-4B-Instruct in the separate
+[`anthropic-vllm-vision.yaml`](../.github/workflows/anthropic-vllm-vision.yaml)
+GPU workflow. It sends generated red and blue PNGs through the SDK and both
+Praxis routes, then checks that the vision model identifies each color. The
+Qwen3-8B text model cannot establish image support. Both workflows set
+`PRAXIS_TEST_REQUIRE_LIVE=1`, so missing infrastructure fails rather than
+silently skipping the tests. Label an upstream PR `vllm-full-suite` to run both
+GPU workflows before merge; the vision workflow also runs on its own schedule
+and after a manual dispatch once it exists on the default branch.
+
+To run either matrix against a local keyed vLLM server, build Praxis and set
+the exact served model name and backend key:
+
+```console
+cargo build -p praxis-ai-proxy
+PRAXIS_TEST_VLLM_BASE_URL=http://127.0.0.1:8000 \
+PRAXIS_TEST_VLLM_MODEL=<served-model-name> \
+VLLM_API_KEY=<backend-bearer-token> \
+PRAXIS_TEST_REQUIRE_LIVE=1 \
+  uv run tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py -s -k "not image"
+# For a separately served vision model, replace the final -k expression with: -k image
+```
+
+This matrix qualifies those named workflows and models. It is not an
+Anthropic Messages conformance gate: other content blocks, request fields,
+server tools, caching, and model-dependent behaviors require separate contract
+and live-backend coverage before a broader support claim.
+
 ## Passthrough to Anthropic API
 
 Route to `api.anthropic.com` with credential

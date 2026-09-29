@@ -22,7 +22,7 @@ name = "praxis-ai"
 path = "src/main.rs"
 
 [features]
-default = ["standard"]
+default = ["full"]
 # Default-on filters that sit behind a gate so minimal builds can drop them.
 standard = ["aws-sigv4-filter", "policy-engine"]
 # The `policy` filter (Praxis Policy Engine) from praxis core. On by default;
@@ -71,9 +71,17 @@ praxis-main = ["praxis-ai-filters/praxis-main"]
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 clap = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
 notify = { workspace = true }
+percent-encoding = { workspace = true }
+pingora-core = { workspace = true }
 praxis-ai-filters = { workspace = true }
+praxis-ai-apis = { workspace = true }
+praxis-ai-store = { workspace = true }
+praxis-ai-store-lifecycle = { workspace = true }
 praxis-ai-llmd-ext-proc = { workspace = true, optional = true }
 praxis-core = { workspace = true }
 # spiffe: enables the peer_identity_trust security builtin, required as the first
@@ -83,6 +91,7 @@ praxis-filter = { workspace = true, features = ["spiffe"] }
 praxis-protocol = { workspace = true, features = ["admin-api", "config-reload"] }
 praxis-tls = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "fs"] }
 tokio-util = { workspace = true }
@@ -100,5 +109,6 @@ praxis-ai-build-support = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 pingora-core = { workspace = true }
+praxis-ai-store = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }

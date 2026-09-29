@@ -6961,11 +6961,13 @@ fn approval_with_store_disabled_on_committed_stream_emits_sse_error() {
 
 #[test]
 fn approval_batch_exceeding_cap_is_rejected() {
-    // The agentic loop issues exactly one function call per round, so a resume
-    // turn carries a single mcp_approval_response. A larger batch is a client
-    // error and, left unbounded, could exceed PostgreSQL's 16-bit Bind
-    // parameter ceiling in the consume query, so it must fail closed before any
-    // store work or inference.
+    // A single model round can emit several mcp_approval_request items (batched
+    // or parallel tool calls), so a resume turn may legitimately carry several
+    // mcp_approval_response items. The ceiling is the per-round MCP cap
+    // (max_calls_per_round: 32 in agentic-loop.yaml): a batch larger than one
+    // round could have produced is a client error that must fail closed before
+    // any store work or inference, keeping the pending-approval load query well
+    // under PostgreSQL's 16-bit Bind parameter ceiling.
     let model = StatefulCapturingBackend::new(vec![(200, approval_call_response())]).start_with_shutdown();
     let mcp = approval_weather_mock();
 
@@ -6978,16 +6980,25 @@ fn approval_batch_exceeding_cap_is_rejected() {
 
     let (approval_id, previous_response_id) = request_approval(proxy.addr(), &mcp, &tools);
 
-    // Turn 2: a follow-up carrying two mcp_approval_response items exceeds the
-    // one-per-round cap and must be rejected before resume.
+    // Turn 2: a follow-up carrying more mcp_approval_response items than the
+    // configured per-round cap (32) exceeds the batch ceiling and must be
+    // rejected before resume. Pad the real approval with fabricated ids until
+    // the batch holds 33 items (> 32).
+    let mut batch = vec![serde_json::json!(
+        {"type": "mcp_approval_response", "approval_request_id": approval_id, "approve": true}
+    )];
+    for i in 0..32 {
+        batch.push(serde_json::json!({
+            "type": "mcp_approval_response",
+            "approval_request_id": format!("call_appr_weather_{i}"),
+            "approve": true
+        }));
+    }
     let followup = serde_json::to_string(&serde_json::json!({
         "model": "gpt-4.1",
         "previous_response_id": previous_response_id,
         "tools": tools,
-        "input": [
-            {"type": "mcp_approval_response", "approval_request_id": approval_id, "approve": true},
-            {"type": "mcp_approval_response", "approval_request_id": "call_appr_weather_2", "approve": true}
-        ]
+        "input": batch
     }))
     .unwrap();
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &followup));
@@ -7014,6 +7025,263 @@ fn approval_batch_exceeding_cap_is_rejected() {
         model.requests().len(),
         1,
         "only the approval-request turn reaches inference; the oversized batch is rejected before resume"
+    );
+}
+
+/// The MCP fixture with two approval-gated tools, used by the multi-approval
+/// batch round-trip tests.
+fn approval_two_tool_mock() -> praxis_test_utils::McpMockServerGuard {
+    start_mcp_mock_server_with_config(McpMockConfig {
+        tools: vec![
+            McpToolFixture::new("get_weather")
+                .with_description("Get the weather for a location")
+                .with_input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"],
+                    "additionalProperties": false
+                })),
+            McpToolFixture::new("get_time")
+                .with_description("Get the current time in a timezone")
+                .with_input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {"timezone": {"type": "string"}},
+                    "required": ["timezone"],
+                    "additionalProperties": false
+                })),
+        ],
+        ..McpMockConfig::default()
+    })
+}
+
+/// A model turn that asks to call two approval-gated MCP tools in one round, so
+/// the proxy emits two `mcp_approval_request` items from a single batch.
+fn approval_two_call_response() -> String {
+    serde_json::json!({
+        "id": "resp_appr_batch_1",
+        "object": "response",
+        "created_at": 1000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "fc_appr_weather",
+                "call_id": "call_appr_weather",
+                "name": "weather__get_weather",
+                "arguments": r#"{"location":"SF"}"#,
+                "status": "completed"
+            },
+            {
+                "type": "function_call",
+                "id": "fc_appr_time",
+                "call_id": "call_appr_time",
+                "name": "weather__get_time",
+                "arguments": r#"{"timezone":"America/Los_Angeles"}"#,
+                "status": "completed"
+            }
+        ]
+    })
+    .to_string()
+}
+
+/// The MCP tool definition (both tools, approval always required) re-sent on
+/// every turn so `openai_mcp_tool_resolve` repopulates the tool map on resume.
+fn approval_two_tools(mcp_port: u16) -> serde_json::Value {
+    serde_json::json!([{
+        "type": "mcp",
+        "server_label": "weather",
+        "server_url": format!("http://127.0.0.1:{mcp_port}/mcp"),
+        "allowed_tools": ["get_weather", "get_time"],
+        "require_approval": "always"
+    }])
+}
+
+/// Drive the first turn of a two-approval round and return the two approval ids
+/// plus the originating `previous_response_id`. Asserts both gated calls surface
+/// as `mcp_approval_request` items and that neither tool ran while awaiting
+/// approval.
+fn request_two_approvals(
+    proxy_addr: &str,
+    mcp: &praxis_test_utils::McpMockServerGuard,
+    tools: &serde_json::Value,
+) -> (String, String, String) {
+    let request = serde_json::json!({
+        "model": "gpt-4.1",
+        "input": "What are the weather and time in SF?",
+        "parallel_tool_calls": true,
+        "tools": tools,
+    });
+    let raw = http_send(
+        proxy_addr,
+        &json_post("/v1/responses", &serde_json::to_string(&request).unwrap()),
+    );
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "approval-required request should return 200: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    let response_id = response["id"].as_str().expect("response id").to_owned();
+
+    let output = response["output"].as_array().expect("output array");
+    let approvals: Vec<&serde_json::Value> = output
+        .iter()
+        .filter(|item| item["type"] == "mcp_approval_request")
+        .collect();
+    assert_eq!(
+        approvals.len(),
+        2,
+        "one round can emit several approvals: both gated calls must surface: {output:#?}"
+    );
+    let weather = approvals
+        .iter()
+        .find(|item| item["name"] == "get_weather")
+        .expect("weather approval request");
+    let time = approvals
+        .iter()
+        .find(|item| item["name"] == "get_time")
+        .expect("time approval request");
+    let weather_id = weather["id"].as_str().expect("weather approval id").to_owned();
+    let time_id = time["id"].as_str().expect("time approval id").to_owned();
+
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        0,
+        "no tool may execute while an approval is pending"
+    );
+
+    (weather_id, time_id, response_id)
+}
+
+#[test]
+fn approval_batch_resume_executes_multiple_approved_tools() {
+    // A single round emits two approval requests; a resume turn carrying both
+    // mcp_approval_response items (approve+approve) must consume both atomically
+    // and dispatch both tools once before resuming to the final answer. This is
+    // the end-to-end counterpart to the resume_applies_multiple_approvals_in_one_batch
+    // unit test, exercising the real HTTP path and tool-map repopulation.
+    let model = StatefulCapturingBackend::new(vec![
+        (200, approval_two_call_response()),
+        (200, approval_final_response()),
+    ])
+    .start_with_shutdown();
+    let mcp = approval_two_tool_mock();
+
+    let db = TempSqlite::new("issue1146_batch_approve");
+    let proxy_port = free_port();
+    let config = load_approval_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let tools = approval_two_tools(mcp.port());
+
+    let (weather_id, time_id, previous_response_id) = request_two_approvals(proxy.addr(), &mcp, &tools);
+    assert_eq!(weather_id, "call_appr_weather", "approval id must equal the call id");
+    assert_eq!(time_id, "call_appr_time", "approval id must equal the call id");
+
+    // Turn 2: approve both in one batch.
+    let followup = serde_json::to_string(&serde_json::json!({
+        "model": "gpt-4.1",
+        "previous_response_id": previous_response_id,
+        "tools": tools,
+        "input": [
+            {"type": "mcp_approval_response", "approval_request_id": weather_id, "approve": true},
+            {"type": "mcp_approval_response", "approval_request_id": time_id, "approve": true}
+        ]
+    }))
+    .unwrap();
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &followup));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "approved batch follow-up should return 200: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    assert_eq!(
+        response["id"], "resp_appr_final",
+        "an approved batch must resume model→tools→model"
+    );
+
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        2,
+        "both approved tools must execute exactly once"
+    );
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "the model runs once to request approvals and once after the batch resumes"
+    );
+}
+
+#[test]
+fn approval_batch_resume_mixed_approve_and_deny() {
+    // A resume turn can carry a mixed batch: approving one call and denying its
+    // sibling. Only the approved tool executes; the denied call reaches the model
+    // as a truthful function_call_output and never fabricates an mcp_call.
+    let model = StatefulCapturingBackend::new(vec![
+        (200, approval_two_call_response()),
+        (200, approval_final_response()),
+    ])
+    .start_with_shutdown();
+    let mcp = approval_two_tool_mock();
+
+    let db = TempSqlite::new("issue1146_batch_mixed");
+    let proxy_port = free_port();
+    let config = load_approval_config(proxy_port, model.port(), db.url());
+    let proxy = start_proxy(&config);
+
+    let tools = approval_two_tools(mcp.port());
+
+    let (weather_id, time_id, previous_response_id) = request_two_approvals(proxy.addr(), &mcp, &tools);
+
+    // Turn 2: approve the weather call, deny the time call.
+    let followup = serde_json::to_string(&serde_json::json!({
+        "model": "gpt-4.1",
+        "previous_response_id": previous_response_id,
+        "tools": tools,
+        "input": [
+            {"type": "mcp_approval_response", "approval_request_id": weather_id, "approve": true},
+            {"type": "mcp_approval_response", "approval_request_id": time_id, "approve": false}
+        ]
+    }))
+    .unwrap();
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &followup));
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "mixed batch follow-up should return 200: {raw}"
+    );
+    let response: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("response should be JSON");
+    assert_eq!(
+        response["id"], "resp_appr_final",
+        "a mixed batch must still resume to a final answer"
+    );
+
+    assert_eq!(
+        mcp.method_count("tools/call"),
+        1,
+        "only the approved tool may execute; the denied sibling must not run"
+    );
+
+    let model_reqs = model.requests();
+    assert_eq!(
+        model_reqs.len(),
+        2,
+        "the model runs once to request approvals and once after the batch resumes"
+    );
+    let second_body: serde_json::Value =
+        serde_json::from_str(&model_reqs[1].body).expect("second model request should be JSON");
+    let input = second_body["input"].as_array().expect("second request input array");
+    let denial = input
+        .iter()
+        .find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_appr_time")
+        .expect("the denied call must reach the model as a correlated function_call_output");
+    assert!(
+        denial["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("denied by the user")),
+        "the denial must be a truthful, human-readable notice: {denial:#?}"
     );
 }
 

@@ -51,7 +51,7 @@ Call path (client side):
 
 ```text
 PostgresResponseStore::new
-  -> pg_connect_options(database_url, tls)      # apis/src/store/postgres.rs
+  -> pg_connect_options(database_url, tls)      # store-backends/src/postgres.rs
        -> PgConnectOptions::ssl_mode / ssl_root_cert
           / ssl_client_cert / ssl_client_key
   -> PgPoolOptions::connect_with(options)
@@ -264,11 +264,11 @@ harness lives in `tests/utils/src/net/postgres.rs`
 
 ## Key files
 
-- `apis/src/store/postgres_tls.rs`: `PgTlsConfig`, compliance-profile
+- `store-backends/src/postgres_tls.rs`: `PgTlsConfig`, compliance-profile
   validation
-- `apis/src/store/postgres.rs`: `pg_connect_options`,
+- `store-backends/src/postgres.rs`: `pg_connect_options`,
   `rebuild_without_password_file`, connection establishment
-- `apis/src/store/postgres_url.rs`: URL password / TLS-parameter
+- `store-backends/src/postgres_url.rs`: URL password / TLS-parameter
   detection
 - `apis/src/openai/responses/store/config.rs`: response-store TLS config
   wiring

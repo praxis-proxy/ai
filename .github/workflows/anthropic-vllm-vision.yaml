@@ -1,0 +1,196 @@
+name: Anthropic Messages vLLM Vision
+
+# A separate model is required: the Qwen3-8B used by the Claude Code nightly
+# accepts text only. This job proves image requests from the official Anthropic
+# SDK reach a real vision model through both Praxis production example routes.
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled, synchronize]
+  schedule:
+    - cron: "31 6 * * *"
+  workflow_dispatch:
+    inputs:
+      gpu_instance_type:
+        description: Optional EC2 GPU instance type override
+        required: false
+        default: g5.xlarge
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  VLLM_IMAGE: "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
+  VISION_MODEL: "Qwen/Qwen3-VL-4B-Instruct"
+  VISION_REVISION: "ebb281ec70b05090aa6165b016eac8ec08e71b17"
+  SERVED_MODEL: "qwen3-vl-4b"
+  GPU_HF_CACHE_DIR: /tmp/praxis-huggingface
+
+jobs:
+  gpu-start-runner:
+    name: Start vision GPU runner
+    if: >-
+      github.event_name != 'pull_request' ||
+      ((github.event.label.name == 'vllm-full-suite' ||
+        (github.event.action == 'synchronize' &&
+         contains(github.event.pull_request.labels.*.name, 'vllm-full-suite'))) &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      label: ${{ steps.start.outputs.label }}
+      ec2-instance-id: ${{ steps.start.outputs.ec2-instance-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Start EC2 GPU runner
+        id: start
+        uses: ./.github/actions/start-ec2-runner
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+          aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+          ami-id: ${{ vars.AWS_GPU_AMI_ID }}
+          subnet-id: ${{ vars.AWS_SUBNET_ID || vars.US_EAST_2A_SUBNET_ID }}
+          security-group-id: ${{ vars.AWS_SECURITY_GROUP_ID || vars.US_EAST_2_SG_ID }}
+          instance-type: ${{ inputs.gpu_instance_type || 'g5.xlarge' }}
+          github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
+
+  anthropic-sdk-vision:
+    name: Anthropic SDK image requests through Praxis to vLLM
+    needs: [gpu-start-runner]
+    runs-on: ${{ needs.gpu-start-runner.outputs.label }}
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify GPU and container runtime
+        run: |
+          nvidia-smi
+          if command -v docker >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
+            docker info >/dev/null
+          elif command -v podman >/dev/null 2>&1; then
+            echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
+            podman info >/dev/null
+          else
+            echo "Neither Docker nor Podman is available" >&2
+            exit 1
+          fi
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py
+
+      - name: Generate backend credential
+        run: |
+          token="praxis-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          echo "::add-mask::$token"
+          echo "VLLM_API_KEY=$token" >> "$GITHUB_ENV"
+
+      - name: Start pinned vision model on vLLM
+        env:
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gpu_args=()
+          cache_mount="$GPU_HF_CACHE_DIR:/root/.cache/huggingface"
+          if [ "$CONTAINER_RUNTIME" = podman ]; then
+            gpu_args=(--device nvidia.com/gpu=all)
+            cache_mount="${cache_mount}:Z"
+          else
+            gpu_args=(--gpus all)
+          fi
+          mkdir -p "$GPU_HF_CACHE_DIR"
+          "$CONTAINER_RUNTIME" pull "$VLLM_IMAGE"
+          "$CONTAINER_RUNTIME" run -d --name vllm \
+            "${gpu_args[@]}" -p 8000:8000 \
+            -e HUGGING_FACE_HUB_TOKEN -v "$cache_mount" \
+            "$VLLM_IMAGE" \
+            --model "$VISION_MODEL" --revision "$VISION_REVISION" \
+            --served-model-name "$SERVED_MODEL" --max-model-len 8192 \
+            --gpu-memory-utilization 0.90 --enforce-eager \
+            --api-key "$VLLM_API_KEY"
+
+      - name: Wait for native Anthropic Messages endpoint
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 1200))
+          until curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; do
+            if ! "$CONTAINER_RUNTIME" inspect --format='{{.State.Running}}' vllm 2>/dev/null | grep -q true; then
+              "$CONTAINER_RUNTIME" logs vllm 2>&1 || true
+              echo "vLLM exited before readiness" >&2
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              "$CONTAINER_RUNTIME" logs vllm 2>&1 || true
+              echo "vLLM did not become ready in 1200 seconds" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          curl -sf -H "Authorization: Bearer ${VLLM_API_KEY}" \
+            http://127.0.0.1:8000/v1/models >/dev/null
+          curl -sf -H "Authorization: Bearer ${VLLM_API_KEY}" \
+            -H 'content-type: application/json' \
+            -d "{\"model\":\"${SERVED_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}" \
+            http://127.0.0.1:8000/v1/messages/count_tokens >/dev/null
+
+      - name: Build Praxis
+        run: cargo build -p praxis-ai-proxy
+
+      - name: Run official Anthropic SDK image tests
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+        run: uv run tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py -s -k image
+
+      - name: vLLM logs on failure
+        if: failure()
+        run: |
+          "${CONTAINER_RUNTIME:-docker}" logs vllm 2>&1 || true
+
+      - name: Stop vLLM
+        if: always()
+        run: |
+          "${CONTAINER_RUNTIME:-docker}" rm -f vllm || true
+
+  gpu-stop-runner:
+    name: Stop vision GPU runner
+    needs: [gpu-start-runner, anthropic-sdk-vision]
+    if: always() && needs.gpu-start-runner.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Stop EC2 GPU runner
+        uses: ./.github/actions/stop-ec2-runner
+        with:
+          aws-region: ${{ vars.AWS_REGION || 'us-east-2' }}
+          aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+          github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
+          label: ${{ needs.gpu-start-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.gpu-start-runner.outputs.ec2-instance-id }}
