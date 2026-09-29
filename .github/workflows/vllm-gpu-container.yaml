@@ -246,7 +246,7 @@ jobs:
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
-        run: cargo build -p praxis-ai-proxy --no-default-features --features store-sqlite
+        run: cargo build -p praxis-ai-proxy --no-default-features --features standard,openai-all,store-sqlite
 
       - name: Wait for vLLM readiness
         uses: ./.github/actions/wait-vllm
