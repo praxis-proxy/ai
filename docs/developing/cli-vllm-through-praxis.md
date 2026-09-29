@@ -166,11 +166,12 @@ Praxis listens at `http://127.0.0.1:8080`.
 ### Run Praxis from the official container image
 
 Released images are published to
-[`ghcr.io/praxis-proxy/ai`](https://ghcr.io/praxis-proxy/ai). Pin a released
-tag rather than tracking `main` or `nightly`:
+[`ghcr.io/praxis-proxy/ai`](https://ghcr.io/praxis-proxy/ai). The `latest` tag
+tracks the most recent release; substitute a version tag such as `0.4` to pin
+one:
 
 ```console
-docker pull ghcr.io/praxis-proxy/ai:0.4
+docker pull ghcr.io/praxis-proxy/ai:latest
 ```
 
 The image entrypoint is `praxis-ai`, its working directory is `/etc/praxis`,
@@ -191,7 +192,7 @@ docker run -d --rm --name praxis-vllm \
   --network host \
   -e VLLM_API_KEY -e GATEWAY_AUTH_PASSWORD \
   -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
-  ghcr.io/praxis-proxy/ai:0.4 -c /etc/praxis/praxis.yaml
+  ghcr.io/praxis-proxy/ai:latest -c /etc/praxis/praxis.yaml
 ```
 
 Praxis listens at `http://127.0.0.1:8080`, and sections 3 and 4 apply
@@ -218,7 +219,7 @@ docker run -d --rm --name praxis-vllm \
   --add-host=host.docker.internal:host-gateway \
   -e VLLM_API_KEY -e GATEWAY_AUTH_PASSWORD \
   -v "$PWD/praxis-vllm.yaml:/etc/praxis/praxis.yaml:ro,z" \
-  ghcr.io/praxis-proxy/ai:0.4 -c /etc/praxis/praxis.yaml
+  ghcr.io/praxis-proxy/ai:latest -c /etc/praxis/praxis.yaml
 ```
 
 With Podman, both commands work unchanged. Podman also resolves
