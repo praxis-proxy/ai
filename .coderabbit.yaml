@@ -142,12 +142,13 @@ reviews:
 
     - path: "apis/src/openai/responses/**"
       instructions: |
-        On the gateway-owned path (openai_responses_validate,
-        openai_responses_request), a create request with background: true must
-        be rejected with an OpenAI 400 — Praxis does not implement the
-        asynchronous Responses lifecycle locally. Flag a gateway-owned
-        validation path that accepts or buffers background=true instead of
-        rejecting it after logical provider binding. Do not flag the
+        While https://github.com/praxis-proxy/ai/issues/32 remains open and
+        the asynchronous Responses lifecycle is unavailable locally, the
+        gateway-owned path (openai_responses_validate,
+        openai_responses_request) must return an OpenAI 400 for create
+        requests with background: true after logical provider binding.
+        Once that lifecycle is implemented, review it against the issue's
+        contract instead of requiring this rejection. Do not flag the
         openai_responses_format classifier preserving background as routing
         metadata, nor a provider-owned/direct passthrough (e.g. http-passthrough)
         that forwards background=true unchanged to a native OpenAI backend —
