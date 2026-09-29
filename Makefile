@@ -40,7 +40,7 @@ endif
 	test-token-rate-limit-valkey-unit test-token-rate-limit-valkey-integration \
 	openai-conformance check-openai-conformance-reference test-openai-conformance \
 	test-responses-conformance \
-	lint lint-lean check-dep-budget fmt doc audit coverage-check \
+	lint lint-clippy lint-xtask lint-lean check-dep-budget fmt doc audit coverage-check \
 	require-container-engine \
 	container container-run \
 	setup-hooks help \
@@ -209,7 +209,18 @@ test-environment:
 # Quality
 # -------------------------------------------------------------------
 
-lint:
+# `make lint` runs both halves serially for local use. CI splits them into the
+# lint-clippy and lint-xtask jobs: the workspace clippy passes and the xtask
+# meta-lint build share no build artifacts (clippy artifacts are unusable by
+# `cargo run`, and xtask's `dev` feature resolves a distinct dependency graph),
+# so running them serially wastes ~11m rebuilding the tree a second time. As two
+# jobs the wall-clock collapses to the heavier half instead of their sum.
+lint: lint-clippy lint-xtask
+
+# Clippy across every feature permutation, plus the dependency budget, the
+# rustfmt check, and the unused-dependency scan. These are the rustc/clippy
+# steps; `cargo machete` is here because CI installs it only in this job.
+lint-clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy --workspace --all-targets \
 		--features praxis-ai-proxy/azure-ad-filter,praxis-ai-proxy/basic-auth-filter,praxis-ai-proxy/gcp-adc-filter,praxis-ai-proxy/http-callout-filter,praxis-ai-proxy/token-rate-limit-filter,praxis-tests-integration/azure-ad-filter,praxis-tests-integration/basic-auth-filter,praxis-tests-integration/gcp-adc-filter,praxis-tests-integration/http-callout-filter,praxis-tests-integration/token-rate-limit-filter \
@@ -218,6 +229,12 @@ lint:
 	$(MAKE) check-dep-budget
 	cargo +nightly fmt --all -- --check
 	cargo machete --with-metadata .
+
+# xtask-driven meta lints (dep semver, separators, filter/example docs, markdown
+# links, README/registry/coverage sync checks) plus the FIPS dependency guard.
+# The first `cargo xtask` builds the full product tree once; grouping these
+# isolates that build from the clippy passes so the two halves run in parallel.
+lint-xtask:
 	cargo xtask lint-deps
 	$(MAKE) fips-deps
 	cargo xtask lint-separators
@@ -767,6 +784,8 @@ help:
 	@echo ""
 	@echo "Quality:"
 	@echo "  lint                 clippy + rustfmt + dependency, docs, and example checks"
+	@echo "  lint-clippy          clippy (all feature sets) + rustfmt + dep budget + machete"
+	@echo "  lint-xtask           xtask meta lints (docs, registries, coverage) + FIPS dep guard"
 	@echo "  fmt                  format with nightly rustfmt"
 	@echo "  doc                  rustdoc with warnings"
 	@echo "  audit                cargo audit + cargo deny"
