@@ -96,25 +96,71 @@ jobs:
 
   # ----------------------------------------------------------------------------
   # Integration test suites (tests/ crates)
+  #
+  # Split by suite (schema / inference-fixtures / integration) so the three
+  # store-all permutations run in parallel. Run serially in one job they were the
+  # workflow's ~34m critical path — the single longest PR check, which bounds
+  # ci-status. Each job re-pays the store-all base compile, but they run
+  # concurrently so wall-clock collapses to the heaviest suite (integration)
+  # instead of their sum. Each job takes its own cache-suffix; the integration
+  # job keeps the existing test-integration-cargo cache. The llmd-ext-proc
+  # permutation stays in the sibling `environment` job.
   # ----------------------------------------------------------------------------
 
-  test:
+  test-schema:
     needs: [changes]
     if: |
       always() &&
       (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
     runs-on: ubuntu-24.04
-    # The make test-* steps here all build the store-all feature permutation
-    # (plus the experimental-filter subset), so the tree compiles once and the
-    # later steps reuse the warm target dir. The llmd-ext-proc permutation — a
-    # fresh gRPC/proto + policy/OPA/Cedar rebuild that shares no artifacts with
-    # store-all — used to run last in this job and added ~16m to a serial
-    # critical path; it now runs in parallel in the sibling `environment` job,
-    # which is what keeps this job off the ~45m path. Praxis 0.5.6 turns the
-    # policy filter on by default, so store-all still pulls the
-    # praxis-policy-* / OPA / Cedar stack; 50m leaves headroom for cache-cold
-    # runs while warmed caches finish well inside it.
-    timeout-minutes: 50
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        with:
+          cache-suffix: test-schema-cargo
+
+      - name: Schema tests
+        run: make test-schema
+
+  test-inference:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+        with:
+          cache-suffix: test-inference-cargo
+
+      - name: Inference fixture tests
+        run: make test-inference-fixtures
+
+  test-integration:
+    needs: [changes]
+    if: |
+      always() &&
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+    runs-on: ubuntu-24.04
+    # store-all base compile plus the suite's two feature permutations
+    # (store-all and store-all + experimental filters); 45m leaves headroom for
+    # cache-cold runs while warmed caches finish well inside it.
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -126,12 +172,6 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
         with:
           cache-suffix: test-integration-cargo
-
-      - name: Schema tests
-        run: make test-schema
-
-      - name: Inference fixture tests
-        run: make test-inference-fixtures
 
       - name: Install pinned Claude Code CLI
         env:
