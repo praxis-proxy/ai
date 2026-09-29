@@ -113,6 +113,11 @@ def live_clients():
                 assert config.count('"127.0.0.1:8000"') == 1, example
                 config = config.replace('address: "127.0.0.1:8080"', f'address: "127.0.0.1:{port}"')
                 config = config.replace('"127.0.0.1:8000"', f'"{authority}"')
+                # The ephemeral GPU runner runs as root. Match the existing
+                # OpenAI SDK harness by opting in only in this generated config.
+                if os.geteuid() == 0:
+                    assert config.count("insecure_options:\n") == 1, example
+                    config = config.replace("insecure_options:\n", "insecure_options:\n  allow_root: true\n", 1)
                 config_path = directory / f"{route}.yaml"
                 config_path.write_text(config)
                 log_path = directory / f"{route}.log"

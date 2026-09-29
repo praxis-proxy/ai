@@ -6,7 +6,7 @@ name: Anthropic Messages vLLM Vision
 on:
   pull_request:
     branches: [main]
-    types: [labeled]
+    types: [labeled, synchronize]
   schedule:
     - cron: "31 6 * * *"
   workflow_dispatch:
@@ -35,7 +35,9 @@ jobs:
     name: Start vision GPU runner
     if: >-
       github.event_name != 'pull_request' ||
-      (github.event.label.name == 'vllm-full-suite' &&
+      ((github.event.label.name == 'vllm-full-suite' ||
+        (github.event.action == 'synchronize' &&
+         contains(github.event.pull_request.labels.*.name, 'vllm-full-suite'))) &&
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
