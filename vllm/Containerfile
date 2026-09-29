@@ -29,7 +29,8 @@ RUN --mount=type=secret,id=hf_token \
     fi && \
     rm -rf "${MODEL_CACHE_DIR}/.huggingface" "${model_path}/original"
 
-RUN useradd -r -u 1001 -m vllm
-USER 1001
+# The base image may already ship a vllm user; only create it if absent.
+RUN id -u vllm >/dev/null 2>&1 || useradd -r -u 1001 -m vllm
+USER vllm
 
 ENTRYPOINT ["vllm", "serve"]
