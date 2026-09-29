@@ -43,7 +43,7 @@
 //! [`filter_metadata`]: praxis_filter::HttpFilterContext::filter_metadata
 //! [`ResponsesState`]: super::super::state::ResponsesState
 
-use std::sync::Arc;
+use std::{ops::RangeInclusive, sync::Arc};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -399,12 +399,17 @@ struct ResponseCapture {
 
 impl ResponseCapture {
     /// Extract stored input and output from a Responses API exchange.
-    fn from_response_json(json: &Value, request_input: Option<Value>, state_messages: Option<Vec<Value>>) -> Self {
+    fn from_response_json(
+        json: &Value,
+        request_input: Option<Value>,
+        state_messages: Option<Vec<Value>>,
+        reasoning_replay: &[RangeInclusive<usize>],
+    ) -> Self {
         let input = request_input
             .or_else(|| json.get("input").cloned())
             .unwrap_or(Value::Null);
         let history_input = state_messages.map_or_else(|| input.clone(), Value::Array);
-        let messages = assemble_stored_messages(history_input, json.get("output"));
+        let messages = assemble_stored_messages(history_input, json.get("output"), reasoning_replay);
 
         Self { input, messages }
     }
@@ -425,18 +430,35 @@ fn extract_request_input(body: &Option<Bytes>) -> Option<Value> {
 }
 
 /// Build the stored conversation history from response input and output.
-fn assemble_stored_messages(input: Value, output: Option<&Value>) -> Value {
+fn assemble_stored_messages(input: Value, output: Option<&Value>, reasoning_replay: &[RangeInclusive<usize>]) -> Value {
     let mut messages = Vec::new();
-
     append_stored_input_items(&mut messages, input);
+    let output_start = messages.len();
 
     match output {
         Some(Value::Array(items)) => messages.extend(items.iter().cloned()),
         Some(output) if !output.is_null() => messages.push(output.clone()),
         Some(_) | None => {},
     }
+    if let Some(output) = messages.get_mut(output_start..) {
+        normalize_translated_reasoning(output, reasoning_replay);
+    }
 
     Value::Array(messages)
+}
+
+/// Restore reasoning-first replay only within completed Chat turns identified by
+/// the translator. Each range ends at that turn's reasoning item, regardless of
+/// any following tool calls. Rotating it leaves every other turn's positions and
+/// the client-facing response object unchanged.
+fn normalize_translated_reasoning(items: &mut [Value], reasoning_replay: &[RangeInclusive<usize>]) {
+    for range in reasoning_replay {
+        if let Some(turn) = items.get_mut(*range.start()..=*range.end())
+            && turn.last().and_then(|item| item.get("type")).and_then(Value::as_str) == Some("reasoning")
+        {
+            turn.rotate_right(1);
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -684,7 +706,7 @@ fn parse_response_record(
         return None;
     };
 
-    let capture = ResponseCapture::from_response_json(&json, request_input, state_messages);
+    let capture = ResponseCapture::from_response_json(&json, request_input, state_messages, &[]);
 
     Some(ResponseRecord {
         id: id.to_owned(),
@@ -725,7 +747,8 @@ pub(super) fn build_record_from_state(
     };
 
     let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone());
-    let capture = ResponseCapture::from_response_json(json, request_input, state_messages);
+    let capture =
+        ResponseCapture::from_response_json(json, request_input, state_messages, &state.translated_reasoning_replay);
 
     Some(ResponseRecord {
         id: id.to_owned(),
@@ -1362,4 +1385,174 @@ fn reject_invalid_input(message: &str) -> Rejection {
 /// Build a 500 rejection for internal store failures.
 fn reject_store_error() -> Rejection {
     responses_error_rejection(500, "server_error", "Internal server error.")
+}
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    reason = "tests"
+)]
+mod normalize_tests {
+    use serde_json::json;
+
+    use super::{Value, assemble_stored_messages, normalize_translated_reasoning};
+
+    fn types(items: &[Value]) -> Vec<&str> {
+        items
+            .iter()
+            .map(|item| item.get("type").and_then(Value::as_str).unwrap_or("message"))
+            .collect()
+    }
+
+    #[test]
+    fn trailing_reasoning_after_a_message_moves_ahead_of_its_turn() {
+        // The streaming translator emits `[message, reasoning]` when the answer
+        // streams before reasoning. The stored history must lead with reasoning so
+        // continuation replay attaches it to the message that follows.
+        let mut items = vec![
+            json!({"type": "message", "role": "assistant", "id": "msg_1"}),
+            json!({"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "late"}]}),
+        ];
+        normalize_translated_reasoning(&mut items, &[0..=1]);
+        assert_eq!(types(&items), ["reasoning", "message"]);
+    }
+
+    #[test]
+    fn trailing_reasoning_moves_ahead_of_a_message_and_tool_call_turn() {
+        let mut items = vec![
+            json!({"type": "message", "role": "assistant", "id": "msg_1"}),
+            json!({"type": "function_call", "id": "fc_1"}),
+            json!({"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "late"}]}),
+        ];
+        normalize_translated_reasoning(&mut items, &[0..=2]);
+        assert_eq!(types(&items), ["reasoning", "message", "function_call"]);
+    }
+
+    #[test]
+    fn reasoning_first_turns_are_left_untouched() {
+        // The finite builder and native passthrough already lead with reasoning.
+        let mut items = vec![
+            json!({"type": "reasoning", "id": "rs_1"}),
+            json!({"type": "message", "role": "assistant", "id": "msg_1"}),
+        ];
+        let before = items.clone();
+        normalize_translated_reasoning(&mut items, &[]);
+        assert_eq!(items, before);
+    }
+
+    #[test]
+    fn multi_round_agentic_reasoning_is_not_collapsed_onto_an_earlier_turn() {
+        // Each round already leads with its own reasoning, and the trailing
+        // reasoning here (round 2) is followed by round 2's message, so it is not
+        // a trailing item: nothing moves.
+        let mut items = vec![
+            json!({"type": "reasoning", "id": "rs_1"}),
+            json!({"type": "function_call", "id": "fc_1"}),
+            json!({"type": "reasoning", "id": "rs_2"}),
+            json!({"type": "message", "role": "assistant", "id": "msg_2"}),
+        ];
+        let before = items.clone();
+        normalize_translated_reasoning(&mut items, &[]);
+        assert_eq!(items, before);
+    }
+
+    #[test]
+    fn a_standalone_trailing_reasoning_turn_is_preserved() {
+        // The preceding turn already leads with its own reasoning, so a trailing
+        // reasoning item is a separate, standalone turn and must not be merged.
+        let mut items = vec![
+            json!({"type": "reasoning", "id": "rs_1"}),
+            json!({"type": "message", "role": "assistant", "id": "msg_1"}),
+            json!({"type": "reasoning", "id": "rs_2"}),
+        ];
+        let before = items.clone();
+        normalize_translated_reasoning(&mut items, &[]);
+        assert_eq!(items, before);
+    }
+
+    #[test]
+    fn assemble_normalizes_stored_output_without_touching_input_history() {
+        let input = json!([{"role": "user", "content": "hi"}]);
+        let output = json!([
+            {"type": "message", "role": "assistant", "id": "msg_1"},
+            {"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "late"}]}
+        ]);
+        let messages = assemble_stored_messages(input, Some(&output), &[0..=1]);
+        let messages = messages.as_array().expect("assembled messages are an array");
+        // The user input stays first; only the stored output turn is normalized.
+        let first_role = messages
+            .first()
+            .and_then(|item| item.get("role"))
+            .and_then(Value::as_str);
+        assert_eq!(first_role, Some("user"));
+        let output_turn = messages.get(1..).expect("input item precedes the stored output");
+        assert_eq!(types(output_turn), ["reasoning", "message"]);
+    }
+
+    #[test]
+    fn translated_reasoning_stays_with_its_round_even_when_message_ids_repeat() {
+        let output = json!([
+            {"type": "message", "role": "assistant", "id": "msg_shared", "content": "first"},
+            {"type": "message", "role": "assistant", "id": "msg_shared", "content": "second"},
+            {"type": "reasoning", "id": "rs_second", "content": [{"type": "reasoning_text", "text": "second thought"}]},
+            {"type": "message", "role": "assistant", "id": "msg_shared", "content": "third"},
+            {"type": "reasoning", "id": "rs_third", "content": [{"type": "reasoning_text", "text": "third thought"}]}
+        ]);
+        let input = assemble_stored_messages(json!([]), Some(&output), &[1..=2, 3..=4]);
+        let chat = crate::openai::translation::chat_completions::responses_request_to_chat_request(
+            &json!({"model": "m", "input": input}),
+            &crate::openai::translation::reasoning::ReasoningOptions {
+                dialect: crate::openai::translation::reasoning::ReasoningDialect::Vllm,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            chat["messages"],
+            json!([
+                {"role": "assistant", "content": "first"},
+                {"role": "assistant", "content": "second", "reasoning": "second thought"},
+                {"role": "assistant", "content": "third", "reasoning": "third thought"}
+            ])
+        );
+        assert_eq!(output[1]["type"], "message", "wire order must be unchanged");
+    }
+
+    #[test]
+    fn late_reasoning_before_a_tool_call_replays_with_the_answer() {
+        let output = json!([
+            {"type": "message", "role": "assistant", "content": "answer"},
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "thought"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"}
+        ]);
+        let input = assemble_stored_messages(json!([]), Some(&output), &[0..=1]);
+        let chat = crate::openai::translation::chat_completions::responses_request_to_chat_request(
+            &json!({"model": "m", "input": input}),
+            &crate::openai::translation::reasoning::ReasoningOptions {
+                dialect: crate::openai::translation::reasoning::ReasoningDialect::Vllm,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            chat["messages"][0],
+            json!({"role": "assistant", "content": "answer", "reasoning": "thought"})
+        );
+        assert_eq!(chat["messages"][1]["tool_calls"][0]["id"], "call_1");
+        assert!(chat["messages"][1].get("reasoning").is_none());
+    }
+
+    #[test]
+    fn native_output_without_translator_provenance_keeps_its_order() {
+        let output = json!([
+            {"type": "message", "role": "assistant", "id": "msg_1"},
+            {"type": "message", "role": "assistant", "id": "msg_2"},
+            {"type": "reasoning", "id": "rs_native"}
+        ]);
+        assert_eq!(assemble_stored_messages(json!([]), Some(&output), &[]), output);
+    }
 }

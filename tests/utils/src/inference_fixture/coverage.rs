@@ -1325,8 +1325,8 @@ mod tests {
             ]
         );
         assert_eq!(report.features_total, 44);
-        assert_eq!(report.scenarios_total, 44);
-        assert_eq!(report.recordings_total, 49);
+        assert_eq!(report.scenarios_total, 46);
+        assert_eq!(report.recordings_total, 51);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1358,6 +1358,8 @@ mod tests {
                 "responses/chat-reasoning-nonstream",
                 "responses/chat-reasoning-replay",
                 "responses/chat-reasoning-stream",
+                "responses/chat-reasoning-stream-late",
+                "responses/chat-reasoning-stream-late-tool",
                 "responses/chat-reasoning-stream-malformed",
                 "responses/chat-structured-output-with-tools",
                 "responses/chat-tool-echo",
@@ -1551,7 +1553,11 @@ mod tests {
                 ),
                 (
                     &"responses.chat.reasoning.stream".to_owned(),
-                    &vec!["responses/chat-reasoning-stream".to_owned()]
+                    &vec![
+                        "responses/chat-reasoning-stream".to_owned(),
+                        "responses/chat-reasoning-stream-late".to_owned(),
+                        "responses/chat-reasoning-stream-late-tool".to_owned()
+                    ]
                 ),
                 (
                     &"responses.chat.reasoning.stream_errors".to_owned(),

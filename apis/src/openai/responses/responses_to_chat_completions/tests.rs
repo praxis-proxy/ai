@@ -2281,3 +2281,76 @@ async fn default_dialect_leaves_reasoning_content_unextracted() {
     assert_eq!(output[0]["type"], "message");
     assert!(output.iter().all(|item| item["type"] != "reasoning"));
 }
+
+
+#[test]
+fn translated_late_reasoning_tracks_each_round_in_request_state() {
+    use std::fmt::Write as _;
+
+    let config: super::config::ResponsesToChatCompletionsConfig =
+        serde_yaml::from_str("reasoning:\n  dialect: vllm").unwrap();
+    let request = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut context = crate::test_utils::make_filter_context(&request);
+    context.current_filter_id = Some(0);
+    let mut state = ResponsesState::from_request_body(json!({"model": "m", "input": "hello", "stream": true}));
+    state
+        .accumulated_output
+        .push(json!({"type": "message", "role": "assistant", "content": "earlier turn"}));
+    context.extensions.insert(state);
+    for _ in 0..2 {
+        context.insert_filter_state(super::stream::StreamConverter::new(
+            "resp_shared".to_owned(),
+            0,
+            config.stream_limits(),
+            config.reasoning,
+        ));
+        let mut provider = String::new();
+        for delta in [
+            json!({"content": "answer"}),
+            json!({"reasoning": "thought"}),
+            json!({"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}),
+        ] {
+            write!(
+                provider,
+                "data: {}\n\n",
+                json!({
+                    "id": "chatcmpl_shared", "object": "chat.completion.chunk", "model": "m",
+                    "choices": [{"index": 0, "delta": delta}]
+                })
+            )
+            .unwrap();
+        }
+        provider.push_str(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n",
+        );
+        let mut body = Some(Bytes::from(provider));
+        assert!(matches!(
+            ResponsesToChatCompletionsFilter::transform_stream_response(&mut context, &mut body, false).unwrap(),
+            FilterAction::Continue
+        ));
+        let terminal: serde_json::Value = std::str::from_utf8(body.as_ref().unwrap())
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).unwrap())
+            .next_back()
+            .unwrap();
+        // EOF is a later callback, after the successful terminal was emitted.
+        assert!(matches!(
+            ResponsesToChatCompletionsFilter::transform_stream_response(&mut context, &mut None, true).unwrap(),
+            FilterAction::Continue
+        ));
+        let state = context.extensions.get_mut::<ResponsesState>().unwrap();
+        state
+            .accumulated_output
+            .extend(terminal["response"]["output"].as_array().unwrap().iter().cloned());
+    }
+    assert_eq!(
+        context
+            .extensions
+            .get::<ResponsesState>()
+            .unwrap()
+            .translated_reasoning_replay,
+        [1..=2, 4..=5]
+    );
+}

@@ -2871,6 +2871,60 @@ fn reasoning_stream_byte_limits_count_utf8_and_fail_before_offending_delta() {
 }
 
 #[test]
+fn reasoning_stream_late_reasoning_preserves_announced_message_first_positions() {
+    // vLLM can stream the answer text before any reasoning delta. The message
+    // then claims output_index 0 and reasoning claims 1. The terminal snapshot
+    // must preserve those announced positions ([message, reasoning]) so clients
+    // correlating streamed events to the terminal output by index stay correct;
+    // reattaching the late reasoning to its assistant turn is handled on the
+    // continuation path, not by reordering the client-facing terminal.
+    let events = run_reasoning(
+        &[json!({"content":"ans"}), json!({"reasoning":"late"})],
+        "stop",
+        wide_limits(),
+        65536,
+    );
+    let terminal = &events.last().unwrap().1["response"];
+    let output = terminal["output"].as_array().unwrap();
+    assert_eq!(
+        output
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["message", "reasoning"]
+    );
+    let reasoning_id = output[1]["id"].as_str().unwrap();
+    // The reasoning item sits at terminal position 1, exactly where its emitted
+    // events announced it.
+    let added = events
+        .iter()
+        .find(|(name, event)| name == "response.output_item.added" && event["item"]["type"] == "reasoning")
+        .unwrap();
+    assert_eq!(added.1["output_index"], 1);
+    assert_eq!(added.1["item"]["id"].as_str().unwrap(), reasoning_id);
+    for name in [
+        "response.reasoning_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+    ] {
+        let event = events
+            .iter()
+            .find(|(event_name, event)| {
+                event_name == name
+                    && (event["item_id"] == json!(reasoning_id) || event["item"]["id"] == json!(reasoning_id))
+            })
+            .unwrap_or_else(|| panic!("missing {name} for reasoning item"));
+        assert_eq!(event.1["output_index"], 1);
+    }
+    let reasoning_done = events
+        .iter()
+        .find(|(name, _)| name == "response.reasoning_text.done")
+        .unwrap();
+    assert_eq!(reasoning_done.1["text"], "late");
+    assert_eq!(output[1]["content"][0]["text"], "late");
+}
+
+#[test]
 fn reasoning_stream_preserves_interleaved_output_indexes_and_incomplete_status() {
     for finish_reason in ["stop", "tool_calls", "length", "content_filter"] {
         let events = run_reasoning(
@@ -2885,6 +2939,9 @@ fn reasoning_stream_preserves_interleaved_output_indexes_and_incomplete_status()
         );
         let terminal = &events.last().unwrap().1["response"];
         let output = terminal["output"].as_array().unwrap();
+        // The terminal snapshot preserves the announced arrival-order positions:
+        // the message and tool call streamed before any reasoning delta arrived,
+        // so reasoning keeps the trailing index it announced.
         assert_eq!(
             output
                 .iter()
@@ -2901,6 +2958,9 @@ fn reasoning_stream_preserves_interleaved_output_indexes_and_incomplete_status()
                 "incomplete"
             }
         );
+        // Each done event's item sits at the terminal position its output_index
+        // announced, so clients correlating events to the terminal by index are
+        // always correct.
         for (_, event) in &events {
             if event["type"] == "response.output_item.done" {
                 assert_eq!(
@@ -3009,4 +3069,55 @@ fn reasoning_stream_with_no_raw_reasoning_only_emits_the_answer() {
     assert_eq!(output.len(), 1);
     assert_eq!(output[0]["type"], "message");
     assert!(!events.iter().any(|(name, _)| name.contains("reasoning")));
+}
+
+
+#[test]
+fn late_reasoning_replay_position_is_published_once_only_after_success() {
+    for finish_reason in ["stop", "tool_calls", "length", "content_filter"] {
+        let mut conv = reasoning_converter(wide_limits(), 65536);
+        let body = request_body();
+        let mut raw = Vec::new();
+        for delta in [
+            json!({"content": "answer"}),
+            json!({"reasoning": "thought"}),
+            json!({"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}),
+        ] {
+            push(
+                &mut conv,
+                &body,
+                format!("data: {}\n\n", reasoning_chunk(&delta, None)).as_bytes(),
+                &mut raw,
+            );
+            assert_eq!(conv.take_replay_reasoning_index(), None);
+        }
+        push(
+            &mut conv,
+            &body,
+            &provider_stream(&[&reasoning_chunk(&json!({}), Some(finish_reason))]),
+            &mut raw,
+        );
+        finish(&mut conv, &body, &mut raw);
+        assert_eq!(conv.take_replay_reasoning_index(), Some(1));
+        assert_eq!(conv.take_replay_reasoning_index(), None);
+        let events = parse_events(&raw);
+        assert_eq!(
+            events.last().unwrap().1["response"]["output"][2]["type"],
+            "function_call"
+        );
+    }
+    let mut conv = reasoning_converter(wide_limits(), 65536);
+    let body = request_body();
+    let mut raw = Vec::new();
+    push(
+        &mut conv,
+        &body,
+        &provider_stream(&[
+            &reasoning_chunk(&json!({"content": "answer"}), None),
+            &reasoning_chunk(&json!({"reasoning": {"invalid": true}}), None),
+        ]),
+        &mut raw,
+    );
+    assert_eq!(parse_events(&raw).last().unwrap().0, "response.failed");
+    assert_eq!(conv.take_replay_reasoning_index(), None);
 }

@@ -369,6 +369,9 @@ pub(super) struct StreamConverter {
     accumulated_bytes: usize,
     /// Count of decoded SSE frames processed.
     frames_processed: usize,
+    /// Late reasoning position from a successful terminal, consumed once by the
+    /// filter to preserve this completion's association in stored replay.
+    replay_reasoning_index: Option<usize>,
 }
 
 impl StreamConverter {
@@ -404,7 +407,14 @@ impl StreamConverter {
             tool_calls: Vec::new(),
             accumulated_bytes: 0,
             frames_processed: 0,
+            replay_reasoning_index: None,
         }
+    }
+
+    /// Take the late reasoning position for this completed Chat turn. Earlier
+    /// output items all belong to this same completion, even if tool calls follow.
+    pub(super) fn take_replay_reasoning_index(&mut self) -> Option<usize> {
+        self.replay_reasoning_index.take()
     }
 
     /// Feed one response body chunk, returning any completed Responses SSE bytes.
@@ -1445,6 +1455,11 @@ impl StreamConverter {
             return Err(error);
         }
         self.phase = Phase::EmittedTerminal;
+        self.replay_reasoning_index = self
+            .reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.output_index)
+            .filter(|&index| index > 0);
         Ok(())
     }
 

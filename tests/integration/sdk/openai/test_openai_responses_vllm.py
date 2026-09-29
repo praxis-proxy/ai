@@ -2825,6 +2825,48 @@ class TestResponsesReasoningVLLM:
             "role": "assistant", "content": None, "reasoning": "I picked 42.",
         }
 
+    @pytest.mark.parametrize("with_tool_call", [False, True], ids=["answer", "answer-then-tool"])
+    def test_late_reasoning_stays_with_its_stored_assistant_turn(
+        self, reasoning_capture_client, with_tool_call,
+    ):
+        client, forwarded = reasoning_capture_client
+        ChatCaptureHandler.stream_deltas = [{"content": "Earlier answer."}]
+        with client.responses.stream(model=VLLM_MODEL, input="First turn.", store=True) as stream:
+            list(stream)
+            first = stream.get_final_response()
+        ChatCaptureHandler.stream_deltas = [{"content": "Done."}, {"reasoning": "I picked 42."}]
+        if with_tool_call:
+            ChatCaptureHandler.stream_deltas.append({"tool_calls": [{
+                "index": 0, "id": "call_lookup", "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }]})
+        with client.responses.stream(
+            model=VLLM_MODEL, previous_response_id=first.id, input="Pick a number.", store=True,
+        ) as stream:
+            list(stream)
+            second = stream.get_final_response()
+        expected_types = ["message", "reasoning"] + (["function_call"] if with_tool_call else [])
+        assert [item.type for item in second.output] == expected_types
+        stored = client.responses.retrieve(second.id)
+        # The stream helper adds SDK-only `parsed=None` to text content.
+        assert [item.model_dump(exclude_none=True) for item in stored.output] == [
+            item.model_dump(exclude_none=True) for item in second.output
+        ]
+        continuation = [{"role": "user", "content": "Which number?"}]
+        if with_tool_call:
+            continuation.insert(0, {"type": "function_call_output", "call_id": "call_lookup", "output": "42"})
+        client.responses.create(
+            model=VLLM_MODEL, previous_response_id=second.id, input=continuation, store=False,
+        )
+        messages = forwarded[-1]["messages"]
+        assert messages[1] == {"role": "assistant", "content": "Earlier answer."}
+        assert messages[3] == {"role": "assistant", "content": "Done.", "reasoning": "I picked 42."}
+        if with_tool_call:
+            assert messages[4]["tool_calls"][0]["id"] == "call_lookup"
+            assert "reasoning" not in messages[4]
+            assert messages[5]["role"] == "tool"
+        assert messages[-1] == {"role": "user", "content": "Which number?"}
+
     @pytest.mark.parametrize("bad_delta", [
         {"reasoning": {"invalid": "provider-private-data"}},
         {"reasoning": "x" * 65536},
@@ -2851,7 +2893,9 @@ class TestResponsesReasoningVLLM:
             max_output_tokens=1024, store=True,
         ) as stream:
             events = list(stream)
-            final = stream.get_final_response()
+        terminal_event = events[-1]
+        assert terminal_event.type in {"response.completed", "response.incomplete"}, terminal_event.type
+        final = terminal_event.response
         assert final.status in {"completed", "incomplete"}
         deltas = [event for event in events if event.type == "response.reasoning_text.delta"]
         assert deltas, "the configured reasoning model must emit raw reasoning"

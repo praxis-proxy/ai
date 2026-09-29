@@ -348,6 +348,8 @@ impl ResponsesToChatCompletionsFilter {
             out.extend_from_slice(&events);
         }
 
+        record_stream_reasoning_replay(ctx, &mut converter);
+
         *body = (!out.is_empty()).then(|| Bytes::from(out));
         if !end_of_stream {
             ctx.insert_filter_state(converter);
@@ -731,6 +733,18 @@ fn prepare_transformed_response_headers(ctx: &mut HttpFilterContext<'_>) {
             http::HeaderValue::from_static("application/json"),
         );
         ctx.response_headers_modified = true;
+    }
+}
+
+/// Retain the translator's turn boundary for stored replay across IRR re-entry.
+fn record_stream_reasoning_replay(ctx: &mut HttpFilterContext<'_>, converter: &mut StreamConverter) {
+    if let Some(reasoning_index) = converter.take_replay_reasoning_index()
+        && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
+    {
+        // Match the stream accumulator's output offset. Request extensions
+        // survive IRR re-entry and are visible to the outer response store.
+        let start = state.accumulated_output.len();
+        state.translated_reasoning_replay.push(start..=start + reasoning_index);
     }
 }
 
