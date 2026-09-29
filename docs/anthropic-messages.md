@@ -194,12 +194,16 @@ empty or still contains `TBD`.
 [`tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py`](../tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py)
 uses the official Anthropic Python SDK against both committed vLLM examples.
 The text matrix checks non-streaming messages and usage, streamed event order
-and final text, `messages.count_tokens`, and a forced `tool_use` followed by a
+and final text, `messages.count_tokens`, and automatic `tool_use` followed by a
 `tool_result` and final answer. The translated config can count tokens in this
 matrix because the shared vLLM server also exposes the native count-tokens
 endpoint; a Chat-Completions-only backend cannot. The live SDK step in
 [`vllm-integration.yaml`](../.github/workflows/vllm-integration.yaml) runs this
 matrix against the same Qwen3-8B instance as Claude Code acceptance.
+The first live run returned `end_turn` for a named tool-choice request on both
+routes. The SDK test records that stop-reason mismatch as an expected failure
+when a `tool_use` block is present; named tool-choice semantics remain
+unqualified.
 
 Positive image coverage uses Qwen3-VL-4B-Instruct in the separate
 [`anthropic-vllm-vision.yaml`](../.github/workflows/anthropic-vllm-vision.yaml)
