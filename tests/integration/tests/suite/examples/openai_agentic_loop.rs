@@ -20,9 +20,9 @@ use std::{
 };
 
 use praxis_test_utils::{
-    McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, build_pipeline, example_config_path,
-    free_port, http_send, json_post, parse_body, parse_status, patch_yaml, start_mcp_mock_server_with_config,
-    start_proxy,
+    McpMockConfig, McpToolFixture, StatefulCapturingBackend, TempSqlite, bind_unique_port, build_pipeline,
+    example_config_path, free_port, http_send, json_post, parse_body, parse_status, patch_yaml,
+    start_mcp_mock_server_with_config, start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -3277,7 +3277,7 @@ fn web_search_round_trip_executes_and_re_enters_inference() {
     ])
     .start_with_shutdown();
 
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     spawn_search_mock(search_listener);
 
@@ -3394,7 +3394,7 @@ fn web_search_callout_executes_outbound_chain_filters() {
     ])
     .start_with_shutdown();
 
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     let captured = spawn_capturing_search_mock(search_listener);
 
@@ -3494,11 +3494,11 @@ fn all_three_dispatchers_execute_in_one_irr_continuation() {
     ])
     .start_with_shutdown();
 
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     let search_calls = spawn_search_mock(search_listener);
 
-    let vector_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let vector_listener = bind_unique_port().0;
     let vector_port = vector_listener.local_addr().unwrap().port();
     let vector_calls = spawn_vector_store_mock(vector_listener);
 
@@ -3642,7 +3642,7 @@ fn web_search_batch_respects_response_wide_max_tool_calls() {
         serde_json::to_string(&first_response).expect("serialize model response"),
     )])
     .start_with_shutdown();
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     spawn_search_mock(search_listener);
     let proxy_port = free_port();
@@ -3779,7 +3779,7 @@ fn web_search_provider_failure_continues_loop_with_failed_result() {
     ])
     .start_with_shutdown();
 
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     spawn_failing_search_mock(search_listener);
 
@@ -3932,7 +3932,7 @@ fn streaming_web_search_round_trip_resumes_one_logical_response() {
         ),
     ];
     let (model_port, model_requests, model_thread) = start_streaming_model(vec![first_response, second_response]);
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     let search_calls = spawn_search_mock(search_listener);
     let proxy_port = free_port();
@@ -4224,7 +4224,7 @@ fn streaming_web_search_multi_query_call_costs_one_tool_call() {
         ),
     ];
     let (model_port, model_requests, model_thread) = start_streaming_model(vec![first_response, second_response]);
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     let search_calls = spawn_search_mock(search_listener);
     let proxy_port = free_port();
@@ -4384,7 +4384,7 @@ fn streaming_web_search_suppresses_premature_round_zero_done() {
         ),
     ];
     let (model_port, _model_requests, model_thread) = start_streaming_model(vec![first_response, second_response]);
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     let search_calls = spawn_search_mock(search_listener);
     let proxy_port = free_port();
@@ -4552,7 +4552,7 @@ fn streaming_web_search_partial_in_band_lifecycle_synthesizes_missing_phases() {
         ),
     ];
     let (model_port, _model_requests, model_thread) = start_streaming_model(vec![first_response, second_response]);
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     let search_calls = spawn_search_mock(search_listener);
     let proxy_port = free_port();
@@ -4721,7 +4721,7 @@ fn streaming_web_search_failure_synthesizes_partial_progress_in_one_logical_resp
         ),
     ];
     let (model_port, _model_requests, model_thread) = start_streaming_model(vec![first_response, second_response]);
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     spawn_failing_search_mock(search_listener);
     let proxy_port = free_port();
@@ -5081,7 +5081,7 @@ fn web_search_caps_multiple_calls_within_one_round_without_reentry() {
     let model = StatefulCapturingBackend::new(vec![(200, serde_json::to_string(&first_response).unwrap())])
         .start_with_shutdown();
 
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     let search_count = spawn_counting_search_mock(search_listener);
 
@@ -5177,7 +5177,7 @@ fn web_search_multi_query_call_costs_one_tool_call() {
     ])
     .start_with_shutdown();
 
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     let search_count = spawn_counting_search_mock(search_listener);
 
@@ -5274,7 +5274,7 @@ fn web_search_budget_persists_across_loop_iterations() {
     ])
     .start_with_shutdown();
 
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     let search_count = spawn_counting_search_mock(search_listener);
 
@@ -5357,7 +5357,7 @@ fn incomplete_web_search_still_consumes_response_wide_budget() {
         (200, second_response.to_string()),
     ])
     .start_with_shutdown();
-    let search_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let search_listener = bind_unique_port().0;
     let search_port = search_listener.local_addr().unwrap().port();
     let search_count = spawn_counting_search_mock(search_listener);
     let proxy_port = free_port();
@@ -5699,7 +5699,7 @@ type StreamingModel = (u16, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>);
 
 /// Start a two-turn model backend that emits each SSE event as a chunk.
 fn start_streaming_model(responses: Vec<Vec<String>>) -> StreamingModel {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("streaming model should bind");
+    let listener = bind_unique_port().0;
     let port = listener
         .local_addr()
         .expect("streaming model should have an address")
