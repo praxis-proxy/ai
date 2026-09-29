@@ -32,23 +32,6 @@ inputs:
 runs:
   using: composite
   steps:
-      # The self-hosted RHEL runner is persistent, so podman state from earlier
-      # runs piles up on the same disk the checkout and the cargo/target cache
-      # volumes live on: every run rebuilds the toolchain image (make
-      # fips-toolchain), orphaning the previous build's layers, and a cold suite
-      # build has run the disk to zero mid-compile (No space left on device).
-      # Reclaim the unreferenced state up front. No -a, so the tagged image the
-      # job just loaded (localhost/praxis-ai:<version>-fips) survives; no
-      # --volumes, so the praxis-ai-fips-host-cargo/-target caches the
-      # 180-minute cold-build budget depends on survive. Best-effort, and free
-      # space is printed either side so a future exhaustion is visible here.
-    - name: Reclaim disk on the persistent runner (podman prune, caches kept)
-      shell: bash
-      run: |
-        df -h "$GITHUB_WORKSPACE" || df -h || true
-        podman system prune --force || true
-        df -h "$GITHUB_WORKSPACE" || df -h || true
-
       # xtask (make fips-host-check, make fips-runtime-probe) compiles on the
       # host; the suites do not.
     - name: Set up Rust
