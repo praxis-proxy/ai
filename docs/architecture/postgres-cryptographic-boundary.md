@@ -24,13 +24,14 @@ hostname verification, and, when configured, **client-certificate
 authentication** — runs inside the platform TLS library. SQLx selects it
 through its `tls-native-tls` feature, which binds [native-tls] to the
 operating system's own provider: **OpenSSL on Linux** and
-**Security.framework (Secure Transport) on macOS**. The `store-postgres`
-feature in `apis/Cargo.toml` turns it on:
+**Security.framework (Secure Transport) on macOS**. The PostgreSQL profiles in
+`store-backends/Cargo.toml` turn it on:
 
 ```toml
 [features]
-store = ["dep:sqlx", "dep:dashmap"]
-store-postgres = ["store", "sqlx/postgres", "sqlx/tls-native-tls"]
+_postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/tls-native-tls"]
+postgres = ["_postgres", "sqlx/postgres-password-auth"]
+postgres-cert-auth = ["_postgres"]
 ```
 
 Everything on this path is the host's system TLS stack. Client
@@ -134,7 +135,7 @@ handshake with `AuthenticationOk` and **no password primitive executes**
 ### Client configuration
 
 Both filters accept the same TLS fields (carried by `PgTlsConfig` in
-`apis/src/store/postgres_tls.rs`):
+`store-backends/src/postgres_tls.rs`):
 
 | Field | Purpose |
 | --- | --- |

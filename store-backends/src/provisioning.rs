@@ -1002,9 +1002,6 @@ mod postgres_tests {
 
     /// A client-cert mTLS config the response-store filter accepts must also
     /// pass factory validation: the factory runs the same TLS check.
-    ///
-    /// `require_certificate_authentication` is left off so the compliance
-    /// profile's `PGPASSWORD`-env read does not make this env-dependent.
     #[test]
     fn validate_accepts_client_cert_mtls_config() {
         let cfg = json!({
@@ -1016,6 +1013,7 @@ mod postgres_tests {
             "ssl_root_cert": "/etc/pki/ca.pem",
             "ssl_client_cert": "/etc/pki/client.pem",
             "ssl_client_key": "/etc/pki/client.key",
+            "require_certificate_authentication": true,
         });
         PostgresBackendFactory
             .validate_config(&cfg)
@@ -1034,6 +1032,7 @@ mod postgres_tests {
             "ssl_mode": "require",
             "ssl_client_cert": "/etc/pki/client.pem",
             "ssl_client_key": "/etc/pki/client.key",
+            "require_certificate_authentication": true,
         });
         let err = PostgresBackendFactory
             .validate_config(&cfg)
