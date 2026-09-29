@@ -505,8 +505,9 @@ mod tests {
         },
     };
 
-    use super::*;
     use praxis_ai_store::url_security::is_file_url_ssrf_blocked;
+
+    use super::*;
 
     fn test_client() -> SubRequestClient {
         crate::subrequest::isolated_client(4)
