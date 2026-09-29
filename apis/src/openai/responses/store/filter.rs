@@ -11,9 +11,10 @@
 //! persist?" decision as new information becomes available:
 //!
 //! - **`on_request`**: reads classifier metadata to decide whether the request needs the store (persistable POST or
-//!   `previous_response_id`). Lazily initializes the store backend when needed. Rejects with a 500 response on store
-//!   init failure for any request that requires the store (persistence or rehydration). `GET` and `DELETE` endpoints
-//!   owned by the store also reject rather than falling through to the upstream.
+//!   `previous_response_id`). Resolves the store from the per-request registry, which the serving runtime provisions.
+//!   Rejects with a 500 response when a request that requires the store (persistence or rehydration) finds none
+//!   provisioned. `GET` and `DELETE` endpoints owned by the store also reject rather than falling through to the
+//!   upstream.
 //!
 //! - **`on_response`**: re-checks skip conditions, then inspects the response status and content-type. Non-2xx
 //!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and bail
@@ -43,8 +44,6 @@
 //! [`filter_metadata`]: praxis_filter::HttpFilterContext::filter_metadata
 //! [`ResponsesState`]: super::super::state::ResponsesState
 
-use std::{ops::RangeInclusive, sync::Arc};
-
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -52,33 +51,22 @@ use praxis_filter::{
     body::{BodyAccess, BodyMode, MAX_JSON_BODY_BYTES},
     parse_filter_config,
 };
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
-use secrecy::ExposeSecret as _;
 use serde_json::Value;
-use tokio::sync::OnceCell;
 use tracing::{debug, trace, warn};
 
-#[cfg(feature = "store-postgres")]
-use super::config::revalidate_postgres_host;
 use super::{
-    super::{
-        DEFAULT_STORE_NAME, append_stored_input_items, bound_body_outcome, error::responses_error_rejection,
-        is_explicit_compact_request, state::ResponsesState,
-    },
+    super::{DEFAULT_STORE_NAME, bound_body_outcome, error::responses_error_rejection, state::ResponsesState},
     InputItemPage, ListParams, MAX_PAGE_LIMIT, Order,
-    config::{ResponseStoreConfig, StorageBackend, validate_config},
+    config::{ResponseStoreConfig, validate_config},
     list_input_items,
 };
-#[cfg(feature = "store-postgres")]
-use crate::store::PostgresResponseStore;
-#[cfg(feature = "store-sqlite")]
-use crate::store::SqliteResponseStore;
 use crate::{
     classifier::is_responses_create,
     is_event_stream_content_type,
     openai::include::{IncludeFields, decode_query_component_strict, parse_include},
+    service::responses::ResponsesService,
     state_owner::{StateOwner, require_state_owner},
-    store::{PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, StoreError},
+    store::{PendingApprovalRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
 };
 
 /// Persists Responses API responses to the configured response store backend.
@@ -93,17 +81,14 @@ use crate::{
 /// conversations_table: openai_conversation_messages
 /// allow_private_database_url: true
 /// ```
-pub struct ResponseStoreFilter {
-    /// Parsed configuration.
-    pub(crate) config: ResponseStoreConfig,
-
-    /// Lazily initialized store backend. SQLite init failures are cached
-    /// as `None`; Postgres init failures are retried on every code path.
-    pub(crate) store: OnceCell<Option<Arc<dyn ResponseStore>>>,
-}
+pub struct ResponseStoreFilter;
 
 impl ResponseStoreFilter {
     /// Create a filter from parsed YAML config.
+    ///
+    /// The config is validated here so a malformed or unknown-backend config
+    /// fails at pipeline construction. The serving-runtime provisioner opens the
+    /// backend and registers it; the filter only resolves it at request time.
     ///
     /// # Errors
     ///
@@ -111,147 +96,22 @@ impl ResponseStoreFilter {
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", config)?;
         validate_config(&cfg)?;
-        Ok(Box::new(Self::new(cfg)))
-    }
-
-    /// Create a filter from validated config.
-    pub(super) fn new(config: ResponseStoreConfig) -> Self {
-        Self {
-            config,
-            store: OnceCell::new(),
-        }
-    }
-
-    /// Build the configured store backend.
-    #[expect(clippy::too_many_lines, reason = "tracing macros inflate complexity")]
-    #[cfg_attr(
-        not(any(feature = "store-postgres", feature = "store-sqlite")),
-        expect(clippy::unused_async, reason = "only the SQL backends await during construction")
-    )]
-    pub(super) async fn build_store(&self) -> Result<Arc<dyn ResponseStore>, StoreError> {
-        match self.config.backend {
-            #[cfg(feature = "store-sqlite")]
-            StorageBackend::Sqlite => {
-                let store = SqliteResponseStore::new(
-                    self.config.database_url.expose_secret(),
-                    &self.config.responses_table,
-                    &self.config.conversations_table,
-                    None,
-                    self.config.pool.as_ref(),
-                    self.config.compression.as_ref(),
-                )
-                .await;
-                store.map(|s| {
-                    let arc: Arc<dyn ResponseStore> = Arc::new(s);
-                    arc
-                })
-            },
-            #[cfg(not(feature = "store-sqlite"))]
-            StorageBackend::Sqlite => Err(StoreError::Unavailable(
-                "sqlite backend was not compiled; enable the 'store-sqlite' feature".to_owned(),
-            )),
-            #[cfg(feature = "store-postgres")]
-            StorageBackend::Postgres => {
-                revalidate_postgres_host(&self.config).map_err(|e| {
-                    StoreError::Unavailable(format!("postgres host validation failed before connect: {e}"))
-                })?;
-                let tls = self.config.tls_config();
-                let store = Box::pin(PostgresResponseStore::new(
-                    self.config.database_url.expose_secret(),
-                    &self.config.responses_table,
-                    &self.config.conversations_table,
-                    None,
-                    &tls,
-                    self.config.pool.as_ref(),
-                    self.config.compression.as_ref(),
-                ))
-                .await;
-                store.map(|s| {
-                    let arc: Arc<dyn ResponseStore> = Arc::new(s);
-                    arc
-                })
-            },
-            #[cfg(not(feature = "store-postgres"))]
-            StorageBackend::Postgres => Err(StoreError::Unavailable(
-                "postgres backend was not compiled; enable the 'store-postgres' feature".to_owned(),
-            )),
-        }
-    }
-
-    /// Build the store and log successful initialization.
-    async fn build_logged_store(&self) -> Result<Arc<dyn ResponseStore>, StoreError> {
-        let store = Box::pin(self.build_store()).await?;
-        debug!(
-            backend = ?self.config.backend,
-            responses_table = %self.config.responses_table,
-            conversations_table = %self.config.conversations_table,
-            "response store initialized"
-        );
-        Ok(store)
-    }
-
-    /// Initialize a store once, caching failed init permanently.
-    async fn init_permanent_store(&self) -> Option<Arc<dyn ResponseStore>> {
-        match Box::pin(self.build_logged_store()).await {
-            Ok(store) => Some(store),
-            Err(e) => {
-                warn!(
-                    backend = ?self.config.backend,
-                    error = %e,
-                    "response store initialization failed (permanent)"
-                );
-                None
-            },
-        }
-    }
-
-    /// Return the initialized store, retrying transient Postgres failures.
-    async fn get_or_init_store(&self) -> Option<Arc<dyn ResponseStore>> {
-        if matches!(self.config.backend, StorageBackend::Postgres) {
-            match self
-                .store
-                .get_or_try_init(|| async { Box::pin(self.build_logged_store()).await.map(Some) })
-                .await
-            {
-                Ok(store) => store.as_ref().map(Arc::clone),
-                Err(e) => {
-                    warn!(
-                        backend = ?self.config.backend,
-                        error = %e,
-                        "response store initialization failed (will retry)"
-                    );
-                    None
-                },
-            }
-        } else {
-            self.store
-                .get_or_init(|| async { Box::pin(self.init_permanent_store()).await })
-                .await
-                .as_ref()
-                .map(Arc::clone)
-        }
-    }
-
-    /// Best-effort store init for the explicit compact endpoint.
-    ///
-    /// The compact filter handles a missing store with its own error,
-    /// so a failed init here does not reject the request.
-    async fn try_init_store_for_compact(&self, ctx: &HttpFilterContext<'_>) {
-        if is_explicit_compact_request(ctx)
-            && let Some(store) = &self.get_or_init_store().await
-        {
-            register_store_in_context(ctx, store);
-        }
+        Ok(Box::new(Self))
     }
 
     /// Handle `DELETE /v1/responses/{id}` by deleting from the store.
-    async fn handle_delete(&self, owner: &StateOwner, id: &str) -> Result<FilterAction, FilterError> {
-        let Some(store) = self.ensure_store().await else {
+    async fn handle_delete(
+        &self,
+        ctx: &HttpFilterContext<'_>,
+        owner: &StateOwner,
+        id: &str,
+    ) -> Result<FilterAction, FilterError> {
+        let Some(service) = resolve_service(ctx, owner) else {
             return Ok(FilterAction::Reject(reject_store_error()));
         };
 
-        let deleted = store
-            .delete_response(owner, id)
+        let deleted = service
+            .delete(id)
             .await
             .map_err(|e| FilterError::from(format!("openai_response_store: delete failed: {e}")))?;
 
@@ -266,28 +126,12 @@ impl ResponseStoreFilter {
 
     /// Return whether this exchange should release response body
     /// chunks immediately instead of waiting for EOS.
-    fn should_release_skipped_response_body(&self, ctx: &HttpFilterContext<'_>) -> bool {
-        should_skip_persist(ctx) || self.store.get().and_then(Option::as_ref).is_none()
-    }
-
-    /// Return the initialized store and terminal response bytes.
-    fn terminal_store_and_body<'a>(
-        &self,
-        ctx: &HttpFilterContext<'_>,
-        body: &'a Option<Bytes>,
-    ) -> Option<(&dyn ResponseStore, &'a Bytes)> {
-        if should_skip_persist(ctx) {
-            return None;
-        }
-
-        let store = self.store.get().and_then(Option::as_deref)?;
-        let bytes = body.as_ref().filter(|b| !b.is_empty())?;
-
-        Some((store, bytes))
+    fn should_release_skipped_response_body(ctx: &HttpFilterContext<'_>) -> bool {
+        should_skip_persist(ctx) || !store_available(ctx)
     }
 
     /// Persist a streaming response from accumulated `ResponsesState`.
-    fn persist_from_streaming_state(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+    fn persist_from_streaming_state(ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if should_skip_persist(ctx) {
             return Ok(FilterAction::Continue);
         }
@@ -299,60 +143,141 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        let Some(store) = self.store.get().and_then(Option::as_deref) else {
+        if !store_available(ctx) {
             trace!("skipping streaming persistence: store unavailable");
             return Ok(FilterAction::Continue);
-        };
+        }
 
-        let Some(capture) = ctx.extensions.remove::<ResponseStoreRequestState>() else {
-            return Ok(FilterAction::Reject(reject_store_error()));
-        };
-        let Some(owner) = capture.owner else {
-            return Ok(FilterAction::Reject(reject_store_error()));
-        };
-        let request_input = capture.input;
-
-        // Capture the proxy-issued pending approvals before building the record;
-        // the borrow is released before `build_record_from_state` re-borrows ctx.
+        // Capture the proxy-issued pending approvals before taking the context.
         let pending_approvals = pending_approvals_from_ctx(ctx);
+        let (service, owner, request_input) = match take_persist_context(ctx) {
+            Ok(parts) => parts,
+            Err(action) => return Ok(action),
+        };
 
-        let Some(record) = build_record_from_state(ctx, owner, request_input) else {
-            trace!("skipping streaming persistence: no accumulated state");
+        let Some(record) = build_streaming_record(ctx, owner, request_input) else {
+            trace!("skipping streaming persistence: no persistable record");
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(store, &record, &pending_approvals)?;
+        persist_response_blocking(&service, &record, &pending_approvals)?;
         Ok(FilterAction::Continue)
     }
 
     /// Persist a non-streaming response from the buffered body bytes.
     fn persist_from_buffered_body(
-        &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &Option<Bytes>,
     ) -> Result<FilterAction, FilterError> {
-        let Some((store, bytes)) = self.terminal_store_and_body(ctx, body) else {
+        if should_skip_persist(ctx) {
+            return Ok(FilterAction::Continue);
+        }
+        let Some(bytes) = body.as_ref().filter(|b| !b.is_empty()) else {
             return Ok(FilterAction::Continue);
         };
-        let Some(capture) = ctx.extensions.remove::<ResponseStoreRequestState>() else {
-            return Ok(FilterAction::Reject(reject_store_error()));
-        };
-        let Some(owner) = capture.owner else {
-            return Ok(FilterAction::Reject(reject_store_error()));
-        };
-        let request_input = capture.input;
-        let state_messages = ctx
-            .extensions
-            .get::<ResponsesState>()
-            .map(|state| state.persisted_messages.clone());
+        if !store_available(ctx) {
+            return Ok(FilterAction::Continue);
+        }
+
+        // Capture the proxy-issued pending approvals before taking the context.
         let pending_approvals = pending_approvals_from_ctx(ctx);
-        let Some(record) = parse_response_record(bytes, owner, request_input, state_messages) else {
+        let (service, owner, request_input) = match take_persist_context(ctx) {
+            Ok(parts) => parts,
+            Err(action) => return Ok(action),
+        };
+
+        let Some(record) = build_buffered_record(ctx, bytes, owner, request_input) else {
             return Ok(FilterAction::Continue);
         };
 
-        persist_response_blocking(store, &record, &pending_approvals)?;
+        persist_response_blocking(&service, &record, &pending_approvals)?;
         Ok(FilterAction::Continue)
     }
+}
+
+/// Resolve the owner-scoped Responses service from the per-request registry.
+///
+/// The store is provisioned into the registry on the serving runtime; the filter
+/// takes an owner-bound handle at request time and wraps it in the service.
+/// `None` when no registry is installed or the store is not provisioned.
+fn resolve_service(ctx: &HttpFilterContext<'_>, owner: &StateOwner) -> Option<ResponsesService> {
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .and_then(|registry| registry.get_scoped(DEFAULT_STORE_NAME, owner))
+        .map(ResponsesService::new)
+}
+
+/// Take the request-scoped persistence context captured before inference: the
+/// owner-scoped service, the immutable owner, and the original request input.
+/// `Err` carries the fail-closed rejection when the capture, owner, or store is
+/// missing.
+fn take_persist_context(
+    ctx: &mut HttpFilterContext<'_>,
+) -> Result<(ResponsesService, StateOwner, Option<Value>), FilterAction> {
+    let capture = ctx
+        .extensions
+        .remove::<ResponseStoreRequestState>()
+        .ok_or_else(|| FilterAction::Reject(reject_store_error()))?;
+    let owner = capture
+        .owner
+        .ok_or_else(|| FilterAction::Reject(reject_store_error()))?;
+    let service = resolve_service(ctx, &owner).ok_or_else(|| FilterAction::Reject(reject_store_error()))?;
+    Ok((service, owner, capture.input))
+}
+
+/// Build the streaming record from accumulated [`ResponsesState`]. `None` when no
+/// state was accumulated or the response is not persistable.
+fn build_streaming_record(
+    ctx: &HttpFilterContext<'_>,
+    owner: StateOwner,
+    request_input: Option<Value>,
+) -> Option<ResponseRecord> {
+    let state = ctx.extensions.get::<ResponsesState>()?;
+    let response_object = state.response_object.clone();
+    let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone());
+    ResponsesService::build_record(
+        response_object,
+        owner,
+        request_input,
+        state_messages,
+        &state.translated_reasoning_replay,
+    )
+}
+
+/// Build the buffered record from the decoded response body and the captured
+/// request state. `None` when the body is invalid JSON or not persistable.
+fn build_buffered_record(
+    ctx: &HttpFilterContext<'_>,
+    bytes: &[u8],
+    owner: StateOwner,
+    request_input: Option<Value>,
+) -> Option<ResponseRecord> {
+    let state_messages = ctx
+        .extensions
+        .get::<ResponsesState>()
+        .map(|state| state.persisted_messages.clone());
+    let json = decode_response_body(bytes)?;
+    ResponsesService::build_record(json, owner, request_input, state_messages, &[])
+}
+
+/// Decode a buffered response body, logging and skipping on invalid JSON.
+fn decode_response_body(bytes: &[u8]) -> Option<Value> {
+    match serde_json::from_slice(bytes) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            warn!(error = %e, "response store: invalid response JSON");
+            None
+        },
+    }
+}
+
+/// Whether the default store is provisioned into the per-request registry. The
+/// owner-scoped read needs an owner, so a presence check that does not have one
+/// (release decision, pre-persist gate) uses this instead.
+fn store_available(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ResponseStoreRegistry>()
+        .is_some_and(|registry| registry.contains(DEFAULT_STORE_NAME))
 }
 
 // -----------------------------------------------------------------------------
@@ -388,33 +313,6 @@ fn capture_request_input(ctx: &mut HttpFilterContext<'_>, input: Value) {
     ctx.extensions.insert(state);
 }
 
-/// Fields extracted from the response JSON for the store record.
-struct ResponseCapture {
-    /// Original request input used by rehydration.
-    input: Value,
-
-    /// Full message history used by rehydration.
-    messages: Value,
-}
-
-impl ResponseCapture {
-    /// Extract stored input and output from a Responses API exchange.
-    fn from_response_json(
-        json: &Value,
-        request_input: Option<Value>,
-        state_messages: Option<Vec<Value>>,
-        reasoning_replay: &[RangeInclusive<usize>],
-    ) -> Self {
-        let input = request_input
-            .or_else(|| json.get("input").cloned())
-            .unwrap_or(Value::Null);
-        let history_input = state_messages.map_or_else(|| input.clone(), Value::Array);
-        let messages = assemble_stored_messages(history_input, json.get("output"), reasoning_replay);
-
-        Self { input, messages }
-    }
-}
-
 /// Extract the original Responses API request input from the buffered
 /// create request body.
 fn extract_request_input(body: &Option<Bytes>) -> Option<Value> {
@@ -427,38 +325,6 @@ fn extract_request_input(body: &Option<Bytes>) -> Option<Value> {
         },
     };
     json.as_object_mut()?.remove("input")
-}
-
-/// Build the stored conversation history from response input and output.
-fn assemble_stored_messages(input: Value, output: Option<&Value>, reasoning_replay: &[RangeInclusive<usize>]) -> Value {
-    let mut messages = Vec::new();
-    append_stored_input_items(&mut messages, input);
-    let output_start = messages.len();
-
-    match output {
-        Some(Value::Array(items)) => messages.extend(items.iter().cloned()),
-        Some(output) if !output.is_null() => messages.push(output.clone()),
-        Some(_) | None => {},
-    }
-    if let Some(output) = messages.get_mut(output_start..) {
-        normalize_translated_reasoning(output, reasoning_replay);
-    }
-
-    Value::Array(messages)
-}
-
-/// Restore reasoning-first replay only within completed Chat turns identified by
-/// the translator. Each range ends at that turn's reasoning item, regardless of
-/// any following tool calls. Rotating it leaves every other turn's positions and
-/// the client-facing response object unchanged.
-fn normalize_translated_reasoning(items: &mut [Value], reasoning_replay: &[RangeInclusive<usize>]) {
-    for range in reasoning_replay {
-        if let Some(turn) = items.get_mut(*range.start()..=*range.end())
-            && turn.last().and_then(|item| item.get("type")).and_then(Value::as_str) == Some("reasoning")
-        {
-            turn.rotate_right(1);
-        }
-    }
 }
 
 // -----------------------------------------------------------------------------
@@ -475,40 +341,22 @@ pub(super) fn extract_response_id(path: &str) -> Option<&str> {
 }
 
 // -----------------------------------------------------------------------------
-// Registry Helpers
+// Persistence Arming
 // -----------------------------------------------------------------------------
-
-/// Publish the initialized store into the per-request registry so
-/// downstream filters (rehydrate, compact, etc.) can read from it.
-fn register_store_in_context(ctx: &HttpFilterContext<'_>, store: &Arc<dyn ResponseStore>) {
-    let Some(registry) = ctx.extensions.get::<ResponseStoreRegistry>() else {
-        return;
-    };
-    // The response store is intentionally instance-scoped today: a Praxis
-    // process has one default Responses store shared by listener pipelines.
-    // If multi-store-per-instance support is added later, this registry key
-    // must become config- or listener-scoped instead of "default".
-    if registry.contains(DEFAULT_STORE_NAME) {
-        return;
-    }
-    let name: Arc<str> = Arc::from(DEFAULT_STORE_NAME);
-    if let Err(e) = registry.register(&name, Arc::clone(store)) {
-        debug!(error = %e, "response store already registered");
-    }
-}
 
 /// Mark this exchange as persistence-armed on the shared [`ResponsesState`].
 ///
 /// This is the exchange-scoped signal `mcp_dispatch` requires before emitting an
-/// `mcp_approval_request`. It is set only when this store filter both registers a
-/// backend and classifies the request as one whose response it will persist, so
-/// — unlike pipeline-scoped registry membership — it proves persistence is armed
-/// for THIS exchange and catches a store filter that is absent,
-/// request-conditioned out, or ordered after dispatch.
+/// `mcp_approval_request`. It is set only when the request classifies as one
+/// whose response this filter will persist, so, unlike pipeline-scoped registry
+/// membership, it proves persistence is armed for THIS exchange and catches a
+/// store filter that is absent, request-conditioned out, or ordered after
+/// dispatch.
 ///
 /// It is written from `on_request_body` because `openai_responses_validate`
 /// creates `ResponsesState` in its own `on_request_body`, which runs earlier in
-/// the same body phase; `ResponsesState` is not yet present during `on_request`.
+/// the same body phase, so `ResponsesState` is not yet present during
+/// `on_request`.
 fn arm_persistence_if_persisting(ctx: &mut HttpFilterContext<'_>) {
     if request_will_persist_response(ctx)
         && let Some(state) = ctx.extensions.get_mut::<ResponsesState>()
@@ -681,90 +529,10 @@ fn response_is_persistable(ctx: &mut HttpFilterContext<'_>) -> bool {
     true
 }
 
-/// Parse a response body into a [`ResponseRecord`], returning
-/// `None` for invalid JSON or missing required fields.
-fn parse_response_record(
-    bytes: &[u8],
-    owner: StateOwner,
-    request_input: Option<Value>,
-    state_messages: Option<Vec<Value>>,
-) -> Option<ResponseRecord> {
-    let json: Value = match serde_json::from_slice(bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "response store: invalid response JSON");
-            return None;
-        },
-    };
-
-    let id = json.get("id").and_then(Value::as_str);
-    let created_at = json.get("created_at").and_then(Value::as_i64);
-    let model = json.get("model").and_then(Value::as_str);
-
-    let (Some(id), Some(created_at), Some(model)) = (id, created_at, model) else {
-        warn!("response store: missing required field (id, created_at, or model)");
-        return None;
-    };
-
-    let capture = ResponseCapture::from_response_json(&json, request_input, state_messages, &[]);
-
-    Some(ResponseRecord {
-        id: id.to_owned(),
-        owner,
-        created_at,
-        model: model.to_owned(),
-        response_object: json,
-        input: capture.input,
-        messages: capture.messages,
-    })
-}
-
-/// Build a [`ResponseRecord`] from accumulated streaming state.
-///
-/// Reads `ResponsesState` from extensions. Returns `None` if the
-/// state is absent, `response_object` is null, or required fields
-/// are missing.
-pub(super) fn build_record_from_state(
-    ctx: &HttpFilterContext<'_>,
-    owner: StateOwner,
-    request_input: Option<Value>,
-) -> Option<ResponseRecord> {
-    let state = ctx.extensions.get::<ResponsesState>()?;
-
-    if state.response_object.is_null() {
-        warn!("streaming persistence: response_object is null (incomplete stream?)");
-        return None;
-    }
-
-    let json = &state.response_object;
-    let id = json.get("id").and_then(Value::as_str);
-    let created_at = json.get("created_at").and_then(Value::as_i64);
-    let model = json.get("model").and_then(Value::as_str);
-
-    let (Some(id), Some(created_at), Some(model)) = (id, created_at, model) else {
-        warn!("streaming persistence: missing required field (id, created_at, or model)");
-        return None;
-    };
-
-    let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone());
-    let capture =
-        ResponseCapture::from_response_json(json, request_input, state_messages, &state.translated_reasoning_replay);
-
-    Some(ResponseRecord {
-        id: id.to_owned(),
-        owner,
-        created_at,
-        model: model.to_owned(),
-        response_object: json.clone(),
-        input: capture.input,
-        messages: capture.messages,
-    })
-}
-
 /// Persist a response record synchronously via [`block_in_place`].
 ///
 /// Uses the current Tokio runtime handle to drive the async
-/// `upsert_response` call without yielding back to Pingora's
+/// `persist` call without yielding back to Pingora's
 /// synchronous `response_body_filter`. This guarantees the record
 /// is durable before the response reaches the client, preventing
 /// races where a subsequent `DELETE /v1/responses/{id}` arrives
@@ -782,7 +550,7 @@ pub(super) fn build_record_from_state(
 ///
 /// [`block_in_place`]: tokio::task::block_in_place
 fn persist_response_blocking(
-    store: &dyn ResponseStore,
+    service: &ResponsesService,
     record: &ResponseRecord,
     pending_approvals: &[PendingApprovalRecord],
 ) -> Result<(), FilterError> {
@@ -794,14 +562,8 @@ fn persist_response_blocking(
     );
 
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(|| {
-        handle.block_on(async {
-            store
-                .persist_response_with_pending_approvals(record, pending_approvals)
-                .await
-        })
-    })
-    .map_err(|e| -> FilterError { Box::new(e) })
+    tokio::task::block_in_place(|| handle.block_on(async { service.persist(record, pending_approvals).await }))
+        .map_err(|e| -> FilterError { Box::new(e) })
 }
 
 /// Snapshot the proxy-issued pending approvals from request-scoped state.
@@ -857,10 +619,6 @@ impl HttpFilter for ResponseStoreFilter {
         BodyMode::Stream
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "request routing and pre-inference owner capture remain one lifecycle hook"
-    )]
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if is_responses_format(ctx) && !is_streaming_request(ctx) {
             ctx.set_response_body_mode(BodyMode::StreamBuffer {
@@ -881,7 +639,7 @@ impl HttpFilter for ResponseStoreFilter {
                     Ok(owner) => owner.clone(),
                     Err(action) => return Ok(action),
                 };
-                return self.handle_delete(&owner, id).await;
+                return self.handle_delete(ctx, &owner, id).await;
             }
             return Ok(FilterAction::Continue);
         }
@@ -890,22 +648,15 @@ impl HttpFilter for ResponseStoreFilter {
             return Ok(action);
         }
 
-        if !should_init_store_for_request(ctx) {
-            self.try_init_store_for_compact(ctx).await;
-            return Ok(FilterAction::Continue);
-        }
-
-        match &self.get_or_init_store().await {
-            Some(store) => register_store_in_context(ctx, store),
-            None => return Ok(FilterAction::Reject(reject_store_error())),
+        // A persistable or rehydrating request needs the provisioned store; fail
+        // fast (before inference) when it is absent rather than at response time.
+        if should_init_store_for_request(ctx) && !store_available(ctx) {
+            return Ok(FilterAction::Reject(reject_store_error()));
         }
 
         Ok(FilterAction::Continue)
     }
 
-    /// Eagerly register the store during the body phase so
-    /// downstream filters running in `StreamBuffer` pre-read
-    /// (before `on_request`) can access it.
     async fn on_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
@@ -924,17 +675,14 @@ impl HttpFilter for ResponseStoreFilter {
             capture_request_input(ctx, input);
         }
         if should_init_store_for_request(ctx) {
-            match &self.get_or_init_store().await {
-                Some(store) => register_store_in_context(ctx, store),
-                None => return Ok(FilterAction::Reject(reject_store_error())),
+            if !store_available(ctx) {
+                return Ok(FilterAction::Reject(reject_store_error()));
             }
             // Publish the exchange-scoped persistence-armed marker so a
             // downstream approval pause (mcp_dispatch) can tell that THIS
-            // response will be persisted, not merely that a store is registered
+            // response will be persisted, not merely that a store is provisioned
             // somewhere in the pipeline.
             arm_persistence_if_persisting(ctx);
-        } else {
-            self.try_init_store_for_compact(ctx).await;
         }
         Ok(FilterAction::Continue)
     }
@@ -957,7 +705,7 @@ impl HttpFilter for ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if self.get_or_init_store().await.is_none() {
+        if !store_available(ctx) {
             return Ok(FilterAction::Reject(reject_store_error()));
         }
 
@@ -972,7 +720,7 @@ impl HttpFilter for ResponseStoreFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        if self.should_release_skipped_response_body(ctx) {
+        if Self::should_release_skipped_response_body(ctx) {
             return Ok(FilterAction::Release);
         }
 
@@ -994,7 +742,7 @@ impl HttpFilter for ResponseStoreFilter {
                     // state is missing (#1197), or an `Err` on a persistence
                     // failure — and must be propagated so the client never
                     // observes `response.completed` for an unpersisted record.
-                    match self.persist_from_streaming_state(ctx)? {
+                    match Self::persist_from_streaming_state(ctx)? {
                         FilterAction::Continue => {},
                         action => return Ok(action),
                     }
@@ -1010,14 +758,14 @@ impl HttpFilter for ResponseStoreFilter {
             if streaming_terminal_emitted(ctx) {
                 return Ok(FilterAction::Continue);
             }
-            return self.persist_from_streaming_state(ctx);
+            return Self::persist_from_streaming_state(ctx);
         }
 
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
 
-        self.persist_from_buffered_body(ctx, body)
+        Self::persist_from_buffered_body(ctx, body)
     }
 }
 
@@ -1049,11 +797,6 @@ impl ResponseStoreFilter {
         Ok(None)
     }
 
-    /// Lazily initialize the store and return a clone of the `Arc`.
-    async fn ensure_store(&self) -> Option<Arc<dyn ResponseStore>> {
-        self.get_or_init_store().await
-    }
-
     /// Serve `GET /v1/responses/{id}`.
     #[expect(
         clippy::cognitive_complexity,
@@ -1069,17 +812,17 @@ impl ResponseStoreFilter {
             return FilterAction::Reject(reject_invalid_input(&msg));
         }
 
-        let Some(store) = self.ensure_store().await else {
-            return FilterAction::Reject(reject_store_error());
-        };
-
         let owner = match require_state_owner(ctx) {
             Ok(owner) => owner,
             Err(action) => return action,
         };
+
+        let Some(service) = resolve_service(ctx, owner) else {
+            return FilterAction::Reject(reject_store_error());
+        };
         debug!(response_id = id, "retrieving stored response");
 
-        match store.get_response(owner, id).await {
+        match service.get(id).await {
             Ok(Some(record)) => {
                 let body = serde_json::to_vec(&record.response_object).unwrap_or_default();
                 FilterAction::Reject(
@@ -1102,14 +845,13 @@ impl ResponseStoreFilter {
     /// Load a [`ResponseRecord`] from the store, returning a
     /// [`FilterAction`] rejection on store or not-found errors.
     async fn load_record(&self, ctx: &HttpFilterContext<'_>, id: &str) -> Result<ResponseRecord, FilterAction> {
-        let Some(store) = self.ensure_store().await else {
+        let owner = require_state_owner(ctx)?;
+        let Some(service) = resolve_service(ctx, owner) else {
             return Err(FilterAction::Reject(reject_store_error()));
         };
-
-        let owner = require_state_owner(ctx)?;
         debug!(response_id = id, "retrieving input items");
 
-        match store.get_response(owner, id).await {
+        match service.get(id).await {
             Ok(Some(r)) => Ok(r),
             Ok(None) => {
                 debug!(response_id = id, "response not found for input_items");
@@ -1385,174 +1127,4 @@ fn reject_invalid_input(message: &str) -> Rejection {
 /// Build a 500 rejection for internal store failures.
 fn reject_store_error() -> Rejection {
     responses_error_rejection(500, "server_error", "Internal server error.")
-}
-
-#[cfg(test)]
-#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    reason = "tests"
-)]
-mod normalize_tests {
-    use serde_json::json;
-
-    use super::{Value, assemble_stored_messages, normalize_translated_reasoning};
-
-    fn types(items: &[Value]) -> Vec<&str> {
-        items
-            .iter()
-            .map(|item| item.get("type").and_then(Value::as_str).unwrap_or("message"))
-            .collect()
-    }
-
-    #[test]
-    fn trailing_reasoning_after_a_message_moves_ahead_of_its_turn() {
-        // The streaming translator emits `[message, reasoning]` when the answer
-        // streams before reasoning. The stored history must lead with reasoning so
-        // continuation replay attaches it to the message that follows.
-        let mut items = vec![
-            json!({"type": "message", "role": "assistant", "id": "msg_1"}),
-            json!({"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "late"}]}),
-        ];
-        normalize_translated_reasoning(&mut items, &[0..=1]);
-        assert_eq!(types(&items), ["reasoning", "message"]);
-    }
-
-    #[test]
-    fn trailing_reasoning_moves_ahead_of_a_message_and_tool_call_turn() {
-        let mut items = vec![
-            json!({"type": "message", "role": "assistant", "id": "msg_1"}),
-            json!({"type": "function_call", "id": "fc_1"}),
-            json!({"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "late"}]}),
-        ];
-        normalize_translated_reasoning(&mut items, &[0..=2]);
-        assert_eq!(types(&items), ["reasoning", "message", "function_call"]);
-    }
-
-    #[test]
-    fn reasoning_first_turns_are_left_untouched() {
-        // The finite builder and native passthrough already lead with reasoning.
-        let mut items = vec![
-            json!({"type": "reasoning", "id": "rs_1"}),
-            json!({"type": "message", "role": "assistant", "id": "msg_1"}),
-        ];
-        let before = items.clone();
-        normalize_translated_reasoning(&mut items, &[]);
-        assert_eq!(items, before);
-    }
-
-    #[test]
-    fn multi_round_agentic_reasoning_is_not_collapsed_onto_an_earlier_turn() {
-        // Each round already leads with its own reasoning, and the trailing
-        // reasoning here (round 2) is followed by round 2's message, so it is not
-        // a trailing item: nothing moves.
-        let mut items = vec![
-            json!({"type": "reasoning", "id": "rs_1"}),
-            json!({"type": "function_call", "id": "fc_1"}),
-            json!({"type": "reasoning", "id": "rs_2"}),
-            json!({"type": "message", "role": "assistant", "id": "msg_2"}),
-        ];
-        let before = items.clone();
-        normalize_translated_reasoning(&mut items, &[]);
-        assert_eq!(items, before);
-    }
-
-    #[test]
-    fn a_standalone_trailing_reasoning_turn_is_preserved() {
-        // The preceding turn already leads with its own reasoning, so a trailing
-        // reasoning item is a separate, standalone turn and must not be merged.
-        let mut items = vec![
-            json!({"type": "reasoning", "id": "rs_1"}),
-            json!({"type": "message", "role": "assistant", "id": "msg_1"}),
-            json!({"type": "reasoning", "id": "rs_2"}),
-        ];
-        let before = items.clone();
-        normalize_translated_reasoning(&mut items, &[]);
-        assert_eq!(items, before);
-    }
-
-    #[test]
-    fn assemble_normalizes_stored_output_without_touching_input_history() {
-        let input = json!([{"role": "user", "content": "hi"}]);
-        let output = json!([
-            {"type": "message", "role": "assistant", "id": "msg_1"},
-            {"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "late"}]}
-        ]);
-        let messages = assemble_stored_messages(input, Some(&output), &[0..=1]);
-        let messages = messages.as_array().expect("assembled messages are an array");
-        // The user input stays first; only the stored output turn is normalized.
-        let first_role = messages
-            .first()
-            .and_then(|item| item.get("role"))
-            .and_then(Value::as_str);
-        assert_eq!(first_role, Some("user"));
-        let output_turn = messages.get(1..).expect("input item precedes the stored output");
-        assert_eq!(types(output_turn), ["reasoning", "message"]);
-    }
-
-    #[test]
-    fn translated_reasoning_stays_with_its_round_even_when_message_ids_repeat() {
-        let output = json!([
-            {"type": "message", "role": "assistant", "id": "msg_shared", "content": "first"},
-            {"type": "message", "role": "assistant", "id": "msg_shared", "content": "second"},
-            {"type": "reasoning", "id": "rs_second", "content": [{"type": "reasoning_text", "text": "second thought"}]},
-            {"type": "message", "role": "assistant", "id": "msg_shared", "content": "third"},
-            {"type": "reasoning", "id": "rs_third", "content": [{"type": "reasoning_text", "text": "third thought"}]}
-        ]);
-        let input = assemble_stored_messages(json!([]), Some(&output), &[1..=2, 3..=4]);
-        let chat = crate::openai::translation::chat_completions::responses_request_to_chat_request(
-            &json!({"model": "m", "input": input}),
-            &crate::openai::translation::reasoning::ReasoningOptions {
-                dialect: crate::openai::translation::reasoning::ReasoningDialect::Vllm,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            chat["messages"],
-            json!([
-                {"role": "assistant", "content": "first"},
-                {"role": "assistant", "content": "second", "reasoning": "second thought"},
-                {"role": "assistant", "content": "third", "reasoning": "third thought"}
-            ])
-        );
-        assert_eq!(output[1]["type"], "message", "wire order must be unchanged");
-    }
-
-    #[test]
-    fn late_reasoning_before_a_tool_call_replays_with_the_answer() {
-        let output = json!([
-            {"type": "message", "role": "assistant", "content": "answer"},
-            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "thought"}]},
-            {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"}
-        ]);
-        let input = assemble_stored_messages(json!([]), Some(&output), &[0..=1]);
-        let chat = crate::openai::translation::chat_completions::responses_request_to_chat_request(
-            &json!({"model": "m", "input": input}),
-            &crate::openai::translation::reasoning::ReasoningOptions {
-                dialect: crate::openai::translation::reasoning::ReasoningDialect::Vllm,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            chat["messages"][0],
-            json!({"role": "assistant", "content": "answer", "reasoning": "thought"})
-        );
-        assert_eq!(chat["messages"][1]["tool_calls"][0]["id"], "call_1");
-        assert!(chat["messages"][1].get("reasoning").is_none());
-    }
-
-    #[test]
-    fn native_output_without_translator_provenance_keeps_its_order() {
-        let output = json!([
-            {"type": "message", "role": "assistant", "id": "msg_1"},
-            {"type": "message", "role": "assistant", "id": "msg_2"},
-            {"type": "reasoning", "id": "rs_native"}
-        ]);
-        assert_eq!(assemble_stored_messages(json!([]), Some(&output), &[]), output);
-    }
 }

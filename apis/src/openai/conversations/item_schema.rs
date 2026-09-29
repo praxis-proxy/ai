@@ -57,7 +57,7 @@ pub(super) fn validate_input_item(item: &Value) -> Result<(), String> {
 }
 
 /// Validate one normalized item returned by the local API.
-pub(super) fn validate_output_item(item: &Value) -> Result<(), String> {
+pub(crate) fn validate_output_item(item: &Value) -> Result<(), String> {
     let validators = ITEM_VALIDATORS.as_ref().map_err(Clone::clone)?;
     validate_item(&validators.output, item, "ConversationItem")
 }

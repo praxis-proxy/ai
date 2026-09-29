@@ -49,6 +49,11 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     register_external_metering(registry, subrequest_client);
     register_anthropic_filters(registry, subrequest_client);
     register_openai_filters(registry);
+    #[cfg(feature = "store")]
+    praxis_filter::register_filters!(
+        @register registry,
+        http "praxis_store_readiness_gate" => crate::StoreReadinessGateFilter::from_config
+    );
     #[cfg(feature = "openai-responses")]
     register_openai_responses_filters(registry, subrequest_client);
     register_routing_filters(registry);

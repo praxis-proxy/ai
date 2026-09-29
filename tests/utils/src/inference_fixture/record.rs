@@ -373,6 +373,7 @@ pub(super) async fn record_live(
     debug_assert_eq!(released_port, listener_port);
     let mut proxy = start_proxy_no_wait(&config);
     wait_for_tcp(proxy.addr());
+    proxy.wait_for_store_ready();
 
     let scenario_id = bound.id;
     let protocol = bound.protocol;
