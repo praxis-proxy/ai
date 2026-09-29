@@ -402,10 +402,10 @@ mod tests {
     }
 
     #[test]
-    fn full_flow_flattens_to_twenty_six_ordered_nodes() {
+    fn full_flow_flattens_to_thirty_ordered_nodes() {
         let graph = full_flow_graph();
         let nodes = graph.flatten_chain(PIPELINE_CHAIN).expect("chain exists");
-        assert_eq!(nodes.len(), 26, "16 main + 10 IRR-step filters");
+        assert_eq!(nodes.len(), 30, "19 main + 11 IRR-step filters");
         for (i, node) in nodes.iter().enumerate() {
             assert_eq!(node.order, i + 1, "orders are 1-based and sequential");
         }
@@ -416,12 +416,16 @@ mod tests {
         let graph = full_flow_graph();
         let nodes = graph.flatten_chain(PIPELINE_CHAIN).expect("chain exists");
         assert_eq!(nodes[0].filter_type, "trace_context");
-        assert_eq!(nodes[15].filter_type, IRR_FILTER, "router is the 16th filter");
-        assert_eq!(nodes[15].depth, 0, "the router itself is main-chain");
-        assert_eq!(nodes[16].depth, 1, "first inference-step filter is nested");
-        assert_eq!(nodes[16].irr_step.as_deref(), Some("inference"));
-        assert_eq!(nodes[16].filter_type, "project_state_owner_headers");
-        assert_eq!(nodes[25].filter_type, "openai_responses_proxy", "last step filter");
+        assert_eq!(nodes[18].filter_type, IRR_FILTER, "IRR is the 19th filter");
+        assert_eq!(nodes[18].depth, 0, "the IRR itself is main-chain");
+        assert_eq!(nodes[19].depth, 1, "first inference-step filter is nested");
+        assert_eq!(nodes[19].irr_step.as_deref(), Some("inference"));
+        assert_eq!(nodes[19].filter_type, "project_state_owner_headers");
+        assert_eq!(
+            nodes[27].filter_type, "openai_responses_proxy",
+            "proxy after the step load balancer"
+        );
+        assert_eq!(nodes[29].filter_type, "path_rewrite", "last step filter");
     }
 
     #[test]

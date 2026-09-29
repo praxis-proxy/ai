@@ -821,7 +821,7 @@ const PIPELINE = {
         },
         "S9": {
           "state": "active",
-          "note": "establishes TraceContext on the WS handshake before bypass"
+          "note": "establishes TraceContext on the WS handshake before the direct-services branch"
         },
         "S10": {
           "state": "active",
@@ -829,7 +829,15 @@ const PIPELINE = {
         },
         "S11": {
           "state": "active",
-          "note": "establishes TraceContext before the dedicated-service bypass"
+          "note": "establishes TraceContext before the dedicated-service direct-services branch"
+        },
+        "S12": {
+          "state": "active",
+          "note": "establishes TraceContext before the direct-openai passthrough forward"
+        },
+        "S13": {
+          "state": "active",
+          "note": "establishes TraceContext for the managed chat-completions round"
         }
       }
     },
@@ -881,7 +889,7 @@ const PIPELINE = {
         },
         "S9": {
           "state": "active",
-          "note": "owner mapped on WS handshake before bypass"
+          "note": "owner mapped on WS handshake before the direct-services branch"
         },
         "S10": {
           "state": "active",
@@ -889,7 +897,15 @@ const PIPELINE = {
         },
         "S11": {
           "state": "active",
-          "note": "owner mapped before dedicated-service bypass"
+          "note": "owner mapped before the dedicated-service direct-services branch"
+        },
+        "S12": {
+          "state": "active",
+          "note": "owner mapped before the direct-openai forward"
+        },
+        "S13": {
+          "state": "active",
+          "note": "owner mapped for the managed chat-completions round"
         }
       }
     },
@@ -965,7 +981,15 @@ const PIPELINE = {
         },
         "S11": {
           "state": "active",
-          "note": "strips all provider-key headers and sets the assertion before the dedicated-service bypass"
+          "note": "strips all provider-key headers and sets the assertion before the dedicated-service direct-services branch"
+        },
+        "S12": {
+          "state": "active",
+          "note": "strips all provider-key headers and sets the assertion before the direct-openai forward (unused this scenario)"
+        },
+        "S13": {
+          "state": "active",
+          "note": "strips all provider-key headers and sets the assertion for the managed round (unused this scenario)"
         }
       }
     },
@@ -1015,7 +1039,7 @@ const PIPELINE = {
         },
         "S9": {
           "state": "active",
-          "note": "projects before WS bypass"
+          "note": "projects before the WS direct-services branch"
         },
         "S10": {
           "state": "active",
@@ -1023,7 +1047,15 @@ const PIPELINE = {
         },
         "S11": {
           "state": "active",
-          "note": "projects before dedicated-service bypass"
+          "note": "projects before the dedicated-service direct-services branch"
+        },
+        "S12": {
+          "state": "active",
+          "note": "projects before the direct-openai forward"
+        },
+        "S13": {
+          "state": "active",
+          "note": "projects before the managed chat-completions round"
         }
       }
     },
@@ -1079,66 +1111,14 @@ const PIPELINE = {
         "S11": {
           "state": "passthrough",
           "note": "/v1/prompts|/v1/embeddings|/v1/files|/v1/vector_stores are not in any operation registry; strips routing headers"
-        }
-      }
-    },
-    {
-      "id": "openai_conversations",
-      "name": "openai_conversations",
-      "group": "conversations",
-      "order": 6,
-      "phase": "request-phase (CRUD + has_conversation); response-phase appends items on success (non-streaming)",
-      "config": {
-        "backend": "sqlite",
-        "database_url": "sqlite://responses.db?mode=rwc",
-        "conversations_table": "openai_conversations",
-        "items_table": "openai_conversation_items"
-      },
-      "promotes": "sets has_conversation when Responses request carries a conversation field; on response path appends input+output items back to the conversation",
-      "scenarios": {
-        "S1": {
-          "state": "passthrough",
-          "note": "no conversation field; would activate on /v1/conversations CRUD or conversation-bearing create"
         },
-        "S2": {
-          "state": "passthrough",
-          "note": "no conversation field; note append-back is non-streaming only"
+        "S12": {
+          "state": "active",
+          "note": "POST /v1/responses -\u003e openai_responses (create); gpt-5 head is classified here, provider chosen at the router"
         },
-        "S3": {
-          "state": "passthrough",
-          "note": "no conversation field"
-        },
-        "S4": {
-          "state": "passthrough",
-          "note": "prev_response_id path, not a conversation field"
-        },
-        "S5": {
-          "state": "passthrough",
-          "note": "no conversation field"
-        },
-        "S6": {
-          "state": "passthrough",
-          "note": "no conversation field"
-        },
-        "S7": {
-          "state": "passthrough",
-          "note": "no conversation field"
-        },
-        "S8": {
-          "state": "passthrough",
-          "note": "GET retrieve, not a conversations op"
-        },
-        "S9": {
-          "state": "passthrough",
-          "note": "WS handshake, not a conversations op"
-        },
-        "S10": {
-          "state": "passthrough",
-          "note": "non-Responses body, not a conversations op"
-        },
-        "S11": {
-          "state": "passthrough",
-          "note": "dedicated-service path, not a conversations op"
+        "S13": {
+          "state": "active",
+          "note": "POST /v1/responses -\u003e openai_responses (create); vllm-chat head is classified here, provider chosen at the router"
         }
       }
     },
@@ -1146,7 +1126,7 @@ const PIPELINE = {
       "id": "openai_responses_format",
       "name": "openai_responses_format",
       "group": "classification",
-      "order": 7,
+      "order": 6,
       "phase": "request-phase classifier; promotes internal x-praxis-* routing headers",
       "config": {
         "on_invalid": "continue",
@@ -1155,7 +1135,7 @@ const PIPELINE = {
         "headers.stream": "x-praxis-ai-stream",
         "headers.mode": "x-praxis-responses-mode"
       },
-      "promotes": "x-praxis-ai-format, x-praxis-ai-model, x-praxis-ai-stream, x-praxis-responses-mode",
+      "promotes": "x-praxis-ai-format, x-praxis-ai-model, x-praxis-ai-stream, x-praxis-responses-mode; the model header is overwritten from the parsed body so clients cannot spoof the router's model policy",
       "scenarios": {
         "S1": {
           "state": "active",
@@ -1200,6 +1180,237 @@ const PIPELINE = {
         "S11": {
           "state": "passthrough",
           "note": "path not /v1/responses; no Responses classification"
+        },
+        "S12": {
+          "state": "active",
+          "note": "classifies openai_responses; model gpt-5 drives the direct-openai (application_provider=openai) route"
+        },
+        "S13": {
+          "state": "active",
+          "note": "classifies openai_responses; model vllm-chat drives the chat-completions (managed) route"
+        }
+      }
+    },
+    {
+      "id": "router",
+      "name": "router",
+      "group": "routing",
+      "order": 7,
+      "phase": "request-phase binding router; freezes ONE logical cluster plus its application_provider/application_protocol as bound_upstream metadata; exactly one top-level router per binding pipeline",
+      "config": {
+        "routes": [
+          "path_prefix /v1/prompts -\u003e prompts-api",
+          "path_prefix /v1/embeddings -\u003e embeddings-api",
+          "path_prefix /v1/files -\u003e files-api",
+          "path_prefix /v1/conversations -\u003e inference-backend",
+          "path /v1/responses + upgrade:websocket -\u003e responses-websocket-backend",
+          "path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:gpt-5 -\u003e openai-responses-backend",
+          "path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -\u003e chat-completions-backend",
+          "path_prefix /v1/responses + x-praxis-ai-format:openai_responses -\u003e inference-backend",
+          "path_prefix /v1/vector_stores -\u003e vector-stores-backend"
+        ]
+      },
+      "promotes": "binds exactly one logical cluster per request and freezes its application_provider/application_protocol as bound_upstream metadata read by the two terminal branches and the IRR-step load balancer; the classifier-owned x-praxis-ai-model header cannot be spoofed; model gpt-5 -\u003e openai-responses-backend (provider openai), vllm-chat -\u003e chat-completions-backend (managed), any other Responses model -\u003e inference-backend (managed native); a request matching no route is a route-miss (bare 404)",
+      "scenarios": {
+        "S1": {
+          "state": "active",
+          "note": "binds inference-backend (managed native Responses) via the /v1/responses format route"
+        },
+        "S2": {
+          "state": "active",
+          "note": "binds inference-backend via the /v1/responses format route"
+        },
+        "S3": {
+          "state": "active",
+          "note": "binds inference-backend via the /v1/responses format route"
+        },
+        "S4": {
+          "state": "active",
+          "note": "binds inference-backend via the /v1/responses format route"
+        },
+        "S5": {
+          "state": "active",
+          "note": "binds inference-backend via the /v1/responses format route"
+        },
+        "S6": {
+          "state": "active",
+          "note": "binds inference-backend via the /v1/responses format route"
+        },
+        "S7": {
+          "state": "active",
+          "note": "binds inference-backend via the /v1/responses format route"
+        },
+        "S8": {
+          "state": "active",
+          "note": "binds inference-backend via the /v1/responses prefix route so the GET retrieve reaches the local store"
+        },
+        "S9": {
+          "state": "active",
+          "note": "binds responses-websocket-backend (application_provider=direct) via the /v1/responses upgrade:websocket route"
+        },
+        "S10": {
+          "state": "active",
+          "note": "no route matches (format is not openai_responses, no upgrade header) -\u003e route-miss (bare 404)"
+        },
+        "S11": {
+          "state": "active",
+          "note": "binds a dedicated-service cluster by path_prefix (application_provider=direct)"
+        },
+        "S12": {
+          "state": "active",
+          "note": "binds openai-responses-backend (application_provider=openai) via the gpt-5 route"
+        },
+        "S13": {
+          "state": "active",
+          "note": "binds chat-completions-backend (managed vllm) via the vllm-chat route"
+        }
+      }
+    },
+    {
+      "id": "direct_openai_branch",
+      "name": "headers (direct-openai branch)",
+      "group": "routing",
+      "order": 8,
+      "phase": "request-phase branch carrier; when bound_upstream.application_provider=openai it takes the direct-openai terminal branch and rejoins at terminal; header set is a no-op anchor only",
+      "config": {
+        "conditions": [
+          "when bound_upstream.application_provider: openai"
+        ],
+        "branch_chains": [
+          {
+            "name": "direct-openai",
+            "rejoin": "terminal",
+            "chain": "direct-openai-dispatch (load_balancer cluster_source:bound_upstream -\u003e openai-responses-backend 127.0.0.1:3001)"
+          }
+        ]
+      },
+      "promotes": "terminal branch for the direct-OpenAI path; when the router bound a cluster whose application_provider is openai, forwards the ORIGINAL Responses request unchanged to the OpenAI-compatible provider and stops the parent chain, so the managed body filters and the IRR never run",
+      "scenarios": {
+        "S1": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S2": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S3": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S4": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S5": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S6": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S7": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S8": {
+          "state": "inert",
+          "note": "GET bound inference-backend (managed); branch not taken"
+        },
+        "S9": {
+          "state": "inert",
+          "note": "WS bound responses-websocket-backend (direct), not openai; branch not taken"
+        },
+        "S10": {
+          "state": "skipped",
+          "note": "router route-miss already returned 404"
+        },
+        "S11": {
+          "state": "inert",
+          "note": "dedicated-service bound provider=direct, not openai; branch not taken"
+        },
+        "S12": {
+          "state": "active",
+          "note": "bound provider=openai -\u003e takes the direct-openai terminal branch; forwards the original request to openai-responses-backend 3001 and stops the chain (no managed body work, no IRR)"
+        },
+        "S13": {
+          "state": "inert",
+          "note": "bound provider=vllm (managed), not openai; branch not taken, chain continues to the managed body filters"
+        }
+      }
+    },
+    {
+      "id": "direct_services_branch",
+      "name": "headers (direct-services branch)",
+      "group": "routing",
+      "order": 9,
+      "phase": "request-phase branch carrier; when bound_upstream.application_provider=direct it takes the direct-services terminal branch and rejoins at terminal",
+      "config": {
+        "conditions": [
+          "when bound_upstream.application_provider: direct"
+        ],
+        "branch_chains": [
+          {
+            "name": "direct-services",
+            "rejoin": "terminal",
+            "chain": "direct-services-dispatch (load_balancer cluster_source:bound_upstream -\u003e prompts-api 9998 / embeddings-api 9997 / files-api 9999 / responses-websocket-backend 3001 / vector-stores-backend 3002)"
+          }
+        ]
+      },
+      "promotes": "terminal branch for dedicated services; when the router bound a cluster whose application_provider is direct (/v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores, and the /v1/responses WebSocket upgrade), forwards straight upstream and rejoins terminal so the IRR never runs",
+      "scenarios": {
+        "S1": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S2": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S3": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S4": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S5": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S6": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S7": {
+          "state": "inert",
+          "note": "bound provider is managed native; branch condition unmet, chain continues"
+        },
+        "S8": {
+          "state": "inert",
+          "note": "GET bound inference-backend (managed); branch not taken (store answers later)"
+        },
+        "S9": {
+          "state": "active",
+          "note": "bound responses-websocket-backend (direct) -\u003e takes the direct-services terminal branch; forwards the WS upgrade to 3001"
+        },
+        "S10": {
+          "state": "skipped",
+          "note": "router route-miss already returned 404"
+        },
+        "S11": {
+          "state": "active",
+          "note": "bound dedicated-service cluster (direct) -\u003e takes the direct-services terminal branch; forwards to the path_prefix backend"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai branch already rejoined terminal at the prior filter"
+        },
+        "S13": {
+          "state": "inert",
+          "note": "bound provider=vllm (managed), not direct; branch not taken"
         }
       }
     },
@@ -1207,10 +1418,14 @@ const PIPELINE = {
       "id": "openai_responses_validate",
       "name": "openai_responses_validate",
       "group": "classification",
-      "order": 8,
-      "phase": "request-phase; JSON syntax + ID generation",
-      "config": {},
-      "promotes": "validates JSON syntax; generates response and conversation IDs; writes responses.* metadata (provider-owned param combos pass through)",
+      "order": 10,
+      "phase": "request-phase; JSON syntax + ID generation; gated unless bound_upstream.application_provider=openai",
+      "config": {
+        "conditions": [
+          "unless bound_upstream.application_provider: openai"
+        ]
+      },
+      "promotes": "validates JSON syntax; generates response and conversation IDs; writes responses.* metadata (provider-owned param combos pass through); suppressed on the direct-openai path",
       "scenarios": {
         "S1": {
           "state": "active",
@@ -1245,16 +1460,24 @@ const PIPELINE = {
           "note": "GET has no body to validate"
         },
         "S9": {
-          "state": "passthrough",
-          "note": "WS handshake, no Responses body"
+          "state": "skipped",
+          "note": "WS took the direct-services terminal branch before the body filters"
         },
         "S10": {
-          "state": "passthrough",
-          "note": "non-Responses body passes through (not classified openai_responses)"
+          "state": "skipped",
+          "note": "router route-miss (404) before the body filters"
         },
         "S11": {
-          "state": "passthrough",
-          "note": "dedicated-service path"
+          "state": "skipped",
+          "note": "dedicated services took the direct-services terminal branch before the body filters"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai terminal branch ran before the body filters"
+        },
+        "S13": {
+          "state": "active",
+          "note": "validates the managed vllm-chat create; generates ids"
         }
       }
     },
@@ -1262,9 +1485,13 @@ const PIPELINE = {
       "id": "openai_tool_parse",
       "name": "openai_tool_parse",
       "group": "classification",
-      "order": 9,
-      "phase": "request-phase; parses tools/tool_choice, does NOT mutate body",
-      "config": {},
+      "order": 11,
+      "phase": "request-phase; parses tools/tool_choice, does NOT mutate body; gated unless bound_upstream.application_provider=openai",
+      "config": {
+        "conditions": [
+          "unless bound_upstream.application_provider: openai"
+        ]
+      },
       "promotes": "has_tools, has_web_search, tool_choice, function_count (summary facts to metadata/results)",
       "scenarios": {
         "S1": {
@@ -1300,16 +1527,95 @@ const PIPELINE = {
           "note": "GET retrieve"
         },
         "S9": {
-          "state": "passthrough",
-          "note": "WS handshake"
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "passthrough",
-          "note": "non-Responses body"
+          "state": "skipped",
+          "note": "router route-miss before this filter"
         },
         "S11": {
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai terminal branch ran first"
+        },
+        "S13": {
           "state": "passthrough",
-          "note": "dedicated-service path"
+          "note": "no tools; has_tools=false"
+        }
+      }
+    },
+    {
+      "id": "openai_conversations",
+      "name": "openai_conversations",
+      "group": "conversations",
+      "order": 12,
+      "phase": "request-phase (CRUD + has_conversation); response-phase appends items on success (non-streaming); gated unless bound_upstream.application_provider=openai",
+      "config": {
+        "backend": "sqlite",
+        "database_url": "sqlite://responses.db?mode=rwc",
+        "conversations_table": "openai_conversations",
+        "items_table": "openai_conversation_items",
+        "conditions": [
+          "unless bound_upstream.application_provider: openai"
+        ]
+      },
+      "promotes": "sets has_conversation when Responses request carries a conversation field; on response path appends input+output items back to the conversation",
+      "scenarios": {
+        "S1": {
+          "state": "passthrough",
+          "note": "no conversation field; would activate on /v1/conversations CRUD or conversation-bearing create"
+        },
+        "S2": {
+          "state": "passthrough",
+          "note": "no conversation field; note append-back is non-streaming only"
+        },
+        "S3": {
+          "state": "passthrough",
+          "note": "no conversation field"
+        },
+        "S4": {
+          "state": "passthrough",
+          "note": "prev_response_id path, not a conversation field"
+        },
+        "S5": {
+          "state": "passthrough",
+          "note": "no conversation field"
+        },
+        "S6": {
+          "state": "passthrough",
+          "note": "no conversation field"
+        },
+        "S7": {
+          "state": "passthrough",
+          "note": "no conversation field"
+        },
+        "S8": {
+          "state": "passthrough",
+          "note": "GET retrieve, not a conversations op"
+        },
+        "S9": {
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
+        },
+        "S10": {
+          "state": "skipped",
+          "note": "router route-miss before this filter"
+        },
+        "S11": {
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai terminal branch ran first"
+        },
+        "S13": {
+          "state": "passthrough",
+          "note": "no conversation field"
         }
       }
     },
@@ -1317,13 +1623,16 @@ const PIPELINE = {
       "id": "openai_response_store",
       "name": "openai_response_store",
       "group": "store",
-      "order": 10,
-      "phase": "request-phase registers backend + serves GET retrieve (terminal); response-phase persists AFTER IRR composes terminal (reverse order)",
+      "order": 13,
+      "phase": "request-phase registers backend + serves GET retrieve (terminal); response-phase persists AFTER IRR composes terminal (reverse order); gated unless bound_upstream.application_provider=openai",
       "config": {
         "backend": "sqlite",
         "database_url": "sqlite://responses.db?mode=rwc",
         "responses_table": "openai_responses",
-        "conversations_table": "openai_conversations"
+        "conversations_table": "openai_conversations",
+        "conditions": [
+          "unless bound_upstream.application_provider: openai"
+        ]
       },
       "promotes": "registers store backend for rehydrate/compact; persists ResponsesState.response_object on response path; answers GET /v1/responses/{id} pre-IRR",
       "scenarios": {
@@ -1360,16 +1669,24 @@ const PIPELINE = {
           "note": "SERVES GET as terminal response pre-IRR and short-circuits pipeline"
         },
         "S9": {
-          "state": "passthrough",
-          "note": "WS handshake is GET /v1/responses with no id; store does not answer"
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "passthrough",
-          "note": "non-Responses body not persisted"
+          "state": "skipped",
+          "note": "router route-miss before this filter"
         },
         "S11": {
-          "state": "passthrough",
-          "note": "dedicated-service path"
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai terminal branch ran first"
+        },
+        "S13": {
+          "state": "inert",
+          "note": "backend registered but store:false -\u003e no persistence"
         }
       }
     },
@@ -1377,9 +1694,13 @@ const PIPELINE = {
       "id": "openai_responses_rehydrate",
       "name": "openai_responses_rehydrate",
       "group": "context",
-      "order": 11,
-      "phase": "request-phase; loads and prepends prior history",
-      "config": {},
+      "order": 14,
+      "phase": "request-phase; loads and prepends prior history; gated unless bound_upstream.application_provider=openai",
+      "config": {
+        "conditions": [
+          "unless bound_upstream.application_provider: openai"
+        ]
+      },
       "promotes": "loads context from previous_response_id or conversation, prepends message history; previous_response_id takes precedence when both present",
       "scenarios": {
         "S1": {
@@ -1415,16 +1736,24 @@ const PIPELINE = {
           "note": "store short-circuited GET before this filter"
         },
         "S9": {
-          "state": "passthrough",
-          "note": "WS handshake, no rehydrate"
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "passthrough",
-          "note": "non-Responses body"
+          "state": "skipped",
+          "note": "router route-miss before this filter"
         },
         "S11": {
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai terminal branch ran first"
+        },
+        "S13": {
           "state": "passthrough",
-          "note": "dedicated-service path"
+          "note": "no previous_response_id/conversation"
         }
       }
     },
@@ -1432,19 +1761,18 @@ const PIPELINE = {
       "id": "openai_file_resolve",
       "name": "openai_file_resolve",
       "group": "context",
-      "order": 12,
-      "phase": "request-phase pre-security callout; fires only when file_id refs present",
+      "order": 15,
+      "phase": "request-phase pre-security callout; fires only when file_id refs present; gated unless bound_upstream.application_provider=openai",
       "config": {
         "files_api_url": "http://127.0.0.1:9999",
         "user_credential": "ogx_files",
         "allow_pre_security_callout": true,
-        "outbound_chain": "files-api-outbound (project_state_owner_headers x-tenant-id/x-user-id + headers x-file-callout=file-resolve)",
-        "forward_headers": [
-          "x-tenant-id",
-          "x-user-id"
-        ],
+        "outbound_chain": "files-api-outbound (project_state_owner_headers x-tenant-id/x-user-id)",
         "on_missing": "reject",
-        "timeout_ms": 10000
+        "timeout_ms": 10000,
+        "conditions": [
+          "unless bound_upstream.application_provider: openai"
+        ]
       },
       "promotes": "resolves file_id refs in current input + rehydrated history via Files API; rebuilds body with file_data/image_url (on_missing: reject); injects the caller-scoped ogx_files credential on file_id callouts (file_url downloads use the separate credential-free resolver)",
       "scenarios": {
@@ -1481,16 +1809,24 @@ const PIPELINE = {
           "note": "store short-circuited GET"
         },
         "S9": {
-          "state": "passthrough",
-          "note": "WS handshake, no body refs"
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "passthrough",
-          "note": "non-Responses body"
+          "state": "skipped",
+          "note": "router route-miss before this filter"
         },
         "S11": {
-          "state": "passthrough",
-          "note": "dedicated-service path"
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai terminal branch ran first"
+        },
+        "S13": {
+          "state": "inert",
+          "note": "no file_id refs; callout does not fire"
         }
       }
     },
@@ -1498,11 +1834,14 @@ const PIPELINE = {
       "id": "openai_doc_extract",
       "name": "openai_doc_extract",
       "group": "context",
-      "order": 13,
-      "phase": "request-phase; converts input_file parts, on_unsupported continue",
+      "order": 16,
+      "phase": "request-phase; converts input_file parts, on_unsupported continue; gated unless bound_upstream.application_provider=openai",
       "config": {
         "allow_pre_security_callout": true,
-        "on_unsupported": "continue"
+        "on_unsupported": "continue",
+        "conditions": [
+          "unless bound_upstream.application_provider: openai"
+        ]
       },
       "promotes": "converts input_file content parts to input_text (base64 decode + UTF-8 validate) for backends lacking native input_file; unsupported formats left unchanged",
       "scenarios": {
@@ -1539,16 +1878,24 @@ const PIPELINE = {
           "note": "store short-circuited GET"
         },
         "S9": {
-          "state": "passthrough",
-          "note": "WS handshake"
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "passthrough",
-          "note": "non-Responses body"
+          "state": "skipped",
+          "note": "router route-miss before this filter"
         },
         "S11": {
-          "state": "passthrough",
-          "note": "dedicated-service path"
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai terminal branch ran first"
+        },
+        "S13": {
+          "state": "inert",
+          "note": "no input_file parts to convert"
         }
       }
     },
@@ -1556,8 +1903,8 @@ const PIPELINE = {
       "id": "openai_mcp_tool_resolve",
       "name": "openai_mcp_tool_resolve",
       "group": "context",
-      "order": 14,
-      "phase": "request-phase; resolves MCP tools/list from operator connectors",
+      "order": 17,
+      "phase": "request-phase; resolves MCP tools/list from operator connectors; gated unless bound_upstream.application_provider=openai",
       "config": {
         "user_credential": "mcp_gateway",
         "authorization_assertion": "mcp_gateway",
@@ -1570,6 +1917,9 @@ const PIPELINE = {
             "id": "trusted-mcp",
             "server_url": "http://127.0.0.1:8001/mcp"
           }
+        ],
+        "conditions": [
+          "unless bound_upstream.application_provider: openai"
         ]
       },
       "promotes": "calls tools/list on each upstream MCP server; writes mcp_tool_map to ResponsesState; forwards the caller-scoped mcp_gateway credential + opaque authorization assertion and identity headers ONLY to configured connector_id targets, never an arbitrary client server_url",
@@ -1607,113 +1957,94 @@ const PIPELINE = {
           "note": "store short-circuited GET"
         },
         "S9": {
-          "state": "passthrough",
-          "note": "WS handshake"
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "passthrough",
-          "note": "non-Responses body"
+          "state": "skipped",
+          "note": "router route-miss before this filter"
         },
         "S11": {
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai terminal branch ran first"
+        },
+        "S13": {
           "state": "passthrough",
-          "note": "dedicated-service path"
+          "note": "no MCP tool entries"
         }
       }
     },
     {
-      "id": "bypass_gate",
-      "name": "headers (bypass carrier)",
+      "id": "static_response",
+      "name": "static_response (unsupported subpath 404)",
       "group": "routing",
-      "order": 15,
-      "phase": "request-phase carrier with unless-gate; branch_chains route to backends and rejoin at terminal",
+      "order": 18,
+      "phase": "request-phase terminal guard; returns 404 for a managed Responses request on an unsupported /v1/responses subpath",
       "config": {
-        "conditions.unless": {
-          "path": "/v1/responses",
-          "methods": [
-            "POST"
-          ],
-          "headers": {
-            "x-praxis-ai-format": "openai_responses"
-          }
-        },
-        "branch_chains": [
-          {
-            "name": "bypass-irr",
-            "rejoin": "terminal",
-            "chain": "bypass-chain"
-          }
-        ],
-        "routes": [
-          {
-            "path_prefix": "/v1/prompts",
-            "cluster": "prompts-api"
-          },
-          {
-            "path_prefix": "/v1/embeddings",
-            "cluster": "embeddings-api"
-          },
-          {
-            "path_prefix": "/v1/files",
-            "cluster": "files-api"
-          },
-          {
-            "path": "/v1/responses",
-            "headers": {
-              "upgrade": "websocket"
-            },
-            "cluster": "inference-backend"
-          },
-          {
-            "path_prefix": "/v1/vector_stores",
-            "cluster": "vector-stores-backend"
-          }
+        "status": 404,
+        "body": "{\"error\":{\"message\":\"unsupported managed Responses operation\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_request_error\"}}",
+        "conditions": [
+          "when path_prefix: /v1/responses",
+          "unless path: /v1/responses"
         ]
       },
-      "promotes": "runs for everything EXCEPT a classified POST /v1/responses create; branch router+load_balancer select a backend, or route-miss 404; discrimination lives here because IRR strips x-praxis-*",
+      "promotes": "fail-closed 404 for a managed Responses request on an unsupported /v1/responses subpath (e.g. POST /v1/responses/{id}/cancel); legitimate GET/DELETE resource ops were already served by openai_response_store, and exact /v1/responses create/retrieve is excluded by the unless gate; provider-owned OpenAI traffic already left via direct-openai",
       "scenarios": {
         "S1": {
-          "state": "skipped",
-          "note": "unless matches classified POST create; falls through to IRR"
+          "state": "inert",
+          "note": "path is exactly /v1/responses (create); the unless gate excludes it"
         },
         "S2": {
-          "state": "skipped",
-          "note": "unless matches; streaming create falls through to IRR"
+          "state": "inert",
+          "note": "path is exactly /v1/responses (create); the unless gate excludes it"
         },
         "S3": {
-          "state": "skipped",
-          "note": "unless matches; still a classified create -\u003e IRR"
+          "state": "inert",
+          "note": "path is exactly /v1/responses (create); the unless gate excludes it"
         },
         "S4": {
-          "state": "skipped",
-          "note": "unless matches; create -\u003e IRR"
+          "state": "inert",
+          "note": "path is exactly /v1/responses (create); the unless gate excludes it"
         },
         "S5": {
-          "state": "skipped",
-          "note": "unless matches; create -\u003e IRR"
+          "state": "inert",
+          "note": "path is exactly /v1/responses (create); the unless gate excludes it"
         },
         "S6": {
-          "state": "skipped",
-          "note": "unless matches; create -\u003e IRR"
+          "state": "inert",
+          "note": "path is exactly /v1/responses (create); the unless gate excludes it"
         },
         "S7": {
-          "state": "skipped",
-          "note": "unless matches; create -\u003e IRR"
+          "state": "inert",
+          "note": "path is exactly /v1/responses (create); the unless gate excludes it"
         },
         "S8": {
           "state": "skipped",
-          "note": "store already produced terminal GET response before this carrier runs"
+          "note": "openai_response_store already served the GET retrieve"
         },
         "S9": {
-          "state": "active",
-          "note": "not a POST create -\u003e carrier runs; /v1/responses + upgrade:websocket route -\u003e inference-backend"
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
         },
         "S10": {
-          "state": "active",
-          "note": "missing x-praxis-ai-format:openai_responses -\u003e carrier runs; no upgrade header -\u003e route-miss 404"
+          "state": "skipped",
+          "note": "router route-miss (404) before this filter"
         },
         "S11": {
-          "state": "active",
-          "note": "carrier runs; path_prefix routes to prompts/embeddings/files/vector_stores backend"
+          "state": "skipped",
+          "note": "direct-services terminal branch ran first"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai terminal branch ran first"
+        },
+        "S13": {
+          "state": "inert",
+          "note": "path is exactly /v1/responses (create); the unless gate excludes it"
         }
       }
     },
@@ -1721,7 +2052,7 @@ const PIPELINE = {
       "id": "iterative_request_router",
       "name": "iterative_request_router",
       "group": "irr",
-      "order": 16,
+      "order": 19,
       "phase": "terminal filter; owns agentic model-tool-model loop; transitions on openai_agentic_loop action",
       "config": {
         "initial_step": "inference",
@@ -1744,7 +2075,7 @@ const PIPELINE = {
           }
         ]
       },
-      "promotes": "runs classified openai_responses create requests through the inference step loop; strips x-praxis-* from sub-request (step router is path-only)",
+      "promotes": "runs gateway-owned openai_responses create requests through the inference step loop; OpenAI-bound traffic already left via the direct-openai terminal branch, so IRR is reached only by managed providers; the inference step consumes the frozen logical binding directly (no second routing decision)",
       "scenarios": {
         "S1": {
           "state": "active",
@@ -1780,15 +2111,23 @@ const PIPELINE = {
         },
         "S9": {
           "state": "skipped",
-          "note": "WS handshake took bypass branch"
+          "note": "WS handshake took the direct-services terminal branch"
         },
         "S10": {
           "state": "skipped",
-          "note": "non-Responses body took bypass -\u003e 404"
+          "note": "router route-miss (404) before the IRR"
         },
         "S11": {
           "state": "skipped",
-          "note": "dedicated services took bypass branch"
+          "note": "dedicated services took the direct-services terminal branch"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "direct-openai terminal branch bypassed the IRR"
+        },
+        "S13": {
+          "state": "active",
+          "note": "enters IRR; one round; the bound chat-completions upstream drives protocol translation"
         }
       }
     },
@@ -1796,7 +2135,7 @@ const PIPELINE = {
       "id": "irr_project_state_owner_headers",
       "name": "project_state_owner_headers (IRR step)",
       "group": "irr-step",
-      "order": 17,
+      "order": 20,
       "phase": "IRR inference step, request-phase; re-projection inside destination-owned subrequest",
       "config": {
         "tenant_header": "x-tenant-id",
@@ -1847,6 +2186,14 @@ const PIPELINE = {
         "S11": {
           "state": "skipped",
           "note": "IRR not entered"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S13": {
+          "state": "active",
+          "note": "re-projects owner headers for the managed chat-completions round"
         }
       }
     },
@@ -1854,10 +2201,14 @@ const PIPELINE = {
       "id": "openai_stream_events",
       "name": "openai_stream_events",
       "group": "irr-step",
-      "order": 18,
+      "order": 21,
       "phase": "IRR step; request-phase pass + response-phase composes one logical Responses lifecycle across rounds",
-      "config": {},
-      "promotes": "composes every inference SSE stream into ONE lifecycle; withholds per-round terminal events until IRR transition known; populates ResponsesState.response_object (required for streaming persistence + loop-terminal error delivery)",
+      "config": {
+        "max_buffer_bytes": 67108864,
+        "max_events": 200000,
+        "timeout_secs": 600
+      },
+      "promotes": "composes every inference SSE stream into ONE lifecycle; withholds per-round terminal events until IRR transition known; populates ResponsesState.response_object (required for streaming persistence + loop-terminal error delivery); limits stay at or above the responses_to_chat_completions converter bounds so no client-visible frame is dropped from the store",
       "scenarios": {
         "S1": {
           "state": "active",
@@ -1902,6 +2253,14 @@ const PIPELINE = {
         "S11": {
           "state": "skipped",
           "note": "IRR not entered"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S13": {
+          "state": "active",
+          "note": "composes the chat-translated lifecycle; populates response_object"
         }
       }
     },
@@ -1909,14 +2268,13 @@ const PIPELINE = {
       "id": "openai_web_search",
       "name": "openai_web_search",
       "group": "irr-step",
-      "order": 19,
+      "order": 22,
       "phase": "IRR step request-phase dispatcher; no response phase; inert until model emits web_search_call",
       "config": {
         "provider": "brave",
         "api_key": "${WEB_SEARCH_API_KEY}",
         "user_credential": "brave_search",
-        "max_calls_per_round": 32,
-        "outbound_chain": "web-search-outbound (request_id filter)"
+        "max_calls_per_round": 32
       },
       "promotes": "executes web_search_call assignments prepared by the loop owner; fails closed if per-user brave_search slot missing",
       "scenarios": {
@@ -1963,6 +2321,14 @@ const PIPELINE = {
         "S11": {
           "state": "skipped",
           "note": "IRR not entered"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S13": {
+          "state": "inert",
+          "note": "no web_search_call emitted"
         }
       }
     },
@@ -1970,7 +2336,7 @@ const PIPELINE = {
       "id": "openai_mcp_dispatch",
       "name": "openai_mcp_dispatch",
       "group": "irr-step",
-      "order": 20,
+      "order": 23,
       "phase": "IRR step request-phase dispatcher; no response phase; inert until model emits MCP tool call",
       "config": {
         "user_credential": "mcp_gateway",
@@ -2029,6 +2395,14 @@ const PIPELINE = {
         "S11": {
           "state": "skipped",
           "note": "IRR not entered"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S13": {
+          "state": "inert",
+          "note": "no MCP call emitted"
         }
       }
     },
@@ -2036,21 +2410,17 @@ const PIPELINE = {
       "id": "openai_file_search_callout",
       "name": "openai_file_search_callout",
       "group": "irr-step",
-      "order": 21,
+      "order": 24,
       "phase": "IRR step request-phase dispatcher; executes at request-body EOS on re-entry; no response phase; inert until model emits file_search_call",
       "config": {
         "vector_store_url": "http://127.0.0.1:3002",
         "user_credential": "ogx_files",
-        "outbound_chain": "vector-store-outbound (project_state_owner_headers x-tenant-id/x-user-id + headers X-Vector-Store-Client=praxis-ai-gateway)",
+        "outbound_chain": "vector-store-outbound (project_state_owner_headers x-tenant-id/x-user-id)",
         "timeout_ms": 5000,
         "max_response_bytes": 10485760,
         "max_total_response_bytes": 67108864,
         "max_state_bytes": 136314880,
-        "on_failure": "closed",
-        "forward_headers": [
-          "x-tenant-id",
-          "x-user-id"
-        ]
+        "on_failure": "closed"
       },
       "promotes": "executes assigned file_search_call items against vector store 3002; injects the caller-scoped ogx_files credential on the vector-store callout; reconciles results in place in ResponsesState.accumulated_output",
       "scenarios": {
@@ -2097,6 +2467,14 @@ const PIPELINE = {
         "S11": {
           "state": "skipped",
           "note": "IRR not entered"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S13": {
+          "state": "inert",
+          "note": "no file_search_call emitted"
         }
       }
     },
@@ -2104,7 +2482,7 @@ const PIPELINE = {
       "id": "openai_agentic_loop",
       "name": "openai_agentic_loop",
       "group": "irr-step",
-      "order": 22,
+      "order": 25,
       "phase": "IRR step; request-phase records assignments; response-phase parses model output and publishes single loop|done transition (sole authority)",
       "config": {
         "max_infer_iters": 7
@@ -2154,6 +2532,14 @@ const PIPELINE = {
         "S11": {
           "state": "skipped",
           "note": "IRR not entered"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S13": {
+          "state": "active",
+          "note": "parses the translated round; action=done (no tools)"
         }
       }
     },
@@ -2161,7 +2547,7 @@ const PIPELINE = {
       "id": "irr_headers",
       "name": "headers (IRR step)",
       "group": "irr-step",
-      "order": 23,
+      "order": 26,
       "phase": "IRR step request-phase; sets outbound header",
       "config": {
         "request_set": [
@@ -2216,68 +2602,14 @@ const PIPELINE = {
         "S11": {
           "state": "skipped",
           "note": "IRR not entered"
-        }
-      }
-    },
-    {
-      "id": "irr_router",
-      "name": "router (IRR step)",
-      "group": "irr-step",
-      "order": 24,
-      "phase": "IRR step request-phase; PATH-ONLY routing (x-praxis-* stripped)",
-      "config": {
-        "routes": [
-          {
-            "path": "/v1/responses",
-            "cluster": "inference-backend"
-          }
-        ]
-      },
-      "promotes": "routes /v1/responses to inference-backend; cannot match x-praxis-ai-format because IRR strips reserved-prefix headers",
-      "scenarios": {
-        "S1": {
-          "state": "active",
-          "note": "path /v1/responses -\u003e inference-backend"
         },
-        "S2": {
-          "state": "active",
-          "note": "routes to inference-backend"
-        },
-        "S3": {
-          "state": "active",
-          "note": "routes to inference-backend"
-        },
-        "S4": {
-          "state": "active",
-          "note": "routes to inference-backend"
-        },
-        "S5": {
-          "state": "active",
-          "note": "routes to inference-backend each round"
-        },
-        "S6": {
-          "state": "active",
-          "note": "routes to inference-backend each round"
-        },
-        "S7": {
-          "state": "active",
-          "note": "routes to inference-backend each round"
-        },
-        "S8": {
+        "S12": {
           "state": "skipped",
           "note": "IRR not entered"
         },
-        "S9": {
-          "state": "skipped",
-          "note": "IRR not entered"
-        },
-        "S10": {
-          "state": "skipped",
-          "note": "IRR not entered"
-        },
-        "S11": {
-          "state": "skipped",
-          "note": "IRR not entered"
+        "S13": {
+          "state": "active",
+          "note": "sets Content-Type on the outbound chat-completions subrequest"
         }
       }
     },
@@ -2285,49 +2617,58 @@ const PIPELINE = {
       "id": "irr_load_balancer",
       "name": "load_balancer (IRR step)",
       "group": "irr-step",
-      "order": 25,
-      "phase": "IRR step request-phase; selects endpoint for inference-backend",
+      "order": 27,
+      "phase": "IRR step request-phase; selects the endpoint for the router-bound cluster (cluster_source:bound_upstream) and publishes its typed application_protocol BEFORE the protocol-adaptive body builders",
       "config": {
+        "cluster_source": "bound_upstream",
         "clusters": [
           {
             "name": "inference-backend",
             "endpoints": [
               "127.0.0.1:3001"
             ],
-            "http.application_protocol": "openai_responses (commented out)",
-            "http.application_provider": "openai (commented out)"
+            "http.application_protocol": "openai_responses",
+            "http.application_provider": "vllm"
+          },
+          {
+            "name": "chat-completions-backend",
+            "endpoints": [
+              "127.0.0.1:3001"
+            ],
+            "http.application_protocol": "openai_chat_completions",
+            "http.application_provider": "vllm"
           }
         ]
       },
-      "promotes": "selects inference-backend endpoint 127.0.0.1:3001; selection precedes proxy request-header hook; optional application_* declarations left commented so prompt templates fail closed",
+      "promotes": "resolves the request-level binding to a concrete endpoint (no second routing decision) and publishes the selected cluster's application_protocol; every selected_upstream gate below reads this fresh selection so exactly one protocol-adaptive body builder fires each round",
       "scenarios": {
         "S1": {
           "state": "active",
-          "note": "selects 127.0.0.1:3001"
+          "note": "selects inference-backend 127.0.0.1:3001 (openai_responses); publishes protocol"
         },
         "S2": {
           "state": "active",
-          "note": "selects 127.0.0.1:3001"
+          "note": "selects inference-backend 127.0.0.1:3001 (openai_responses); publishes protocol"
         },
         "S3": {
           "state": "active",
-          "note": "selects 127.0.0.1:3001"
+          "note": "selects inference-backend 127.0.0.1:3001 (openai_responses); publishes protocol"
         },
         "S4": {
           "state": "active",
-          "note": "selects 127.0.0.1:3001"
+          "note": "selects inference-backend 127.0.0.1:3001 (openai_responses); publishes protocol"
         },
         "S5": {
           "state": "active",
-          "note": "selects 127.0.0.1:3001 each round"
+          "note": "selects inference-backend 127.0.0.1:3001 (openai_responses) each round"
         },
         "S6": {
           "state": "active",
-          "note": "selects 127.0.0.1:3001 each round"
+          "note": "selects inference-backend 127.0.0.1:3001 (openai_responses) each round"
         },
         "S7": {
           "state": "active",
-          "note": "selects 127.0.0.1:3001 each round"
+          "note": "selects inference-backend 127.0.0.1:3001 (openai_responses) each round"
         },
         "S8": {
           "state": "skipped",
@@ -2344,6 +2685,14 @@ const PIPELINE = {
         "S11": {
           "state": "skipped",
           "note": "IRR not entered"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S13": {
+          "state": "active",
+          "note": "selects chat-completions-backend 127.0.0.1:3001 (openai_chat_completions); publishes protocol"
         }
       }
     },
@@ -2351,10 +2700,14 @@ const PIPELINE = {
       "id": "openai_responses_proxy",
       "name": "openai_responses_proxy",
       "group": "irr-step",
-      "order": 26,
-      "phase": "IRR step; request-body hook rebuilds outbound body; request-header hook runs AFTER load_balancer selection (fail-closed capability check); response-phase handles buffered/streamed",
-      "config": {},
-      "promotes": "rebuilds outbound body from ResponsesState; auto-selects typed streaming when effective body has stream:true; fails closed on prompt templates unless selected cluster declares BOTH application_protocol:openai_responses AND application_provider:openai (both commented out here)",
+      "order": 28,
+      "phase": "IRR step protocol-adaptive body builder; fires only when the selected upstream speaks Responses (selected_upstream.application_protocol=openai_responses); response-phase handles buffered/streamed",
+      "config": {
+        "conditions": [
+          "when selected_upstream.application_protocol: openai_responses"
+        ]
+      },
+      "promotes": "on a native-Responses upstream rebuilds the outbound Responses body from ResponsesState; auto-selects typed streaming when the effective body has stream:true; enforces provider-aware prompt-template support; inert when the selected upstream speaks Chat Completions",
       "scenarios": {
         "S1": {
           "state": "active",
@@ -2399,6 +2752,154 @@ const PIPELINE = {
         "S11": {
           "state": "skipped",
           "note": "IRR not entered"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S13": {
+          "state": "inert",
+          "note": "selected upstream is openai_chat_completions, not openai_responses -\u003e gate fails; the body builder does not fire"
+        }
+      }
+    },
+    {
+      "id": "responses_to_chat_completions",
+      "name": "responses_to_chat_completions",
+      "group": "irr-step",
+      "order": 29,
+      "phase": "IRR step protocol-adaptive body builder; fires only when the selected upstream speaks Chat Completions; request-phase translates Responses-\u003eChat, response-phase (reverse) translates Chat-\u003eResponses",
+      "config": {
+        "max_rewritten_body_bytes": 33554432,
+        "max_emitted_sse_frame_bytes": 50331648,
+        "max_stream_events": 100000,
+        "stream_timeout_secs": 300,
+        "conditions": [
+          "when selected_upstream.application_protocol: openai_chat_completions"
+        ]
+      },
+      "promotes": "when the selected upstream speaks Chat Completions, translates the canonical Responses request into a Chat Completions request and (because response filters run in reverse) converts the Chat response - finite JSON or streamed SSE - back into a Responses resource / Responses SSE before openai_agentic_loop and openai_stream_events observe it; also rejects OpenAI prompt templates (no Chat representation); inert when the selected upstream speaks Responses natively",
+      "scenarios": {
+        "S1": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no translation"
+        },
+        "S2": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no translation"
+        },
+        "S3": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no translation"
+        },
+        "S4": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no translation"
+        },
+        "S5": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no translation"
+        },
+        "S6": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no translation"
+        },
+        "S7": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no translation"
+        },
+        "S8": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S9": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S10": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S11": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S13": {
+          "state": "active",
+          "note": "translates the Responses request to Chat Completions and the Chat response back to Responses for chat-completions-backend"
+        }
+      }
+    },
+    {
+      "id": "path_rewrite",
+      "name": "path_rewrite",
+      "group": "irr-step",
+      "order": 30,
+      "phase": "IRR step request-phase; rewrites the outbound path to /v1/chat/completions when the selected upstream speaks Chat Completions",
+      "config": {
+        "replace.pattern": "^/v1/responses/?$",
+        "replace.replacement": "/v1/chat/completions",
+        "conditions": [
+          "when selected_upstream.application_protocol: openai_chat_completions + path_prefix /v1/responses + methods [POST]"
+        ]
+      },
+      "promotes": "the translator leaves the request URI unchanged, so this rewrites POST /v1/responses -\u003e /v1/chat/completions for the Chat backend; the identical protocol gate plus the create verb/path guards ensure only translated create requests are rewritten",
+      "scenarios": {
+        "S1": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no path rewrite"
+        },
+        "S2": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no path rewrite"
+        },
+        "S3": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no path rewrite"
+        },
+        "S4": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no path rewrite"
+        },
+        "S5": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no path rewrite"
+        },
+        "S6": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no path rewrite"
+        },
+        "S7": {
+          "state": "inert",
+          "note": "selected upstream openai_responses; no path rewrite"
+        },
+        "S8": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S9": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S10": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S11": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S12": {
+          "state": "skipped",
+          "note": "IRR not entered"
+        },
+        "S13": {
+          "state": "active",
+          "note": "rewrites POST /v1/responses -\u003e /v1/chat/completions"
         }
       }
     }
@@ -2453,7 +2954,7 @@ const PIPELINE = {
       {
         "order": 6,
         "depth": 0,
-        "filter_type": "openai_conversations",
+        "filter_type": "openai_responses_format",
         "name": null,
         "irr_step": null,
         "conditions": [],
@@ -2462,169 +2963,109 @@ const PIPELINE = {
       {
         "order": 7,
         "depth": 0,
-        "filter_type": "openai_responses_format",
+        "filter_type": "router",
         "name": null,
         "irr_step": null,
         "conditions": [],
-        "branch_chains": []
+        "branch_chains": [],
+        "routes": [
+          {
+            "path_prefix": "/v1/prompts",
+            "cluster": "prompts-api"
+          },
+          {
+            "path_prefix": "/v1/embeddings",
+            "cluster": "embeddings-api"
+          },
+          {
+            "path_prefix": "/v1/files",
+            "cluster": "files-api"
+          },
+          {
+            "path_prefix": "/v1/conversations",
+            "cluster": "inference-backend"
+          },
+          {
+            "path": "/v1/responses",
+            "headers": {
+              "upgrade": "websocket"
+            },
+            "cluster": "responses-websocket-backend"
+          },
+          {
+            "path": "/v1/responses",
+            "headers": {
+              "x-praxis-ai-format": "openai_responses",
+              "x-praxis-ai-model": "gpt-5"
+            },
+            "cluster": "openai-responses-backend"
+          },
+          {
+            "path": "/v1/responses",
+            "headers": {
+              "x-praxis-ai-format": "openai_responses",
+              "x-praxis-ai-model": "vllm-chat"
+            },
+            "cluster": "chat-completions-backend"
+          },
+          {
+            "path_prefix": "/v1/responses",
+            "headers": {
+              "x-praxis-ai-format": "openai_responses"
+            },
+            "cluster": "inference-backend"
+          },
+          {
+            "path_prefix": "/v1/vector_stores",
+            "cluster": "vector-stores-backend"
+          }
+        ]
       },
       {
         "order": 8,
-        "depth": 0,
-        "filter_type": "openai_responses_validate",
-        "name": null,
-        "irr_step": null,
-        "conditions": [],
-        "branch_chains": []
-      },
-      {
-        "order": 9,
-        "depth": 0,
-        "filter_type": "openai_tool_parse",
-        "name": null,
-        "irr_step": null,
-        "conditions": [],
-        "branch_chains": []
-      },
-      {
-        "order": 10,
-        "depth": 0,
-        "filter_type": "openai_response_store",
-        "name": null,
-        "irr_step": null,
-        "conditions": [],
-        "branch_chains": []
-      },
-      {
-        "order": 11,
-        "depth": 0,
-        "filter_type": "openai_responses_rehydrate",
-        "name": null,
-        "irr_step": null,
-        "conditions": [],
-        "branch_chains": []
-      },
-      {
-        "order": 12,
-        "depth": 0,
-        "filter_type": "openai_file_resolve",
-        "name": null,
-        "irr_step": null,
-        "conditions": [],
-        "branch_chains": []
-      },
-      {
-        "order": 13,
-        "depth": 0,
-        "filter_type": "openai_doc_extract",
-        "name": null,
-        "irr_step": null,
-        "conditions": [],
-        "branch_chains": []
-      },
-      {
-        "order": 14,
-        "depth": 0,
-        "filter_type": "openai_mcp_tool_resolve",
-        "name": null,
-        "irr_step": null,
-        "conditions": [],
-        "branch_chains": []
-      },
-      {
-        "order": 15,
         "depth": 0,
         "filter_type": "headers",
         "name": null,
         "irr_step": null,
         "conditions": [
           {
-            "unless": {
+            "when": {
               "grpc": null,
-              "path": "/v1/responses",
+              "path": null,
               "path_prefix": null,
-              "methods": [
-                "POST"
-              ],
-              "headers": {
-                "x-praxis-ai-format": "openai_responses"
+              "methods": null,
+              "headers": null,
+              "bound_upstream": {
+                "application_protocol": null,
+                "application_provider": "openai"
               },
-              "bound_upstream": null,
               "selected_upstream": null
             }
           }
         ],
         "branch_chains": [
           {
-            "name": "bypass-irr",
+            "name": "direct-openai",
             "chains": [
               {
-                "name": "bypass-chain",
+                "name": "direct-openai-dispatch",
                 "filters": [
-                  {
-                    "filter": "router",
-                    "failure_mode": "closed",
-                    "routes": [
-                      {
-                        "path_prefix": "/v1/prompts",
-                        "cluster": "prompts-api"
-                      },
-                      {
-                        "path_prefix": "/v1/embeddings",
-                        "cluster": "embeddings-api"
-                      },
-                      {
-                        "path_prefix": "/v1/files",
-                        "cluster": "files-api"
-                      },
-                      {
-                        "path": "/v1/responses",
-                        "headers": {
-                          "upgrade": "websocket"
-                        },
-                        "cluster": "inference-backend"
-                      },
-                      {
-                        "path_prefix": "/v1/vector_stores",
-                        "cluster": "vector-stores-backend"
-                      }
-                    ]
-                  },
                   {
                     "filter": "load_balancer",
                     "failure_mode": "closed",
                     "clusters": [
                       {
-                        "name": "prompts-api",
-                        "endpoints": [
-                          "127.0.0.1:9998"
-                        ]
-                      },
-                      {
-                        "name": "embeddings-api",
-                        "endpoints": [
-                          "127.0.0.1:9997"
-                        ]
-                      },
-                      {
-                        "name": "files-api",
-                        "endpoints": [
-                          "127.0.0.1:9999"
-                        ]
-                      },
-                      {
-                        "name": "inference-backend",
+                        "name": "openai-responses-backend",
+                        "http": {
+                          "application_protocol": "openai_responses",
+                          "application_provider": "openai"
+                        },
                         "endpoints": [
                           "127.0.0.1:3001"
                         ]
-                      },
-                      {
-                        "name": "vector-stores-backend",
-                        "endpoints": [
-                          "127.0.0.1:3002"
-                        ]
                       }
-                    ]
+                    ],
+                    "cluster_source": "bound_upstream"
                   }
                 ]
               }
@@ -2636,7 +3077,321 @@ const PIPELINE = {
         ]
       },
       {
+        "order": 9,
+        "depth": 0,
+        "filter_type": "headers",
+        "name": null,
+        "irr_step": null,
+        "conditions": [
+          {
+            "when": {
+              "grpc": null,
+              "path": null,
+              "path_prefix": null,
+              "methods": null,
+              "headers": null,
+              "bound_upstream": {
+                "application_protocol": null,
+                "application_provider": "direct"
+              },
+              "selected_upstream": null
+            }
+          }
+        ],
+        "branch_chains": [
+          {
+            "name": "direct-services",
+            "chains": [
+              {
+                "name": "direct-services-dispatch",
+                "filters": [
+                  {
+                    "filter": "load_balancer",
+                    "failure_mode": "closed",
+                    "clusters": [
+                      {
+                        "name": "prompts-api",
+                        "http": {
+                          "application_provider": "direct"
+                        },
+                        "endpoints": [
+                          "127.0.0.1:9998"
+                        ]
+                      },
+                      {
+                        "name": "embeddings-api",
+                        "http": {
+                          "application_provider": "direct"
+                        },
+                        "endpoints": [
+                          "127.0.0.1:9997"
+                        ]
+                      },
+                      {
+                        "name": "files-api",
+                        "http": {
+                          "application_provider": "direct"
+                        },
+                        "endpoints": [
+                          "127.0.0.1:9999"
+                        ]
+                      },
+                      {
+                        "name": "responses-websocket-backend",
+                        "http": {
+                          "application_provider": "direct"
+                        },
+                        "endpoints": [
+                          "127.0.0.1:3001"
+                        ]
+                      },
+                      {
+                        "name": "vector-stores-backend",
+                        "http": {
+                          "application_provider": "direct"
+                        },
+                        "endpoints": [
+                          "127.0.0.1:3002"
+                        ]
+                      }
+                    ],
+                    "cluster_source": "bound_upstream"
+                  }
+                ]
+              }
+            ],
+            "max_iterations": null,
+            "on_result": null,
+            "rejoin": "terminal"
+          }
+        ]
+      },
+      {
+        "order": 10,
+        "depth": 0,
+        "filter_type": "openai_responses_validate",
+        "name": null,
+        "irr_step": null,
+        "conditions": [
+          {
+            "unless": {
+              "grpc": null,
+              "path": null,
+              "path_prefix": null,
+              "methods": null,
+              "headers": null,
+              "bound_upstream": {
+                "application_protocol": null,
+                "application_provider": "openai"
+              },
+              "selected_upstream": null
+            }
+          }
+        ],
+        "branch_chains": []
+      },
+      {
+        "order": 11,
+        "depth": 0,
+        "filter_type": "openai_tool_parse",
+        "name": null,
+        "irr_step": null,
+        "conditions": [
+          {
+            "unless": {
+              "grpc": null,
+              "path": null,
+              "path_prefix": null,
+              "methods": null,
+              "headers": null,
+              "bound_upstream": {
+                "application_protocol": null,
+                "application_provider": "openai"
+              },
+              "selected_upstream": null
+            }
+          }
+        ],
+        "branch_chains": []
+      },
+      {
+        "order": 12,
+        "depth": 0,
+        "filter_type": "openai_conversations",
+        "name": null,
+        "irr_step": null,
+        "conditions": [
+          {
+            "unless": {
+              "grpc": null,
+              "path": null,
+              "path_prefix": null,
+              "methods": null,
+              "headers": null,
+              "bound_upstream": {
+                "application_protocol": null,
+                "application_provider": "openai"
+              },
+              "selected_upstream": null
+            }
+          }
+        ],
+        "branch_chains": []
+      },
+      {
+        "order": 13,
+        "depth": 0,
+        "filter_type": "openai_response_store",
+        "name": null,
+        "irr_step": null,
+        "conditions": [
+          {
+            "unless": {
+              "grpc": null,
+              "path": null,
+              "path_prefix": null,
+              "methods": null,
+              "headers": null,
+              "bound_upstream": {
+                "application_protocol": null,
+                "application_provider": "openai"
+              },
+              "selected_upstream": null
+            }
+          }
+        ],
+        "branch_chains": []
+      },
+      {
+        "order": 14,
+        "depth": 0,
+        "filter_type": "openai_responses_rehydrate",
+        "name": null,
+        "irr_step": null,
+        "conditions": [
+          {
+            "unless": {
+              "grpc": null,
+              "path": null,
+              "path_prefix": null,
+              "methods": null,
+              "headers": null,
+              "bound_upstream": {
+                "application_protocol": null,
+                "application_provider": "openai"
+              },
+              "selected_upstream": null
+            }
+          }
+        ],
+        "branch_chains": []
+      },
+      {
+        "order": 15,
+        "depth": 0,
+        "filter_type": "openai_file_resolve",
+        "name": null,
+        "irr_step": null,
+        "conditions": [
+          {
+            "unless": {
+              "grpc": null,
+              "path": null,
+              "path_prefix": null,
+              "methods": null,
+              "headers": null,
+              "bound_upstream": {
+                "application_protocol": null,
+                "application_provider": "openai"
+              },
+              "selected_upstream": null
+            }
+          }
+        ],
+        "branch_chains": []
+      },
+      {
         "order": 16,
+        "depth": 0,
+        "filter_type": "openai_doc_extract",
+        "name": null,
+        "irr_step": null,
+        "conditions": [
+          {
+            "unless": {
+              "grpc": null,
+              "path": null,
+              "path_prefix": null,
+              "methods": null,
+              "headers": null,
+              "bound_upstream": {
+                "application_protocol": null,
+                "application_provider": "openai"
+              },
+              "selected_upstream": null
+            }
+          }
+        ],
+        "branch_chains": []
+      },
+      {
+        "order": 17,
+        "depth": 0,
+        "filter_type": "openai_mcp_tool_resolve",
+        "name": null,
+        "irr_step": null,
+        "conditions": [
+          {
+            "unless": {
+              "grpc": null,
+              "path": null,
+              "path_prefix": null,
+              "methods": null,
+              "headers": null,
+              "bound_upstream": {
+                "application_protocol": null,
+                "application_provider": "openai"
+              },
+              "selected_upstream": null
+            }
+          }
+        ],
+        "branch_chains": []
+      },
+      {
+        "order": 18,
+        "depth": 0,
+        "filter_type": "static_response",
+        "name": null,
+        "irr_step": null,
+        "conditions": [
+          {
+            "when": {
+              "grpc": null,
+              "path": null,
+              "path_prefix": "/v1/responses",
+              "methods": null,
+              "headers": null,
+              "bound_upstream": null,
+              "selected_upstream": null
+            }
+          },
+          {
+            "unless": {
+              "grpc": null,
+              "path": "/v1/responses",
+              "path_prefix": null,
+              "methods": null,
+              "headers": null,
+              "bound_upstream": null,
+              "selected_upstream": null
+            }
+          }
+        ],
+        "branch_chains": []
+      },
+      {
+        "order": 19,
         "depth": 0,
         "filter_type": "iterative_request_router",
         "name": null,
@@ -2645,7 +3400,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 17,
+        "order": 20,
         "depth": 1,
         "filter_type": "project_state_owner_headers",
         "name": null,
@@ -2654,7 +3409,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 18,
+        "order": 21,
         "depth": 1,
         "filter_type": "openai_stream_events",
         "name": null,
@@ -2663,7 +3418,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 19,
+        "order": 22,
         "depth": 1,
         "filter_type": "openai_web_search",
         "name": null,
@@ -2672,7 +3427,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 20,
+        "order": 23,
         "depth": 1,
         "filter_type": "openai_mcp_dispatch",
         "name": null,
@@ -2681,7 +3436,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 21,
+        "order": 24,
         "depth": 1,
         "filter_type": "openai_file_search_callout",
         "name": null,
@@ -2690,7 +3445,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 22,
+        "order": 25,
         "depth": 1,
         "filter_type": "openai_agentic_loop",
         "name": null,
@@ -2699,7 +3454,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 23,
+        "order": 26,
         "depth": 1,
         "filter_type": "headers",
         "name": null,
@@ -2708,22 +3463,7 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 24,
-        "depth": 1,
-        "filter_type": "router",
-        "name": null,
-        "irr_step": "inference",
-        "conditions": [],
-        "branch_chains": [],
-        "routes": [
-          {
-            "path": "/v1/responses",
-            "cluster": "inference-backend"
-          }
-        ]
-      },
-      {
-        "order": 25,
+        "order": 27,
         "depth": 1,
         "filter_type": "load_balancer",
         "name": null,
@@ -2732,12 +3472,58 @@ const PIPELINE = {
         "branch_chains": []
       },
       {
-        "order": 26,
+        "order": 28,
         "depth": 1,
         "filter_type": "openai_responses_proxy",
         "name": null,
         "irr_step": "inference",
-        "conditions": [],
+        "conditions": [
+          {
+            "when": {
+              "selected_upstream": {
+                "application_protocol": "openai_responses"
+              }
+            }
+          }
+        ],
+        "branch_chains": []
+      },
+      {
+        "order": 29,
+        "depth": 1,
+        "filter_type": "responses_to_chat_completions",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [
+          {
+            "when": {
+              "selected_upstream": {
+                "application_protocol": "openai_chat_completions"
+              }
+            }
+          }
+        ],
+        "branch_chains": []
+      },
+      {
+        "order": 30,
+        "depth": 1,
+        "filter_type": "path_rewrite",
+        "name": null,
+        "irr_step": "inference",
+        "conditions": [
+          {
+            "when": {
+              "selected_upstream": {
+                "application_protocol": "openai_chat_completions"
+              },
+              "path_prefix": "/v1/responses",
+              "methods": [
+                "POST"
+              ]
+            }
+          }
+        ],
         "branch_chains": []
       }
     ],
@@ -2839,49 +3625,89 @@ const PIPELINE = {
       "request": "POST /v1/prompts | /v1/embeddings | /v1/files | /v1/vector_stores",
       "entersIRR": false,
       "loopRounds": 0
+    },
+    {
+      "id": "S12",
+      "label": "Direct OpenAI passthrough",
+      "request": "POST /v1/responses {model:gpt-5,...} (application_provider=openai)",
+      "entersIRR": false,
+      "loopRounds": 0
+    },
+    {
+      "id": "S13",
+      "label": "Chat Completions backend",
+      "request": "POST /v1/responses {model:vllm-chat,store:false} (managed vllm, openai_chat_completions)",
+      "entersIRR": true,
+      "loopRounds": 1
     }
   ],
   "clusters": [
+    {
+      "name": "inference-backend",
+      "endpoints": [
+        "127.0.0.1:3001"
+      ],
+      "definedIn": "router route (path_prefix /v1/responses) + IRR-step load_balancer (cluster_source:bound_upstream)",
+      "routedBy": "router binds managed native Responses for gpt-4.1/default models; the IRR inference step resolves it on 3001",
+      "note": "application_provider vllm; the IRR-step load_balancer publishes application_protocol openai_responses so openai_responses_proxy fires"
+    },
+    {
+      "name": "openai-responses-backend",
+      "endpoints": [
+        "127.0.0.1:3001"
+      ],
+      "definedIn": "router route (model gpt-5) + direct-openai-dispatch load_balancer (cluster_source:bound_upstream)",
+      "routedBy": "router binds this when x-praxis-ai-model is gpt-5; the direct-openai terminal branch forwards the original request unchanged",
+      "note": "application_provider openai -\u003e the managed body filters and the IRR are skipped; the provider owns the response"
+    },
+    {
+      "name": "chat-completions-backend",
+      "endpoints": [
+        "127.0.0.1:3001"
+      ],
+      "definedIn": "router route (model vllm-chat) + IRR-step load_balancer (cluster_source:bound_upstream)",
+      "routedBy": "router binds this when x-praxis-ai-model is vllm-chat; the IRR inference step resolves it on 3001",
+      "note": "application_provider vllm, application_protocol openai_chat_completions -\u003e responses_to_chat_completions + path_rewrite fire instead of openai_responses_proxy"
+    },
     {
       "name": "prompts-api",
       "endpoints": [
         "127.0.0.1:9998"
       ],
-      "definedIn": "bypass-chain load_balancer",
-      "routedBy": "bypass router path_prefix /v1/prompts"
+      "definedIn": "direct-services-dispatch load_balancer",
+      "routedBy": "router path_prefix /v1/prompts (application_provider direct)"
     },
     {
       "name": "embeddings-api",
       "endpoints": [
         "127.0.0.1:9997"
       ],
-      "definedIn": "bypass-chain load_balancer",
-      "routedBy": "bypass router path_prefix /v1/embeddings"
+      "definedIn": "direct-services-dispatch load_balancer",
+      "routedBy": "router path_prefix /v1/embeddings (application_provider direct)"
     },
     {
       "name": "files-api",
       "endpoints": [
         "127.0.0.1:9999"
       ],
-      "definedIn": "bypass-chain load_balancer",
-      "routedBy": "bypass router path_prefix /v1/files"
-    },
-    {
-      "name": "inference-backend",
-      "endpoints": [
-        "127.0.0.1:3001"
-      ],
-      "definedIn": "BOTH bypass-chain load_balancer AND IRR inference-step load_balancer",
-      "routedBy": "bypass router (path /v1/responses + upgrade:websocket) and IRR step router (path /v1/responses)",
-      "note": "optional http.application_protocol:openai_responses + http.application_provider:openai are commented out on both definitions, so prompt-template requests fail closed in openai_responses_proxy"
+      "definedIn": "direct-services-dispatch load_balancer",
+      "routedBy": "router path_prefix /v1/files (application_provider direct)"
     },
     {
       "name": "vector-stores-backend",
       "endpoints": [
         "127.0.0.1:3002"
       ],
-      "definedIn": "bypass-chain load_balancer",
-      "routedBy": "bypass router path_prefix /v1/vector_stores"
+      "definedIn": "direct-services-dispatch load_balancer",
+      "routedBy": "router path_prefix /v1/vector_stores (application_provider direct)"
+    },
+    {
+      "name": "responses-websocket-backend",
+      "endpoints": [
+        "127.0.0.1:3001"
+      ],
+      "definedIn": "direct-services-dispatch load_balancer",
+      "routedBy": "router path /v1/responses + upgrade:websocket (application_provider direct)"
     }
   ],
   "externalServices": [
@@ -2900,7 +3726,7 @@ const PIPELINE = {
       "endpoint": "http://127.0.0.1:9999",
       "usedBy": [
         "openai_file_resolve callout (files_api_url)",
-        "bypass files-api cluster (/v1/files)"
+        "files-api cluster (/v1/files direct-services branch)"
       ],
       "credential": "user_credential ogx_files (per-user slot from x-user-ogx-key) injected on file_id callouts; file_url downloads use the separate credential-free resolver"
     },
@@ -2909,7 +3735,7 @@ const PIPELINE = {
       "endpoint": "http://127.0.0.1:3002",
       "usedBy": [
         "openai_file_search_callout (vector_store_url)",
-        "bypass vector-stores-backend cluster (/v1/vector_stores)"
+        "vector-stores-backend cluster (/v1/vector_stores direct-services branch)"
       ],
       "credential": "user_credential ogx_files (per-user slot from x-user-ogx-key) injected on file_search callouts"
     },
@@ -3012,24 +3838,24 @@ const SCEN_META = {
     ]
   },
   "S8": {
-    "narr": "\u003cb\u003eGET retrieve.\u003c/b\u003e openai_response_store answers PRE-IRR as a terminal response and short-circuits — rehydrate, the callouts, the bypass carrier, and the IRR never run.",
+    "narr": "\u003cb\u003eGET retrieve.\u003c/b\u003e openai_response_store answers PRE-IRR as a terminal response and short-circuits the pipeline — rehydrate, the callouts, static_response, and the IRR never run.",
     "clusters": [],
     "services": []
   },
   "S9": {
-    "narr": "\u003cb\u003eWebSocket.\u003c/b\u003e A GET /v1/responses handshake with Upgrade:websocket takes the bypass branch and routes to inference-backend.",
+    "narr": "\u003cb\u003eWebSocket.\u003c/b\u003e A GET /v1/responses handshake with Upgrade:websocket is bound by the router to responses-websocket-backend; the direct-services terminal branch forwards it to 3001, so the managed body filters and the IRR never run.",
     "clusters": [
-      "inference-backend"
+      "responses-websocket-backend"
     ],
     "services": []
   },
   "S10": {
-    "narr": "\u003cb\u003eNon-Responses body.\u003c/b\u003e A Chat/Anthropic/unclassified body posted to /v1/responses is not classified openai_responses, runs the bypass carrier, and gets a route-miss 404.",
+    "narr": "\u003cb\u003eNon-Responses body.\u003c/b\u003e A Chat/Anthropic/unclassified body posted to /v1/responses is not classified openai_responses, so no router route matches — a route-miss returns a bare 404 before any body filter runs.",
     "clusters": [],
     "services": []
   },
   "S11": {
-    "narr": "\u003cb\u003eDedicated services.\u003c/b\u003e /v1/prompts | /v1/embeddings | /v1/files | /v1/vector_stores take the bypass branch and route by path_prefix to their backend cluster.",
+    "narr": "\u003cb\u003eDedicated services.\u003c/b\u003e /v1/prompts | /v1/embeddings | /v1/files | /v1/vector_stores are bound by the router to their path_prefix cluster (application_provider direct); the direct-services terminal branch forwards straight upstream and the IRR never runs.",
     "clusters": [
       "prompts-api",
       "embeddings-api",
@@ -3040,6 +3866,20 @@ const SCEN_META = {
       "Files API",
       "Vector store"
     ]
+  },
+  "S12": {
+    "narr": "\u003cb\u003eDirect OpenAI passthrough.\u003c/b\u003e A create with model gpt-5 is bound by the router to openai-responses-backend (application_provider openai); the direct-openai terminal branch forwards the ORIGINAL Responses request unchanged to 3001. The managed body filters and the IRR are skipped — the provider owns the response.",
+    "clusters": [
+      "openai-responses-backend"
+    ],
+    "services": []
+  },
+  "S13": {
+    "narr": "\u003cb\u003eChat Completions backend.\u003c/b\u003e A create with model vllm-chat is bound by the router to chat-completions-backend (managed). The IRR runs one round; the IRR-step load_balancer selects openai_chat_completions, so responses_to_chat_completions translates the request to Chat Completions (path_rewrite retargets /v1/chat/completions) and translates the Chat response back into a Responses resource.",
+    "clusters": [
+      "chat-completions-backend"
+    ],
+    "services": []
   }
 };
 
@@ -3249,7 +4089,7 @@ const WIRE = {
       "Content-Type: application/json"
     ],
     "resBody": "{\n  \"id\": \"resp_abc123\",\n  \"object\": \"response\",\n  \"created_at\": 1000,\n  \"status\": \"completed\",\n  \"model\": \"gpt-4.1\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"Hi there\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 9,\n    \"input_tokens_details\": {\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 4,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 13\n  }\n}",
-    "notes": "openai_response_store runs PRE-IRR and short-circuits GET /v1/responses/{id} with the persisted response_object served verbatim as application/json; rehydrate, the bypass carrier, all callouts, and the IRR agentic loop never execute. Owner-scoped lookup keys on the state_owner context (x-auth-tenant/x-auth-user), so the object is returned identically whether it was originally created buffered or accumulated from a stream:true lifecycle.",
+    "notes": "openai_response_store runs PRE-IRR and short-circuits GET /v1/responses/{id} with the persisted response_object served verbatim as application/json; rehydrate, static_response, all callouts, and the IRR agentic loop never execute. Owner-scoped lookup keys on the state_owner context (x-auth-tenant/x-auth-user), so the object is returned identically whether it was originally created buffered or accumulated from a stream:true lifecycle.",
     "provenance": [
       "apis/src/openai/responses/store/filter.rs:838-844 (GET handled in on_request before IRR)",
       "apis/src/openai/responses/store/filter.rs:1040-1047 (returns record.response_object verbatim, content-type application/json, status 200)",
@@ -3281,13 +4121,14 @@ const WIRE = {
       "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
     ],
     "resBody": "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
-    "notes": "A GET /v1/responses carrying Upgrade: websocket takes the bypass branch: the bypass carrier's unless-gate only skips POST + x-praxis-ai-format:openai_responses, so this GET runs the carrier, whose /v1/responses route matches on the Upgrade header (routes cannot match on HTTP method) and forwards to inference-backend. The IRR is never entered because it buffers responses and cannot handle 101 upgrades. The Sec-WebSocket-Accept is the RFC 6455 SHA-1 of the client key; after 101 the tunnel is bidirectional and the backend streams response.create-style Responses events.",
+    "notes": "A GET /v1/responses carrying Upgrade: websocket is bound by the top-level router to responses-websocket-backend (application_provider=direct) via the dedicated upgrade:websocket route. The direct-services terminal branch then forwards the handshake straight to 3001 and rejoins at terminal, so the managed body filters and the IRR never run (the IRR buffers responses and cannot handle 101 upgrades). The Sec-WebSocket-Accept is the RFC 6455 SHA-1 of the client key; after 101 the tunnel is bidirectional and the backend streams response.create-style Responses events.",
     "provenance": [
-      "tests/integration/tests/suite/examples/full_flow_agentic.rs:1107-1127 (exact WS request head: Connection/Upgrade/Sec-WebSocket-Version:13/Sec-WebSocket-Key + x-auth-* headers)",
-      "tests/integration/tests/suite/examples/full_flow_agentic.rs:909-916 (handshake returns SWITCHING_PROTOCOLS), 944-957 (backend receives GET /v1/responses + headers)",
-      "tests/integration/tests/suite/examples/full_flow_agentic.rs:1142-1167 (WS handshake reaches inference-backend via non-IRR bypass; IRR cannot handle 101)",
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:1113-1196 (full_flow_websocket_upgrade_preserves_handshake_and_ordered_text: WS request head + ordered text relay)",
+      {
+        "tests/integration/tests/suite/examples/full_flow_agentic.rs:1374-1397 (full_flow_websocket_handshake_reaches_inference_backend": "handshake returns SWITCHING_PROTOCOLS and reaches the 3001 backend)"
+      },
       "tests/integration/fixtures/openai/responses/websocket-codex-0.144.1.json:15-19 (WS response.create client kind and Responses event schema)",
-      "examples/configs/openai/responses/full-flow-agentic.yaml:96-119 (bypass branch owns non-create/WS traffic), 444-474 (headers carrier unless-gate + /v1/responses route matching upgrade: websocket -\u003e inference-backend), 247-261 (WebSocket takes bypass, not IRR)"
+      "examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + upgrade:websocket -\u003e responses-websocket-backend; direct-services branch when bound_upstream.application_provider=direct forwards to 3001 and rejoins terminal)"
     ]
   },
   "S10": {
@@ -3305,13 +4146,15 @@ const WIRE = {
       "Connection: close"
     ],
     "resBody": "",
-    "notes": "A Chat Completions body ({model,messages}) posted to /v1/responses is NOT classified openai_responses by openai_responses_format, so the bypass carrier's `unless` allow-list does not skip it: it runs the carrier and enters the bypass router. That router only exposes /v1/prompts, /v1/embeddings, /v1/files, /v1/vector_stores, and a /v1/responses route gated on `upgrade: websocket`. A plain POST /v1/responses carries no Upgrade header, so nothing matches and the router rejects with a bare 404. The route-miss body is EMPTY (no JSON error envelope): the praxis router emits Rejection::status(404) with body:None, and the protocol layer writes the header with no content-length and Connection: close. resKind is `none` (not `json`) because there is truthfully no body. Discrimination lives here PRE-IRR because the IRR strips x-praxis-* headers from its sub-request, so the IRR step router (path-only) could never re-classify Responses-vs-Chat.",
+    "notes": "A Chat Completions body ({model,messages}) posted to /v1/responses is NOT classified openai_responses by openai_responses_format, so none of the router's /v1/responses routes match: the gpt-5/vllm-chat/format routes all require x-praxis-ai-format:openai_responses, and the WebSocket route requires an Upgrade header. A plain POST /v1/responses with a Chat/Anthropic/unclassified body therefore hits no route and the router rejects with a bare 404 BEFORE any body filter, branch, or the IRR runs. The route-miss body is EMPTY (no JSON error envelope): the praxis router emits Rejection::status(404) with body:None, and the protocol layer writes the header with no content-length and Connection: close. resKind is `none` (not `json`) because there is truthfully no body. Discrimination lives here at the router (PRE-IRR) because the IRR consumes the frozen binding and never re-classifies Responses-vs-Chat.",
     "provenance": [
-      "examples/configs/openai/responses/full-flow-agentic.yaml:444-470 (bypass carrier `unless` gate + bypass router: no route matches a non-Responses POST /v1/responses)",
-      "tests/integration/tests/suite/examples/full_flow_agentic.rs:299-329 (full_flow_chat_completions_body_on_responses_path_does_not_reach_backend asserts status 404)",
-      "tests/integration/tests/suite/examples/full_flow_agentic.rs:331-361 (Anthropic Messages body variant also 404 via the same structural allow-list)",
-      "~/.cargo/registry/.../praxis-proxy-filter-0.6.0/src/builtins/http/traffic_management/router/mod.rs:514 (route-miss =\u003e Rejection::status(404), body:None) [praxis core dep]",
-      "~/.cargo/registry/.../praxis-proxy-protocol-0.6.0/src/http/pingora/convert.rs:150-171 (send_rejection: no content-length when body absent, keepalive disabled) [praxis core dep]"
+      "examples/configs/openai/responses/full-flow-agentic.yaml (router routes: every /v1/responses route requires x-praxis-ai-format:openai_responses or upgrade:websocket, so a non-Responses POST /v1/responses matches nothing)",
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:489-520 (full_flow_chat_completions_body_on_responses_path_does_not_reach_backend asserts status 404)",
+      {
+        "tests/integration/tests/suite/examples/full_flow_agentic.rs:521-560 (full_flow_anthropic_messages_body_on_responses_path_does_not_reach_backend": "same route-miss for an Anthropic body)"
+      },
+      "~/.cargo/registry/.../praxis-proxy-filter-0.7.1/src/builtins/http/traffic_management/router/mod.rs (route-miss =\u003e Rejection::status(404), body:None) [praxis core dep]",
+      "~/.cargo/registry/.../praxis-proxy-protocol-0.7.1/src/http/pingora/convert.rs (send_rejection: no content-length when body absent, keepalive disabled) [praxis core dep]"
     ]
   },
   "S11": {
@@ -3329,11 +4172,62 @@ const WIRE = {
       "Content-Type: application/json"
     ],
     "resBody": "{\n  \"object\": \"list\",\n  \"data\": [\n    {\n      \"object\": \"embedding\",\n      \"index\": 0,\n      \"embedding\": [\n        0.0023064255,\n        -0.009327292,\n        0.015797347,\n        -0.0079056\n      ]\n    }\n  ],\n  \"model\": \"text-embedding-3-small\",\n  \"usage\": {\n    \"prompt_tokens\": 5,\n    \"total_tokens\": 5\n  }\n}",
-    "notes": "POST /v1/embeddings matches the bypass router's path_prefix `/v1/embeddings` -\u003e cluster embeddings-api (127.0.0.1:9997) and rejoins at `terminal`, so it is forwarded straight upstream and NEVER enters the IRR. The gateway forwards the embeddings backend's response verbatim (bypass branch), so the exact embedding object shape is produced by the upstream embeddings-api, not the gateway. The `embedding` vector is truncated to four floats for brevity (real vectors are 1536-dim for text-embedding-3-small). The other dedicated services take the same bypass branch by path_prefix and likewise skip the IRR: /v1/prompts -\u003e prompts-api (127.0.0.1:9998), /v1/files -\u003e files-api (127.0.0.1:9999), /v1/vector_stores -\u003e vector-stores-backend (127.0.0.1:3002). NOTE: no repo fixture emits a real embeddings JSON object (the embeddings-routing functional test returns the marker string \"embeddings-api\"); this is the minimal truthful OpenAI embeddings shape.",
+    "notes": "POST /v1/embeddings matches the top-level router's path_prefix `/v1/embeddings` -\u003e cluster embeddings-api (application_provider=direct, 127.0.0.1:9997). Because the binding is direct, the direct-services terminal branch forwards it straight upstream and rejoins at `terminal`, so it NEVER enters the IRR and the managed body filters never run. The gateway forwards the embeddings backend's response verbatim, so the exact embedding object shape is produced by the upstream embeddings-api, not the gateway. The `embedding` vector is truncated to four floats for brevity (real vectors are 1536-dim for text-embedding-3-small). The other dedicated services take the same direct-services branch by path_prefix and likewise skip the IRR: /v1/prompts -\u003e prompts-api (127.0.0.1:9998), /v1/files -\u003e files-api (127.0.0.1:9999), /v1/vector_stores -\u003e vector-stores-backend (127.0.0.1:3002). NOTE: no repo fixture emits a real embeddings JSON object (the embeddings-routing functional test returns the marker string \"embeddings-api\"); this is the minimal truthful OpenAI embeddings shape.",
     "provenance": [
-      "examples/configs/openai/responses/full-flow-agentic.yaml:457-500 (bypass router path_prefix /v1/embeddings -\u003e embeddings-api; load_balancer endpoint 127.0.0.1:9997; also /v1/prompts:9998, /v1/files:9999, /v1/vector_stores:3002)",
-      "tests/integration/tests/suite/examples/full_flow_agentic.rs:1324-1352 (full_flow_agentic_non_responses_path_bypasses_irr proves a dedicated-service path bypasses the IRR and the bypass branch forwards the backend response verbatim)",
+      "examples/configs/openai/responses/full-flow-agentic.yaml (router path_prefix /v1/embeddings -\u003e embeddings-api; direct-services-dispatch load_balancer endpoint 127.0.0.1:9997; also /v1/prompts:9998, /v1/files:9999, /v1/vector_stores:3002)",
+      "tests/integration/tests/suite/examples/full_flow_agentic.rs:1559-1588 (full_flow_agentic_non_responses_path_bypasses_irr proves a dedicated-service path bypasses the IRR and the direct-services branch forwards the backend response verbatim)",
       "tests/integration/tests/suite/examples/openai_embeddings_routing.rs:14-60 (embeddings routing functional test; backend returns marker string, no JSON embeddings fixture exists)"
+    ]
+  },
+  "S12": {
+    "reqMethod": "POST",
+    "reqPath": "/v1/responses",
+    "reqHeaders": [
+      "Content-Type: application/json",
+      "x-auth-tenant: integration-tenant",
+      "x-auth-user: integration-user",
+      "x-user-ogx-key: Bearer integration-ogx-key"
+    ],
+    "reqBody": "{\n  \"model\": \"gpt-5\",\n  \"input\": \"continue at the provider\",\n  \"background\": true,\n  \"previous_response_id\": \"resp_provider_owned\",\n  \"conversation\": \"conv_provider_owned\"\n}",
+    "resStatus": "200 OK",
+    "resKind": "json",
+    "resHeaders": [
+      "Content-Type: application/json"
+    ],
+    "resBody": "{\n  \"id\": \"resp_openai_direct\",\n  \"object\": \"response\",\n  \"status\": \"queued\",\n  \"background\": true,\n  \"output\": []\n}",
+    "notes": "model gpt-5 makes openai_responses_format publish x-praxis-ai-model:gpt-5, which the router matches to openai-responses-backend with application_provider=openai. The direct-openai terminal branch then forwards the ORIGINAL Responses request UNCHANGED to the provider (3001) and stops the chain, so openai_responses_validate, the store/rehydrate/callout body filters, and the IRR never run. This is why background:true, previous_response_id:resp_provider_owned, and conversation:conv_provider_owned all pass straight through: on the managed path background would be rejected 400 (see full_flow_managed_provider_rejects_background_before_forwarding) and the provider-owned continuation ids would be gateway-validated, but here the provider owns the request/response. The backend receives exactly one request at /v1/responses whose body is byte-identical to the client request, and the provider's response (status:queued) is returned verbatim without gateway composition.",
+    "provenance": [
+      {
+        "tests/integration/tests/suite/examples/full_flow_agentic.rs:365-410 (full_flow_openai_provider_is_direct_passthrough": "200, provider response returned verbatim, backend gets one /v1/responses request with body === client request)"
+      },
+      {
+        "tests/integration/tests/suite/examples/full_flow_agentic.rs:413-439 (full_flow_managed_provider_rejects_background_before_forwarding": "the managed path rejects background:true with 400, contrasting the direct passthrough)"
+      },
+      "examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:gpt-5 -\u003e openai-responses-backend; direct-openai branch when bound_upstream.application_provider=openai forwards to 3001 and rejoins terminal; body filters + IRR gated unless application_provider=openai)"
+    ]
+  },
+  "S13": {
+    "reqMethod": "POST",
+    "reqPath": "/v1/responses",
+    "reqHeaders": [
+      "Content-Type: application/json",
+      "x-auth-tenant: integration-tenant",
+      "x-auth-user: integration-user",
+      "x-user-ogx-key: Bearer integration-ogx-key"
+    ],
+    "reqBody": "{\n  \"model\": \"vllm-chat\",\n  \"input\": \"hello\",\n  \"store\": false\n}",
+    "resStatus": "200 OK",
+    "resKind": "json",
+    "resHeaders": [
+      "Content-Type: application/json"
+    ],
+    "resBody": "{\n  \"id\": \"resp_bound\",\n  \"object\": \"response\",\n  \"status\": \"completed\",\n  \"model\": \"vllm-chat\",\n  \"output\": [\n    {\n      \"type\": \"message\",\n      \"role\": \"assistant\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"text\": \"translated\",\n          \"annotations\": []\n        }\n      ]\n    }\n  ],\n  \"usage\": {\n    \"input_tokens\": 3,\n    \"output_tokens\": 1,\n    \"total_tokens\": 4\n  }\n}",
+    "notes": "model vllm-chat makes openai_responses_format publish x-praxis-ai-model:vllm-chat, which the router matches to chat-completions-backend (managed vllm, application_provider=direct is NOT set — the provider is vllm), so the direct branches stay inert and the request flows through the managed body filters into the IRR. Inside the single IRR round the IRR-step load_balancer selects chat-completions-backend and publishes application_protocol:openai_chat_completions; that gate makes openai_responses_proxy inert and instead fires responses_to_chat_completions (which translates the Responses request into a Chat Completions request carrying messages, not input) and path_rewrite (which retargets the outbound path to /v1/chat/completions). The backend therefore receives exactly one request at /v1/chat/completions. On the reverse path responses_to_chat_completions translates the Chat completion back into a Responses resource before openai_agentic_loop and openai_stream_events observe it. store:false so nothing is persisted. The test asserts only response.object==\"response\" and output[0].content[0].text==\"translated\"; the id shown is gateway-generated (openai_responses_validate ran on the managed path) and the usage (3/1/4) is the Chat usage mapped by the translator — both illustrative here.",
+    "provenance": [
+      {
+        "tests/integration/tests/suite/examples/full_flow_agentic.rs:442-486 (full_flow_managed_chat_backend_translates_after_binding": "200, response.object==response + output text \"translated\"; backend gets one /v1/chat/completions request whose body has messages and no input)"
+      },
+      "examples/configs/openai/responses/full-flow-agentic.yaml (router route: path /v1/responses + x-praxis-ai-format:openai_responses + x-praxis-ai-model:vllm-chat -\u003e chat-completions-backend; IRR-step load_balancer cluster_source:bound_upstream selects openai_chat_completions; responses_to_chat_completions + path_rewrite gated when selected_upstream.application_protocol:openai_chat_completions; openai_responses_proxy gated when openai_responses)"
     ]
   }
 };
@@ -3674,7 +4568,7 @@ const TIMELINE = {
         "kind": "request",
         "title": "Round-1 inference carrying the resolved MCP tools",
         "channel": "POST http://127.0.0.1:3001/v1/responses",
-        "note": "The resolver lowers each MCP tool to an encoded function tool named \u003cserver_label\u003e__\u003ctool_name\u003e (encode_function_name -\u003e weather__get_weather, mcp_dispatch/tests.rs:2124-2126). Test asserts first_model_body.tools contains {type:function, name:weather__get_weather} and preserves parallel_tool_calls=true (openai_agentic_loop.rs:365-382). Routed to inference-backend 127.0.0.1:3001 by the IRR step router.",
+        "note": "The resolver lowers each MCP tool to an encoded function tool named \u003cserver_label\u003e__\u003ctool_name\u003e (encode_function_name -\u003e weather__get_weather, mcp_dispatch/tests.rs:2124-2126). Test asserts first_model_body.tools contains {type:function, name:weather__get_weather} and preserves parallel_tool_calls=true (openai_agentic_loop.rs:365-382). Resolved to inference-backend 127.0.0.1:3001 by the IRR-step load_balancer (cluster_source:bound_upstream).",
         "bodyKind": "json",
         "body": "{\"model\":\"gpt-4.1\",\"input\":\"What is the weather in SF?\",\"parallel_tool_calls\":true,\"tools\":[{\"type\":\"function\",\"name\":\"weather__get_weather\",…}]}",
         "provenance": [
@@ -3797,12 +4691,12 @@ const TIMELINE = {
         "kind": "request",
         "title": "Client POST /v1/responses with web_search tool",
         "channel": "POST http://127.0.0.1:8080/v1/responses",
-        "note": "Classified openai_responses create request; falls through the bypass carrier into the IRR. In full-flow-agentic.yaml the trusted boundary would also carry x-user-brave-key (see step 4 note).",
+        "note": "Classified openai_responses create request; the router binds inference-backend (managed native Responses, application_provider vllm), so the direct branches stay inert and it flows through the body filters into the IRR. In full-flow-agentic.yaml the trusted boundary would also carry x-user-brave-key (see step 4 note).",
         "bodyKind": "json",
         "body": "{\"model\":\"gpt-4.1\",\"input\":\"Search for Rust 2025 edition features\",\"tools\":[{\"type\":\"web_search_preview\"}]}",
         "provenance": [
           "tests/integration/tests/suite/examples/openai_agentic_loop.rs:3271-3279",
-          "examples/configs/openai/responses/full-flow-agentic.yaml:444-451"
+          "examples/configs/openai/responses/full-flow-agentic.yaml (router route path_prefix /v1/responses + x-praxis-ai-format:openai_responses -\u003e inference-backend)"
         ]
       },
       {
