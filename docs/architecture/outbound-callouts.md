@@ -68,7 +68,11 @@ selection is needed — all callouts share the same validated TLS stack as
 upstream cluster connections.
 
 On RHEL/OpenShift FIPS builds, the system OpenSSL provider enforces approved
-cipher suites and algorithms for every outbound connection automatically.
+cipher suites and algorithms for every outbound connection automatically. The
+FIPS feature set includes `openai-file-resolve-filter` and `aws-sigv4-filter`;
+`openai-mcp-tools` remains excluded because its `store` dependency pulls sha2
+through sqlx, and the response stores and policy engine are excluded for the
+same reason.
 
 `reqwest` is a dev/test-only dependency. Test TLS infrastructure
 (`tests/utils/src/net/tls.rs`) uses rustls for mock servers and certificate

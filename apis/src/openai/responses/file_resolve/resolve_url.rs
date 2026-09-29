@@ -375,16 +375,10 @@ impl FileUrlResolver {
         }
         let remaining = deadline - now;
 
-        // Build sub-request with callout-depth header
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::HeaderName::from_static("x-praxis-callout-depth"),
-            http::HeaderValue::from_static("1"),
-        );
         let request = SubRequest {
             method: http::Method::GET,
             uri: http::Uri::default(),
-            headers,
+            headers: http::HeaderMap::new(),
             body: bytes::Bytes::new(),
         };
 

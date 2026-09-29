@@ -84,3 +84,4 @@ schemars = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tokio-util = { workspace = true }
+tracing-subscriber = { workspace = true }
