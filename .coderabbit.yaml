@@ -169,9 +169,7 @@ reviews:
 
         Locally owned endpoints (GET/DELETE, persistence, rehydrate) must
         reject with 500 on store-init failure and never fall through to the
-        upstream. GET /v1/responses/{id} must reject stream=true, include,
-        starting_after, include_obfuscation, and unknown query parameters with
-        400.
+        upstream.
 
     - path: "apis/src/openai/responses/agentic_loop/**"
       instructions: |
