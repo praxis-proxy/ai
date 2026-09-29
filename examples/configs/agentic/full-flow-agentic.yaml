@@ -15,9 +15,9 @@
 #
 #   - application_provider=anthropic: a terminal branch forwards the original
 #     Messages request and response without body translation.
-#   - application_protocol=openai_chat_completions on /v1/messages: the gateway
-#     translates Messages to Chat Completions and translates the response back,
-#     then terminates without entering the Responses IRR.
+#   - application_provider=anthropic_compat: the gateway translates Messages to
+#     Chat Completions and translates the response back, then terminates without
+#     entering the Responses IRR.
 #   - application_provider=openai: a terminal branch forwards the original
 #     Responses request directly. Managed validation, response state,
 #     persistence/rehydration, hosted-tool resolution, and the IRR never run.
@@ -503,15 +503,14 @@ filter_chains:
                           - "127.0.0.1:8000"
 
       # Translated Claude Code traffic also terminates before the Responses
-      # IRR. The promoted format distinguishes it from managed OpenAI Responses
-      # requests that use the same Chat Completions protocol.
+      # IRR. Its adapter-specific provider identity distinguishes it from
+      # managed OpenAI Responses requests that use the same Chat Completions
+      # protocol and gives static reachability checks one ownership fact.
       - filter: headers
         conditions:
           - when:
-              headers:
-                x-praxis-ai-format: "anthropic_messages"
               bound_upstream:
-                application_protocol: openai_chat_completions
+                application_provider: anthropic_compat
         branch_chains:
           - name: translated-anthropic
             rejoin: terminal
@@ -524,7 +523,7 @@ filter_chains:
                       - name: "anthropic-chat-completions-backend"
                         http:
                           application_protocol: openai_chat_completions
-                          application_provider: vllm
+                          application_provider: anthropic_compat
                         endpoints:
                           - "127.0.0.1:8000"
 

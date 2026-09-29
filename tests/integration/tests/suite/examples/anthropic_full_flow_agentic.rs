@@ -67,6 +67,7 @@ fn unified_anthropic_path_has_no_server_owned_agentic_loop() {
     assert!(!yaml.contains("- filter: anthropic_messages_protocol"));
     assert!(yaml.contains("name: direct-anthropic"));
     assert!(yaml.contains("name: translated-anthropic"));
+    assert!(yaml.contains("application_provider: anthropic_compat"));
 }
 
 #[test]
