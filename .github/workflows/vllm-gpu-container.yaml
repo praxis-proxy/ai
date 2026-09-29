@@ -17,6 +17,7 @@ on:
     branches: [main]
     paths:
       - "vllm/Containerfile"
+      - ".github/actions/build-vllm-gpu/**"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
       - ".github/actions/start-ec2-runner/**"
@@ -27,6 +28,7 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - "vllm/Containerfile"
+      - ".github/actions/build-vllm-gpu/**"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
       - ".github/actions/start-ec2-runner/**"
@@ -94,8 +96,11 @@ jobs:
         run: |
           CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
             'vllm/Containerfile' \
+            '.github/actions/build-vllm-gpu/' \
             '.github/actions/start-vllm/' \
             '.github/actions/wait-vllm/' \
+            '.github/actions/start-ec2-runner/' \
+            '.github/actions/stop-ec2-runner/' \
             '.github/workflows/vllm-gpu-container.yaml')
           if [ -n "$CHANGED" ]; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
@@ -114,7 +119,10 @@ jobs:
     needs: [changes]
     if: |
       always() &&
-      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true')
+      (needs.changes.result == 'skipped' || needs.changes.outputs.relevant == 'true') &&
+      (github.event_name != 'pull_request' ||
+        (github.event.pull_request.head.repo.full_name == github.repository &&
+         github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -202,22 +210,12 @@ jobs:
             tests/integration/ogx-constraints.txt
 
       - name: Build image
-        env:
-          DOCKER_BUILDKIT: "1"
-          # Same secret the other vLLM workflows read. Optional: it is only
-          # needed for gated checkpoints, and the default Qwen3-8B is not one.
-          HF_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          BUILD_ARGS=(
-            --build-arg "INFERENCE_MODEL=${INFERENCE_MODEL}"
-            --tag "${IMAGE_NAME}:${IMAGE_TAG}"
-            --file vllm/Containerfile
-          )
-          if [ -n "${HF_TOKEN}" ]; then
-            BUILD_ARGS+=(--secret "id=hf_token,env=HF_TOKEN")
-          fi
-          "$CONTAINER_RUNTIME" build "${BUILD_ARGS[@]}" .
+        uses: ./.github/actions/build-vllm-gpu
+        with:
+          model: ${{ env.INFERENCE_MODEL }}
+          image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
 
       - name: Start vLLM on GPU
         uses: ./.github/actions/start-vllm

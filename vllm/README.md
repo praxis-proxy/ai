@@ -19,8 +19,8 @@ Published to `ghcr.io/praxis-proxy/vllm-gpu`.
 ## Default model
 
 CI defaults to [`Qwen/Qwen3-8B`](https://huggingface.co/Qwen/Qwen3-8B), the same
-model the GPU jobs in `vllm-integration.yaml` serve (`VLLM_GPU_MODEL`), so the
-published image is the one the repository's live coverage is qualified against.
+model the full GPU suite in `vllm-integration.yaml` serves (`VLLM_GPU_MODEL`).
+The suite builds the image from its checked-out commit and tests that build.
 
 The 8.19 B bf16 checkpoint is ~15.3 GiB of weights. It needs a card with enough
 VRAM left over for a KV cache; the CI runner is a `g5.xlarge` (A10G, 24 GiB,
@@ -47,6 +47,20 @@ docker build \
   --build-arg INFERENCE_MODEL=meta-llama/Llama-3.1-8B \
   --secret id=hf_token,env=HF_TOKEN \
   --tag vllm-gpu:Llama-3.1-8B \
+  --file vllm/Containerfile \
+  .
+```
+
+To bake a specific model revision, pass `INFERENCE_REVISION` with the full
+Hugging Face commit hash. The Anthropic vision GPU workflow does this for
+`Qwen/Qwen3-VL-4B-Instruct` and runs its SDK image tests against the local
+built image.
+
+```console
+docker build \
+  --build-arg INFERENCE_MODEL=Qwen/Qwen3-VL-4B-Instruct \
+  --build-arg INFERENCE_REVISION=ebb281ec70b05090aa6165b016eac8ec08e71b17 \
+  --tag vllm-gpu:Qwen3-VL-4B-Instruct \
   --file vllm/Containerfile \
   .
 ```
@@ -97,7 +111,8 @@ the same `critical_vllm` subset CI gates on:
 
 ```console
 # 1. Start the image on the GPU (see "Running" above), then:
-cargo build -p praxis-ai-proxy --no-default-features --features store-sqlite
+cargo build -p praxis-ai-proxy --no-default-features \
+  --features standard,openai-all,store-sqlite
 
 # 2. OGX backs the file_search / file_resolve tests in the critical set.
 uv run --with-requirements tests/integration/ogx-constraints.txt \
@@ -109,8 +124,9 @@ VLLM_TEST_BACKEND=live VLLM_MODEL=Qwen/Qwen3-8B \
   -s -m "critical_vllm"
 ```
 
-Drop `-m "critical_vllm"` to run the complete live Responses suite — the same
-thing the nightly `vllm-integration.yaml` run does against the CPU image.
+Drop `-m "critical_vllm"` to run the complete live Responses suite. The
+nightly GPU job builds this image from its checkout and runs that full suite
+with a PostgreSQL response store.
 
 ## CI
 
@@ -127,13 +143,19 @@ with `VLLM_TEST_BACKEND=live`. That is the same suite, same marker, and same
 `vllm-live-cpu` job in `vllm-integration.yaml` uses against the CPU image, so
 GPU and CPU images are held to one standard.
 
+The scheduled and `vllm-full-suite` label runs in `vllm-integration.yaml` also
+build this image from the checked-out commit and exercise the complete live
+Responses suite against that local build. The PR image job and full-suite job
+are separate builds; neither publishes an image from a PR.
+
 Triggers:
 
-- **Push to `main`** (when `Containerfile`, the vLLM start/wait actions, the
-  EC2 runner actions, or the workflow changes) — builds, tests, and pushes both
+- **Push to `main`** (when `Containerfile`, the GPU build action, the vLLM
+  start/wait actions, the EC2 runner actions, or the workflow changes) —
+  builds, tests, and pushes both
   `:<model>` (e.g. `:Qwen3-8B`) and `:latest`.
-- **Pull request** / **merge queue** — builds and tests only; nothing is
-  pushed.
+- **Same-repository pull request** / **merge queue** — builds and tests only;
+  nothing is pushed. Fork and Dependabot PRs skip the secret-backed GPU runner.
 - **Manual (`workflow_dispatch`)** — accepts an `inference_model` input to
   build an arbitrary HuggingFace model and a `gpu_instance_type` input to
   override the EC2 instance type; pushes `:<model>` but not `:latest`. Defaults

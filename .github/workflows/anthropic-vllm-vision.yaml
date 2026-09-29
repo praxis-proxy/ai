@@ -24,11 +24,10 @@ concurrency:
 permissions: {}
 
 env:
-  VLLM_IMAGE: "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
+  VLLM_IMAGE: "ghcr.io/praxis-proxy/vllm-gpu:Qwen3-VL-4B-Instruct"
   VISION_MODEL: "Qwen/Qwen3-VL-4B-Instruct"
   VISION_REVISION: "ebb281ec70b05090aa6165b016eac8ec08e71b17"
   SERVED_MODEL: "qwen3-vl-4b"
-  GPU_HF_CACHE_DIR: /tmp/praxis-huggingface
 
 jobs:
   gpu-start-runner:
@@ -38,7 +37,8 @@ jobs:
       ((github.event.label.name == 'vllm-full-suite' ||
         (github.event.action == 'synchronize' &&
          contains(github.event.pull_request.labels.*.name, 'vllm-full-suite'))) &&
-       github.event.pull_request.head.repo.full_name == github.repository)
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -78,16 +78,28 @@ jobs:
       - name: Verify GPU and container runtime
         run: |
           nvidia-smi
-          if command -v docker >/dev/null 2>&1; then
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
-            docker info >/dev/null
-          elif command -v podman >/dev/null 2>&1; then
+          elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
-            podman info >/dev/null
           else
-            echo "Neither Docker nor Podman is available" >&2
+            echo "Neither Docker nor Podman is usable" >&2
             exit 1
           fi
+
+      - name: Free disk space
+        run: |
+          "$CONTAINER_RUNTIME" system prune -af || true
+          df -h /
+
+      - name: Build pinned vision GPU image
+        uses: ./.github/actions/build-vllm-gpu
+        with:
+          model: ${{ env.VISION_MODEL }}
+          revision: ${{ env.VISION_REVISION }}
+          image: ${{ env.VLLM_IMAGE }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
 
       - name: Setup Rust
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
@@ -106,25 +118,18 @@ jobs:
           echo "VLLM_API_KEY=$token" >> "$GITHUB_ENV"
 
       - name: Start pinned vision model on vLLM
-        env:
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
         run: |
           set -euo pipefail
           gpu_args=()
-          cache_mount="$GPU_HF_CACHE_DIR:/root/.cache/huggingface"
           if [ "$CONTAINER_RUNTIME" = podman ]; then
             gpu_args=(--device nvidia.com/gpu=all)
-            cache_mount="${cache_mount}:Z"
           else
             gpu_args=(--gpus all)
           fi
-          mkdir -p "$GPU_HF_CACHE_DIR"
-          "$CONTAINER_RUNTIME" pull "$VLLM_IMAGE"
-          "$CONTAINER_RUNTIME" run -d --name vllm \
+          "$CONTAINER_RUNTIME" run -d --name vllm --pull=never \
             "${gpu_args[@]}" -p 8000:8000 \
-            -e HUGGING_FACE_HUB_TOKEN -v "$cache_mount" \
             "$VLLM_IMAGE" \
-            --model "$VISION_MODEL" --revision "$VISION_REVISION" \
+            --model "/opt/vllm/models/${VISION_MODEL}" \
             --served-model-name "$SERVED_MODEL" --max-model-len 8192 \
             --gpu-memory-utilization 0.90 --enforce-eager \
             --api-key "$VLLM_API_KEY"

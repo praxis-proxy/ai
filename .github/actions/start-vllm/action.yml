@@ -27,6 +27,10 @@ inputs:
     description: Value for vLLM's --gpu-memory-utilization flag.
     required: false
     default: "0.5"
+  max-model-len:
+    description: Maximum served context length.
+    required: false
+    default: "4096"
 runs:
   using: composite
   steps:
@@ -40,6 +44,7 @@ runs:
         VLLM_PULL: ${{ inputs.pull }}
         VLLM_DEVICE_ARGS: ${{ inputs.device-args }}
         VLLM_GPU_MEMORY_UTILIZATION: ${{ inputs.gpu-memory-utilization }}
+        VLLM_MAX_MODEL_LEN: ${{ inputs.max-model-len }}
       run: |
         # Pull the (multi-GB, model-baked) image and start the container in the
         # background so the pull + model load overlap the caller's next steps
@@ -54,15 +59,19 @@ runs:
         # word-split into distinct argv entries.
         nohup bash -c '
           set -euo pipefail
+          pull_args=()
           if [ "$VLLM_PULL" = "true" ]; then
             "$VLLM_RUNTIME" pull "$VLLM_IMAGE"
+          else
+            pull_args=(--pull=never)
           fi
           "$VLLM_RUNTIME" run -d --name vllm \
+            "${pull_args[@]}" \
             -p 8000:8000 \
             $VLLM_DEVICE_ARGS \
             "$VLLM_IMAGE" \
             --model "$VLLM_MODEL_PATH" \
-            --max-model-len 4096 \
+            --max-model-len "$VLLM_MAX_MODEL_LEN" \
             --served-model-name "$VLLM_MODEL" \
             --enable-auto-tool-choice \
             --tool-call-parser hermes \
