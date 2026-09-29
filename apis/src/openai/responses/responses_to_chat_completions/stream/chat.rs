@@ -13,7 +13,7 @@ use std::borrow::Cow;
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, value::RawValue};
 
-use crate::openai::translation::reasoning::ReasoningDialect;
+use crate::openai::translation::reasoning::{RawReasoningField, ReasoningDialect};
 
 /// One Chat Completions streaming chunk (`chat.completion.chunk`).
 #[derive(Debug, Deserialize)]
@@ -92,8 +92,8 @@ impl ChatDelta<'_> {
 
         for field in dialect.raw_fields() {
             let raw = match *field {
-                "reasoning" => self.reasoning,
-                _ => self.reasoning_content,
+                RawReasoningField::Reasoning => self.reasoning,
+                RawReasoningField::ReasoningContent => self.reasoning_content,
             };
             if let Some(raw) = raw {
                 let Text(text) = serde_json::from_str(raw.get())?;

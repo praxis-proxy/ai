@@ -2820,9 +2820,19 @@ class TestOpenAIResponsesVLLM:
 class TestResponsesReasoningVLLM:
     """Reasoning-dialect translation exercised through the OpenAI SDK."""
 
-    def test_streaming_reasoning_sdk_events_and_stored_continuation(self, reasoning_capture_client):
+    @pytest.mark.parametrize("preferred_field", [True, False], ids=["preferred", "legacy"])
+    def test_streaming_reasoning_sdk_events_and_stored_continuation(
+        self, reasoning_capture_client, preferred_field,
+    ):
         """The SDK consumes raw reasoning events and persisted reasoning-only output."""
         client, forwarded = reasoning_capture_client
+        ChatCaptureHandler.stream_deltas = [
+            {
+                "reasoning": "I picked " if preferred_field else "",
+                "reasoning_content": "ignored" if preferred_field else "I picked ",
+            },
+            {"reasoning_content": "42."},
+        ]
         with client.responses.stream(model=VLLM_MODEL, input="Pick a number.", store=True) as stream:
             events = list(stream)
             final = stream.get_final_response()

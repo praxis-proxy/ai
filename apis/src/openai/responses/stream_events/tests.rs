@@ -1186,6 +1186,24 @@ async fn logical_stream_suppresses_malformed_chunk_and_emits_terminal_error() {
     );
 }
 
+#[tokio::test]
+async fn logical_stream_rejects_event_type_line_injection() {
+    for delimiter in ["\r", "\n", "\r\n"] {
+        let filter = make_filter();
+        let mut ctx = arm_plain_stream(&filter);
+        let payload = json!({"type": format!("future{delimiter}data: {{}}{delimiter}{delimiter}event: injected")});
+        let mut chunk = Some(Bytes::from(format!("data: {payload}\n\n")));
+        filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(chunk.is_none(), "unsafe event must not be forwarded");
+        let mut eos = None;
+        filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+        let output = String::from_utf8(eos.unwrap().to_vec()).unwrap();
+        assert!(output.contains("event: error"));
+        assert!(!output.contains("injected"));
+        assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
+    }
+}
+
 /// Arm a plain streaming logical-stream context (no hosted tools) for the given
 /// filter, then feed a `response.created` opener. Returns the armed context.
 fn arm_plain_stream(filter: &OpenaiStreamEventsFilter) -> praxis_filter::HttpFilterContext<'static> {

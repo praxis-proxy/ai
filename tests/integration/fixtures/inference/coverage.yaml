@@ -433,3 +433,12 @@ features:
     providers:
       vllm:
         status: live_covered
+  - id: responses.streaming.invalid_event_type
+    scopes:
+      - responses_agentic_loop
+    status: synthetic_only
+    scenarios:
+      - responses/invalid-stream-event-type
+    providers:
+      synthetic:
+        status: synthetic_only

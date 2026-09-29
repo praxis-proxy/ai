@@ -14,6 +14,25 @@ const DEFAULT_MAX_REASONING_BYTES: usize = 65_536;
 /// The reasoning item content part type carrying raw chain-of-thought.
 const REASONING_TEXT_PART_TYPE: &str = "reasoning_text";
 
+/// Provider fields supported by both finite and streaming reasoning extraction.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RawReasoningField {
+    /// Preferred vLLM field.
+    Reasoning,
+    /// Deprecated vLLM alias.
+    ReasoningContent,
+}
+
+impl RawReasoningField {
+    /// JSON key used by finite Chat Completions messages.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reasoning => "reasoning",
+            Self::ReasoningContent => "reasoning_content",
+        }
+    }
+}
+
 /// Backend specific named reasoning dialect.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -27,10 +46,10 @@ pub(crate) enum ReasoningDialect {
 
 impl ReasoningDialect {
     /// Raw reasoning fields in preference order, shared by finite and streaming extraction.
-    pub(crate) const fn raw_fields(self) -> &'static [&'static str] {
+    pub(crate) const fn raw_fields(self) -> &'static [RawReasoningField] {
         match self {
             Self::None => &[],
-            Self::Vllm => &["reasoning", "reasoning_content"],
+            Self::Vllm => &[RawReasoningField::Reasoning, RawReasoningField::ReasoningContent],
         }
     }
 
@@ -291,7 +310,7 @@ fn resolve_raw_reasoning(
     dialect: ReasoningDialect,
 ) -> Result<Option<&str>, TranslationError> {
     for field in dialect.raw_fields() {
-        match message.get(*field) {
+        match message.get(field.as_str()) {
             // A null, empty, or absent field is not a payload; try the next name.
             None | Some(Value::Null) => {},
             Some(Value::String(text)) if text.is_empty() => {},
