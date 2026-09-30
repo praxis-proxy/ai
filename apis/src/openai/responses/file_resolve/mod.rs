@@ -210,7 +210,7 @@ impl FileResolveFilter {
     /// [`from_config_with_client`]: Self::from_config_with_client
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let client = crate::subrequest::isolated_client(4);
-        Self::build(config, client, None)
+        Self::build(config, &client, None)
     }
 
     /// Create a filter using the shared [`SubRequestClient`].
@@ -226,7 +226,7 @@ impl FileResolveFilter {
     /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
     pub fn from_config_with_client(
         config: &serde_yaml::Value,
-        client: SubRequestClient,
+        client: &SubRequestClient,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         Self::build(config, client, None)
     }
@@ -246,7 +246,7 @@ impl FileResolveFilter {
     /// [`ChainBindingContext::bind_chain`]: praxis_filter::ChainBindingContext::bind_chain
     pub fn from_config_with_outbound(
         config: &serde_yaml::Value,
-        client: SubRequestClient,
+        client: &SubRequestClient,
         outbound: Arc<FilterPipeline>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         Self::build(config, client, Some(outbound))
@@ -276,7 +276,7 @@ impl FileResolveFilter {
     #[expect(clippy::too_many_lines, reason = "filter construction boilerplate")]
     fn build(
         config: &serde_yaml::Value,
-        subrequest_client: SubRequestClient,
+        subrequest_client: &SubRequestClient,
         outbound: Option<Arc<FilterPipeline>>,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
         let cfg: FileResolveConfig = parse_filter_config("openai_file_resolve", config)?;
@@ -292,7 +292,7 @@ impl FileResolveFilter {
 
         let api_client = ApiClient::new(ApiClientConfig {
             api_base_url: validated.files_api_url.clone(),
-            client: subrequest_client,
+            client: subrequest_client.clone(),
             timeout: std::time::Duration::from_millis(validated.timeout_ms),
             max_response_bytes: 1_048_576,
             forward_header_names,
@@ -321,6 +321,7 @@ impl FileResolveFilter {
                 .map_err(|e| -> FilterError { format!("openai_file_resolve: {e}").into() })?;
             Some(FileUrlResolver {
                 allowed_private_origins: origins,
+                client: subrequest_client.clone(),
             })
         } else {
             None

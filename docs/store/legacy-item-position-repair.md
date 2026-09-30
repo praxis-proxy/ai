@@ -8,14 +8,13 @@ is an **operator-run data repair**, not an automatic startup migration: changing
 persisted ordering without a backup or while writers are active is unsafe.
 
 These statements apply to the **pre-#570, version 1** items table, before its
-`(tenant_id, conversation_id, position)` unique index exists. They do **not**
-upgrade the older owner columns or response payload columns to the current
-schema. Do not change the schema-version stamp to make a newer binary accept
-an older schema. Complete any other required migrations separately. In
-particular, an owner-scope migration must replace this version 1 index with
-the current `(conversation_id, position)` index after validating globally
-unique conversation IDs. The index name is the same: `IF NOT EXISTS` alone
-will **not** replace the old index definition.
+`(tenant_id, conversation_id, position)` unique index exists. They are for
+**historical data recovery only**, not an upgrade to the current schema.
+Current releases require a new, empty schema-v4 store; follow the
+[recreate-only upgrade policy](schema-migration.md) rather than repairing an
+older database for reuse. Do not change the schema-version stamp to make a
+newer binary accept an older schema. Index definitions have also changed;
+`IF NOT EXISTS` alone will **not** replace an old index definition.
 
 1. Stop every gateway instance writing to this database and take a backup.
 2. Substitute the configured items table name for `<items>` throughout the
@@ -115,6 +114,6 @@ COMMIT;
 ```
 
 Run the inspection query again. It must return no rows. Check that the item
-count still matches the backup before continuing with the rest of the schema
-upgrade. Current schema versions use a different owner-scoped table shape;
-for the supported v2-to-v3 step, see [schema migration](schema-migration.md).
+count still matches the backup before using the recovered historical data.
+Do not reuse this repaired database with a current release; provision a new
+store as described in [schema migration](schema-migration.md).

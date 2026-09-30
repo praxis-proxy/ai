@@ -75,6 +75,8 @@ pub(crate) mod stream_events;
 pub(crate) mod usage;
 
 #[cfg(feature = "openai-responses")]
+pub use agentic_loop::AgenticLoopFilter;
+#[cfg(feature = "openai-responses")]
 pub use doc_extract::DocExtractFilter;
 #[cfg(feature = "openai-file-resolve-filter")]
 pub use file_resolve::FileResolveFilter;
@@ -245,7 +247,7 @@ impl io::Write for BoundedJsonCounter {
 /// Default store name used when registering the response store in the
 /// per-request registry.
 #[cfg(feature = "store")]
-pub(crate) const DEFAULT_STORE_NAME: &str = "default";
+pub const DEFAULT_STORE_NAME: &str = "default";
 
 /// Legacy test tenant value retained for fixture compatibility.
 #[cfg(test)]
@@ -389,7 +391,7 @@ impl HttpFilter for ResponsesFormatFilter {
 
         write_metadata(ctx, &classified, mode);
         promote_headers(ctx, &classified, &self.config, mode);
-        promote_filter_results(ctx, &classified, mode)?;
+        promote_filter_results(ctx, "openai_responses_format", &classified, mode)?;
 
         Ok(FilterAction::Release)
     }
@@ -606,10 +608,14 @@ fn promote_headers(
 /// Promote classification facts to filter results for branch conditions.
 fn promote_filter_results(
     ctx: &mut HttpFilterContext<'_>,
+    filter: &'static str,
     classified: &ClassifiedRequest,
     mode: Option<&'static str>,
 ) -> Result<(), FilterError> {
-    let results = ctx.filter_results.entry("openai_responses_format").or_default();
+    // Results are published under the publishing filter's own name. A branch
+    // condition must name the filter it is attached to, so publishing under a
+    // fixed name would leave every branch on this filter unmatched.
+    let results = ctx.filter_results.entry(filter).or_default();
 
     results.set("format", classified.format.as_str())?;
     promote_optional_results(results, classified)?;
@@ -790,9 +796,9 @@ pub(crate) fn append_stored_input_items(messages: &mut Vec<serde_json::Value>, i
 
 /// Check whether this is an explicit `POST /v1/responses/compact` request.
 ///
-/// Shared by the store filter (best-effort store init) and the compaction
-/// filter, so neither optional filter depends on the other.
-#[cfg(feature = "store")]
+/// Used by the compaction filter to detect an explicit compact request. The
+/// store filter no longer needs it since migrating to registry-only resolution.
+#[cfg(feature = "openai-compact")]
 pub(crate) fn is_explicit_compact_request(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.request.method == http::Method::POST && ctx.request.uri.path().trim_end_matches('/') == "/v1/responses/compact"
 }
@@ -816,10 +822,14 @@ pub(crate) mod validate;
 #[cfg(feature = "openai-responses")]
 pub(crate) mod web_search;
 
-#[cfg(feature = "openai-responses")]
-pub use agentic_loop::AgenticLoopFilter;
+#[cfg(feature = "openai-responses-openapi")]
+pub(crate) mod contracts;
+#[cfg(feature = "openai-responses-openapi")]
+pub(crate) mod openapi;
 #[cfg(feature = "openai-compact")]
 pub use compact::CompactFilter;
+#[cfg(feature = "openai-responses-openapi")]
+pub use openapi::implementation_openapi_json;
 #[cfg(feature = "store")]
 pub use rehydrate::RehydrateFilter;
 #[cfg(feature = "openai-responses")]

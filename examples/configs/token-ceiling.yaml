@@ -1,0 +1,37 @@
+# Pre-forward token ceiling guard.
+#
+# Enable with:
+#   cargo run -p praxis-ai-proxy --features token-ceiling-filter -- \
+#     -c examples/configs/token-ceiling.yaml
+#
+# Place token_ceiling after any request translation or prompt enrichment so it
+# evaluates the final provider-bound JSON body. Missing output limits are
+# rejected when max_output_tokens is configured; values are never clamped.
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path: "/v1/chat/completions"
+            cluster: upstream
+
+      - filter: token_ceiling
+        max_input_tokens: 4000
+        max_output_tokens: 1024
+        tokenizer: cl100k_base
+
+      - filter: load_balancer
+        clusters:
+          - name: upstream
+            endpoints:
+              - "127.0.0.1:9000"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend

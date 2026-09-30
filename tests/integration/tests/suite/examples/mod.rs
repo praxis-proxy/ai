@@ -101,6 +101,8 @@ mod responses_to_chat_completions_reasoning;
 mod session_replay;
 mod stream_usage_inject;
 mod time_to_first_token;
+#[cfg(feature = "token-ceiling-filter")]
+mod token_ceiling;
 mod token_count;
 mod token_counting;
 #[cfg(feature = "token-rate-limit-filter")]

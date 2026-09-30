@@ -8,3 +8,6 @@ mod parser;
 
 #[cfg(feature = "openai-responses")]
 pub(crate) use event::ResponsesEvent;
+#[cfg(all(feature = "openai-responses", test))]
+#[expect(unused_imports, reason = "used in test builds")]
+pub(crate) use parser::ResponsesSseParser;

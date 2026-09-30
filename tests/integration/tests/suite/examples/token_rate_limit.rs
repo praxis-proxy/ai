@@ -277,6 +277,63 @@ fn example_config_token_rate_limit_mixed_algorithms() {
     );
 }
 
+/// Per-header bucket keys (ai#123 / ai#129): loads the shipped
+/// `token-rate-limit-header-keys.yaml` example with a tiny budget so two
+/// tenants isolate. A second request from the same tenant is 429; the
+/// other tenant is unaffected. Missing `x-tenant-id` is 400.
+#[test]
+fn header_bucket_keys_isolate_tenants() {
+    let backend = Backend::fixed(PLAIN_TEXT_BODY)
+        .header("content-type", "text/plain")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let path = example_config_path("token-rate-limit-header-keys.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let yaml = yaml
+        .replace("capacity: 100000", "capacity: 10")
+        .replace("reserved_tokens: 500", "reserved_tokens: 10");
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend.port())]));
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("header-key example should parse");
+    let proxy = start_proxy(&config);
+
+    let alpha = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-tenant-id", "alpha")]),
+    );
+    assert_eq!(
+        parse_status(&alpha),
+        200,
+        "first tenant-alpha request should be admitted"
+    );
+
+    let beta = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-tenant-id", "beta")]),
+    );
+    assert_eq!(
+        parse_status(&beta),
+        200,
+        "tenant-beta must not share tenant-alpha's bucket"
+    );
+
+    let alpha_again = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-tenant-id", "alpha")]),
+    );
+    assert_eq!(
+        parse_status(&alpha_again),
+        429,
+        "second tenant-alpha request should exhaust its own 10-token bucket"
+    );
+
+    let missing = http_send(proxy.addr(), &json_post("/v1/chat/completions", "{}"));
+    assert_eq!(
+        parse_status(&missing),
+        400,
+        "a missing key header must fail closed with 400, not fall through to the global bucket"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // Mixed algorithms, per rule (ai#789/praxis#551) -- Valkey-backed, driven
 // through the real gateway pipeline across two independent proxy

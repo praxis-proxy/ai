@@ -8,7 +8,11 @@ on:
   push:
     branches: [main]
     paths:
+      - "store/**"
+      - "store-backends/**"
+      - "store-lifecycle/**"
       - "apis/src/store/**"
+      - "apis/src/service/**"
       - "apis/src/openai/responses/store/**"
       - "apis/src/openai/conversations/**"
       - "examples/configs/openai/responses/response-store.yaml"
@@ -31,7 +35,11 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened]
     paths:
+      - "store/**"
+      - "store-backends/**"
+      - "store-lifecycle/**"
       - "apis/src/store/**"
+      - "apis/src/service/**"
       - "apis/src/openai/responses/store/**"
       - "apis/src/openai/conversations/**"
       - "examples/configs/openai/responses/response-store.yaml"
@@ -93,7 +101,11 @@ jobs:
         run: |
           CHANGED=$(git diff --name-only "${{ github.event.merge_group.base_sha }}" \
                                          "${{ github.event.merge_group.head_sha }}" -- \
+            'store/' \
+            'store-backends/' \
+            'store-lifecycle/' \
             'apis/src/store/' \
+            'apis/src/service/' \
             'apis/src/openai/responses/store/' \
             'apis/src/openai/conversations/' \
             'examples/configs/openai/responses/response-store.yaml' \

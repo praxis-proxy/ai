@@ -36,7 +36,10 @@ use crate::{
         openai_mcp_tool_resolve::{McpToolIndex, encode_function_name},
         state::{DeferredMcpConnector, McpApprovalState, McpConnectorContextPolicy, ResponsesState},
     },
-    store::{PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore},
+    store::{
+        PendingApprovalRecord, PersistedStateBackend, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+        SqliteResponseStore,
+    },
     test_utils::{make_filter_context, make_owned_filter_context, make_request},
 };
 
@@ -2327,7 +2330,7 @@ async fn seed_weather_approval_for_owner(
 }
 
 /// A fresh in-memory SQLite store for the approval-consumption path.
-async fn make_approval_store() -> Arc<dyn ResponseStore> {
+async fn make_approval_store() -> Arc<dyn PersistedStateBackend> {
     Arc::new(
         SqliteResponseStore::new("sqlite::memory:", "resp", "conv", None, None, None)
             .await
@@ -2336,7 +2339,7 @@ async fn make_approval_store() -> Arc<dyn ResponseStore> {
 }
 
 /// Insert a registry exposing `store` under the default name into `ctx`.
-fn register_store(ctx: &mut praxis_filter::HttpFilterContext<'_>, store: Arc<dyn ResponseStore>) {
+fn register_store(ctx: &mut praxis_filter::HttpFilterContext<'_>, store: Arc<dyn PersistedStateBackend>) {
     let registry = ResponseStoreRegistry::new();
     registry
         .register(&Arc::from("default"), store)

@@ -55,7 +55,7 @@ see the [Praxis core filter reference][core-ref].
 | [`openai_responses_model_rewrite`](openai_responses_model_rewrite.md) | Rewrites the `model` field in Responses and Chat Completions request bodies. |
 | [`openai_responses_proxy`](openai_responses_proxy.md) | Rebuilds the request body from `ResponsesState` when present. |
 | [`openai_responses_rehydrate`](openai_responses_rehydrate.md) | Validates `previous_response_id` by fetching the stored response, confirming its status is `"completed"`, and populating `ResponsesState` with the full conversation history (stored turns + current input). |
-| [`openai_responses_request`](openai_responses_request.md) | Processes the Responses create request body once and initializes state. |
+| [`openai_responses_request`](openai_responses_request.md) | Processes a Responses request body once and initializes state. |
 | [`openai_responses_validate`](openai_responses_validate.md) | Validates and enriches Responses API requests. |
 | [`openai_stream_events`](openai_stream_events.md) | Composes the current IRR execution into one logical Responses stream. |
 | [`openai_tool_parse`](openai_tool_parse.md) | Parses tool definitions and `tool_choice` from Responses API request bodies and promotes routing facts to metadata and filter results without mutating the body. |
@@ -157,5 +157,6 @@ see the [Praxis core filter reference][core-ref].
 | Filter | Description |
 |--------|-------------|
 | [`stream_usage_inject`](stream_usage_inject.md) | Injects `stream_options.include_usage = true` into streaming OpenAI chat-completions requests so the upstream response contains token usage. |
+| [`token_ceiling`](token_ceiling.md) | Rejects provider-bound requests whose estimated serialized request body or requested output exceeds configured limits. Missing output-limit fields are rejected when `max_output_tokens` is configured; this strict behavior prevents providers from applying an unbounded model default. At least one of `max_input_tokens` or `max_output_tokens` is required, and `max_body_bytes` defaults to 2 MiB. |
 | [`token_count`](token_count.md) | Extracts token usage from AI inference responses and writes unified counts to [`filter_metadata`]. |
 | [`token_usage_headers`](token_usage_headers.md) | Injects `Praxis-Token-Input`, `Praxis-Token-Output`, and `Praxis-Token-Total` headers into downstream responses when token usage data is present in [`filter_metadata`]. Also injects `Praxis-Token-Status` when usage capture failed (e.g. overflow), so an unavailable count is never silently indistinguishable from a genuine zero. |

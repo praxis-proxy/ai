@@ -54,10 +54,12 @@ cargo test -p praxis-ai-filters --features full -- test_name
 cargo test -p praxis-ai-proxy --features full -- test_name
 ```
 
-The product crates default to the lean `standard` feature set, so tests for the
-opt-in OpenAI groups are compiled out without `--features full` (or the group's
-own feature). A name filter that matches only compiled-out tests reports
-"0 passed" and exits successfully.
+The `praxis-ai-proxy` production binary defaults to `full`, including the
+PostgreSQL-backed OpenAI Responses and Conversations APIs. The library crates
+retain the lean `standard` default, so their tests for opt-in OpenAI groups are
+compiled out without `--features full` (or the group's own feature). A name
+filter that matches only compiled-out tests reports "0 passed" and exits
+successfully.
 
 ## Architecture
 

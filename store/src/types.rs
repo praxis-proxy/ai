@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use crate::StateOwner;
+use crate::owner::StateOwner;
 
 // -----------------------------------------------------------------------------
 // ResponseRecord
@@ -84,7 +84,7 @@ pub struct ConversationRecord {
 /// Items are the individual entries within a conversation (messages,
 /// tool calls, tool outputs, etc.). Stored as opaque JSON blobs with
 /// a monotonic position for ordering.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ConversationItemRecord {
     /// Unique item ID (e.g., `"item_abc123"`).
     pub item_id: String,

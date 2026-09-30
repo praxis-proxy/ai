@@ -8,10 +8,9 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::{
-    CompressionAlgorithm, ConversationItemRecord, ConversationRecord, PendingApprovalRecord, PgTlsConfig,
-    PostgresResponseStore, ResponseRecord, ResponseStoreRegistry, SqliteResponseStore, SslMode, StoreCompressionConfig,
-    StoreError,
-    trait_def::{ConversationItemStore, ResponseStore},
+    CompressionAlgorithm, ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord,
+    PersistedStateBackend, PgTlsConfig, PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+    SqliteResponseStore, SslMode, StoreCompressionConfig, StoreError,
 };
 use crate::openai::{
     include::IncludeFields,
@@ -45,70 +44,6 @@ async fn sqlite_store_initializes_schema() {
         .expect("get should succeed");
 
     assert!(result.is_none(), "empty store should return None");
-}
-
-#[tokio::test]
-async fn sqlite_pre_index_duplicate_positions_report_repair_at_startup() {
-    let dir = tempfile::tempdir().expect("tempdir should succeed");
-    let url = format!("sqlite://{}?mode=rwc", dir.path().join("legacy_items.db").display());
-    let initial = SqliteResponseStore::new(&url, "legacy_responses", "legacy_conversations", None, None, None)
-        .await
-        .expect("store without items should initialize");
-    drop(initial);
-
-    let tables = super::schemas::TableNames {
-        responses: "legacy_responses".to_owned(),
-        conversations: "legacy_conversations".to_owned(),
-        items: Some("legacy_items".to_owned()),
-    };
-    let ddl = super::schemas::generate_ddl(&tables, super::schemas::SqlDialect::Sqlite).unwrap();
-    let items_table = ddl
-        .iter()
-        .find(|statement| statement.starts_with("CREATE TABLE IF NOT EXISTS legacy_items "))
-        .expect("items DDL should be generated");
-    let pool = sqlx::SqlitePool::connect(&url)
-        .await
-        .expect("existing database should open");
-    sqlx::query(sqlx::AssertSqlSafe(items_table.as_str()))
-        .execute(&pool)
-        .await
-        .expect("legacy items table should be created without the new index");
-    for id in ["a", "b"] {
-        sqlx::query(
-            "INSERT INTO legacy_items \
-             (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
-             VALUES (?, 'tenant', 'issuer', 'subject', 'conv', '{}', 1, 1)",
-        )
-        .bind(id)
-        .execute(&pool)
-        .await
-        .expect("legacy store permitted duplicate positions");
-    }
-    pool.close().await;
-
-    let err = SqliteResponseStore::new(
-        &url,
-        "legacy_responses",
-        "legacy_conversations",
-        Some("legacy_items"),
-        None,
-        None,
-    )
-    .await
-    .err()
-    .expect("new unique index must reject duplicate legacy positions");
-    assert!(
-        err.to_string().contains("docs/store/legacy-item-position-repair.md"),
-        "startup must provide the repair path: {err}"
-    );
-    let pool = sqlx::SqlitePool::connect(&url)
-        .await
-        .expect("database should remain readable");
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM legacy_items")
-        .fetch_one(&pool)
-        .await
-        .expect("legacy rows should still exist");
-    assert_eq!(count, 2, "failed startup must not discard legacy rows");
 }
 
 // -----------------------------------------------------------------------------
@@ -2745,8 +2680,8 @@ async fn sqlite_rejects_table_with_incompatible_primary_key() {
         "error should mention the expected id key: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -2797,8 +2732,8 @@ async fn sqlite_rejects_table_with_tenant_leaking_unique_constraint() {
         "error should explain a unique index beyond the primary key is rejected: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -2841,7 +2776,7 @@ async fn sqlite_rejects_table_with_case_insensitive_collation_on_key() {
         msg.to_ascii_lowercase().contains("collation"),
         "error should explain the collation is unsafe: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -2886,7 +2821,7 @@ async fn sqlite_rejects_table_with_non_text_affinity_key() {
         msg.to_ascii_lowercase().contains("affinity"),
         "error should explain the affinity is unsafe: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 // -----------------------------------------------------------------------------
@@ -2913,7 +2848,7 @@ async fn sqlite_stamps_schema_version_on_fresh_db() {
         .fetch_one(&pool)
         .await
         .expect("version row should exist");
-    assert_eq!(version, 3, "fresh store should stamp version 3");
+    assert_eq!(version, 4, "fresh store should stamp version 4");
 }
 
 #[tokio::test]
@@ -2951,8 +2886,8 @@ async fn sqlite_rejects_schema_version_mismatch() {
     );
     assert!(msg.contains("99"), "error should show stored version: {msg}");
     assert!(
-        msg.contains("migration required"),
-        "error should mention migration: {msg}"
+        msg.contains("recreation required"),
+        "error should mention recreation: {msg}"
     );
 }
 
@@ -3015,15 +2950,16 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
         "store must refuse a version-2 database"
     );
 
-    // Apply the documented operator migration: CAST the responses payload
-    // columns to BLOB storage class and bump the schema version.
+    // Apply the documented operator migrations: CAST the responses payload
+    // columns to BLOB storage class and stamp the current schema version. This
+    // fixture has no items table, so v3 -> v4 requires only the version stamp.
     let pool = sqlx::SqlitePool::connect_with(options)
         .await
         .expect("pool should connect");
     for stmt in [
         "UPDATE mr SET response_object = CAST(response_object AS BLOB), \
          input = CAST(input AS BLOB), messages = CAST(messages AS BLOB)",
-        "UPDATE mr_schema_version SET version = 3",
+        "UPDATE mr_schema_version SET version = 4",
     ] {
         sqlx::query(stmt)
             .execute(&pool)
@@ -3035,7 +2971,7 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
     // After migration the store starts and the legacy row reads back intact.
     let store = SqliteResponseStore::new(&url, "mr", "mc", None, None, None)
         .await
-        .expect("store should start on a migrated version-3 database");
+        .expect("store should start on a migrated version-4 database");
 
     let owner = crate::test_utils::test_owner("tenant_a");
     let fetched = store
@@ -3200,7 +3136,7 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
 #[tokio::test]
 async fn registry_register_and_get_scoped() {
     let registry = ResponseStoreRegistry::new();
-    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(make_store().await);
     registry
         .register(&Arc::from("primary"), Arc::clone(&store))
         .expect("register should succeed");
@@ -3213,7 +3149,7 @@ async fn registry_register_and_get_scoped() {
 #[tokio::test]
 async fn registry_scoped_handle_rejects_a_record_from_another_owner() {
     let registry = ResponseStoreRegistry::new();
-    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(make_store().await);
     registry.register(&Arc::from("primary"), store).unwrap();
     let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
     let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
@@ -3240,7 +3176,7 @@ fn registry_get_missing_returns_none() {
 #[tokio::test]
 async fn registry_duplicate_registration_fails() {
     let registry = ResponseStoreRegistry::new();
-    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(make_store().await);
     let name = Arc::from("dup");
     registry
         .register(&name, Arc::clone(&store))
@@ -3436,24 +3372,26 @@ fn pg_ssl_mode_deserializes_verified_modes() {
 fn pg_ssl_mode_converts_to_pg_ssl_mode() {
     use sqlx::postgres::PgSslMode;
 
+    use super::to_pg_ssl_mode;
+
     assert!(
-        matches!(PgSslMode::from(SslMode::Disable), PgSslMode::Disable),
+        matches!(to_pg_ssl_mode(SslMode::Disable), PgSslMode::Disable),
         "Disable should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::Prefer), PgSslMode::Prefer),
+        matches!(to_pg_ssl_mode(SslMode::Prefer), PgSslMode::Prefer),
         "Prefer should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::Require), PgSslMode::Require),
+        matches!(to_pg_ssl_mode(SslMode::Require), PgSslMode::Require),
         "Require should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::VerifyCa), PgSslMode::VerifyCa),
+        matches!(to_pg_ssl_mode(SslMode::VerifyCa), PgSslMode::VerifyCa),
         "VerifyCa should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::VerifyFull), PgSslMode::VerifyFull),
+        matches!(to_pg_ssl_mode(SslMode::VerifyFull), PgSslMode::VerifyFull),
         "VerifyFull should map"
     );
 }
@@ -3540,8 +3478,8 @@ async fn pg_rejects_table_with_incompatible_primary_key() {
         "error should mention the primary key: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -3575,8 +3513,8 @@ async fn pg_rejects_table_with_tenant_leaking_unique_constraint() {
         "error should explain a unique index beyond the primary key is rejected: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -3609,7 +3547,7 @@ async fn pg_rejects_table_with_deferrable_primary_key() {
         msg.to_ascii_lowercase().contains("deferrable"),
         "error should explain the constraint is deferrable: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -3643,7 +3581,7 @@ async fn pg_rejects_table_with_case_insensitive_collation_on_key() {
         msg.to_ascii_lowercase().contains("collation"),
         "error should explain the collation folds comparisons: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -3675,7 +3613,7 @@ async fn pg_rejects_table_with_citext_key() {
         msg.to_ascii_lowercase().contains("citext"),
         "error should name the case-insensitive type: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -3734,7 +3672,7 @@ async fn pg_rejects_schema_version_mismatch() {
 
 #[tokio::test]
 #[ignore]
-async fn pg_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
+async fn pg_v2_text_schema_migrates_to_v4_bytea_preserving_rows() {
     let fx = PgSchemaFixture::new("mig");
 
     let legacy_v2 = [
@@ -3777,14 +3715,14 @@ async fn pg_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
              ALTER COLUMN messages TYPE BYTEA USING convert_to(messages, 'UTF8')",
             fx.responses
         ),
-        format!("UPDATE {} SET version = 3", fx.version),
+        format!("UPDATE {} SET version = 4", fx.version),
     ];
-    let migrated_v3: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
+    let migrated_v4: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
 
-    let result = fx.init(&migrated_v3, &[]).await;
+    let result = fx.init(&migrated_v4, &[]).await;
     assert!(
         result.is_ok(),
-        "store should start on a migrated version-3 database: {:?}",
+        "store should start on a migrated version-4 database: {:?}",
         result.err()
     );
 }
@@ -4616,6 +4554,20 @@ async fn pg_conversation_item_tenant_isolation() {
         .await
         .expect("cross-tenant list should succeed");
     assert!(cross_tenant_list.is_empty(), "tenant_b should see no items");
+
+    let same_id_for_tenant_b = make_conversation_item("item_1", "tenant_b", "conv_2", 1);
+    store
+        .create_test_items(&[same_id_for_tenant_b])
+        .await
+        .expect("the same item ID should be accepted for another tenant");
+
+    for (tenant_id, conversation_id) in [("tenant_a", "conv_1"), ("tenant_b", "conv_2")] {
+        let fetched = store
+            .get_conversation_item(&crate::test_utils::test_owner(tenant_id), conversation_id, "item_1")
+            .await
+            .expect("tenant-scoped get should succeed");
+        assert!(fetched.is_some(), "{tenant_id} should see its own item");
+    }
 }
 
 #[tokio::test]
@@ -5248,4 +5200,21 @@ fn make_response_record(id: &str, tenant_id: &str, created_at: i64) -> ResponseR
         input: json!("test input"),
         messages: json!([{"role": "user", "content": "hello"}]),
     }
+}
+
+/// The SQLite backend satisfies the shared persisted-state contract suite,
+/// proving it adopted the praxis-ai-store traits (the #1258 SQL-adopt check).
+#[tokio::test]
+async fn sqlite_backend_satisfies_the_store_contract() {
+    let store = SqliteResponseStore::new(
+        "sqlite::memory:",
+        "contract_responses",
+        "contract_conversations",
+        Some("contract_items"),
+        None,
+        None,
+    )
+    .await
+    .expect("store creation should succeed");
+    praxis_ai_store::contract_tests::run_contract_suite(&store).await;
 }

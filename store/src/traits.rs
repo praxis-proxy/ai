@@ -6,8 +6,10 @@
 
 use async_trait::async_trait;
 
-use super::types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError};
-use crate::StateOwner;
+use crate::{
+    owner::StateOwner,
+    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
+};
 
 // -----------------------------------------------------------------------------
 // ResponseStore Trait
@@ -200,15 +202,6 @@ pub trait ResponseStore: Send + Sync {
     /// concurrent callers race for the row and exactly one observes `None`. An
     /// empty slice is a no-op that returns `Ok(None)`.
     ///
-    /// Transactional backends **must** acquire the per-row locks in a
-    /// deterministic order independent of the caller's slice order (e.g. sorted
-    /// by `approval_id`). Two concurrent batches for the same
-    /// `(owner, response_id)` can list overlapping approvals in opposite order,
-    /// and locking them in caller order would let each transaction hold one row
-    /// while waiting on the other — a deadlock. A global lock order makes such a
-    /// cycle impossible. The returned index is always the position in the
-    /// caller's `approval_ids` slice regardless of the internal lock order.
-    ///
     /// [`get_pending_approvals`]: ResponseStore::get_pending_approvals
     ///
     /// # Errors
@@ -332,8 +325,9 @@ pub trait ConversationItemStore: Send + Sync {
 
     /// Insert one or more conversation items.
     ///
-    /// Items are inserted individually. A duplicate globally unique `item_id`
-    /// fails and cannot transfer the original item's owner.
+    /// Items are inserted individually. An `item_id` is unique within one exact
+    /// owner, so a duplicate for that owner fails while another owner may use
+    /// the same provider-generated id.
     ///
     /// # Errors
     ///
@@ -484,3 +478,18 @@ pub trait ConversationItemStore: Send + Sync {
         item_id: &str,
     ) -> Result<bool, StoreError>;
 }
+
+// -----------------------------------------------------------------------------
+// PersistedStateBackend
+// -----------------------------------------------------------------------------
+
+/// A backend that provides both response and conversation-item persistence.
+///
+/// The unified registry stores this combined handle, so a resolved backend
+/// provably implements both halves and a Conversations-requiring caller can
+/// never receive a response-only backend. Any type implementing both traits
+/// satisfies it through the blanket impl; responses-only callers upcast to
+/// `dyn ResponseStore`.
+pub trait PersistedStateBackend: ResponseStore + ConversationItemStore {}
+
+impl<T: ResponseStore + ConversationItemStore> PersistedStateBackend for T {}

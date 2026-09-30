@@ -7,12 +7,16 @@
 //! provider responses, storing normalized counts in filter metadata, and
 //! optionally exposing those counts as downstream response headers.
 
+#[cfg(feature = "token-ceiling-filter")]
+mod ceiling;
 mod count;
 mod headers;
 mod providers;
 mod stream_usage;
 mod streaming;
 
+#[cfg(feature = "token-ceiling-filter")]
+pub use ceiling::TokenCeilingFilter;
 pub use count::TokenCountFilter;
 pub use headers::TokenUsageHeadersFilter;
 use praxis_filter::HttpFilterContext;

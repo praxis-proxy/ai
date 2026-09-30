@@ -480,7 +480,9 @@ def _write_web_search_chat_streaming_config(
 def _wait_for_proxy(
     port: int, proc: subprocess.Popen, log_path: str, timeout: float = 30.0
 ) -> None:
+    """Wait for the listener and any asynchronous store provisioning."""
     deadline = time.monotonic() + timeout
+    readiness_url = f"http://127.0.0.1:{port}/v1/responses/__praxis_readiness__"
     while time.monotonic() < deadline:
         # A fatal config/startup error makes Praxis exit before it ever binds
         # the port. Surface its logs immediately instead of waiting out the
@@ -493,11 +495,29 @@ def _wait_for_proxy(
             )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                return
+                pass
         except OSError:
             time.sleep(0.2)
+            continue
+
+        try:
+            response = httpx.get(
+                readiness_url,
+                headers=TRUSTED_OWNER_HEADERS,
+                timeout=0.5,
+            )
+        except httpx.HTTPError:
+            time.sleep(0.2)
+            continue
+        if not (
+            response.status_code == 503
+            and "Persisted state is still initializing." in response.text
+        ):
+            return
+        time.sleep(0.2)
     raise TimeoutError(
-        f"Praxis did not start within {timeout}s on port {port}:\n{_read_log_tail(log_path)}"
+        f"Praxis did not become ready within {timeout}s on port {port}:\n"
+        f"{_read_log_tail(log_path)}"
     )
 
 

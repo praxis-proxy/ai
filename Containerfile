@@ -31,6 +31,9 @@ WORKDIR /src
 
 # Workspace manifests
 COPY Cargo.toml Cargo.lock ./
+COPY store/Cargo.toml ./store/Cargo.toml
+COPY store-lifecycle/Cargo.toml ./store-lifecycle/Cargo.toml
+COPY store-backends/Cargo.toml ./store-backends/Cargo.toml
 COPY apis/Cargo.toml ./apis/Cargo.toml
 COPY filters/Cargo.toml ./filters/Cargo.toml
 COPY server/Cargo.toml ./server/Cargo.toml
@@ -58,7 +61,11 @@ RUN sed -i '/xtask/d; /tests\//d; /benchmarks/d' Cargo.toml
 
 # Create stub source files for the crates whose real source isn't
 # needed until after dependencies are cached.
-RUN mkdir -p apis/src filters/src server/src integrations/llmd/ext-proc/src \
+RUN mkdir -p store/src store-lifecycle/src store-backends/src \
+        apis/src filters/src server/src integrations/llmd/ext-proc/src \
+    && echo '//! stub' > store/src/lib.rs \
+    && echo '//! stub' > store-lifecycle/src/lib.rs \
+    && echo '//! stub' > store-backends/src/lib.rs \
     && echo '//! stub' > apis/src/lib.rs \
     && echo '//! stub' > filters/src/lib.rs \
     && echo '//! stub' > server/src/lib.rs \
@@ -67,7 +74,7 @@ RUN mkdir -p apis/src filters/src server/src integrations/llmd/ext-proc/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy --features "${PRAXIS_AI_FEATURES}"
+    cargo build --release -p praxis-ai-proxy --no-default-features --features "${PRAXIS_AI_FEATURES}"
 
 # ------------------------------------------------------------------------------
 # Cache Tricks
@@ -77,12 +84,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # crates recompile; all external dependencies are cached.
 # build_support/src was already real (see above), so it is not
 # copied again here.
+COPY store/src ./store/src
+COPY store-lifecycle/src ./store-lifecycle/src
+COPY store-backends/src ./store-backends/src
 COPY apis/src ./apis/src
 COPY filters/src ./filters/src
 COPY server/src ./server/src
 COPY integrations/llmd/ext-proc/src ./integrations/llmd/ext-proc/src
 
-RUN find apis/src filters/src server/src integrations/llmd/ext-proc/src \
+RUN find store/src store-lifecycle/src store-backends/src \
+        apis/src filters/src server/src integrations/llmd/ext-proc/src \
     -name '*.rs' -exec touch {} +
 
 # ------------------------------------------------------------------------------
@@ -91,7 +102,7 @@ RUN find apis/src filters/src server/src integrations/llmd/ext-proc/src \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p praxis-ai-proxy --features "${PRAXIS_AI_FEATURES}" \
+    cargo build --release -p praxis-ai-proxy --no-default-features --features "${PRAXIS_AI_FEATURES}" \
     && cp target/release/praxis-ai /usr/local/bin/praxis-ai
 
 # ------------------------------------------------------------------------------

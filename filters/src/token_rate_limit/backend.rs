@@ -7,8 +7,8 @@
 //! on nerdalert's `poc/distributed-token-rate-limit-demo` spike branch
 //! (<https://github.com/nerdalert/ai/tree/poc/distributed-token-rate-limit-demo>).
 //! `reserve`/`reconcile` are key-agnostic (`ReserveRequest`/`ReconcileRequest`
-//! carry a plain `String` key); this filter supplies either a global key
-//! or a privacy-preserving hash of the authenticated subject.
+//! carry a plain `String` key). The filter resolves M5 dimensions into an
+//! opaque key before calling these backends.
 
 use std::{
     sync::{
@@ -25,7 +25,7 @@ use redis::aio::MultiplexedConnection;
 use tokio::sync::mpsc;
 
 use super::{
-    ledger::{Budget, Decision, Ledger, Settlement},
+    ledger::{Budget, Decision, DenialReason, Ledger, Settlement},
     token_bucket_ledger::{self, TokenBucketLedger},
 };
 
@@ -37,7 +37,7 @@ const VALKEY_TIMEOUT: Duration = Duration::from_millis(500);
 /// Request to admit an estimated token cost against a key's budget.
 #[derive(Debug, Clone)]
 pub(super) struct ReserveRequest {
-    /// Opaque budget key resolved by the filter's configured key source.
+    /// Opaque budget key resolved from the filter's key spec.
     pub(super) key: String,
     /// Estimated token cost to reserve if admitted.
     pub(super) estimate: u64,
@@ -81,6 +81,8 @@ pub(super) enum BackendReserve {
     Denied {
         /// Conservative delay before another admission attempt.
         retry_after_ms: u64,
+        /// Distinguishes budget exhaustion from the `max_keys` cap.
+        reason: DenialReason,
     },
 }
 
@@ -131,6 +133,36 @@ impl ValkeyTelemetryState {
             usize::try_from(keys).map_err(|_error| BackendError::InvalidResponse)?,
         );
         Ok(())
+    }
+
+    /// Decode a Lua `reserve` reply: admitted (`1`), budget-denied (`0`),
+    /// or per-rule `max_keys` (`2`).
+    fn parse_reserve_reply(&self, response: &[i64]) -> Result<BackendReserve, BackendError> {
+        match response {
+            [1, id, estimate, usage_after, remaining, active, keys] => {
+                self.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendReserve::Admitted {
+                    reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
+                    estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
+                    usage_after: u64::try_from(*usage_after).map_err(|_error| BackendError::InvalidResponse)?,
+                })
+            },
+            [0, retry_after, remaining, active, keys] => {
+                self.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendReserve::Denied {
+                    retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
+                    reason: DenialReason::WindowCapacity,
+                })
+            },
+            [2, retry_after, remaining, active, keys] => {
+                self.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendReserve::Denied {
+                    retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
+                    reason: DenialReason::KeyCapacity,
+                })
+            },
+            _ => Err(BackendError::InvalidResponse),
+        }
     }
 
     /// Replace the complete last-observed snapshot.
@@ -261,7 +293,7 @@ impl TokenRateLimitStateBackend for InMemoryTokenRateLimitBackend {
                     estimate: reservation.estimate,
                     usage_after: reservation.usage_after,
                 },
-                Decision::Denied { retry_after_ms, .. } => BackendReserve::Denied { retry_after_ms },
+                Decision::Denied { retry_after_ms, reason } => BackendReserve::Denied { retry_after_ms, reason },
             },
         )
     }
@@ -387,7 +419,9 @@ impl TokenRateLimitStateBackend for InMemoryTokenBucketBackend {
                     estimate: reservation.estimate,
                     usage_after: reservation.usage_after,
                 },
-                token_bucket_ledger::Decision::Denied { retry_after_ms } => BackendReserve::Denied { retry_after_ms },
+                token_bucket_ledger::Decision::Denied { retry_after_ms, reason } => {
+                    BackendReserve::Denied { retry_after_ms, reason }
+                },
             },
         )
     }
@@ -445,8 +479,10 @@ impl TokenRateLimitStateBackend for InMemoryTokenBucketBackend {
 /// and aggregate remaining balance. `ARGV`: reservation timeout (ms),
 /// max keys, max active reservations, estimate, budget count, then
 /// `(window_ms, capacity)` pairs. Returns
-/// `[1, id, estimate, usage_after, remaining, active, keys]` on admission or
-/// `[0, retry_after_ms, remaining, active, keys]` on denial.
+/// `[1, id, estimate, usage_after, remaining, active, keys]` on admission,
+/// `[0, retry_after_ms, remaining, active, keys]` on budget denial, or
+/// `[2, retry_after_ms, remaining, active, keys]` when the per-rule
+/// `max_keys` cap would be exceeded.
 const RESERVE_SCRIPT: &str = include_str!("lua/sliding_window_reserve.lua");
 
 /// Atomically settle a prior reservation against actual usage -- the
@@ -768,7 +804,7 @@ pub(super) struct ValkeyBackendConfig {
     /// charged at its estimate, mirroring the in-memory ledger's own
     /// field of the same name.
     pub(super) reservation_timeout_ms: u64,
-    /// Maximum distinct keys retained per namespace.
+    /// Maximum distinct keys retained per rule.
     pub(super) max_keys: usize,
     /// Maximum reservations awaiting reconciliation across all keys in
     /// this namespace.
@@ -906,23 +942,7 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
             &self.budgets,
         );
         let response = self.valkey.eval(RESERVE_SCRIPT, &keys, &args).await?;
-        match response.as_slice() {
-            [1, id, estimate, usage_after, remaining, active, keys] => {
-                self.telemetry.record_reply(*remaining, *active, *keys)?;
-                Ok(BackendReserve::Admitted {
-                    reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
-                    estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
-                    usage_after: u64::try_from(*usage_after).map_err(|_error| BackendError::InvalidResponse)?,
-                })
-            },
-            [0, retry_after, remaining, active, keys] => {
-                self.telemetry.record_reply(*remaining, *active, *keys)?;
-                Ok(BackendReserve::Denied {
-                    retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
-                })
-            },
-            _ => Err(BackendError::InvalidResponse),
-        }
+        self.telemetry.parse_reserve_reply(&response)
     }
 
     async fn reconcile(&self, request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
@@ -1000,8 +1020,10 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
 /// either algorithm's bookkeeping corrupting the other's. `ARGV`: `[1]`
 /// capacity, `[2]` `refill_rate` (tokens/sec), `[3]` reservation timeout
 /// (ms), `[4]` max keys, `[5]` max active reservations, `[6]` estimate.
-/// Returns `[1, id, estimate, usage_after, remaining, active, keys]` on admission or
-/// `[0, retry_after_ms, remaining, active, keys]` on denial.
+/// Returns `[1, id, estimate, usage_after, remaining, active, keys]` on admission,
+/// `[0, retry_after_ms, remaining, active, keys]` on budget denial, or
+/// `[2, retry_after_ms, remaining, active, keys]` when the per-rule
+/// `max_keys` cap would be exceeded.
 pub(super) const TOKEN_BUCKET_RESERVE_SCRIPT: &str = include_str!("lua/token_bucket_reserve.lua");
 
 /// Atomically settle a prior token-bucket reservation against actual
@@ -1057,7 +1079,7 @@ pub(super) struct ValkeyTokenBucketConfig {
     /// Time after which an ambiguous (never-reconciled) reservation
     /// stops being tracked as active (it's already charged).
     pub(super) reservation_timeout_ms: u64,
-    /// Maximum distinct keys retained per namespace/algorithm.
+    /// Maximum distinct keys retained per rule.
     pub(super) max_keys: usize,
     /// Maximum reservations awaiting reconciliation across all keys in
     /// this namespace/algorithm.
@@ -1186,23 +1208,7 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
             request.estimate.to_string(),
         ];
         let response = self.valkey.eval(TOKEN_BUCKET_RESERVE_SCRIPT, &keys, &args).await?;
-        match response.as_slice() {
-            [1, id, estimate, usage_after, remaining, active, keys] => {
-                self.telemetry.record_reply(*remaining, *active, *keys)?;
-                Ok(BackendReserve::Admitted {
-                    reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
-                    estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
-                    usage_after: u64::try_from(*usage_after).map_err(|_error| BackendError::InvalidResponse)?,
-                })
-            },
-            [0, retry_after, remaining, active, keys] => {
-                self.telemetry.record_reply(*remaining, *active, *keys)?;
-                Ok(BackendReserve::Denied {
-                    retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
-                })
-            },
-            _ => Err(BackendError::InvalidResponse),
-        }
+        self.telemetry.parse_reserve_reply(&response)
     }
 
     async fn reconcile(&self, request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {

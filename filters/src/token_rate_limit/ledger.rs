@@ -579,6 +579,38 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_reclaims_an_idle_key_while_a_busy_sibling_remains() {
+        let l = Ledger::new(LedgerConfig {
+            budgets: vec![Budget {
+                window_ms: 100,
+                capacity: 10,
+            }],
+            reservation_timeout_ms: 50,
+            max_keys: 2,
+            max_key_length: 256,
+            max_active_reservations: 32,
+        })
+        .unwrap();
+        let idle = match l.reserve("idle", 1, 0) {
+            Decision::Admitted(reservation) => reservation,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        assert!(matches!(l.reconcile(idle.id, Some(1), 0), Settlement::Applied { .. }));
+        let busy = match l.reserve("busy", 1, 150) {
+            Decision::Admitted(reservation) => reservation,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        assert!(matches!(l.reconcile(busy.id, Some(1), 150), Settlement::Applied { .. }));
+        assert_eq!(l.key_count(), 2);
+        let _ = l.cleanup(200, 16);
+        assert_eq!(
+            l.key_count(),
+            1,
+            "idle keys past the window must be reclaimed even when a busy sibling is present"
+        );
+    }
+
+    #[test]
     fn concurrent_different_keys_respect_global_reservation_bound() {
         let ledger = Arc::new(
             Ledger::new(LedgerConfig {
