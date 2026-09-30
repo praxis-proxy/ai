@@ -941,6 +941,10 @@ impl ResponseStore for PostgresResponseStore {
         let event_types: Vec<&str> = events.iter().map(|event| event.event_type.as_str()).collect();
         let terminals: Vec<i64> = events.iter().map(|event| i64::from(event.terminal)).collect();
         let created_ats: Vec<i64> = events.iter().map(|event| event.created_at).collect();
+        // Bind a borrowed view of each payload; `Cow::Borrowed` (the `none`
+        // default) points straight at the event bytes, so this array holds
+        // pointers, not payload copies.
+        let payload_refs: Vec<&[u8]> = payloads.iter().map(|payload| payload.as_ref()).collect();
 
         sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(owner.tenant_id())
@@ -949,7 +953,7 @@ impl ResponseStore for PostgresResponseStore {
             .bind(response_id)
             .bind(sequence_numbers)
             .bind(event_types)
-            .bind(payloads)
+            .bind(payload_refs)
             .bind(terminals)
             .bind(created_ats)
             .execute(&mut *tx)
@@ -1767,7 +1771,7 @@ fn row_to_event_record(row: &PgRow) -> Result<ResponseEventRecord, StoreError> {
         event_type: row
             .try_get("event_type")
             .map_err(|e| StoreError::Database(e.to_string()))?,
-        payload: decode_bytes(&payload_bytes)?,
+        payload: decode_bytes(payload_bytes)?,
         terminal: terminal != 0,
         created_at: row
             .try_get("created_at")

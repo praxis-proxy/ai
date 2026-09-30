@@ -836,6 +836,9 @@ impl ResponseStore for SqliteResponseStore {
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
         for (event, payload) in events.iter().zip(&payloads) {
+            // `Cow::Borrowed` (the `none` default) binds the event bytes directly;
+            // only a zstd frame owns, and `as_ref` borrows either without a copy.
+            let payload = payload.as_ref();
             sqlx::query(AssertSqlSafe(sql.as_str()))
                 .bind(owner.tenant_id())
                 .bind(owner.issuer())
@@ -1678,7 +1681,7 @@ fn row_to_event_record(row: &sqlx::sqlite::SqliteRow) -> Result<ResponseEventRec
         event_type: row
             .try_get("event_type")
             .map_err(|e| StoreError::Database(e.to_string()))?,
-        payload: decode_bytes(&payload_bytes)?,
+        payload: decode_bytes(payload_bytes)?,
         terminal: terminal != 0,
         created_at: row
             .try_get("created_at")

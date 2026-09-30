@@ -3,6 +3,8 @@
 
 //! Optional payload compression for the responses store.
 
+use std::borrow::Cow;
+
 use serde::Deserialize;
 
 use crate::{ResponseRecord, StoreError};
@@ -151,17 +153,24 @@ impl StoreCompressionConfig {
     ///
     /// Returns [`StoreError::Serialization`] if a payload exceeds the size limit
     /// or zstd compression fails.
-    pub async fn encode_byte_values(&self, values: &[&[u8]]) -> Result<Vec<Vec<u8>>, StoreError> {
-        // The stored form owns its bytes for the sqlx bind; borrow-to-owned here
-        // is the boundary copy, identical in cost to the previous serialize step.
-        let owned: Vec<Vec<u8>> = values.iter().map(|value| value.to_vec()).collect();
-
+    pub async fn encode_byte_values<'a>(&self, values: &[&'a [u8]]) -> Result<Vec<Cow<'a, [u8]>>, StoreError> {
+        // With `algorithm: none` (the default) the stored form is the payload
+        // itself, so borrow each one — the bind reads it directly with no copy.
+        // Only zstd needs owned output, allocated on that branch alone.
         if self.algorithm == CompressionAlgorithm::None {
-            return Ok(owned);
+            return Ok(values.iter().map(|value| Cow::Borrowed(*value)).collect());
         }
 
+        let owned: Vec<Vec<u8>> = values.iter().map(|value| value.to_vec()).collect();
         let config = self.clone();
-        run_blocking(move || owned.into_iter().map(|json| config.encode_json(json)).collect()).await
+        let frames = run_blocking(move || {
+            owned
+                .into_iter()
+                .map(|json| config.encode_json(json))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await?;
+        Ok(frames.into_iter().map(Cow::Owned).collect())
     }
 
     /// Apply the configured codec to an owned JSON buffer.
@@ -233,15 +242,19 @@ pub fn decode(stored: &[u8]) -> Result<serde_json::Value, StoreError> {
 /// parse/serialize round trip, so a decode that normalized key order would break
 /// verbatim replay.
 ///
+/// Takes ownership of `stored` so an uncompressed row (the common case) is
+/// returned by move with no copy; only a zstd frame allocates, for its
+/// decompressed output.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Serialization`] if a zstd frame is corrupt or its
 /// decompressed payload exceeds the size limit.
-pub fn decode_bytes(stored: &[u8]) -> Result<Vec<u8>, StoreError> {
+pub fn decode_bytes(stored: Vec<u8>) -> Result<Vec<u8>, StoreError> {
     if stored.starts_with(&ZSTD_MAGIC) {
-        decompress_zstd(stored)
+        decompress_zstd(&stored)
     } else {
-        Ok(stored.to_vec())
+        Ok(stored)
     }
 }
 
@@ -415,9 +428,10 @@ mod tests {
         let encoded = cfg.encode_byte_values(&payloads).await.unwrap();
         assert_eq!(encoded.len(), payloads.len());
         for (raw, stored) in payloads.iter().zip(&encoded) {
+            assert!(matches!(stored, Cow::Borrowed(_)), "none must borrow, not copy the payload");
             assert!(!stored.starts_with(&ZSTD_MAGIC), "none must not compress");
-            assert_eq!(stored, raw, "payload stored byte-for-byte");
-            assert_eq!(decode_bytes(stored).unwrap(), raw.to_vec());
+            assert_eq!(stored.as_ref(), *raw, "payload stored byte-for-byte");
+            assert_eq!(decode_bytes(stored.to_vec()).unwrap(), raw.to_vec());
         }
     }
 
@@ -428,8 +442,9 @@ mod tests {
         let encoded = cfg.encode_byte_values(&[raw]).await.unwrap();
         let stored = encoded.first().expect("one payload encoded");
         assert!(stored.starts_with(&ZSTD_MAGIC), "expected zstd frame: {stored:?}");
+        assert!(matches!(stored, Cow::Owned(_)), "zstd must own the compressed frame");
         assert_eq!(
-            decode_bytes(stored).unwrap(),
+            decode_bytes(stored.to_vec()).unwrap(),
             raw.to_vec(),
             "raw JSON bytes survive the zstd round trip verbatim"
         );
@@ -440,7 +455,7 @@ mod tests {
         // An uncompressed row is handed back byte-for-byte, key order intact, so
         // replay never reorders the original event.
         let raw = br#"{"b":2,"a":1}"#.as_slice();
-        assert_eq!(decode_bytes(raw).unwrap(), raw.to_vec());
+        assert_eq!(decode_bytes(raw.to_vec()).unwrap(), raw.to_vec());
     }
 
     #[test]
