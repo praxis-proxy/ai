@@ -46,9 +46,15 @@ fn a_burst_near_the_limit_is_shed_with_503_not_failed() {
         report.count(503) > 0,
         "150 in-flight requests must exceed 256 descriptors: {report:?}"
     );
+    // How many are admitted depends on how many client sockets the accept loop
+    // has taken, and how fresh the descriptor sample is, at each admission, so
+    // it varies with scheduling. The admission arithmetic is pinned exactly by
+    // praxis-core's `fd::tests::a_burst_is_shed_before_the_next_sample`; here it
+    // is enough that shedding is partial and that the proxy recovers (checked
+    // below).
     assert!(
         report.count(200) > 0,
-        "requests that fit before the limit must still succeed: {report:?}"
+        "requests within the limit must still succeed: {report:?}"
     );
     assert!(
         overload_rejects(admin) > 0,

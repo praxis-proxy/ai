@@ -55,6 +55,8 @@
 #[cfg(target_os = "linux")]
 mod limits;
 #[cfg(target_os = "linux")]
+mod metering;
+#[cfg(target_os = "linux")]
 mod pressure;
 
 // -----------------------------------------------------------------------------
