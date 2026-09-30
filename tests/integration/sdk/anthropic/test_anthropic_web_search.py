@@ -518,23 +518,29 @@ class TestAnthropicWebSearch:
         # Exactly one client-visible lifecycle wraps the terminal answer: open
         # with message_start, close with message_stop, exactly one of each so
         # the internal search round is not leaked as a second lifecycle.
-        assert event_types[0] == "message_start", event_types
-        assert event_types[-1] == "message_stop", event_types
-        assert event_types.count("message_start") == 1, event_types
-        assert event_types.count("message_stop") == 1, event_types
+        assert event_types[0] == "message_start", f"stream must open with message_start: {event_types}"
+        assert event_types[-1] == "message_stop", f"stream must close with message_stop: {event_types}"
+        assert event_types.count("message_start") == 1, (
+            f"the internal search round must not leak a second message_start: {event_types}"
+        )
+        assert event_types.count("message_stop") == 1, (
+            f"the internal search round must not leak a second message_stop: {event_types}"
+        )
 
         # A text delta arrives strictly between open and close.
-        assert "content_block_delta" in event_types, event_types
+        assert "content_block_delta" in event_types, f"the terminal answer must stream a text delta: {event_types}"
         first_delta = event_types.index("content_block_delta")
-        assert 0 < first_delta < len(event_types) - 1, event_types
+        assert 0 < first_delta < len(event_types) - 1, (
+            f"the text delta must fall strictly between message_start and message_stop: {event_types}"
+        )
 
         # The managed WebSearch tool_use block stays internal to the loop.
         assert block_types == ["text"], f"only the terminal text block is visible: {block_types}"
-        assert collected == FINAL_TEXT
+        assert collected == FINAL_TEXT, f"the streamed answer must equal the terminal text: {collected!r}"
 
         assert len(model.requests) == 2, "streaming loop re-enters the model"
         assert len(search.requests) == 1, "streaming loop dispatches one search"
-        assert model.requests[0].get("stream") is True
+        assert model.requests[0].get("stream") is True, "the first model round must request streaming transport"
 
     def test_missing_user_credential_fails_closed(self, web_search_stack):
         """A request without the per-user provider key is rejected before callout."""

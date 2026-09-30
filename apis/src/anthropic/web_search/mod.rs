@@ -588,7 +588,7 @@ impl AnthropicWebSearchFilter {
     /// the client's response transport.
     ///
     /// A buffered request is not yet committed, so it fails closed with a JSON
-    /// `413 invalid_request_error` the client can act on. A streaming request has
+    /// `413 request_too_large` the client can act on. A streaming request has
     /// already committed a `200 text/event-stream` lifecycle (round 0 forwarded
     /// `message_start`), so a JSON body cannot replace it: this request-phase
     /// rejection makes the re-entry step complete, and the IRR streaming session
@@ -601,7 +601,7 @@ impl AnthropicWebSearchFilter {
         if !streaming {
             return FilterAction::Reject(anthropic_rejection(
                 413,
-                "invalid_request_error",
+                "request_too_large",
                 "web search request exceeds configured max_body_bytes",
             ));
         }
