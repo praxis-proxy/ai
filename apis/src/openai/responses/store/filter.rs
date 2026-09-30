@@ -44,6 +44,8 @@
 //! [`filter_metadata`]: praxis_filter::HttpFilterContext::filter_metadata
 //! [`ResponsesState`]: super::super::state::ResponsesState
 
+use std::num::{NonZeroU32, NonZeroU64};
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
@@ -120,10 +122,10 @@ const NO_REPLAY_LOG_MESSAGE: &str = "This response has no replayable event strea
 /// ```
 pub struct ResponseStoreFilter {
     /// Maximum number of SSE events retained in a streamed response's replay log.
-    max_event_count: u32,
+    max_event_count: NonZeroU32,
 
     /// Maximum total payload bytes retained in a streamed response's replay log.
-    max_event_bytes: u64,
+    max_event_bytes: NonZeroU64,
 }
 
 impl ResponseStoreFilter {
@@ -132,7 +134,7 @@ impl ResponseStoreFilter {
     /// Exposed to the crate's tests; production construction goes through
     /// [`Self::from_config`], which reads the bounds from validated YAML.
     #[must_use]
-    pub(super) const fn with_bounds(max_event_count: u32, max_event_bytes: u64) -> Self {
+    pub(super) const fn with_bounds(max_event_count: NonZeroU32, max_event_bytes: NonZeroU64) -> Self {
         Self {
             max_event_count,
             max_event_bytes,
@@ -289,7 +291,7 @@ impl ResponseStoreFilter {
     /// Decode `chunk` and append each contained SSE event, stopping and marking
     /// the log non-replayable on a bound overrun or decoder poison.
     fn accumulate_events(&self, state: &mut ResponseStoreRequestState, chunk: &Bytes) {
-        let max_event_bytes = self.max_event_bytes;
+        let max_event_bytes = self.max_event_bytes.get();
         let decoder = state.event_decoder.get_or_insert_with(|| {
             // Allow a single event whose JSON `data` payload fills the whole byte
             // budget, plus framing headroom the decoder counts but the budget
@@ -333,7 +335,8 @@ impl ResponseStoreFilter {
         };
         // Enforce both bounds before committing this event.
         let next_bytes = state.event_bytes.saturating_add(byte_len);
-        if state.events.len() as u64 >= u64::from(self.max_event_count) || next_bytes > self.max_event_bytes {
+        if state.events.len() as u64 >= u64::from(self.max_event_count.get()) || next_bytes > self.max_event_bytes.get()
+        {
             state.events_over_budget = true;
             state.events.clear();
             state.event_bytes = 0;
@@ -1504,7 +1507,7 @@ fn reject_store_error() -> Rejection {
 /// log to have reached a terminal event (400 [`NO_REPLAY_LOG_MESSAGE`]
 /// otherwise) — a failed or incomplete log never appears as a complete replay.
 /// On success returns a [`FilterAction::StreamingTerminalResponse`] (200,
-/// `text/event-stream`, `no-cache`) whose body pages the log from the store; the
+/// `text/event-stream`, `no-store`) whose body pages the log from the store; the
 /// whole log is never held in memory.
 async fn serve_replay(service: ResponsesService, id: &str, starting_after: Option<u64>) -> FilterAction {
     if let Err(action) = ensure_response_exists(&service, id).await {
@@ -1520,7 +1523,11 @@ async fn serve_replay(service: ResponsesService, id: &str, starting_after: Optio
         http::header::CONTENT_TYPE,
         http::HeaderValue::from_static("text/event-stream"),
     );
-    headers.insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-cache"));
+    // `no-store`, not `no-cache`: the replay body is one owner's model output and
+    // the request is authorized by the owner header, not the URL. `no-cache` still
+    // lets a shared cache keyed on the URL store the body and revalidate, which
+    // could hand one owner's replay to another; `no-store` forbids storing it.
+    headers.insert(http::header::CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
 
     debug!(response_id = id, "serving SSE replay");
     let body = ReplayStreamBody::new(service, id.to_owned(), starting_after, terminal_sequence);

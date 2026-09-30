@@ -519,11 +519,17 @@ async fn stream_events_replays_stored_event_log() {
         !after_events.is_empty(),
         "replay after the first event must still return events"
     );
-    assert!(
-        after_events
-            .iter()
-            .all(|(_, seq)| seq.expect("event has sequence") > first_seq),
-        "starting_after must skip events at or before the cursor: {after_events:?}"
+    // Assert the exact stored suffix, not just the bounds: a replay that dropped
+    // middle events after the cursor (e.g. returned only response.completed) would
+    // still satisfy a bounds-only check.
+    let expected_after: Vec<_> = created_events
+        .iter()
+        .filter(|(_, seq)| seq.is_some_and(|s| s > first_seq))
+        .cloned()
+        .collect();
+    assert_eq!(
+        after_events, expected_after,
+        "starting_after must return exactly the stored suffix after the cursor: {after_events:?}"
     );
     assert_eq!(
         after_events.last().map(|(t, _)| t.as_str()),

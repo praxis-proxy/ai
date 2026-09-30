@@ -227,18 +227,20 @@ pub trait ResponseStore: Send + Sync {
 
     /// Append normalized SSE events to a response's durable event log.
     ///
-    /// Called from the proxy **output** path as each streamed event leaves
-    /// `openai_stream_events` (already sequence-stamped, not yet delivered), this
-    /// builds the log that `GET /v1/responses/{id}?stream=true` replays.
+    /// Called from the proxy **output** path at the terminal seam of a streamed
+    /// response: `openai_response_store` holds the sequence-stamped events in
+    /// request scope, upserts the parent record, then flushes them here in one
+    /// batch before releasing the terminal frame. This builds the log that
+    /// `GET /v1/responses/{id}?stream=true` replays.
     ///
-    /// Writes are insert-if-absent on `(response_id, sequence_number)`
-    /// (`ON CONFLICT DO NOTHING`) and gated on the parent response existing under
-    /// the exact same owner (`WHERE EXISTS(... responses ... owner triple)`), so a
-    /// re-released chunk never double-writes and events can never attach to a
-    /// response the caller does not own. Rows for a response that does not exist
-    /// (or is owned by someone else) are silently dropped.
+    /// Writes are insert-if-absent on `(response_id, sequence_number)` and gated
+    /// on the parent response existing under the exact same owner, so a re-released
+    /// batch never double-writes and events can never attach to a response the
+    /// caller does not own. Rows for a response that does not exist (or is owned by
+    /// someone else) are silently dropped. The write serializes against
+    /// `delete_response` so a concurrent delete cannot leave orphaned event rows.
     ///
-    /// Idempotency means the caller may safely retry a batch; ordering across
+    /// Idempotency means the caller may safely retry the batch; ordering across
     /// batches is defined solely by `sequence_number`.
     ///
     /// # Errors

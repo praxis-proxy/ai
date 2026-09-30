@@ -150,10 +150,11 @@ pub struct PendingApprovalRecord {
 /// The durable event log lets a completed, `stream: true` response be replayed
 /// verbatim through `GET /v1/responses/{id}?stream=true`. Each record is one
 /// outbound SSE event, stamped with the client-visible `sequence_number` from
-/// `openai_stream_events`, persisted as it leaves the sequencer and before the
-/// client sees it. The `(response_id, sequence_number)` pair is the primary key;
-/// the owner triple gates every access to the parent response, exactly like
-/// [`PendingApprovalRecord`].
+/// `openai_stream_events`. The events are buffered in request scope and flushed
+/// as one batch at the terminal seam, after the parent record is stored and
+/// before the terminal frame is released. The `(response_id, sequence_number)`
+/// pair is the primary key; the owner triple gates every access to the parent
+/// response, exactly like [`PendingApprovalRecord`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResponseEventRecord {
     /// Parent response ID (e.g., `"resp_abc123"`).

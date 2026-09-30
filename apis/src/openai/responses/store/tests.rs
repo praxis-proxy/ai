@@ -4,6 +4,7 @@
 //! Unit tests for the `openai_response_store` filter.
 
 use std::{
+    num::{NonZeroU32, NonZeroU64},
     path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -1286,7 +1287,7 @@ async fn streaming_event_flush_failure_fails_closed() {
 async fn streaming_events_over_budget_are_not_persisted() {
     // A one-event count bound: the second event trips the bound, abandoning the
     // whole log so the response stays retrievable as JSON but is not replayable.
-    let filter = ResponseStoreFilter::with_bounds(1, super::config::DEFAULT_MAX_EVENT_BYTES);
+    let filter = ResponseStoreFilter::with_bounds(NonZeroU32::new(1).unwrap(), super::config::DEFAULT_MAX_EVENT_BYTES);
     let store = Arc::new(RecordingResponseStore::new(false));
     let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
 
@@ -1363,7 +1364,8 @@ async fn streaming_event_within_budget_but_over_raw_framing_is_captured() {
     // completed response returned 400 on replay. The framing headroom must let
     // the event decode and reach the authoritative payload check.
     let budget: u64 = 100;
-    let filter = ResponseStoreFilter::with_bounds(super::config::DEFAULT_MAX_EVENT_COUNT, budget);
+    let filter =
+        ResponseStoreFilter::with_bounds(super::config::DEFAULT_MAX_EVENT_COUNT, NonZeroU64::new(budget).unwrap());
     let store = Arc::new(RecordingResponseStore::new(false));
     let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
 
@@ -3847,7 +3849,7 @@ async fn replay_returns_events_in_order_ending_with_terminal() {
     );
     assert_eq!(
         streaming.headers.get(http::header::CACHE_CONTROL).unwrap(),
-        "no-cache",
+        "no-store",
         "replay must not be cached"
     );
 

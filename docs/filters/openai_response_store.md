@@ -27,8 +27,8 @@ Replay becomes available only after the original response and event log are pers
 | `allow_private_database_url` | bool | no | Allow `PostgreSQL` URLs that target local-sensitive addresses. By default, DNS names, localhost, loopback, private, link-local, cloud metadata, unspecified, and Unix socket targets are rejected. This opt-in is intended for local development and tests. |
 | `pool` | PoolConfig | no | Connection pool tuning options. When omitted, sqlx defaults apply (`max_connections = 10`, `idle_timeout = 600s`, `acquire_timeout = 30s`). |
 | `compression` | StoreCompressionConfig | no | Optional payload compression for stored JSON columns. When omitted, payloads are stored uncompressed. Reads auto-detect the format, so enabling compression keeps existing uncompressed records readable. |
-| `max_event_count` | integer | no | Maximum number of SSE events retained in a streamed response's replay log (`GET /v1/responses/{id}?stream=true`). A stream that exceeds this stops event capture for that response, so its terminal event is never recorded and the response becomes non-replayable. The live client stream and the plain JSON record are unaffected. |
-| `max_event_bytes` | integer | no | Maximum total payload bytes retained in a streamed response's replay log. Same over-budget behavior as [`max_event_count`](Self::max_event_count). |
+| `max_event_count` | NonZeroU32 | no | Maximum number of SSE events retained in a streamed response's replay log (`GET /v1/responses/{id}?stream=true`). A stream that exceeds this stops event capture for that response, so its terminal event is never recorded and the response becomes non-replayable. The live client stream and the plain JSON record are unaffected. |
+| `max_event_bytes` | NonZeroU64 | no | Maximum total payload bytes retained in a streamed response's replay log. Same over-budget behavior as `max_event_count`. |
 
 ## Example
 
