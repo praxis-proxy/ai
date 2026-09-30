@@ -13,10 +13,14 @@ on:
   push:
     branches: [main]
     paths:
+      - "store/**"
+      - "store-backends/**"
+      - "store-lifecycle/**"
       - "apis/src/openai/responses/**"
       - "apis/src/openai/conversations/**"
       - "apis/src/openai/sse/**"
       - "apis/src/store/**"
+      - "apis/src/service/**"
       - "server/**"
       - "tests/integration/sdk/openai/**"
       - "tests/utils/examples/conversations_tenant_proxy.rs"
@@ -25,6 +29,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "Makefile"
+      - "vllm/Containerfile"
+      - ".github/actions/build-vllm-gpu/**"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
       - ".github/workflows/vllm-integration.yaml"
@@ -79,10 +85,12 @@ env:
   CARGO_TERM_COLOR: always
   VLLM_IMAGE: "quay.io/opendatahub/vllm-cpu:Qwen3-0.6B-granite-embedding-125m-english@sha256:0212dc82981178033cb71c7477ba8ad1998fb6c0b1ee40646119fb9724ac951b"
   VLLM_MODEL: "Qwen/Qwen3-0.6B"
-  # CUDA image used by the GPU full-suite jobs on the ephemeral EC2 runner.
-  # The model is downloaded from Hugging Face at container start (not baked in),
-  # unlike the CPU image above.
+  # The acceptance jobs still use their pinned upstream image.
   VLLM_GPU_IMAGE: "docker.io/vllm/vllm-openai:v0.29.0-cu129@sha256:7ef5a35d1ef8ce2cf9d671dd91eec6e367c5849262e0362b4d3d4a26be0d87d2"
+  # The full suite builds this tag from the checked-out Containerfile and serves
+  # its baked model. The tag is local to the ephemeral runner; no registry pull
+  # or PR publication is needed to validate the current commit.
+  VLLM_BUILT_GPU_IMAGE: "ghcr.io/praxis-proxy/vllm-gpu:Qwen3-8B"
   # Model served on the GPU runner. A capable model is required for reliable
   # tool-calling (file_search, MCP) — the 0.6B CPU model above is not. Qwen3-8B
   # fits the A10G (24GB) used by the g5.xlarge GPU runner with FlashAttention-2.
@@ -91,7 +99,7 @@ env:
   # capability 8.6, so FlashAttention-2 is available).
   GPU_INSTANCE_TYPE: "g5.xlarge"
   # The custom GPU runner service does not guarantee HOME is exported. Keep the
-  # model cache at an explicit instance-local path shared by sequential jobs.
+  # model cache at an explicit instance-local path shared by the acceptance jobs.
   GPU_HF_CACHE_DIR: /tmp/praxis-huggingface
   # llm-d-inference-sim v0.11.2 multi-architecture image index.
   INFERENCE_SIM_IMAGE: "ghcr.io/llm-d/llm-d-inference-sim@sha256:32144df791330a0006b747edfdf2b114a0fe728e023a9d1b3463eeb48d32abb9"
@@ -130,10 +138,14 @@ jobs:
           HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
+            'store/' \
+            'store-backends/' \
+            'store-lifecycle/' \
             'apis/src/openai/responses/' \
             'apis/src/openai/conversations/' \
             'apis/src/openai/sse/' \
             'apis/src/store/' \
+            'apis/src/service/' \
             'server/' \
             'tests/integration/sdk/openai/' \
             'tests/utils/examples/conversations_tenant_proxy.rs' \
@@ -142,6 +154,8 @@ jobs:
             'Cargo.toml' \
             'Cargo.lock' \
             'Makefile' \
+            'vllm/Containerfile' \
+            '.github/actions/build-vllm-gpu/' \
             '.github/actions/start-vllm/' \
             '.github/actions/wait-vllm/' \
             '.github/workflows/vllm-integration.yaml')
@@ -179,7 +193,7 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
@@ -352,7 +366,7 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -522,11 +536,13 @@ jobs:
   # Runs on the SAME ephemeral EC2 GPU runner as the full suite (machulav
   # v2.3.9 registers a non-ephemeral runner, so a second job runs on the same
   # instance), sequentially AFTER it (`needs: vllm-gpu-full-suite`), reusing the
-  # Qwen3-8B weights the full suite already downloaded via a shared on-disk HF
-  # cache. It starts its OWN vLLM container WITH --api-key (the full suite's is
-  # keyless and torn down first): the credential-isolation proof requires the
-  # backend to REJECT an un-injected bearer, and two Qwen3-8B cannot coexist on
-  # the 24GB A10G, so a separate sequential keyed container is mandatory.
+  # Qwen3-8B weights from a shared on-disk HF cache when another acceptance job
+  # already downloaded them. The full suite uses baked weights in a separate
+  # image. This job starts its OWN vLLM container WITH --api-key (the full
+  # suite's is keyless and torn down first): the credential-isolation proof
+  # requires the backend to REJECT an un-injected bearer. Two Qwen3-8B
+  # containers cannot coexist on the 24GB A10G, so a separate sequential
+  # keyed container is mandatory.
   #
   # Reproducibility-critical: depends on the pins recorded in
   # tests/integration/fixtures/claude-code-cli/pin.toml (consumed via the `pins`
@@ -541,7 +557,7 @@ jobs:
   # ----------------------------------------------------------------------------
 
   vllm-gpu-claude-acceptance:
-    name: Claude Code acceptance on real vLLM (GPU)
+    name: Claude Code and Anthropic SDK acceptance on real vLLM (GPU)
     needs: [gpu-start-runner, vllm-gpu-full-suite, pins]
     # Reuse the GPU runner started for the full suite. `!cancelled()` lets this
     # run even when the full suite was skipped (a run_claude_acceptance-only
@@ -564,10 +580,9 @@ jobs:
         github.event_name == 'schedule'
       )
     runs-on: ${{ needs.gpu-start-runner.outputs.label }}
-    # Comfortable on the nightly (the full suite already warmed the on-disk HF
-    # cache), but a run_claude_acceptance-only dispatch hits a COLD cache and
-    # must download ~16GB of Qwen3-8B before serving. Allow enough headroom for
-    # that path (still under the 90-minute instance budget the full suite uses).
+    # The pinned upstream image downloads ~16GB of Qwen3-8B on a cold cache;
+    # the full suite's baked image does not populate this cache. A previous
+    # acceptance job on the same instance may have warmed it.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -600,6 +615,14 @@ jobs:
 
       - name: Setup Rust
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
+
+      - name: Install uv for Anthropic SDK acceptance
+        id: anthropic_sdk_uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py
 
       - name: Verify pins are resolvable
         run: |
@@ -661,11 +684,9 @@ jobs:
           if [ "$CONTAINER_RUNTIME" = "podman" ]; then
             cache_mount="${cache_mount}:Z"
           fi
-          # Reuse the Qwen3-8B weights the full-suite job downloaded earlier on
-          # this same ephemeral instance via a shared on-disk HF cache, so this
-          # keyed container only pays CUDA init + weight load, not a ~16GB
-          # re-download. On a run_claude_acceptance-only dispatch (no full suite)
-          # the cache is cold and vLLM downloads the weights itself.
+          # The full suite uses baked weights, so this pinned upstream image
+          # downloads Qwen3-8B into the host cache unless an earlier acceptance
+          # job on the same instance already populated it.
           mkdir -p "$GPU_HF_CACHE_DIR"
           "$CONTAINER_RUNTIME" pull "$VLLM_IMAGE_PIN"
           # Native Anthropic Messages serving (/v1/messages,
@@ -689,8 +710,8 @@ jobs:
         run: |
           set -euo pipefail
           echo "Waiting for vLLM..."
-          # Allow a generous deadline: on a cold cache (run_claude_acceptance-only
-          # dispatch) vLLM downloads ~16GB of Qwen3-8B weights before serving.
+          # Allow a generous deadline when the pinned image must download the
+          # weights into a cold host cache before serving.
           deadline=$((SECONDS + 1200))
           until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; do
             if ! "$CONTAINER_RUNTIME" inspect --format='{{.State.Running}}' vllm 2>/dev/null | grep -q true; then
@@ -892,6 +913,16 @@ jobs:
             claude_code_vllm::pinned_claude_code_auto_mode_drives_transformed_vllm_through_full_flow \
             --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/acceptance-auto-transformed.log"
           exit "${PIPESTATUS[0]}"
+
+      - name: Run Anthropic SDK Messages against real vLLM
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        timeout-minutes: 15
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+        run: |
+          uv run tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py -s -k "not image"
 
       - name: Acceptance log tail on failure
         if: failure()
@@ -1305,10 +1336,10 @@ jobs:
           "${CONTAINER_RUNTIME:-docker}" rm -f praxis-postgres || true
 
   # ----------------------------------------------------------------------------
-  # Complete live vLLM Responses suite on a real GPU. Runs nightly, on a
+  # Build the model-baked image from this checkout and run the complete live
+  # Responses suite against it on a real GPU. Runs nightly, on a
   # `run_live_vllm` dispatch, and on a vllm-full-suite PR label. An ephemeral
-  # EC2 g4dn.xlarge runner is provisioned for the run and torn down
-  # unconditionally afterwards.
+  # EC2 GPU runner is provisioned for the run and torn down afterwards.
   # ----------------------------------------------------------------------------
 
   gpu-start-runner:
@@ -1322,7 +1353,9 @@ jobs:
       (
         github.event_name == 'pull_request' &&
         github.event.action == 'labeled' &&
-        github.event.label.name == 'vllm-full-suite'
+        github.event.label.name == 'vllm-full-suite' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.user.login != 'dependabot[bot]'
       )
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1375,16 +1408,29 @@ jobs:
       - name: Verify GPU and container runtime
         run: |
           nvidia-smi
-          if command -v docker >/dev/null 2>&1; then
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=docker" >> "$GITHUB_ENV"
-            docker info >/dev/null
-          elif command -v podman >/dev/null 2>&1; then
+            echo "GPU_DEVICE_ARGS=--gpus all" >> "$GITHUB_ENV"
+          elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
             echo "CONTAINER_RUNTIME=podman" >> "$GITHUB_ENV"
-            podman info >/dev/null
+            echo "GPU_DEVICE_ARGS=--device nvidia.com/gpu=all" >> "$GITHUB_ENV"
           else
-            echo "Neither docker nor podman is available on this runner" >&2
+            echo "Neither docker nor podman is usable on this runner" >&2
             exit 1
           fi
+
+      - name: Free disk space
+        run: |
+          "$CONTAINER_RUNTIME" system prune -af || true
+          df -h /
+
+      - name: Build model-baked GPU image
+        uses: ./.github/actions/build-vllm-gpu
+        with:
+          model: ${{ env.VLLM_GPU_MODEL }}
+          image: ${{ env.VLLM_BUILT_GPU_IMAGE }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          hugging-face-token: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
 
       - name: Setup Rust
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
@@ -1415,7 +1461,7 @@ jobs:
           done
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           # The GPU AMI ships Python 3.9; ogx[starter] needs >=3.12, so pin the
           # interpreter setup-uv provisions. Cache is repo-scoped (GH cache
@@ -1426,56 +1472,16 @@ jobs:
             tests/integration/ogx-constraints.txt
 
       - name: Start vLLM on GPU (background)
-        env:
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HUGGING_FACE_HUB_TOKEN }}
-        run: |
-          # Background the image pull + container launch so the multi-GB CUDA
-          # image download and model weight load overlap `cargo build` below.
-          # `run -d` needs the image present, so pull and run are chained in one
-          # detached subshell; the readiness wait then joins on the serving port.
-          # Runtime, image, model and GPU flags are passed positionally so they
-          # expand in the inner shell without leaking outer-shell quoting.
-          gpu_args=()
-          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
-            gpu_args=(--device nvidia.com/gpu=all)
-          else
-            gpu_args=(--gpus all)
-          fi
-          # Persist the HF weight cache on the instance so the later Claude Code
-          # acceptance job (a second job on this same ephemeral runner) loads
-          # Qwen3-8B from disk instead of re-downloading ~16GB.
-          mkdir -p "$GPU_HF_CACHE_DIR"
-          cache_mount="$GPU_HF_CACHE_DIR:/root/.cache/huggingface"
-          if [ "$CONTAINER_RUNTIME" = "podman" ]; then
-            # The GPU AMI enforces SELinux; relabel the host directory so the
-            # rootless container can populate and reuse the model cache.
-            cache_mount="${cache_mount}:Z"
-          fi
-          gpu_args+=(-v "$cache_mount")
-
-          # The single-quoted body is the inner script; $1/$runtime/... expand
-          # there, not in this outer shell, which is the whole point.
-          # shellcheck disable=SC2016
-          nohup bash -c '
-            set -euo pipefail
-            runtime="$1"; image="$2"; model="$3"; shift 3
-            "$runtime" pull "$image"
-            "$runtime" run -d --name vllm \
-              "$@" \
-              -p 8000:8000 \
-              -e HUGGING_FACE_HUB_TOKEN \
-              "$image" \
-              --model "$model" \
-              --max-model-len 16384 \
-              --served-model-name "$model" \
-              --enable-auto-tool-choice \
-              --tool-call-parser hermes \
-              --reasoning-parser deepseek_r1 \
-              --gpu-memory-utilization 0.9
-          ' bash "$CONTAINER_RUNTIME" "$VLLM_GPU_IMAGE" "$VLLM_GPU_MODEL" "${gpu_args[@]}" \
-            > /tmp/vllm-launch.log 2>&1 &
-          echo $! > /tmp/vllm-launch.pid
-          echo "vLLM launch (pull + run) started in background, pid $(cat /tmp/vllm-launch.pid)"
+        uses: ./.github/actions/start-vllm
+        with:
+          image: ${{ env.VLLM_BUILT_GPU_IMAGE }}
+          model: ${{ env.VLLM_GPU_MODEL }}
+          model-path: /opt/vllm/models/${{ env.VLLM_GPU_MODEL }}
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          pull: "false"
+          device-args: ${{ env.GPU_DEVICE_ARGS }}
+          gpu-memory-utilization: "0.9"
+          max-model-len: "16384"
 
       - name: Pre-install OGX dependencies
         run: |
@@ -1490,42 +1496,10 @@ jobs:
         run: cargo build -p praxis-ai-proxy --features full
 
       - name: Wait for vLLM readiness
-        run: |
-          # The image pull + container launch run in the background so they can
-          # overlap `cargo build`; join on them here. Model weights download from
-          # Hugging Face on first start, so allow a generous deadline. Poll the
-          # serving endpoints directly (runtime agnostic), but fail fast if the
-          # background launcher exited before the port ever came up (bad pull,
-          # OOM on load) rather than waiting out the whole deadline.
-          dump_launch_log() {
-            echo "----- /tmp/vllm-launch.log -----"
-            cat /tmp/vllm-launch.log 2>/dev/null || echo "No vLLM launch log found"
-          }
-          echo "Waiting for vLLM health and model endpoints..."
-          launch_pid="$(cat /tmp/vllm-launch.pid)"
-          deadline=$((SECONDS + 1200))
-          until curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1 && \
-                curl -sf http://127.0.0.1:8000/v1/models > /dev/null 2>&1; do
-            if ! kill -0 "$launch_pid" 2>/dev/null; then
-              # `podman run -d` exits successfully as soon as it creates the
-              # container, often before vLLM binds its port. Only fail when the
-              # launcher is gone AND no running container remains.
-              if ! "$CONTAINER_RUNTIME" inspect --format='{{.State.Running}}' vllm 2>/dev/null | grep -q true; then
-                echo "::error::vLLM launcher exited without a running container"
-                dump_launch_log
-                exit 1
-              fi
-            fi
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::vLLM did not become ready within 1200s"
-              dump_launch_log
-              exit 1
-            fi
-            sleep 5
-          done
-          echo "vLLM is ready"
-          curl -sf http://127.0.0.1:8000/v1/models | head -c 500
-          echo
+        uses: ./.github/actions/wait-vllm
+        with:
+          runtime: ${{ env.CONTAINER_RUNTIME }}
+          timeout: "1200"
 
       - name: Wait for OGX readiness
         run: |
@@ -1678,7 +1652,7 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every

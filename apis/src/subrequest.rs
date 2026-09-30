@@ -43,6 +43,25 @@ struct ParsedUrl {
     authority: http::HeaderValue,
     /// Path and query sent to the upstream.
     uri: http::Uri,
+    /// Path with query values replaced by `[REDACTED]`, safe for logging.
+    redacted_uri: String,
+}
+
+/// Build a log-safe version of a path-and-query string by replacing each
+/// query-parameter value with `[REDACTED]`. Returns the path unchanged
+/// when there is no query string.
+fn redact_path_query(pq: &str) -> String {
+    let Some((path, query)) = pq.split_once('?') else {
+        return pq.to_owned();
+    };
+    let redacted: Vec<_> = query
+        .split('&')
+        .map(|pair| {
+            pair.split_once('=')
+                .map_or_else(|| pair.to_owned(), |(key, _)| format!("{key}=[REDACTED]"))
+        })
+        .collect();
+    format!("{path}?{}", redacted.join("&"))
 }
 
 /// Extract scheme, TLS flag, host, port, SNI, authority, and path.
@@ -72,6 +91,7 @@ fn parse_url_components(url: &str) -> Result<ParsedUrl, SubRequestError> {
         .map_err(|e| SubRequestError::InvalidRequest(format!("invalid authority: {e}")))?;
 
     let path_and_query = parsed.path_and_query().map_or("/", |pq| pq.as_str());
+    let redacted_uri = redact_path_query(path_and_query);
     let uri: http::Uri = path_and_query
         .parse()
         .map_err(|e| SubRequestError::InvalidRequest(format!("bad path: {e}")))?;
@@ -83,6 +103,7 @@ fn parse_url_components(url: &str) -> Result<ParsedUrl, SubRequestError> {
         sni,
         authority,
         uri,
+        redacted_uri,
     })
 }
 
@@ -227,6 +248,12 @@ async fn execute_with_addresses(
     let addrs = validate_resolved_addrs("sub-request", &addrs, address_policy)
         .map_err(|error| SubRequestError::Connect(error.to_string()))?;
     let mut request = request;
+    debug!(
+        host = %parsed.host,
+        uri = %parsed.redacted_uri,
+        method = %request.method,
+        "sub-request: dispatching"
+    );
     request.uri = parsed.uri;
     request.headers.insert(http::header::HOST, parsed.authority);
 
@@ -529,5 +556,111 @@ mod tests {
             [format!("host: {authority}").as_str()],
             "only the URL authority should be sent as Host: {wire}"
         );
+    }
+
+    #[test]
+    fn redact_path_query_preserves_path_without_query() {
+        assert_eq!(redact_path_query("/v1/files"), "/v1/files");
+    }
+
+    #[test]
+    fn redact_path_query_replaces_values() {
+        assert_eq!(
+            redact_path_query("/blob?sig=SECRET&se=2026-01-01"),
+            "/blob?sig=[REDACTED]&se=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn redact_path_query_preserves_valueless_keys() {
+        assert_eq!(redact_path_query("/path?flag"), "/path?flag");
+    }
+
+    #[tokio::test]
+    #[expect(clippy::too_many_lines, reason = "inline tracing capture layer and assertions")]
+    async fn dispatch_log_event_redacts_query_values() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone)]
+        struct EventCapture(Arc<Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+                struct FieldCollector {
+                    message: Option<String>,
+                    uri: Option<String>,
+                }
+                impl tracing::field::Visit for FieldCollector {
+                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                        match field.name() {
+                            "message" => self.message = Some(format!("{value:?}")),
+                            "uri" => self.uri = Some(format!("{value:?}")),
+                            _ => {},
+                        }
+                    }
+
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        match field.name() {
+                            "message" => self.message = Some(value.to_owned()),
+                            "uri" => self.uri = Some(value.to_owned()),
+                            _ => {},
+                        }
+                    }
+                }
+                let mut collector = FieldCollector {
+                    message: None,
+                    uri: None,
+                };
+                event.record(&mut collector);
+                if collector.message.as_deref() == Some("sub-request: dispatching")
+                    && let Some(uri) = collector.uri
+                {
+                    self.0.lock().unwrap().push(uri);
+                }
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let capture = EventCapture(Arc::clone(&events));
+        let subscriber = tracing_subscriber::registry().with(capture);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _captured = capture_raw_request(listener);
+
+        let client = test_client();
+        let url = format!("http://example.test:{}/blob?sig=SECRET&token=s3cret", addr.port());
+
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let _result = Box::pin(execute_url_with_test_addresses(
+            &client,
+            &url,
+            empty_request(),
+            1024,
+            Duration::from_secs(5),
+            AddressPolicy::AllowPrivate,
+            None,
+            vec![addr],
+        ))
+        .await;
+
+        let logged_uris = events.lock().unwrap();
+        assert!(
+            !logged_uris.is_empty(),
+            "dispatch event with uri field should be emitted"
+        );
+        for uri in logged_uris.iter() {
+            assert!(
+                !uri.contains("SECRET") && !uri.contains("s3cret"),
+                "signed URL secrets must not appear in logged URI: {uri}"
+            );
+            assert!(
+                uri.contains("[REDACTED]"),
+                "query values should be replaced with [REDACTED]: {uri}"
+            );
+        }
     }
 }

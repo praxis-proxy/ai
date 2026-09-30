@@ -39,6 +39,8 @@ use std::{
 
 use dashmap::DashMap;
 
+use super::{ledger::DenialReason, remaining_total::RemainingTotal};
+
 /// Upper bound, in seconds, on `capacity / refill_rate` -- the time to
 /// fill an empty bucket from scratch.
 ///
@@ -132,6 +134,10 @@ pub(super) struct Reservation {
     pub(super) estimate: u64,
     /// Monotonic timestamp at admission, in milliseconds.
     pub(super) created_at_ms: u64,
+    /// Tokens consumed from the bucket after this reservation
+    /// (`capacity - remaining`). Exposed for the filter's graduated
+    /// tier evaluation (S1).
+    pub(super) usage_after: u64,
 }
 
 /// Result of attempting admission.
@@ -144,6 +150,8 @@ pub(super) enum Decision {
         /// Conservative delay before the bucket refills enough to admit
         /// the same estimate.
         retry_after_ms: u64,
+        /// Distinguishes budget exhaustion from the `max_keys` cap.
+        reason: DenialReason,
     },
 }
 
@@ -176,6 +184,8 @@ struct BucketState {
     tokens: f64,
     last_refill_ms: u64,
     active: HashMap<u64, ActiveReservation>,
+    /// Last remaining balance included in [`TokenBucketLedger::remaining_total`].
+    reported_remaining: u64,
 }
 
 impl BucketState {
@@ -188,6 +198,7 @@ impl BucketState {
             tokens: capacity as f64,
             last_refill_ms: 0,
             active: HashMap::new(),
+            reported_remaining: capacity,
         }
     }
 
@@ -261,6 +272,7 @@ pub(super) struct TokenBucketLedger {
     next_id: AtomicU64,
     key_count: AtomicUsize,
     active_reservations: AtomicUsize,
+    remaining_total: RemainingTotal,
 }
 
 impl TokenBucketLedger {
@@ -274,6 +286,7 @@ impl TokenBucketLedger {
             next_id: AtomicU64::new(1),
             key_count: AtomicUsize::new(0),
             active_reservations: AtomicUsize::new(0),
+            remaining_total: RemainingTotal::default(),
         })
     }
 
@@ -292,32 +305,61 @@ impl TokenBucketLedger {
         self.key_count.load(Ordering::Relaxed)
     }
 
+    /// Sum of the last calculated remaining balance for retained keys.
+    pub(super) fn remaining_total(&self) -> u64 {
+        self.remaining_total.reported()
+    }
+
+    /// Publish one key's whole-token balance, moving its contribution to
+    /// the aggregate.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "token balances are finite, non-negative, and bounded by validated capacity"
+    )]
+    fn publish_remaining(&self, state: &mut BucketState) {
+        let remaining = state.tokens.floor() as u64;
+        let previous = std::mem::replace(&mut state.reported_remaining, remaining);
+        self.remaining_total.replace(previous, remaining);
+    }
+
     /// Reserve an estimate against one key's bucket: refill to `now_ms`,
     /// admit and immediately decrement if enough tokens are available,
     /// deny otherwise.
     pub(super) fn reserve(&self, key: &str, estimate: u64, now_ms: u64) -> Decision {
         if key.is_empty() || key.len() > self.config.max_key_length || estimate == 0 {
-            return Decision::Denied { retry_after_ms: 0 };
+            return Decision::Denied {
+                retry_after_ms: 0,
+                reason: DenialReason::InvalidKey,
+            };
         }
 
-        let state = match self.keys.entry(key.to_owned()) {
-            dashmap::mapref::entry::Entry::Occupied(entry) => Arc::clone(entry.get()),
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                if self
-                    .key_count
-                    .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
-                        (count < self.config.max_keys).then_some(count + 1)
-                    })
-                    .is_err()
-                {
-                    return Decision::Denied { retry_after_ms: 0 };
-                }
-                let state = Arc::new(Mutex::new(BucketState::new(self.config.capacity)));
-                entry.insert(Arc::clone(&state));
-                state
-            },
+        let entry = loop {
+            if let Some(entry) = self.keys.get(key) {
+                break entry;
+            }
+            match self.keys.entry(key.to_owned()) {
+                dashmap::mapref::entry::Entry::Occupied(_) => {},
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    if self
+                        .key_count
+                        .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |count| {
+                            (count < self.config.max_keys).then_some(count + 1)
+                        })
+                        .is_err()
+                    {
+                        return Decision::Denied {
+                            retry_after_ms: 0,
+                            reason: DenialReason::KeyCapacity,
+                        };
+                    }
+                    let state = Arc::new(Mutex::new(BucketState::new(self.config.capacity)));
+                    self.remaining_total.add(self.config.capacity);
+                    entry.insert(state);
+                },
+            }
         };
-        let mut state = match state.lock() {
+        let mut state = match entry.value().lock() {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -334,6 +376,7 @@ impl TokenBucketLedger {
         )]
         let estimate_f64 = estimate as f64;
         if estimate_f64 > state.tokens {
+            self.publish_remaining(&mut state);
             let deficit = estimate_f64 - state.tokens;
             let retry_after_ms = (deficit / self.config.refill_rate * 1000.0).ceil();
             #[expect(
@@ -342,7 +385,10 @@ impl TokenBucketLedger {
                 reason = "retry_after_ms is a small positive duration bounded by realistic refill rates"
             )]
             let retry_after_ms = retry_after_ms.max(1.0) as u64;
-            return Decision::Denied { retry_after_ms };
+            return Decision::Denied {
+                retry_after_ms,
+                reason: DenialReason::WindowCapacity,
+            };
         }
         if self
             .active_reservations
@@ -351,12 +397,22 @@ impl TokenBucketLedger {
             })
             .is_err()
         {
+            self.publish_remaining(&mut state);
             return Decision::Denied {
                 retry_after_ms: self.config.reservation_timeout_ms,
+                reason: DenialReason::ReservationCapacity,
             };
         }
 
         state.tokens -= estimate_f64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "capacity is bounded by MAX_F64_SAFE_INTEGER, difference is non-negative and within u64 range"
+        )]
+        let usage_after = (self.config.capacity as f64 - state.tokens).max(0.0) as u64;
+        self.publish_remaining(&mut state);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         state.active.insert(
             id,
@@ -367,10 +423,12 @@ impl TokenBucketLedger {
         );
         self.reservations.insert(id, key.to_owned());
         drop(state);
+        drop(entry);
         Decision::Admitted(Reservation {
             id,
             estimate,
             created_at_ms: now_ms,
+            usage_after,
         })
     }
 
@@ -408,6 +466,7 @@ impl TokenBucketLedger {
                 state.tokens = (state.tokens - overage as f64).max(0.0);
             }
         }
+        self.publish_remaining(&mut state);
         drop(state);
         Settlement::Applied {
             actual,
@@ -442,7 +501,9 @@ impl TokenBucketLedger {
                 self.reservations.remove(id);
             }
             self.active_reservations.fetch_sub(expired.len(), Ordering::Relaxed);
+            self.publish_remaining(&mut state);
             let empty = state.is_empty(self.config.capacity);
+            let reported_remaining = state.reported_remaining;
             drop(state);
             drop(entry);
             if empty
@@ -458,6 +519,7 @@ impl TokenBucketLedger {
                     .is_some()
             {
                 self.key_count.fetch_sub(1, Ordering::Relaxed);
+                self.remaining_total.subtract(reported_remaining);
             }
         }
         orphaned
@@ -476,7 +538,10 @@ impl TokenBucketLedger {
     reason = "ledger tests intentionally fail fast on impossible fixture states"
 )]
 mod tests {
-    use std::sync::{Arc, Barrier};
+    use std::{
+        sync::{Arc, Barrier, mpsc},
+        time::Duration,
+    };
 
     use super::*;
 
@@ -670,6 +735,35 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_cannot_remove_a_key_while_reserve_holds_its_map_entry() {
+        let ledger = Arc::new(ledger(10, 1.0));
+        ledger
+            .keys
+            .insert("alice".into(), Arc::new(Mutex::new(BucketState::new(10))));
+        ledger.key_count.store(1, Ordering::Relaxed);
+        ledger.remaining_total.add(10);
+
+        // `reserve` keeps this same DashMap entry guard while locking and
+        // changing BucketState, so cleanup must not remove its key in-between.
+        let entry = ledger.keys.get("alice").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let cleanup_ledger = Arc::clone(&ledger);
+        let cleanup = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            cleanup_ledger.cleanup(100, 1);
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(entry);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        cleanup.join().unwrap();
+        assert_eq!(ledger.key_count(), 0);
+        assert_eq!(ledger.remaining_total(), 0);
+    }
+
+    #[test]
     fn invalid_config_is_rejected() {
         assert!(
             TokenBucketLedger::new(TokenBucketConfig {
@@ -759,7 +853,13 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(l.reserve("a", 1, 0), Decision::Admitted(_)));
-        assert!(matches!(l.reserve("b", 1, 0), Decision::Denied { .. }));
+        assert!(matches!(
+            l.reserve("b", 1, 0),
+            Decision::Denied {
+                reason: DenialReason::KeyCapacity,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -775,5 +875,40 @@ mod tests {
         .unwrap();
         assert!(matches!(l.reserve("a", 1, 0), Decision::Admitted(_)));
         assert!(matches!(l.reserve("b", 1, 0), Decision::Denied { .. }));
+    }
+
+    #[test]
+    fn remaining_total_sums_latest_bucket_balances_across_keys() {
+        let l = ledger(100, 10.0);
+        let first = match l.reserve("alice", 40, 0) {
+            Decision::Admitted(reservation) => reservation,
+            other => panic!("expected admission, got {other:?}"),
+        };
+        assert_eq!(l.remaining_total(), 60);
+        assert!(matches!(l.reserve("bob", 25, 0), Decision::Admitted(_)));
+        assert_eq!(l.remaining_total(), 135, "60 for alice plus 75 for bob");
+
+        assert!(matches!(
+            l.reconcile(first.id, Some(10), 0),
+            Settlement::Applied { refund: 30, .. }
+        ));
+        assert_eq!(l.remaining_total(), 165, "alice's refund must update the aggregate");
+
+        l.cleanup(10_000, 8);
+        assert_eq!(
+            l.remaining_total(),
+            0,
+            "fully refilled idle keys must leave the aggregate"
+        );
+    }
+
+    #[test]
+    fn remaining_total_stays_saturated_until_the_exact_sum_falls_below_the_gauge_limit() {
+        let l = ledger(MAX_F64_SAFE_INTEGER, 10_000_000.0);
+
+        assert!(matches!(l.reserve("alice", 1, 0), Decision::Admitted(_)));
+        assert_eq!(l.remaining_total(), super::super::MAX_REPORTED_REMAINING);
+        assert!(matches!(l.reserve("bob", 1, 0), Decision::Admitted(_)));
+        assert_eq!(l.remaining_total(), super::super::MAX_REPORTED_REMAINING);
     }
 }

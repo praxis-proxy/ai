@@ -11,8 +11,8 @@ use super::*;
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{
-        ConversationRecord, PendingApprovalRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry,
-        SqliteResponseStore, StoreError,
+        ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, ResponseRecord,
+        ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
     },
 };
 
@@ -45,13 +45,10 @@ fn unknown_field_rejected() {
 }
 
 #[test]
-fn body_access_is_read_only() {
+fn declares_dual_phase_body_access() {
     let filter = default_filter();
-    assert_eq!(
-        filter.request_body_access(),
-        BodyAccess::ReadOnly,
-        "filter should use read-only body access"
-    );
+    assert_eq!(filter.request_body_access(), BodyAccess::ReadOnly);
+    assert_eq!(filter.bound_upstream_request_body_access(), BodyAccess::ReadOnly);
 }
 
 // -----------------------------------------------------------------------------
@@ -334,24 +331,40 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
     let mut entries: Vec<FilterEntry> = serde_yaml::from_str(&format!(
         r#"
 - filter: openai_responses_format
+- filter: router
+  routes:
+    - path_prefix: "/"
+      cluster: test-backend
 - filter: openai_response_store
   backend: sqlite
   database_url: "{db_url}"
   responses_table: test_responses
   conversations_table: test_conversations
 - filter: openai_responses_rehydrate
+- filter: load_balancer
+  cluster_source: bound_upstream
+  clusters:
+    - name: test-backend
+      endpoints: ["127.0.0.1:3001"]
 "#
     ))
     .unwrap();
     let registry = crate::test_utils::make_ai_registry();
     let mut pipeline = FilterPipeline::build(&mut entries, &registry).unwrap();
-    pipeline.add_pipeline_extension(Box::new(ResponseStoreRegistry::new()));
+    // The store is provisioned into the registry outside the filter; back it by
+    // the same file the previous response was seeded into so rehydrate finds it.
+    let provisioned = SqliteResponseStore::new(&db_url, "test_responses", "test_conversations", None, None, None)
+        .await
+        .unwrap();
+    let store_registry = ResponseStoreRegistry::new();
+    store_registry
+        .register(&Arc::from("default"), Arc::new(provisioned))
+        .unwrap();
+    pipeline.add_pipeline_extension(Box::new(store_registry));
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_owned_filter_context(&req);
     pipeline.prepare_extensions(&mut ctx.extensions);
-
-    drop(pipeline.execute_http_request(&mut ctx).await.unwrap());
 
     let original = r#"{"model":"gpt-4.1","input":"What next?","previous_response_id":"resp_prev"}"#;
     let mut body = Some(Bytes::from(original));
@@ -362,7 +375,14 @@ async fn pipeline_validates_during_cold_request_body_pre_read() {
         .unwrap();
     assert!(
         matches!(action, FilterAction::Release),
-        "on_request should register store so rehydrate finds it in on_request_body"
+        "format classification should release the canonical pre-read body"
+    );
+    ctx.buffered_request_body = body.clone();
+
+    let request_action = pipeline.execute_http_request(&mut ctx).await.unwrap();
+    assert!(
+        matches!(request_action, FilterAction::Continue),
+        "binding should run the bound-body store and rehydrate hooks"
     );
 
     assert_eq!(
@@ -1309,6 +1329,32 @@ async fn truncation_setting_preserved_through_rehydration() {
 // -----------------------------------------------------------------------------
 // Conversation Rehydration
 // -----------------------------------------------------------------------------
+
+/// An explicit null selects no conversation, the same as omitting the field.
+/// Treating it as present rejected a well-formed body: a token-count request
+/// carrying `"conversation": null` was told its conversation value was
+/// malformed.
+#[tokio::test]
+async fn an_explicit_null_conversation_is_treated_as_absent() {
+    let store = MockStore::with_conversation("conv_unused", json!([]));
+    let registry = setup_registry(store);
+
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"count me","conversation":null}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "a null conversation must not be rejected as malformed"
+    );
+}
 
 #[tokio::test]
 async fn rehydrates_from_conversation_string_id() {
@@ -3569,4 +3615,156 @@ fn cleanup_sqlite_file(db_path: &std::path::Path) {
     drop(std::fs::remove_file(db_path));
     drop(std::fs::remove_file(format!("{}-shm", db_path.display())));
     drop(std::fs::remove_file(format!("{}-wal", db_path.display())));
+}
+
+/// The rehydrate registry facade uses only the response half, so this test
+/// double leaves the conversation-item surface unsupported.
+#[async_trait::async_trait]
+impl ConversationItemStore for MockStore {
+    async fn upsert_conversation(&self, _record: &ConversationRecord) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn update_conversation_messages(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _messages: &Value,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn update_conversation_metadata(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _metadata: &Value,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn compare_and_swap_conversation_messages(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _expected_messages: &Value,
+        _messages: &Value,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_conversation(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+    ) -> Result<Option<ConversationRecord>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_conversation(&self, _owner: &StateOwner, _conversation_id: &str) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn create_conversation_items(&self, _items: &[ConversationItemRecord]) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn list_conversation_items(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _after_item_id: Option<&str>,
+        _limit: u32,
+        _ascending: bool,
+    ) -> Result<Vec<ConversationItemRecord>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_existing_conversation_item_ids(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_ids: &[&str],
+    ) -> Result<Vec<String>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn get_conversation_item(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<ConversationItemRecord>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_conversation_item(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn conversation_item_position(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn max_item_position(&self, _owner: &StateOwner, _conversation_id: &str) -> Result<i64, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn create_items_and_sync_messages(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _items: &[ConversationItemRecord],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
+
+    async fn delete_item_and_sync_messages(
+        &self,
+        _owner: &StateOwner,
+        _conversation_id: &str,
+        _item_id: &str,
+    ) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(
+            "mock store has no conversation items".to_owned(),
+        ))
+    }
 }

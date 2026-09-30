@@ -26,6 +26,7 @@ import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -345,11 +346,51 @@ def _wait_for_proxy(
     )
 
 
+def _proxy_env(readiness_port: int) -> dict[str, str]:
+    """Enable the store-readiness listener on a fixture-private port."""
+    env = os.environ.copy()
+    env["PRAXIS_STORE_READINESS_ADDR"] = f"127.0.0.1:{readiness_port}"
+    return env
+
+
+def _wait_for_store_ready(
+    readiness_port: int,
+    process: subprocess.Popen,
+    timeout: float = PROXY_STARTUP_TIMEOUT,
+) -> None:
+    """Wait until asynchronous store provisioning has completed."""
+    deadline = time.monotonic() + timeout
+    url = f"http://127.0.0.1:{readiness_port}/ready"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            stderr = process.stderr.read().strip() if process.stderr is not None else ""
+            raise RuntimeError(
+                f"proxy exited with status {process.returncode} before becoming ready: {stderr}"
+            )
+        try:
+            response = httpx.get(url, timeout=0.5)
+        except httpx.HTTPError:
+            time.sleep(0.1)
+            continue
+        if response.status_code == 200:
+            return
+        if response.status_code != 503:
+            raise RuntimeError(
+                f"unexpected readiness response {response.status_code}: {response.text}"
+            )
+        time.sleep(0.1)
+    raise TimeoutError(
+        f"store did not become ready within {timeout}s "
+        f"(process status: {process.poll()})"
+    )
+
+
 @pytest.fixture(scope="session")
 def praxis_proxy():
     """Start a Praxis proxy for the test session and tear it down after."""
     with tempfile.TemporaryDirectory() as db_dir:
         port = _free_port()
+        readiness_port = _free_port()
         db_path = os.path.join(db_dir, "conversations.db")
         config_path = _write_config(port, db_path)
         binary = _find_binary()
@@ -359,9 +400,11 @@ def praxis_proxy():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            env=_proxy_env(readiness_port),
         )
         try:
             _wait_for_proxy(port, proc)
+            _wait_for_store_ready(readiness_port, proc)
             yield port
         finally:
             proc.send_signal(signal.SIGINT)
@@ -378,6 +421,7 @@ def classifier_missing_proxy():
     """Start Praxis with the Conversations dependency deliberately omitted."""
     with tempfile.TemporaryDirectory() as db_dir:
         port = _free_port()
+        readiness_port = _free_port()
         db_path = os.path.join(db_dir, "conversations.db")
         config_path = _write_config(port, db_path, include_operation_classifier=False)
         binary = _find_binary()
@@ -386,9 +430,11 @@ def classifier_missing_proxy():
             [binary, "-c", config_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=_proxy_env(readiness_port),
         )
         try:
-            _wait_for_proxy(port)
+            _wait_for_proxy(port, proc)
+            _wait_for_store_ready(readiness_port, proc)
             yield port
         finally:
             proc.send_signal(signal.SIGINT)
@@ -423,6 +469,7 @@ def chunked_response_client():
 
     with tempfile.TemporaryDirectory() as db_dir:
         proxy_port = _free_port()
+        readiness_port = _free_port()
         db_path = os.path.join(db_dir, "responses.db")
         config_path = _write_chunked_response_config(
             proxy_port, backend.server_port, db_path
@@ -433,9 +480,11 @@ def chunked_response_client():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            env=_proxy_env(readiness_port),
         )
         try:
             _wait_for_proxy(proxy_port, proc)
+            _wait_for_store_ready(readiness_port, proc)
             yield OpenAI(
                 api_key="not-needed",
                 base_url=f"http://127.0.0.1:{proxy_port}/v1",
@@ -474,6 +523,7 @@ def tenant_praxis_proxy():
     binary = _find_tenant_binary()
     with tempfile.TemporaryDirectory() as db_dir:
         port = _free_port()
+        readiness_port = _free_port()
         db_path = os.path.join(db_dir, "conversations.db")
         config_path = _write_tenant_config(port, db_path)
 
@@ -482,9 +532,11 @@ def tenant_praxis_proxy():
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
+            env=_proxy_env(readiness_port),
         )
         try:
             _wait_for_proxy(port, proc)
+            _wait_for_store_ready(readiness_port, proc)
             yield port
         finally:
             proc.send_signal(signal.SIGINT)
@@ -510,6 +562,68 @@ def tenant_clients(tenant_praxis_proxy):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    DATABASE_URL.startswith("postgres"),
+    reason="cold-start lock regression uses SQLite file locking",
+)
+def test_cold_start_returns_503_until_store_is_ready():
+    """The listener binds promptly but gates requests while SQLite is locked."""
+    with tempfile.TemporaryDirectory() as db_dir:
+        port = _free_port()
+        db_path = os.path.join(db_dir, "cold-start.db")
+        lock = sqlite3.connect(db_path)
+        lock.execute("CREATE TABLE lock_holder (id INTEGER)")
+        lock.commit()
+        lock.execute("BEGIN EXCLUSIVE")
+        lock_released = False
+        config_path = _write_config(port, db_path)
+        proc = subprocess.Popen(
+            [_find_binary(), "-c", config_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        client = OpenAI(
+            api_key="not-needed",
+            base_url=f"http://127.0.0.1:{port}/v1",
+            default_headers={OWNER_HEADER: _owner_assertion("cold-start")},
+            max_retries=0,
+            timeout=2.0,
+        )
+        try:
+            _wait_for_proxy(port, proc)
+            with pytest.raises(InternalServerError) as pending:
+                client.conversations.retrieve("not-created")
+            assert pending.value.status_code == 503
+
+            lock.commit()
+            lock.close()
+            lock_released = True
+            deadline = time.monotonic() + PROXY_STARTUP_TIMEOUT
+            while True:
+                try:
+                    client.conversations.retrieve("not-created")
+                except NotFoundError:
+                    break
+                except InternalServerError as error:
+                    assert error.status_code == 503
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("store did not become ready after releasing SQLite lock")
+                    time.sleep(0.1)
+        finally:
+            if not lock_released:
+                if lock.in_transaction:
+                    lock.rollback()
+                lock.close()
+            proc.send_signal(signal.SIGINT)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.unlink(config_path)
 
 
 def _message_items(prefix: str, count: int) -> list[dict]:
@@ -1463,7 +1577,7 @@ class TestConversationTenantIsolation:
         page = tenant_a.conversations.items.list(conversation.id)
         assert [item.id for item in page.data] == ["item_tenant_private"]
 
-    def test_item_id_cannot_transfer_between_tenants(self, tenant_clients):
+    def test_same_item_id_is_isolated_between_tenants(self, tenant_clients):
         tenant_a, tenant_b = tenant_clients
         conversation_a = tenant_a.conversations.create(
             items=[
@@ -1475,24 +1589,27 @@ class TestConversationTenantIsolation:
                 }
             ],
         )
-        with pytest.raises(InternalServerError) as exc_info:
-            tenant_b.conversations.create(
-                items=[
-                    {
-                        "id": "item_shared_across_tenants",
-                        "type": "message",
-                        "role": "user",
-                        "content": "tenant-b value",
-                    }
-                ],
-            )
-        assert exc_info.value.status_code == 500
+        conversation_b = tenant_b.conversations.create(
+            items=[
+                {
+                    "id": "item_shared_across_tenants",
+                    "type": "message",
+                    "role": "user",
+                    "content": "tenant-b value",
+                }
+            ],
+        )
 
         item_a = tenant_a.conversations.items.retrieve(
             "item_shared_across_tenants",
             conversation_id=conversation_a.id,
         )
+        item_b = tenant_b.conversations.items.retrieve(
+            "item_shared_across_tenants",
+            conversation_id=conversation_b.id,
+        )
         assert item_a.content[0].text == "tenant-a value"
+        assert item_b.content[0].text == "tenant-b value"
 
     def test_denied_access_does_not_affect_callers_own_resources(
         self,

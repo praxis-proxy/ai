@@ -144,7 +144,7 @@ impl<'a> ResponseContext<'a> {
             previous_response_id: request.string("previous_response_id"),
             store: request.bool("store").unwrap_or(true),
             tools: request.array("tools").unwrap_or_default(),
-            tool_choice: request.value("tool_choice"),
+            tool_choice: request.value("tool_choice").filter(|v| !v.is_null()),
             presence_penalty: request.value("presence_penalty"),
             frequency_penalty: request.value("frequency_penalty"),
             top_logprobs: request.u64("top_logprobs"),
@@ -412,9 +412,10 @@ fn translate_responses_request(
 
 /// Resolve and insert the Chat Completions `tool_choice`, when one applies.
 ///
-/// A synthesized canonical `auto` is omitted when the request carried no tools
-/// and no explicit choice of its own, so translation does not invent a field the
-/// caller never sent.
+/// `auto` is omitted when the translated request carries no tools because Chat
+/// Completions backends may reject any `tool_choice` without a matching `tools`
+/// field. The original Responses request remains available when the response
+/// resource is built, so the client still observes its intended `auto` value.
 fn insert_chat_tool_choice(
     obj: &Map<String, Value>,
     chat: &mut Map<String, Value>,
@@ -423,10 +424,8 @@ fn insert_chat_tool_choice(
     has_file_search: bool,
 ) -> Result<(), TranslationError> {
     let tool_choice = overrides.tool_choice.or_else(|| obj.get("tool_choice"));
-    let omit_synthesized_default = !chat.contains_key("tools")
-        && obj.get("tool_choice").is_none()
-        && overrides.tool_choice.and_then(Value::as_str) == Some("auto");
-    if !omit_synthesized_default
+    let omit_auto_without_tools = !chat.contains_key("tools") && tool_choice.and_then(Value::as_str) == Some("auto");
+    if !omit_auto_without_tools
         && let Some(tool_choice) = build_chat_tool_choice(tool_choice, has_web_search, has_file_search)?
     {
         chat.insert("tool_choice".to_owned(), tool_choice);
@@ -1348,6 +1347,10 @@ fn convert_function_tool(tool: &Map<String, Value>) -> Value {
 }
 
 /// Convert Responses `tool_choice` into Chat Completions-compatible shape.
+///
+/// An explicit JSON `null` (or absent `None`) is treated as absent/default per
+/// observed OpenAI compatibility, returning `Ok(None)` so translation omits the
+/// `tool_choice` field from the outbound Chat Completions request.
 fn build_chat_tool_choice(
     choice: Option<&Value>,
     has_web_search: bool,
@@ -1358,6 +1361,7 @@ fn build_chat_tool_choice(
     };
 
     match choice {
+        Value::Null => Ok(None),
         Value::String(_) => Ok(Some(choice.clone())),
         Value::Object(choice_obj) => build_object_tool_choice(choice_obj, has_web_search, has_file_search).map(Some),
         _ => Err(TranslationError::UnsupportedToolChoiceType(
@@ -1796,6 +1800,7 @@ fn reasoning_value(context: &ResponseContext<'_>) -> Result<Value, TranslationEr
 fn tool_choice_value(context: &ResponseContext<'_>) -> Value {
     context
         .tool_choice
+        .filter(|v| !v.is_null())
         .cloned()
         .unwrap_or_else(|| Value::String(DEFAULT_TOOL_CHOICE.to_owned()))
 }

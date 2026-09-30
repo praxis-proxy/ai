@@ -40,18 +40,21 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SubRequestResponseMode,
-    body::MAX_JSON_BODY_BYTES, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SelectedUpstreamBodyOutcome,
+    SubRequestResponseMode, body::MAX_JSON_BODY_BYTES, parse_filter_config,
 };
 use serde::{
     Deserialize, Deserializer,
     de::{IgnoredAny, MapAccess, Visitor},
     ser::SerializeMap as _,
 };
-use tracing::{debug, trace};
+use tracing::debug;
 
 use self::config::{ResponsesProxyConfig, build_config};
-use super::{body_limits::reject_rewritten_body_too_large, error::responses_error_rejection, state::ResponsesState};
+use super::{
+    body_limits::reject_rewritten_body_too_large, enforce_agentic_stream_guard, error::responses_error_rejection,
+    state::ResponsesState,
+};
 use crate::{classifier::is_responses_create, json_body::SerializedJson};
 
 // -----------------------------------------------------------------------------
@@ -70,10 +73,9 @@ use crate::{classifier::is_responses_create, json_body::SerializedJson};
 ///
 /// Non-null `prompt` template references are rejected unless the load balancer
 /// selected a cluster declaring `application_protocol: openai_responses` and
-/// `application_provider: openai`. Because cluster selection happens during
-/// the request-header phase, a pipeline that uses OpenAI-managed prompts must
-/// order this filter after its router and load balancer. Missing or different
-/// application metadata fails closed.
+/// `application_provider: openai`. The check runs in the selected-upstream body
+/// phase, after routing has frozen that application metadata. Missing or
+/// different application metadata fails closed.
 ///
 /// This filter always advertises the Praxis streaming capability. When the
 /// effective outbound body contains `"stream": true` it selects Praxis's
@@ -115,14 +117,16 @@ pub struct ResponsesProxyFilter {
 
 impl ResponsesProxyFilter {
     /// Reject prompt templates unless the selected cluster declares OpenAI.
-    fn reject_prompt_for_non_openai_upstream(ctx: &HttpFilterContext<'_>) -> Option<FilterAction> {
-        let prompt_requested = ctx
-            .extensions
-            .get::<PromptTemplateState>()
-            .is_some_and(|state| state.requested);
-        (prompt_requested && !is_openai_responses_provider(ctx)).then(|| {
+    fn reject_prompt_for_non_openai_upstream(
+        ctx: &HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+    ) -> Option<SelectedUpstreamBodyOutcome> {
+        (is_responses_create(&ctx.request.method, ctx.request.uri.path())
+            && request_has_prompt_template(ctx, body)
+            && !is_openai_responses_provider(ctx))
+        .then(|| {
             debug!("rejecting prompt template for non-OpenAI Responses backend");
-            FilterAction::Reject(responses_error_rejection(
+            SelectedUpstreamBodyOutcome::Reject(responses_error_rejection(
                 400,
                 "invalid_request_error",
                 "prompt templates are supported only when the selected upstream declares application_protocol: openai_responses and application_provider: openai",
@@ -179,7 +183,7 @@ impl HttpFilter for ResponsesProxyFilter {
         "openai_responses_proxy"
     }
 
-    fn request_body_access(&self) -> BodyAccess {
+    fn selected_upstream_request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadWrite
     }
 
@@ -194,59 +198,55 @@ impl HttpFilter for ResponsesProxyFilter {
 
     fn may_select_streaming_subrequest_response(&self) -> bool {
         // Always advertise the capability: transport follows the effective
-        // outbound `stream` field, chosen per-request in `on_request_body`.
+        // outbound `stream` field, chosen per-request after upstream selection.
         // There is no operator opt-in. A runtime guard in Praxis still
         // validates the actual streaming terminal action.
         true
     }
 
-    async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
-        if is_responses_create(&ctx.request.method, ctx.request.uri.path())
-            && let Some(action) = Self::reject_prompt_for_non_openai_upstream(ctx)
-        {
-            return Ok(action);
-        }
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         Ok(FilterAction::Continue)
     }
 
-    async fn on_request_body(
+    async fn on_selected_upstream_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        end_of_stream: bool,
-    ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream {
-            trace!("buffering request body chunk");
-            return Ok(FilterAction::Continue);
+    ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
+        if let Some(action) = Self::reject_prompt_for_non_openai_upstream(ctx, body) {
+            return Ok(action);
         }
-
-        let prompt_requested =
-            is_responses_create(&ctx.request.method, ctx.request.uri.path()) && request_has_prompt_template(ctx, body);
-        ctx.extensions.insert(PromptTemplateState {
-            requested: prompt_requested,
-        });
-
         let Some(state) = ctx.extensions.get::<ResponsesState>() else {
             select_terminal_response_mode(ctx, body);
+            if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
+                return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
+            }
             debug!("no ResponsesState in extensions, passthrough");
-            return Ok(FilterAction::Continue);
+            return Ok(SelectedUpstreamBodyOutcome::Continue);
         };
 
         if !request_needs_rebuild(state) {
             select_terminal_response_mode(ctx, body);
+            if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
+                return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
+            }
             debug!("ResponsesState does not require an outbound rewrite, passthrough");
-            return Ok(FilterAction::Continue);
+            return Ok(SelectedUpstreamBodyOutcome::Continue);
         }
 
         let serialized = match self.serialize_body(state)? {
             Ok(bytes) => bytes,
-            Err(action) => return Ok(action),
+            Err(FilterAction::Reject(rejection)) => return Ok(SelectedUpstreamBodyOutcome::Reject(rejection)),
+            Err(_) => return Err("openai_responses_proxy: invalid selected-upstream body outcome".into()),
         };
 
         SerializedJson::from_bytes(serialized).commit(body, self.name(), "body");
         select_terminal_response_mode(ctx, body);
+        if let Some(rejection) = enforce_agentic_stream_guard(ctx) {
+            return Ok(SelectedUpstreamBodyOutcome::Reject(rejection));
+        }
 
-        Ok(FilterAction::Continue)
+        Ok(SelectedUpstreamBodyOutcome::Continue)
     }
 }
 
@@ -342,12 +342,6 @@ impl Visitor<'_> for PromptTemplateFieldVisitor {
             PromptTemplateField::Other
         })
     }
-}
-
-/// Prompt presence captured during body pre-read for header-phase validation.
-struct PromptTemplateState {
-    /// Whether the canonical request carries a non-null `prompt`.
-    requested: bool,
 }
 
 // -----------------------------------------------------------------------------

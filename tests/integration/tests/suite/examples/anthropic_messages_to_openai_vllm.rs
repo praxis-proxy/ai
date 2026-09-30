@@ -14,6 +14,7 @@
 //!    hoisted into a Chat Completions system message) and the OpenAI response is translated back into an Anthropic
 //!    message.
 //! 3. Client credentials are stripped and the backend's own Bearer token is injected.
+//! 4. Native token counting remains untouched when the backend also serves that endpoint.
 //!
 //! Like the native tests, `credential_injection` and `basic_auth` resolve their
 //! secrets at pipeline-build time. `std::env::set_var` is `unsafe` (and
@@ -210,6 +211,46 @@ fn transform_vllm_rewrites_message_path_and_translates_response() {
         "POST /v1/messages must be rewritten to /v1/chat/completions, got: {}",
         forwarded.uri
     );
+
+    drop(proxy);
+}
+
+#[test]
+fn transform_vllm_preserves_native_count_tokens_when_backend_supports_it() {
+    let count_response = r#"{"input_tokens":4}"#;
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, count_response.to_owned()),
+        (200, count_response.to_owned()),
+        (200, count_response.to_owned()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let config = transform_vllm_config(proxy_port, backend.port());
+    let proxy = start_proxy(&config);
+
+    let request = serde_json::json!({
+        "model": "qwen3-8b",
+        "messages": [{"role": "user", "content": "Count these tokens"}],
+    });
+    let raw = http_send(
+        proxy.addr(),
+        &json_post_with_header("/v1/messages/count_tokens", &request.to_string(), &gateway_auth_line()),
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "native count-tokens response should pass through"
+    );
+    assert_eq!(parse_body(&raw), count_response);
+    let requests = backend.requests();
+    let forwarded = requests
+        .iter()
+        .find(|r| r.method == "POST")
+        .expect("backend should receive a POST request");
+    assert_eq!(forwarded.uri, "/v1/messages/count_tokens");
+    let body: serde_json::Value = serde_json::from_str(&forwarded.body).expect("forwarded body should be JSON");
+    assert_eq!(body, request, "count-tokens body must not be translated");
 
     drop(proxy);
 }

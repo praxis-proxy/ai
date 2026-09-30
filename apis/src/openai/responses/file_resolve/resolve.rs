@@ -597,7 +597,7 @@ struct FileMetadata {
 }
 
 /// Resolved file content ready for inlining.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct ResolvedFile {
     /// Base64-encoded file content (no `data:` prefix).
     pub(super) base64: String,

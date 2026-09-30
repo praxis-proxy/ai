@@ -479,9 +479,9 @@ fn canonicalize_restores_lowered_client_tool_terminal_snapshot() {
         json!([{"type": "custom", "name": "run_python"}]),
         "tools restored to the client's custom declaration"
     );
-    assert!(
-        state.response_object.get("tool_choice").is_none(),
-        "a Null tool_choice echo removes the field"
+    assert_eq!(
+        state.response_object["tool_choice"], "auto",
+        "a Null tool_choice echo normalizes to auto"
     );
     assert!(
         !state.response_object.to_string().contains("agentic_ns__"),

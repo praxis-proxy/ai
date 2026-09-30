@@ -190,6 +190,9 @@ filter_chains:
                     routes:
                       - path_prefix: "/"
                         cluster: "stateful"
+      # Classification preserves provider-owned fields. The managed-path
+      # validator owns rejection of unsupported background execution.
+      - filter: openai_responses_validate
       - filter: router
         routes:
           - path_prefix: "/"

@@ -369,10 +369,7 @@ def _write_reasoning_config(praxis_port: int, db_path: str) -> str:
     config = config.replace("127.0.0.1:3001", _vllm_endpoint())
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
-    return path
+    return _persist_config(config)
 
 
 def _write_reasoning_backend_config(
@@ -396,10 +393,25 @@ def _write_reasoning_backend_config(
     config = config.replace("dialect: vllm", f"dialect: {dialect}")
     config = _patch_store_backend(config, db_path)
 
-    fd, path = tempfile.mkstemp(suffix=".yaml")
-    with os.fdopen(fd, "w") as f:
-        f.write(config)
-    return path
+    return _persist_config(config)
+
+
+def test_reasoning_config_writers_inherit_root_override(tmp_path, monkeypatch):
+    """Keep every reasoning fixture compatible with the root-run GPU worker."""
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    db_path = str(tmp_path / "responses.db")
+    paths = [
+        _write_reasoning_config(18_080, db_path),
+        _write_reasoning_backend_config(18_081, db_path, 18_082),
+    ]
+    try:
+        for path in paths:
+            with open(path) as config_file:
+                config = config_file.read()
+            assert config.count("allow_root: true") == 1, config
+    finally:
+        for path in paths:
+            os.unlink(path)
 
 
 def _write_compact_config(
@@ -468,7 +480,9 @@ def _write_web_search_chat_streaming_config(
 def _wait_for_proxy(
     port: int, proc: subprocess.Popen, log_path: str, timeout: float = 30.0
 ) -> None:
+    """Wait for the listener and any asynchronous store provisioning."""
     deadline = time.monotonic() + timeout
+    readiness_url = f"http://127.0.0.1:{port}/v1/responses/__praxis_readiness__"
     while time.monotonic() < deadline:
         # A fatal config/startup error makes Praxis exit before it ever binds
         # the port. Surface its logs immediately instead of waiting out the
@@ -481,11 +495,29 @@ def _wait_for_proxy(
             )
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                return
+                pass
         except OSError:
             time.sleep(0.2)
+            continue
+
+        try:
+            response = httpx.get(
+                readiness_url,
+                headers=TRUSTED_OWNER_HEADERS,
+                timeout=0.5,
+            )
+        except httpx.HTTPError:
+            time.sleep(0.2)
+            continue
+        if not (
+            response.status_code == 503
+            and "Persisted state is still initializing." in response.text
+        ):
+            return
+        time.sleep(0.2)
     raise TimeoutError(
-        f"Praxis did not start within {timeout}s on port {port}:\n{_read_log_tail(log_path)}"
+        f"Praxis did not become ready within {timeout}s on port {port}:\n"
+        f"{_read_log_tail(log_path)}"
     )
 
 
@@ -2810,10 +2842,14 @@ class TestResponsesReasoningVLLM:
             reasoning={"effort": "low"},
             temperature=0,
             store=True,
-            max_output_tokens=256,
+            # The continuation contract accepts only completed stored
+            # responses. Leave enough room for Qwen3's reasoning block and
+            # terminal answer instead of treating a token-capped response as a
+            # valid continuation parent.
+            max_output_tokens=1024,
         )
 
-        assert response.status in ("completed", "incomplete"), response.status
+        assert response.status == "completed", response.status
         output_types = [item.type for item in response.output]
         assert output_types, "response must carry at least one output item"
 
@@ -4722,6 +4758,164 @@ class TestAgenticLoopVLLM:
             f"once; got: {[item.type for item in response.output]}"
         )
         assert {item.name for item in mcp_calls} == {"get_weather", "get_time"}
+
+    @requires_vllm_compat
+    def test_mcp_approval_batch_resume_executes_multiple_approved_tools(
+        self,
+        agentic_client,
+        agentic_proxy,
+    ):
+        """Issue #1146: two approval-gated MCP calls emitted in one model
+        round, both approved in a SINGLE resume batch, must both execute.
+
+        The pre-fix dispatcher rejected any ``mcp_approval_response`` batch
+        with more than one item, so this whole flow returned a 400.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "utilities",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather", "get_time"],
+                "require_approval": "always",
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        approval_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call both get_weather and get_time for Paris in the "
+                "same turn before answering. Do not omit either function. "
+                "/no_think"
+            ),
+            tools=tools,
+            parallel_tool_calls=True,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        approval_requests = [
+            item for item in approval_response.output
+            if item.type == "mcp_approval_request"
+        ]
+        assert len(approval_requests) == 2, (
+            "both approval-gated MCP calls should emit an approval request; "
+            f"got: {[item.type for item in approval_response.output]}"
+        )
+        assert {req.name for req in approval_requests} == {"get_weather", "get_time"}
+        assert MCPHandler.tool_call_count() == calls_before, (
+            "no MCP tool must execute before approval"
+        )
+
+        final_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            previous_response_id=approval_response.id,
+            input=[
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": req.id,
+                    "approve": True,
+                }
+                for req in approval_requests
+            ],
+            tools=tools,
+            parallel_tool_calls=True,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        assert MCPHandler.tool_call_count() == calls_before + 2, (
+            "approving both requests in one batch must execute both MCP tools"
+        )
+        mcp_calls = [
+            item for item in final_response.output if item.type == "mcp_call"
+        ]
+        assert {item.name for item in mcp_calls} == {"get_weather", "get_time"}, (
+            "approved batch should contain both MCP results; got: "
+            f"{[item.type for item in final_response.output]}"
+        )
+
+    @requires_vllm_compat
+    def test_mcp_approval_batch_resume_mixed_approve_and_deny(
+        self,
+        agentic_client,
+        agentic_proxy,
+    ):
+        """Issue #1146: a resume batch that approves one call and denies the
+        other executes only the approved tool.
+
+        The denied call must not reach the MCP server; only the approved
+        ``get_weather`` produces an ``mcp_call`` in the resumed response.
+        """
+        _, mcp_port, _ = agentic_proxy
+        tools = [
+            {
+                "type": "mcp",
+                "server_label": "utilities",
+                "server_url": f"http://127.0.0.1:{mcp_port}/mcp",
+                "allowed_tools": ["get_weather", "get_time"],
+                "require_approval": "always",
+            }
+        ]
+        calls_before = MCPHandler.tool_call_count()
+
+        approval_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            input=(
+                "You MUST call both get_weather and get_time for Paris in the "
+                "same turn before answering. Do not omit either function. "
+                "/no_think"
+            ),
+            tools=tools,
+            parallel_tool_calls=True,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        by_name = {
+            item.name: item
+            for item in approval_response.output
+            if item.type == "mcp_approval_request"
+        }
+        assert set(by_name) == {"get_weather", "get_time"}, (
+            "both approval-gated MCP calls should emit an approval request; "
+            f"got: {[item.type for item in approval_response.output]}"
+        )
+
+        final_response = agentic_client.responses.create(
+            model=VLLM_MODEL,
+            previous_response_id=approval_response.id,
+            input=[
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": by_name["get_weather"].id,
+                    "approve": True,
+                },
+                {
+                    "type": "mcp_approval_response",
+                    "approval_request_id": by_name["get_time"].id,
+                    "approve": False,
+                },
+            ],
+            tools=tools,
+            parallel_tool_calls=True,
+            store=True,
+            max_output_tokens=512,
+        )
+
+        assert MCPHandler.tool_call_count() == calls_before + 1, (
+            "only the approved MCP tool must execute; the denied call must not "
+            "reach the server"
+        )
+        mcp_call_names = [
+            item.name for item in final_response.output if item.type == "mcp_call"
+        ]
+        assert mcp_call_names == ["get_weather"], (
+            "only the approved call should produce an mcp_call; got: "
+            f"{[item.type for item in final_response.output]}"
+        )
 
     def test_mcp_tool_streams_terminal_round_as_one_logical_response(
         self,
@@ -7119,6 +7313,148 @@ def test_invalid_tool_choice_raises_bad_request(openai_client):
     assert "tool_choice" in str(exc_info.value).lower()
 
 
+def test_null_tool_choice_succeeds_sdk(chat_streaming_client):
+    """Verify null is omitted upstream and normalized to auto for the client."""
+    request_start = len(SimulatorBackendHandler.recorded_requests)
+    response = chat_streaming_client.responses.create(
+        model=VLLM_MODEL,
+        input="Hello",
+        tools=[
+            {
+                "type": "function",
+                "name": "test_tool",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ],
+        tool_choice=None,
+    )
+    assert response.status == "completed"
+    assert response.tool_choice == "auto"
+
+    if VLLM_TEST_BACKEND == "simulator":
+        recorded = [
+            body
+            for path, body in SimulatorBackendHandler.recorded_requests[request_start:]
+            if path.rstrip("/").endswith("/v1/chat/completions")
+        ]
+        assert len(recorded) == 1, recorded
+        translated = recorded[0]
+        assert "tool_choice" not in translated, translated
+        assert translated["tools"] == [
+            {
+                "type": "function",
+                "function": {
+                    "name": "test_tool",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+
+@pytest.mark.parametrize(
+    "choice_case,tool_choice,with_tools",
+    [
+        pytest.param("null", None, True, id="null-with-tools"),
+        pytest.param("null", None, False, id="null-without-tools"),
+        pytest.param("omitted", None, True, id="omitted-with-tools"),
+        pytest.param("omitted", None, False, id="omitted-without-tools"),
+        pytest.param("value", "none", True, id="none-with-tools"),
+        pytest.param("value", "none", False, id="none-without-tools"),
+        pytest.param("value", "auto", True, id="auto-with-tools"),
+        pytest.param("value", "auto", False, id="auto-without-tools"),
+        pytest.param(
+            "value",
+            {"type": "function", "name": "test_tool"},
+            True,
+            id="forced-function-with-tools",
+        ),
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True])
+@requires_vllm_compat
+def test_valid_tool_choice_variants_raw_http(
+    chat_streaming_client, choice_case, tool_choice, with_tools, stream
+):
+    """Verify translated tool_choice variants in buffered and streaming modes."""
+    body = {
+        "model": VLLM_MODEL,
+        "input": "Hello",
+        "stream": stream,
+    }
+    if choice_case != "omitted":
+        body["tool_choice"] = tool_choice
+    if with_tools:
+        body["tools"] = [
+            {
+                "type": "function",
+                "name": "test_tool",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+
+    raw = httpx.post(
+        f"{str(chat_streaming_client.base_url).rstrip('/')}/responses",
+        headers={"Authorization": "Bearer test"},
+        json=body,
+        timeout=30,
+    )
+    assert raw.status_code == 200, (
+        f"Failed for case={choice_case}, choice={tool_choice}, "
+        f"tools={with_tools}, stream={stream}: {raw.text}"
+    )
+
+    expected_choice = "auto" if choice_case in {"null", "omitted"} else tool_choice
+    if not stream:
+        data = raw.json()
+        assert data["tool_choice"] == expected_choice
+    else:
+        # Check that emitted SSE response objects carry normalized tool_choice
+        for line in raw.text.splitlines():
+            if line.startswith("data: "):
+                try:
+                    event = json.loads(line[6:])
+                    if isinstance(event, dict) and "response" in event:
+                        assert event["response"]["tool_choice"] == expected_choice
+                except json.JSONDecodeError:
+                    pass
+
+
+@pytest.mark.parametrize(
+    "malformed_choice",
+    [
+        42,
+        {"name": "test_tool"},  # missing "type" discriminator
+        "invalid_choice",
+    ],
+)
+@pytest.mark.parametrize("stream", [False, True])
+@requires_vllm_compat
+def test_malformed_tool_choice_variants_raw_http(
+    chat_streaming_client, malformed_choice, stream
+):
+    """Verify malformed tool_choice variants return 400 over raw HTTP in buffered and streaming modes."""
+    raw = httpx.post(
+        f"{str(chat_streaming_client.base_url).rstrip('/')}/responses",
+        headers={"Authorization": "Bearer test"},
+        json={
+            "model": VLLM_MODEL,
+            "input": "Hello",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "test_tool",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            "tool_choice": malformed_choice,
+            "stream": stream,
+        },
+        timeout=30,
+    )
+    assert raw.status_code == 400
+    assert "tool_choice" in raw.text.lower() or "invalid" in raw.text.lower()
+
+
 # ---------------------------------------------------------------------------
 # openai_file_resolve outbound-chain (fully stubbed upstreams; no vLLM/OGX)
 # ---------------------------------------------------------------------------
@@ -7402,6 +7738,149 @@ class TestFileResolveOutboundChain:
         assert all(h == "file-resolve" for h in files_stub.callout_headers), (
             files_stub.callout_headers
         )
+
+
+# ---------------------------------------------------------------------------
+# Model rewrite on Chat Completions
+# ---------------------------------------------------------------------------
+
+MODEL_REWRITE_CONFIG_PATH = "examples/configs/openai/responses/model-rewrite.yaml"
+
+# The client-facing name the alias table maps onto the real backend model.
+# Matches the shipped example's "codex-*" wildcard alias.
+MODEL_REWRITE_CLIENT_MODEL = "codex-mini-2026-06-24"
+
+
+def _write_model_rewrite_config(praxis_port: int, backend_endpoint: str) -> str:
+    """Patch the shipped model-rewrite example for the selected backend.
+
+    Substituting the backend model name for the example's `llama-3.3-70b`
+    updates the alias target, the `default_model`, and the router's
+    `x-praxis-ai-effective-model` match in one pass, so the rewritten model
+    is both what the backend receives and what selects the cluster. All
+    three example clusters point at the one backend under test.
+    """
+    with open(MODEL_REWRITE_CONFIG_PATH) as f:
+        config = f.read()
+
+    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    for placeholder in ("127.0.0.1:3001", "127.0.0.1:3002", "127.0.0.1:3003"):
+        config = config.replace(placeholder, backend_endpoint)
+    config = config.replace("llama-3.3-70b", VLLM_MODEL)
+
+    return _persist_config(config)
+
+
+@pytest.fixture(scope="session")
+def model_rewrite_proxy(tmp_path_factory, request, backend_endpoint):
+    """Start a Praxis proxy with the shipped model-rewrite pipeline."""
+    port = _free_port()
+    config_path = _write_model_rewrite_config(port, backend_endpoint)
+    binary = _find_binary()
+
+    log_dir = tmp_path_factory.mktemp("model-rewrite")
+    log_path = str(log_dir / "praxis.log")
+    log_file = open(log_path, "w")
+    started = False
+
+    proc = subprocess.Popen(
+        [binary, "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for_proxy(port, proc, log_path)
+        started = True
+        yield port
+    finally:
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if not started or request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(
+                    f"\n=== Model rewrite proxy logs ===\n{f.read()}",
+                    file=sys.stderr,
+                )
+        os.unlink(config_path)
+
+
+@pytest.fixture(scope="session")
+def model_rewrite_client(model_rewrite_proxy):
+    """Return an OpenAI client pointed at the model-rewrite proxy."""
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{model_rewrite_proxy}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=300,
+    )
+
+
+class TestModelRewriteChatCompletionsVLLM:
+    """openai_responses_model_rewrite applied to POST /v1/chat/completions.
+
+    A gateway advertises one client-facing model name while the selected
+    backend requires its own. The filter rewrites the top-level `model`
+    before the request leaves the proxy, so the backend never sees the
+    client-facing name and never 404s on an unknown model.
+    """
+
+    def test_chat_completions_alias_rewritten_for_backend(
+        self, model_rewrite_client
+    ):
+        completion = model_rewrite_client.chat.completions.create(
+            model=MODEL_REWRITE_CLIENT_MODEL,
+            messages=[{"role": "user", "content": "Say hi."}],
+            max_tokens=16,
+        )
+
+        assert completion.model == VLLM_MODEL, (
+            f"backend should report the rewritten model, got {completion.model!r}"
+        )
+        assert completion.choices, "backend should return at least one choice"
+
+    def test_chat_completions_streaming_alias_rewritten_for_backend(
+        self, model_rewrite_client
+    ):
+        stream = model_rewrite_client.chat.completions.create(
+            model=MODEL_REWRITE_CLIENT_MODEL,
+            messages=[{"role": "user", "content": "Say hi."}],
+            max_tokens=16,
+            stream=True,
+        )
+
+        models = set()
+        chunks = 0
+        for chunk in stream:
+            chunks += 1
+            if chunk.model:
+                models.add(chunk.model)
+
+        assert chunks, "streamed chat completion should yield at least one chunk"
+        assert models == {VLLM_MODEL}, (
+            f"every chunk should report the rewritten model, got {models!r}"
+        )
+
+    def test_chat_completions_default_model_injected(self, model_rewrite_proxy):
+        """A request with no `model` picks up the configured default_model.
+
+        The SDK requires `model`, so this drives the raw HTTP endpoint.
+        """
+        response = httpx.post(
+            f"http://127.0.0.1:{model_rewrite_proxy}/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Say hi."}],
+                "max_tokens": 16,
+            },
+            timeout=300.0,
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["model"] == VLLM_MODEL, response.text
 
 
 if __name__ == "__main__":

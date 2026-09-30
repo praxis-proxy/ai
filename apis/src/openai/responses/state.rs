@@ -487,7 +487,7 @@ pub(crate) struct ResponsesState {
     /// `mcp_approval_response`. Consent provenance lives here and in the
     /// store, never in the (client-influenced) conversation history.
     #[cfg(feature = "store")]
-    pub pending_approvals: Vec<crate::store::PendingApprovalRecord>,
+    pub pending_approvals: Vec<praxis_ai_store::PendingApprovalRecord>,
 
     /// Whether the store filter armed persistence for this exchange.
     ///
@@ -923,6 +923,7 @@ impl ResponsesState {
         let persisted_messages = messages.clone();
         let tool_choice = body
             .get("tool_choice")
+            .filter(|v| !v.is_null())
             .cloned()
             .unwrap_or_else(|| serde_json::Value::String("auto".to_owned()));
 

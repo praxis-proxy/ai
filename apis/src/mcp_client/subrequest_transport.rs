@@ -2655,6 +2655,16 @@ mod tests {
         assert_eq!(headers.get(http::header::ACCEPT).unwrap(), "text/event-stream");
     }
 
+    #[test]
+    fn get_stream_headers_carry_session_id() {
+        let session: Arc<str> = Arc::from("mock-mcp-session-1");
+        let headers = client()
+            .build_get_stream_headers(None, HashMap::new(), Some(&session), None)
+            .unwrap();
+        assert_eq!(headers.get(session_id_header()).unwrap(), "mock-mcp-session-1");
+        assert_eq!(headers.get(http::header::ACCEPT).unwrap(), "text/event-stream");
+    }
+
     // -- GET stream auth handling (F3) --
 
     #[tokio::test]

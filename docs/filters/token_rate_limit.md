@@ -7,11 +7,47 @@ Token-denominated rate limiter: reserves an estimated cost at admission, reconci
 
 ## Configuration Notes
 
-Experimental: requires the `token-rate-limit-filter` cargo feature, which is off by default and activates the `experimental` marker. This filter delivers the agreed M1/M2/M6 milestone scope, but its parent proposal is not yet `accepted` and open questions remain (HA/clustered-Valkey failure modes, and the relationship to Kuadrant's `TokenRateLimitPolicy` -- see `ai#127`). The configuration surface may change between releases.
+Experimental: requires the `token-rate-limit-filter` cargo feature, which is off by default and activates the `experimental` marker. This filter delivers the agreed M1/M2/M6/M7 milestone scope, but its parent proposal is not yet `accepted` and open questions remain (HA/clustered-Valkey failure modes, and the relationship to Kuadrant's `TokenRateLimitPolicy` -- see `ai#127`). The configuration surface may change between releases.
 
 Mirrors the `rules:`/`match:` shape from the `00121_token-rate-limiting` proposal in `praxis-proxy/enhancements`, scoped to this milestone's static header-value matchers, per-rule algorithm choice, configurable estimation strategies (M3, see [`EstimationConfig`]), and M4 token-type weights (`default_weights` / per-rule `weights`). CEL matchers and soft-limit tiers are still out of scope (see the module doc comment) -- upstream itself defers those.
 
 Assumes request identity has already been resolved upstream (this filter doesn't authenticate callers) -- a catch-all rule (no `match:`) reserves quota for every request that reaches it, including probes and health checks. Scope rules with explicit `match:` conditions, or place an identity/auth filter earlier in the pipeline. Tracked as follow-on integration work in `grid#101`.
+
+Observability is group-level by rule, never by user. Metrics carry only bounded `rule`, `algorithm`, `backend`, `result`, and `capacity` labels; accounting logs and optional OpenTelemetry spans likewise omit raw subject and bucket-key values. The Prometheus contract is:
+
+- `praxis_trl_requests_total{rule,result}` (`admitted` or `denied`): budget decisions only. Requests rejected before a decision are counted by `praxis_trl_unauthenticated_total` (401, no trusted subject) and `praxis_trl_backend_errors_total` (503, fail closed) instead.
+
+- `praxis_trl_unauthenticated_total{rule}`
+
+- `praxis_trl_tokens_reserved_total{rule}`
+
+- `praxis_trl_tokens_reconciled_total{rule}`
+
+- `praxis_trl_tokens_refunded_total{rule}`
+
+- `praxis_trl_tokens_overage_total{rule}`
+
+- `praxis_trl_reservations_total{rule,result}` (`reconciled` or `orphaned`)
+
+- `praxis_trl_soft_tier_activations_total{rule,capacity}`
+
+- `praxis_trl_backend_errors_total{rule,backend}`: failed reservations (the 503 path) and reconciliations abandoned after their retries.
+
+- `praxis_trl_backend_reconciliation_total{rule,backend,result}`: reconciliations completed by a Valkey worker.
+
+- `praxis_trl_budget_remaining{rule,algorithm}`
+
+- `praxis_trl_reservations_active{rule}`
+
+- `praxis_trl_active_keys{rule}`
+
+Every previous `praxis_ai_token_rate_limit_*` name has moved to this prefix; no compatibility aliases are emitted.
+
+`budget_remaining` is the sum of the latest calculated remaining balances for the rule's retained keys, and `active_keys` is how many balances contribute. Window aging and refill are evaluated lazily during normal backend operations, so both are snapshots rather than continuously refreshed values. Like all Prometheus gauges they are f64 and saturate at the largest exactly representable integer (2^53 - 1).
+
+Gauge scope depends on the backend. With the `memory` backend every gauge describes this process only, so aggregate replicas with `sum`. With the `valkey` backend every replica exports the rule-wide value it last observed from the shared store, so aggregate replicas with `max`; a replica that stops seeing traffic for a rule keeps exporting its last observation until it does. Valkey applies expiry incrementally on each admission, so its counts can briefly include entries that have just expired.
+
+Admissions, denials, reconciliations, and backend failures also emit structured records on the `praxis_ai::token_rate_limit::accounting` tracing target: `INFO` for admissions and settlements, `WARN` for failures. They are on by default at `INFO`, so every admitted or denied request produces one line in the operational log stream; keep only failures with `runtime.log_overrides: {"praxis_ai::token_rate_limit::accounting": "warn"}`, and separate them from other operational logs by filtering on the `target` field. The records contain bounded policy and token-count fields only. They are best-effort operational audit records, not a durable billing source.
 
 ## Configuration
 
@@ -41,7 +77,13 @@ Assumes request identity has already been resolved upstream (this filter doesn't
 | `rules[].weights.cached_input` | number | no | Weight for prompt-cache hits (`token.cache_read`). A value below `1.0` cheapens cached input; the proposal's example is `0.1`. |
 | `rules[].weights.cache_write` | number | no | Weight for prompt-cache writes (`token.cache_write`). Anthropic cache creation is typically priced *above* uncached input; omit to keep `1.0`. |
 | `rules[].weights.reasoning` | number | no | Weight for reasoning / thinking tokens (`token.reasoning`). |
-| `key` | `global` \| `authenticated_subject` | no | Trusted request identity used to partition each rule's budget. The default preserves the historical single global bucket. |
+| `rules[].tiers` | TierConfig[] | no | Graduated enforcement tiers (proposal S1). Each tier defines a usage threshold and an action (`inject` or `deny`). When the backend admits a request, every tier whose `capacity` is at or below the current usage level fires: - `inject`: the request continues and the tier's `headers` are set on the upstream request. - `deny`: hard-reject with 429 (same as M6; must be the last tier). Tiers must have strictly ascending `capacity` values. At most one `deny` tier is allowed, and it must be the last. Its `capacity` must equal the algorithm's own `capacity`. When omitted, the rule behaves as before: a single hard deny at the algorithm's `capacity`. |
+| `rules[].tiers[].capacity` | integer | yes | Usage threshold at which this tier activates. |
+| `rules[].tiers[].action` | ActionConfig | yes | What happens when usage crosses this tier's threshold. |
+| `rules[].tiers[].action.type` | `inject` \| `deny` | yes | Whether to continue with injected headers or hard-reject. |
+| `rules[].tiers[].action.headers` | object<string, string> | no | Headers to inject on the upstream request (required for `inject`, ignored for `deny`). |
+| `key` | KeySpec | no | How this filter partitions each matched rule's token budget. Accepts a scalar (`global`, `authenticated_subject`, `ip`, `model`), a list of dimensions (composite keys), a single dimension mapping (`header: x-tenant-id`), or a full spec with `dimensions` and `missing`. Defaults to one shared global bucket. Composite dimension *order does not matter*: compiled dimensions are sorted into a canonical order so reordering a list cannot silently reset live budgets. `ip` and `model` are as caller-controlled as `header` when they come from a forwarding header or a client-supplied model string. Pair them with `max_keys` so one client cannot fill the table. |
+| `max_keys` | integer | no | Soft cap on distinct budget keys retained at once, **per rule**. Bounds cardinality from per-header, per-IP, and composite keying. Defaults to [`super::MAX_KEYS`]. A new distinct key past this cap is denied (429, accounting outcome `key_capacity`) rather than growing without bound. In-process ledgers enforce the cap per rule. Valkey enforces it against the per-rule retained-key set (`{namespace}:v1:rule:{hash}:keys`, or the token-bucket equivalent), not the namespace-wide set. Idle in-process keys are reaped by ledger cleanup, which walks a bounded number of entries per request (including busy ones) so a single in-window key cannot pin the table at this cap. |
 | `backend` | BackendConfig | no | Where every rule's admission state lives: in-process (default, one budget per gateway instance) or a shared Valkey backend (one budget shared across every gateway instance/replica). One backend for the whole filter, not per rule -- rules already share Valkey key-space isolation via `namespace`/rule-name hashing, so per-rule backend selection bought no isolation benefit, only a separate Valkey connection per rule pointed at the same URL. Revisit if a real deployment ever needs to mix in-process and Valkey rules in one filter instance. |
 | `backend.kind` | `memory` \| `valkey` | no | Which backend implementation to use. |
 | `backend.url` | string | no | Backend connection URL. Supports one `${ENV_VAR}` reference, so credentials/hostnames don't need to be committed to config. Required when `kind: valkey`, ignored otherwise. |
@@ -57,6 +99,18 @@ Assumes request identity has already been resolved upstream (this filter doesn't
 
 ```yaml
 filter: token_rate_limit
+key:                               # optional: defaults to one shared bucket per rule
+  - authenticated_subject          # global | authenticated_subject | ip | model | header: NAME
+  - model                          # header first (x-model); body only if already buffered
+# key:                             # IP via a forwarding header (right-most hop after trusted_hops)
+#   ip:
+#     header: x-forwarded-for
+#     trusted_hops: 1
+#     ipv6_prefix: 64
+# key:                             # named header, fail-open when absent
+#   header: x-tenant-id
+#   missing: fallback
+max_keys: 100000                   # optional: per-rule cap on distinct budget keys
 backend:                           # optional: defaults to in-process state, shared by every rule
   kind: valkey                      # memory (default) | valkey
   url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"

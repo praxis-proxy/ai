@@ -9,7 +9,7 @@ use std::{
 };
 
 use http::{HeaderValue, header};
-use praxis_ai_apis::token_cache::TokenCache;
+use praxis_ai_apis::{subrequest::SubRequestClient, token_cache::TokenCache};
 use praxis_filter::{FilterError, parse_filter_config};
 use tracing::warn;
 
@@ -85,6 +85,9 @@ pub struct GcpAdcFilter {
     /// [`praxis_ai_apis::token_cache`].
     cache: TokenCache<HeaderValue>,
 
+    /// Shared sub-request client for metadata server callouts.
+    subrequest_client: SubRequestClient,
+
     /// Resolved credential source.
     source: TokenSource,
 
@@ -108,11 +111,16 @@ impl GcpAdcFilter {
     /// Returns [`FilterError`] if `service_account` or `metadata_host`
     /// are structurally unsafe, a field is set that its `source` does
     /// not use, or ADC file resolution fails.
-    fn new(config: &GcpAdcConfig, application_credentials: Option<&std::path::Path>) -> Result<Self, FilterError> {
+    fn new(
+        config: &GcpAdcConfig,
+        application_credentials: Option<&std::path::Path>,
+        subrequest_client: SubRequestClient,
+    ) -> Result<Self, FilterError> {
         validate_config(config)?;
         let source = resolve_token_source(config, application_credentials)?;
         Ok(Self {
             cache: TokenCache::new(EXPIRY_SKEW),
+            subrequest_client,
             source,
             scope: config.scope.clone(),
             metadata_host: config.metadata_host.clone(),
@@ -120,7 +128,8 @@ impl GcpAdcFilter {
         })
     }
 
-    /// Parse YAML config and build a boxed filter instance.
+    /// Parse YAML config and build a boxed filter instance with an
+    /// isolated [`SubRequestClient`].
     ///
     /// # Errors
     ///
@@ -128,11 +137,34 @@ impl GcpAdcFilter {
     /// resolution fails.
     pub(crate) fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn praxis_filter::HttpFilter>, FilterError> {
         let config: GcpAdcConfig = parse_filter_config("gcp_adc", config)?;
+        let client = crate::isolated_subrequest_client(4);
         Ok(Box::new(Self::new(
             &config,
             std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS")
                 .as_deref()
                 .map(std::path::Path::new),
+            client,
+        )?))
+    }
+
+    /// Parse YAML config and build a boxed filter instance using the
+    /// shared [`SubRequestClient`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the config is malformed or credential
+    /// resolution fails.
+    pub(crate) fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: SubRequestClient,
+    ) -> Result<Box<dyn praxis_filter::HttpFilter>, FilterError> {
+        let config: GcpAdcConfig = parse_filter_config("gcp_adc", config)?;
+        Ok(Box::new(Self::new(
+            &config,
+            std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS")
+                .as_deref()
+                .map(std::path::Path::new),
+            client,
         )?))
     }
 }
@@ -158,7 +190,13 @@ impl praxis_filter::HttpFilter for GcpAdcFilter {
         let fetched = self
             .cache
             .get_or_refresh(|| {
-                token::fetch_pinned(&self.source, &self.metadata_host, &self.scope, TOKEN_REQUEST_TIMEOUT)
+                token::fetch_pinned(
+                    &self.subrequest_client,
+                    &self.source,
+                    &self.metadata_host,
+                    &self.scope,
+                    TOKEN_REQUEST_TIMEOUT,
+                )
             })
             .await;
         match fetched {

@@ -937,20 +937,17 @@ async fn mode_stateful_when_tools_present() {
 }
 
 #[tokio::test]
-async fn background_true_is_rejected_even_when_invalid_formats_continue() {
-    let action = run_filter_raw(
+async fn background_true_is_classified_for_provider_aware_validation() {
+    let ctx = run_filter(
         "on_invalid: continue",
         r#"{"input":"test","store":false,"background":true}"#,
     )
     .await;
-    let FilterAction::Reject(rejection) = action else {
-        panic!("background=true should be rejected before routing");
-    };
-    assert_eq!(rejection.status, 400);
-    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
-    assert_eq!(body["error"]["type"], "invalid_request_error");
-    assert_eq!(body["error"]["code"], "invalid_request_error");
-    assert_eq!(body["error"]["message"], "background mode is not supported");
+    assert_eq!(
+        ctx.get_metadata("openai_responses_format.background"),
+        Some("true"),
+        "classification must preserve background so managed-provider validation can reject it"
+    );
 }
 
 #[tokio::test]

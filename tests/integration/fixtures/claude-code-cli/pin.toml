@@ -78,8 +78,10 @@ flags = [
 ]
 
 [vllm]
-# Container image pinned by digest — the SAME CUDA image the GPU full suite runs
-# (env.VLLM_GPU_IMAGE in .github/workflows/vllm-integration.yaml). vLLM v0.29.0
+# Container image pinned by digest for Claude Code acceptance
+# (env.VLLM_GPU_IMAGE in .github/workflows/vllm-integration.yaml). The GPU full
+# Responses suite builds the model-baked image from vllm/Containerfile instead.
+# vLLM v0.29.0
 # serves the native Anthropic Messages surface (`/v1/messages`,
 # `/v1/messages/count_tokens`) by default, in addition to `/v1/chat/completions`,
 # so one container backs both the native and transformed acceptance paths with no

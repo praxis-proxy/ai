@@ -8,10 +8,9 @@ use std::sync::Arc;
 use serde_json::json;
 
 use super::{
-    CompressionAlgorithm, ConversationItemRecord, ConversationRecord, PendingApprovalRecord, PgTlsConfig,
-    PostgresResponseStore, ResponseRecord, ResponseStoreRegistry, SqliteResponseStore, SslMode, StoreCompressionConfig,
-    StoreError,
-    trait_def::{ConversationItemStore, ResponseStore},
+    CompressionAlgorithm, ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord,
+    PersistedStateBackend, PgTlsConfig, PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+    SqliteResponseStore, SslMode, StoreCompressionConfig, StoreError,
 };
 use crate::openai::{
     include::IncludeFields,
@@ -640,6 +639,66 @@ async fn consume_approvals_concurrent_claims_exactly_once() {
     let rejected = usize::from(a == Some(0)) + usize::from(b == Some(0));
     assert_eq!(claimed, 1, "exactly one concurrent caller must claim the approval");
     assert_eq!(rejected, 1, "exactly one concurrent caller must be rejected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consume_approvals_opposite_order_batches_claim_once() {
+    // Two concurrent resumes consume the SAME two ids in OPPOSITE caller order.
+    // SQLite serializes writers so it cannot deadlock, but the deterministic
+    // id-sorted locking must still make exactly one batch claim both rows while
+    // the other is rejected, and the rejected batch must report an index into
+    // its OWN caller slice.
+    let dir = tempfile::tempdir().expect("temp dir should be created");
+    let db_path = dir.path().join("opposite_order_consume.db");
+    let url = format!("sqlite://{}?mode=rwc", db_path.display());
+    let store = Arc::new(
+        SqliteResponseStore::new(&url, "test_responses", "test_conversation_messages", None, None, None)
+            .await
+            .expect("store creation should succeed"),
+    );
+    seed_pending(store.as_ref(), "tenant_a", RESP, &["call_1", "call_2"]).await;
+
+    let store_a = Arc::clone(&store);
+    let store_b = Arc::clone(&store);
+    let task_a = tokio::spawn(async move {
+        store_a
+            .consume_approvals(
+                &crate::test_utils::test_owner("tenant_a"),
+                RESP,
+                &["call_1", "call_2"],
+                1000,
+            )
+            .await
+    });
+    let task_b = tokio::spawn(async move {
+        store_b
+            .consume_approvals(
+                &crate::test_utils::test_owner("tenant_a"),
+                RESP,
+                &["call_2", "call_1"],
+                1000,
+            )
+            .await
+    });
+
+    let a = task_a
+        .await
+        .expect("task a should join")
+        .expect("consume a should succeed");
+    let b = task_b
+        .await
+        .expect("task b should join")
+        .expect("consume b should succeed");
+
+    let claimed = usize::from(a.is_none()) + usize::from(b.is_none());
+    assert_eq!(claimed, 1, "exactly one opposite-order batch must claim both approvals");
+    // The loser rejects on the first id it locks (call_1, the sort minimum),
+    // which is index 0 in task a's slice and index 1 in task b's slice.
+    match (a, b) {
+        (Some(idx), None) => assert_eq!(idx, 0, "task a rejects at its own call_1 index"),
+        (None, Some(idx)) => assert_eq!(idx, 1, "task b rejects at its own call_1 index"),
+        other => panic!("exactly one opposite-order batch must win, got {other:?}"),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -2627,8 +2686,8 @@ async fn sqlite_rejects_table_with_incompatible_primary_key() {
         "error should mention the expected id key: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -2679,8 +2738,8 @@ async fn sqlite_rejects_table_with_tenant_leaking_unique_constraint() {
         "error should explain a unique index beyond the primary key is rejected: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -2723,7 +2782,7 @@ async fn sqlite_rejects_table_with_case_insensitive_collation_on_key() {
         msg.to_ascii_lowercase().contains("collation"),
         "error should explain the collation is unsafe: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -2768,7 +2827,7 @@ async fn sqlite_rejects_table_with_non_text_affinity_key() {
         msg.to_ascii_lowercase().contains("affinity"),
         "error should explain the affinity is unsafe: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 // -----------------------------------------------------------------------------
@@ -2795,7 +2854,7 @@ async fn sqlite_stamps_schema_version_on_fresh_db() {
         .fetch_one(&pool)
         .await
         .expect("version row should exist");
-    assert_eq!(version, 3, "fresh store should stamp version 3");
+    assert_eq!(version, 4, "fresh store should stamp version 4");
 }
 
 #[tokio::test]
@@ -2833,8 +2892,8 @@ async fn sqlite_rejects_schema_version_mismatch() {
     );
     assert!(msg.contains("99"), "error should show stored version: {msg}");
     assert!(
-        msg.contains("migration required"),
-        "error should mention migration: {msg}"
+        msg.contains("recreation required"),
+        "error should mention recreation: {msg}"
     );
 }
 
@@ -2897,15 +2956,16 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
         "store must refuse a version-2 database"
     );
 
-    // Apply the documented operator migration: CAST the responses payload
-    // columns to BLOB storage class and bump the schema version.
+    // Apply the documented operator migrations: CAST the responses payload
+    // columns to BLOB storage class and stamp the current schema version. This
+    // fixture has no items table, so v3 -> v4 requires only the version stamp.
     let pool = sqlx::SqlitePool::connect_with(options)
         .await
         .expect("pool should connect");
     for stmt in [
         "UPDATE mr SET response_object = CAST(response_object AS BLOB), \
          input = CAST(input AS BLOB), messages = CAST(messages AS BLOB)",
-        "UPDATE mr_schema_version SET version = 3",
+        "UPDATE mr_schema_version SET version = 4",
     ] {
         sqlx::query(stmt)
             .execute(&pool)
@@ -2917,7 +2977,7 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
     // After migration the store starts and the legacy row reads back intact.
     let store = SqliteResponseStore::new(&url, "mr", "mc", None, None, None)
         .await
-        .expect("store should start on a migrated version-3 database");
+        .expect("store should start on a migrated version-4 database");
 
     let owner = crate::test_utils::test_owner("tenant_a");
     let fetched = store
@@ -3082,7 +3142,7 @@ async fn concurrent_create_items_and_sync_messages_assigns_distinct_positions() 
 #[tokio::test]
 async fn registry_register_and_get_scoped() {
     let registry = ResponseStoreRegistry::new();
-    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(make_store().await);
     registry
         .register(&Arc::from("primary"), Arc::clone(&store))
         .expect("register should succeed");
@@ -3095,7 +3155,7 @@ async fn registry_register_and_get_scoped() {
 #[tokio::test]
 async fn registry_scoped_handle_rejects_a_record_from_another_owner() {
     let registry = ResponseStoreRegistry::new();
-    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(make_store().await);
     registry.register(&Arc::from("primary"), store).unwrap();
     let owner = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "alice").unwrap();
     let other = crate::StateOwner::from_trusted_parts("tenant-a", "issuer-a", "bob").unwrap();
@@ -3122,7 +3182,7 @@ fn registry_get_missing_returns_none() {
 #[tokio::test]
 async fn registry_duplicate_registration_fails() {
     let registry = ResponseStoreRegistry::new();
-    let store: Arc<dyn ResponseStore> = Arc::new(make_store().await);
+    let store: Arc<dyn PersistedStateBackend> = Arc::new(make_store().await);
     let name = Arc::from("dup");
     registry
         .register(&name, Arc::clone(&store))
@@ -3318,24 +3378,26 @@ fn pg_ssl_mode_deserializes_verified_modes() {
 fn pg_ssl_mode_converts_to_pg_ssl_mode() {
     use sqlx::postgres::PgSslMode;
 
+    use super::to_pg_ssl_mode;
+
     assert!(
-        matches!(PgSslMode::from(SslMode::Disable), PgSslMode::Disable),
+        matches!(to_pg_ssl_mode(SslMode::Disable), PgSslMode::Disable),
         "Disable should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::Prefer), PgSslMode::Prefer),
+        matches!(to_pg_ssl_mode(SslMode::Prefer), PgSslMode::Prefer),
         "Prefer should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::Require), PgSslMode::Require),
+        matches!(to_pg_ssl_mode(SslMode::Require), PgSslMode::Require),
         "Require should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::VerifyCa), PgSslMode::VerifyCa),
+        matches!(to_pg_ssl_mode(SslMode::VerifyCa), PgSslMode::VerifyCa),
         "VerifyCa should map"
     );
     assert!(
-        matches!(PgSslMode::from(SslMode::VerifyFull), PgSslMode::VerifyFull),
+        matches!(to_pg_ssl_mode(SslMode::VerifyFull), PgSslMode::VerifyFull),
         "VerifyFull should map"
     );
 }
@@ -3422,8 +3484,8 @@ async fn pg_rejects_table_with_incompatible_primary_key() {
         "error should mention the primary key: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -3457,8 +3519,8 @@ async fn pg_rejects_table_with_tenant_leaking_unique_constraint() {
         "error should explain a unique index beyond the primary key is rejected: {msg}"
     );
     assert!(
-        msg.contains("migration"),
-        "error should tell the operator a migration is required: {msg}"
+        msg.contains("database recreation required"),
+        "error should tell the operator database recreation is required: {msg}"
     );
 }
 
@@ -3491,7 +3553,7 @@ async fn pg_rejects_table_with_deferrable_primary_key() {
         msg.to_ascii_lowercase().contains("deferrable"),
         "error should explain the constraint is deferrable: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -3525,7 +3587,7 @@ async fn pg_rejects_table_with_case_insensitive_collation_on_key() {
         msg.to_ascii_lowercase().contains("collation"),
         "error should explain the collation folds comparisons: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -3557,7 +3619,7 @@ async fn pg_rejects_table_with_citext_key() {
         msg.to_ascii_lowercase().contains("citext"),
         "error should name the case-insensitive type: {msg}"
     );
-    assert!(msg.contains("migration"), "{msg}");
+    assert!(msg.contains("database recreation required"), "{msg}");
 }
 
 #[tokio::test]
@@ -3616,7 +3678,7 @@ async fn pg_rejects_schema_version_mismatch() {
 
 #[tokio::test]
 #[ignore]
-async fn pg_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
+async fn pg_v2_text_schema_migrates_to_v4_bytea_preserving_rows() {
     let fx = PgSchemaFixture::new("mig");
 
     let legacy_v2 = [
@@ -3659,14 +3721,14 @@ async fn pg_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
              ALTER COLUMN messages TYPE BYTEA USING convert_to(messages, 'UTF8')",
             fx.responses
         ),
-        format!("UPDATE {} SET version = 3", fx.version),
+        format!("UPDATE {} SET version = 4", fx.version),
     ];
-    let migrated_v3: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
+    let migrated_v4: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
 
-    let result = fx.init(&migrated_v3, &[]).await;
+    let result = fx.init(&migrated_v4, &[]).await;
     assert!(
         result.is_ok(),
-        "store should start on a migrated version-3 database: {:?}",
+        "store should start on a migrated version-4 database: {:?}",
         result.err()
     );
 }
@@ -4082,6 +4144,66 @@ async fn pg_consume_approvals_batch_is_all_or_nothing_on_replay() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn pg_consume_approvals_opposite_order_batches_do_not_deadlock() {
+    // Two resumes for the same (owner, response) consume the same two ids in
+    // OPPOSITE caller order. Without a deterministic lock order the two
+    // transactions could each hold one row and block on the other, deadlocking
+    // (PostgreSQL aborts one with SQLSTATE 40P01, surfaced here as an error).
+    // consume_approvals sorts ids before locking, so both transactions take
+    // call_1 then call_2 and merely serialize: exactly one claims the batch, the
+    // other is rejected, and neither errors or hangs.
+    let store = Arc::new(make_pg_store().await);
+    seed_pending(store.as_ref(), "tenant_a", RESP, &["call_1", "call_2"]).await;
+
+    let store_a = Arc::clone(&store);
+    let store_b = Arc::clone(&store);
+    let task_a = tokio::spawn(async move {
+        store_a
+            .consume_approvals(
+                &crate::test_utils::test_owner("tenant_a"),
+                RESP,
+                &["call_1", "call_2"],
+                1000,
+            )
+            .await
+    });
+    let task_b = tokio::spawn(async move {
+        store_b
+            .consume_approvals(
+                &crate::test_utils::test_owner("tenant_a"),
+                RESP,
+                &["call_2", "call_1"],
+                1000,
+            )
+            .await
+    });
+
+    let (join_a, join_b) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        (task_a.await, task_b.await)
+    })
+    .await
+    .expect("opposite-order batches must not deadlock");
+    let a = join_a.expect("task a should join").expect("consume a should not error");
+    let b = join_b.expect("task b should join").expect("consume b should not error");
+
+    let claimed = usize::from(a.is_none()) + usize::from(b.is_none());
+    let rejected = usize::from(a.is_some()) + usize::from(b.is_some());
+    assert_eq!(claimed, 1, "exactly one opposite-order batch must claim both approvals");
+    assert_eq!(rejected, 1, "exactly one opposite-order batch must be rejected");
+
+    // Both ids are burned regardless of which batch won: the winner consumed the
+    // whole batch, so a fresh single-id consume of each now finds it gone.
+    for id in ["call_1", "call_2"] {
+        let replay = store
+            .consume_approvals(&crate::test_utils::test_owner("tenant_a"), RESP, &[id], 2000)
+            .await
+            .expect("replay consume should succeed");
+        assert!(replay.is_some(), "the winning batch must have consumed {id}");
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn pg_upsert_and_get_conversation() {
@@ -4438,6 +4560,20 @@ async fn pg_conversation_item_tenant_isolation() {
         .await
         .expect("cross-tenant list should succeed");
     assert!(cross_tenant_list.is_empty(), "tenant_b should see no items");
+
+    let same_id_for_tenant_b = make_conversation_item("item_1", "tenant_b", "conv_2", 1);
+    store
+        .create_test_items(&[same_id_for_tenant_b])
+        .await
+        .expect("the same item ID should be accepted for another tenant");
+
+    for (tenant_id, conversation_id) in [("tenant_a", "conv_1"), ("tenant_b", "conv_2")] {
+        let fetched = store
+            .get_conversation_item(&crate::test_utils::test_owner(tenant_id), conversation_id, "item_1")
+            .await
+            .expect("tenant-scoped get should succeed");
+        assert!(fetched.is_some(), "{tenant_id} should see its own item");
+    }
 }
 
 #[tokio::test]
@@ -5076,4 +5212,21 @@ fn make_response_record(id: &str, tenant_id: &str, created_at: i64) -> ResponseR
         input: json!("test input"),
         messages: json!([{"role": "user", "content": "hello"}]),
     }
+}
+
+/// The SQLite backend satisfies the shared persisted-state contract suite,
+/// proving it adopted the praxis-ai-store traits (the #1258 SQL-adopt check).
+#[tokio::test]
+async fn sqlite_backend_satisfies_the_store_contract() {
+    let store = SqliteResponseStore::new(
+        "sqlite::memory:",
+        "contract_responses",
+        "contract_conversations",
+        Some("contract_items"),
+        None,
+        None,
+    )
+    .await
+    .expect("store creation should succeed");
+    praxis_ai_store::contract_tests::run_contract_suite(&store).await;
 }

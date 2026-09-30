@@ -1,0 +1,110 @@
+# Token Rate Limiting -- Graduated Soft-Limit Tiers (S1)
+#
+# Extends token-rate-limit.yaml with graduated enforcement tiers (proposal
+# S1, ai#881). Each tier defines a usage threshold and an action: `inject`
+# continues the request with headers set on the upstream hop, `deny`
+# hard-rejects with 429.
+#
+# As team-alpha's hourly usage climbs through the tier thresholds:
+#   80,000 tokens  →  X-Token-Hour-Tier: warning
+#   95,000 tokens  →  X-Token-Hour-Tier: degraded
+#  100,000 tokens  →  429 rejection
+#
+# Downstream schedulers (e.g. llm-d) read the injected headers and may
+# route to cheaper models, lower priority, or restrict concurrency —
+# the filter does not control or prescribe downstream behavior.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/token-rate-limit-soft-tiers.yaml
+#   # First request (within budget, no tier breached):
+#   curl -i http://localhost:8080/v1/chat/completions -H 'x-app-id: alpha' -d '{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}'
+#
+# See token-rate-limit.yaml for the full rationale on reservation-based
+# admission, reconciliation, M4 token-type weights, and the `rules:`
+# schema.
+#
+# Tiers must have strictly ascending capacity values. The deny tier (if
+# present) must be last, and its capacity must equal the algorithm's
+# `capacity`. Inject-only tiers (no deny) add headers below the algorithm
+# capacity; requests over capacity are still rejected.
+#
+# Supported token_count provider values:
+#   openai | anthropic | google | bedrock | azure
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path: "/v1/chat/completions"
+            cluster: backend
+
+      - filter: token_rate_limit
+        default_weights:
+          cached_input: 0.1
+          cache_write: 1.25
+          reasoning: 0.9
+        rules:
+          - name: team-alpha
+            match:
+              headers:
+                x-app-id: alpha
+            algorithm: sliding_window
+            window: 1h
+            capacity: 100000
+            reserved_tokens: 500
+            weights:
+              cached_input: 0.05
+            tiers:
+              - capacity: 80000
+                action:
+                  type: inject
+                  headers:
+                    X-Token-Hour-Tier: warning
+              - capacity: 95000
+                action:
+                  type: inject
+                  headers:
+                    X-Token-Hour-Tier: degraded
+                    x-gateway-inference-fairness-id: "85"
+              - capacity: 100000
+                action:
+                  type: deny
+
+          # Inject-only enforcement: tiers add headers, but the
+          # algorithm's own capacity (50000) still rejects over-budget
+          # requests with 429.
+          - name: team-beta
+            match:
+              headers:
+                x-app-id: beta
+            algorithm: sliding_window
+            window: 1h
+            capacity: 50000
+            reserved_tokens: 200
+            tiers:
+              - capacity: 40000
+                action:
+                  type: inject
+                  headers:
+                    X-Token-Hour-Tier: warning
+
+      - filter: token_count
+        provider: openai
+
+      - filter: access_log
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+insecure_options:
+  allow_private_endpoints: true

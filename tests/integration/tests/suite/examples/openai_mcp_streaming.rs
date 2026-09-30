@@ -14,7 +14,7 @@ use praxis_test_utils::{
     start_mcp_mock_server_with_config, start_proxy, start_proxy_with_registry,
 };
 
-/// Bound asynchronous rmcp cleanup/stream observations without making the
+/// Bound the wait for rmcp's asynchronous session cleanup without making the
 /// integration test fail on a busy shared CI runner.
 const RECORDED_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -51,6 +51,15 @@ where
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+}
+
+/// Compact `method + headers` view of everything the mock recorded, so a failed
+/// wait reports what did arrive instead of only that the wait expired.
+fn recorded_summary(mcp: &praxis_test_utils::McpMockServerGuard) -> Vec<String> {
+    mcp.received_requests()
+        .iter()
+        .map(|r| format!("{} {:?}", r.http_method, r.headers))
+        .collect()
 }
 
 // -----------------------------------------------------------------------------
@@ -394,7 +403,7 @@ fn clean_request_after_stream_succeeds() {
 }
 
 // -----------------------------------------------------------------------------
-// Scenario 4b: GET common stream + DELETE cleanup route through the outbound chain
+// Scenario 4b: DELETE cleanup routes through the outbound chain
 // -----------------------------------------------------------------------------
 // NOTE: There is deliberately no Last-Event-ID / resumption test here. rmcp only
 // sends Last-Event-ID when an already-established GET common stream drops
@@ -403,7 +412,7 @@ fn clean_request_after_stream_succeeds() {
 // Asserting resumption in this flow would be unreachable, fabricated coverage.
 
 #[test]
-fn get_common_stream_and_delete_cleanup_route_through_outbound_chain() {
+fn delete_cleanup_routes_through_outbound_chain() {
     let first_response = serde_json::json!({
         "id": "resp_1",
         "object": "response",
@@ -479,48 +488,25 @@ fn get_common_stream_and_delete_cleanup_route_through_outbound_chain() {
         "MCP server should receive one tool call"
     );
 
-    // GET common stream: opened, session-scoped, AND routed through the filtered
-    // outbound chain. The mcp_dispatch session's outbound chain stamps
-    // x-mcp-client via its `headers` filter; a correctly routed GET carries it.
-    // The rmcp worker opens this eager GET stream asynchronously and the mock
-    // records connections on separate threads, so poll rather than snapshotting
-    // once (same reason the DELETE below polls).
-    let saw_chain_get = wait_for_recorded(&mcp, |reqs| {
-        reqs.iter().any(|r| {
-            r.http_method == "GET"
-                && r.headers
-                    .iter()
-                    .any(|(k, v)| k == "x-mcp-client" && v == "praxis-ai-gateway")
-        })
-    });
-    assert!(
-        saw_chain_get,
-        "the mcp_dispatch session's eager GET common stream must route through the \
-         filtered outbound chain and carry x-mcp-client (within 30s)"
-    );
-    let reqs = mcp.received_requests();
-    let chain_get = reqs
-        .iter()
-        .find(|r| {
-            r.http_method == "GET"
-                && r.headers
-                    .iter()
-                    .any(|(k, v)| k == "x-mcp-client" && v == "praxis-ai-gateway")
-        })
-        .expect("GET with x-mcp-client should be present after wait_for_recorded returned true");
-    assert!(
-        chain_get
-            .headers
-            .iter()
-            .any(|(k, v)| k == "mcp-session-id" && v == "mock-mcp-session-1"),
-        "GET common stream must carry the negotiated MCP session id; headers: {:?}",
-        chain_get.headers
-    );
-
+    // The eager GET common stream is deliberately not asserted here. rmcp spawns
+    // it into a JoinSet and aborts that set when the session tears down, so in a
+    // serve -> tool-call -> drop flow the GET can be aborted before it ever
+    // reaches the wire. That is not a latency problem, so no polling budget makes
+    // it reliable. The mock still serves the stream (serve_get_stream), so the
+    // transport's GET success arm is still exercised end to end.
+    //
+    // The DELETE below carries the outbound-chain coverage instead. rmcp awaits
+    // it on the shutdown path, so it is always sent, and GET and DELETE reach the
+    // wire through the same `prepare_staged_request` staging, so routing through
+    // the chain is the same code for both. The session id a GET carries is
+    // covered by `get_stream_headers_carry_session_id` in the transport's own
+    // unit tests.
+    //
     // NOTE: The top-level openai_mcp_tool_resolve discovery session has NO
-    // outbound_chain, so its own GET/DELETE correctly carry no x-mcp-client. We
-    // assert on the mcp_dispatch session's GET/DELETE, which DO route through the
-    // chain — that is the outbound-filter-on-non-POST coverage this test exists for.
+    // outbound_chain, so its own DELETE correctly carries no x-mcp-client. We
+    // assert on the mcp_dispatch session's DELETE, which DOES route through the
+    // chain, and that is the outbound-filter-on-non-POST coverage this test
+    // exists for.
 
     // DELETE cleanup fires asynchronously on transport drop; poll for the
     // dispatch session's DELETE (the one that carries the egress header).
@@ -535,7 +521,9 @@ fn get_common_stream_and_delete_cleanup_route_through_outbound_chain() {
     assert!(
         saw_chain_delete,
         "the mcp_dispatch session's DELETE cleanup should route through the filtered \
-         outbound chain and be recorded within 30s of transport drop"
+         outbound chain and be recorded within {RECORDED_REQUEST_TIMEOUT:?} of transport \
+         drop; recorded: {:?}",
+        recorded_summary(&mcp)
     );
 
     let reqs = mcp.received_requests();

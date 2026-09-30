@@ -208,6 +208,38 @@ mod tests {
     }
 
     #[test]
+    fn explicit_auto_tool_choice_is_omitted_without_tools() {
+        let mapped = map(&json!({
+            "model": "gpt-4.1-mini",
+            "input": "hello",
+            "tool_choice": "auto"
+        }));
+
+        assert!(mapped.get("tools").is_none());
+        assert!(
+            mapped.get("tool_choice").is_none(),
+            "Chat Completions backends may reject tool_choice when no tools are present"
+        );
+    }
+
+    #[test]
+    fn explicit_auto_tool_choice_is_preserved_with_tools() {
+        let mapped = map(&json!({
+            "model": "gpt-4.1-mini",
+            "input": "hello",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "parameters": {"type": "object"}
+            }],
+            "tool_choice": "auto"
+        }));
+
+        assert_eq!(mapped["tool_choice"], "auto");
+        assert_eq!(mapped["tools"][0]["function"]["name"], "lookup");
+    }
+
+    #[test]
     fn state_reasoning_item_is_replayed_into_the_assistant_turn() {
         let request = json!({"model": "m", "input": "hi"});
         let messages = vec![
@@ -1965,6 +1997,30 @@ mod tests {
     }
 
     #[test]
+    fn null_tool_choice_means_no_field() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": "hello",
+            "tool_choice": null
+        }));
+
+        assert!(mapped.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn null_tool_choice_with_tools_means_no_tool_choice_field() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": "hello",
+            "tools": [{"type": "function", "name": "f", "parameters": {}}],
+            "tool_choice": null
+        }));
+
+        assert!(mapped.get("tools").is_some());
+        assert!(mapped.get("tool_choice").is_none());
+    }
+
+    #[test]
     fn non_string_non_object_tool_choice_is_rejected() {
         let error = map_error(&json!({"model": "m", "input": "hello", "tool_choice": 42}));
 
@@ -2858,6 +2914,23 @@ mod tests {
             Value::Null,
             "an incomplete response must have a null completed_at: {mapped}",
         );
+    }
+
+    #[test]
+    fn response_resource_normalizes_null_tool_choice_to_auto() {
+        let request = json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "tools": [{"type": "function", "name": "f"}],
+            "tool_choice": null
+        });
+        let context =
+            super::chat_completions::ResponseContext::from_responses_request(&request, "resp_1".to_owned(), 100);
+        let response = simple_chat_response("stop", "done");
+
+        let mapped = super::chat_completions::chat_response_to_response_resource(&response, &context).unwrap();
+
+        assert_eq!(mapped["tool_choice"], "auto");
     }
 
     #[test]

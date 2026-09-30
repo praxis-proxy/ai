@@ -18,10 +18,7 @@ use praxis_protocol::{CertWatcherShutdowns, ListenerPipelines, Protocol as _, ht
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::{
-    pipelines::resolve_pipelines,
-    subrequest::{create_subrequest_client, spawn_circuit_eviction_if_configured},
-};
+use crate::subrequest::{create_subrequest_client, spawn_circuit_eviction_if_configured};
 
 // -----------------------------------------------------------------------------
 // Config Path Resolution
@@ -89,6 +86,7 @@ pub fn run_server_with_registry(config: Config, registry: FilterRegistry, config
 /// config watcher, and run.
 #[expect(clippy::allow_attributes, reason = "lint is platform/config-dependent")]
 #[allow(clippy::needless_pass_by_value, reason = "server owns config")]
+#[expect(clippy::too_many_lines, reason = "store provisioning and readiness registration")]
 fn boot_server(
     config: Config,
     registry: FilterRegistry,
@@ -96,18 +94,46 @@ fn boot_server(
     config_path: Option<PathBuf>,
 ) -> ! {
     install_crypto_provider();
+    if praxis_tls::provider::required()
+        && let Some(reason) = fips_blocker(&registry)
+    {
+        fatal(&reason);
+    }
     enforce_root_check(&config);
     warn_insecure_options(&config);
     init_runtime_limits(&config.runtime);
     warn_insecure_key_permissions(&config);
 
     let health_registry = build_health_registry(&config.clusters);
-    let state = build_server_state(&config, &registry, &health_registry, subrequest_client);
+    #[cfg_attr(
+        not(any(feature = "store-postgres", feature = "store-sqlite")),
+        expect(unused_mut, reason = "store_service is taken only with a store backend")
+    )]
+    let mut state = build_server_state(&config, &registry, &health_registry, subrequest_client);
 
     info!("initializing server");
     let mut server = PingoraServerRuntime::new(&config);
     let _cert_shutdowns = register_protocols(&mut server, &config, &state.pipelines);
     register_admin_endpoints(&mut server, &config, health_registry, &state.kv_stores);
+
+    // Provision response-store backends as a serving-runtime startup service.
+    // The service holds Pingora's ready notifier until every initial pool is
+    // open and exits startup on a terminal failure.
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    if let Some(service) = state.store_service.take() {
+        server
+            .server_mut()
+            .add_service(pingora_core::services::background::background_service(
+                "store-provision",
+                service,
+            ));
+    }
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    register_store_readiness_endpoint(
+        &mut server,
+        state.store_readiness.clone(),
+        Arc::clone(&state.health_slot),
+    );
 
     let _watcher = spawn_watcher(config_path, config, registry, state);
 
@@ -130,9 +156,27 @@ struct ServerState {
     subrequest_client: praxis_core::subrequest::SubRequestClient,
     /// Health check cancellation token.
     health_shutdown: Arc<Mutex<CancellationToken>>,
+    /// Command handle that provisions replacement generations on the serving
+    /// runtime before the watcher swaps pipelines.
+    store_reload: crate::StoreReloadHandle,
+    /// Shared handle to the current cluster health registry, updated on reload so
+    /// the readiness endpoint never reads a stale startup snapshot.
+    health_slot: crate::SharedHealthRegistry,
+    /// Serving-runtime store provisioner, taken by `boot_server` and registered
+    /// as a Pingora background service before the server runs.
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    store_service: Option<crate::store_provision::StoreProvisionService>,
+    /// Readiness handle the store provisioner drives, read by the readiness
+    /// endpoint.
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    store_readiness: crate::store_provision::StoreReadinessHandle,
 }
 
 /// Build filter pipelines, health checks, and registries.
+#[expect(
+    clippy::too_many_lines,
+    reason = "store wiring adds registry, provisioner, and readiness"
+)]
 fn build_server_state(
     config: &Config,
     registry: &FilterRegistry,
@@ -142,8 +186,28 @@ fn build_server_state(
     info!("building filter pipelines");
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
 
-    let pipelines = resolve_pipelines(config, registry, health_registry, &kv_stores, &subrequest_client)
-        .unwrap_or_else(|e| fatal(&e));
+    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    let (store_registries, store_service, store_reload, store_readiness) =
+        crate::store_provision::build_store_wiring(config).unwrap_or_else(|e| fatal(&e));
+    #[cfg(all(feature = "store", not(any(feature = "store-postgres", feature = "store-sqlite"))))]
+    let store_registries = crate::StoreRegistries::default();
+    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    let store_reload = crate::StoreReloadHandle::default();
+
+    #[cfg(feature = "store")]
+    let pipelines = crate::pipelines::resolve_pipelines_with_stores(
+        config,
+        registry,
+        health_registry,
+        &kv_stores,
+        &subrequest_client,
+        &store_registries,
+    )
+    .unwrap_or_else(|e| fatal(&e));
+    #[cfg(not(feature = "store"))]
+    let pipelines =
+        crate::pipelines::resolve_pipelines(config, registry, health_registry, &kv_stores, &subrequest_client)
+            .unwrap_or_else(|e| fatal(&e));
 
     let health_shutdown = Arc::new(Mutex::new(CancellationToken::new()));
     spawn_health_check_tasks(config, Arc::clone(health_registry), &health_shutdown);
@@ -153,11 +217,19 @@ fn build_server_state(
     let _circuit_eviction =
         spawn_circuit_eviction_if_configured(config, &subrequest_client, &circuit_eviction_shutdown);
 
+    let health_slot = Arc::new(Mutex::new(Arc::clone(health_registry)));
+
     ServerState {
         pipelines: Arc::new(pipelines),
         kv_stores,
         subrequest_client,
         health_shutdown,
+        store_reload,
+        health_slot,
+        #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+        store_service: Some(store_service),
+        #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+        store_readiness,
     }
 }
 
@@ -207,6 +279,8 @@ fn spawn_watcher(
         registry: Arc::new(registry),
         shutdown: CancellationToken::new(),
         subrequest_client: state.subrequest_client,
+        store_reload: state.store_reload,
+        health_slot: state.health_slot,
     });
     Some(handle)
 }
@@ -236,6 +310,29 @@ fn register_admin_endpoints(
             },
         );
     }
+}
+
+/// Register the store-readiness endpoint on its own listener when its address is
+/// configured (via the readiness env var).
+///
+/// It runs on a separate port because the protocol admin service owns its route
+/// set. It reads the provisioning readiness handle and composes it with cluster
+/// health, so an orchestrator probe gates traffic on store provisioning.
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+fn register_store_readiness_endpoint(
+    server: &mut PingoraServerRuntime,
+    readiness: crate::store_provision::StoreReadinessHandle,
+    health: crate::SharedHealthRegistry,
+) {
+    if std::env::var(crate::readiness::READINESS_ADDR_ENV).is_err() {
+        return;
+    }
+    let addr = crate::readiness::readiness_addr();
+    let app = crate::readiness::StoreReadinessService::new(readiness, health);
+    let mut service = pingora_core::services::listening::Service::new("store-readiness".to_owned(), app);
+    service.add_tcp(&addr);
+    info!(address = %addr, path = crate::readiness::READINESS_PATH, "store readiness endpoint enabled");
+    server.server_mut().add_service(service);
 }
 
 // -----------------------------------------------------------------------------
@@ -441,6 +538,43 @@ fn spawn_health_check_tasks(
 // Utility Functions
 // -----------------------------------------------------------------------------
 
+/// Registered filter names whose dependencies do their own cryptography
+/// outside the system OpenSSL, so a binary that registers one cannot honor
+/// `PRAXIS_REQUIRE_FIPS` whatever the provider reports.
+///
+/// - `policy`: the Praxis Policy Engine's JWT verification runs on aws-lc-rs (through jsonwebtoken) and its OAuth and
+///   Valkey plugins use the pure-Rust `hmac` and `sha2` crates.
+/// - `openai_response_store`: registered exactly when the `store` feature is compiled in, whose sqlx brings `sha2`
+///   (and, with `PostgreSQL`, SCRAM's `md-5` and `hmac`). Every store-backed group (conversations, compact, MCP tools)
+///   implies `store`, so this one name covers them all.
+const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_response_store"];
+
+/// Why this binary cannot honor `PRAXIS_REQUIRE_FIPS`, if it cannot.
+///
+/// The provider and kernel checks cover rustls only; a filter on
+/// `NON_FIPS_FILTERS` carries its own cryptography. Checked against the
+/// registry rather than the config so a hot reload cannot add the filter
+/// later.
+#[must_use]
+pub fn fips_blocker(registry: &FilterRegistry) -> Option<String> {
+    let available = registry.available_filters();
+    let registered: Vec<String> = NON_FIPS_FILTERS
+        .iter()
+        .copied()
+        .filter(|name| available.contains(name))
+        .map(|name| format!("`{name}` filter"))
+        .collect();
+
+    (!registered.is_empty()).then(|| {
+        format!(
+            "{} is set but this binary registers the {}, whose dependencies do their own cryptography outside the \
+             system OpenSSL; run the FIPS build",
+            praxis_tls::provider::REQUIRE_FIPS_ENV,
+            registered.join(" and ")
+        )
+    })
+}
+
 /// Install the process-wide rustls crypto provider, the one backed by the
 /// system OpenSSL, and log the FIPS status it reports.
 ///
@@ -583,5 +717,26 @@ mod tests {
         );
         super::install_crypto_provider();
         assert!(praxis_tls::provider::installed(), "installing again is harmless");
+    }
+
+    #[test]
+    fn the_fips_blocker_names_exactly_the_registered_non_fips_filters() {
+        praxis_tls::provider::install();
+        let client =
+            praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(1, None));
+        let registry = crate::build_full_registry(&client);
+        let blocker = super::fips_blocker(&registry);
+        if cfg!(any(feature = "policy-engine", feature = "store")) {
+            let reason = blocker.expect("a binary with non-FIPS filters is blocked");
+            assert!(reason.contains("PRAXIS_REQUIRE_FIPS"), "{reason}");
+            if cfg!(feature = "policy-engine") {
+                assert!(reason.contains("`policy` filter"), "{reason}");
+            }
+            if cfg!(feature = "store") {
+                assert!(reason.contains("`openai_response_store` filter"), "{reason}");
+            }
+        } else {
+            assert_eq!(blocker, None, "the FIPS feature set registers no blocked filter");
+        }
     }
 }

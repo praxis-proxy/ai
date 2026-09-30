@@ -221,24 +221,162 @@ fn dedicated_default_header_targets_are_accepted() {
     assert!(OpenaiResponsesRequestFilter::from_config(&value).is_ok());
 }
 
+/// Filter results must be published under this filter's own name. A branch
+/// condition has to name the filter it is attached to, and every other
+/// filter's results are cleared before it is evaluated, so publishing under
+/// the replaced classifier's name left every `on_result` branch unmatched —
+/// a stateful request silently took the stateless path.
 #[tokio::test]
-async fn a_non_create_responses_operation_is_left_alone() {
+async fn filter_results_are_published_under_this_filter() {
     let filter = default_filter();
-    let request = make_request(http::Method::GET, "/v1/responses/resp_123");
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4.1",
+            "input": "hi",
+            "previous_response_id": "resp_1"
+        }))
+        .unwrap(),
+    ));
+
+    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    let results = ctx
+        .filter_results
+        .get("openai_responses_request")
+        .expect("results belong to the filter that published them");
+    assert_eq!(results.get("format"), Some("openai_responses"));
+    assert_eq!(
+        results.get("mode"),
+        Some("stateful"),
+        "the routing fact a branch condition matches on"
+    );
+    assert!(
+        !ctx.filter_results.contains_key("openai_responses_format"),
+        "nothing is published under the replaced filter's name"
+    );
+}
+
+#[tokio::test]
+async fn bodyless_responses_operations_are_left_alone() {
+    // The registry declares these as carrying no body, so there is nothing to
+    // parse and nothing to publish.
+    for (method, path) in [
+        (http::Method::GET, "/v1/responses/resp_123"),
+        (http::Method::DELETE, "/v1/responses/resp_123"),
+        (http::Method::POST, "/v1/responses/resp_123/cancel"),
+        (http::Method::GET, "/v1/responses/resp_123/input_items"),
+    ] {
+        let filter = default_filter();
+        let request = make_request(method.clone(), path);
+        let mut ctx = make_filter_context(&request);
+        let mut body = None;
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Release), "{method} {path}");
+        assert!(
+            ctx.extensions.get::<ResponsesState>().is_none(),
+            "{method} {path} must not initialize state"
+        );
+        assert!(
+            !ctx.filter_metadata.contains_key("openai_responses_format.format"),
+            "{method} {path} publishes nothing; identity comes from the request head"
+        );
+    }
+}
+
+/// Compact and input-token-count declare their body optional, so a request
+/// without one is complete and must not be treated as an invalid body.
+#[tokio::test]
+async fn an_absent_optional_body_is_not_an_invalid_body() {
+    for path in ["/v1/responses/compact", "/v1/responses/input_tokens"] {
+        // `reject` is the strictest setting; even there an absent optional body
+        // is legitimate and must pass through.
+        let filter = filter("on_invalid: reject\n");
+        let request = make_request(http::Method::POST, path);
+        let mut ctx = make_filter_context(&request);
+        let mut body = None;
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Release), "{path} should forward");
+        assert_eq!(
+            ctx.filter_metadata
+                .get("openai_responses_format.format")
+                .map(String::as_str),
+            Some("openai_responses"),
+            "{path} still publishes its identity so header routing can see it"
+        );
+        assert!(
+            ctx.extensions.get::<ResponsesState>().is_none(),
+            "{path} without a body initializes no state"
+        );
+    }
+}
+
+/// Create declares its body required, so an absent one is still an invalid
+/// body and still follows `on_invalid`.
+#[tokio::test]
+async fn an_absent_required_body_still_follows_on_invalid() {
+    let filter = filter("on_invalid: reject\n");
+    let request = create_request();
     let mut ctx = make_filter_context(&request);
     let mut body = None;
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-    assert!(matches!(action, FilterAction::Release));
     assert!(
-        ctx.extensions.get::<ResponsesState>().is_none(),
-        "a bodyless operation must not initialize create state"
+        matches!(action, FilterAction::Reject(_)),
+        "create requires a body, so an absent one is rejected"
     );
+}
+
+/// A malformed body is an error whether or not the operation required one.
+#[tokio::test]
+async fn a_malformed_optional_body_still_follows_on_invalid() {
+    let filter = filter("on_invalid: reject\n");
+    let request = make_request(http::Method::POST, "/v1/responses/compact");
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from_static(b"{not json"));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
     assert!(
-        !ctx.filter_metadata.contains_key("openai_responses_format.format"),
-        "identity comes from the request head, so nothing is published here"
+        matches!(action, FilterAction::Reject(_)),
+        "an optional body that was supplied but is malformed is still invalid"
     );
+}
+
+/// Compact and input-token-count declare a request body in the registry, so
+/// they are parsed and published like create rather than released untouched.
+#[tokio::test]
+async fn other_body_bearing_responses_operations_are_processed() {
+    for path in ["/v1/responses/compact", "/v1/responses/input_tokens"] {
+        let filter = default_filter();
+        let request = make_request(http::Method::POST, path);
+        let mut ctx = make_filter_context(&request);
+        let mut body = Some(Bytes::from(
+            serde_json::to_vec(&json!({"model": "gpt-4.1", "previous_response_id": "resp_1"})).unwrap(),
+        ));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Release), "{path}");
+        assert_eq!(
+            ctx.filter_metadata
+                .get("openai_responses_format.format")
+                .map(String::as_str),
+            Some("openai_responses"),
+            "{path} should publish its classification"
+        );
+        assert!(
+            ctx.extensions.get::<ResponsesState>().is_none(),
+            "{path} is not creating a response, so it must not get create state — \
+             the agentic loop reads the MCP approval state that carries"
+        );
+    }
 }
 
 #[tokio::test]

@@ -24,3 +24,8 @@ pub(crate) const REDHAT_REGISTRIES_D: &str = include_str!("../../assets/fips/reg
 /// process. Test infrastructure only: on a FIPS-enabled host the provider
 /// activates by itself, and an application must never do this.
 pub(crate) const FIPS_PROVIDER_CNF: &str = include_str!("../../assets/fips/fips-provider.cnf");
+
+/// The builds of Red Hat's OpenSSL FIPS provider module NIST has validated
+/// or is validating, by the version string the module reports; `host-check`
+/// grades the module a host or an image carries against this list.
+pub(crate) const CERTIFIED_MODULES: &str = include_str!("../../assets/fips/certified-modules.json");

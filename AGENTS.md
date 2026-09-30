@@ -54,10 +54,12 @@ cargo test -p praxis-ai-filters --features full -- test_name
 cargo test -p praxis-ai-proxy --features full -- test_name
 ```
 
-The product crates default to the lean `standard` feature set, so tests for the
-opt-in OpenAI groups are compiled out without `--features full` (or the group's
-own feature). A name filter that matches only compiled-out tests reports
-"0 passed" and exits successfully.
+The `praxis-ai-proxy` production binary defaults to `full`, including the
+PostgreSQL-backed OpenAI Responses and Conversations APIs. The library crates
+retain the lean `standard` default, so their tests for opt-in OpenAI groups are
+compiled out without `--features full` (or the group's own feature). A name
+filter that matches only compiled-out tests reports "0 passed" and exits
+successfully.
 
 ## Architecture
 
@@ -94,10 +96,10 @@ Follows the same conventions as
 [praxis core](https://github.com/praxis-proxy/praxis).
 See [CONTRIBUTING.md] for the full coding style guide,
 including the
-[PR review process](CONTRIBUTING.md#pr-review-process)
+[PR review process](.github/CONTRIBUTING.md#pr-review-process)
 for handling `praxis-bot` automated review comments.
 
-[CONTRIBUTING.md]: https://github.com/praxis-proxy/ai/blob/main/CONTRIBUTING.md
+[CONTRIBUTING.md]: https://github.com/praxis-proxy/ai/blob/main/.github/CONTRIBUTING.md
 
 ## Git Workflow
 

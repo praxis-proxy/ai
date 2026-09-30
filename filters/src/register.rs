@@ -19,7 +19,7 @@ use crate::TokenRateLimitFilter;
 use crate::{
     A2aFilter, AiGuardrailsFilter, CredentialInjectFilter, ExternalMeteringFilter, IdentityHeaderGuardFilter,
     IntelligentRouteFilter, LlmisvcModelProviderResolverFilter, McpFilter, ModelToHeaderFilter, PromptEnrichFilter,
-    ProviderRouteFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
+    ProviderRouteFilter, StreamUsageInjectFilter, TimeToFirstTokenFilter, TokenCountFilter, TokenUsageHeadersFilter,
 };
 
 /// Register all in-tree AI HTTP filters into `registry`.
@@ -40,15 +40,20 @@ pub fn register_ai_filters(registry: &mut FilterRegistry, subrequest_client: Opt
     #[cfg(feature = "aws-sigv4-filter")]
     register_aws_filters(registry);
     #[cfg(feature = "azure-ad-filter")]
-    register_azure_filters(registry);
+    register_azure_filters(registry, subrequest_client);
     register_azure_translation_filters(registry);
     #[cfg(feature = "gcp-adc-filter")]
-    register_gcp_filters(registry);
+    register_gcp_filters(registry, subrequest_client);
     register_general_ai_filters(registry);
     register_ai_guardrails(registry, subrequest_client);
     register_external_metering(registry, subrequest_client);
     register_anthropic_filters(registry, subrequest_client);
     register_openai_filters(registry);
+    #[cfg(feature = "store")]
+    praxis_filter::register_filters!(
+        @register registry,
+        http "praxis_store_readiness_gate" => crate::StoreReadinessGateFilter::from_config
+    );
     #[cfg(feature = "openai-responses")]
     register_openai_responses_filters(registry, subrequest_client);
     register_routing_filters(registry);
@@ -113,10 +118,25 @@ fn register_aws_filters(registry: &mut FilterRegistry) {
     register_routing_security_filter(registry, "aws_sigv4_sign", Sigv4SignFilter::from_config);
 }
 
-/// Register Azure-specific filters.
+/// Register Azure-specific filters, capturing the shared sub-request
+/// client when one is available.
 #[cfg(feature = "azure-ad-filter")]
-fn register_azure_filters(registry: &mut FilterRegistry) {
-    register_routing_security_filter(registry, "azure_ad", AzureAdFilter::from_config);
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_azure_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register_with_class(
+                "azure_ad",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    AzureAdFilter::from_config_with_client(config, client.clone())
+                })),
+                praxis_filter::SecurityClass::Security,
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'azure_ad'"));
+    } else {
+        register_routing_security_filter(registry, "azure_ad", AzureAdFilter::from_config);
+    }
 }
 
 /// Register Azure OpenAI translation filters.
@@ -127,10 +147,25 @@ fn register_azure_translation_filters(registry: &mut FilterRegistry) {
     );
 }
 
-/// Register GCP-specific filters.
+/// Register GCP-specific filters, capturing the shared sub-request
+/// client when one is available.
 #[cfg(feature = "gcp-adc-filter")]
-fn register_gcp_filters(registry: &mut FilterRegistry) {
-    register_routing_security_filter(registry, "gcp_adc", GcpAdcFilter::from_config);
+#[expect(clippy::panic, reason = "duplicate filter registration is a fatal configuration bug")]
+fn register_gcp_filters(registry: &mut FilterRegistry, subrequest_client: Option<&SubRequestClient>) {
+    if let Some(client) = subrequest_client {
+        let client = client.clone();
+        registry
+            .register_with_class(
+                "gcp_adc",
+                praxis_filter::FilterFactory::Http(std::sync::Arc::new(move |config| {
+                    GcpAdcFilter::from_config_with_client(config, client.clone())
+                })),
+                praxis_filter::SecurityClass::Security,
+            )
+            .unwrap_or_else(|_| panic!("duplicate filter name: 'gcp_adc'"));
+    } else {
+        register_routing_security_filter(registry, "gcp_adc", GcpAdcFilter::from_config);
+    }
 }
 
 /// Register general-purpose AI filters.
@@ -168,6 +203,10 @@ fn register_general_ai_filters(registry: &mut FilterRegistry) {
 
 /// Register token counting/usage/rate-limiting filters.
 fn register_token_filters(registry: &mut FilterRegistry) {
+    praxis_filter::register_filters!(
+        @register registry,
+        http "stream_usage_inject" => StreamUsageInjectFilter::from_config
+    );
     praxis_filter::register_filters!(
         @register registry,
         http "token_count" => TokenCountFilter::from_config
@@ -531,7 +570,7 @@ fn register_file_resolve(registry: &mut FilterRegistry, subrequest_client: Optio
                     Some(client) => client.clone(),
                     None => crate::isolated_subrequest_client(4),
                 };
-                praxis_ai_apis::openai::FileResolveFilter::from_config_with_outbound(config, client, outbound)
+                praxis_ai_apis::openai::FileResolveFilter::from_config_with_outbound(config, &client, outbound)
             }),
         )
         .unwrap_or_else(|_| panic!("duplicate filter name: 'openai_file_resolve'"));
