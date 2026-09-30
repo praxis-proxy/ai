@@ -117,7 +117,7 @@ before sending requests.
 | [rehydrate.yaml](configs/openai/responses/rehydrate.yaml) | Validates `previous_response_id` by fetching the stored response, confirming its status is completed, and promoting the ID to filter metadata |
 | [request-validate.yaml](configs/openai/responses/request-validate.yaml) | Validates Responses API JSON and enriches request metadata |
 | [response-store-postgres-mtls.yaml](configs/openai/responses/response-store-postgres-mtls.yaml) | Persists non-streaming Responses API responses to PostgreSQL over a TLS-verified connection that authenticates with a client certificate instead of a password |
-| [response-store.yaml](configs/openai/responses/response-store.yaml) | Persists non-streaming Responses API responses to a database and serves stored data via GET endpoints and handles DELETE /v1/responses/{id} locally |
+| [response-store.yaml](configs/openai/responses/response-store.yaml) | Persists streaming and non-streaming Responses API responses to a database, serves stored data via GET endpoints, and handles DELETE /v1/responses/{id} locally |
 | [responses-proxy.yaml](configs/openai/responses/responses-proxy.yaml) | Proxies OpenAI Responses API requests to a native /v1/responses backend |
 | [responses-routing.yaml](configs/openai/responses/responses-routing.yaml) | Routes Responses API traffic by detected mode |
 | [responses-to-chat-completions-reasoning.yaml](configs/openai/responses/responses-to-chat-completions-reasoning.yaml) | Same pipeline as responses-to-chat-completions.yaml, but targets a vLLM backend that returns raw reasoning in choices[].message.reasoning |
