@@ -73,7 +73,11 @@ async fn response_store_persists_over_certificate_authenticated_tls() {
         proxy.addr(),
         &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello over mTLS"}"#),
     );
-    assert_eq!(parse_status(&raw), 200, "Responses API POST should return 200");
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "Responses API POST should return 200; raw response:\n{raw}"
+    );
     assert_eq!(
         parse_body(&raw),
         RESPONSE_JSON,
