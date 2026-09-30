@@ -170,8 +170,11 @@ pub struct ResponseEventRecord {
     /// payload's `type`.
     pub event_type: String,
 
-    /// The fully-normalized event JSON, exactly as delivered to the client.
-    pub payload: serde_json::Value,
+    /// The fully-normalized event's `data` payload as raw JSON bytes, exactly as
+    /// delivered to the client. Held and replayed verbatim — never parsed into a
+    /// [`serde_json::Value`] — so replay reproduces the original bytes without a
+    /// parse/serialize round trip and without retaining a value tree per event.
+    pub payload: Vec<u8>,
 
     /// True iff this is a terminal event (`completed`/`incomplete`/`failed`/
     /// `error`). A replayable log always ends with exactly one terminal event.

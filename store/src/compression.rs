@@ -137,6 +137,33 @@ impl StoreCompressionConfig {
         run_blocking(move || fields.into_iter().map(|json| config.encode_json(json)).collect()).await
     }
 
+    /// Encode a batch of raw JSON payloads into their stored binary form.
+    ///
+    /// Used by the durable event log, whose rows store each SSE event's `data`
+    /// payload verbatim as raw JSON bytes. Unlike [`encode_values`](Self::encode_values)
+    /// there is nothing to serialize: with `algorithm: none` each payload is
+    /// stored as-is, and with `algorithm: zstd` it is compressed into a raw zstd
+    /// frame. Reads go back through [`decode_bytes`]. The whole batch shares one
+    /// blocking hop so appending many small events does not spawn a worker per
+    /// event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Serialization`] if a payload exceeds the size limit
+    /// or zstd compression fails.
+    pub async fn encode_byte_values(&self, values: &[&[u8]]) -> Result<Vec<Vec<u8>>, StoreError> {
+        // The stored form owns its bytes for the sqlx bind; borrow-to-owned here
+        // is the boundary copy, identical in cost to the previous serialize step.
+        let owned: Vec<Vec<u8>> = values.iter().map(|value| value.to_vec()).collect();
+
+        if self.algorithm == CompressionAlgorithm::None {
+            return Ok(owned);
+        }
+
+        let config = self.clone();
+        run_blocking(move || owned.into_iter().map(|json| config.encode_json(json)).collect()).await
+    }
+
     /// Apply the configured codec to an owned JSON buffer.
     fn encode_json(&self, json: Vec<u8>) -> Result<Vec<u8>, StoreError> {
         match self.algorithm {
@@ -190,26 +217,57 @@ pub async fn run_blocking<T: Send + 'static>(
 /// JSON.
 pub fn decode(stored: &[u8]) -> Result<serde_json::Value, StoreError> {
     if stored.starts_with(&ZSTD_MAGIC) {
-        use std::io::Read as _;
-
-        let decoder =
-            zstd::Decoder::new(stored).map_err(|e| StoreError::Serialization(format!("zstd decompress: {e}")))?;
-        // Read one byte past the cap so a payload sitting exactly at the limit is
-        // accepted while anything larger is rejected.
-        let mut json = Vec::new();
-        decoder
-            .take(MAX_DECOMPRESSED_SIZE + 1)
-            .read_to_end(&mut json)
-            .map_err(|e| StoreError::Serialization(format!("zstd decompress: {e}")))?;
-        if json.len() as u64 > MAX_DECOMPRESSED_SIZE {
-            return Err(StoreError::Serialization(
-                "zstd decompress: decompressed payload exceeds size limit".to_owned(),
-            ));
-        }
+        let json = decompress_zstd(stored)?;
         serde_json::from_slice(&json).map_err(|e| StoreError::Serialization(e.to_string()))
     } else {
         serde_json::from_slice(stored).map_err(|e| StoreError::Serialization(e.to_string()))
     }
+}
+
+/// Decode a stored event-log payload back into its raw JSON bytes.
+///
+/// Like [`decode`] the format is auto-detected — a zstd frame is decompressed,
+/// anything else is returned as-is — but the bytes are handed back verbatim
+/// rather than parsed into a [`serde_json::Value`]. The durable event log stores
+/// each event's `data` payload byte-for-byte and replays it without a
+/// parse/serialize round trip, so a decode that normalized key order would break
+/// verbatim replay.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Serialization`] if a zstd frame is corrupt or its
+/// decompressed payload exceeds the size limit.
+pub fn decode_bytes(stored: &[u8]) -> Result<Vec<u8>, StoreError> {
+    if stored.starts_with(&ZSTD_MAGIC) {
+        decompress_zstd(stored)
+    } else {
+        Ok(stored.to_vec())
+    }
+}
+
+/// Decompress a raw zstd frame, bounding the output at [`MAX_DECOMPRESSED_SIZE`].
+///
+/// # Errors
+///
+/// Returns [`StoreError::Serialization`] if the frame is corrupt or its
+/// decompressed payload exceeds the size limit.
+fn decompress_zstd(frame: &[u8]) -> Result<Vec<u8>, StoreError> {
+    use std::io::Read as _;
+
+    let decoder = zstd::Decoder::new(frame).map_err(|e| StoreError::Serialization(format!("zstd decompress: {e}")))?;
+    // Read one byte past the cap so a payload sitting exactly at the limit is
+    // accepted while anything larger is rejected.
+    let mut json = Vec::new();
+    decoder
+        .take(MAX_DECOMPRESSED_SIZE + 1)
+        .read_to_end(&mut json)
+        .map_err(|e| StoreError::Serialization(format!("zstd decompress: {e}")))?;
+    if json.len() as u64 > MAX_DECOMPRESSED_SIZE {
+        return Err(StoreError::Serialization(
+            "zstd decompress: decompressed payload exceeds size limit".to_owned(),
+        ));
+    }
+    Ok(json)
 }
 
 // -----------------------------------------------------------------------------
@@ -345,6 +403,44 @@ mod tests {
         let mut corrupt = ZSTD_MAGIC.to_vec();
         corrupt.extend_from_slice(b"not a real frame");
         assert!(decode(&corrupt).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn encode_byte_values_none_stores_payloads_verbatim() {
+        let cfg = StoreCompressionConfig::default();
+        let payloads = [
+            br#"{"type":"a","sequence_number":0}"#.as_slice(),
+            br#"{"type":"b","sequence_number":1}"#.as_slice(),
+        ];
+        let encoded = cfg.encode_byte_values(&payloads).await.unwrap();
+        assert_eq!(encoded.len(), payloads.len());
+        for (raw, stored) in payloads.iter().zip(&encoded) {
+            assert!(!stored.starts_with(&ZSTD_MAGIC), "none must not compress");
+            assert_eq!(stored, raw, "payload stored byte-for-byte");
+            assert_eq!(decode_bytes(stored).unwrap(), raw.to_vec());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn encode_byte_values_zstd_roundtrips_through_decode_bytes() {
+        let cfg = zstd_config();
+        let raw = br#"{"type":"response.output_text.delta","sequence_number":7,"delta":"hello"}"#.as_slice();
+        let encoded = cfg.encode_byte_values(&[raw]).await.unwrap();
+        let stored = encoded.first().expect("one payload encoded");
+        assert!(stored.starts_with(&ZSTD_MAGIC), "expected zstd frame: {stored:?}");
+        assert_eq!(
+            decode_bytes(stored).unwrap(),
+            raw.to_vec(),
+            "raw JSON bytes survive the zstd round trip verbatim"
+        );
+    }
+
+    #[test]
+    fn decode_bytes_returns_raw_json_without_magic() {
+        // An uncompressed row is handed back byte-for-byte, key order intact, so
+        // replay never reorders the original event.
+        let raw = br#"{"b":2,"a":1}"#.as_slice();
+        assert_eq!(decode_bytes(raw).unwrap(), raw.to_vec());
     }
 
     #[test]

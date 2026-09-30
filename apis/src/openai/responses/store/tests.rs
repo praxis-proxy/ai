@@ -6347,7 +6347,8 @@ fn event_record(
         owner: owner.clone(),
         sequence_number,
         event_type: event_type.to_owned(),
-        payload: json!({"type": event_type, "sequence_number": sequence_number}),
+        payload: serde_json::to_vec(&json!({"type": event_type, "sequence_number": sequence_number}))
+            .expect("event payload serializes"),
         terminal,
         created_at: 1000,
     }

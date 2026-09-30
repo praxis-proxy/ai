@@ -16,7 +16,7 @@ use tracing::info;
 use super::{
     ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
     PoolConfig, ResponseEventRecord, ResponseRecord, ResponseStore, SslMode, StoreError,
-    compression::{StoreCompressionConfig, decode, run_blocking},
+    compression::{StoreCompressionConfig, decode, decode_bytes, run_blocking},
     pool::apply_pool_config,
     postgres_tls::PgTlsConfig,
     schemas::{
@@ -905,10 +905,10 @@ impl ResponseStore for PostgresResponseStore {
         if events.is_empty() {
             return Ok(());
         }
-        // One blocking hop compresses every payload; reads decode via `decode`.
+        // One blocking hop compresses every payload; reads decode via `decode_bytes`.
         let payloads = self
             .compression
-            .encode_values(&events.iter().map(|event| &event.payload).collect::<Vec<_>>())
+            .encode_byte_values(&events.iter().map(|event| event.payload.as_slice()).collect::<Vec<_>>())
             .await?;
         let lock_sql = events_parent_lock_sql(&self.tables.responses);
         let sql = events_insert_sql(&self.tables.responses);
@@ -1767,7 +1767,7 @@ fn row_to_event_record(row: &PgRow) -> Result<ResponseEventRecord, StoreError> {
         event_type: row
             .try_get("event_type")
             .map_err(|e| StoreError::Database(e.to_string()))?,
-        payload: decode(&payload_bytes)?,
+        payload: decode_bytes(&payload_bytes)?,
         terminal: terminal != 0,
         created_at: row
             .try_get("created_at")

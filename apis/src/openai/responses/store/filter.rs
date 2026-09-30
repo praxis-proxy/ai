@@ -44,7 +44,10 @@
 //! [`filter_metadata`]: praxis_filter::HttpFilterContext::filter_metadata
 //! [`ResponsesState`]: super::super::state::ResponsesState
 
-use std::num::{NonZeroU32, NonZeroU64};
+use std::{
+    borrow::Cow,
+    num::{NonZeroU32, NonZeroU64},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -359,27 +362,47 @@ fn decode_replay_row(record: &SseRecord) -> Option<(u64, CapturedEvent)> {
     if data.as_ref() == b"[DONE]" {
         return None;
     }
-    let Ok(payload) = serde_json::from_slice::<Value>(&data) else {
-        trace!("replay capture: outbound SSE event was not valid JSON; skipping");
+    // Peek only the header fields needed to index and classify the event; the
+    // full `data` payload is retained as raw bytes, not a parsed value tree. A
+    // struct deserialize still validates the whole JSON object and rejects a
+    // missing or non-numeric `sequence_number`, matching the previous behavior.
+    let Ok(head) = serde_json::from_slice::<ReplayEventHead<'_>>(&data) else {
+        trace!("replay capture: outbound SSE event lacked a numeric sequence_number or was not valid JSON; skipping");
         return None;
     };
-    let sequence_number = payload.get("sequence_number").and_then(Value::as_u64)?;
     let event_type = record
         .event()
         .and_then(|e| std::str::from_utf8(e).ok())
         .map(str::to_owned)
-        .or_else(|| payload.get("type").and_then(Value::as_str).map(str::to_owned))
+        .or_else(|| head.ty.map(Cow::into_owned))
         .unwrap_or_default();
     let terminal = is_terminal_event_type(&event_type);
     Some((
         data.len() as u64,
         CapturedEvent {
-            sequence_number,
+            sequence_number: head.sequence_number,
             event_type,
-            payload,
+            payload: data.to_vec(),
             terminal,
         },
     ))
+}
+
+/// The only fields read from a captured SSE event's JSON `data` payload: the
+/// required numeric `sequence_number` used to index the replay log, and the
+/// optional `type` used as the event name when the SSE record omits an `event:`
+/// line. The `type` is borrowed from the input where possible so the common
+/// path (an `event:` line is present) allocates nothing. Every other field is
+/// ignored — the payload itself is stored verbatim as raw bytes.
+#[derive(serde::Deserialize)]
+struct ReplayEventHead<'a> {
+    /// Required client-visible logical-stream sequence number; a missing or
+    /// non-numeric value fails the deserialize so the event is skipped.
+    sequence_number: u64,
+    /// Optional wire event name, used only when the SSE record has no `event:`
+    /// line. Borrowed from the payload where no unescaping is needed.
+    #[serde(borrow, default, rename = "type")]
+    ty: Option<Cow<'a, str>>,
 }
 
 /// Resolve the owner-scoped Responses service from the per-request registry.
@@ -490,9 +513,10 @@ struct CapturedEvent {
     sequence_number: u64,
     /// Wire event name (equals the payload's `type`).
     event_type: String,
-    /// Parsed event JSON. Re-encoded byte-for-byte on replay because
-    /// `preserve_order` keeps object key order stable across the round trip.
-    payload: Value,
+    /// The event's `data` payload as raw JSON bytes, captured verbatim so replay
+    /// re-emits the original bytes without a parse/serialize round trip and no
+    /// value tree is retained per event until the terminal seam.
+    payload: Vec<u8>,
     /// Whether this is a terminal event.
     terminal: bool,
 }
@@ -1668,20 +1692,14 @@ impl StreamingResponseBody for ReplayStreamBody {
 }
 
 /// Encode one stored event row back to the canonical wire SSE form
-/// (`event: <type>\ndata: <compact-json>\n\n`), byte-identical to the original
-/// outbound event because `preserve_order` keeps object key order stable across
-/// the parse/serialize round trip. On a serialization failure the partial `data`
-/// bytes are rolled back so a truncated payload is never followed by the
-/// delimiter.
+/// (`event: <type>\ndata: <compact-json>\n\n`). The stored payload is the
+/// original event's `data` bytes, so it is written verbatim — byte-identical to
+/// the original outbound event, with no parse/serialize round trip that could
+/// reorder object keys or fail mid-write.
 fn encode_replay_event(event: &ResponseEventRecord, output: &mut Vec<u8>) {
     output.extend_from_slice(b"event: ");
     output.extend_from_slice(event.event_type.as_bytes());
     output.extend_from_slice(b"\ndata: ");
-    let start = output.len();
-    if let Err(error) = serde_json::to_writer(&mut *output, &event.payload) {
-        debug!(%error, "replay: event payload serialization failed");
-        output.truncate(start);
-        return;
-    }
+    output.extend_from_slice(&event.payload);
     output.extend_from_slice(b"\n\n");
 }

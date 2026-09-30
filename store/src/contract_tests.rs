@@ -57,7 +57,8 @@ fn event(owner: &StateOwner, response_id: &str, sequence_number: u64, terminal: 
         owner: owner.clone(),
         sequence_number,
         event_type: event_type.to_owned(),
-        payload: serde_json::json!({ "type": event_type, "sequence_number": sequence_number }),
+        payload: serde_json::to_vec(&serde_json::json!({ "type": event_type, "sequence_number": sequence_number }))
+            .expect("event payload serializes"),
         terminal,
         created_at: 1,
     }
@@ -761,14 +762,14 @@ async fn event_log_append_is_insert_if_absent(backend: &dyn PersistedStateBacken
     persist_parent_response(backend, &o, "resp_events_idem").await;
 
     let mut original = event(&o, "resp_events_idem", 0, false);
-    original.payload = serde_json::json!({ "v": "original" });
+    original.payload = serde_json::to_vec(&serde_json::json!({ "v": "original" })).expect("payload serializes");
     backend
         .append_events(&o, "resp_events_idem", std::slice::from_ref(&original))
         .await
         .expect("append original");
 
     let mut collision = event(&o, "resp_events_idem", 0, false);
-    collision.payload = serde_json::json!({ "v": "overwrite" });
+    collision.payload = serde_json::to_vec(&serde_json::json!({ "v": "overwrite" })).expect("payload serializes");
     backend
         .append_events(&o, "resp_events_idem", std::slice::from_ref(&collision))
         .await
@@ -781,7 +782,7 @@ async fn event_log_append_is_insert_if_absent(backend: &dyn PersistedStateBacken
     assert_eq!(listed.len(), 1, "a duplicate sequence created a second row");
     assert_eq!(
         listed.first().map(|event| &event.payload),
-        Some(&serde_json::json!({ "v": "original" })),
+        Some(&serde_json::to_vec(&serde_json::json!({ "v": "original" })).expect("payload serializes")),
         "insert-if-absent overwrote the already-stored event"
     );
 }
