@@ -1692,14 +1692,81 @@ impl StreamingResponseBody for ReplayStreamBody {
 }
 
 /// Encode one stored event row back to the canonical wire SSE form
-/// (`event: <type>\ndata: <compact-json>\n\n`). The stored payload is the
-/// original event's `data` bytes, so it is written verbatim — byte-identical to
-/// the original outbound event, with no parse/serialize round trip that could
-/// reorder object keys or fail mid-write.
+/// (`event: <type>\ndata: <payload>\n\n`). The stored payload is the original
+/// event's `data` bytes, written verbatim with no parse/serialize round trip
+/// that could reorder object keys or fail mid-write.
+///
+/// The payload is emitted as one `data:` field per line: an SSE decoder joins
+/// multiple `data:` lines back with `\n`, so a payload carrying embedded
+/// newlines still decodes to the original bytes rather than being truncated at
+/// the first line. Normalized events are single-line compact JSON, so the common
+/// case produces exactly one `data:` field.
 fn encode_replay_event(event: &ResponseEventRecord, output: &mut Vec<u8>) {
     output.extend_from_slice(b"event: ");
     output.extend_from_slice(event.event_type.as_bytes());
-    output.extend_from_slice(b"\ndata: ");
-    output.extend_from_slice(&event.payload);
-    output.extend_from_slice(b"\n\n");
+    output.push(b'\n');
+    for line in event.payload.split(|&b| b == b'\n') {
+        output.extend_from_slice(b"data: ");
+        output.extend_from_slice(line);
+        output.push(b'\n');
+    }
+    output.push(b'\n');
+}
+
+#[cfg(test)]
+mod encode_replay_event_tests {
+    use bytes::Bytes;
+    use praxis_filter::sse::SseDecoder;
+
+    use super::{ResponseEventRecord, StateOwner, encode_replay_event};
+
+    /// Build a minimal event record carrying `payload` for the encoder under test.
+    fn record_with_payload(event_type: &str, payload: &[u8]) -> ResponseEventRecord {
+        ResponseEventRecord {
+            response_id: "resp_replay".to_owned(),
+            owner: StateOwner::from_trusted_parts("t", "i", "s").expect("valid owner parts"),
+            sequence_number: 1,
+            event_type: event_type.to_owned(),
+            payload: payload.to_vec(),
+            terminal: false,
+            created_at: 0,
+        }
+    }
+
+    /// Decode a single-record `frame`, returning its event name and joined `data`.
+    fn decode_single(frame: &[u8]) -> (Option<String>, Vec<u8>) {
+        let mut decoder = SseDecoder::new();
+        let batch = decoder.push(&Bytes::copy_from_slice(frame));
+        let record = batch.records.first().expect("one SSE record decoded");
+        let event = record
+            .event()
+            .map(|name| String::from_utf8(name.to_vec()).expect("utf8 event name"));
+        (event, record.data().to_vec())
+    }
+
+    /// A single-line payload replays byte-identically through the SSE decoder.
+    #[test]
+    fn single_line_payload_round_trips() {
+        let payload = br#"{"type":"response.completed","sequence_number":1}"#;
+        let mut out = Vec::new();
+        encode_replay_event(&record_with_payload("response.completed", payload), &mut out);
+        let (event, data) = decode_single(&out);
+        assert_eq!(event.as_deref(), Some("response.completed"));
+        assert_eq!(data, payload.to_vec());
+    }
+
+    /// A payload with an embedded newline is emitted as multiple `data:` lines and
+    /// an SSE decoder rejoins them into the original bytes rather than truncating
+    /// at the first line (the regression a single `data:` field would cause).
+    #[test]
+    fn multi_line_payload_round_trips_without_truncation() {
+        let payload = b"{\"a\":1}\n{\"b\":2}";
+        let mut out = Vec::new();
+        encode_replay_event(&record_with_payload("response.output_text.delta", payload), &mut out);
+        let text = std::str::from_utf8(&out).expect("utf8 frame");
+        assert_eq!(text.matches("data: ").count(), 2, "one data field per payload line");
+        let (event, data) = decode_single(&out);
+        assert_eq!(event.as_deref(), Some("response.output_text.delta"));
+        assert_eq!(data, payload.to_vec());
+    }
 }
