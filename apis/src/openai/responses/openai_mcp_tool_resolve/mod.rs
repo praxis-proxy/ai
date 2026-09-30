@@ -509,7 +509,7 @@ impl McpToolResolveFilter {
             .collect();
         let task_results = futures::future::try_join_all(futures).await?;
 
-        collect_resolutions(entries, &entry_to_task, &task_results)
+        collect_resolutions(entries, &entry_to_task, task_results)
     }
 
     /// Resolve tools for a single MCP entry independently.
@@ -855,17 +855,19 @@ fn check_body_size(serialized: &SerializedJson, max_rewritten_body_bytes: usize)
 fn collect_resolutions(
     entries: &[serde_json::Value],
     entry_to_task: &[Option<usize>],
-    task_results: &[Option<Vec<serde_json::Value>>],
+    mut task_results: Vec<Option<Vec<serde_json::Value>>>,
 ) -> Result<Resolution, ResolveError> {
     let mut tool_map = HashMap::new();
     let mut per_entry = Vec::with_capacity(entries.len());
     let mut has_resolved = false;
     let mut resolved_labels = HashSet::new();
     let mut listings = Vec::new();
+    let mut remaining_consumers = task_consumer_counts(entry_to_task, task_results.len());
+
     for (entry, task_idx) in entries.iter().zip(entry_to_task) {
-        if let Some((resolution, listing_tools)) =
-            build_entry_resolution(entry, *task_idx, task_results, &mut tool_map)?
-        {
+        let tools =
+            (*task_idx).and_then(|task_idx| consume_task_result(task_idx, &mut task_results, &mut remaining_consumers));
+        if let Some((resolution, listing_tools)) = build_entry_resolution(entry, tools, &mut tool_map)? {
             has_resolved = true;
             let label = server_label(entry).to_owned();
             resolved_labels.insert(label.clone());
@@ -888,6 +890,37 @@ fn collect_resolutions(
         resolved_labels,
         listings,
     })
+}
+
+/// Count how many entries consume each deduplicated resolution task.
+fn task_consumer_counts(entry_to_task: &[Option<usize>], task_count: usize) -> Vec<usize> {
+    let mut counts = vec![0; task_count];
+    for task_idx in entry_to_task.iter().flatten() {
+        if let Some(count) = counts.get_mut(*task_idx) {
+            *count += 1;
+        }
+    }
+    counts
+}
+
+/// Return one entry's task result, moving it for the final consumer.
+///
+/// A deduplicated task may feed several request entries. Earlier consumers
+/// receive a clone while the final (or only) consumer takes the owned result.
+fn consume_task_result(
+    task_idx: usize,
+    task_results: &mut [Option<Vec<serde_json::Value>>],
+    remaining_consumers: &mut [usize],
+) -> Option<Vec<serde_json::Value>> {
+    let remaining = remaining_consumers.get_mut(task_idx)?;
+    let result = task_results.get_mut(task_idx)?;
+    if *remaining > 1 {
+        *remaining -= 1;
+        result.clone()
+    } else {
+        *remaining = 0;
+        result.take()
+    }
 }
 
 /// Resolve connector IDs to server URLs for MCP tool entries.
@@ -954,11 +987,10 @@ fn validate_connector_entry(entry: &serde_json::Value, connector_id: &str) -> Re
 /// result before it is consumed into `tool_map`.
 fn build_entry_resolution(
     entry: &serde_json::Value,
-    task_idx: Option<usize>,
-    task_results: &[Option<Vec<serde_json::Value>>],
+    tools: Option<Vec<serde_json::Value>>,
     tool_map: &mut HashMap<(String, String), serde_json::Value>,
 ) -> Result<Option<(EntryResolution, Vec<serde_json::Value>)>, ResolveError> {
-    let Some(tools) = task_idx.and_then(|idx| task_results.get(idx)?.clone()) else {
+    let Some(tools) = tools else {
         return Ok(None);
     };
     let allowed = extract_allowed_tools(entry)?;

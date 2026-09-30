@@ -1380,6 +1380,40 @@ fn dedup_entries_groups_same_label_url() {
 }
 
 #[test]
+fn task_result_is_retained_only_until_its_final_consumer() {
+    let entry_to_task = [Some(0), Some(0), Some(1)];
+    let mut task_results = vec![
+        Some(vec![serde_json::json!({"name": "shared"})]),
+        Some(vec![serde_json::json!({"name": "unique"})]),
+    ];
+    let mut remaining_consumers = task_consumer_counts(&entry_to_task, task_results.len());
+
+    let first_shared = consume_task_result(0, &mut task_results, &mut remaining_consumers);
+    assert!(first_shared.is_some(), "the first shared consumer receives a result");
+    assert!(
+        task_results[0].is_some(),
+        "the shared result remains owned until its final consumer"
+    );
+
+    let final_shared = consume_task_result(0, &mut task_results, &mut remaining_consumers);
+    assert_eq!(
+        final_shared, first_shared,
+        "both shared consumers receive the same result"
+    );
+    assert!(
+        task_results[0].is_none(),
+        "the final shared consumer takes the stored result"
+    );
+
+    let unique = consume_task_result(1, &mut task_results, &mut remaining_consumers);
+    assert!(unique.is_some(), "the unique consumer receives its result");
+    assert!(
+        task_results[1].is_none(),
+        "a uniquely consumed result is moved immediately"
+    );
+}
+
+#[test]
 fn dedup_entries_keeps_credentialed_independent() {
     let entries = vec![
         serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "authorization": "tok_a"}),
@@ -5391,7 +5425,7 @@ fn collect_resolutions_preserves_only_reusable_target_identity() {
         Some(vec![serde_json::json!({"name": "connector_tool"})]),
     ];
 
-    let resolution = collect_resolutions(&entries, &[Some(0), Some(1), Some(2)], &task_results)
+    let resolution = collect_resolutions(&entries, &[Some(0), Some(1), Some(2)], task_results)
         .expect("valid entries resolve to listings");
     let target_urls: Vec<_> = resolution
         .listings
