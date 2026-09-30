@@ -1941,10 +1941,11 @@ fn rewrite_tools_array(
     (result, generated_names)
 }
 
-/// Copy only the client-visible deferred MCP fields into the outbound tool.
+/// Move only the client-visible deferred MCP fields into the outbound tool.
 fn sanitize_deferred_connector_tool(tool: serde_json::Value) -> serde_json::Value {
-    let Some(obj) = tool.as_object() else {
-        return tool;
+    let mut obj = match tool {
+        serde_json::Value::Object(obj) => obj,
+        other => return other,
     };
     let mut sanitized = serde_json::Map::new();
     for key in [
@@ -1956,8 +1957,8 @@ fn sanitize_deferred_connector_tool(tool: serde_json::Value) -> serde_json::Valu
         "allowed_callers",
         "require_approval",
     ] {
-        if let Some(value) = obj.get(key) {
-            sanitized.insert(key.to_owned(), value.clone());
+        if let Some(value) = obj.remove(key) {
+            sanitized.insert(key.to_owned(), value);
         }
     }
     serde_json::Value::Object(sanitized)
