@@ -61,7 +61,10 @@ const CE_TYPE_USAGE: &str = "inference.tokens.used";
 
 /// Metadata key holding the resolved model name, written during the request
 /// body phase and read during the response body phase.
-const META_METERING_MODEL: &str = "metering.model";
+pub(crate) const META_METERING_MODEL: &str = "metering.model";
+
+/// Metadata key for the tenant username resolved by external metering.
+pub(crate) const META_METERING_USERNAME: &str = "metering.username";
 
 /// Well-known `filter_metadata` key for input tokens (set by `token_count`).
 const META_TOKEN_INPUT: &str = "token.input";
@@ -350,6 +353,11 @@ impl HttpFilter for ExternalMeteringFilter {
             state.username.clone_from(fallback);
         }
 
+        // Publish the resolved identity for downstream consumers such as
+        // token_usage_metrics. This avoids repeating trust-tier resolution
+        // when external_metering already ran earlier in the pipeline.
+        ctx.set_metadata(META_METERING_USERNAME, state.username.clone());
+
         if !state.model.is_empty() {
             ctx.filter_metadata
                 .insert(META_METERING_MODEL.to_owned(), state.model.clone());
@@ -546,7 +554,7 @@ fn capture_identity(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_name
         .unwrap_or_default()
         .to_owned();
 
-    let mut identity = read_identity_headers(ctx, prefix, identity_namespace);
+    let mut identity = crate::identity::resolve_tenant_identity(ctx, prefix, identity_namespace);
     strip_client_credentials(ctx);
 
     if identity.group.is_empty() {
@@ -562,117 +570,6 @@ fn capture_identity(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_name
         subscription: identity.subscription,
         user_agent,
         username: identity.username,
-    }
-}
-
-/// Tenant identity as carried on the request headers.
-#[derive(Default)]
-struct Identity {
-    /// Value of `{prefix}group`.
-    group: String,
-
-    /// Value of `{prefix}model`.
-    model: String,
-
-    /// Value of `{prefix}subscription`.
-    subscription: String,
-
-    /// Value of `{prefix}username`.
-    username: String,
-}
-
-/// Resolve tenant identity from the highest-trust source available.
-///
-/// Three tiers, most trusted first:
-///
-/// 1. Unnamespaced `{prefix}*` metadata keys, written by an authentication filter from verified credentials (e.g. JWT
-///    claims or a validated API key). When any of these are present, every lower tier is ignored entirely so a client
-///    cannot spoof the remaining fields via forged headers alongside valid credentials.
-/// 2. Namespaced `{namespace}.{prefix}*` metadata keys, written by the `identity_header_guard` filter from captured
-///    request headers.
-/// 3. Raw `{prefix}*` request headers, set by a trusted upstream auth layer when neither metadata tier is populated.
-///
-/// Identity headers are always marked for removal so tenant identity
-/// never leaks to the upstream provider, regardless of which tier
-/// supplied the identity.
-fn read_identity_headers(ctx: &mut HttpFilterContext<'_>, prefix: &str, identity_namespace: &str) -> Identity {
-    let mut identity = Identity::default();
-    read_metadata_identity(ctx, prefix, "", &mut identity);
-
-    // Any verified field blocks the lower tiers entirely: an auth filter
-    // may map only some claims (e.g. group without username), and a
-    // partially verified identity must not be extended by forgeable
-    // sources.
-    let has_verified_identity = !(identity.username.is_empty()
-        && identity.group.is_empty()
-        && identity.subscription.is_empty()
-        && identity.model.is_empty());
-
-    if !has_verified_identity {
-        read_metadata_identity(ctx, prefix, &format!("{identity_namespace}."), &mut identity);
-    }
-
-    let has_metadata_identity = has_verified_identity || !identity.username.is_empty();
-    if has_metadata_identity {
-        strip_identity_headers(ctx, prefix);
-    } else {
-        read_header_identity(ctx, prefix, &mut identity);
-    }
-
-    identity
-}
-
-/// Read the `{namespace}{prefix}*` identity keys from `filter_metadata`,
-/// overwriting only the fields the namespace carries.
-fn read_metadata_identity(ctx: &HttpFilterContext<'_>, prefix_lower: &str, namespace: &str, identity: &mut Identity) {
-    if let Some(val) = ctx.filter_metadata.get(&format!("{namespace}{prefix_lower}group")) {
-        identity.group.clone_from(val);
-    }
-    if let Some(val) = ctx.filter_metadata.get(&format!("{namespace}{prefix_lower}model")) {
-        identity.model.clone_from(val);
-    }
-    if let Some(val) = ctx
-        .filter_metadata
-        .get(&format!("{namespace}{prefix_lower}subscription"))
-    {
-        identity.subscription.clone_from(val);
-    }
-    if let Some(val) = ctx.filter_metadata.get(&format!("{namespace}{prefix_lower}username")) {
-        identity.username.clone_from(val);
-    }
-}
-
-/// Read identity from raw `{prefix}*` request headers, marking each one
-/// for removal.
-///
-/// [`HeaderName::as_str`] already returns the lowercased name, so the
-/// pre-lowercased prefix compares directly without per-header allocation.
-fn read_header_identity(ctx: &mut HttpFilterContext<'_>, prefix_lower: &str, identity: &mut Identity) {
-    for (key, value) in &ctx.request.headers {
-        let Some(suffix) = key.as_str().strip_prefix(prefix_lower) else {
-            continue;
-        };
-        let val = value.to_str().unwrap_or_default();
-
-        match suffix {
-            "group" if identity.group.is_empty() => val.clone_into(&mut identity.group),
-            "model" if identity.model.is_empty() => val.clone_into(&mut identity.model),
-            "subscription" if identity.subscription.is_empty() => val.clone_into(&mut identity.subscription),
-            "username" if identity.username.is_empty() => val.clone_into(&mut identity.username),
-            _ => {},
-        }
-
-        ctx.request_headers_to_remove.push(key.clone());
-    }
-}
-
-/// Mark every `{prefix}*` header for removal without reading it, so
-/// unused identity headers still never reach the upstream provider.
-fn strip_identity_headers(ctx: &mut HttpFilterContext<'_>, prefix_lower: &str) {
-    for (key, _) in &ctx.request.headers {
-        if key.as_str().starts_with(prefix_lower) {
-            ctx.request_headers_to_remove.push(key.clone());
-        }
     }
 }
 

@@ -1,0 +1,65 @@
+# Token Usage Prometheus Metrics (POC)
+#
+# Opt-in per-tenant token counters for small known tenant sets.
+# This is not a production usage dashboard.
+#
+# Emits praxis_ai_tokens_total{tenant, model, kind} after token_count
+# extracts usage. Tenant identity uses the same 3-tier resolution as
+# external_metering (verified metadata or identity_header_guard metadata).
+# Raw request headers are never used directly. Distinct tenant labels are bounded by
+# max_tenants; further tenants share overflow_tenant (default: other).
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/token-usage-metrics.yaml
+#   curl http://localhost:8080/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -H "x-tenant-username: alice" \
+#     -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}'
+#
+# Grafana: import examples/dashboards/token-usage-metrics.json
+# Prometheus scrape endpoint: http://127.0.0.1:9901/metrics
+#
+# Pipeline ordering: token_usage_metrics is declared before token_count
+# so response hooks (reverse order) extract counts first.
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      # Capture identity into FilterContext metadata and strip the raw header.
+      # In a pipeline with external_metering, token_usage_metrics can instead
+      # reuse the resolved metering.username metadata that filter publishes.
+      - filter: identity_header_guard
+        prefix: "x-tenant-"
+        metadata_namespace: "identity"
+
+      - filter: token_usage_metrics
+        identity_header_prefix: "x-tenant-"
+        identity_metadata_namespace: "identity"
+        max_tenants: 32
+        overflow_tenant: other
+
+      - filter: token_count
+        provider: openai
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+
+admin:
+  address: "127.0.0.1:9901"
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to local backends

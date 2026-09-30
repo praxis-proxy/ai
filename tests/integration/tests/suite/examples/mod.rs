@@ -106,6 +106,7 @@ mod token_counting;
 #[cfg(feature = "token-rate-limit-filter")]
 mod token_rate_limit;
 mod token_usage_headers;
+mod token_usage_metrics;
 mod vector_stores_routing;
 mod vertex_gemini;
 mod vllm_agentic_api;
