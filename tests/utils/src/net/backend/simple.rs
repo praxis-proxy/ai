@@ -740,6 +740,7 @@ fn build_config(address: &str, clusters: Vec<Cluster>, filters: Vec<FilterEntry>
     let listener = Listener {
         address: address.to_owned(),
         cluster: None,
+        downstream_keepalive_timeout_ms: None,
         downstream_read_timeout_ms: None,
         filter_chains: vec!["backend".to_owned()],
         max_connections: None,
