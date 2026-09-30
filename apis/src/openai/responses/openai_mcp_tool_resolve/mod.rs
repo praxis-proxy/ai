@@ -2305,7 +2305,7 @@ fn mcp_tool_to_list_tools_entry(definition: &serde_json::Value) -> serde_json::V
 /// building the full tools array to catch this.
 pub(crate) fn encode_function_name(label: &str, tool_name: &str) -> String {
     let raw = format!("{label}__{tool_name}");
-    let sanitized: String = raw
+    let mut sanitized: String = raw
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
@@ -2315,11 +2315,9 @@ pub(crate) fn encode_function_name(label: &str, tool_name: &str) -> String {
             }
         })
         .collect();
-    if sanitized.len() <= MAX_FUNCTION_NAME_LEN {
-        sanitized
-    } else {
-        sanitized.chars().take(MAX_FUNCTION_NAME_LEN).collect()
-    }
+    // Every character above is mapped to ASCII, so this byte index is always a character boundary.
+    sanitized.truncate(MAX_FUNCTION_NAME_LEN);
+    sanitized
 }
 
 /// Reverse lookup for model-facing MCP function names.
