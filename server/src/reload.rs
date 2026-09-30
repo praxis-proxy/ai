@@ -230,6 +230,7 @@ fn log_restart_required_changes(old: &Config, new: &Config) {
     detect_protocol_changes(old, new);
     detect_compression_additions(old, new);
     detect_tls_toggles(old, new);
+    detect_listener_setting_changes(old, new);
     detect_subrequest_connector_changes(old, new);
     detect_process_limit_changes(old, new);
 }
@@ -345,6 +346,35 @@ fn detect_tls_toggles(old: &Config, new: &Config) {
                     );
                 },
                 _ => {},
+            }
+        }
+    }
+}
+
+/// Detect changes to listener settings the HTTP handler captures once at
+/// startup: connection limits and downstream timeouts.
+fn detect_listener_setting_changes(old: &Config, new: &Config) {
+    for new_l in &new.listeners {
+        let Some(old_l) = old.listeners.iter().find(|l| l.name == new_l.name) else {
+            continue;
+        };
+        for (field, changed) in [
+            ("max_connections", old_l.max_connections != new_l.max_connections),
+            (
+                "downstream_keepalive_timeout_ms",
+                old_l.downstream_keepalive_timeout_ms != new_l.downstream_keepalive_timeout_ms,
+            ),
+            (
+                "downstream_read_timeout_ms",
+                old_l.downstream_read_timeout_ms != new_l.downstream_read_timeout_ms,
+            ),
+        ] {
+            if changed {
+                warn!(
+                    listener = %new_l.name,
+                    field,
+                    "listener setting changed; requires restart (applied when the listener starts)"
+                );
             }
         }
     }
@@ -867,6 +897,38 @@ filter_chains:
     }
 
     #[test]
+    fn listener_keepalive_timeout_change_warns() {
+        let old = config_with_listener_line("");
+        let new = config_with_listener_line("    downstream_keepalive_timeout_ms: 5000\n");
+        let warnings = capture_warnings(|| detect_listener_setting_changes(&old, &new));
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one changed listener setting, one warning: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("requires restart"),
+            "the timeout is applied when the listener starts: {:?}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn listener_limit_and_read_timeout_changes_warn() {
+        let old = config_with_listener_line("");
+        let new = config_with_listener_line("    max_connections: 10\n    downstream_read_timeout_ms: 5000\n");
+        let warnings = capture_warnings(|| detect_listener_setting_changes(&old, &new));
+        assert_eq!(warnings.len(), 2, "each changed setting warns: {warnings:?}");
+    }
+
+    #[test]
+    fn unchanged_listener_settings_do_not_warn() {
+        let config = config_with_listener_line("    downstream_keepalive_timeout_ms: 5000\n");
+        let warnings = capture_warnings(|| detect_listener_setting_changes(&config, &config));
+        assert!(warnings.is_empty(), "nothing changed: {warnings:?}");
+    }
+
+    #[test]
     fn max_open_files_change_warns() {
         let old = config_with_runtime_line("threads: 1");
         let new = config_with_runtime_line("max_open_files: 4096");
@@ -957,6 +1019,15 @@ filter_chains:
     fn test_client() -> praxis_core::subrequest::SubRequestClient {
         praxis_tls::provider::install();
         praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
+    }
+
+    fn config_with_listener_line(line: &str) -> Config {
+        Config::from_yaml(&format!(
+            "listeners:\n  - name: web\n    address: \"127.0.0.1:8080\"\n{line}    \
+             filter_chains: [main]\nfilter_chains:\n  - name: main\n    \
+             filters:\n      - filter: static_response\n        status: 200\n"
+        ))
+        .unwrap()
     }
 
     fn config_with_runtime_line(line: &str) -> Config {
