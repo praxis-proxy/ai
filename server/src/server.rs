@@ -102,6 +102,7 @@ fn boot_server(
     enforce_root_check(&config);
     warn_insecure_options(&config);
     init_runtime_limits(&config.runtime);
+    crate::fd_limit::apply(&config);
     warn_insecure_key_permissions(&config);
 
     let health_registry = build_health_registry(&config.clusters);

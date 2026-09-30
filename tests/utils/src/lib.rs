@@ -23,6 +23,7 @@ pub mod fips;
 /// Versioned wire fixtures and inference scenarios for integration tests.
 pub mod inference_fixture;
 pub mod net;
+pub mod process;
 pub mod proxy;
 pub mod recording;
 pub mod session_replay;
@@ -41,6 +42,9 @@ pub use cli_process::{
 pub use example_config::{allow_loopback_endpoints, example_config_path, load_example_config, patch_yaml};
 pub use fips::{approved_mode, assert_fips_host_if_declared, expect_approved_mode, fips_host, fips_host_declared};
 pub use net::*;
+#[cfg(target_os = "linux")]
+pub use process::own_open_file_limits;
+pub use process::{PraxisProcess, READY_TIMEOUT};
 pub use proxy::{
     PRAXIS_AI_BIN_ENV, ProxyGuard, ProxyShutdownError, ReloadableProxyGuard, build_pipeline, custom_filter_yaml,
     praxis_ai_bin, registry_with, simple_proxy_yaml, start_full_proxy, start_proxy, start_proxy_no_wait,

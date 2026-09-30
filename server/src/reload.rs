@@ -231,6 +231,7 @@ fn log_restart_required_changes(old: &Config, new: &Config) {
     detect_compression_additions(old, new);
     detect_tls_toggles(old, new);
     detect_subrequest_connector_changes(old, new);
+    detect_process_limit_changes(old, new);
 }
 
 /// Detect listener additions, removals, and address rebinds.
@@ -366,6 +367,17 @@ fn detect_subrequest_connector_changes(old: &Config, new: &Config) {
         );
     }
     detect_subrequest_circuit_breaker_change(old, new);
+}
+
+/// Detect changes to process limits applied once at startup.
+fn detect_process_limit_changes(old: &Config, new: &Config) {
+    if old.runtime.max_open_files != new.runtime.max_open_files {
+        warn!(
+            old = ?old.runtime.max_open_files,
+            new = ?new.runtime.max_open_files,
+            "runtime.max_open_files changed; requires restart (the open file limit is set once at startup)"
+        );
+    }
 }
 
 /// Detect `runtime.subrequest_circuit_breaker` changes that require a restart.
@@ -848,6 +860,26 @@ filter_chains:
     }
 
     #[test]
+    fn max_open_files_change_warns() {
+        let old = config_with_runtime_line("threads: 1");
+        let new = config_with_runtime_line("max_open_files: 4096");
+        let warnings = capture_warnings(|| detect_process_limit_changes(&old, &new));
+        assert_eq!(warnings.len(), 1, "one changed limit, one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("requires restart"),
+            "the open file limit is set once at startup: {:?}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn unchanged_process_limits_do_not_warn() {
+        let config = config_with_runtime_line("max_open_files: 4096");
+        let warnings = capture_warnings(|| detect_process_limit_changes(&config, &config));
+        assert!(warnings.is_empty(), "nothing changed: {warnings:?}");
+    }
+
+    #[test]
     fn circuit_breaker_unchanged_no_warning() {
         let config = config_with_circuit_breaker(Some(5));
         let warnings = capture_warnings(|| detect_subrequest_circuit_breaker_change(&config, &config));
@@ -905,6 +937,15 @@ filter_chains:
     fn test_client() -> praxis_core::subrequest::SubRequestClient {
         praxis_tls::provider::install();
         praxis_core::subrequest::SubRequestClient::new(praxis_core::subrequest::SubRequestConnector::new(8, None))
+    }
+
+    fn config_with_runtime_line(line: &str) -> Config {
+        Config::from_yaml(&format!(
+            "listeners:\n  - name: web\n    address: \"127.0.0.1:8080\"\n    \
+             filter_chains: [main]\nruntime:\n  {line}\nfilter_chains:\n  - name: main\n    \
+             filters:\n      - filter: static_response\n        status: 200\n"
+        ))
+        .unwrap()
     }
 
     fn config_with_circuit_breaker(failures: Option<u32>) -> Config {

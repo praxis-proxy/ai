@@ -44,7 +44,7 @@ http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 jsonschema = { version = "0.58.1", default-features = false }
-nix = { version = "0.31.3", default-features = false, features = ["process", "signal", "user"] }
+nix = { version = "0.31.3", default-features = false, features = ["process", "resource", "signal", "user"] }
 percent-encoding = "2.3.2"
 notify = "8.2.0"
 object = { version = "0.40.0", default-features = false, features = ["read_core", "elf", "std"] }
