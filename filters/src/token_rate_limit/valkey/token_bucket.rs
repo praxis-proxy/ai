@@ -466,6 +466,11 @@ impl ValkeyTokenBucketBackend {
     /// The denial for `estimate` against `tokens` and the namespace caps,
     /// or `None` to admit. A key refused by `max_keys` has no budget here,
     /// so it reports `0` remaining, as the in-memory ledger does.
+    ///
+    /// `max_keys` and `max_active_reservations` are enforced without a
+    /// distributed lock: two requests that race past the cap before either
+    /// increments the counter may both be admitted. The overshoot is bounded
+    /// to the number of concurrent requests on this replica.
     fn deny_reason(&self, tokens: f64, reads: &BucketReads, estimate: u64) -> Option<BackendReserve> {
         #[expect(clippy::cast_precision_loss, reason = "compared against a balance <= 2^53")]
         let deficit = estimate as f64 - tokens;
@@ -919,6 +924,7 @@ mod tests {
         let BackendReserve::Denied {
             retry_after_ms,
             remaining,
+            ..
         } = backend.reserve(reserve("alice", 50, now)).await.unwrap()
         else {
             panic!("50 exceeds 20");

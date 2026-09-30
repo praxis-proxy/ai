@@ -338,6 +338,11 @@ impl ValkeySlidingWindowBackend {
 
     /// The admission decision given `reads` after a pre-charge has been
     /// applied (counters already include the estimate; pass `estimate = 0`).
+    ///
+    /// `max_keys` and `max_active_reservations` are enforced without a
+    /// distributed lock: two requests that race past the cap before either
+    /// increments the counter may both be admitted. The overshoot is bounded
+    /// to the number of concurrent requests on this replica.
     fn decide(&self, reads: &WindowReads, estimate: u64, now_ms: u64) -> Decision {
         if !reads.key_known && reads.keys >= self.max_keys {
             return Decision::Denied {
@@ -564,7 +569,7 @@ impl TokenRateLimitStateBackend for ValkeySlidingWindowBackend {
             } => {
                 // Best-effort undo; a failed undo leaves a conservative
                 // over-count that expires with the sub-window TTL.
-                let _ = self.undo_charge(&prefix, request.now_ms, request.estimate).await;
+                drop(self.undo_charge(&prefix, request.now_ms, request.estimate).await);
                 self.telemetry.record(remaining, active_after, keys_after);
                 Ok(BackendReserve::Denied {
                     retry_after_ms,
@@ -899,6 +904,7 @@ mod tests {
         let BackendReserve::Denied {
             retry_after_ms,
             remaining,
+            ..
         } = backend.reserve(reserve("alice", 60, now)).await.unwrap()
         else {
             panic!("another 60 exceeds the 40 left");

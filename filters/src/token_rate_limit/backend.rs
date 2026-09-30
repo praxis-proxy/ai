@@ -23,7 +23,7 @@ use metrics::counter;
 use tokio::sync::mpsc;
 
 use super::{
-    ledger::{Budget, Decision, DenialReason, Ledger, Settlement},
+    ledger::{Decision, DenialReason, Ledger, Settlement},
     token_bucket_ledger::{self, TokenBucketLedger},
 };
 

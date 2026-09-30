@@ -1125,7 +1125,6 @@ fn debug_format_lists_configured_rule_names() {
         rules,
         needs_body,
         key_spec: super::compile_key_spec(cfg.key).unwrap(),
-        epoch: std::time::Instant::now(),
     };
     let debug = format!("{filter:?}");
     assert!(debug.contains("default"), "got: {debug}");
