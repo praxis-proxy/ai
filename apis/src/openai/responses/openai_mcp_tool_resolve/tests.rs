@@ -199,9 +199,17 @@ fn config_with_custom_max_tools() {
 // MCP Entry Extraction
 // =========================================================================
 
+fn rewrite_tools_array_for_test(
+    mut tools: Vec<serde_json::Value>,
+    per_entry: Vec<EntryResolution>,
+) -> (Vec<serde_json::Value>, HashSet<String>) {
+    let mcp_entries = extract_mcp_entries_from_tools(&mut tools);
+    rewrite_tools_array(tools, mcp_entries, per_entry)
+}
+
 #[test]
 fn extract_mcp_entries_from_mixed_tools() {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "input": "test",
         "tools": [
             {"type": "function", "name": "calc"},
@@ -210,41 +218,55 @@ fn extract_mcp_entries_from_mixed_tools() {
             {"type": "mcp", "server_label": "calendar", "server_url": "http://localhost:8002/mcp"}
         ]
     });
-    let entries = extract_mcp_entries(&body);
+    let entries = extract_mcp_entries(&mut body);
 
-    assert_eq!(entries.len(), 2, "should extract 2 MCP entries");
+    assert_eq!(entries.values.len(), 2, "should extract 2 MCP entries");
     assert_eq!(
-        entries[0]["server_label"].as_str(),
+        entries.values[0]["server_label"].as_str(),
         Some("weather"),
         "first entry server_label"
     );
     assert_eq!(
-        entries[1]["server_label"].as_str(),
+        entries.values[1]["server_label"].as_str(),
         Some("calendar"),
         "second entry server_label"
+    );
+    assert_eq!(
+        entries.tool_indices,
+        vec![1, 3],
+        "original positions should be retained"
+    );
+    assert!(body["tools"][1].is_null(), "first MCP entry should be moved out");
+    assert!(body["tools"][3].is_null(), "second MCP entry should be moved out");
+    assert_eq!(body["tools"][0]["name"], "calc", "non-MCP tool should remain in place");
+    assert_eq!(
+        body["tools"][2]["type"], "web_search",
+        "non-MCP tool should remain in place"
     );
 }
 
 #[test]
 fn extract_mcp_entries_empty_when_no_mcp() {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "input": "test",
         "tools": [{"type": "function", "name": "calc"}]
     });
-    let entries = extract_mcp_entries(&body);
+    let entries = extract_mcp_entries(&mut body);
     assert!(entries.is_empty(), "should find no MCP entries");
+    assert_eq!(body["tools"][0]["name"], "calc", "non-MCP tool should remain untouched");
 }
 
 #[test]
 fn extract_mcp_entries_handles_no_tools() {
-    let body = serde_json::json!({"input": "test"});
-    let entries = extract_mcp_entries(&body);
+    let mut body = serde_json::json!({"input": "test"});
+    let entries = extract_mcp_entries(&mut body);
     assert!(entries.is_empty(), "should handle missing tools array");
 }
 
 #[test]
 fn extract_mcp_entries_handles_non_object() {
-    let entries = extract_mcp_entries(&serde_json::json!(["not", "an", "object"]));
+    let mut body = serde_json::json!(["not", "an", "object"]);
+    let entries = extract_mcp_entries(&mut body);
     assert!(entries.is_empty(), "should handle a non-object request body");
 }
 
@@ -1697,7 +1719,7 @@ fn rewrite_tools_array_drops_resolved_empty_entry() {
     ];
     let per_entry = vec![EntryResolution::Resolved(Vec::new())];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 1, "resolved-empty MCP entry should be dropped");
     assert_eq!(rewritten[0]["name"], "calc", "function tool preserved");
@@ -1714,7 +1736,7 @@ fn rewrite_tools_array_preserves_passthrough_entry() {
     })];
     let per_entry = vec![EntryResolution::PassThrough];
 
-    let (rewritten, _) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, _) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 1, "passthrough entry should be preserved");
     assert_eq!(rewritten[0]["type"], "mcp", "passthrough keeps original type");
@@ -1728,7 +1750,7 @@ fn rewrite_tools_array_expands_resolved_nonempty() {
         &serde_json::json!({"name": "tool_a", "description": "A"}),
     )])];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 1, "one MCP entry → one function tool");
     assert_eq!(rewritten[0]["type"], "function");
@@ -1767,7 +1789,8 @@ fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
     let tool_map = HashMap::new();
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
-    let serialized = rewrite_request_body(&mut body, per_entry, &tool_map, &resolved_labels)
+    let mcp_entries = extract_mcp_entries(&mut body);
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
         .expect("rewrite must not error")
         .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
 
@@ -1826,7 +1849,8 @@ fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
     let tool_map = HashMap::new();
     let resolved_labels = HashSet::from(["weather".to_owned(), "empty".to_owned()]);
 
-    let serialized = rewrite_request_body(&mut body, per_entry, &tool_map, &resolved_labels)
+    let mcp_entries = extract_mcp_entries(&mut body);
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
         .expect("rewrite must not error")
         .expect("mixed request must be rewritten");
 
@@ -1876,7 +1900,8 @@ fn rewrite_request_body_normalizes_to_none_keeping_unrelated_tool_when_allowed_t
     let tool_map = HashMap::new();
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
-    let serialized = rewrite_request_body(&mut body, per_entry, &tool_map, &resolved_labels)
+    let mcp_entries = extract_mcp_entries(&mut body);
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
         .expect("rewrite must not error")
         .expect("resolved-empty entry must trigger a rewrite");
 
@@ -1970,7 +1995,7 @@ fn rewrite_tools_array_converts_mcp_to_function() {
         "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}}
     })]];
     let resolution = make_resolution(&raw);
-    let (rewritten, generated) = rewrite_tools_array(tools, resolution.per_entry);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, resolution.per_entry);
 
     assert_eq!(rewritten.len(), 2, "should have 2 tools");
     assert_eq!(rewritten[0]["name"], "calc", "first tool unchanged");
@@ -1999,7 +2024,7 @@ fn rewrite_tools_array_preserves_unresolved_mcp() {
         "server_url": "http://10.0.0.99/mcp"
     })];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, vec![EntryResolution::PassThrough]);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, vec![EntryResolution::PassThrough]);
 
     assert_eq!(rewritten.len(), 1, "should preserve unresolved entry");
     assert_eq!(rewritten[0]["type"], "mcp", "unresolved MCP left unchanged");
@@ -2022,7 +2047,7 @@ fn rewrite_tools_array_sanitizes_deferred_connectors() {
         "require_approval": "never"
     })];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, vec![EntryResolution::SanitizeDeferred]);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, vec![EntryResolution::SanitizeDeferred]);
 
     assert_eq!(rewritten.len(), 1);
     assert_eq!(rewritten[0]["type"], "mcp");
@@ -2077,7 +2102,7 @@ fn rewrite_tools_array_expands_multiple_tools() {
         ),
     ])];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 2, "one MCP entry expands to multiple function tools");
     let names: Vec<&str> = rewritten.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -2444,7 +2469,7 @@ fn rewrite_per_entry_respects_allowed_tools_filter() {
         )]),
     ];
 
-    let (rewritten, _) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, _) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 2, "each entry expands independently");
     assert_eq!(rewritten[0]["name"], "s__tool_a", "first entry only has tool_a");

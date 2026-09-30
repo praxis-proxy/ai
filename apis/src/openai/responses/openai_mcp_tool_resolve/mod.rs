@@ -334,15 +334,18 @@ impl McpToolResolveFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        parsed: serde_json::Value,
+        mut parsed: serde_json::Value,
     ) -> Result<FilterAction, ResolveError> {
-        let mut mcp_entries = extract_mcp_entries(&parsed);
+        let mut mcp_entries = extract_mcp_entries(&mut parsed);
         if mcp_entries.is_empty() {
             return Ok(FilterAction::Continue);
         }
 
-        resolve_connector_ids(&self.connectors, &mut mcp_entries)?;
-        let has_configured_connector = mcp_entries.iter().any(|entry| entry.get("connector_id").is_some());
+        resolve_connector_ids(&self.connectors, &mut mcp_entries.values)?;
+        let has_configured_connector = mcp_entries
+            .values
+            .iter()
+            .any(|entry| entry.get("connector_id").is_some());
         let connector_identity = if has_configured_connector {
             stage_mcp_callout_identity(
                 ctx,
@@ -353,21 +356,21 @@ impl McpToolResolveFilter {
         } else {
             None
         };
-        require_tool_search_for_deferred(ctx, &mcp_entries)?;
-        self.validate_entries(&mcp_entries)?;
+        require_tool_search_for_deferred(ctx, &mcp_entries.values)?;
+        self.validate_entries(&mcp_entries.values)?;
 
         // Capture the parent transport + downstream attributes for the outbound
         // callout before the resolution work borrows `ctx` mutably; fails closed
         // if no shared sub-request client is available.
         let callout = self.acquire_callout(ctx)?;
         let deferred_mcp = collect_deferred_connectors(
-            &mcp_entries,
+            &mcp_entries.values,
             self.timeout,
             self.max_tools,
             self.max_rewritten_body_bytes,
         );
         let resolution = self
-            .resolve_request_entries(ctx, &mcp_entries, &callout, connector_identity.as_ref())
+            .resolve_request_entries(ctx, &mcp_entries.values, &callout, connector_identity.as_ref())
             .await?;
         if !resolution.has_resolved && deferred_mcp.is_empty() {
             return Ok(FilterAction::Continue);
@@ -381,7 +384,15 @@ impl McpToolResolveFilter {
             self.user_credential_slot.as_deref(),
             self.authorization_assertion_slot.as_deref(),
         );
-        self.commit_resolved_tools(ctx, body, parsed, resolution, deferred_mcp, connector_context_policy)
+        self.commit_resolved_tools(
+            ctx,
+            body,
+            parsed,
+            mcp_entries,
+            resolution,
+            deferred_mcp,
+            connector_context_policy,
+        )
     }
 
     /// Rewrite the request body and store resolved plus deferred MCP state.
@@ -394,6 +405,7 @@ impl McpToolResolveFilter {
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
         mut parsed: serde_json::Value,
+        mcp_entries: ExtractedMcpEntries,
         resolution: Resolution,
         deferred_mcp: Vec<DeferredMcpConnector>,
         connector_context_policy: McpConnectorContextPolicy,
@@ -405,7 +417,8 @@ impl McpToolResolveFilter {
             listings,
             ..
         } = resolution;
-        let Some(serialized) = rewrite_request_body(&mut parsed, per_entry, &tool_map, &resolved_labels)? else {
+        let Some(serialized) = rewrite_request_body(&mut parsed, mcp_entries, per_entry, &tool_map, &resolved_labels)?
+        else {
             return Ok(FilterAction::Continue);
         };
         check_body_size(&serialized, self.max_rewritten_body_bytes)?;
@@ -761,6 +774,22 @@ enum EntryResolution {
     SanitizeDeferred,
     /// Entry was resolved to zero or more function tools.
     Resolved(Vec<serde_json::Value>),
+}
+
+/// MCP request entries moved out of the parsed `tools` array while resolution
+/// is in progress, together with their original positions in that array.
+struct ExtractedMcpEntries {
+    /// Owned MCP request entries in request order.
+    values: Vec<serde_json::Value>,
+    /// Original index of each entry in the complete mixed `tools` array.
+    tool_indices: Vec<usize>,
+}
+
+impl ExtractedMcpEntries {
+    /// Return whether the request contained any MCP entries.
+    fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
 }
 
 /// Result of resolving all MCP entries.
@@ -1808,6 +1837,7 @@ fn select_forward_headers(names: &[http::HeaderName], source: &http::HeaderMap) 
 /// never reach the inference backend.
 fn rewrite_request_body(
     parsed: &mut serde_json::Value,
+    mcp_entries: ExtractedMcpEntries,
     per_entry: Vec<EntryResolution>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
@@ -1824,7 +1854,7 @@ fn rewrite_request_body(
     // Commit the emptied array anyway: returning `None` would make the
     // caller forward the *original* body, leaking those entries'
     // `authorization`/`headers` credentials to the inference backend.
-    let (rewritten, generated_names) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, generated_names) = rewrite_tools_array(tools, mcp_entries, per_entry);
     detect_name_collisions(&rewritten, &generated_names)?;
 
     let rewritten_count = rewritten.len();
@@ -1843,35 +1873,36 @@ fn rewrite_request_body(
 /// pre-built function tools from `per_entry`.
 fn rewrite_tools_array(
     tools: Vec<serde_json::Value>,
+    mcp_entries: ExtractedMcpEntries,
     per_entry: Vec<EntryResolution>,
 ) -> (Vec<serde_json::Value>, HashSet<String>) {
     let mut result = Vec::with_capacity(tools.len());
     let mut generated_names = HashSet::new();
-    let mut entries = per_entry.into_iter();
+    let mut mcp_tools = mcp_entries.tool_indices.into_iter().zip(mcp_entries.values).peekable();
+    let mut resolutions = per_entry.into_iter();
 
-    for tool in tools {
-        if tool.get("type").and_then(serde_json::Value::as_str) != Some("mcp") {
-            result.push(tool);
-            continue;
-        }
-
-        let resolution = entries.next().unwrap_or(EntryResolution::PassThrough);
-
-        match resolution {
-            EntryResolution::PassThrough => {
-                result.push(tool);
-            },
-            EntryResolution::SanitizeDeferred => {
-                result.push(sanitize_deferred_connector_tool(tool));
-            },
-            EntryResolution::Resolved(function_tools) => {
-                for ft in function_tools {
-                    if let Some(name) = ft.get("name").and_then(serde_json::Value::as_str) {
-                        generated_names.insert(name.to_owned());
-                    }
-                    result.push(ft);
+    for (tool_index, tool) in tools.into_iter().enumerate() {
+        match mcp_tools.next_if(|(index, _)| *index == tool_index) {
+            Some((_, mcp_tool)) => {
+                let resolution = resolutions.next().unwrap_or(EntryResolution::PassThrough);
+                match resolution {
+                    EntryResolution::PassThrough => {
+                        result.push(mcp_tool);
+                    },
+                    EntryResolution::SanitizeDeferred => {
+                        result.push(sanitize_deferred_connector_tool(mcp_tool));
+                    },
+                    EntryResolution::Resolved(function_tools) => {
+                        for ft in function_tools {
+                            if let Some(name) = ft.get("name").and_then(serde_json::Value::as_str) {
+                                generated_names.insert(name.to_owned());
+                            }
+                            result.push(ft);
+                        }
+                    },
                 }
             },
+            None => result.push(tool),
         }
     }
 
@@ -2829,17 +2860,29 @@ fn server_label(entry: &serde_json::Value) -> &str {
         .unwrap_or("unknown")
 }
 
-/// Extract MCP tool entries from the parsed request body.
-fn extract_mcp_entries(value: &serde_json::Value) -> Vec<serde_json::Value> {
-    let Some(tools) = value.get("tools").and_then(serde_json::Value::as_array) else {
-        return Vec::new();
+/// Move MCP tool entries out of the parsed request body for resolution.
+fn extract_mcp_entries(value: &mut serde_json::Value) -> ExtractedMcpEntries {
+    let Some(tools) = value.get_mut("tools").and_then(serde_json::Value::as_array_mut) else {
+        return ExtractedMcpEntries {
+            values: Vec::new(),
+            tool_indices: Vec::new(),
+        };
     };
 
-    tools
-        .iter()
-        .filter(|t| t.get("type").and_then(serde_json::Value::as_str) == Some("mcp"))
-        .cloned()
-        .collect()
+    extract_mcp_entries_from_tools(tools)
+}
+
+/// Move MCP entries out of a complete mixed tools array.
+fn extract_mcp_entries_from_tools(tools: &mut [serde_json::Value]) -> ExtractedMcpEntries {
+    let mut values = Vec::new();
+    let mut tool_indices = Vec::new();
+    for (index, tool) in tools.iter_mut().enumerate() {
+        if tool.get("type").and_then(serde_json::Value::as_str) == Some("mcp") {
+            tool_indices.push(index);
+            values.push(tool.take());
+        }
+    }
+    ExtractedMcpEntries { values, tool_indices }
 }
 
 /// Extract `allowed_tools` from an MCP tool entry.
