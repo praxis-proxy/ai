@@ -1233,7 +1233,8 @@ async fn release_after_drain(old_pipelines: Vec<Weak<FilterPipeline>>, leases: V
     release_leases(leases).await;
 }
 
-#[cfg(all(test, any(feature = "store-postgres", feature = "store-sqlite")))]
+#[cfg(test)]
+#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, clippy::too_many_lines, reason = "tests")]
 mod tests {
