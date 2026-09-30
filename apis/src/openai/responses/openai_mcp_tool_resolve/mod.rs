@@ -1995,21 +1995,32 @@ fn detect_name_collisions(tools: &[serde_json::Value], generated_names: &HashSet
 ///   `{"type":"allowed_tools","mode":"required","tools":[...]}`.
 ///
 /// - **MCP selectors in `allowed_tools`**: expands each MCP selector to its generated function equivalents.
+///
+/// The choice is removed from the request and consumed so unchanged fields
+/// and selectors can be moved back without cloning their JSON payloads.
 fn rewrite_tool_choice(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
 ) -> Result<(), ResolveError> {
-    let Some(serde_json::Value::Object(choice_obj)) = obj.get("tool_choice").cloned() else {
+    let Some((choice_key, choice)) = obj.remove_entry("tool_choice") else {
         return Ok(());
     };
-    let choice_type = choice_obj.get("type").and_then(serde_json::Value::as_str);
-
-    match choice_type {
-        Some("mcp") => rewrite_mcp_tool_choice(obj, &choice_obj, tool_map, resolved_labels),
-        Some("allowed_tools") => rewrite_allowed_tools_choice(obj, &choice_obj, tool_map, resolved_labels),
-        _ => Ok(()),
-    }
+    let rewritten = match choice {
+        serde_json::Value::Object(choice_obj)
+            if choice_obj.get("type").and_then(serde_json::Value::as_str) == Some("mcp") =>
+        {
+            rewrite_mcp_tool_choice(choice_obj, tool_map, resolved_labels)?
+        },
+        serde_json::Value::Object(choice_obj)
+            if choice_obj.get("type").and_then(serde_json::Value::as_str) == Some("allowed_tools") =>
+        {
+            rewrite_allowed_tools_choice(choice_obj, tool_map, resolved_labels)?
+        },
+        choice => choice,
+    };
+    obj.insert(choice_key, rewritten);
+    Ok(())
 }
 
 /// Rewrite an MCP-typed `tool_choice` to its function equivalent.
@@ -2017,11 +2028,10 @@ fn rewrite_tool_choice(
 /// Returns [`ResolveError::EmptyResolvedToolChoice`] when the
 /// targeted label was resolved but produced zero eligible tools.
 fn rewrite_mcp_tool_choice(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    choice_obj: &serde_json::Map<String, serde_json::Value>,
+    choice_obj: serde_json::Map<String, serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
-) -> Result<(), ResolveError> {
+) -> Result<serde_json::Value, ResolveError> {
     let label = choice_obj
         .get("server_label")
         .and_then(serde_json::Value::as_str)
@@ -2030,26 +2040,21 @@ fn rewrite_mcp_tool_choice(
     if let Some(name) = choice_obj.get("name").and_then(serde_json::Value::as_str) {
         if tool_map.contains_key(&(label.to_owned(), name.to_owned())) {
             let function_name = encode_function_name(label, name);
-            obj.insert(
-                "tool_choice".to_owned(),
-                serde_json::json!({"type": "function", "name": function_name}),
-            );
+            return Ok(serde_json::json!({"type": "function", "name": function_name}));
         } else if resolved_labels.contains(label) {
             return Err(ResolveError::EmptyResolvedToolChoice(label.to_owned()));
         }
-        return Ok(());
+        return Ok(serde_json::Value::Object(choice_obj));
     }
 
     let function_refs = collect_function_refs_for_label(label, tool_map);
     if !function_refs.is_empty() {
-        obj.insert(
-            "tool_choice".to_owned(),
-            serde_json::json!({"type": "allowed_tools", "mode": "required", "tools": function_refs}),
-        );
+        Ok(serde_json::json!({"type": "allowed_tools", "mode": "required", "tools": function_refs}))
     } else if resolved_labels.contains(label) {
-        return Err(ResolveError::EmptyResolvedToolChoice(label.to_owned()));
+        Err(ResolveError::EmptyResolvedToolChoice(label.to_owned()))
+    } else {
+        Ok(serde_json::Value::Object(choice_obj))
     }
-    Ok(())
 }
 
 /// Rewrite MCP selectors inside an `allowed_tools`-typed
@@ -2070,19 +2075,23 @@ fn rewrite_mcp_tool_choice(
 /// and the model must not fall back to any other tool still supplied in
 /// the request.
 fn rewrite_allowed_tools_choice(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    choice_obj: &serde_json::Map<String, serde_json::Value>,
+    mut choice_obj: serde_json::Map<String, serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
-) -> Result<(), ResolveError> {
-    let Some(tools_arr) = choice_obj.get("tools").and_then(serde_json::Value::as_array) else {
-        return Ok(());
+) -> Result<serde_json::Value, ResolveError> {
+    let Some((tools_key, tools)) = choice_obj.remove_entry("tools") else {
+        return Ok(serde_json::Value::Object(choice_obj));
+    };
+    let serde_json::Value::Array(tools_arr) = tools else {
+        choice_obj.insert(tools_key, tools);
+        return Ok(serde_json::Value::Object(choice_obj));
     };
 
     let (new_tools, changed, dropped_label) = rebuild_allowed_tools_selectors(tools_arr, tool_map, resolved_labels);
 
     if !changed {
-        return Ok(());
+        choice_obj.insert(tools_key, serde_json::Value::Array(new_tools));
+        return Ok(serde_json::Value::Object(choice_obj));
     }
 
     if new_tools.is_empty() {
@@ -2099,14 +2108,11 @@ fn rewrite_allowed_tools_choice(
         // `"none"` rather than removing `tool_choice`: removal would let
         // the model call any other tool left in the request, which the
         // original choice deliberately excluded.
-        obj.insert("tool_choice".to_owned(), serde_json::Value::String("none".to_owned()));
-        return Ok(());
+        return Ok(serde_json::Value::String("none".to_owned()));
     }
 
-    let mut new_choice = choice_obj.clone();
-    new_choice.insert("tools".to_owned(), serde_json::Value::Array(new_tools));
-    obj.insert("tool_choice".to_owned(), serde_json::Value::Object(new_choice));
-    Ok(())
+    choice_obj.insert(tools_key, serde_json::Value::Array(new_tools));
+    Ok(serde_json::Value::Object(choice_obj))
 }
 
 /// Rebuild an `allowed_tools` selector list: expand resolved MCP
@@ -2117,7 +2123,7 @@ fn rewrite_allowed_tools_choice(
 /// input, and the first dropped `server_label` (used for error
 /// reporting when the list collapses to empty).
 fn rebuild_allowed_tools_selectors(
-    tools_arr: &[serde_json::Value],
+    tools_arr: Vec<serde_json::Value>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
 ) -> (Vec<serde_json::Value>, bool, Option<String>) {
@@ -2127,14 +2133,14 @@ fn rebuild_allowed_tools_selectors(
 
     for tool_ref in tools_arr {
         if tool_ref.get("type").and_then(serde_json::Value::as_str) != Some("mcp") {
-            new_tools.push(tool_ref.clone());
+            new_tools.push(tool_ref);
             continue;
         }
         let before = new_tools.len();
-        expand_mcp_selector(tool_ref, tool_map, &mut new_tools);
+        expand_mcp_selector(&tool_ref, tool_map, &mut new_tools);
         if new_tools.len() > before {
             changed = true;
-        } else if selector_label_resolved(tool_ref, resolved_labels) {
+        } else if selector_label_resolved(&tool_ref, resolved_labels) {
             // The server was resolved locally but exposes no matching
             // tool; the selector is locally consumed. Drop it so the
             // MCP reference never reaches the inference backend.
@@ -2148,7 +2154,7 @@ fn rebuild_allowed_tools_selectors(
         } else {
             // Unresolved (deferred / connector-only / unknown) selector:
             // preserve it for the backend to handle.
-            new_tools.push(tool_ref.clone());
+            new_tools.push(tool_ref);
         }
     }
 
