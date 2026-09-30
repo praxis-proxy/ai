@@ -1161,7 +1161,12 @@ async fn fetch_and_validate_previous(
 /// `Release` when no conversation field is present or a `Reject`
 /// when the field is malformed.
 fn resolve_conversation_id(body: &Value) -> Result<String, FilterAction> {
-    let has_field = body.get("conversation").is_some();
+    // An explicit null selects no conversation, the same as omitting the field.
+    // Treating it as present rejects a well-formed body — a token-count request
+    // carrying `"conversation": null` would be told its conversation value is
+    // malformed. The classifier and the request processor already read both
+    // history selectors this way.
+    let has_field = body.get("conversation").is_some_and(|value| !value.is_null());
     extract_conversation_id(body).ok_or_else(|| {
         if has_field {
             FilterAction::Reject(responses_error_rejection(

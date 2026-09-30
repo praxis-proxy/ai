@@ -166,6 +166,16 @@ test-store-features:
 		exit 1; \
 	fi
 
+test-feature-isolation:
+	@for group in openai-file-resolve-filter openai-mcp-tools; do \
+		echo "check: $$group"; \
+		cargo check -p praxis-ai-proxy --features $$group || exit 1; \
+	done
+	@for group in azure-ad-filter gcp-adc-filter; do \
+		echo "check: $$group"; \
+		cargo check -p praxis-ai-proxy --features $$group || exit 1; \
+	done
+
 test-schema:
 	cargo test -p praxis-tests-schema --features store-all $(_NOCAPTURE)
 
@@ -345,14 +355,16 @@ coverage-check:
 #                        sqlx enables sqlx-core's `migrate` feature with its
 #                        tokio runtime, and that pulls sha2; store-postgres
 #                        adds sqlx-postgres' md-5/hmac/sha2/rsa (SCRAM)
-#   openai-file-resolve-filter, openai-mcp-tools, azure-ad-filter,
-#   gcp-adc-filter       reqwest's `rustls` feature compiles aws-lc-rs in
+#   openai-mcp-tools     depends on store, which pulls sha2 through sqlx
+#   azure-ad-filter, gcp-adc-filter
+#                        experimental; off for the same reasons they are off
+#                        in the standard build
 #
-# What remains of the opt-in groups is openai-responses (the Responses API
-# kernel, which adds no crates) and aws-sigv4-filter (aws_sigv4_sign signs
-# through the system OpenSSL; the aws-sigv4 crate is only its test oracle).
-# The experimental filters stay off for the same reasons they are off in
-# the standard build. FIPS_FEATURES is the single place this is defined;
+# The remaining non-experimental groups compile cleanly: openai-responses
+# (the Responses kernel, no crates), openai-file-resolve-filter (migrated
+# to SubRequestClient, no reqwest/aws-lc-rs), and aws-sigv4-filter (signs
+# through system OpenSSL). FIPS_FEATURES is the single place this is
+# defined;
 # Containerfile.fips (CARGO_FEATURES) mirrors it and must be kept in sync.
 #
 # The FIPS build goes to its own target directory so it never overwrites,
@@ -389,7 +401,7 @@ coverage-check:
 #
 # See docs/developing/fips.md and docs/developing/getting-started.md.
 
-FIPS_FEATURES           := openai-responses,aws-sigv4-filter
+FIPS_FEATURES           := openai-responses,openai-file-resolve-filter,aws-sigv4-filter
 # The same list qualified for a multi-package cargo invocation.
 _COMMA                  := ,
 FIPS_FEATURES_QUALIFIED := $(subst $(_COMMA),$(_COMMA)praxis-ai-proxy/,praxis-ai-proxy/$(FIPS_FEATURES))

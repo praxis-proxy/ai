@@ -193,7 +193,7 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
@@ -366,7 +366,7 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -618,7 +618,7 @@ jobs:
 
       - name: Install uv for Anthropic SDK acceptance
         id: anthropic_sdk_uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.12"
           enable-cache: true
@@ -1461,7 +1461,7 @@ jobs:
           done
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           # The GPU AMI ships Python 3.9; ogx[starter] needs >=3.12, so pin the
           # interpreter setup-uv provisions. Cache is repo-scoped (GH cache
@@ -1652,7 +1652,7 @@ jobs:
         uses: praxis-proxy/conventions/.github/actions/setup-rust@7e1e8d97c2dc820d24b31f9a65b119c4d0e5342c # v0.1.0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           # Persist uv's wheel/download cache across runs so the multi-GB OGX
           # closure (torch, CUDA, faiss, transformers) is not re-downloaded every
