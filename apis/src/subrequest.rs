@@ -798,8 +798,30 @@ mod tests {
         let client = test_client();
         let url = format!("http://example.test:{}/blob?sig=SECRET&token=s3cret", addr.port());
 
+        // Callsite interest is cached process-wide, and while this is the only
+        // scoped dispatcher, a callsite first reached from another test's
+        // thread caches that thread's "nobody listening" answer. Register the
+        // callsite before capturing (creating the dispatcher raises the max
+        // level so it can register), then recompute interest with the capture
+        // installed.
         let dispatch = tracing::Dispatch::new(subscriber);
+        let refused = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let _warm_up = Box::pin(execute_url_with_test_addresses(
+            &client,
+            &url,
+            empty_request(),
+            1024,
+            Duration::from_secs(5),
+            AddressPolicy::AllowPrivate,
+            None,
+            vec![refused],
+        ))
+        .await;
         let _guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
         let _result = Box::pin(execute_url_with_test_addresses(
             &client,
             &url,
