@@ -2532,15 +2532,16 @@ async fn prepare_deferred_listing(
     callout: &mcp_client::McpCallout,
     connector_identity: Option<&McpCalloutIdentity>,
 ) -> Result<PreparedDeferredListing, ResolveError> {
+    let entry = deferred_entry_view(connector);
     let listing = list_deferred_connector(
         connector,
+        &entry,
         forwarded_header_names,
         forwarded_headers,
         callout,
         connector_identity,
     )
     .await?;
-    let entry = deferred_entry_view(connector);
     let allowed = extract_allowed_tools(&entry)?;
     let filtered = apply_allowed_tools_filter(listing, &allowed);
     let functions: Vec<serde_json::Value> = filtered
@@ -2628,12 +2629,12 @@ fn check_json_body_size(body: &serde_json::Value, max_rewritten_body_bytes: usiz
 /// Call `tools/list` for one deferred connector, redacting URLs on error.
 async fn list_deferred_connector(
     connector: &DeferredMcpConnector,
+    entry: &serde_json::Value,
     forwarded_header_names: &[http::HeaderName],
     forwarded_headers: &http::HeaderMap,
     callout: &mcp_client::McpCallout,
     connector_identity: Option<&McpCalloutIdentity>,
 ) -> Result<Vec<serde_json::Value>, ResolveError> {
-    let entry = deferred_entry_view(connector);
     // No upfront SSRF classifier: `fetch_tools` always dials, and the subrequest
     // transport validates the target during the callout, so the SSRF rejection is
     // reconstructed from the transport signal below without a second DNS
@@ -2646,7 +2647,7 @@ async fn list_deferred_connector(
         callout,
         connector_identity,
     };
-    fetch_tools(&entry, &connector.server_url, options)
+    fetch_tools(entry, &connector.server_url, options)
         .await
         .map_err(|err| match err {
             ResolveError::Client { source, .. } => deferred_connector_client_error(connector, source),
