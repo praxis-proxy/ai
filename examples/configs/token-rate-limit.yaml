@@ -48,9 +48,9 @@
 #
 # Observability requires no filter configuration. Metrics use bounded
 # rule/algorithm/result/backend labels and never identify a user. The
-# budget_remaining gauge is the sum of the latest calculated balances
-# across retained keys in a rule; active_keys shows how many balances
-# contribute. Window aging/refill is lazy, so this is a snapshot. Build
+# budget_remaining is the remaining budget for the key of the most
+# recent admission decision on this replica; active_keys shows how
+# many keys the backend currently retains. Both are snapshots. Build
 # with `opentelemetry` to add the request-scoped decision span. Structured
 # best-effort audit records use the dedicated
 # `praxis_ai::token_rate_limit::accounting` log target at INFO (one line

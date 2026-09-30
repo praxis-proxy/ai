@@ -22,6 +22,10 @@ pub(super) const VALKEY_TIMEOUT: Duration = Duration::from_millis(500);
 /// connection is one potential failed request after an outage.
 const MAX_IDLE_TRANSACTION_CONNECTIONS: usize = 8;
 
+/// Maximum total transaction connections alive at once (idle + checked out).
+/// Requests block for up to [`VALKEY_TIMEOUT`] for a slot before failing.
+const MAX_TRANSACTION_CONNECTIONS: usize = 64;
+
 /// Filter-wide Valkey access, cloned into every Valkey-backed rule.
 ///
 /// `pub(in crate::token_rate_limit)`, not `pub(super)`: the Valkey
@@ -80,16 +84,28 @@ impl ValkeyConnection {
     /// # Errors
     ///
     /// Returns [`BackendError::Unavailable`] when a new connection cannot
-    /// be opened.
+    /// be opened, or when [`MAX_TRANSACTION_CONNECTIONS`] are all in use
+    /// and none becomes available within [`VALKEY_TIMEOUT`].
     pub(super) async fn transaction(&self) -> Result<TransactionConnection, BackendError> {
         let idle = self.transactions.idle.lock().await.pop();
-        let connection = match idle {
-            Some(connection) => connection,
-            None => self.open().await?,
+        let (connection, permit) = match idle {
+            Some(PooledConnection { connection, permit }) => (connection, permit),
+            None => {
+                let permit = tokio::time::timeout(
+                    VALKEY_TIMEOUT,
+                    Arc::clone(&self.transactions.semaphore).acquire_owned(),
+                )
+                .await
+                .map_err(|_| BackendError::Unavailable("transaction pool exhausted: timeout".into()))?
+                .map_err(|_| BackendError::Unavailable("transaction pool closed".into()))?;
+                let connection = self.open().await?;
+                (connection, permit)
+            },
         };
         Ok(TransactionConnection {
             connection,
             pool: Arc::clone(&self.transactions),
+            permit,
         })
     }
 
@@ -119,11 +135,27 @@ impl ValkeyConnection {
     }
 }
 
+/// An idle connection paired with its semaphore permit.
+struct PooledConnection {
+    connection: MultiplexedConnection,
+    permit: tokio::sync::OwnedSemaphorePermit,
+}
+
 /// Idle dedicated connections, reused across transactions.
-#[derive(Default)]
 struct TransactionConnections {
     /// Connections returned by [`TransactionConnection::finish`].
-    idle: tokio::sync::Mutex<Vec<MultiplexedConnection>>,
+    idle: tokio::sync::Mutex<Vec<PooledConnection>>,
+    /// Bounds the total connections alive at once (idle + checked out).
+    semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for TransactionConnections {
+    fn default() -> Self {
+        Self {
+            idle: tokio::sync::Mutex::new(Vec::new()),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_TRANSACTION_CONNECTIONS)),
+        }
+    }
 }
 
 /// One checked-out connection. Call [`Self::finish`] after a completed
@@ -134,6 +166,8 @@ pub(super) struct TransactionConnection {
     connection: MultiplexedConnection,
     /// Pool to return it to.
     pool: Arc<TransactionConnections>,
+    /// Held while checked out; returned to the pool alongside the connection.
+    permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl TransactionConnection {
@@ -142,14 +176,15 @@ impl TransactionConnection {
         &mut self.connection
     }
 
-    /// Return the connection to the pool for reuse, or drop it when
+    /// Return the connection to the pool for reuse, or drop both when
     /// [`MAX_IDLE_TRANSACTION_CONNECTIONS`] are already idle.
     pub(super) async fn finish(self) {
-        let Self { connection, pool } = self;
+        let Self { connection, pool, permit } = self;
         let mut idle = pool.idle.lock().await;
         if idle.len() < MAX_IDLE_TRANSACTION_CONNECTIONS {
-            idle.push(connection);
+            idle.push(PooledConnection { connection, permit });
         }
+        // Both connection and permit drop here when pool is full.
     }
 }
 

@@ -74,6 +74,7 @@ use super::{
             BackendError, BackendReserve, BackendSettlement, BackendSnapshot, ReconcileRequest, ReconcileWorker,
             ReserveRequest, TokenRateLimitStateBackend,
         },
+        ledger::DenialReason,
         token_bucket_ledger,
     },
     RuleTelemetry, ValkeyConnection, amount,
@@ -359,7 +360,7 @@ impl ValkeyTokenBucketBackend {
             .arg("last_refill_ms")
             .arg(last_refill_ms)
             .ignore();
-        pipe.cmd("PEXPIRE").arg(&bucket.key).arg(self.state_ttl_ms()).ignore();
+        pipe.cmd("PEXPIRE").arg(&bucket.key).arg(self.state_ttl_ms()).arg("GT").ignore();
     }
 
     // -------------------------------------------------------------------------
@@ -472,25 +473,30 @@ impl ValkeyTokenBucketBackend {
             return Some(BackendReserve::Denied {
                 retry_after_ms: 0,
                 remaining: 0,
+                reason: DenialReason::KeyCapacity,
             });
         }
-        let retry_after_ms = if reads.active >= self.max_active_reservations {
-            self.reservation_timeout_ms
-        } else if deficit > 0.0 {
+        if reads.active >= self.max_active_reservations {
+            return Some(BackendReserve::Denied {
+                retry_after_ms: self.reservation_timeout_ms,
+                remaining: Self::whole(tokens),
+                reason: DenialReason::ReservationCapacity,
+            });
+        }
+        if deficit > 0.0 {
             #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
                 reason = "a positive delay; `as` saturates for absurd estimates"
             )]
             let retry_after_ms = (deficit / self.refill_rate * 1000.0).ceil().max(1.0) as u64;
-            retry_after_ms
-        } else {
-            return None;
-        };
-        Some(BackendReserve::Denied {
-            retry_after_ms,
-            remaining: Self::whole(tokens),
-        })
+            return Some(BackendReserve::Denied {
+                retry_after_ms,
+                remaining: Self::whole(tokens),
+                reason: DenialReason::WindowCapacity,
+            });
+        }
+        None
     }
 
     /// The `MULTI` block admitting reservation `reservation_id` of `estimate`
