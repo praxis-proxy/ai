@@ -63,11 +63,26 @@ fn authenticated_json_post(path: &str, body: &str) -> String {
 fn unified_anthropic_path_has_no_server_owned_agentic_loop() {
     let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("read unified example");
 
-    assert!(!yaml.contains("anthropic_web_search"));
-    assert!(!yaml.contains("- filter: anthropic_messages_protocol"));
-    assert!(yaml.contains("name: direct-anthropic"));
-    assert!(yaml.contains("name: translated-anthropic"));
-    assert!(yaml.contains("application_provider: anthropic_compat"));
+    assert!(
+        !yaml.contains("anthropic_web_search"),
+        "the Claude Code-first example must not run a server-owned Anthropic web-search loop"
+    );
+    assert!(
+        !yaml.contains("- filter: anthropic_messages_protocol"),
+        "the unified example must leave the client-owned Claude Code tool cycle intact"
+    );
+    assert!(
+        yaml.contains("name: direct-anthropic"),
+        "the unified example must retain a native Anthropic terminal branch"
+    );
+    assert!(
+        yaml.contains("name: translated-anthropic"),
+        "the unified example must retain a translated Anthropic terminal branch"
+    );
+    assert!(
+        yaml.contains("application_provider: anthropic_compat"),
+        "the translated branch must select the Anthropic-compatible provider binding"
+    );
 }
 
 #[test]
@@ -104,26 +119,44 @@ fn native_anthropic_preserves_claude_code_request_and_response() {
         ),
     );
 
-    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(parse_status(&raw), 200, "native Messages request should succeed");
     assert_eq!(
         serde_json::from_str::<Value>(&parse_body(&raw)).unwrap(),
-        provider_response
+        provider_response,
+        "native Anthropic response should pass through unchanged"
     );
     let forwarded = backend
         .requests()
         .into_iter()
         .find(|request| request.method == "POST")
         .expect("native provider should receive a POST");
-    assert_eq!(forwarded.uri, "/v1/messages");
-    assert_eq!(serde_json::from_str::<Value>(&forwarded.body).unwrap(), request);
-    assert!(
-        forwarded
-            .headers
-            .to_ascii_lowercase()
-            .contains("x-api-key: provider-key")
+    assert_eq!(forwarded.uri, "/v1/messages", "native request path should be preserved");
+    assert_eq!(
+        serde_json::from_str::<Value>(&forwarded.body).unwrap(),
+        request,
+        "native Anthropic request body should pass through unchanged"
     );
-    assert!(!forwarded.headers.to_ascii_lowercase().contains("x-tenant-id"));
-    assert!(!forwarded.headers.to_ascii_lowercase().contains("x-user-id"));
+    let forwarded_headers = forwarded.headers.to_ascii_lowercase();
+    assert!(
+        forwarded_headers.contains("x-api-key: provider-key"),
+        "native Anthropic route should preserve the provider credential"
+    );
+    assert!(
+        !forwarded_headers.contains("x-tenant-id"),
+        "native Anthropic route must not project the tenant identity"
+    );
+    assert!(
+        !forwarded_headers.contains("x-user-id"),
+        "native Anthropic route must not project the user identity"
+    );
+    assert!(
+        !forwarded_headers.contains("x-auth-tenant"),
+        "native Anthropic route must not forward the ingress tenant identity"
+    );
+    assert!(
+        !forwarded_headers.contains("x-auth-user"),
+        "native Anthropic route must not forward the ingress user identity"
+    );
 }
 
 #[test]
@@ -166,24 +199,39 @@ fn translated_anthropic_preserves_client_tool_cycle() {
         &authenticated_json_post("/v1/messages", &request.to_string()),
     );
 
-    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(parse_status(&raw), 200, "translated Messages request should succeed");
     let response: Value = serde_json::from_str(&parse_body(&raw)).expect("Anthropic response JSON");
-    assert_eq!(response["type"], "message");
-    assert_eq!(response["content"][0]["type"], "tool_use");
-    assert_eq!(response["content"][0]["name"], "Read");
+    assert_eq!(
+        response["type"], "message",
+        "translated response should use the Messages envelope"
+    );
+    assert_eq!(
+        response["content"][0]["type"], "tool_use",
+        "Chat Completions tool calls should translate to Anthropic tool_use blocks"
+    );
+    assert_eq!(
+        response["content"][0]["name"], "Read",
+        "translated tool call should preserve its name"
+    );
 
     let forwarded = backend
         .requests()
         .into_iter()
         .find(|request| request.method == "POST")
         .expect("Chat provider should receive a POST");
-    assert_eq!(forwarded.uri, "/v1/chat/completions");
+    assert_eq!(
+        forwarded.uri, "/v1/chat/completions",
+        "translated route should target the Chat Completions endpoint"
+    );
     let body: Value = serde_json::from_str(&forwarded.body).expect("Chat request JSON");
-    assert!(body["messages"].as_array().is_some_and(|messages| {
-        messages
-            .iter()
-            .any(|message| message["role"] == "tool" && message["tool_call_id"] == "toolu_previous")
-    }));
+    assert!(
+        body["messages"].as_array().is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|message| message["role"] == "tool" && message["tool_call_id"] == "toolu_previous")
+        }),
+        "translated request should preserve the client's tool-result turn"
+    );
 }
 
 #[test]
@@ -203,18 +251,26 @@ fn native_count_tokens_passes_through() {
         &authenticated_json_post("/v1/messages/count_tokens", &request.to_string()),
     );
 
-    assert_eq!(parse_status(&raw), 200);
+    assert_eq!(parse_status(&raw), 200, "native token counting should succeed");
     assert_eq!(
         serde_json::from_str::<Value>(&parse_body(&raw)).unwrap(),
-        provider_response
+        provider_response,
+        "native token-count response should pass through unchanged"
     );
     let forwarded = backend
         .requests()
         .into_iter()
         .find(|request| request.method == "POST")
         .expect("native provider should receive count_tokens");
-    assert_eq!(forwarded.uri, "/v1/messages/count_tokens");
-    assert_eq!(serde_json::from_str::<Value>(&forwarded.body).unwrap(), request);
+    assert_eq!(
+        forwarded.uri, "/v1/messages/count_tokens",
+        "native token counting should preserve its endpoint"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&forwarded.body).unwrap(),
+        request,
+        "native token-count request body should pass through unchanged"
+    );
 }
 
 #[test]
@@ -233,8 +289,18 @@ fn translated_count_tokens_returns_explicit_not_found() {
         &authenticated_json_post("/v1/messages/count_tokens", &request.to_string()),
     );
 
-    assert_eq!(parse_status(&raw), 404);
+    assert_eq!(
+        parse_status(&raw),
+        404,
+        "translated token counting should return an explicit unsupported response"
+    );
     let response: Value = serde_json::from_str(&parse_body(&raw)).expect("Anthropic error JSON");
-    assert_eq!(response["error"]["type"], "not_found_error");
-    assert!(backend.requests().into_iter().all(|request| request.method != "POST"));
+    assert_eq!(
+        response["error"]["type"], "not_found_error",
+        "translated token counting should return an Anthropic not_found_error"
+    );
+    assert!(
+        backend.requests().into_iter().all(|request| request.method != "POST"),
+        "unsupported translated token counting must not reach the backend"
+    );
 }

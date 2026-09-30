@@ -9,7 +9,6 @@
 //! the existing filter and IRR integration coverage remains intact.
 
 use std::{
-    collections::HashMap,
     io::{ErrorKind, Read as _, Write as _},
     net::TcpStream,
     sync::{Arc, Mutex, mpsc},
@@ -18,7 +17,7 @@ use std::{
 };
 
 use praxis_test_utils::{
-    StatefulCapturingBackend, bind_unique_port, free_port, http_send, parse_body, parse_status, patch_yaml, start_proxy,
+    StatefulCapturingBackend, bind_unique_port, free_port, http_send, parse_body, parse_status, start_proxy,
 };
 use serde_json::{Value, json};
 
@@ -194,18 +193,32 @@ fn search_results() -> Value {
 // Config loaders
 // -----------------------------------------------------------------------------
 
+/// Replace one fixture fragment, failing when fixture drift makes the override
+/// ambiguous or ineffective.
+fn replace_once(yaml: &str, from: &str, to: &str) -> String {
+    assert_eq!(
+        yaml.matches(from).count(),
+        1,
+        "fixture must contain exactly one `{from}`"
+    );
+    yaml.replacen(from, to, 1)
+}
+
 /// Read the retained fixture and rewrite the proxy/backend ports and the search
 /// provider endpoint so the loop calls the local stubs.
 fn base_example_yaml(proxy_port: u16, model_port: u16, search_port: u16) -> String {
     let yaml = std::fs::read_to_string(FIXTURE).expect("read Anthropic web-search fixture");
-    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8000", model_port)]));
-    let yaml = yaml.replace(
+    let yaml = replace_once(&yaml, "127.0.0.1:8080", &format!("127.0.0.1:{proxy_port}"));
+    let yaml = replace_once(&yaml, "127.0.0.1:8000", &format!("127.0.0.1:{model_port}"));
+    let yaml = replace_once(
+        &yaml,
         "api_key: ${WEB_SEARCH_API_KEY}",
         &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
     // The provider callout targets a loopback mock, so the executor's SSRF check
     // requires the operator opt-in on the outbound pipeline.
-    yaml.replace(
+    replace_once(
+        &yaml,
         "allow_private_endpoints: true",
         "allow_private_endpoints: true\n  allow_private_upstreams: true",
     )
@@ -224,8 +237,11 @@ fn load_config_with_max_iterations(
     search_port: u16,
     max_iterations: u32,
 ) -> praxis_core::config::Config {
-    let yaml = base_example_yaml(proxy_port, model_port, search_port)
-        .replace("max_iterations: 6", &format!("max_iterations: {max_iterations}"));
+    let yaml = replace_once(
+        &base_example_yaml(proxy_port, model_port, search_port),
+        "max_iterations: 6",
+        &format!("max_iterations: {max_iterations}"),
+    );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse Anthropic web-search fixture")
 }
 
@@ -237,8 +253,11 @@ fn load_config_with_timeout(
     search_port: u16,
     timeout_ms: u32,
 ) -> praxis_core::config::Config {
-    let yaml = base_example_yaml(proxy_port, model_port, search_port)
-        .replace("timeout_ms: 90000", &format!("timeout_ms: {timeout_ms}"));
+    let yaml = replace_once(
+        &base_example_yaml(proxy_port, model_port, search_port),
+        "timeout_ms: 90000",
+        &format!("timeout_ms: {timeout_ms}"),
+    );
     praxis_core::config::Config::from_yaml(&yaml).expect("parse Anthropic web-search fixture")
 }
 
@@ -262,13 +281,15 @@ fn load_config_with_limits(
 ) -> praxis_core::config::Config {
     let mut yaml = base_example_yaml(proxy_port, model_port, search_port);
     if let Some(max_state_bytes) = max_state_bytes {
-        yaml = yaml.replace(
+        yaml = replace_once(
+            &yaml,
             "max_iterations: 6",
             &format!("max_iterations: 6\n        max_state_bytes: {max_state_bytes}"),
         );
     }
     if let Some(max_body_bytes) = max_body_bytes {
-        yaml = yaml.replace(
+        yaml = replace_once(
+            &yaml,
             "timeout_ms: 10000",
             &format!("timeout_ms: 10000\n                max_body_bytes: {max_body_bytes}"),
         );
