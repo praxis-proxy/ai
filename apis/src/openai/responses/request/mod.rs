@@ -18,9 +18,11 @@
 //! same body independently, so routing facts, proxy-owned defaults, and state
 //! could be derived from different parses of one request.
 //!
-//! Metadata and filter results keep the `openai_responses_format` namespace.
-//! Twelve downstream filters read those keys, and renaming them is a separate
-//! change rather than a side effect of consolidating the parse.
+//! Metadata keeps the `openai_responses_format` namespace, because twelve
+//! downstream filters read those keys and renaming them is a separate change
+//! rather than a side effect of consolidating the parse. Filter results are
+//! published under this filter's own name, since a branch condition must name
+//! the filter it is attached to.
 //!
 //! # YAML
 //!
@@ -75,8 +77,9 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// Rejects `background=true` with a 400, matching `openai_responses_format`,
 /// because Praxis does not implement the asynchronous Responses lifecycle.
 ///
-/// Promotes `openai_responses_format.*` metadata and filter results, and
-/// generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG),
+/// Promotes `openai_responses_format.*` metadata, publishes filter results
+/// under `openai_responses_request`, and generates
+/// `responses.response_id` (`resp_` + 32 hex chars, CSPRNG),
 /// `responses.conversation_id`, `responses.store`, `responses.background`, and
 /// `responses.stream`.
 pub struct OpenaiResponsesRequestFilter {
@@ -227,7 +230,7 @@ fn publish_classification(
     super::install_error_formatter(ctx, classified.format);
     super::write_metadata(ctx, classified, mode);
     super::promote_headers(ctx, classified, config, mode);
-    super::promote_filter_results(ctx, classified, mode)
+    super::promote_filter_results(ctx, FILTER_NAME, classified, mode)
 }
 
 /// Apply `on_invalid` to a body that could not be classified.

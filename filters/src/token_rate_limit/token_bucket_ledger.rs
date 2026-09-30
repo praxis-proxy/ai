@@ -39,7 +39,7 @@ use std::{
 
 use dashmap::DashMap;
 
-use super::remaining_total::RemainingTotal;
+use super::{ledger::DenialReason, remaining_total::RemainingTotal};
 
 /// Upper bound, in seconds, on `capacity / refill_rate` -- the time to
 /// fill an empty bucket from scratch.
@@ -150,6 +150,8 @@ pub(super) enum Decision {
         /// Conservative delay before the bucket refills enough to admit
         /// the same estimate.
         retry_after_ms: u64,
+        /// Distinguishes budget exhaustion from the `max_keys` cap.
+        reason: DenialReason,
     },
 }
 
@@ -326,7 +328,10 @@ impl TokenBucketLedger {
     /// deny otherwise.
     pub(super) fn reserve(&self, key: &str, estimate: u64, now_ms: u64) -> Decision {
         if key.is_empty() || key.len() > self.config.max_key_length || estimate == 0 {
-            return Decision::Denied { retry_after_ms: 0 };
+            return Decision::Denied {
+                retry_after_ms: 0,
+                reason: DenialReason::InvalidKey,
+            };
         }
 
         let entry = loop {
@@ -343,7 +348,10 @@ impl TokenBucketLedger {
                         })
                         .is_err()
                     {
-                        return Decision::Denied { retry_after_ms: 0 };
+                        return Decision::Denied {
+                            retry_after_ms: 0,
+                            reason: DenialReason::KeyCapacity,
+                        };
                     }
                     let state = Arc::new(Mutex::new(BucketState::new(self.config.capacity)));
                     self.remaining_total.add(self.config.capacity);
@@ -377,7 +385,10 @@ impl TokenBucketLedger {
                 reason = "retry_after_ms is a small positive duration bounded by realistic refill rates"
             )]
             let retry_after_ms = retry_after_ms.max(1.0) as u64;
-            return Decision::Denied { retry_after_ms };
+            return Decision::Denied {
+                retry_after_ms,
+                reason: DenialReason::WindowCapacity,
+            };
         }
         if self
             .active_reservations
@@ -389,6 +400,7 @@ impl TokenBucketLedger {
             self.publish_remaining(&mut state);
             return Decision::Denied {
                 retry_after_ms: self.config.reservation_timeout_ms,
+                reason: DenialReason::ReservationCapacity,
             };
         }
 
@@ -841,7 +853,13 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(l.reserve("a", 1, 0), Decision::Admitted(_)));
-        assert!(matches!(l.reserve("b", 1, 0), Decision::Denied { .. }));
+        assert!(matches!(
+            l.reserve("b", 1, 0),
+            Decision::Denied {
+                reason: DenialReason::KeyCapacity,
+                ..
+            }
+        ));
     }
 
     #[test]

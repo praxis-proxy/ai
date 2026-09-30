@@ -82,7 +82,8 @@ Admissions, denials, reconciliations, and backend failures also emit structured 
 | `rules[].tiers[].action` | ActionConfig | yes | What happens when usage crosses this tier's threshold. |
 | `rules[].tiers[].action.type` | `inject` \| `deny` | yes | Whether to continue with injected headers or hard-reject. |
 | `rules[].tiers[].action.headers` | object<string, string> | no | Headers to inject on the upstream request (required for `inject`, ignored for `deny`). |
-| `key` | `global` \| `authenticated_subject` | no | Trusted request identity used to partition each rule's budget. The default preserves the historical single global bucket. |
+| `key` | KeySpec | no | How this filter partitions each matched rule's token budget. Accepts a scalar (`global`, `authenticated_subject`, `ip`, `model`), a list of dimensions (composite keys), a single dimension mapping (`header: x-tenant-id`), or a full spec with `dimensions` and `missing`. Defaults to one shared global bucket. Composite dimension *order does not matter*: compiled dimensions are sorted into a canonical order so reordering a list cannot silently reset live budgets. `ip` and `model` are as caller-controlled as `header` when they come from a forwarding header or a client-supplied model string. Pair them with `max_keys` so one client cannot fill the table. |
+| `max_keys` | integer | no | Soft cap on distinct budget keys retained at once, **per rule**. Bounds cardinality from per-header, per-IP, and composite keying. Defaults to [`super::MAX_KEYS`]. A new distinct key past this cap is denied (429, accounting outcome `key_capacity`) rather than growing without bound. In-process ledgers enforce the cap per rule. Valkey enforces it against the per-rule retained-key set (`{namespace}:v1:rule:{hash}:keys`, or the token-bucket equivalent), not the namespace-wide set. Idle in-process keys are reaped by ledger cleanup, which walks a bounded number of entries per request (including busy ones) so a single in-window key cannot pin the table at this cap. |
 | `backend` | BackendConfig | no | Where every rule's admission state lives: in-process (default, one budget per gateway instance) or a shared Valkey backend (one budget shared across every gateway instance/replica). One backend for the whole filter, not per rule -- rules already share Valkey key-space isolation via `namespace`/rule-name hashing, so per-rule backend selection bought no isolation benefit, only a separate Valkey connection per rule pointed at the same URL. Revisit if a real deployment ever needs to mix in-process and Valkey rules in one filter instance. |
 | `backend.kind` | `memory` \| `valkey` | no | Which backend implementation to use. |
 | `backend.url` | string | no | Backend connection URL. Supports one `${ENV_VAR}` reference, so credentials/hostnames don't need to be committed to config. Required when `kind: valkey`, ignored otherwise. |
@@ -98,6 +99,18 @@ Admissions, denials, reconciliations, and backend failures also emit structured 
 
 ```yaml
 filter: token_rate_limit
+key:                               # optional: defaults to one shared bucket per rule
+  - authenticated_subject          # global | authenticated_subject | ip | model | header: NAME
+  - model                          # header first (x-model); body only if already buffered
+# key:                             # IP via a forwarding header (right-most hop after trusted_hops)
+#   ip:
+#     header: x-forwarded-for
+#     trusted_hops: 1
+#     ipv6_prefix: 64
+# key:                             # named header, fail-open when absent
+#   header: x-tenant-id
+#   missing: fallback
+max_keys: 100000                   # optional: per-rule cap on distinct budget keys
 backend:                           # optional: defaults to in-process state, shared by every rule
   kind: valkey                      # memory (default) | valkey
   url: "${TOKEN_RATE_LIMIT_VALKEY_URL}"

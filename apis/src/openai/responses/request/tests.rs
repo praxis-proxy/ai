@@ -221,6 +221,43 @@ fn dedicated_default_header_targets_are_accepted() {
     assert!(OpenaiResponsesRequestFilter::from_config(&value).is_ok());
 }
 
+/// Filter results must be published under this filter's own name. A branch
+/// condition has to name the filter it is attached to, and every other
+/// filter's results are cleared before it is evaluated, so publishing under
+/// the replaced classifier's name left every `on_result` branch unmatched —
+/// a stateful request silently took the stateless path.
+#[tokio::test]
+async fn filter_results_are_published_under_this_filter() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4.1",
+            "input": "hi",
+            "previous_response_id": "resp_1"
+        }))
+        .unwrap(),
+    ));
+
+    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    let results = ctx
+        .filter_results
+        .get("openai_responses_request")
+        .expect("results belong to the filter that published them");
+    assert_eq!(results.get("format"), Some("openai_responses"));
+    assert_eq!(
+        results.get("mode"),
+        Some("stateful"),
+        "the routing fact a branch condition matches on"
+    );
+    assert!(
+        !ctx.filter_results.contains_key("openai_responses_format"),
+        "nothing is published under the replaced filter's name"
+    );
+}
+
 #[tokio::test]
 async fn a_non_create_responses_operation_is_left_alone() {
     let filter = default_filter();

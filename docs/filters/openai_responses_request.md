@@ -13,7 +13,7 @@ The operation is recognized from the request head, so only `POST /v1/responses` 
 
 Rejects `background=true` with a 400, matching `openai_responses_format`, because Praxis does not implement the asynchronous Responses lifecycle.
 
-Promotes `openai_responses_format.*` metadata and filter results, and generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, and `responses.stream`.
+Promotes `openai_responses_format.*` metadata, publishes filter results under `openai_responses_request`, and generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, and `responses.stream`.
 
 ## Configuration
 
