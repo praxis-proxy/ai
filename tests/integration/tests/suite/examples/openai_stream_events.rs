@@ -425,13 +425,13 @@ async fn stream_events_fails_closed_when_accumulation_budget_exceeded() {
     cleanup_sqlite_files(&db_path);
 }
 
+/// A completed response created with stream=true stores its normalized event
+/// log; GET /v1/responses/{id}?stream=true replays those exact events, in
+/// original sequence order, ending with the terminal event -- without
+/// reconstructing deltas. `starting_after` resumes after a cursor, and
+/// `starting_after` without `stream=true` is rejected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_events_replays_stored_event_log() {
-    // A completed response created with stream=true stores its normalized event
-    // log; GET /v1/responses/{id}?stream=true replays those exact events, in
-    // original sequence order, ending with the terminal event -- without
-    // reconstructing deltas. `starting_after` resumes after a cursor, and
-    // `starting_after` without `stream=true` is rejected.
     let sse_body = [
         "event: response.created\n",
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream_example\",\"status\":\"in_progress\"}}\n\n",
@@ -553,14 +553,14 @@ async fn stream_events_replays_stored_event_log() {
     cleanup_sqlite_files(&db_path);
 }
 
+/// A legacy `openai_responses_format` classifier pipeline promotes
+/// `openai_responses_format.format=openai_responses` for a replay GET (a GET to
+/// /v1/responses/{id} is a Responses endpoint) with `stream=false` (no request
+/// body). The store filter must force streaming mode for the replay GET instead
+/// of selecting the buffered Responses-format response mode, which the runtime
+/// would reject with a 500 against the streaming replay body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_events_replay_streams_under_legacy_classifier_pipeline() {
-    // A legacy `openai_responses_format` classifier pipeline promotes
-    // `openai_responses_format.format=openai_responses` for a replay GET (a GET to
-    // /v1/responses/{id} is a Responses endpoint) with `stream=false` (no request
-    // body). The store filter must force streaming mode for the replay GET instead
-    // of selecting the buffered Responses-format response mode, which the runtime
-    // would reject with a 500 against the streaming replay body.
     let sse_body = [
         "event: response.created\n",
         "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream_example\",\"status\":\"in_progress\"}}\n\n",
@@ -647,11 +647,11 @@ async fn stream_events_replay_streams_under_legacy_classifier_pipeline() {
     cleanup_sqlite_files(&db_path);
 }
 
+/// A response created without stream=true is persisted via the buffered path
+/// with no event log; replaying it must return 400 invalid_request_error --
+/// never a 404 and never a stream reconstructed from the stored JSON.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_events_replay_rejects_response_without_event_log() {
-    // A response created without stream=true is persisted via the buffered path
-    // with no event log; replaying it must return 400 invalid_request_error --
-    // never a 404 and never a stream reconstructed from the stored JSON.
     let backend_guard = Backend::fixed(RESPONSE_JSON)
         .header("content-type", "application/json")
         .start_with_shutdown();
