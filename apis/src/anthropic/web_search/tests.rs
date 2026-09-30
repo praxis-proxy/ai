@@ -40,15 +40,10 @@ default_context_size: medium
     AnthropicWebSearchFilter::from_config(&config).unwrap()
 }
 
-fn terminal_streaming_filter() -> Box<dyn HttpFilter> {
-    let config = serde_yaml::from_str(
-        r"
-provider: you
-api_key: test-key
-default_context_size: medium
-terminal_streaming: true
-",
-    )
+fn test_filter_with_max_body_bytes(max_body_bytes: usize) -> Box<dyn HttpFilter> {
+    let config = serde_yaml::from_str(&format!(
+        "provider: you\napi_key: test-key\ndefault_context_size: medium\nmax_body_bytes: {max_body_bytes}",
+    ))
     .unwrap();
     AnthropicWebSearchFilter::from_config(&config).unwrap()
 }
@@ -75,7 +70,6 @@ outbound_chain: web_search_outbound
     AnthropicWebSearchFilter {
         default_context_size: validated.default_context_size,
         max_body_bytes: validated.max_body_bytes,
-        terminal_streaming: validated.terminal_streaming,
         search_client,
         outbound: Arc::new(outbound),
         user_credential_slot: validated.user_credential,
@@ -250,7 +244,10 @@ fn result_action(ctx: &HttpFilterContext<'_>) -> Option<String> {
 }
 
 #[tokio::test]
-async fn streaming_request_is_rejected_before_reentry() {
+async fn streaming_request_is_accepted_and_selects_streaming_transport() {
+    // A `stream: true` Messages request is no longer rejected: the filter selects
+    // the streaming transport from the client's `stream` field so the terminal
+    // response is delivered incrementally.
     let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&request);
@@ -259,52 +256,45 @@ async fn streaming_request_is_rejected_before_reentry() {
     ));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    let FilterAction::Reject(rejection) = action else {
-        panic!("expected rejection");
-    };
-    assert_eq!(rejection.status, 400);
-    let body: Value = serde_json::from_slice(rejection.body.as_ref().unwrap()).unwrap();
-    assert_eq!(body["type"], "error");
-    assert_eq!(body["error"]["type"], "invalid_request_error");
+
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("streaming is not supported"))
+        matches!(action, FilterAction::Continue),
+        "an effective streaming request must be accepted, not rejected"
+    );
+    assert_eq!(
+        ctx.subrequest_response_mode(),
+        SubRequestResponseMode::Streaming,
+        "an effective streaming request must select the streaming transport"
     );
 }
 
 #[test]
-fn terminal_streaming_declares_streaming_capability() {
+fn always_declares_streaming_capability() {
+    // The transport is chosen per request, so the filter always advertises the
+    // Praxis streaming capability regardless of any config.
     assert!(
-        !test_filter().may_select_streaming_subrequest_response(),
-        "the buffered loop must not declare the Praxis streaming capability"
-    );
-    assert!(
-        terminal_streaming_filter().may_select_streaming_subrequest_response(),
-        "terminal_streaming must declare the Praxis streaming capability"
+        test_filter().may_select_streaming_subrequest_response(),
+        "anthropic_web_search must always declare the Praxis streaming capability"
     );
 }
 
 #[test]
-fn terminal_streaming_uses_incremental_response_body() {
-    let buffered = test_filter();
-    assert_eq!(buffered.response_body_access(), BodyAccess::ReadOnly);
+fn always_uses_incremental_response_body() {
+    // The response body is always delivered incrementally (BodyMode::Stream) with
+    // write access, so the filter composes in a streaming-capable step. A
+    // non-streaming request instead selects the buffered subrequest transport per
+    // request, which accumulates each round's response.
+    let filter = test_filter();
+    assert_eq!(filter.response_body_access(), BodyAccess::ReadWrite);
     assert!(
-        matches!(buffered.response_body_mode(), BodyMode::StreamBuffer { .. }),
-        "the buffered loop must accumulate the whole response before classifying"
-    );
-
-    let streaming = terminal_streaming_filter();
-    assert_eq!(streaming.response_body_access(), BodyAccess::ReadWrite);
-    assert!(
-        matches!(streaming.response_body_mode(), BodyMode::Stream),
-        "terminal streaming must deliver response chunks incrementally"
+        matches!(filter.response_body_mode(), BodyMode::Stream),
+        "the response body must be delivered incrementally"
     );
 }
 
 #[tokio::test]
-async fn terminal_streaming_accepts_streaming_request_and_selects_streaming_transport() {
-    let filter = terminal_streaming_filter();
+async fn accepts_streaming_request_and_selects_streaming_transport() {
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&request);
     let mut body = Some(Bytes::from_static(
@@ -315,7 +305,7 @@ async fn terminal_streaming_accepts_streaming_request_and_selects_streaming_tran
 
     assert!(
         matches!(action, FilterAction::Continue),
-        "terminal streaming must accept an effective streaming request"
+        "an effective streaming request must be accepted"
     );
     assert_eq!(
         ctx.subrequest_response_mode(),
@@ -325,8 +315,8 @@ async fn terminal_streaming_accepts_streaming_request_and_selects_streaming_tran
 }
 
 #[tokio::test]
-async fn terminal_streaming_keeps_buffered_transport_when_not_streaming() {
-    let filter = terminal_streaming_filter();
+async fn keeps_buffered_transport_when_not_streaming() {
+    let filter = test_filter();
     for body_bytes in [
         br#"{"model":"test","max_tokens":32,"stream":false,"messages":[{"role":"user","content":"hi"}]}"#.as_slice(),
         br#"{"model":"test","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}"#.as_slice(),
@@ -340,7 +330,7 @@ async fn terminal_streaming_keeps_buffered_transport_when_not_streaming() {
 
         assert!(
             matches!(action, FilterAction::Continue),
-            "a non-streaming request must continue under terminal_streaming"
+            "a non-streaming request must continue"
         );
         assert_eq!(
             ctx.subrequest_response_mode(),
@@ -592,6 +582,113 @@ async fn non_message_error_body_signals_done() {
 }
 
 #[tokio::test]
+async fn buffered_response_over_max_body_bytes_is_rejected() {
+    // Regression: with `response_body_mode() == Stream` the executor's per-filter
+    // response cap is dropped, so a buffered round that exceeds `max_body_bytes`
+    // (but stays under the router's larger ceiling) must be rejected by the filter
+    // itself. A `max_body_bytes` of 1 KiB with a ~4 KiB successful model response
+    // is between the two limits.
+    let filter = test_filter_with_max_body_bytes(1024);
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = initialized_context(&request).await;
+    assert_eq!(
+        ctx.subrequest_response_mode(),
+        SubRequestResponseMode::Buffered,
+        "a non-streaming request must select the buffered transport",
+    );
+    let mut body = Some(message_response(
+        json!([{"type":"text","text":"x".repeat(4096)}]),
+        "end_turn",
+    ));
+    assert!(
+        body.as_ref().unwrap().len() > 1024,
+        "the response must exceed max_body_bytes"
+    );
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("an oversized buffered response must be rejected, got {action:?}");
+    };
+    assert_eq!(
+        rejection.status, 502,
+        "an oversized upstream response is a 502 api_error"
+    );
+    assert!(
+        result_action(&ctx).is_none(),
+        "a rejected round must not signal a loop or done action",
+    );
+}
+
+#[tokio::test]
+async fn buffered_response_rejected_from_recorded_raw_size_after_translation_shrinks_it() {
+    // Finding #1: on the response path a translation filter composed below this
+    // loop runs first and can shrink an oversized upstream error into a small
+    // Anthropic envelope before this ceiling check sees it. The translator records
+    // the pre-transform byte count in metadata; this filter must reject from the
+    // recorded raw size even when the observed body is well under `max_body_bytes`.
+    let filter = test_filter_with_max_body_bytes(1024);
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = initialized_context(&request).await;
+    // The translator already normalized the oversized error into this tiny body.
+    let mut body = Some(message_response(json!([{"type":"text","text":"shrunk"}]), "end_turn"));
+    assert!(
+        body.as_ref().unwrap().len() < 1024,
+        "the observed (translated) body must be under max_body_bytes",
+    );
+    ctx.set_metadata(RESPONSE_RAW_BYTES_KEY, "8192");
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("an oversized raw round must be rejected despite the shrunk body, got {action:?}");
+    };
+    assert_eq!(
+        rejection.status, 502,
+        "the raw-size ceiling rejects with a 502 api_error",
+    );
+    assert!(
+        result_action(&ctx).is_none(),
+        "a rejected round must not signal a loop or done action",
+    );
+}
+
+#[tokio::test]
+async fn buffered_response_rejected_when_translation_expands_body_over_limit() {
+    // Complementary to the shrinking case: a translation filter below this loop can
+    // also EXPAND a Chat Completions response into a larger Anthropic message. The
+    // recorded raw size may be under the limit while the body actually buffered here
+    // exceeds it, so the observed length must be checked too -- not only the raw size.
+    let filter = test_filter_with_max_body_bytes(1024);
+    let request = make_request(Method::POST, "/v1/messages");
+    let mut ctx = initialized_context(&request).await;
+    // The raw upstream round was small; only the translated body is oversized.
+    ctx.set_metadata(RESPONSE_RAW_BYTES_KEY, "512");
+    let mut body = Some(message_response(
+        json!([{"type":"text","text":"x".repeat(4096)}]),
+        "end_turn",
+    ));
+    assert!(
+        body.as_ref().unwrap().len() > 1024,
+        "the observed (expanded) body must exceed max_body_bytes",
+    );
+
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    let FilterAction::Reject(rejection) = action else {
+        panic!("an expanded oversized body must be rejected despite the small raw size, got {action:?}");
+    };
+    assert_eq!(
+        rejection.status, 502,
+        "the observed-body ceiling rejects with a 502 api_error",
+    );
+    assert!(
+        result_action(&ctx).is_none(),
+        "a rejected round must not signal a loop or done action",
+    );
+}
+
+#[tokio::test]
 async fn non_end_of_stream_is_noop() {
     let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
@@ -819,8 +916,8 @@ fn feed_chunk(
 }
 
 #[test]
-fn terminal_streaming_forwards_message_start_and_suppresses_search_before_end_of_stream() {
-    let filter = terminal_streaming_filter();
+fn streaming_forwards_message_start_and_suppresses_search_before_end_of_stream() {
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
     // One pre-terminal chunk carrying the lifecycle opener and a managed call.
@@ -849,8 +946,8 @@ fn terminal_streaming_forwards_message_start_and_suppresses_search_before_end_of
 }
 
 #[test]
-fn terminal_streaming_text_answer_emits_terminal_and_signals_done() {
-    let filter = terminal_streaming_filter();
+fn streaming_text_answer_emits_terminal_and_signals_done() {
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
 
@@ -893,8 +990,8 @@ fn terminal_streaming_text_answer_emits_terminal_and_signals_done() {
 }
 
 #[test]
-fn terminal_streaming_managed_web_search_suppresses_block_and_signals_loop() {
-    let filter = terminal_streaming_filter();
+fn streaming_managed_web_search_suppresses_block_and_signals_loop() {
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
 
@@ -915,8 +1012,8 @@ fn terminal_streaming_managed_web_search_suppresses_block_and_signals_loop() {
 }
 
 #[test]
-fn terminal_streaming_fails_closed_on_malformed_frame() {
-    let filter = terminal_streaming_filter();
+fn streaming_fails_closed_on_malformed_frame() {
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
 
@@ -949,8 +1046,8 @@ fn terminal_streaming_fails_closed_on_malformed_frame() {
 }
 
 #[tokio::test]
-async fn terminal_streaming_passes_through_non_success_upstream() {
-    let filter = terminal_streaming_filter();
+async fn streaming_passes_through_non_success_upstream() {
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
     let mut response = make_response();
@@ -979,7 +1076,7 @@ async fn on_request_strips_accept_encoding() {
     // A compressed response cannot be parsed into Messages SSE events, nor
     // classified as a buffered JSON body: strip the client's content-coding
     // negotiation so every backend round returns identity-encoded bytes.
-    for filter in [test_filter(), terminal_streaming_filter()] {
+    for filter in [test_filter(), test_filter()] {
         let request = make_request(Method::POST, "/v1/messages");
         let mut ctx = make_filter_context(&request);
 
@@ -994,8 +1091,8 @@ async fn on_request_strips_accept_encoding() {
 }
 
 #[tokio::test]
-async fn terminal_streaming_declines_content_encoded_response() {
-    let filter = terminal_streaming_filter();
+async fn streaming_declines_content_encoded_response() {
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
     let mut response = make_response();
@@ -1024,12 +1121,12 @@ async fn terminal_streaming_declines_content_encoded_response() {
 }
 
 #[tokio::test]
-async fn terminal_streaming_fails_closed_on_later_round_non_success() {
+async fn streaming_fails_closed_on_later_round_non_success() {
     // Round 0 forwards `message_start`, so the client is mid-stream on a
     // committed 200 SSE lifecycle. A later round that returns a non-2xx status
     // cannot have its raw error body dumped into the open stream: doing so would
     // corrupt it. The stream fails closed to one terminal error event instead.
-    let filter = terminal_streaming_filter();
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
 
@@ -1071,11 +1168,11 @@ async fn terminal_streaming_fails_closed_on_later_round_non_success() {
 }
 
 #[tokio::test]
-async fn terminal_streaming_fails_closed_on_later_round_content_encoded() {
+async fn streaming_fails_closed_on_later_round_content_encoded() {
     // A later round that returns a content-encoded body cannot be parsed as
     // Messages SSE; forwarding the compressed bytes into the open stream would
     // corrupt it, so the stream fails closed to one terminal error event.
-    let filter = terminal_streaming_filter();
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
 
@@ -1110,7 +1207,7 @@ async fn terminal_streaming_fails_closed_on_later_round_content_encoded() {
 
 #[tokio::test]
 async fn on_response_marks_non_success_round_untransformable() {
-    let filter = terminal_streaming_filter();
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
     let mut response = make_response();
@@ -1126,7 +1223,7 @@ async fn on_response_marks_non_success_round_untransformable() {
 
 #[tokio::test]
 async fn on_response_marks_content_encoded_round_untransformable() {
-    let filter = terminal_streaming_filter();
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
     let mut response = make_response();
@@ -1146,7 +1243,7 @@ async fn on_response_marks_content_encoded_round_untransformable() {
 async fn on_response_clears_stale_marker_on_success_round() {
     // A prior untransformable round must not leak its marker into a later
     // transformable round: each header phase re-decides afresh.
-    let filter = terminal_streaming_filter();
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
 
@@ -1167,20 +1264,39 @@ async fn on_response_clears_stale_marker_on_success_round() {
 }
 
 #[tokio::test]
-async fn on_response_does_not_mark_for_buffered_filter() {
-    // The buffered loop reads the response status directly in the body phase, so
-    // the non-streaming filter records no streaming marker.
+async fn buffered_round_classifies_from_status_ignoring_marker() {
+    // The marker is now recorded in every header phase, but a buffered round
+    // (default subrequest transport) reads the response status directly in the
+    // body phase and never consults the marker: an untransformable non-2xx round
+    // still ends the loop with `done`.
     let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
-    let mut ctx = make_filter_context(&request);
+    let mut ctx = initialized_context(&request).await;
     let mut response = make_response();
     response.status = http::StatusCode::TOO_MANY_REQUESTS;
+    ctx.response_header = Some(&mut response);
 
-    run_response_header(&*filter, &mut ctx, &mut response).await;
-
+    // The header phase records the marker unconditionally, even on the buffered
+    // transport (the buffered body phase below ignores it and reads the status).
+    let header_action = filter.on_response(&mut ctx).await.unwrap();
+    assert!(matches!(header_action, FilterAction::Continue));
     assert!(
-        ctx.extensions.get::<UntransformableRound>().is_none(),
-        "the buffered filter records no streaming marker"
+        ctx.extensions.get::<UntransformableRound>().is_some(),
+        "the header phase records the marker for any untransformable round"
+    );
+
+    // The buffered body phase keeps the header populated (only the IRR streaming
+    // body phase clears it) and classifies from the status.
+    let mut body = Some(Bytes::from_static(
+        br#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#,
+    ));
+    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        result_action(&ctx).as_deref(),
+        Some("done"),
+        "a buffered non-success round classifies from the status and ends the loop"
     );
 }
 
@@ -1244,11 +1360,10 @@ fn handle_stream_termination_emits_terminal_error_and_signals_done() {
 }
 
 #[test]
-fn terminal_streaming_buffered_round_still_classifies() {
-    // Under `terminal_streaming` a non-streaming (buffered) round keeps the
-    // buffered classify behavior: mode stays Buffered, and a full JSON body is
-    // classified at end_of_stream.
-    let filter = terminal_streaming_filter();
+fn buffered_round_still_classifies() {
+    // A non-streaming (buffered) round keeps the buffered classify behavior: mode
+    // stays Buffered, and a full JSON body is classified at end_of_stream.
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&request);
     let original = message_response(
@@ -1269,8 +1384,8 @@ fn terminal_streaming_buffered_round_still_classifies() {
 }
 
 #[test]
-fn terminal_streaming_reassembles_fragmented_message_start() {
-    let filter = terminal_streaming_filter();
+fn streaming_reassembles_fragmented_message_start() {
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
     let full = sse_message_start("msg_frag");
@@ -1292,8 +1407,8 @@ fn terminal_streaming_reassembles_fragmented_message_start() {
 }
 
 #[test]
-fn terminal_streaming_forwards_multiline_data_delta() {
-    let filter = terminal_streaming_filter();
+fn streaming_forwards_multiline_data_delta() {
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
 
@@ -1328,8 +1443,8 @@ fn terminal_streaming_forwards_multiline_data_delta() {
 }
 
 #[test]
-fn terminal_streaming_remaps_text_index_after_suppressed_search() {
-    let filter = terminal_streaming_filter();
+fn streaming_remaps_text_index_after_suppressed_search() {
+    let filter = test_filter();
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = streaming_response_context(&request);
 
@@ -1589,13 +1704,6 @@ fn absent_slot_resolves_without_a_credential() {
     );
 }
 
-/// A terminal-streaming filter requiring the given per-user credential slot.
-fn streaming_filter_requiring_slot(slot: &str) -> AnthropicWebSearchFilter {
-    let mut filter = filter_requiring_slot(slot);
-    filter.terminal_streaming = true;
-    filter
-}
-
 /// A managed `WebSearch` request body with the given `stream` flag.
 fn managed_web_search_request(stream: bool) -> Bytes {
     Bytes::from(
@@ -1612,12 +1720,12 @@ fn managed_web_search_request(stream: bool) -> Bytes {
 
 #[tokio::test]
 async fn streaming_missing_credential_rejects_before_first_inference_stream() {
-    // Under terminal streaming the callout credential was formerly first checked
-    // at re-entry, after round 0 may have already committed HTTP 200 — too late to
+    // On the streaming path the callout credential was formerly first checked at
+    // re-entry, after round 0 may have already committed HTTP 200 — too late to
     // fail closed. A managed-WebSearch `stream: true` request with a required-but-
     // missing slot must be rejected with 401 before the first inference stream, so
     // no backend round or provider callout ever runs.
-    let filter = streaming_filter_requiring_slot("brave");
+    let filter = filter_requiring_slot("brave");
     let request = make_request(Method::POST, "/v1/messages");
     // No CalloutCredentials inserted: the required `brave` slot is absent.
     let mut ctx = make_filter_context(&request);
@@ -1654,7 +1762,7 @@ async fn streaming_with_present_credential_accepts_and_selects_streaming_transpo
     // populated (threaded into the round-0 context by the outer callout_credentials
     // filter), a managed-WebSearch `stream: true` request is accepted and selects
     // the streaming transport for the terminal response.
-    let filter = streaming_filter_requiring_slot("brave");
+    let filter = filter_requiring_slot("brave");
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&request);
     let mut creds = CalloutCredentials::new();
@@ -1680,7 +1788,7 @@ async fn streaming_without_managed_tool_skips_credential_preflight() {
     // The preflight is scoped to requests that declare the managed `WebSearch`
     // tool. A configured slot must not over-reject a `stream: true` request that
     // asks for no web search (no callout will run), even with no credential set.
-    let filter = streaming_filter_requiring_slot("brave");
+    let filter = filter_requiring_slot("brave");
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&request);
     let mut body = Some(Bytes::from_static(
@@ -1716,7 +1824,7 @@ async fn preflight_skips_when_tool_choice_disables_tools() {
     // the managed WebSearch callout can never fire this turn. Demanding the
     // per-user credential here would falsely reject a legitimate request; the
     // preflight must be skipped even though the tool is declared and no slot is set.
-    let filter = streaming_filter_requiring_slot("brave");
+    let filter = filter_requiring_slot("brave");
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&request);
     let mut body = Some(managed_web_search_request_with_tool_choice(
@@ -1737,7 +1845,7 @@ async fn preflight_skips_when_tool_choice_names_a_different_tool() {
     // `tool_choice: {"type": "tool", "name": X}` forces exactly tool X. When X is
     // not the managed WebSearch tool, the callout can never fire, so the preflight
     // must be skipped rather than reject on the missing slot.
-    let filter = streaming_filter_requiring_slot("brave");
+    let filter = filter_requiring_slot("brave");
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&request);
     let mut body = Some(managed_web_search_request_with_tool_choice(
@@ -1757,7 +1865,7 @@ async fn preflight_skips_when_tool_choice_names_a_different_tool() {
 async fn preflight_rejects_when_tool_choice_names_web_search() {
     // `tool_choice: {"type": "tool", "name": "WebSearch"}` forces the managed tool,
     // so a missing per-user credential must still fail closed with 401.
-    let filter = streaming_filter_requiring_slot("brave");
+    let filter = filter_requiring_slot("brave");
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&request);
     let mut body = Some(managed_web_search_request_with_tool_choice(
@@ -1777,7 +1885,7 @@ async fn preflight_rejects_when_tool_choice_names_web_search() {
 async fn preflight_rejects_when_tool_choice_requires_any_tool() {
     // `tool_choice: {"type": "any"}` lets the model pick any declared tool, WebSearch
     // included, so the managed callout may fire and the missing slot must fail closed.
-    let filter = streaming_filter_requiring_slot("brave");
+    let filter = filter_requiring_slot("brave");
     let request = make_request(Method::POST, "/v1/messages");
     let mut ctx = make_filter_context(&request);
     let mut body = Some(managed_web_search_request_with_tool_choice(

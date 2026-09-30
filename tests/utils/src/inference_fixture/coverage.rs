@@ -1267,6 +1267,7 @@ mod tests {
                 vec!["responses_client_tool_compat", "responses_to_chat_completions"],
                 vec!["responses_client_tool_compat", "responses_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
+                vec!["messages_to_chat_completions"],
             ]
         );
         assert_eq!(
@@ -1318,11 +1319,12 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 42);
-        assert_eq!(report.scenarios_total, 42);
-        assert_eq!(report.recordings_total, 47);
+        assert_eq!(report.features_total, 43);
+        assert_eq!(report.scenarios_total, 43);
+        assert_eq!(report.recordings_total, 48);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1341,6 +1343,7 @@ mod tests {
                 "messages/typed-server-tools",
                 "messages/unrepresentable-parameters",
                 "messages/upstream-error",
+                "messages/upstream-error-stream",
                 "responses/agentic-deferred-mcp-connectors",
                 "responses/agentic-parallel-tool-calls",
                 "responses/agentic-status-less-function-call",
@@ -1370,7 +1373,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 42);
+        assert_eq!(manifest.features.len(), 43);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1585,6 +1588,10 @@ mod tests {
                         "messages/stop-sequence-stream".to_owned(),
                     ]
                 ),
+                (
+                    &"messages.error.upstream_stream".to_owned(),
+                    &vec!["messages/upstream-error-stream".to_owned()]
+                ),
             ]
         );
         assert_eq!(
@@ -1717,6 +1724,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)]
         );
+        assert_eq!(
+            manifest.features[42]
+                .providers
+                .iter()
+                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                .collect::<Vec<_>>(),
+            vec![("synthetic", CoverageStatus::SyntheticOnly)]
+        );
         assert!(manifest.features.iter().all(|feature| {
             feature.reason.is_none() && feature.providers.values().all(|coverage| coverage.reason.is_none())
         }));
@@ -1768,6 +1783,10 @@ mod tests {
             429,
             &[],
         );
+        // `messages/upstream-error-stream` is a streaming *request* whose non-2xx
+        // round is normalized to a single JSON error, so it has no
+        // `content_block_delta` repeatable event and does not fit the streaming
+        // branch of `assert_scenario`; the replay test exercises it end to end.
         let malformed_success =
             InferenceScenario::load(&root.join("scenarios/messages/malformed-success.yaml")).unwrap();
         assert_scenario(

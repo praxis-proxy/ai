@@ -3,8 +3,8 @@
 # A single Anthropic Messages gateway that runs the server-owned web-search
 # loop through Praxis core's iterative_request_router (IRR) and serves BOTH
 # streaming and buffered clients from one pipeline. `anthropic_web_search`
-# selects the transport per request from the client's `stream` flag
-# (`terminal_streaming: true`):
+# selects the transport per request from the client's `stream` flag, with no
+# operator opt-in:
 #
 #   * `"stream": true`  -> the terminal answer is streamed to the client as one
 #     coherent Anthropic Messages SSE lifecycle (a single `message_start`,
@@ -86,7 +86,6 @@ filter_chains:
                 user_credential: you_search
                 default_context_size: medium
                 timeout_ms: 10000
-                terminal_streaming: true
               - filter: anthropic_messages_protocol
                 default_version: "2023-06-01"
               - filter: router

@@ -62,6 +62,12 @@ pub(super) enum StreamError {
     /// round would fail, so the loop is terminated with a coherent error rather
     /// than an abrupt EOF.
     DeadlineExceeded,
+    /// Re-entering inference would send a rebuilt request larger than the
+    /// configured body-size bound — the appended search result pushed it over the
+    /// limit. On a committed streaming response the buffered path's request-phase
+    /// 413 cannot replace the open SSE lifecycle, so the loop terminates with one
+    /// coherent error event instead of forwarding an oversized round.
+    ReentryTooLarge,
     /// A later round returned a non-2xx status or a content-encoded body after
     /// the client-visible SSE lifecycle had already started, so it cannot be
     /// transformed and its raw bytes must not corrupt the open stream.
@@ -1030,6 +1036,7 @@ fn anthropic_error(error: &StreamError) -> (&'static str, &'static str) {
             "web search exceeded the maximum number of search iterations",
         ),
         StreamError::DeadlineExceeded => ("api_error", "web search exceeded the configured deadline"),
+        StreamError::ReentryTooLarge => ("api_error", "web search request exceeds configured max_body_bytes"),
         StreamError::IncompleteStream => ("api_error", "web search response stream ended before completion"),
         StreamError::UpstreamTerminated => ("api_error", "web search stream terminated before completion"),
         StreamError::MalformedUtf8
@@ -1567,6 +1574,25 @@ mod tests {
             text.contains("non-empty id and input.query"),
             "the client-safe reason is carried"
         );
+    }
+
+    #[test]
+    fn error_event_bytes_map_reentry_too_large_to_api_error() {
+        // An oversized rebuilt re-entry request on a committed streaming response
+        // fails closed to one terminal SSE `error` event, mirroring the buffered
+        // path's 413 reason under the api_error envelope the open stream requires.
+        let text = String::from_utf8(error_event_bytes(&StreamError::ReentryTooLarge)).unwrap();
+
+        assert!(text.starts_with("event: error\n"), "a terminal error event is emitted");
+        assert!(
+            text.contains("\"type\":\"api_error\""),
+            "an oversized re-entry maps to api_error on the committed stream"
+        );
+        assert!(
+            text.contains("exceeds configured max_body_bytes"),
+            "the client-safe reason names the exceeded ceiling"
+        );
+        assert!(text.ends_with("\n\n"), "the SSE event is framed");
     }
 
     #[test]

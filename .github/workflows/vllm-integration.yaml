@@ -622,7 +622,9 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-          cache-dependency-glob: tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py
+          cache-dependency-glob: |
+            tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py
+            tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py
 
       - name: Verify pins are resolvable
         run: |
@@ -923,6 +925,38 @@ jobs:
           PRAXIS_TEST_REQUIRE_LIVE: "1"
         run: |
           uv run tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py -s -k "not image"
+
+      - name: Run Anthropic SDK web search against real vLLM (stubbed provider)
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        timeout-minutes: 15
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+        run: |
+          # The live model forces a WebSearch call answered by a local body-auth
+          # stub, so this mode is deterministic and needs no external secret.
+          uv run tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py -s \
+            -k "not live_tavily"
+
+      - name: Run credentialed live Tavily web search against real vLLM
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        timeout-minutes: 15
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+          # The generated YAML keeps the ${WEB_SEARCH_API_KEY} reference, so the
+          # secret is consumed only by this one-test process and is never written
+          # into or printed with the config.
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          # Scheduled/manual full runs are controlled environments and must prove
+          # the real provider path. Labeled fork PRs do not receive secrets, so
+          # they retain deterministic coverage and skip only this credentialed test.
+          PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+        run: |
+          uv run tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py -s \
+            -k live_tavily
 
       - name: Acceptance log tail on failure
         if: failure()

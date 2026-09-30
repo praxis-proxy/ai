@@ -20,7 +20,8 @@ pub(crate) mod response;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SubRequestResponseMode,
+    parse_filter_config,
 };
 use tracing::{debug, warn};
 
@@ -37,6 +38,37 @@ const RESPONSE_TRANSFORM_ERROR: &str = "error";
 const RESPONSE_STATUS_KEY: &str = "anthropic_messages_to_chat_completions.response_status";
 /// Metadata key preserving the upstream request ID for the body phase.
 const RESPONSE_REQUEST_ID_KEY: &str = "anthropic_messages_to_chat_completions.response_request_id";
+/// Metadata key recording the raw upstream response byte count before any
+/// transform shrinks it.
+///
+/// On the response path the managed `anthropic_web_search` loop runs after this
+/// translation, so it observes the already-transformed (potentially smaller)
+/// Anthropic body. Recording the pre-transform size lets it enforce its own byte
+/// ceiling on the raw upstream round independently of this filter's limit.
+pub(crate) const RESPONSE_RAW_BYTES_KEY: &str = "anthropic_messages_to_chat_completions.response_raw_bytes";
+
+/// Per-request accumulator for a streaming request's non-2xx error round body.
+///
+/// A streaming request whose round returns a non-2xx status must still be
+/// normalized to a single Anthropic error. The buffered path ratchets the
+/// response body mode to [`BodyMode::StreamBuffer`] in [`on_response`], but a
+/// streaming-composed IRR pipeline (for example the managed `anthropic_web_search`
+/// loop) ignores that per-request ratchet and delivers the error round as raw
+/// `BodyMode::Stream` chunks. Passing those chunks through and then transforming
+/// an empty body at end of stream would emit the raw upstream error followed by a
+/// second, generic Anthropic error — two concatenated JSON objects. Instead the
+/// filter accumulates the raw bytes here, suppresses passthrough, and transforms
+/// the whole body exactly once at end of stream.
+///
+/// [`on_response`]: AnthropicMessagesToChatCompletionsFilter::on_response
+#[derive(Default)]
+struct StreamingErrorBuffer {
+    /// Raw upstream error bytes accumulated so far.
+    buf: Vec<u8>,
+    /// Set once the accumulated body exceeds `max_body_bytes`; the buffer is then
+    /// cleared and end of stream emits a single JSON error instead of the body.
+    overflowed: bool,
+}
 
 /// Metadata key holding the client's `stop_sequences` as a JSON array.
 ///
@@ -89,6 +121,64 @@ impl AnthropicMessagesToChatCompletionsFilter {
             parse_filter_config("anthropic_messages_to_chat_completions", config)?;
         let validated = build_config(cfg)?;
         Ok(Box::new(Self { config: validated }))
+    }
+
+    /// Accumulate a streaming request's non-2xx error round and transform it once.
+    ///
+    /// Raw chunks are appended to a per-request [`StreamingErrorBuffer`] and
+    /// suppressed from passthrough. At end of stream the accumulated body is
+    /// normalized to a single Anthropic error, so exactly one JSON object reaches
+    /// the client even when the composed pipeline delivers the error round as raw
+    /// `Stream` chunks rather than a single buffered body.
+    ///
+    /// An accumulated body that exceeds `max_body_bytes` fails closed with a single
+    /// JSON error body rather than being truncated. This round is pre-SSE: its
+    /// non-2xx status and `application/json` content-type are already committed, so
+    /// a `Reject` here would surface as a stream termination rendered as an
+    /// `event: error` SSE frame under those JSON headers — a body the client cannot
+    /// parse. Emitting one valid JSON error instead keeps the response parseable and
+    /// still refuses to forward an oversized upstream error.
+    fn accumulate_streaming_error_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> FilterAction {
+        if let Some(chunk) = body.take() {
+            let buffer = ctx.extensions.get_or_insert_with(StreamingErrorBuffer::default);
+            if !buffer.overflowed {
+                buffer.buf.extend_from_slice(&chunk);
+                if buffer.buf.len() > self.config.max_body_bytes {
+                    // Free the accumulated bytes and defer the JSON error to end of
+                    // stream; further chunks stay suppressed via `body.take()`.
+                    buffer.overflowed = true;
+                    buffer.buf = Vec::new();
+                }
+            }
+        }
+
+        if !end_of_stream {
+            return FilterAction::Continue;
+        }
+
+        let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY).map(str::to_owned);
+        let buffer = ctx.extensions.remove::<StreamingErrorBuffer>().unwrap_or_default();
+        if buffer.overflowed {
+            *body = Some(Bytes::from(wire::error_body(
+                "api_error",
+                "upstream response exceeded the configured max_body_bytes",
+                request_id.as_deref(),
+            )));
+            return FilterAction::Continue;
+        }
+
+        let status = error_status(ctx);
+        *body = Some(Bytes::from(response::transform_error_response(
+            &buffer.buf,
+            status,
+            request_id.as_deref(),
+        )));
+        FilterAction::Continue
     }
 }
 
@@ -193,32 +283,69 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
             _ => return Ok(FilterAction::Continue),
         };
 
+        // Accumulate manually only when the error round is physically delivered as
+        // raw `Stream` chunks. That happens under a managed streaming IRR (for
+        // example the `anthropic_web_search` loop), which selects
+        // `SubRequestResponseMode::Streaming` and ignores this filter's per-request
+        // `StreamBuffer` ratchet. Gating on the client's `stream` flag alone would
+        // be wrong: a standalone streaming request keeps the ratchet, so the
+        // framework already buffers the round and re-presents the complete body at
+        // end of stream. Accumulating in that case appends the framework's frozen
+        // full body on top of the mid-stream chunks — a doubled, unparseable body
+        // that degrades to a generic fallback error. There the buffered path below
+        // transforms the framework's body exactly once.
+        if transform_error && ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
+            return Ok(self.accumulate_streaming_error_body(ctx, body, end_of_stream));
+        }
+
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
 
-        if transform_error {
-            let status = ctx
-                .get_metadata(RESPONSE_STATUS_KEY)
-                .and_then(|value| value.parse::<u16>().ok())
-                .and_then(|value| http::StatusCode::from_u16(value).ok())
-                .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
-            let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
-            transform_error_body(body, status, request_id);
-        } else {
-            let request_model = ctx
-                .filter_metadata
-                .get("anthropic_messages_to_chat_completions.model")
-                .map_or("", String::as_str);
-            let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
-            let stop_sequences = client_stop_sequences(ctx);
-            if let Some(finish_reason) = transform_non_streaming_body(body, request_model, request_id, &stop_sequences)
-            {
-                ctx.set_metadata("openai.finish_reason", finish_reason);
-            }
+        // Record the raw upstream byte count before any transform shrinks it, so a
+        // later filter (the managed web-search loop, which runs after this
+        // translation on the response path) can enforce its own byte ceiling on the
+        // untransformed size rather than on the smaller body it observes.
+        let raw_len = body.as_ref().map_or(0, Bytes::len);
+        ctx.set_metadata(RESPONSE_RAW_BYTES_KEY, raw_len.to_string());
+
+        // Enforce the response byte ceiling on the RAW upstream body before any
+        // transform can shrink it below a downstream size check. A
+        // streaming-composed pipeline (the managed web-search loop) drops the
+        // executor's per-filter `StreamBuffer` response cap, so an oversized
+        // buffered round would otherwise be normalized and forwarded instead of
+        // rejected. Mirrors the web_search buffered ceiling with a 502 api_error.
+        if raw_len > self.config.max_body_bytes {
+            return Ok(FilterAction::Reject(wire::error_rejection(
+                502,
+                "api_error",
+                "upstream response exceeded the configured max_body_bytes",
+            )));
         }
 
+        transform_buffered_response(ctx, body, transform_error);
         Ok(FilterAction::Continue)
+    }
+}
+
+/// Transform a fully buffered response body in place: normalize an error round
+/// into a single Anthropic error, or rewrite a successful Chat Completions body
+/// into the Messages shape and record the mapped finish reason.
+fn transform_buffered_response(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, transform_error: bool) {
+    if transform_error {
+        let status = error_status(ctx);
+        let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
+        transform_error_body(body, status, request_id);
+    } else {
+        let request_model = ctx
+            .filter_metadata
+            .get("anthropic_messages_to_chat_completions.model")
+            .map_or("", String::as_str);
+        let request_id = ctx.get_metadata(RESPONSE_REQUEST_ID_KEY);
+        let stop_sequences = client_stop_sequences(ctx);
+        if let Some(finish_reason) = transform_non_streaming_body(body, request_model, request_id, &stop_sequences) {
+            ctx.set_metadata("openai.finish_reason", finish_reason);
+        }
     }
 }
 
@@ -338,6 +465,14 @@ fn canonicalize_response_request_id(ctx: &mut HttpFilterContext<'_>) -> Option<S
 #[cfg(test)]
 fn should_transform_response(ctx: &HttpFilterContext<'_>) -> bool {
     response_transform(ctx).is_some()
+}
+
+/// Recover the upstream error status recorded in the response-header phase.
+fn error_status(ctx: &HttpFilterContext<'_>) -> http::StatusCode {
+    ctx.get_metadata(RESPONSE_STATUS_KEY)
+        .and_then(|value| value.parse::<u16>().ok())
+        .and_then(|value| http::StatusCode::from_u16(value).ok())
+        .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// Select the response transformation while headers are available.
@@ -516,6 +651,188 @@ mod tests {
         assert_eq!(parsed["error"]["type"], "api_error");
         assert_eq!(parsed["error"]["message"], "unavailable");
         assert_eq!(parsed["request_id"], "req_header");
+    }
+
+    #[tokio::test]
+    async fn streaming_error_round_accumulates_chunks_into_single_error() {
+        // A streaming-composed pipeline (for example the managed web-search IRR
+        // loop) ignores the per-request `StreamBuffer` ratchet and delivers a
+        // non-2xx round as raw `Stream` chunks. The filter must suppress those raw
+        // chunks and emit exactly one transformed Anthropic error at end of stream,
+        // never the raw body followed by a second empty-input transform.
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let mut response = make_response();
+        response.status = StatusCode::TOO_MANY_REQUESTS;
+        ctx.response_header = Some(&mut response);
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        // The managed IRR selected the streaming subrequest transport, so the error
+        // round arrives as raw `Stream` chunks that this filter must accumulate.
+        ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+        drop(filter.on_response(&mut ctx).await.unwrap());
+        // The IRR clears the response header before the streaming body phase.
+        ctx.response_header = None;
+
+        // The raw upstream error arrives split across two non-terminal chunks.
+        let raw = br#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#;
+        let (head, tail) = raw.split_at(20);
+        let mut first = Some(Bytes::copy_from_slice(head));
+        drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+        assert!(
+            first.is_none(),
+            "intermediate error chunks are suppressed, not forwarded"
+        );
+        let mut second = Some(Bytes::copy_from_slice(tail));
+        drop(filter.on_response_body(&mut ctx, &mut second, false).unwrap());
+        assert!(
+            second.is_none(),
+            "intermediate error chunks are suppressed, not forwarded"
+        );
+
+        // The terminal chunk flushes exactly one transformed error.
+        let mut terminal = Some(Bytes::new());
+        drop(filter.on_response_body(&mut ctx, &mut terminal, true).unwrap());
+        let bytes = terminal.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "rate_limit_error");
+        assert_eq!(
+            parsed["error"]["message"], "rate limited",
+            "the accumulated raw body is transformed, not an empty fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_streaming_error_streambuffer_delivery_yields_single_error() {
+        // A standalone streaming request (no managed IRR) keeps the response body
+        // in `StreamBuffer` mode via the `on_response` ratchet, so the framework
+        // presents each raw chunk mid-stream AND re-presents the frozen full body
+        // at end of stream. `subrequest_response_mode` stays `Buffered` (the
+        // default), so this filter must NOT accumulate the chunks itself: doing so
+        // would append the body twice and corrupt the JSON. It transforms the
+        // framework's buffered body exactly once.
+        let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        assert_eq!(
+            ctx.subrequest_response_mode(),
+            SubRequestResponseMode::Buffered,
+            "a standalone request has no managed IRR, so the transport is buffered"
+        );
+        let mut response = make_response();
+        response.status = StatusCode::TOO_MANY_REQUESTS;
+        ctx.response_header = Some(&mut response);
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        drop(filter.on_response(&mut ctx).await.unwrap());
+        ctx.response_header = None;
+
+        // `StreamBuffer` delivery: the raw upstream error is presented split across
+        // two mid-stream chunks, then the complete frozen buffer is re-presented at
+        // end of stream — exactly as praxis `StreamBuffer` mode drives the hook.
+        let raw = br#"{"error":{"message":"rate limited: retry in 60 seconds","type":"rate_limit_error"}}"#;
+        let (head, tail) = raw.split_at(30);
+        let mut first = Some(Bytes::copy_from_slice(head));
+        drop(filter.on_response_body(&mut ctx, &mut first, false).unwrap());
+        let mut second = Some(Bytes::copy_from_slice(tail));
+        drop(filter.on_response_body(&mut ctx, &mut second, false).unwrap());
+        let mut terminal = Some(Bytes::copy_from_slice(raw));
+        drop(filter.on_response_body(&mut ctx, &mut terminal, true).unwrap());
+
+        let bytes = terminal.unwrap();
+        // A clean parse proves the body was not appended twice: a doubled body is
+        // invalid JSON and falls back to a generic "upstream request failed".
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "rate_limit_error");
+        assert_eq!(
+            parsed["error"]["message"], "rate limited: retry in 60 seconds",
+            "the real upstream message survives; the body is transformed once, not doubled"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_error_over_max_body_bytes_is_rejected() {
+        // The raw upstream body must be measured before any transform can shrink it
+        // below the ceiling. A streaming-composed pipeline (the managed web-search
+        // loop) drops the executor's per-filter response cap, so the translator has
+        // to enforce the limit itself and reject an oversized round with a 502.
+        let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 64").unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let mut response = make_response();
+        response.status = StatusCode::TOO_MANY_REQUESTS;
+        ctx.response_header = Some(&mut response);
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+        drop(filter.on_response(&mut ctx).await.unwrap());
+        ctx.response_header = None;
+
+        // An oversized upstream error body whose transformed envelope would be small.
+        let padding = "x".repeat(4096);
+        let raw = format!(r#"{{"error":{{"message":"{padding}","type":"rate_limit_error"}}}}"#);
+        let mut body = Some(Bytes::from(raw));
+        let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
+
+        let FilterAction::Reject(rejection) = action else {
+            panic!("an oversized buffered error must be rejected, not normalized");
+        };
+        assert_eq!(rejection.status, 502, "the raw-size ceiling rejects with a 502");
+        let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "api_error");
+    }
+
+    #[tokio::test]
+    async fn streaming_error_over_max_body_bytes_fails_closed_with_json() {
+        // The streaming accumulator must fail closed on an oversized error round
+        // without truncating it. This round is pre-SSE: the non-2xx status and
+        // JSON content-type are already committed, so a `Reject` here would become
+        // an `event: error` SSE frame under JSON headers that the client cannot
+        // parse. Instead it emits exactly one valid JSON error at end of stream.
+        let yaml: serde_yaml::Value = serde_yaml::from_str("max_body_bytes: 64").unwrap();
+        let filter = AnthropicMessagesToChatCompletionsFilter::from_config(&yaml).unwrap();
+        let request = make_request(Method::POST, "/v1/messages");
+        let mut ctx = make_filter_context(&request);
+        let mut response = make_response();
+        response.status = StatusCode::TOO_MANY_REQUESTS;
+        response.headers.insert("x-request-id", "req_over".parse().unwrap());
+        ctx.response_header = Some(&mut response);
+        ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "true");
+        // The managed IRR selected the streaming subrequest transport, so the error
+        // round arrives as raw `Stream` chunks that this filter must accumulate.
+        ctx.set_subrequest_response_mode(SubRequestResponseMode::Streaming);
+        drop(filter.on_response(&mut ctx).await.unwrap());
+        ctx.response_header = None;
+
+        // A single oversized chunk arrives before end of stream and is suppressed.
+        let mut chunk = Some(Bytes::from("x".repeat(4096)));
+        let action = filter.on_response_body(&mut ctx, &mut chunk, false).unwrap();
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "an oversized streaming chunk is suppressed, not rejected into an SSE frame"
+        );
+        assert!(chunk.is_none(), "the oversized chunk must not be forwarded");
+
+        // The terminal chunk flushes exactly one valid JSON error, not SSE.
+        let mut terminal = Some(Bytes::new());
+        let action = filter.on_response_body(&mut ctx, &mut terminal, true).unwrap();
+        assert!(matches!(action, FilterAction::Continue), "end of stream continues");
+        let bytes = terminal.unwrap();
+        // `from_slice` on the whole body proves it is one JSON object, never an SSE
+        // event frame (which would fail to parse as JSON).
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["type"], "error");
+        assert_eq!(parsed["error"]["type"], "api_error");
+        assert!(
+            parsed["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("max_body_bytes")),
+            "the JSON error names the exceeded ceiling"
+        );
+        assert_eq!(parsed["request_id"], "req_over", "the upstream request id is preserved");
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
 use crate::{
+    anthropic::messages_to_chat_completions::RESPONSE_RAW_BYTES_KEY,
     callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
     web_search::{
         CalloutContext, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome, WebSearchFilterConfig,
@@ -251,8 +252,9 @@ struct ResponseEnvelope<'a> {
 ///
 /// # Live demo YAML
 ///
-/// The unified example serves both buffered (`stream: false`) and streaming
-/// (`stream: true`) clients from one pipeline via `terminal_streaming: true`.
+/// One pipeline serves both buffered (`stream: false`) and streaming
+/// (`stream: true`) clients: the filter selects the transport per request from
+/// the client's `stream` field, with no operator opt-in.
 ///
 /// ```yaml
 /// # cargo run -p praxis-test-utils --example anthropic_messages_web_search_mock
@@ -267,10 +269,6 @@ pub struct AnthropicWebSearchFilter {
     default_context_size: SearchContextSize,
     /// Maximum request and response body size buffered by the loop.
     max_body_bytes: usize,
-    /// Whether an effective `stream: true` Messages request may use Praxis's
-    /// streaming subrequest transport to deliver the terminal response
-    /// incrementally across IRR rounds.
-    terminal_streaming: bool,
     /// Shared provider client used for You.com callouts.
     search_client: SearchClient,
     /// Prebuilt outbound filter chain each provider request executes through.
@@ -340,7 +338,6 @@ impl AnthropicWebSearchFilter {
         Ok(Box::new(Self {
             default_context_size: validated.default_context_size,
             max_body_bytes: validated.max_body_bytes,
-            terminal_streaming: validated.terminal_streaming,
             search_client,
             outbound,
             user_credential_slot: validated.user_credential,
@@ -383,15 +380,13 @@ impl AnthropicWebSearchFilter {
 
     /// Align the Praxis subrequest response transport with the outbound body.
     ///
-    /// Only meaningful under `terminal_streaming`: an effective `stream: true`
-    /// request selects the streaming transport so the terminal Messages
-    /// response reaches the client incrementally, while a non-streaming request
-    /// keeps the buffered transport. The buffered loop leaves the default mode
-    /// untouched.
-    fn apply_streaming_transport(&self, ctx: &mut HttpFilterContext<'_>, streaming: bool) {
-        if !self.terminal_streaming {
-            return;
-        }
+    /// An effective `stream: true` request selects the streaming transport so the
+    /// terminal Messages response reaches the client incrementally as one coherent
+    /// SSE lifecycle, while an absent or `false` `stream` keeps the buffered
+    /// transport that accumulates each round and returns one final JSON object.
+    /// The choice is captured once here and preserved across web-search re-entry
+    /// by the router-owned `IterationState`.
+    fn apply_streaming_transport(ctx: &mut HttpFilterContext<'_>, streaming: bool) {
         let mode = if streaming {
             SubRequestResponseMode::Streaming
         } else {
@@ -560,18 +555,18 @@ impl AnthropicWebSearchFilter {
         }
         let rebuilt = serde_json::to_vec(&request)
             .map_err(|error| FilterError::from(format!("{FILTER_NAME}: request serialization failed: {error}")))?;
+        // Resolve the caller's original transport intent from the retained request
+        // BEFORE the size check. At re-entry `ctx.subrequest_response_mode()` is
+        // still Buffered (it is applied below), so branching the oversize rejection
+        // on it would misclassify a streaming request whose SSE lifecycle is already
+        // committed. Every round talks to the backend with this intent so the
+        // terminal round can be streamed the moment it arrives.
+        let streaming = request.get("stream").and_then(Value::as_bool).unwrap_or(false);
         if rebuilt.len() > self.max_body_bytes {
-            return Ok(FilterAction::Reject(anthropic_rejection(
-                413,
-                "invalid_request_error",
-                "web search request exceeds configured max_body_bytes",
-            )));
+            return Ok(Self::reject_oversized_reentry(ctx, streaming));
         }
         let rebuilt = Bytes::from(rebuilt);
-        // Every round talks to the backend with the caller's original transport
-        // intent so the terminal round can be streamed the moment it arrives.
-        let streaming = request.get("stream").and_then(Value::as_bool).unwrap_or(false);
-        self.apply_streaming_transport(ctx, streaming);
+        Self::apply_streaming_transport(ctx, streaming);
         let iteration_state = ctx.extensions.get_mut::<IterationState>().ok_or_else(|| {
             FilterError::from(format!(
                 "{FILTER_NAME}: IRR iteration state unavailable while retaining request"
@@ -586,6 +581,118 @@ impl AnthropicWebSearchFilter {
         ctx.request_headers_to_set
             .push((CONTENT_TYPE, HeaderValue::from_static("application/json")));
         *body = Some(rebuilt);
+        Ok(FilterAction::Continue)
+    }
+
+    /// Reject a re-entry whose rebuilt request exceeds `max_body_bytes`, matching
+    /// the client's response transport.
+    ///
+    /// A buffered request is not yet committed, so it fails closed with a JSON
+    /// `413 invalid_request_error` the client can act on. A streaming request has
+    /// already committed a `200 text/event-stream` lifecycle (round 0 forwarded
+    /// `message_start`), so a JSON body cannot replace it: this request-phase
+    /// rejection makes the re-entry step complete, and the IRR streaming session
+    /// drains the rejection's body verbatim as the terminal chunk of the open
+    /// stream. Emit one coherent Anthropic `error` SSE event so the client sees a
+    /// clean terminal instead of a raw JSON object appended to the SSE stream. The
+    /// rejection status is inert once the stream is committed; `Reject` skips the
+    /// response phase, so the loop ends without emitting anything further.
+    fn reject_oversized_reentry(ctx: &mut HttpFilterContext<'_>, streaming: bool) -> FilterAction {
+        if !streaming {
+            return FilterAction::Reject(anthropic_rejection(
+                413,
+                "invalid_request_error",
+                "web search request exceeds configured max_body_bytes",
+            ));
+        }
+        // Poison the logical stream so any later read observes the terminal state;
+        // the committed SSE headers already fix the content type, so the inert 413
+        // status only records the payload-too-large intent.
+        if let Some(logical) = ctx.extensions.get_mut::<streaming::LogicalStream>() {
+            logical.fail();
+        }
+        FilterAction::Reject(
+            Rejection::status(413)
+                .with_header("content-type", "text/event-stream")
+                .with_body(Bytes::from(streaming::error_event_bytes(
+                    &streaming::StreamError::ReentryTooLarge,
+                ))),
+        )
+    }
+
+    /// Accumulate-then-classify a buffered (`stream: false`) round.
+    ///
+    /// The buffered subrequest transport delivers the whole model response in one
+    /// call at `end_of_stream`, so the round is classified from the complete body.
+    fn on_buffered_response_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+
+        // Re-apply the response byte ceiling that the static `StreamBuffer`
+        // response mode used to enforce. `response_body_mode()` now advertises
+        // `Stream` so this filter can compose in a streaming-capable step, which
+        // drops the executor's per-filter response cap — only the router's larger
+        // ceiling would otherwise bound a buffered round. Reject an oversized
+        // model response here instead of buffering it; the streaming path enforces
+        // the same ceiling through `streaming::LogicalStream`.
+        //
+        // Enforce the ceiling on BOTH the raw upstream size and the body observed
+        // here, because a translation filter composed below this loop runs first on
+        // the response path and can change the size in either direction:
+        //   * it can SHRINK an oversized upstream error into a small Anthropic envelope, hiding a raw round that
+        //     exceeds the limit — so measure the pre-transform byte count the translator records; and
+        //   * it can EXPAND a Chat Completions response into a larger Anthropic message, so the body actually buffered
+        //     here can exceed the limit even when the raw round did not — so measure the observed length too.
+        // With no translator (a native Anthropic backend delivers the raw body here)
+        // the metadata is absent and both fall back to the same observed length.
+        let observed_len = body.as_ref().map_or(0, Bytes::len);
+        let raw_len = ctx
+            .get_metadata(RESPONSE_RAW_BYTES_KEY)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(observed_len);
+        if raw_len > self.max_body_bytes || observed_len > self.max_body_bytes {
+            return Ok(FilterAction::Reject(anthropic_rejection(
+                502,
+                "api_error",
+                "web-search upstream response exceeded the configured max_body_bytes",
+            )));
+        }
+        Self::classify_buffered_round(ctx, body)
+    }
+
+    /// Map a fully-buffered round body to its loop decision and matching action.
+    fn classify_buffered_round(
+        ctx: &mut HttpFilterContext<'_>,
+        body: &Option<Bytes>,
+    ) -> Result<FilterAction, FilterError> {
+        if !is_success_response(ctx) {
+            set_action(ctx, ACTION_DONE)?;
+            return Ok(FilterAction::Continue);
+        }
+        match body.as_deref().map_or(ResponseDecision::Done, classify_response) {
+            ResponseDecision::Done => set_action(ctx, ACTION_DONE)?,
+            ResponseDecision::Managed(_) => set_action(ctx, ACTION_LOOP)?,
+            ResponseDecision::InvalidManagedCall => {
+                return Ok(FilterAction::Reject(anthropic_rejection(
+                    400,
+                    "invalid_request_error",
+                    "WebSearch tool use requires a non-empty id and input.query",
+                )));
+            },
+            ResponseDecision::QueryTooLong => {
+                return Ok(FilterAction::Reject(anthropic_rejection(
+                    400,
+                    "invalid_request_error",
+                    "WebSearch input.query must not exceed 8192 bytes",
+                )));
+            },
+        }
         Ok(FilterAction::Continue)
     }
 
@@ -686,29 +793,28 @@ impl HttpFilter for AnthropicWebSearchFilter {
     }
 
     fn response_body_access(&self) -> BodyAccess {
-        // Terminal streaming rewrites the SSE body incrementally; the buffered
-        // loop only inspects the accumulated response.
-        if self.terminal_streaming {
-            BodyAccess::ReadWrite
-        } else {
-            BodyAccess::ReadOnly
-        }
+        // The streaming path rewrites the SSE body incrementally; the buffered
+        // path inspects the accumulated response. Both need write access to the
+        // response body, so the access is declared unconditionally — the transport
+        // is chosen per request, not by config.
+        BodyAccess::ReadWrite
     }
 
     fn response_body_mode(&self) -> BodyMode {
-        // A streaming-capable response pipeline may not use `StreamBuffer`; the
-        // terminal serializer delivers chunks as they arrive.
-        if self.terminal_streaming {
-            BodyMode::Stream
-        } else {
-            BodyMode::StreamBuffer {
-                max_bytes: Some(self.max_body_bytes),
-            }
-        }
+        // Always advertise incremental delivery so this filter can compose in a
+        // streaming-capable step: a streaming-capable response pipeline may not
+        // statically declare `StreamBuffer`. A non-streaming request instead
+        // selects the buffered subrequest transport per request (see
+        // `apply_streaming_transport`), which accumulates each round's response.
+        BodyMode::Stream
     }
 
     fn may_select_streaming_subrequest_response(&self) -> bool {
-        self.terminal_streaming
+        // Always advertise the capability: the transport follows the client's
+        // effective `stream` field, chosen per request. There is no operator
+        // opt-in. A runtime guard in Praxis still validates the actual streaming
+        // terminal action.
+        true
     }
 
     async fn on_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
@@ -742,17 +848,10 @@ impl HttpFilter for AnthropicWebSearchFilter {
             Err(_) => return Ok(FilterAction::Continue),
         };
         let streaming = request.stream == Some(true);
-        if streaming && !self.terminal_streaming {
-            return Ok(FilterAction::Reject(anthropic_rejection(
-                400,
-                "invalid_request_error",
-                "streaming is not supported with anthropic_web_search",
-            )));
-        }
         if let Err(rejection) = self.preflight_managed_credential(ctx, &request) {
             return Ok(FilterAction::Reject(rejection));
         }
-        self.apply_streaming_transport(ctx, streaming);
+        Self::apply_streaming_transport(ctx, streaming);
 
         Ok(FilterAction::Continue)
     }
@@ -764,13 +863,13 @@ impl HttpFilter for AnthropicWebSearchFilter {
         // Messages SSE lifecycle so the body phase — which no longer sees the
         // status or encoding — declines an untransformable round instead of
         // parsing non-SSE bytes as events. The marker is re-evaluated every
-        // round, so a success round clears any marker left by a prior one.
-        if self.terminal_streaming {
-            if !is_success_response(ctx) || response_is_encoded(ctx) {
-                ctx.extensions.insert(UntransformableRound);
-            } else {
-                ctx.extensions.remove::<UntransformableRound>();
-            }
+        // round, so a success round clears any marker left by a prior one. Only
+        // the streaming body phase reads this marker; a buffered round reads the
+        // response status directly and ignores it.
+        if !is_success_response(ctx) || response_is_encoded(ctx) {
+            ctx.extensions.insert(UntransformableRound);
+        } else {
+            ctx.extensions.remove::<UntransformableRound>();
         }
         Ok(FilterAction::Continue)
     }
@@ -781,43 +880,13 @@ impl HttpFilter for AnthropicWebSearchFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        // A streamed round (effective `stream: true` under `terminal_streaming`)
-        // is transformed incrementally; a buffered round keeps the accumulate-
-        // then-classify path below.
-        if self.terminal_streaming && ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
+        // A streamed round (effective `stream: true`) is transformed
+        // incrementally; a buffered round keeps the accumulate-then-classify path.
+        // The transport was selected per request in `on_request_body`.
+        if ctx.subrequest_response_mode() == SubRequestResponseMode::Streaming {
             return self.on_streaming_response_body(ctx, body, end_of_stream);
         }
-
-        if !end_of_stream {
-            return Ok(FilterAction::Continue);
-        }
-
-        if !is_success_response(ctx) {
-            set_action(ctx, ACTION_DONE)?;
-            return Ok(FilterAction::Continue);
-        }
-
-        let decision = body.as_deref().map_or(ResponseDecision::Done, classify_response);
-
-        match decision {
-            ResponseDecision::Done => set_action(ctx, ACTION_DONE)?,
-            ResponseDecision::Managed(_) => set_action(ctx, ACTION_LOOP)?,
-            ResponseDecision::InvalidManagedCall => {
-                return Ok(FilterAction::Reject(anthropic_rejection(
-                    400,
-                    "invalid_request_error",
-                    "WebSearch tool use requires a non-empty id and input.query",
-                )));
-            },
-            ResponseDecision::QueryTooLong => {
-                return Ok(FilterAction::Reject(anthropic_rejection(
-                    400,
-                    "invalid_request_error",
-                    "WebSearch input.query must not exceed 8192 bytes",
-                )));
-            },
-        }
-        Ok(FilterAction::Continue)
+        self.on_buffered_response_body(ctx, body, end_of_stream)
     }
 }
 
