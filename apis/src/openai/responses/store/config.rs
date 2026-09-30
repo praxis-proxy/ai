@@ -16,6 +16,24 @@ use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifier
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_response_store";
 
+/// Default cap on the number of SSE events retained in a streamed response's
+/// replay log.
+pub(crate) const DEFAULT_MAX_EVENT_COUNT: u32 = 10_000;
+
+/// Default cap (16 MiB) on the total payload bytes retained in a streamed
+/// response's replay log.
+pub(crate) const DEFAULT_MAX_EVENT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Serde default for [`ResponseStoreConfig::max_event_count`].
+const fn default_max_event_count() -> u32 {
+    DEFAULT_MAX_EVENT_COUNT
+}
+
+/// Serde default for [`ResponseStoreConfig::max_event_bytes`].
+const fn default_max_event_bytes() -> u64 {
+    DEFAULT_MAX_EVENT_BYTES
+}
+
 // -----------------------------------------------------------------------------
 // StorageBackend
 // -----------------------------------------------------------------------------
@@ -132,6 +150,21 @@ pub(crate) struct ResponseStoreConfig {
     /// uncompressed records readable.
     #[serde(default)]
     pub compression: Option<StoreCompressionConfig>,
+
+    /// Maximum number of SSE events retained in a streamed response's replay
+    /// log (`GET /v1/responses/{id}?stream=true`).
+    ///
+    /// A stream that exceeds this stops event capture for that response, so its
+    /// terminal event is never recorded and the response becomes non-replayable.
+    /// The live client stream and the plain JSON record are unaffected.
+    #[serde(default = "default_max_event_count")]
+    pub max_event_count: u32,
+
+    /// Maximum total payload bytes retained in a streamed response's replay log.
+    ///
+    /// Same over-budget behavior as [`max_event_count`](Self::max_event_count).
+    #[serde(default = "default_max_event_bytes")]
+    pub max_event_bytes: u64,
 }
 
 #[cfg(feature = "store-postgres")]
@@ -172,6 +205,7 @@ pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterErr
     if let Some(compression) = &cfg.compression {
         compression.validate().map_err(|e| format!("{FILTER_NAME}: {e}"))?;
     }
+    validate_event_log_bounds(cfg)?;
     match cfg.backend {
         StorageBackend::Sqlite => {
             validate_sqlite_database_url(database_url)?;
@@ -181,6 +215,17 @@ pub(crate) fn validate_config(cfg: &ResponseStoreConfig) -> Result<(), FilterErr
             #[cfg(feature = "store-postgres")]
             validate_postgres_config(cfg, database_url)?;
         },
+    }
+    Ok(())
+}
+
+/// Reject non-positive replay event-log bounds.
+fn validate_event_log_bounds(cfg: &ResponseStoreConfig) -> Result<(), FilterError> {
+    if cfg.max_event_count == 0 {
+        return Err(format!("{FILTER_NAME}: 'max_event_count' must be greater than zero").into());
+    }
+    if cfg.max_event_bytes == 0 {
+        return Err(format!("{FILTER_NAME}: 'max_event_bytes' must be greater than zero").into());
     }
     Ok(())
 }

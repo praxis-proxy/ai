@@ -29,8 +29,9 @@ use crate::{
     },
     operation::{ApplicationProtocol, Transport},
     store::{
-        ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord,
-        PersistedStateBackend, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+        ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        PersistedStateBackend, ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+        SqliteResponseStore, StoreError,
     },
     test_utils::{make_owned_filter_context as base_owned_filter_context, make_request, make_response},
 };
@@ -4332,7 +4333,7 @@ async fn generated_responses_table_gates_conversations_on_schema_version() {
     let pool = sqlx::SqlitePool::connect_with(options)
         .await
         .expect("pool should connect");
-    sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {version_table} SET version = 4")))
+    sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {version_table} SET version = 5")))
         .execute(&pool)
         .await
         .expect("version bump should succeed");
@@ -4717,6 +4718,33 @@ impl ResponseStore for FailingItemStore {
     ) -> Result<Option<usize>, StoreError> {
         unreachable!("FailingItemStore is a conversations-only test double")
     }
+
+    async fn append_events(
+        &self,
+        _owner: &crate::StateOwner,
+        _response_id: &str,
+        _events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        unreachable!("FailingItemStore is a conversations-only test double")
+    }
+
+    async fn list_events_after(
+        &self,
+        _owner: &crate::StateOwner,
+        _response_id: &str,
+        _after: Option<u64>,
+        _limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        unreachable!("FailingItemStore is a conversations-only test double")
+    }
+
+    async fn event_log_status(
+        &self,
+        _owner: &crate::StateOwner,
+        _response_id: &str,
+    ) -> Result<EventLogStatus, StoreError> {
+        unreachable!("FailingItemStore is a conversations-only test double")
+    }
 }
 
 /// A [`ConversationItemStore`] that reproduces the #1144 metadata-update race.
@@ -4958,6 +4986,33 @@ impl ResponseStore for AppendDuringUpdateStore {
         self.inner
             .consume_approvals(owner, response_id, approval_ids, consumed_at)
             .await
+    }
+
+    async fn append_events(
+        &self,
+        owner: &crate::StateOwner,
+        response_id: &str,
+        events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        self.inner.append_events(owner, response_id, events).await
+    }
+
+    async fn list_events_after(
+        &self,
+        owner: &crate::StateOwner,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        self.inner.list_events_after(owner, response_id, after, limit).await
+    }
+
+    async fn event_log_status(
+        &self,
+        owner: &crate::StateOwner,
+        response_id: &str,
+    ) -> Result<EventLogStatus, StoreError> {
+        self.inner.event_log_status(owner, response_id).await
     }
 }
 

@@ -19,7 +19,10 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use crate::{
     owner::StateOwner,
     traits::{PersistedStateBackend, ResponseStore},
-    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
+    types::{
+        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
+        ResponseRecord, StoreError,
+    },
 };
 
 /// Thread-safe registry of named persisted-state backends.
@@ -150,6 +153,46 @@ impl OwnerScopedStore {
         self.store
             .consume_approvals(&self.owner, response_id, approval_ids, consumed_at)
             .await
+    }
+
+    /// Append normalized SSE events to a response's durable log, scoped to this
+    /// owner. Each record must carry this handle's owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-input error for an owner mismatch or the backend
+    /// error from persistence.
+    pub async fn append_events(&self, response_id: &str, events: &[ResponseEventRecord]) -> Result<(), StoreError> {
+        for event in events {
+            self.require_matching_owner(&event.owner)?;
+        }
+        self.store.append_events(&self.owner, response_id, events).await
+    }
+
+    /// List a response's event-log rows with `sequence_number > after`, scoped to
+    /// this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn list_events_after(
+        &self,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        self.store
+            .list_events_after(&self.owner, response_id, after, limit)
+            .await
+    }
+
+    /// Summarize a response's event log for the replay gate, scoped to this owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store error when the backend query fails.
+    pub async fn event_log_status(&self, response_id: &str) -> Result<EventLogStatus, StoreError> {
+        self.store.event_log_status(&self.owner, response_id).await
     }
 
     /// Persist a conversation only when its immutable owner matches this handle.

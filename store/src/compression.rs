@@ -111,6 +111,32 @@ impl StoreCompressionConfig {
         .await
     }
 
+    /// Encode a batch of standalone JSON values into their stored binary form.
+    ///
+    /// Used by the durable event log, where each row stores one normalized SSE
+    /// event payload. Mirrors [`encode`](Self::encode): raw JSON bytes with
+    /// `algorithm: none`, a raw zstd frame with `algorithm: zstd`, and reads back
+    /// through [`decode`]. The whole batch shares one blocking hop so appending
+    /// many small events does not spawn a worker per event.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Serialization`] if a value cannot be serialized,
+    /// exceeds the size limit, or zstd compression fails.
+    pub async fn encode_values(&self, values: &[&serde_json::Value]) -> Result<Vec<Vec<u8>>, StoreError> {
+        let fields: Vec<Vec<u8>> = values
+            .iter()
+            .map(|value| serde_json::to_vec(value).map_err(|e| StoreError::Serialization(e.to_string())))
+            .collect::<Result<_, _>>()?;
+
+        if self.algorithm == CompressionAlgorithm::None {
+            return Ok(fields);
+        }
+
+        let config = self.clone();
+        run_blocking(move || fields.into_iter().map(|json| config.encode_json(json)).collect()).await
+    }
+
     /// Apply the configured codec to an owned JSON buffer.
     fn encode_json(&self, json: Vec<u8>) -> Result<Vec<u8>, StoreError> {
         match self.algorithm {

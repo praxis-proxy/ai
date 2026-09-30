@@ -142,6 +142,68 @@ pub struct PendingApprovalRecord {
 }
 
 // -----------------------------------------------------------------------------
+// ResponseEventRecord
+// -----------------------------------------------------------------------------
+
+/// A single normalized SSE event captured from a stored streaming response.
+///
+/// The durable event log lets a completed, `stream: true` response be replayed
+/// verbatim through `GET /v1/responses/{id}?stream=true`. Each record is one
+/// outbound SSE event, stamped with the client-visible `sequence_number` from
+/// `openai_stream_events`, persisted as it leaves the sequencer and before the
+/// client sees it. The `(response_id, sequence_number)` pair is the primary key;
+/// the owner triple gates every access to the parent response, exactly like
+/// [`PendingApprovalRecord`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponseEventRecord {
+    /// Parent response ID (e.g., `"resp_abc123"`).
+    pub response_id: String,
+
+    /// Immutable owner inherited from the parent response.
+    pub owner: StateOwner,
+
+    /// Client-visible logical stream sequence number (monotonic, contiguous).
+    pub sequence_number: u64,
+
+    /// Wire event name (e.g., `"response.output_text.delta"`), equal to the
+    /// payload's `type`.
+    pub event_type: String,
+
+    /// The fully-normalized event JSON, exactly as delivered to the client.
+    pub payload: serde_json::Value,
+
+    /// True iff this is a terminal event (`completed`/`incomplete`/`failed`/
+    /// `error`). A replayable log always ends with exactly one terminal event.
+    pub terminal: bool,
+
+    /// Unix timestamp when the event was persisted.
+    pub created_at: i64,
+}
+
+// -----------------------------------------------------------------------------
+// EventLogStatus
+// -----------------------------------------------------------------------------
+
+/// Cheap pre-stream gate describing a response's event log.
+///
+/// Distinguishes "no log" (`exists == false` — legacy or non-streamed record)
+/// from "incomplete log" (`exists == true`, `has_terminal == false` — a stream
+/// that aborted before its terminal event) from "replayable"
+/// (`has_terminal == true`). Only a replayable log may be served as a complete
+/// SSE replay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EventLogStatus {
+    /// Whether any event rows exist for the response.
+    pub exists: bool,
+
+    /// Whether a terminal event row exists (the log reached a clean end).
+    pub has_terminal: bool,
+
+    /// Highest stored `sequence_number`, if any rows exist.
+    pub max_sequence: Option<u64>,
+}
+
+// -----------------------------------------------------------------------------
 // StoreError
 // -----------------------------------------------------------------------------
 

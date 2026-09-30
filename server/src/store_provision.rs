@@ -260,7 +260,13 @@ fn preserve_active_store_configs(
 fn response_store_ref(filter_config: &serde_yaml::Value) -> Option<StoreRef> {
     let backend = filter_config.get("backend").and_then(serde_yaml::Value::as_str)?;
     let mut config = serde_json::to_value(filter_config).ok()?;
-    config.as_object_mut()?.remove("backend");
+    let object = config.as_object_mut()?;
+    object.remove("backend");
+    // The replay event-log bounds are consumed by the response-store filter, not
+    // the backend factory, whose config rejects unknown fields. Drop them for
+    // every backend before dispatching so they never reach the factory parse.
+    object.remove("max_event_count");
+    object.remove("max_event_bytes");
     normalize_sqlite_factory_config(backend, &mut config);
     Some(StoreRef {
         name: Arc::from(DEFAULT_STORE_NAME),
@@ -360,6 +366,8 @@ enum SqlObjectKind {
     PendingApprovalsTable,
     /// Schema-version table associated with a response table.
     SchemaVersionTable,
+    /// Durable SSE event-log table associated with a response table.
+    EventsTable,
     /// Conversation metadata table.
     ConversationsTable,
     /// Tenant lookup index associated with a conversations table.
@@ -407,6 +415,11 @@ fn sql_objects(config: &serde_json::Value) -> Option<Vec<SqlObject>> {
             kind: SqlObjectKind::SchemaVersionTable,
             owner: "responses schema-version table",
             name: format!("{responses_table}_schema_version"),
+        },
+        SqlObject {
+            kind: SqlObjectKind::EventsTable,
+            owner: "responses event-log table",
+            name: format!("{responses_table}_events"),
         },
         SqlObject {
             kind: SqlObjectKind::ConversationsTable,
@@ -1455,6 +1468,52 @@ filter_chains:
         .expect("single store config")
     }
 
+    #[cfg(feature = "store-sqlite")]
+    fn sqlite_store_config_with_event_bounds() -> Config {
+        Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_response_store
+        backend: sqlite
+        database_url: "sqlite::memory:"
+        responses_table: responses
+        conversations_table: conversations
+        max_event_count: 5000
+        max_event_bytes: 8388608
+"#,
+        )
+        .expect("sqlite store config with explicit replay bounds")
+    }
+
+    #[cfg(feature = "store-postgres")]
+    fn postgres_store_config_with_event_bounds() -> Config {
+        Config::from_yaml(
+            r#"
+listeners:
+  - name: web
+    address: "127.0.0.1:8080"
+    filter_chains: [main]
+filter_chains:
+  - name: main
+    filters:
+      - filter: openai_response_store
+        backend: postgres
+        database_url: "postgresql://user:password@8.8.8.8/store"
+        responses_table: responses
+        conversations_table: conversations
+        max_event_count: 5000
+        max_event_bytes: 8388608
+"#,
+        )
+        .expect("postgres store config with explicit replay bounds")
+    }
+
     #[cfg(feature = "openai-conversations")]
     fn responses_and_conversations_config_for(backend: &str, database_url: &str) -> Config {
         Config::from_yaml(&format!(
@@ -1620,6 +1679,45 @@ filter_chains:
         assert_eq!(registries.len(), 1);
         assert_eq!(provisioner.plans.len(), 1);
         assert_eq!(provisioner.plans.first().expect("listener plan").refs.len(), 1);
+    }
+
+    #[cfg(feature = "store-sqlite")]
+    #[test]
+    fn explicit_replay_event_bounds_do_not_block_sqlite_provisioning() {
+        // The replay-log bounds are filter-only knobs; the SQLite factory config
+        // rejects unknown fields. Provisioning must strip them so an operator that
+        // sets them explicitly in YAML still boots, and the backend never sees them.
+        let config = sqlite_store_config_with_event_bounds();
+        let (_registries, provisioner, _reload, _readiness) =
+            build_store_wiring(&config).expect("explicit replay bounds must not reach the SQLite factory");
+        let store_ref = provisioner
+            .plans
+            .first()
+            .and_then(|plan| plan.refs.first())
+            .expect("one provisioned response store");
+        assert!(
+            store_ref.config.get("max_event_count").is_none(),
+            "filter-only max_event_count must be stripped before dispatch to the backend factory"
+        );
+        assert!(
+            store_ref.config.get("max_event_bytes").is_none(),
+            "filter-only max_event_bytes must be stripped before dispatch to the backend factory"
+        );
+    }
+
+    #[cfg(feature = "store-postgres")]
+    #[test]
+    fn explicit_replay_event_bounds_do_not_block_postgres_provisioning() {
+        // Same filter-only strip must apply to the Postgres factory, whose config
+        // also rejects unknown fields; `response_store_ref` drops the bounds for
+        // every backend before dispatch.
+        let config = postgres_store_config_with_event_bounds();
+        let result = build_store_wiring(&config);
+        assert!(
+            result.is_ok(),
+            "explicit replay bounds must be stripped for the Postgres factory too: {:?}",
+            result.err()
+        );
     }
 
     #[cfg(feature = "openai-conversations")]
@@ -1870,6 +1968,40 @@ filter_chains:
         let config = responses_and_conversations_config_for("sqlite", "sqlite::memory:");
 
         assert_sql_namespace_collisions_are_rejected(config);
+    }
+
+    #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]
+    #[test]
+    fn event_log_table_participates_in_namespace_collision_checks() {
+        // The response store derives an event-log table `<responses>_events`. A
+        // conversations items_table that reuses that derived name must be caught
+        // by the pre-provisioning collision check, not left to fail later when
+        // the second CREATE TABLE runs against an incompatible existing table.
+        let mut config = responses_and_conversations_config_for("sqlite", "sqlite::memory:");
+        let conversations = config
+            .filter_chains
+            .get_mut(1)
+            .and_then(|chain| chain.filters.first_mut())
+            .expect("Conversations filter");
+        let items_table = conversations
+            .config
+            .as_mapping_mut()
+            .and_then(|mapping| mapping.get_mut(serde_yaml::Value::String("items_table".to_owned())))
+            .expect("items table config");
+        *items_table = serde_yaml::Value::String("responses_events".to_owned());
+
+        let error = build_store_wiring(&config)
+            .err()
+            .expect("event-log table collision must fail startup");
+        let message = error.to_string();
+        assert!(
+            message.contains("same SQL namespace"),
+            "actionable namespace error: {message}"
+        );
+        assert!(
+            message.contains("responses event-log table"),
+            "event-log owner in collision: {message}"
+        );
     }
 
     #[cfg(all(feature = "openai-conversations", feature = "store-sqlite"))]

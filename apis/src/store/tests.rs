@@ -2854,7 +2854,7 @@ async fn sqlite_stamps_schema_version_on_fresh_db() {
         .fetch_one(&pool)
         .await
         .expect("version row should exist");
-    assert_eq!(version, 4, "fresh store should stamp version 4");
+    assert_eq!(version, 5, "fresh store should stamp version 5");
 }
 
 #[tokio::test]
@@ -2957,15 +2957,17 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
     );
 
     // Apply the documented operator migrations: CAST the responses payload
-    // columns to BLOB storage class and stamp the current schema version. This
-    // fixture has no items table, so v3 -> v4 requires only the version stamp.
+    // columns to BLOB storage class and stamp the current schema version. Later
+    // schema versions only add tables (e.g. the v5 replay event log), which the
+    // idempotent startup DDL creates, so migrating this fixture requires only the
+    // version stamp.
     let pool = sqlx::SqlitePool::connect_with(options)
         .await
         .expect("pool should connect");
     for stmt in [
         "UPDATE mr SET response_object = CAST(response_object AS BLOB), \
          input = CAST(input AS BLOB), messages = CAST(messages AS BLOB)",
-        "UPDATE mr_schema_version SET version = 4",
+        "UPDATE mr_schema_version SET version = 5",
     ] {
         sqlx::query(stmt)
             .execute(&pool)
@@ -2977,7 +2979,7 @@ async fn sqlite_v2_text_schema_migrates_to_v3_bytea_preserving_rows() {
     // After migration the store starts and the legacy row reads back intact.
     let store = SqliteResponseStore::new(&url, "mr", "mc", None, None, None)
         .await
-        .expect("store should start on a migrated version-4 database");
+        .expect("store should start on a migrated version-5 database");
 
     let owner = crate::test_utils::test_owner("tenant_a");
     let fetched = store
@@ -3721,14 +3723,14 @@ async fn pg_v2_text_schema_migrates_to_v4_bytea_preserving_rows() {
              ALTER COLUMN messages TYPE BYTEA USING convert_to(messages, 'UTF8')",
             fx.responses
         ),
-        format!("UPDATE {} SET version = 4", fx.version),
+        format!("UPDATE {} SET version = 5", fx.version),
     ];
-    let migrated_v4: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
+    let migrated_v5: Vec<String> = legacy_v2.into_iter().chain(migrate).collect();
 
-    let result = fx.init(&migrated_v4, &[]).await;
+    let result = fx.init(&migrated_v5, &[]).await;
     assert!(
         result.is_ok(),
-        "store should start on a migrated version-4 database: {:?}",
+        "store should start on a migrated version-5 database: {:?}",
         result.err()
     );
 }
@@ -4035,6 +4037,15 @@ async fn pg_response_id_collision_cannot_transfer_ownership() {
 #[ignore]
 async fn postgres_passes_shared_ownership_contract() {
     ownership_contract(&make_pg_store_with_items().await).await;
+}
+
+/// The `PostgreSQL` backend satisfies the shared persisted-state contract suite,
+/// including the replay event-log contract. Mirrors
+/// [`sqlite_backend_satisfies_the_store_contract`] for the live PG backend.
+#[tokio::test]
+#[ignore]
+async fn postgres_backend_satisfies_the_store_contract() {
+    praxis_ai_store::contract_tests::run_contract_suite(&make_pg_store_with_items().await).await;
 }
 
 #[tokio::test]
