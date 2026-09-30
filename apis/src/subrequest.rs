@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(redact_path_query("/path?flag"), "/path?flag");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[expect(clippy::too_many_lines, reason = "inline tracing capture layer and assertions")]
     async fn dispatch_log_event_redacts_query_values() {
         use std::sync::{Arc, Mutex};

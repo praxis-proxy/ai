@@ -2519,7 +2519,6 @@ fn bind_exact_string(value: &mut Value, expected: &str, replacement: &str) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     //! Behavioral tests for the versioned inference fixture schema.

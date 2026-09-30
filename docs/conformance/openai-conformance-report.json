@@ -2,7 +2,8 @@
   "schema_version": 3,
   "scope": {
     "areas": [
-      "Conversations"
+      "Conversations",
+      "Responses"
     ],
     "include_deprecated": false,
     "include_beta": false
@@ -24,16 +25,23 @@
       "projection_sha256": "b5b8af413e9cc84597d300f41789b6fb988f328baa531a61df8877fe321dc856",
       "operations": 8,
       "inherited_security": "deployment"
+    },
+    {
+      "area_id": "responses",
+      "area": "Responses",
+      "projection_sha256": "1ab6e85792f77615d31f4d386f17a001dcad92ba49ed488a2ba9912028491797",
+      "operations": 14,
+      "inherited_security": "deployment"
     }
   ],
   "capability_coverage": {
-    "total_operations": 8,
-    "covered_operations_count": 8,
+    "total_operations": 15,
+    "covered_operations_count": 15,
     "missing_operations_count": 0,
     "coverage_percent": 100.0,
     "ignored": {
       "deprecated": 0,
-      "beta": 0
+      "beta": 7
     },
     "by_area": [
       {
@@ -42,12 +50,19 @@
         "covered": 8,
         "missing": 0,
         "coverage_percent": 100.0
+      },
+      {
+        "area": "Responses",
+        "total": 7,
+        "covered": 7,
+        "missing": 0,
+        "coverage_percent": 100.0
       }
     ],
     "by_mode": [
       {
         "mode": "passthrough",
-        "operations": 0
+        "operations": 6
       },
       {
         "mode": "inspect",
@@ -55,7 +70,7 @@
       },
       {
         "mode": "transform",
-        "operations": 0
+        "operations": 1
       },
       {
         "mode": "local",
@@ -221,6 +236,146 @@
           "area": "Conversations",
           "mode": "local",
           "evidence": "praxis_ai_apis::openai::conversations_operation_specs::CreateConversationItems"
+        }
+      },
+      {
+        "operation": {
+          "method": "DELETE",
+          "path": "/responses/{response_id}",
+          "operation": "DELETE /responses/{response_id}",
+          "area": "Responses",
+          "tag": "Responses",
+          "operation_id": "deleteResponse",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "DELETE",
+          "path": "/responses/{response_id}",
+          "operation": "DELETE /responses/{response_id}",
+          "area": "Responses",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::responses_operation_specs::DeleteResponse"
+        }
+      },
+      {
+        "operation": {
+          "method": "GET",
+          "path": "/responses/{response_id}",
+          "operation": "GET /responses/{response_id}",
+          "area": "Responses",
+          "tag": "Responses",
+          "operation_id": "getResponse",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "GET",
+          "path": "/responses/{response_id}",
+          "operation": "GET /responses/{response_id}",
+          "area": "Responses",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::responses_operation_specs::GetResponse"
+        }
+      },
+      {
+        "operation": {
+          "method": "GET",
+          "path": "/responses/{response_id}/input_items",
+          "operation": "GET /responses/{response_id}/input_items",
+          "area": "Responses",
+          "tag": "Responses",
+          "operation_id": "listInputItems",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "GET",
+          "path": "/responses/{response_id}/input_items",
+          "operation": "GET /responses/{response_id}/input_items",
+          "area": "Responses",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::responses_operation_specs::ListInputItems"
+        }
+      },
+      {
+        "operation": {
+          "method": "POST",
+          "path": "/responses",
+          "operation": "POST /responses",
+          "area": "Responses",
+          "tag": "Responses",
+          "operation_id": "createResponse",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "POST",
+          "path": "/responses",
+          "operation": "POST /responses",
+          "area": "Responses",
+          "mode": "transform",
+          "evidence": "praxis_ai_apis::openai::responses_operation_specs::CreateResponse"
+        }
+      },
+      {
+        "operation": {
+          "method": "POST",
+          "path": "/responses/compact",
+          "operation": "POST /responses/compact",
+          "area": "Responses",
+          "tag": "untagged",
+          "operation_id": "Compactconversation",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "POST",
+          "path": "/responses/compact",
+          "operation": "POST /responses/compact",
+          "area": "Responses",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::responses_operation_specs::CompactConversation"
+        }
+      },
+      {
+        "operation": {
+          "method": "POST",
+          "path": "/responses/input_tokens",
+          "operation": "POST /responses/input_tokens",
+          "area": "Responses",
+          "tag": "untagged",
+          "operation_id": "Getinputtokencounts",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "POST",
+          "path": "/responses/input_tokens",
+          "operation": "POST /responses/input_tokens",
+          "area": "Responses",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::responses_operation_specs::CountInputTokens"
+        }
+      },
+      {
+        "operation": {
+          "method": "POST",
+          "path": "/responses/{response_id}/cancel",
+          "operation": "POST /responses/{response_id}/cancel",
+          "area": "Responses",
+          "tag": "Responses",
+          "operation_id": "cancelResponse",
+          "deprecated": false,
+          "beta": false
+        },
+        "support": {
+          "method": "POST",
+          "path": "/responses/{response_id}/cancel",
+          "operation": "POST /responses/{response_id}/cancel",
+          "area": "Responses",
+          "mode": "passthrough",
+          "evidence": "praxis_ai_apis::openai::responses_operation_specs::CancelResponse"
         }
       }
     ],
@@ -479,11 +634,123 @@
           }
         ],
         "all_exact": true
+      },
+      {
+        "area_id": "responses",
+        "area": "Responses",
+        "implementation_source": "generated:praxis-ai-apis/openai/responses",
+        "operation_contracts": {
+          "total": 1,
+          "exact": 1,
+          "missing": 0,
+          "drifted": 0,
+          "request_drifted": 0,
+          "response_drifted": 0,
+          "other_drifted": 0,
+          "exact_percent": 100.0,
+          "missing_operations": [],
+          "drifted_operations": []
+        },
+        "inherited_contract": {
+          "exact": true,
+          "details": []
+        },
+        "upstream_spec_exceptions": [
+          {
+            "kind": "request",
+            "operation": {
+              "method": "POST",
+              "path": "/responses",
+              "operation": "POST /responses"
+            },
+            "detail": "requestBody.content.application/json.schema.allOf.deleted",
+            "rationale": "Praxis defines CreateResponseRequest directly rather than inheriting allOf branches",
+            "evidence": "praxis-ai-apis/openai/responses/contracts.rs: CreateResponseRequest schema"
+          },
+          {
+            "kind": "request",
+            "operation": {
+              "method": "POST",
+              "path": "/responses",
+              "operation": "POST /responses"
+            },
+            "detail": "requestBody.content.application/json.schema.properties.added",
+            "rationale": "Praxis defines CreateResponseRequest properties directly rather than inheriting allOf branches",
+            "evidence": "praxis-ai-apis/openai/responses/contracts.rs: CreateResponseRequest properties"
+          },
+          {
+            "kind": "request",
+            "operation": {
+              "method": "POST",
+              "path": "/responses",
+              "operation": "POST /responses"
+            },
+            "detail": "requestBody.content.application/json.schema.type.added",
+            "rationale": "Praxis explicitly marks CreateResponseRequest as object type",
+            "evidence": "praxis-ai-apis/openai/responses/contracts.rs: CreateResponseRequest type"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/responses",
+              "operation": "POST /responses"
+            },
+            "detail": "responses.200.content.application/json.schema.allOf.deleted",
+            "rationale": "Praxis defines ResponseResource directly rather than inheriting allOf branches",
+            "evidence": "praxis-ai-apis/openai/responses/contracts.rs: ResponseResource schema"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/responses",
+              "operation": "POST /responses"
+            },
+            "detail": "responses.200.content.application/json.schema.properties.added",
+            "rationale": "Praxis defines ResponseResource properties directly rather than inheriting allOf branches",
+            "evidence": "praxis-ai-apis/openai/responses/contracts.rs: ResponseResource properties"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/responses",
+              "operation": "POST /responses"
+            },
+            "detail": "responses.200.content.application/json.schema.required.added",
+            "rationale": "Praxis explicitly marks required properties on ResponseResource",
+            "evidence": "praxis-ai-apis/openai/responses/contracts.rs: ResponseResource required fields"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/responses",
+              "operation": "POST /responses"
+            },
+            "detail": "responses.200.content.application/json.schema.type.added",
+            "rationale": "Praxis explicitly marks ResponseResource as object type",
+            "evidence": "praxis-ai-apis/openai/responses/contracts.rs: ResponseResource type"
+          },
+          {
+            "kind": "response",
+            "operation": {
+              "method": "POST",
+              "path": "/responses",
+              "operation": "POST /responses"
+            },
+            "detail": "responses.200.content.deleted",
+            "rationale": "Praxis registers application/json for transformed responses and omits text/event-stream from the OpenAPI 200 response schema",
+            "evidence": "praxis-ai-apis/openai/responses/routes/mod.rs: CreateResponse response spec"
+          }
+        ],
+        "all_exact": true
       }
     ],
     "operation_contracts": {
-      "total": 8,
-      "exact": 8,
+      "total": 9,
+      "exact": 9,
       "missing": 0,
       "drifted": 0,
       "request_drifted": 0,
@@ -501,12 +768,28 @@
           "response_drifted": 0,
           "other_drifted": 0,
           "conformance_percent": 100.0
+        },
+        {
+          "area": "Responses",
+          "total": 1,
+          "conformant": 1,
+          "missing": 0,
+          "drifted": 0,
+          "request_drifted": 0,
+          "response_drifted": 0,
+          "other_drifted": 0,
+          "conformance_percent": 100.0
         }
       ]
     },
     "area_contracts": [
       {
         "area": "Conversations",
+        "exact": true,
+        "details": []
+      },
+      {
+        "area": "Responses",
         "exact": true,
         "details": []
       }
@@ -551,6 +834,33 @@
           {
             "kind": "request_item_contract",
             "evidence": "openai::conversations::tests::conformance_conversations_item_requests_reject_unknown_and_malformed_contracts"
+          }
+        ]
+      },
+      {
+        "area": "Responses",
+        "modes": [
+          "passthrough",
+          "transform"
+        ],
+        "status": "passed",
+        "command": "cargo test -p praxis-ai-apis --no-default-features --features openai-responses,store-all --lib conformance_responses_ -- --show-output",
+        "checks": [
+          {
+            "kind": "route_dispatch",
+            "evidence": "openai::responses::tests::conformance_responses_routes_match_runtime_registry"
+          },
+          {
+            "kind": "success_response_contract",
+            "evidence": "openai::responses::tests::conformance_responses_success_payloads_match_generated_response_schemas"
+          },
+          {
+            "kind": "sse_lifecycle_contract",
+            "evidence": "openai::responses::tests::conformance_responses_sse_lifecycle_events_match_schemas"
+          },
+          {
+            "kind": "schema_check_sensitivity",
+            "evidence": "openai::responses::tests::conformance_responses_generated_schema_check_rejects_incomplete_payloads"
           }
         ]
       }

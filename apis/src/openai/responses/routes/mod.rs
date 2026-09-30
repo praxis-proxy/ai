@@ -7,13 +7,23 @@
 //! headers — rather than from body heuristics, so a request is recognized before
 //! any payload is read.
 //!
-//! Praxis proxies the Responses contract rather than owning it, so these
-//! operations declare their runtime request-body shape without an
-//! `OwnedOperationContract`. Operation IDs are the official ones from the pinned
-//! OpenAI specification, reproduced verbatim including upstream's casing.
+//! Operation IDs are the official ones from the pinned OpenAI specification,
+//! reproduced verbatim including upstream's casing.
+//!
+//! Under the transformed profile (`responses_to_chat_completions`), Praxis owns
+//! the `POST /v1/responses` request and response contract, translating requests
+//! and resources for a Chat Completions backend. In native Responses passthrough
+//! deployments, the upstream provider owns the contract and continuations while
+//! Praxis proxies requests directly. `CreateResponse` declares
+//! [`HandlingMode::Transform`] to reflect contract ownership under the transformed
+//! profile.
 
 use std::ops::Deref;
 
+#[cfg(feature = "openai-responses-openapi")]
+use super::contracts::{CreateResponseRequest, ResponseResource};
+#[cfg(feature = "openai-responses-openapi")]
+use crate::openai::operation::{MediaTypeSpec, OwnedOperationContract, RequestBodySpec, ResponseSpec, schema_binding};
 use crate::{
     openai::operation::OpenAiOperationSpec,
     operation::{
@@ -21,6 +31,10 @@ use crate::{
         Transport, match_operation,
     },
 };
+
+/// JSON media type used by all Responses bodies.
+#[cfg(feature = "openai-responses-openapi")]
+const JSON_CONTENT_TYPE: &str = "application/json";
 
 /// Application protocol these operations belong to.
 ///
@@ -51,6 +65,62 @@ impl OperationEntry for ResponsesOperationSpec {
     }
 }
 
+/// Convert a registry request declaration into an optional schema binding.
+#[cfg(feature = "openai-responses-openapi")]
+#[expect(
+    unused_macro_rules,
+    reason = "all-shapes helper macro preserved for registry consistency"
+)]
+macro_rules! request_binding {
+    ([none]) => {
+        None
+    };
+    ([required $schema:ty]) => {
+        Some(RequestBodySpec {
+            required: true,
+            content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($schema))],
+        })
+    };
+    ([optional $schema:ty]) => {
+        Some(RequestBodySpec {
+            required: false,
+            content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($schema))],
+        })
+    };
+}
+
+/// Convert a registry contract declaration into optional owned metadata.
+#[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+macro_rules! operation_contract {
+    (none {}) => {
+        None
+    };
+    (
+        owned {
+            parameters: [$($parameter:expr),* $(,)?],
+            request: $request:tt,
+            response: $response:ty $(,)?
+        }
+    ) => {{
+        #[cfg(feature = "openai-responses-openapi")]
+        {
+            Some(OwnedOperationContract {
+                parameters: &[$($parameter),*],
+                request: request_binding!($request),
+                responses: &[ResponseSpec {
+                    status: "200",
+                    description: "OK",
+                    content: &[MediaTypeSpec::new(JSON_CONTENT_TYPE, schema_binding!($response))],
+                }],
+            })
+        }
+        #[cfg(not(feature = "openai-responses-openapi"))]
+        {
+            None
+        }
+    }};
+}
+
 /// Convert a registry body declaration into a runtime request-body shape.
 macro_rules! request_body_shape {
     ([none]) => {
@@ -74,7 +144,8 @@ macro_rules! responses_operations {
                 transport: $transport:ident,
                 path: $path:literal,
                 mode: $mode:ident,
-                body: $body:tt $(,)?
+                body: $body:tt,
+                contract: $contract_kind:ident $contract:tt $(,)?
             }
         ),+ $(,)?
     ) => {
@@ -103,8 +174,8 @@ macro_rules! responses_operations {
                             request_body: request_body_shape!($body),
                         },
                         spec_path: $path,
-                        #[cfg(feature = "openai-conversations")]
-                        owned_contract: None,
+                        #[cfg(any(feature = "openai-conversations", feature = "openai-responses-openapi"))]
+                        owned_contract: operation_contract!($contract_kind $contract),
                     },
                 },
             )+
@@ -118,8 +189,13 @@ responses_operations! {
         method: Post,
         transport: Http,
         path: "/responses",
-        mode: Inspect,
+        mode: Transform,
         body: [required json],
+        contract: owned {
+            parameters: [],
+            request: [required CreateResponseRequest],
+            response: ResponseResource,
+        },
     },
     CreateResponseWebSocket {
         operation_id: "praxis_createResponseWebSocket",
@@ -128,6 +204,7 @@ responses_operations! {
         path: "/responses",
         mode: Passthrough,
         body: [none],
+        contract: none {},
     },
     GetResponse {
         operation_id: "getResponse",
@@ -136,6 +213,7 @@ responses_operations! {
         path: "/responses/{response_id}",
         mode: Passthrough,
         body: [none],
+        contract: none {},
     },
     DeleteResponse {
         operation_id: "deleteResponse",
@@ -144,6 +222,7 @@ responses_operations! {
         path: "/responses/{response_id}",
         mode: Passthrough,
         body: [none],
+        contract: none {},
     },
     CancelResponse {
         operation_id: "cancelResponse",
@@ -152,6 +231,7 @@ responses_operations! {
         path: "/responses/{response_id}/cancel",
         mode: Passthrough,
         body: [none],
+        contract: none {},
     },
     ListInputItems {
         operation_id: "listInputItems",
@@ -160,6 +240,7 @@ responses_operations! {
         path: "/responses/{response_id}/input_items",
         mode: Passthrough,
         body: [none],
+        contract: none {},
     },
     CountInputTokens {
         operation_id: "Getinputtokencounts",
@@ -167,9 +248,8 @@ responses_operations! {
         transport: Http,
         path: "/responses/input_tokens",
         mode: Passthrough,
-        // The pinned specification omits `required` on this requestBody,
-        // which defaults to false under OpenAPI.
         body: [optional json],
+        contract: none {},
     },
     CompactConversation {
         operation_id: "Compactconversation",
@@ -177,9 +257,8 @@ responses_operations! {
         transport: Http,
         path: "/responses/compact",
         mode: Passthrough,
-        // The pinned specification omits `required` on this requestBody,
-        // which defaults to false under OpenAPI.
         body: [optional json],
+        contract: none {},
     },
 }
 
@@ -363,12 +442,19 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "openai-conversations")]
+    #[cfg(feature = "openai-responses-openapi")]
     #[test]
-    fn registry_declares_no_owned_contract() {
+    fn transformed_operations_declare_owned_contracts() {
         assert!(
-            OPERATION_SPECS.iter().all(|spec| spec.owned_contract().is_none()),
-            "Praxis proxies the Responses contract rather than owning it"
+            OPERATION_SPECS.iter().any(|spec| spec.owned_contract().is_some()),
+            "transformed Responses operations declare owned contracts"
+        );
+        assert!(
+            OPERATION_SPECS
+                .iter()
+                .filter(|spec| spec.mode() == HandlingMode::Passthrough)
+                .all(|spec| spec.owned_contract().is_none()),
+            "passthrough Responses operations declare no owned contract"
         );
     }
 }
