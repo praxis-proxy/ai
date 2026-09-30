@@ -28,7 +28,9 @@
 # defaults to in-process; set a filter-level `backend: {kind: valkey,
 # url: ..., namespace: ...}` (a sibling of `rules:`, not per-rule) to
 # share every rule's budget across every gateway instance/replica over
-# one shared connection.
+# one shared connection. The Valkey backend uses plain commands; two
+# admissions racing on one key may briefly overshoot the budget by
+# their estimates.
 #
 # Set `key:` to partition each matching rule's budget. Scalars
 # (`global`, `authenticated_subject`, `ip`, `model`), a header mapping
