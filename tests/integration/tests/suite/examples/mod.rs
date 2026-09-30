@@ -24,6 +24,8 @@ mod client_tool_compat_chat_completions;
 mod compact;
 mod credential_injection;
 mod external_metering;
+#[cfg(target_os = "linux")]
+mod file_descriptor_limits;
 mod file_search_callout;
 mod file_search_chat_completions;
 mod file_search_streaming;

@@ -26,6 +26,7 @@ origin.
 | `openai_responses_compact` | Configured `inference_url` | `allow_private_inference_url` | No-follow | Anonymous; no downstream or cluster headers |
 | `ai_guardrails` with NeMo | Configured `endpoint` | Global `allow_private_upstreams` | No-follow | Configured `outbound_chain`; no downstream headers by default |
 | `http_callout` | Configured `target.url` | `allow_private_addresses` | No-follow | Configured static headers plus allowed `forward_headers` |
+| `external_metering` balance check and usage report | Configured `metering_url` via `SubRequestClient` | `allow_private_endpoint` | No-follow | Anonymous; no downstream headers |
 | MCP client | Request-derived server URL or configured connector | `allow_loopback` for loopback only | No-follow | Sanitized request-provided MCP authorization/headers |
 | `azure_ad` token fetch | Configured authority plus tenant via `SubRequestClient` | `allow_private_authority` | No-follow | Client secret in the token POST body |
 | `gcp_adc` metadata fetch | Protocol-owned metadata endpoint via `SubRequestClient` | Intrinsic to metadata mode | No-follow | `Metadata-Flavor` protocol header; returned token is not forwarded back to metadata |
@@ -35,6 +36,10 @@ they resolve once per attempt, validate every address against `AddressPolicy`,
 do not follow redirects, and allow private access only through their narrow
 origin/loopback controls. GCP metadata intentionally allows its protocol-owned
 private destination via `AddressPolicy::AllowPrivate`.
+
+`external_metering` calls out twice per request, so it resolves its configured
+host through the upstream DNS cache rather than on every call. Every cached
+address is still validated against `AddressPolicy` before connecting.
 
 Upstream cluster connections are not direct callouts. They use the core Praxis
 endpoint and TLS policy instead of these filter-level controls.

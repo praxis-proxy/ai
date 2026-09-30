@@ -504,7 +504,8 @@ fn warn_insecure_key_permissions(_config: &Config) {}
 /// Keep the file descriptor sample current and publish it as the
 /// `praxis_process_open_fds` and `praxis_process_max_fds` gauges, on a
 /// dedicated thread so sampling never runs on a request worker. Nothing is
-/// spawned where descriptors are not tracked.
+/// spawned where descriptors are not tracked. Mirrors praxis 0.7.2's private
+/// `fd_sampler_loop`.
 fn spawn_fd_sampler() {
     if praxis_core::fd::usage().is_none() {
         return;

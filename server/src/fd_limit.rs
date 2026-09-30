@@ -10,9 +10,9 @@
 //! privileges, and a warning names the limit when it is too small for the
 //! configured concurrency.
 //!
-//! Mirrors praxis's `crates/server/src/fd_limit.rs`, which is private to the
-//! praxis server crate that this bootstrap does not use. Keep the two in step,
-//! and delete this copy once praxis exposes the module.
+//! Mirrors `crates/server/src/fd_limit.rs` as of praxis 0.7.2, which is
+//! private to the praxis server crate that this bootstrap does not use. Keep
+//! the two in step, and delete this copy once praxis exposes the module.
 
 use praxis_core::config::Config;
 use tracing::{info, warn};
