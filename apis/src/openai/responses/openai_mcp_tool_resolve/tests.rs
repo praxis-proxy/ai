@@ -2191,13 +2191,13 @@ fn mcp_tool_to_function_tool_prefers_input_schema_camel_case() {
 #[test]
 fn mcp_list_tools_item_emits_responses_input_schema() {
     let listing = mcp_list_tools_item(
-        "weather",
-        &[serde_json::json!({
+        "weather".to_owned(),
+        vec![mcp_listing_tool_for_responses(&serde_json::json!({
             "name": "get_weather",
             "description": "Get weather",
             "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}},
             "annotations": {"readOnlyHint": true}
-        })],
+        }))],
     );
 
     assert_eq!(listing["type"], "mcp_list_tools");

@@ -2040,7 +2040,7 @@ fn rewrite_mcp_tool_choice(
     if let Some(name) = choice_obj.get("name").and_then(serde_json::Value::as_str) {
         if tool_map.contains_key(&(label.to_owned(), name.to_owned())) {
             let function_name = encode_function_name(label, name);
-            return Ok(serde_json::json!({"type": "function", "name": function_name}));
+            return Ok(function_tool_reference(function_name));
         } else if resolved_labels.contains(label) {
             return Err(ResolveError::EmptyResolvedToolChoice(label.to_owned()));
         }
@@ -2049,7 +2049,11 @@ fn rewrite_mcp_tool_choice(
 
     let function_refs = collect_function_refs_for_label(label, tool_map);
     if !function_refs.is_empty() {
-        Ok(serde_json::json!({"type": "allowed_tools", "mode": "required", "tools": function_refs}))
+        let mut choice = serde_json::Map::new();
+        choice.insert("type".to_owned(), serde_json::Value::String("allowed_tools".to_owned()));
+        choice.insert("mode".to_owned(), serde_json::Value::String("required".to_owned()));
+        choice.insert("tools".to_owned(), serde_json::Value::Array(function_refs));
+        Ok(serde_json::Value::Object(choice))
     } else if resolved_labels.contains(label) {
         Err(ResolveError::EmptyResolvedToolChoice(label.to_owned()))
     } else {
@@ -2185,7 +2189,7 @@ fn expand_mcp_selector(
 
     if let Some(name) = selector.get("name").and_then(serde_json::Value::as_str) {
         if tool_map.contains_key(&(label.to_owned(), name.to_owned())) {
-            out.push(serde_json::json!({"type": "function", "name": encode_function_name(label, name)}));
+            out.push(function_tool_reference(encode_function_name(label, name)));
         }
     } else {
         out.extend(collect_function_refs_for_label(label, tool_map));
@@ -2201,8 +2205,16 @@ fn collect_function_refs_for_label(
     tool_map
         .keys()
         .filter(|(l, _)| l == label)
-        .map(|(l, n)| serde_json::json!({"type": "function", "name": encode_function_name(l, n)}))
+        .map(|(l, n)| function_tool_reference(encode_function_name(l, n)))
         .collect()
+}
+
+/// Build a function-tool selector, consuming its encoded name.
+fn function_tool_reference(encoded_name: String) -> serde_json::Value {
+    let mut reference = serde_json::Map::new();
+    reference.insert("type".to_owned(), serde_json::Value::String("function".to_owned()));
+    reference.insert("name".to_owned(), serde_json::Value::String(encoded_name));
+    serde_json::Value::Object(reference)
 }
 
 /// Convert a single MCP tool definition to a Responses API
@@ -2235,8 +2247,8 @@ fn mcp_tool_to_function_tool(label: &str, definition: &serde_json::Value) -> ser
         .unwrap_or_else(|| serde_json::json!({"type": "object"}));
 
     let mut obj = serde_json::Map::new();
-    obj.insert("type".to_owned(), serde_json::json!("function"));
-    obj.insert("name".to_owned(), serde_json::json!(encoded_name));
+    obj.insert("type".to_owned(), serde_json::Value::String("function".to_owned()));
+    obj.insert("name".to_owned(), serde_json::Value::String(encoded_name));
     if let Some(desc) = description {
         obj.insert("description".to_owned(), desc);
     }
@@ -2535,7 +2547,8 @@ async fn prepare_deferred_listing(
         .iter()
         .map(|def| mcp_tool_to_function_tool(&connector.server_label, def))
         .collect();
-    let listing_item = mcp_list_tools_item(&connector.server_label, &filtered);
+    let listing_tools = filtered.iter().map(mcp_listing_tool_for_responses).collect();
+    let listing_item = mcp_list_tools_item(connector.server_label.clone(), listing_tools);
     Ok(PreparedDeferredListing {
         entry,
         filtered,
@@ -2684,18 +2697,19 @@ fn deferred_entry_view(connector: &DeferredMcpConnector) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-/// Public `mcp_list_tools` item with no URL, credentials, or connector id.
-///
-/// MCP `tools/list` returns `inputSchema`; the Responses item schema requires
-/// `input_schema`. Map each listed tool onto the public shape so typed SDKs
-/// can parse a successful deferred listing.
-fn mcp_list_tools_item(server_label: &str, tools: &[serde_json::Value]) -> serde_json::Value {
-    serde_json::json!({
-        "id": mcp_list_tools_id(server_label),
-        "type": "mcp_list_tools",
-        "server_label": server_label,
-        "tools": tools.iter().map(mcp_listing_tool_for_responses).collect::<Vec<_>>(),
-    })
+/// Build a public `mcp_list_tools` item from already normalized tools, moving
+/// the label and tools into the item with no URL, credentials, or connector id.
+fn mcp_list_tools_item(server_label: String, tools: Vec<serde_json::Value>) -> serde_json::Value {
+    let id = mcp_list_tools_id(&server_label);
+    let mut item = serde_json::Map::new();
+    item.insert("id".to_owned(), serde_json::Value::String(id));
+    item.insert(
+        "type".to_owned(),
+        serde_json::Value::String("mcp_list_tools".to_owned()),
+    );
+    item.insert("server_label".to_owned(), serde_json::Value::String(server_label));
+    item.insert("tools".to_owned(), serde_json::Value::Array(tools));
+    serde_json::Value::Object(item)
 }
 
 /// Map one MCP tool definition onto the Responses `mcp_list_tools` tool shape.
@@ -2808,12 +2822,18 @@ fn build_discovery_item(
     // A second copy of the tool definitions is necessary at this persistence
     // boundary; the public item must not carry the target URL.
     let cached = server_url.map(|server_url| {
-        serde_json::json!({
-            "type": "praxis_mcp_cached_listing",
-            "server_label": server_label,
-            "server_url": server_url,
-            "tools": tools.clone(),
-        })
+        let mut cached = serde_json::Map::new();
+        cached.insert(
+            "type".to_owned(),
+            serde_json::Value::String("praxis_mcp_cached_listing".to_owned()),
+        );
+        cached.insert(
+            "server_label".to_owned(),
+            serde_json::Value::String(server_label.clone()),
+        );
+        cached.insert("server_url".to_owned(), serde_json::Value::String(server_url));
+        cached.insert("tools".to_owned(), serde_json::Value::Array(tools.clone()));
+        serde_json::Value::Object(cached)
     });
     item.insert("server_label".to_owned(), serde_json::Value::String(server_label));
     item.insert("tools".to_owned(), serde_json::Value::Array(tools));
@@ -3135,10 +3155,10 @@ fn insert_tools(
         .get("server_url")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    let headers = entry.get("headers").cloned();
-    let authorization = entry.get("authorization").cloned();
-    let require_approval = entry.get("require_approval").cloned();
-    let connector_id = entry.get("connector_id").cloned();
+    let headers = entry.get("headers");
+    let authorization = entry.get("authorization");
+    let require_approval = entry.get("require_approval");
+    let connector_id = entry.get("connector_id");
 
     for tool in tools {
         let tool_name = tool.get("name").and_then(serde_json::Value::as_str).map(str::to_owned);
@@ -3147,17 +3167,29 @@ fn insert_tools(
         };
 
         let key = (label.to_owned(), tool_name);
-        tool_map.insert(
-            key,
-            serde_json::json!({
-                "server_label": label,
-                "server_url": server_url,
-                "headers": headers,
-                "authorization": authorization,
-                "require_approval": require_approval,
-                "connector_id": connector_id,
-                "tool_definition": tool,
-            }),
+        let mut dispatch = serde_json::Map::new();
+        dispatch.insert("server_label".to_owned(), serde_json::Value::String(label.to_owned()));
+        dispatch.insert(
+            "server_url".to_owned(),
+            serde_json::Value::String(server_url.to_owned()),
         );
+        dispatch.insert(
+            "headers".to_owned(),
+            headers.cloned().unwrap_or(serde_json::Value::Null),
+        );
+        dispatch.insert(
+            "authorization".to_owned(),
+            authorization.cloned().unwrap_or(serde_json::Value::Null),
+        );
+        dispatch.insert(
+            "require_approval".to_owned(),
+            require_approval.cloned().unwrap_or(serde_json::Value::Null),
+        );
+        dispatch.insert(
+            "connector_id".to_owned(),
+            connector_id.cloned().unwrap_or(serde_json::Value::Null),
+        );
+        dispatch.insert("tool_definition".to_owned(), tool);
+        tool_map.insert(key, serde_json::Value::Object(dispatch));
     }
 }
