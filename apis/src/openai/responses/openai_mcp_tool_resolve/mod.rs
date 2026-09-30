@@ -334,9 +334,9 @@ impl McpToolResolveFilter {
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        original_bytes: Bytes,
+        parsed: serde_json::Value,
     ) -> Result<FilterAction, ResolveError> {
-        let mut mcp_entries = extract_mcp_entries(&original_bytes);
+        let mut mcp_entries = extract_mcp_entries(&parsed);
         if mcp_entries.is_empty() {
             return Ok(FilterAction::Continue);
         }
@@ -381,26 +381,19 @@ impl McpToolResolveFilter {
             self.user_credential_slot.as_deref(),
             self.authorization_assertion_slot.as_deref(),
         );
-        self.commit_resolved_tools(
-            ctx,
-            body,
-            &original_bytes,
-            resolution,
-            deferred_mcp,
-            connector_context_policy,
-        )
+        self.commit_resolved_tools(ctx, body, parsed, resolution, deferred_mcp, connector_context_policy)
     }
 
     /// Rewrite the request body and store resolved plus deferred MCP state.
     #[expect(
         clippy::too_many_arguments,
-        reason = "rewrite needs body, original bytes, and both resolved maps"
+        reason = "rewrite needs the parsed body and both resolved maps"
     )]
     fn commit_resolved_tools(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        original_bytes: &Bytes,
+        mut parsed: serde_json::Value,
         resolution: Resolution,
         deferred_mcp: Vec<DeferredMcpConnector>,
         connector_context_policy: McpConnectorContextPolicy,
@@ -412,13 +405,12 @@ impl McpToolResolveFilter {
             listings,
             ..
         } = resolution;
-        let Some(serialized) = rewrite_request_body(original_bytes, per_entry, &tool_map, &resolved_labels)? else {
+        let Some(serialized) = rewrite_request_body(&mut parsed, per_entry, &tool_map, &resolved_labels)? else {
             return Ok(FilterAction::Continue);
         };
         check_body_size(&serialized, self.max_rewritten_body_bytes)?;
         serialized.commit(body, self.name(), "tools");
-        let body_for_state = body.as_ref().map_or_else(|| original_bytes.as_ref(), |b| b.as_ref());
-        write_state(ctx, body_for_state, tool_map, deferred_mcp, connector_context_policy);
+        write_state(ctx, parsed, tool_map, deferred_mcp, connector_context_policy);
         commit_discovery_items(ctx, listings);
         Ok(FilterAction::Continue)
     }
@@ -637,13 +629,16 @@ impl HttpFilter for McpToolResolveFilter {
         let Some(bytes) = body.as_ref().cloned() else {
             return Ok(FilterAction::Continue);
         };
+        let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return Ok(FilterAction::Continue);
+        };
 
         let streaming = is_streaming(ctx);
 
         // `bytes` is an `Arc`-backed `Bytes`; cloning bumps a refcount rather than
         // copying the body, so keeping a handle for the failure path (which
         // captures the size-bounded request options from it) is cheap.
-        match Box::pin(self.resolve_mcp_tools(ctx, body, bytes.clone())).await {
+        match Box::pin(self.resolve_mcp_tools(ctx, body, parsed)).await {
             Ok(action) => Ok(action),
             Err(e) => Ok(resolve_error_action(ctx, &e, streaming, &bytes)),
         }
@@ -1812,14 +1807,11 @@ fn select_forward_headers(names: &[http::HeaderName], source: &http::HeaderMap) 
 /// pipeline-local `connector_id`, configured URL, and credentials
 /// never reach the inference backend.
 fn rewrite_request_body(
-    original_bytes: &[u8],
+    parsed: &mut serde_json::Value,
     per_entry: Vec<EntryResolution>,
     tool_map: &HashMap<(String, String), serde_json::Value>,
     resolved_labels: &HashSet<String>,
 ) -> Result<Option<SerializedJson>, ResolveError> {
-    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(original_bytes) else {
-        return Ok(None);
-    };
     let Some(obj) = parsed.as_object_mut() else {
         return Ok(None);
     };
@@ -1839,7 +1831,7 @@ fn rewrite_request_body(
     obj.insert("tools".to_owned(), serde_json::Value::Array(rewritten));
     rewrite_tool_choice(obj, tool_map, resolved_labels)?;
 
-    let serialized = serialize_json_body(&parsed).map_err(|e| {
+    let serialized = serialize_json_body(parsed).map_err(|e| {
         debug!(error = %e, "failed to serialize rewritten body");
         ResolveError::Serialization(e)
     })?;
@@ -2321,7 +2313,7 @@ impl<'a> McpToolIndex<'a> {
 /// path in `openai_responses_proxy` which would strip it.
 fn write_state(
     ctx: &mut HttpFilterContext<'_>,
-    body: &[u8],
+    parsed: serde_json::Value,
     map: HashMap<(String, String), serde_json::Value>,
     deferred_mcp: Vec<DeferredMcpConnector>,
     connector_context_policy: McpConnectorContextPolicy,
@@ -2330,18 +2322,16 @@ fn write_state(
         state.mcp_tool_map = map;
         state.deferred_mcp = deferred_mcp;
         state.mcp_connector_context_policy = connector_context_policy;
-        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) {
-            state.tools = parsed
-                .get("tools")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(tc) = parsed.get("tool_choice") {
-                state.tool_choice = tc.clone();
-            }
-            state.request_body = parsed;
+        state.tools = parsed
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(tc) = parsed.get("tool_choice") {
+            state.tool_choice = tc.clone();
         }
-    } else if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(body) {
+        state.request_body = parsed;
+    } else {
         let mut state = ResponsesState::from_request_body(parsed);
         state.mcp_tool_map = map;
         state.deferred_mcp = deferred_mcp;
@@ -2839,12 +2829,8 @@ fn server_label(entry: &serde_json::Value) -> &str {
         .unwrap_or("unknown")
 }
 
-/// Extract MCP tool entries from the request body.
-fn extract_mcp_entries(body: &[u8]) -> Vec<serde_json::Value> {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return Vec::new();
-    };
-
+/// Extract MCP tool entries from the parsed request body.
+fn extract_mcp_entries(value: &serde_json::Value) -> Vec<serde_json::Value> {
     let Some(tools) = value.get("tools").and_then(serde_json::Value::as_array) else {
         return Vec::new();
     };
