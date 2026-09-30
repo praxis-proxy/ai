@@ -1330,6 +1330,32 @@ async fn truncation_setting_preserved_through_rehydration() {
 // Conversation Rehydration
 // -----------------------------------------------------------------------------
 
+/// An explicit null selects no conversation, the same as omitting the field.
+/// Treating it as present rejected a well-formed body: a token-count request
+/// carrying `"conversation": null` was told its conversation value was
+/// malformed.
+#[tokio::test]
+async fn an_explicit_null_conversation_is_treated_as_absent() {
+    let store = MockStore::with_conversation("conv_unused", json!([]));
+    let registry = setup_registry(store);
+
+    let filter = default_filter();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses/input_tokens");
+    let mut ctx = crate::test_utils::make_owned_filter_context(&req);
+    ctx.extensions.insert(registry.clone());
+    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    let mut body = Some(Bytes::from(
+        r#"{"model":"gpt-4.1","input":"count me","conversation":null}"#,
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "a null conversation must not be rejected as malformed"
+    );
+}
+
 #[tokio::test]
 async fn rehydrates_from_conversation_string_id() {
     let messages = json!([

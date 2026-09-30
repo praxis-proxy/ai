@@ -12,10 +12,6 @@
 //!   PRAXIS_BENCH_PG_SSLMODE=disable cargo bench -p praxis-ai-benchmarks
 //! ```
 #![expect(
-    missing_docs,
-    reason = "criterion_group!/criterion_main! expand to undocumented items"
-)]
-#![expect(
     clippy::expect_used,
     reason = "benches build fixed inputs up front; a panic just aborts the run"
 )]

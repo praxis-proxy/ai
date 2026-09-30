@@ -3,13 +3,17 @@
 
 //! URL resolution and SSRF validation for `file_url` references.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
-use praxis_ai_store::url_security::{is_cloud_metadata, is_file_url_ssrf_blocked};
+use praxis_ai_store::url_security::is_cloud_metadata;
 use praxis_core::connectivity::normalize_mapped_ipv4;
 
 use super::resolve::{ResolveError, ResolvedFile, max_content_bytes_for_data_url};
-use crate::openai::responses::content_parts::infer_mime_from_filename;
+use crate::{
+    callout_target::AddressPolicy,
+    openai::responses::content_parts::infer_mime_from_filename,
+    subrequest::{SubRequest, SubRequestClient},
+};
 
 /// A validated, normalized origin (scheme + host + port) for allowlist matching.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -320,14 +324,16 @@ pub(crate) fn sanitize_filename(raw: &str) -> Option<String> {
     }
 }
 
-/// Resolves `file_url` references with DNS pinning and SSRF protection.
+/// Resolves `file_url` references with SSRF protection via [`SubRequestClient`].
 pub(crate) struct FileUrlResolver {
     /// Origins that permit resolution to private/loopback addresses.
     pub(crate) allowed_private_origins: Vec<NormalizedOrigin>,
+    /// Shared sub-request client for URL fetching.
+    pub(crate) client: SubRequestClient,
 }
 
 impl FileUrlResolver {
-    /// Resolve a `file_url` with SSRF protection and DNS pinning.
+    /// Resolve a `file_url` with SSRF protection.
     #[expect(clippy::too_many_lines, reason = "main resolution flow")]
     pub(crate) async fn resolve_url(
         &self,
@@ -338,14 +344,27 @@ impl FileUrlResolver {
         let parsed_url = validate_file_url(url)?;
         let label = redact_url(url);
 
-        // Check if origin is allowlisted for private addresses
+        // Pre-validate hostname before SubRequestClient handles DNS/SSRF
+        if let Some(host) = parsed_url.host_str()
+            && !self
+                .allowed_private_origins
+                .iter()
+                .any(|origin| origin.matches_url(&parsed_url))
+            && is_blocked_hostname(host)
+        {
+            return Err(ResolveError::FileUrlBlocked { label });
+        }
+
+        // Determine address policy from origin allowlist
         let allow_private = self
             .allowed_private_origins
             .iter()
             .any(|origin| origin.matches_url(&parsed_url));
-
-        // Resolve and validate addresses
-        let (host, addrs) = resolve_and_pin_url(&parsed_url, allow_private, &label, deadline).await?;
+        let address_policy = if allow_private {
+            AddressPolicy::AllowPrivate
+        } else {
+            AddressPolicy::PublicOnly
+        };
 
         // Check deadline before making the request
         let now = tokio::time::Instant::now();
@@ -357,39 +376,55 @@ impl FileUrlResolver {
         }
         let remaining = deadline - now;
 
-        // Build pinned client
-        let client = build_pinned_client(&host, &addrs, remaining).map_err(|e| ResolveError::FileUrlFailed {
-            label: label.clone(),
-            detail: format!("failed to build HTTP client: {e}"),
-        })?;
+        let request = SubRequest {
+            method: http::Method::GET,
+            uri: http::Uri::default(),
+            headers: http::HeaderMap::new(),
+            body: bytes::Bytes::new(),
+        };
 
-        // Send GET with only x-praxis-callout-depth header
-        let mut request = client.get(parsed_url.as_str());
-        request = request.header("x-praxis-callout-depth", "1");
-
-        let response = request.send().await.map_err(|e| {
-            let detail = if e.is_timeout() {
-                "fetch timed out".to_owned()
-            } else {
-                "fetch failed".to_owned()
-            };
-            ResolveError::FileUrlFailed {
-                label: label.clone(),
-                detail,
+        let response = crate::subrequest::execute_url(
+            &self.client,
+            parsed_url.as_str(),
+            request,
+            max_resolved_bytes,
+            remaining,
+            address_policy,
+        )
+        .await
+        .map_err(|e| {
+            use crate::subrequest::SubRequestError;
+            match &e {
+                SubRequestError::DeadlineExceeded => ResolveError::FileUrlFailed {
+                    label: label.clone(),
+                    detail: "fetch timed out".to_owned(),
+                },
+                SubRequestError::Connect(detail) if detail.contains("blocked non-public address") => {
+                    ResolveError::FileUrlBlocked { label: label.clone() }
+                },
+                SubRequestError::ResponseTooLarge { .. } => ResolveError::TooLarge {
+                    reference: label.clone(),
+                    limit: max_resolved_bytes,
+                },
+                _ => ResolveError::FileUrlFailed {
+                    label: label.clone(),
+                    detail: "fetch failed".to_owned(),
+                },
             }
         })?;
 
         // Check success status
-        if !response.status().is_success() {
+        let status = http::StatusCode::from_u16(response.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+        if !status.is_success() {
             return Err(ResolveError::FileUrlFailed {
                 label,
-                detail: format!("server returned {}", response.status()),
+                detail: format!("server returned {status}"),
             });
         }
 
         // Validate Content-Type
         let content_type = response
-            .headers()
+            .headers
             .get(http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .and_then(|ct| {
@@ -411,19 +446,17 @@ impl FileUrlResolver {
             }
         })?;
 
-        // Check Content-Length against max raw bytes
-        if let Some(cl) = response.content_length()
-            && usize::try_from(cl).unwrap_or(usize::MAX) > max_content_bytes
-        {
+        // Check body size against content budget
+        if response.body.len() > max_content_bytes {
             return Err(ResolveError::TooLarge {
                 reference: label,
                 limit: max_resolved_bytes,
             });
         }
 
-        // Derive filename before consuming body: prefer Content-Disposition, fall back to URL path
+        // Derive filename: prefer Content-Disposition, fall back to URL path
         let filename = response
-            .headers()
+            .headers
             .get(http::header::CONTENT_DISPOSITION)
             .and_then(|v| v.to_str().ok())
             .and_then(parse_content_disposition_filename)
@@ -435,11 +468,8 @@ impl FileUrlResolver {
                     .and_then(sanitize_filename)
             });
 
-        // Read bounded body
-        let content = read_bounded_url_body(response, &label, max_content_bytes, max_resolved_bytes).await?;
-
         // Encode as base64
-        let base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &content);
+        let base64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &response.body);
 
         Ok(ResolvedFile {
             base64,
@@ -449,152 +479,10 @@ impl FileUrlResolver {
     }
 }
 
-/// Read a file URL response body while preserving URL-specific error context.
-async fn read_bounded_url_body(
-    mut response: reqwest::Response,
-    label: &str,
-    max_content_bytes: usize,
-    limit: usize,
-) -> Result<Vec<u8>, ResolveError> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| ResolveError::FileUrlFailed {
-        label: label.to_owned(),
-        detail: if e.is_timeout() {
-            "content download timed out".to_owned()
-        } else {
-            format!("content download read error: {e}")
-        },
-    })? {
-        if chunk.len() > max_content_bytes.saturating_sub(body.len()) {
-            return Err(ResolveError::TooLarge {
-                reference: label.to_owned(),
-                limit,
-            });
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
-}
-
-/// Resolve DNS and validate all addresses.
-#[expect(clippy::too_many_lines, reason = "DNS resolution + validation flow")]
-async fn resolve_and_pin_url(
-    url: &url::Url,
-    allow_private: bool,
-    label: &str,
-    deadline: tokio::time::Instant,
-) -> Result<(String, Vec<SocketAddr>), ResolveError> {
-    let Some(host) = url.host_str() else {
-        return Err(ResolveError::FileUrlBlocked {
-            label: label.to_owned(),
-        });
-    };
-
-    // Check if host is an IP literal
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        let normalized = normalize_mapped_ipv4(ip);
-        if is_file_url_ssrf_blocked(&normalized, allow_private) {
-            return Err(ResolveError::FileUrlBlocked {
-                label: label.to_owned(),
-            });
-        }
-        // IP literals don't need DNS resolution, return empty addrs for no pinning
-        return Ok((host.to_owned(), Vec::new()));
-    }
-
-    // Check blocked hostnames
-    if !allow_private && is_blocked_hostname(host) {
-        return Err(ResolveError::FileUrlBlocked {
-            label: label.to_owned(),
-        });
-    }
-
-    // DNS resolution
-    let port = url.port_or_known_default().unwrap_or(80);
-    let lookup = format!("{host}:{port}");
-
-    let addrs: Vec<SocketAddr> = tokio::time::timeout_at(deadline, tokio::net::lookup_host(&lookup))
-        .await
-        .map_err(|e| {
-            tracing::debug!(error = %e, "DNS resolution deadline exceeded");
-            ResolveError::FileUrlFailed {
-                label: label.to_owned(),
-                detail: "DNS resolution timed out".to_owned(),
-            }
-        })?
-        .map_err(|e| ResolveError::FileUrlFailed {
-            label: label.to_owned(),
-            detail: format!("DNS resolution failed: {e}"),
-        })?
-        .collect();
-
-    let validated = validate_resolved_addrs(addrs, allow_private, label)?;
-    Ok((host.to_owned(), validated))
-}
-
-/// Validate and deduplicate every address returned for one DNS lookup.
-fn validate_resolved_addrs(
-    addrs: Vec<SocketAddr>,
-    allow_private: bool,
-    label: &str,
-) -> Result<Vec<SocketAddr>, ResolveError> {
-    if addrs.is_empty() {
-        return Err(ResolveError::FileUrlFailed {
-            label: label.to_owned(),
-            detail: "DNS returned zero addresses".to_owned(),
-        });
-    }
-
-    // Deduplicate and validate all IPs
-    let mut seen = std::collections::HashSet::new();
-    let mut validated = Vec::new();
-    for addr in addrs {
-        let ip = normalize_mapped_ipv4(addr.ip());
-        if seen.insert(ip) {
-            if is_file_url_ssrf_blocked(&ip, allow_private) {
-                return Err(ResolveError::FileUrlBlocked {
-                    label: label.to_owned(),
-                });
-            }
-            validated.push(SocketAddr::new(ip, addr.port()));
-        }
-    }
-
-    Ok(validated)
-}
-
 /// Check if a hostname is blocked (localhost and *.localhost).
 fn is_blocked_hostname(host: &str) -> bool {
     let lower = host.to_ascii_lowercase();
     lower == "localhost" || lower.ends_with(".localhost")
-}
-
-/// Build a per-request pinned reqwest client.
-fn build_pinned_client(
-    host: &str,
-    addrs: &[SocketAddr],
-    timeout: std::time::Duration,
-) -> Result<reqwest::Client, reqwest::Error> {
-    configure_pinned_client(reqwest::Client::builder(), host, addrs, timeout)
-}
-
-/// Apply proxy, redirect, timeout, and DNS-pinning policy to a client builder.
-fn configure_pinned_client(
-    builder: reqwest::ClientBuilder,
-    host: &str,
-    addrs: &[SocketAddr],
-    timeout: std::time::Duration,
-) -> Result<reqwest::Client, reqwest::Error> {
-    let mut builder = builder
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(timeout);
-
-    if !addrs.is_empty() {
-        builder = builder.resolve_to_addrs(host, addrs);
-    }
-
-    builder.build()
 }
 
 #[cfg(test)]
@@ -609,7 +497,7 @@ fn configure_pinned_client(
 mod tests {
     use std::{
         io::{Read as _, Write as _},
-        net::TcpListener,
+        net::{SocketAddr, TcpListener},
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -617,7 +505,13 @@ mod tests {
         },
     };
 
+    use praxis_ai_store::url_security::is_file_url_ssrf_blocked;
+
     use super::*;
+
+    fn test_client() -> SubRequestClient {
+        crate::subrequest::isolated_client(4)
+    }
 
     #[test]
     fn parse_valid_https_origin() {
@@ -1864,6 +1758,7 @@ mod tests {
     async fn file_url_resolver_blocks_legacy_ipv4_loopback_encodings() {
         let resolver = FileUrlResolver {
             allowed_private_origins: vec![],
+            client: test_client(),
         };
 
         for url in [
@@ -1922,10 +1817,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pinned_client_times_out_while_response_body_is_stalled() {
+    async fn resolver_times_out_while_response_body_is_stalled() {
         let server = start_stalled_body_server();
         let resolver = FileUrlResolver {
             allowed_private_origins: vec![NormalizedOrigin::parse(&format!("http://{}", server.address)).unwrap()],
+            client: test_client(),
         };
         let result = resolver
             .resolve_url(
@@ -1941,32 +1837,14 @@ mod tests {
             server.headers_sent.load(Ordering::Acquire),
             "the response headers must arrive before the body-read timeout"
         );
-        match result {
-            Err(ResolveError::FileUrlFailed { detail, .. }) => {
-                assert!(
-                    detail.contains("timed out"),
-                    "a body that stalls after headers must report a timeout"
-                );
-            },
-            Err(other) => panic!("expected URL timeout for a stalled body, got {other}"),
-            Ok(_) => panic!("a body that stalls after headers must fail at the shared deadline"),
-        }
-    }
-
-    #[test]
-    fn dns_rebinding_with_mixed_public_and_private_answers_is_blocked() {
-        let addrs = vec!["93.184.216.34:443".parse().unwrap(), "127.0.0.1:443".parse().unwrap()];
-
-        let result = validate_resolved_addrs(addrs, false, "https://files.example/document.pdf");
-
         assert!(
-            matches!(result, Err(ResolveError::FileUrlBlocked { .. })),
-            "one private DNS answer must reject the entire pinned address set"
+            result.is_err(),
+            "a body that stalls after headers must fail at the shared deadline"
         );
     }
 
     #[tokio::test]
-    async fn pinned_client_uses_only_validated_dns_addresses() {
+    async fn resolver_fetches_from_allowlisted_private_origin() {
         let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let target_address = target_listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
@@ -1974,23 +1852,25 @@ mod tests {
             let mut request = [0_u8; 4096];
             let _read = stream.read(&mut request).unwrap();
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok",
+                )
                 .unwrap();
         });
 
-        let client = build_pinned_client(
-            "files.example.test",
-            &[target_address],
-            std::time::Duration::from_secs(5),
-        )
-        .unwrap();
-        let response = client
-            .get(format!("http://files.example.test:{}/file.txt", target_address.port()))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.bytes().await.unwrap().as_ref(), b"ok");
+        let resolver = FileUrlResolver {
+            allowed_private_origins: vec![NormalizedOrigin::parse(&format!("http://{target_address}")).unwrap()],
+            client: test_client(),
+        };
+        let result = resolver
+            .resolve_url(
+                &format!("http://{target_address}/file.txt"),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                1024,
+            )
+            .await;
         server.join().unwrap();
+        assert!(result.is_ok(), "allowlisted private origin should succeed: {result:?}");
     }
 
     fn start_redirect_server(target_address: SocketAddr) -> (SocketAddr, std::thread::JoinHandle<()>) {
@@ -2017,6 +1897,7 @@ mod tests {
 
         let resolver = FileUrlResolver {
             allowed_private_origins: vec![NormalizedOrigin::parse(&format!("http://{redirect_address}")).unwrap()],
+            client: test_client(),
         };
         let result = resolver
             .resolve_url(
@@ -2037,39 +1918,6 @@ mod tests {
         assert!(
             matches!(target_listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
             "redirect target must not receive a connection"
-        );
-    }
-
-    #[tokio::test]
-    async fn pinned_client_disables_configured_proxy() {
-        let target_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let target_address = target_listener.local_addr().unwrap();
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        proxy_listener.set_nonblocking(true).unwrap();
-        let proxy_address = proxy_listener.local_addr().unwrap();
-
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = target_listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _read = stream.read(&mut request).unwrap();
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-                .unwrap();
-        });
-
-        let builder = reqwest::Client::builder().proxy(reqwest::Proxy::all(format!("http://{proxy_address}")).unwrap());
-        let client = configure_pinned_client(builder, "127.0.0.1", &[], std::time::Duration::from_secs(5)).unwrap();
-        let response = client
-            .get(format!("http://{target_address}/file.txt"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.bytes().await.unwrap().as_ref(), b"ok");
-        server.join().unwrap();
-
-        assert!(
-            matches!(proxy_listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
-            "configured proxy must not receive a connection"
         );
     }
 

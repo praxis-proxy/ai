@@ -43,11 +43,11 @@ http = "1.5.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
-jsonschema = { version = "0.56.0", default-features = false }
+jsonschema = { version = "0.58.1", default-features = false }
 nix = { version = "0.31.3", default-features = false, features = ["process", "signal", "user"] }
 percent-encoding = "2.3.2"
 notify = "8.2.0"
-object = { version = "0.39.1", default-features = false, features = ["read_core", "elf", "std"] }
+object = { version = "0.40.0", default-features = false, features = ["read_core", "elf", "std"] }
 # System OpenSSL bindings, the same crate praxis's rustls provider uses; never
 # with the `vendored` feature, the platform library is the validated module.
 openssl = "0.10.81"
@@ -56,15 +56,12 @@ rand = "0.10.3"
 rcgen = "0.14.10"
 redis = { version = "1.7.0", default-features = false, features = ["tokio-comp"] }
 regex = "1.13.1"
-# TLS through rustls without a compiled-in provider: reqwest's `rustls`
-# feature would compile aws-lc-rs into every consumer, a second cryptography
-# stack next to the system OpenSSL the process provider routes through. With
-# `rustls-no-provider` reqwest uses the provider the process installed
-# (praxis_tls::provider::install), so the FIPS suites' test binaries carry no
-# alternative provider a green run could have silently used. rmcp forwards
-# the same choice to its own reqwest edge.
+# reqwest is a dev/test-only dependency. Production callouts use
+# SubRequestClient, which inherits TLS from the process-wide Pingora
+# provider (praxis_tls::provider::install). `rustls-no-provider` avoids
+# compiling aws-lc-rs into test binaries.
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
-rmcp = { version = "3.4.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+rmcp = { version = "3.4.0", default-features = false, features = ["client", "transport-streamable-http-client"] }
 # Without default features: `aws_lc_rs` on by default would silently link
 # aws-lc-rs into every test binary, and `prefer-post-quantum` implies
 # `aws_lc_rs`. The provider is whatever the process installed.
@@ -95,10 +92,10 @@ tokio-util = "0.7.19"
 url = "2.5.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
-utoipa = "5.5.0"
+utoipa = "6.0.0"
 wiremock = "0.6.5"
 allocation-counter = "0.8.1"
-criterion = { version = "0.7.0", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 prost = "0.14.4"
 prost-build = "0.14.4"
 prost-types = "0.14.4"
