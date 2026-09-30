@@ -340,9 +340,10 @@ impl ValkeySlidingWindowBackend {
     /// applied (counters already include the estimate; pass `estimate = 0`).
     ///
     /// `max_keys` and `max_active_reservations` are enforced without a
-    /// distributed lock: two requests that race past the cap before either
-    /// increments the counter may both be admitted. The overshoot is bounded
-    /// to the number of concurrent requests on this replica.
+    /// distributed lock: two requests on any replica that race past the cap
+    /// before either increments the shared counter may both be admitted. The
+    /// overshoot is bounded by the number of concurrent requests fleet-wide at
+    /// the instant the cap is crossed.
     fn decide(&self, reads: &WindowReads, estimate: u64, now_ms: u64) -> Decision {
         if !reads.key_known && reads.keys >= self.max_keys {
             return Decision::Denied {
