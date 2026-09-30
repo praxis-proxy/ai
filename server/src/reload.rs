@@ -378,6 +378,13 @@ fn detect_process_limit_changes(old: &Config, new: &Config) {
             "runtime.max_open_files changed; requires restart (the open file limit is set once at startup)"
         );
     }
+    if old.runtime.shed_on_fd_pressure != new.runtime.shed_on_fd_pressure {
+        warn!(
+            old = old.runtime.shed_on_fd_pressure,
+            new = new.runtime.shed_on_fd_pressure,
+            "runtime.shed_on_fd_pressure changed; requires restart (the descriptor monitor starts once)"
+        );
+    }
 }
 
 /// Detect `runtime.subrequest_circuit_breaker` changes that require a restart.
@@ -868,6 +875,19 @@ filter_chains:
         assert!(
             warnings[0].contains("requires restart"),
             "the open file limit is set once at startup: {:?}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn shed_on_fd_pressure_change_warns() {
+        let old = config_with_runtime_line("threads: 1");
+        let new = config_with_runtime_line("shed_on_fd_pressure: false");
+        let warnings = capture_warnings(|| detect_process_limit_changes(&old, &new));
+        assert_eq!(warnings.len(), 1, "one changed setting, one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("requires restart"),
+            "the descriptor monitor starts once: {:?}",
             warnings[0]
         );
     }
