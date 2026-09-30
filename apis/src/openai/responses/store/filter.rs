@@ -74,8 +74,7 @@ use crate::{
     service::responses::ResponsesService,
     state_owner::{StateOwner, require_state_owner},
     store::{
-        EventLogStatus, PendingApprovalRecord, ResponseEventRecord, ResponseRecord, ResponseStoreRegistry,
-        StoreError,
+        EventLogStatus, PendingApprovalRecord, ResponseEventRecord, ResponseRecord, ResponseStoreRegistry, StoreError,
     },
 };
 
@@ -1712,6 +1711,8 @@ fn encode_replay_event(event: &ResponseEventRecord, output: &mut Vec<u8>) {
 }
 
 #[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 mod encode_replay_event_tests {
     use bytes::Bytes;
     use praxis_filter::sse::SseDecoder;

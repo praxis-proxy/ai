@@ -944,7 +944,7 @@ impl ResponseStore for PostgresResponseStore {
         // Bind a borrowed view of each payload; `Cow::Borrowed` (the `none`
         // default) points straight at the event bytes, so this array holds
         // pointers, not payload copies.
-        let payload_refs: Vec<&[u8]> = payloads.iter().map(|payload| payload.as_ref()).collect();
+        let payload_refs: Vec<&[u8]> = payloads.iter().map(|payload| &**payload).collect();
 
         sqlx::query(AssertSqlSafe(sql.as_str()))
             .bind(owner.tenant_id())
@@ -1043,9 +1043,7 @@ impl ResponseStore for PostgresResponseStore {
             .as_deref()
             .map(parse_sequence)
             .transpose()?
-            .ok_or_else(|| {
-                StoreError::Database("event log has rows but no maximum sequence number".to_string())
-            })?;
+            .ok_or_else(|| StoreError::Database("event log has rows but no maximum sequence number".to_owned()))?;
         if has_terminal != 0 {
             Ok(EventLogStatus::Replayable { max_sequence })
         } else {

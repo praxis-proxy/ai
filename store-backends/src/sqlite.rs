@@ -941,9 +941,7 @@ impl ResponseStore for SqliteResponseStore {
             .as_deref()
             .map(parse_sequence)
             .transpose()?
-            .ok_or_else(|| {
-                StoreError::Database("event log has rows but no maximum sequence number".to_string())
-            })?;
+            .ok_or_else(|| StoreError::Database("event log has rows but no maximum sequence number".to_owned()))?;
         if has_terminal != 0 {
             Ok(EventLogStatus::Replayable { max_sequence })
         } else {

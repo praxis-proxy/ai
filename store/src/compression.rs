@@ -428,7 +428,10 @@ mod tests {
         let encoded = cfg.encode_byte_values(&payloads).await.unwrap();
         assert_eq!(encoded.len(), payloads.len());
         for (raw, stored) in payloads.iter().zip(&encoded) {
-            assert!(matches!(stored, Cow::Borrowed(_)), "none must borrow, not copy the payload");
+            assert!(
+                matches!(stored, Cow::Borrowed(_)),
+                "none must borrow, not copy the payload"
+            );
             assert!(!stored.starts_with(&ZSTD_MAGIC), "none must not compress");
             assert_eq!(stored.as_ref(), *raw, "payload stored byte-for-byte");
             assert_eq!(decode_bytes(stored.to_vec()).unwrap(), raw.to_vec());
