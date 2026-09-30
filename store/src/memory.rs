@@ -357,14 +357,14 @@ impl ResponseStore for InMemoryStore {
         let Some(log) = inner.events.get(&(owner.clone(), response_id.to_owned())) else {
             return Ok(Vec::new());
         };
-        let mut ordered: Vec<ResponseEventRecord> = log
+        // Filter and order references first, then clone only the bounded page so
+        // one replay page copies at most `limit` events, not the full tail.
+        let mut ordered: Vec<&ResponseEventRecord> = log
             .iter()
             .filter(|event| after.is_none_or(|cursor| event.sequence_number > cursor))
-            .cloned()
             .collect();
-        ordered.sort_by_key(|event| event.sequence_number);
-        ordered.truncate(limit as usize);
-        Ok(ordered)
+        ordered.sort_unstable_by_key(|event| event.sequence_number);
+        Ok(ordered.into_iter().take(limit as usize).cloned().collect())
     }
 
     async fn event_log_status(&self, owner: &StateOwner, response_id: &str) -> Result<EventLogStatus, StoreError> {
