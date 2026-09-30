@@ -360,7 +360,11 @@ impl ValkeyTokenBucketBackend {
             .arg("last_refill_ms")
             .arg(last_refill_ms)
             .ignore();
-        pipe.cmd("PEXPIRE").arg(&bucket.key).arg(self.state_ttl_ms()).arg("GT").ignore();
+        pipe.cmd("PEXPIRE")
+            .arg(&bucket.key)
+            .arg(self.state_ttl_ms())
+            .arg("GT")
+            .ignore();
     }
 
     // -------------------------------------------------------------------------
@@ -375,6 +379,10 @@ impl ValkeyTokenBucketBackend {
     ///
     /// Returns [`BackendError::Unavailable`] on Valkey errors and when
     /// aborted transactions outlast [`VALKEY_TIMEOUT`].
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "transaction.finish() consumes the connection; the lint misidentifies the borrow across .await as a retained drop"
+    )]
     async fn reserve_with<H, F>(&self, request: ReserveRequest, mut between: H) -> Result<BackendReserve, BackendError>
     where
         H: FnMut(u32) -> F + Send,
@@ -697,6 +705,10 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
         self.reserve_with(request, |_attempt| std::future::ready(())).await
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "transaction.finish() consumes the connection; the lint misidentifies the borrow across .await as a retained drop"
+    )]
     async fn reconcile(&self, request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
         let mut retry = AbortRetry::start();
         loop {
@@ -905,6 +917,7 @@ mod tests {
                 .is_none(),
             "Valkey-backed reconciliation must go through enqueue_reconcile, not reconcile_sync"
         );
+        drop(backend);
     }
 
     #[tokio::test]
@@ -1072,6 +1085,7 @@ mod tests {
         );
         assert_eq!(backend.snapshot().active_keys, 2, "two retained keys");
         assert_eq!(backend.snapshot().active_reservations, 2, "two pending reservations");
+        drop(backend);
     }
 
     #[tokio::test]
@@ -1104,6 +1118,8 @@ mod tests {
             };
             assert_eq!(remaining, 40, "{algorithm} saw its own full budget of 100");
         }
+        drop(window);
+        drop(bucket);
     }
 
     #[tokio::test]
@@ -1245,6 +1261,7 @@ mod tests {
             (balance - expected).abs() < f64::EPSILON,
             "the balance must equal capacity minus every admitted estimate (no lost update): {balance} != {expected}"
         );
+        drop(backend);
     }
 
     #[tokio::test]

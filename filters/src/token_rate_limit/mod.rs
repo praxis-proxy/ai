@@ -291,26 +291,55 @@ fn build_sliding_window_backend(
             .map_err(|error| format!("token_rate_limit: rule '{rule_name}': {error}"))?;
             Ok(Arc::new(InMemoryTokenRateLimitBackend::new(ledger)))
         },
-        BackendResource::Valkey { valkey, namespace } => {
-            let min_window_ms = budgets.iter().map(|b| b.window_ms).min().unwrap_or(0);
-            if reservation_timeout_ms > min_window_ms {
-                return Err(format!(
-                    "token_rate_limit: rule '{rule_name}': reservation_timeout ({reservation_timeout_ms} ms) \
-                     must not exceed the shortest window ({min_window_ms} ms) for the Valkey sliding_window backend"
-                )
-                .into());
-            }
-            Ok(Arc::new(ValkeySlidingWindowBackend::new(ValkeySlidingWindowConfig {
-                valkey: (**valkey).clone(),
-                namespace: namespace.clone(),
-                rule: rule_name.to_owned(),
-                budgets,
-                reservation_timeout_ms,
-                max_keys,
-                max_active_reservations: MAX_ACTIVE_RESERVATIONS,
-            })))
-        },
+        BackendResource::Valkey { valkey, namespace } => build_sw_valkey_backend(
+            rule_name,
+            budgets,
+            reservation_timeout_ms,
+            max_keys,
+            valkey,
+            namespace.as_str(),
+        ),
     }
+}
+
+/// Validate and construct the Valkey sliding-window backend for one rule.
+///
+/// Separated from [`build_sliding_window_backend`] to keep both functions
+/// within the line-count limit enforced by `clippy::too_many_lines`.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if `reservation_timeout_ms` exceeds the shortest
+/// budget window, which would cause late settlements to miss their window.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors build_token_bucket_backend; parameters are all distinct and required"
+)]
+fn build_sw_valkey_backend(
+    rule_name: &str,
+    budgets: Vec<Budget>,
+    reservation_timeout_ms: u64,
+    max_keys: usize,
+    valkey: &ValkeyConnection,
+    namespace: &str,
+) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
+    let min_window_ms = budgets.iter().map(|b| b.window_ms).min().unwrap_or(0);
+    if reservation_timeout_ms > min_window_ms {
+        return Err(format!(
+            "token_rate_limit: rule '{rule_name}': reservation_timeout ({reservation_timeout_ms} ms) \
+             must not exceed the shortest window ({min_window_ms} ms) for the Valkey sliding_window backend"
+        )
+        .into());
+    }
+    Ok(Arc::new(ValkeySlidingWindowBackend::new(ValkeySlidingWindowConfig {
+        valkey: valkey.clone(),
+        namespace: namespace.to_owned(),
+        rule: rule_name.to_owned(),
+        budgets,
+        reservation_timeout_ms,
+        max_keys,
+        max_active_reservations: MAX_ACTIVE_RESERVATIONS,
+    })))
 }
 
 /// Build the configured state backend for a `token_bucket` rule
@@ -1198,7 +1227,6 @@ pub struct TokenRateLimitFilter {
     /// Compiled budget-key spec (ai#123). Partition every matching
     /// rule's budget by the configured dimensions.
     key_spec: CompiledKeySpec,
-
 }
 
 impl TokenRateLimitFilter {
@@ -1248,7 +1276,7 @@ impl TokenRateLimitFilter {
         clippy::cast_possible_truncation,
         reason = "millis since Unix epoch fit u64 until year ~292 million"
     )]
-    fn now_ms(&self) -> u64 {
+    fn now_ms() -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1400,7 +1428,9 @@ impl TokenRateLimitFilter {
                 record_admission_span(ctx, rule, pending.request_estimate, "admitted");
                 FilterAction::Continue
             },
-            Ok(BackendReserve::Denied { retry_after_ms, reason, .. }) => {
+            Ok(BackendReserve::Denied {
+                retry_after_ms, reason, ..
+            }) => {
                 tracing::info!(
                     estimate = pending.request_estimate,
                     key = pending.key,
@@ -1508,7 +1538,7 @@ impl TokenRateLimitFilter {
             key,
             reservation_id,
             actual,
-            now_ms: self.now_ms(),
+            now_ms: Self::now_ms(),
         };
         Some((request, rule))
     }
@@ -1785,7 +1815,7 @@ impl HttpFilter for TokenRateLimitFilter {
         if self.needs_body {
             return Ok(FilterAction::Continue);
         }
-        let now_ms = self.now_ms();
+        let now_ms = Self::now_ms();
         let Some((rule_index, rule)) = self.matching_rule(&ctx.request.headers) else {
             return Ok(FilterAction::Continue);
         };
@@ -1822,7 +1852,7 @@ impl HttpFilter for TokenRateLimitFilter {
         if !end_of_stream || !self.needs_body {
             return Ok(FilterAction::Continue);
         }
-        let now_ms = self.now_ms();
+        let now_ms = Self::now_ms();
         let Some((rule_index, rule)) = self.matching_rule(&ctx.request.headers) else {
             return Ok(FilterAction::Continue);
         };

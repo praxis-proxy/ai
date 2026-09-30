@@ -234,7 +234,11 @@ impl TokenRateLimitStateBackend for InMemoryTokenRateLimitBackend {
                 usage_after: reservation.usage_after,
                 remaining: reservation.remaining,
             },
-            Decision::Denied { retry_after_ms, reason, remaining } => BackendReserve::Denied {
+            Decision::Denied {
+                retry_after_ms,
+                reason,
+                remaining,
+            } => BackendReserve::Denied {
                 retry_after_ms,
                 reason,
                 remaining,
@@ -371,8 +375,14 @@ impl TokenRateLimitStateBackend for InMemoryTokenBucketBackend {
                 usage_after: reservation.usage_after,
                 remaining: reservation.remaining,
             },
-            token_bucket_ledger::Decision::Denied { retry_after_ms, reason, remaining } => {
-                BackendReserve::Denied { retry_after_ms, reason, remaining }
+            token_bucket_ledger::Decision::Denied {
+                retry_after_ms,
+                reason,
+                remaining,
+            } => BackendReserve::Denied {
+                retry_after_ms,
+                reason,
+                remaining,
             },
         };
         self.last_remaining.store(reply.remaining(), Ordering::Relaxed);

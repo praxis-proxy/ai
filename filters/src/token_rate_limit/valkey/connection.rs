@@ -88,19 +88,15 @@ impl ValkeyConnection {
     /// and none becomes available within [`VALKEY_TIMEOUT`].
     pub(super) async fn transaction(&self) -> Result<TransactionConnection, BackendError> {
         let idle = self.transactions.idle.lock().await.pop();
-        let (connection, permit) = match idle {
-            Some(PooledConnection { connection, permit }) => (connection, permit),
-            None => {
-                let permit = tokio::time::timeout(
-                    VALKEY_TIMEOUT,
-                    Arc::clone(&self.transactions.semaphore).acquire_owned(),
-                )
+        let (connection, permit) = if let Some(PooledConnection { connection, permit }) = idle {
+            (connection, permit)
+        } else {
+            let permit = tokio::time::timeout(VALKEY_TIMEOUT, Arc::clone(&self.transactions.semaphore).acquire_owned())
                 .await
-                .map_err(|_| BackendError::Unavailable("transaction pool exhausted: timeout".into()))?
-                .map_err(|_| BackendError::Unavailable("transaction pool closed".into()))?;
-                let connection = self.open().await?;
-                (connection, permit)
-            },
+                .map_err(|_elapsed| BackendError::Unavailable("transaction pool exhausted: timeout".into()))?
+                .map_err(|_closed| BackendError::Unavailable("transaction pool closed".into()))?;
+            let connection = self.open().await?;
+            (connection, permit)
         };
         Ok(TransactionConnection {
             connection,
@@ -137,7 +133,9 @@ impl ValkeyConnection {
 
 /// An idle connection paired with its semaphore permit.
 struct PooledConnection {
+    /// The idle connection ready for reuse.
     connection: MultiplexedConnection,
+    /// Permit held while the connection is alive; released on drop.
     permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -179,7 +177,11 @@ impl TransactionConnection {
     /// Return the connection to the pool for reuse, or drop both when
     /// [`MAX_IDLE_TRANSACTION_CONNECTIONS`] are already idle.
     pub(super) async fn finish(self) {
-        let Self { connection, pool, permit } = self;
+        let Self {
+            connection,
+            pool,
+            permit,
+        } = self;
         let mut idle = pool.idle.lock().await;
         if idle.len() < MAX_IDLE_TRANSACTION_CONNECTIONS {
             idle.push(PooledConnection { connection, permit });
@@ -230,9 +232,14 @@ mod tests {
             connection.connection.lock().await.is_some(),
             "a successful pipeline keeps the cached connection"
         );
+        drop(connection);
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "first and second are consumed by finish()/drop(); lint fires spuriously on transient borrows across await"
+    )]
     async fn live_valkey_transaction_connections_are_reused_after_finish() {
         let Some(url) = valkey_url() else {
             return;
@@ -240,15 +247,21 @@ mod tests {
         let connection = ValkeyConnection::new(url).unwrap();
         let first = connection.transaction().await.unwrap();
         first.finish().await;
-        let _second = connection.transaction().await.unwrap();
+        let second = connection.transaction().await.unwrap();
         assert_eq!(
             connection.transactions.idle.lock().await.len(),
             0,
             "the returned connection was handed out again instead of opening another"
         );
+        drop(second);
+        drop(connection);
     }
 
     #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "checked_out is consumed by the finish loop; lint fires spuriously on the Vec's element drops across await"
+    )]
     async fn live_valkey_finishing_more_than_the_idle_cap_keeps_exactly_the_cap() {
         let Some(url) = valkey_url() else {
             return;
@@ -266,6 +279,8 @@ mod tests {
             MAX_IDLE_TRANSACTION_CONNECTIONS,
             "connections finished beyond the idle cap are dropped, not pooled"
         );
+        // Drop the connection (and its idle pool) before the test ends.
+        drop(connection);
     }
 
     #[tokio::test]
@@ -309,6 +324,7 @@ mod tests {
             connection.connection.lock().await.is_none(),
             "a failed pipeline drops the cached connection"
         );
+        drop(connection);
     }
 
     #[test]
