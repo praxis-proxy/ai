@@ -217,9 +217,24 @@ async fn response_store_persists_streamed_post_then_get_returns_completed_json()
         "streaming response should keep the text/event-stream content type"
     );
     let body = parse_body(&raw);
-    assert!(
-        body.contains("response.completed"),
-        "streaming response body should contain the terminal response.completed event: {body}"
+    let completed = sse_completed_events(&body);
+    assert_eq!(
+        completed.len(),
+        1,
+        "client stream must dispatch exactly one blank-line-terminated response.completed event: {body}"
+    );
+    let completed_response = &completed[0]["response"];
+    assert_eq!(
+        completed_response["id"], "resp_stream_store",
+        "terminal event should carry the streamed response id"
+    );
+    assert_eq!(
+        completed_response["status"], "completed",
+        "terminal event should report the completed status"
+    );
+    assert_eq!(
+        completed_response["output"][0]["content"][0]["text"], "Streamed reply",
+        "terminal event should carry the accumulated output text"
     );
 
     // An immediate ordinary GET returns the completed JSON object built from the
@@ -447,4 +462,37 @@ fn get_missing_input_items_returns_404() {
             .contains("resp_nonexistent"),
         "error message should include the missing ID"
     );
+}
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// Parse `response.completed` events from a fully accumulated SSE body.
+///
+/// Splits the body into `\n\n`-delimited frames and returns the parsed `data:`
+/// JSON of every frame whose `type` is `response.completed`. Only frames
+/// terminated by the required blank-line boundary are considered — SSE dispatches
+/// an event only at that boundary, so a truncated final frame is never counted —
+/// and malformed `data:` JSON is dropped rather than matched by a naive
+/// substring.
+fn sse_completed_events(body: &str) -> Vec<serde_json::Value> {
+    let mut frames: Vec<&str> = body.split("\n\n").collect();
+    // Drop the segment after the final boundary: it is either empty (the body
+    // ended with the blank line) or an unterminated, undispatched partial frame.
+    frames.pop();
+
+    frames
+        .iter()
+        .filter_map(|frame| {
+            let data = frame
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(|value| value.strip_prefix(' ').unwrap_or(value))
+                .collect::<Vec<_>>()
+                .join("\n");
+            serde_json::from_str::<serde_json::Value>(&data).ok()
+        })
+        .filter(|event| event["type"] == "response.completed")
+        .collect()
 }
