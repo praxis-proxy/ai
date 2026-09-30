@@ -156,6 +156,21 @@ mod tests {
     }
 
     #[test]
+    fn generated_contracts_accept_configuration_update_items() {
+        validate_input_item(&json!({
+            "type": "configuration_update",
+            "reasoning": {"effort": "high"}
+        }))
+        .unwrap();
+        validate_output_item(&json!({
+            "type": "configuration_update",
+            "id": "cnfu_1",
+            "reasoning": {"effort": "high"}
+        }))
+        .unwrap();
+    }
+
+    #[test]
     fn generated_contracts_reject_unknown_and_malformed_items() {
         let unknown = validate_input_item(&json!({"type": "future_item"})).unwrap_err();
         assert!(
