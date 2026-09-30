@@ -1846,7 +1846,10 @@ fn build_success_result(
             "name": tool_name,
             "arguments": arguments,
             "output": output_text,
-            "error": output_text,
+            "error": {
+                "type": "mcp_tool_execution_error",
+                "content": output_text,
+            },
         })
     } else {
         serde_json::json!({
@@ -1914,7 +1917,10 @@ fn build_error_result(
         "name": tool_name,
         "arguments": arguments,
         "output": "",
-        "error": error_message,
+        "error": {
+            "type": "mcp_tool_execution_error",
+            "content": error_message,
+        },
     });
 
     McpCallResult { message, output_item }

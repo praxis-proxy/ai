@@ -646,10 +646,22 @@ pub(super) fn normalize_item(ctx: &HttpFilterContext<'_>, item: Value) -> Result
     };
     map.insert("id".to_owned(), Value::String(item_id.clone()));
     normalize_message_item(&mut map)?;
+    strip_known_nullable_nulls(&mut map);
     default_item_status(&mut map);
     let item = Value::Object(map);
     validate_output_item(&item)?;
     Ok((item_id, item))
+}
+
+/// Input permits null qualifiers, but output permits only absent or string qualifiers.
+fn strip_known_nullable_nulls(map: &mut Map<String, Value>) {
+    if map.get("type").and_then(Value::as_str) == Some("function_call_output") {
+        for key in ["name", "namespace"] {
+            if map.get(key).is_some_and(Value::is_null) {
+                map.remove(key);
+            }
+        }
+    }
 }
 
 /// Default a missing or `null` item `status` to `completed`.
@@ -1172,6 +1184,40 @@ mod tests {
 
         assert_eq!(normalized[0]["annotations"], serde_json::json!([]));
         assert_eq!(normalized[0]["logprobs"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn function_output_nullable_qualifiers_normalize_and_validate() {
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/conversations");
+        let ctx = crate::test_utils::make_owned_filter_context(&req);
+        for (name, namespace) in [
+            (Value::Null, Value::Null),
+            (serde_json::json!("lookup"), Value::Null),
+            (Value::Null, serde_json::json!("weather")),
+            (serde_json::json!("lookup"), serde_json::json!("weather")),
+        ] {
+            let input = serde_json::json!({
+                "type": "function_call_output", "call_id": "call_1", "output": "done",
+                "name": name, "namespace": namespace,
+            });
+            super::super::item_schema::validate_input_item(&input).unwrap();
+            let (_, output) = normalize_item(&ctx, input).unwrap();
+            for (key, value) in [("name", name), ("namespace", namespace)] {
+                if value.is_null() {
+                    assert!(output.get(key).is_none());
+                } else {
+                    assert_eq!(output[key], value);
+                }
+            }
+            validate_output_item(&output).unwrap();
+        }
+        let invalid = serde_json::json!({
+            "type": "function_call_output", "call_id": "call_1", "output": "done", "name": 42,
+        });
+        assert!(
+            normalize_item(&ctx, invalid).is_err(),
+            "non-null invalid qualifiers stay invalid"
+        );
     }
 
     #[test]

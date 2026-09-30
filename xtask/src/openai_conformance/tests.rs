@@ -391,6 +391,48 @@ fn oasdiff_report_counts_missing_and_drifted_as_nonconformant() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "complete eight-operation response-drift regression"
+)]
+fn missing_rate_limit_responses_remain_actionable_for_every_conversation_operation() {
+    let operations = registered_supported_operations()
+        .into_iter()
+        .map(|operation| SpecOperation {
+            key: OperationKey::new(&operation.method, &operation.path),
+            operation_id: None,
+            tag: operation.area,
+            area: CONVERSATIONS_SCOPE.label,
+            deprecated: false,
+            beta: false,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(operations.len(), 8);
+    let drifted = operations
+        .iter()
+        .map(|operation| {
+            let drift = operation_drift_from_diff(operation.key.clone(), &json!({"responses": {"deleted": ["429"]}}))
+                .expect("missing 429 must produce response drift");
+            assert_eq!(drift.response_details, ["responses.deleted"]);
+            assert!(drift.request_details.is_empty());
+            assert!(drift.other_details.is_empty());
+            (operation.key.clone(), drift)
+        })
+        .collect();
+    let report = build_oasdiff_report(
+        OASDIFF_VERSION,
+        &operations,
+        BTreeSet::new(),
+        drifted,
+        Vec::new(),
+        Vec::new(),
+    );
+    assert_eq!(report.response_drift_count(), 8);
+    assert_eq!(report.conformant, 0);
+    assert_eq!(report.drifted.len(), 8);
+}
+
+#[test]
 #[expect(clippy::too_many_lines, reason = "representative oasdiff JSON fixture")]
 fn schema_property_named_description_is_not_ignored() {
     let drift = operation_drift_from_diff(
