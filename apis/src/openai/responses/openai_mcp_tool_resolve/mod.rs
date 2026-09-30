@@ -2626,6 +2626,10 @@ fn check_json_body_size(body: &serde_json::Value, max_rewritten_body_bytes: usiz
 }
 
 /// Call `tools/list` for one deferred connector, redacting URLs on error.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "deferred discovery threads one owned entry through the existing callout security boundary"
+)]
 async fn list_deferred_connector(
     connector: &DeferredMcpConnector,
     entry: &serde_json::Value,
@@ -3145,6 +3149,10 @@ fn tool_read_only_hint(tool: &serde_json::Value) -> bool {
 
 /// Insert resolved tools into the tool map keyed by
 /// `(server_label, tool_name)`, consuming the definitions.
+#[expect(
+    clippy::too_many_lines,
+    reason = "explicit map construction moves tool definitions while preserving dispatch metadata"
+)]
 fn insert_tools(
     tools: Vec<serde_json::Value>,
     entry: &serde_json::Value,
