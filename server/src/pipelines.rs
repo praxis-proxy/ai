@@ -68,7 +68,7 @@ pub fn resolve_pipelines(
 /// # Errors
 ///
 /// Returns an error from store wiring validation or pipeline construction.
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 pub fn validate_pipelines_with_store_wiring(
     config: &Config,
     registry: &FilterRegistry,

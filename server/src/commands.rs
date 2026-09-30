@@ -43,7 +43,7 @@ pub(crate) fn validate_config_for_startup(config: &Config) -> Result<(), Box<dyn
     }
     let health_registry = praxis_core::health::build_health_registry(&config.clusters);
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     praxis_ai::validate_pipelines_with_store_wiring(
         config,
         &registry,
@@ -51,7 +51,7 @@ pub(crate) fn validate_config_for_startup(config: &Config) -> Result<(), Box<dyn
         &kv_stores,
         &subrequest_client,
     )?;
-    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    #[cfg(not(feature = "_store-backend"))]
     praxis_ai::resolve_pipelines(config, &registry, &health_registry, &kv_stores, &subrequest_client)?;
     Ok(())
 }

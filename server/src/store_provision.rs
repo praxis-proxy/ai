@@ -9,7 +9,7 @@
 //! pools bind to the runtime that opens them, so provisioning must run there, not
 //! on the config-watcher runtime a reload uses.
 
-#![cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#![cfg(feature = "_store-backend")]
 
 #[cfg(feature = "openai-conversations")]
 use std::collections::HashSet;
@@ -1233,7 +1233,7 @@ async fn release_after_drain(old_pipelines: Vec<Weak<FilterPipeline>>, leases: V
     release_leases(leases).await;
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "store-postgres", feature = "store-sqlite")))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(clippy::expect_used, clippy::too_many_lines, reason = "tests")]
 mod tests {

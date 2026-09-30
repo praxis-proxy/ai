@@ -110,7 +110,7 @@ fn boot_server(
 
     let health_registry = build_health_registry(&config.clusters);
     #[cfg_attr(
-        not(any(feature = "store-postgres", feature = "store-sqlite")),
+        not(feature = "_store-backend"),
         expect(unused_mut, reason = "store_service is taken only with a store backend")
     )]
     let mut state = build_server_state(&config, &registry, &health_registry, subrequest_client);
@@ -123,7 +123,7 @@ fn boot_server(
     // Provision response-store backends as a serving-runtime startup service.
     // The service holds Pingora's ready notifier until every initial pool is
     // open and exits startup on a terminal failure.
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     if let Some(service) = state.store_service.take() {
         server
             .server_mut()
@@ -132,7 +132,7 @@ fn boot_server(
                 service,
             ));
     }
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     register_store_readiness_endpoint(
         &mut server,
         state.store_readiness.clone(),
@@ -168,11 +168,11 @@ struct ServerState {
     health_slot: crate::SharedHealthRegistry,
     /// Serving-runtime store provisioner, taken by `boot_server` and registered
     /// as a Pingora background service before the server runs.
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     store_service: Option<crate::store_provision::StoreProvisionService>,
     /// Readiness handle the store provisioner drives, read by the readiness
     /// endpoint.
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     store_readiness: crate::store_provision::StoreReadinessHandle,
 }
 
@@ -190,12 +190,12 @@ fn build_server_state(
     info!("building filter pipelines");
     let kv_stores = praxis_core::kv::KvStoreRegistry::new();
 
-    #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+    #[cfg(feature = "_store-backend")]
     let (store_registries, store_service, store_reload, store_readiness) =
         crate::store_provision::build_store_wiring(config).unwrap_or_else(|e| fatal(&e));
-    #[cfg(all(feature = "store", not(any(feature = "store-postgres", feature = "store-sqlite"))))]
+    #[cfg(all(feature = "store", not(feature = "_store-backend")))]
     let store_registries = crate::StoreRegistries::default();
-    #[cfg(not(any(feature = "store-postgres", feature = "store-sqlite")))]
+    #[cfg(not(feature = "_store-backend"))]
     let store_reload = crate::StoreReloadHandle::default();
 
     #[cfg(feature = "store")]
@@ -230,9 +230,9 @@ fn build_server_state(
         health_shutdown,
         store_reload,
         health_slot,
-        #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+        #[cfg(feature = "_store-backend")]
         store_service: Some(store_service),
-        #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+        #[cfg(feature = "_store-backend")]
         store_readiness,
     }
 }
@@ -322,7 +322,7 @@ fn register_admin_endpoints(
 /// It runs on a separate port because the protocol admin service owns its route
 /// set. It reads the provisioning readiness handle and composes it with cluster
 /// health, so an orchestrator probe gates traffic on store provisioning.
-#[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(feature = "_store-backend")]
 fn register_store_readiness_endpoint(
     server: &mut PingoraServerRuntime,
     readiness: crate::store_provision::StoreReadinessHandle,
