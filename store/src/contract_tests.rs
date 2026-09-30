@@ -848,13 +848,13 @@ async fn event_log_requires_owner_matched_response(backend: &dyn PersistedStateB
             .event_log_status(&b, "resp_events_scope")
             .await
             .expect("status as b"),
-        EventLogStatus::default(),
+        EventLogStatus::Absent,
         "event-log status leaked to a non-owner"
     );
 }
 
-/// `event_log_status` distinguishes no-log, incomplete, and replayable, gating
-/// `has_terminal` on a terminal event being present.
+/// `event_log_status` distinguishes no-log, incomplete, and replayable, marking
+/// the log replayable only once a terminal event is present.
 #[expect(clippy::too_many_lines, reason = "linear contract assertions")]
 async fn event_log_status_gates_on_terminal(backend: &dyn PersistedStateBackend) {
     let o = owner("events-status");
@@ -865,7 +865,7 @@ async fn event_log_status_gates_on_terminal(backend: &dyn PersistedStateBackend)
             .event_log_status(&o, "resp_events_status")
             .await
             .expect("status with no log"),
-        EventLogStatus::default(),
+        EventLogStatus::Absent,
         "a response with no events reported a log"
     );
 
@@ -885,11 +885,7 @@ async fn event_log_status_gates_on_terminal(backend: &dyn PersistedStateBackend)
             .event_log_status(&o, "resp_events_status")
             .await
             .expect("status incomplete"),
-        EventLogStatus {
-            exists: true,
-            has_terminal: false,
-            max_sequence: Some(1),
-        },
+        EventLogStatus::Incomplete { max_sequence: 1 },
         "an incomplete log was misreported"
     );
 
@@ -902,11 +898,7 @@ async fn event_log_status_gates_on_terminal(backend: &dyn PersistedStateBackend)
             .event_log_status(&o, "resp_events_status")
             .await
             .expect("status replayable"),
-        EventLogStatus {
-            exists: true,
-            has_terminal: true,
-            max_sequence: Some(2),
-        },
+        EventLogStatus::Replayable { max_sequence: 2 },
         "a replayable log was misreported"
     );
 }
@@ -948,7 +940,7 @@ async fn event_log_removed_with_response(backend: &dyn PersistedStateBackend) {
             .event_log_status(&o, "resp_events_delete")
             .await
             .expect("status after delete"),
-        EventLogStatus::default(),
+        EventLogStatus::Absent,
         "event-log status survived its response"
     );
 }

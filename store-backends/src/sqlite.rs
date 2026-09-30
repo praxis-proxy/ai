@@ -926,7 +926,7 @@ impl ResponseStore for SqliteResponseStore {
 
         let count: i64 = row.try_get("cnt").map_err(|e| StoreError::Database(e.to_string()))?;
         if count == 0 {
-            return Ok(EventLogStatus::default());
+            return Ok(EventLogStatus::Absent);
         }
         let max_seq: Option<String> = row
             .try_get("max_seq")
@@ -934,11 +934,21 @@ impl ResponseStore for SqliteResponseStore {
         let has_terminal: i64 = row
             .try_get("has_terminal")
             .map_err(|e| StoreError::Database(e.to_string()))?;
-        Ok(EventLogStatus {
-            exists: true,
-            has_terminal: has_terminal != 0,
-            max_sequence: max_seq.as_deref().map(parse_sequence).transpose()?,
-        })
+        // COUNT(*) > 0 guarantees MAX(sequence_number) is non-null; a NULL here
+        // means the row set is corrupt, so fail closed rather than fabricate a
+        // sequence.
+        let max_sequence = max_seq
+            .as_deref()
+            .map(parse_sequence)
+            .transpose()?
+            .ok_or_else(|| {
+                StoreError::Database("event log has rows but no maximum sequence number".to_string())
+            })?;
+        if has_terminal != 0 {
+            Ok(EventLogStatus::Replayable { max_sequence })
+        } else {
+            Ok(EventLogStatus::Incomplete { max_sequence })
+        }
     }
 }
 

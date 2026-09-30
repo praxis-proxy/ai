@@ -370,13 +370,16 @@ impl ResponseStore for InMemoryStore {
     async fn event_log_status(&self, owner: &StateOwner, response_id: &str) -> Result<EventLogStatus, StoreError> {
         let inner = self.lock()?;
         let Some(log) = inner.events.get(&(owner.clone(), response_id.to_owned())) else {
-            return Ok(EventLogStatus::default());
+            return Ok(EventLogStatus::Absent);
         };
-        Ok(EventLogStatus {
-            exists: !log.is_empty(),
-            has_terminal: log.iter().any(|event| event.terminal),
-            max_sequence: log.iter().map(|event| event.sequence_number).max(),
-        })
+        let Some(max_sequence) = log.iter().map(|event| event.sequence_number).max() else {
+            return Ok(EventLogStatus::Absent);
+        };
+        if log.iter().any(|event| event.terminal) {
+            Ok(EventLogStatus::Replayable { max_sequence })
+        } else {
+            Ok(EventLogStatus::Incomplete { max_sequence })
+        }
     }
 }
 

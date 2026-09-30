@@ -73,7 +73,10 @@ use crate::{
     openai::include::{IncludeFields, decode_query_component_strict, parse_include},
     service::responses::ResponsesService,
     state_owner::{StateOwner, require_state_owner},
-    store::{PendingApprovalRecord, ResponseEventRecord, ResponseRecord, ResponseStoreRegistry, StoreError},
+    store::{
+        EventLogStatus, PendingApprovalRecord, ResponseEventRecord, ResponseRecord, ResponseStoreRegistry,
+        StoreError,
+    },
 };
 
 /// Number of replay-log events fetched from the store per streamed page. Bounds
@@ -1585,13 +1588,8 @@ async fn ensure_response_exists(service: &ResponsesService, id: &str) -> Result<
 /// page short of it means rows were removed mid-replay.
 async fn ensure_replayable_log(service: &ResponsesService, id: &str) -> Result<u64, FilterAction> {
     match service.event_log_status(id).await {
-        Ok(status) if status.has_terminal => status.max_sequence.ok_or_else(|| {
-            // A terminal event implies a maximum sequence; a `None` here is a store
-            // invariant violation, not a client error.
-            warn!(response_id = id, "replay: terminal log missing a maximum sequence");
-            FilterAction::Reject(reject_store_error())
-        }),
-        Ok(_) => {
+        Ok(EventLogStatus::Replayable { max_sequence }) => Ok(max_sequence),
+        Ok(EventLogStatus::Absent | EventLogStatus::Incomplete { .. }) => {
             debug!(response_id = id, "replay: no replayable event log");
             Err(FilterAction::Reject(reject_invalid_input(NO_REPLAY_LOG_MESSAGE)))
         },

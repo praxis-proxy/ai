@@ -190,21 +190,31 @@ pub struct ResponseEventRecord {
 
 /// Cheap pre-stream gate describing a response's event log.
 ///
-/// Distinguishes "no log" (`exists == false` — legacy or non-streamed record)
-/// from "incomplete log" (`exists == true`, `has_terminal == false` — a stream
-/// that aborted before its terminal event) from "replayable"
-/// (`has_terminal == true`). Only a replayable log may be served as a complete
-/// SSE replay.
+/// The three variants are mutually exclusive and each carries only the data
+/// that state needs, so states no backend should produce (a terminal event
+/// with no maximum sequence, or a terminal event with no rows) cannot be
+/// represented. Only [`EventLogStatus::Replayable`] may be served as a
+/// complete SSE replay.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EventLogStatus {
-    /// Whether any event rows exist for the response.
-    pub exists: bool,
+pub enum EventLogStatus {
+    /// No event rows exist (legacy or non-streamed record).
+    #[default]
+    Absent,
 
-    /// Whether a terminal event row exists (the log reached a clean end).
-    pub has_terminal: bool,
+    /// Rows exist but no terminal event was recorded (a stream that aborted
+    /// before its terminal event). Carries the highest stored
+    /// `sequence_number`.
+    Incomplete {
+        /// Highest stored `sequence_number`.
+        max_sequence: u64,
+    },
 
-    /// Highest stored `sequence_number`, if any rows exist.
-    pub max_sequence: Option<u64>,
+    /// The log reached a terminal event and can be replayed in full. Carries
+    /// the highest stored `sequence_number` (the terminal event's).
+    Replayable {
+        /// Highest stored `sequence_number`.
+        max_sequence: u64,
+    },
 }
 
 // -----------------------------------------------------------------------------

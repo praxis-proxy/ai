@@ -990,14 +990,17 @@ impl crate::store::ResponseStore for RecordingResponseStore {
     ) -> Result<crate::store::EventLogStatus, crate::store::StoreError> {
         let logs = self.events.lock().expect("events mutex should not be poisoned");
         let Some(log) = logs.get(response_id) else {
-            return Ok(crate::store::EventLogStatus::default());
+            return Ok(crate::store::EventLogStatus::Absent);
         };
         let owned: Vec<&crate::store::ResponseEventRecord> = log.iter().filter(|e| e.owner == *owner).collect();
-        Ok(crate::store::EventLogStatus {
-            exists: !owned.is_empty(),
-            has_terminal: owned.iter().any(|e| e.terminal),
-            max_sequence: owned.iter().map(|e| e.sequence_number).max(),
-        })
+        let Some(max_sequence) = owned.iter().map(|e| e.sequence_number).max() else {
+            return Ok(crate::store::EventLogStatus::Absent);
+        };
+        if owned.iter().any(|e| e.terminal) {
+            Ok(crate::store::EventLogStatus::Replayable { max_sequence })
+        } else {
+            Ok(crate::store::EventLogStatus::Incomplete { max_sequence })
+        }
     }
 }
 
