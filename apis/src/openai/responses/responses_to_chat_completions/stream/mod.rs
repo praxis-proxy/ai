@@ -28,7 +28,7 @@ mod framing;
     clippy::too_many_lines,
     reason = "tests"
 )]
-mod tests;
+pub(crate) mod tests;
 
 use praxis_filter::FilterError;
 use serde_json::{Map, Value, json};
@@ -47,7 +47,7 @@ use crate::openai::translation::chat_completions::{
 
 /// Resource limits governing one streaming translation.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct StreamLimits {
+pub(crate) struct StreamLimits {
     /// Maximum bytes buffered by the SSE frame parser.
     pub(super) max_sse_buffer_bytes: usize,
     /// Maximum total number of Responses SSE events emitted, including the

@@ -1362,7 +1362,6 @@ fn add_structure(current: DocumentResourceUsage, next: DocumentResourceUsage) ->
     }
 }
 
-
 /// Marks one body EOF and completes the attempt if the connection also succeeded.
 fn mark_body_delivered(shared: &RecorderShared, slot: usize) -> bool {
     mark_delivery_boundary(shared, slot, |body_delivered, _connection_succeeded| {

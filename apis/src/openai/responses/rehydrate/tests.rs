@@ -1642,7 +1642,6 @@ async fn conversation_null_messages_treated_as_empty() {
     );
 }
 
-
 // -----------------------------------------------------------------------------
 // Response-side previous_response_id restore (issue #932)
 // -----------------------------------------------------------------------------

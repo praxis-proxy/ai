@@ -10,14 +10,10 @@
 //! the specification after all.
 
 use super::{
-    area::{OPENAI_REFERENCE_MANIFEST, OPENAI_REFERENCE_SPEC},
-    model::OperationScope,
+    area::{OPENAI_REFERENCE_MANIFEST, OPENAI_REFERENCE_SPEC, RESPONSES_SCOPE},
     registry_check::{ok_summary, tally},
     spec::{load_reference_source, project_reference},
 };
-
-/// Responses operations selected from the pinned specification.
-const RESPONSES_SCOPE: OperationScope = OperationScope::new("responses", "Responses", &["/responses"]);
 
 /// Compare the runtime Responses registry against the pinned specification.
 pub(super) fn check() -> Result<String, String> {

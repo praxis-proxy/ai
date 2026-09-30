@@ -495,7 +495,6 @@ fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
             .is_some_and(|v| v == "true")
 }
 
-
 /// Process a single SSE event block (lines between double-newlines).
 ///
 /// Collects all `data` fields into one newline-delimited payload before
