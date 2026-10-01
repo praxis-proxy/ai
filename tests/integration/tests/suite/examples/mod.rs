@@ -75,7 +75,7 @@ mod openai_response_store;
 mod openai_response_store_postgres;
 #[cfg(feature = "store-postgres")]
 mod openai_response_store_postgres_mtls;
-#[cfg(feature = "openai-file-resolve-filter")]
+#[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]
 mod openai_responses_body_size_limits;
 mod openai_responses_format;
 mod openai_responses_model_rewrite;
