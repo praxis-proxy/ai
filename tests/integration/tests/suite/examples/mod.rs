@@ -25,6 +25,8 @@ mod client_tool_compat_chat_completions;
 mod compact;
 mod credential_injection;
 mod external_metering;
+#[cfg(target_os = "linux")]
+mod file_descriptor_limits;
 mod file_search_callout;
 mod file_search_chat_completions;
 mod file_search_streaming;
@@ -74,7 +76,7 @@ mod openai_response_store;
 mod openai_response_store_postgres;
 #[cfg(feature = "store-postgres")]
 mod openai_response_store_postgres_mtls;
-#[cfg(feature = "openai-file-resolve-filter")]
+#[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]
 mod openai_responses_body_size_limits;
 mod openai_responses_format;
 mod openai_responses_model_rewrite;

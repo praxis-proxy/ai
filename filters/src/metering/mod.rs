@@ -258,7 +258,7 @@ impl ExternalMeteringFilter {
             body: Bytes::new(),
         };
 
-        let result = subrequest::execute_url(
+        let result = subrequest::execute_configured_url(
             &self.subrequest_client,
             &url,
             request,
@@ -788,7 +788,7 @@ fn spawn_usage_report(
         };
 
         report_delivery(
-            subrequest::execute_url(
+            subrequest::execute_configured_url(
                 &client,
                 &url,
                 request,

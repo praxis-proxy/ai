@@ -57,7 +57,7 @@ impl Backend {
             status: 200,
             chunks,
             headers: Vec::new(),
-            stall_after_first_chunk: None,
+            pacing: ChunkPacing::default(),
         }
     }
 
@@ -149,9 +149,19 @@ pub struct ChunkedBackend {
     /// Extra response headers as `(name, value)` pairs.
     headers: Vec<(String, String)>,
 
-    /// Optional pause after the first body chunk, to simulate a stalled SSE
-    /// upstream that has already committed headers.
-    stall_after_first_chunk: Option<Duration>,
+    /// Pauses while writing the body.
+    pacing: ChunkPacing,
+}
+
+/// When a [`ChunkedBackend`] pauses while writing its body.
+#[derive(Clone, Copy, Default)]
+struct ChunkPacing {
+    /// Pause before each chunk, to simulate a slow-drip streaming upstream.
+    before_each: Option<Duration>,
+
+    /// Pause after the first chunk, to simulate a stalled SSE upstream that
+    /// has already committed headers.
+    after_first: Option<Duration>,
 }
 
 impl ChunkedBackend {
@@ -175,7 +185,15 @@ impl ChunkedBackend {
     /// seen a valid SSE frame, then the backend goes silent.
     #[must_use]
     pub fn stall_after_first_chunk(mut self, stall: Duration) -> Self {
-        self.stall_after_first_chunk = Some(stall);
+        self.pacing.after_first = Some(stall);
+        self
+    }
+
+    /// Sleep `delay` before writing each chunk, simulating a slow-drip
+    /// streaming upstream that never idles out.
+    #[must_use]
+    pub fn chunk_delay(mut self, delay: Duration) -> Self {
+        self.pacing.before_each = Some(delay);
         self
     }
 
@@ -188,7 +206,7 @@ impl ChunkedBackend {
         let status = self.status;
         let chunks = self.chunks;
         let headers = self.headers;
-        let stall_after_first_chunk = self.stall_after_first_chunk;
+        let pacing = self.pacing;
 
         spawn_tcp_server_with_shutdown(move |mut stream| {
             stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -200,18 +218,18 @@ impl ChunkedBackend {
             // streamed body. A real upstream drains the request and sends a
             // graceful FIN, so mirror that here to keep streaming tests stable.
             let _request = read_full_request(&mut stream);
-            write_chunked_http_body(&mut stream, status, &headers, &chunks, stall_after_first_chunk);
+            write_chunked_http_body(&mut stream, status, &headers, &chunks, pacing);
         })
     }
 }
 
-/// Write a chunked HTTP response, optionally stalling after the first body chunk.
+/// Write a chunked HTTP response, pausing as `pacing` says.
 fn write_chunked_http_body(
     stream: &mut TcpStream,
     status: u16,
     headers: &[(String, String)],
     chunks: &[String],
-    stall_after_first_chunk: Option<Duration>,
+    pacing: ChunkPacing,
 ) {
     let reason = reason_phrase(status);
     let mut resp = format!(
@@ -224,19 +242,22 @@ fn write_chunked_http_body(
     resp.push_str("\r\n");
     let _sent = stream.write_all(resp.as_bytes());
     let _flushed = stream.flush();
-    write_chunked_payload(stream, chunks, stall_after_first_chunk);
+    write_chunked_payload(stream, chunks, pacing);
 }
 
 /// Write chunked-body payload bytes, including the terminating zero chunk.
-fn write_chunked_payload(stream: &mut TcpStream, chunks: &[String], stall_after_first_chunk: Option<Duration>) {
+fn write_chunked_payload(stream: &mut TcpStream, chunks: &[String], pacing: ChunkPacing) {
     for (index, chunk) in chunks.iter().enumerate() {
+        if let Some(delay) = pacing.before_each {
+            std::thread::sleep(delay);
+        }
         let hex_len = format!("{:x}\r\n", chunk.len());
         let _sent = stream.write_all(hex_len.as_bytes());
         let _sent = stream.write_all(chunk.as_bytes());
         let _sent = stream.write_all(b"\r\n");
         let _flushed = stream.flush();
         if index == 0
-            && let Some(stall) = stall_after_first_chunk
+            && let Some(stall) = pacing.after_first
         {
             std::thread::sleep(stall);
         }
@@ -740,6 +761,7 @@ fn build_config(address: &str, clusters: Vec<Cluster>, filters: Vec<FilterEntry>
     let listener = Listener {
         address: address.to_owned(),
         cluster: None,
+        downstream_keepalive_timeout_ms: None,
         downstream_read_timeout_ms: None,
         filter_chains: vec!["backend".to_owned()],
         max_connections: None,

@@ -3,6 +3,7 @@
 
 //! Server bootstrap for Praxis AI.
 
+mod fd_limit;
 pub(crate) mod pipelines;
 #[cfg(any(feature = "store-postgres", feature = "store-sqlite"))]
 pub mod readiness;

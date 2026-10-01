@@ -28,6 +28,7 @@ before sending requests.
 | [azure-ad.yaml](configs/azure-ad.yaml) | Acquires an Entra ID bearer token via the client-credentials grant and injects "Authorization: Bearer <token>" on every proxied request to Azure OpenAI |
 | [credential-injection.yaml](configs/credential-injection.yaml) | Injects per-cluster API credentials into upstream requests and strips client-provided credentials to prevent forwarding |
 | [external-metering.yaml](configs/external-metering.yaml) | Pre-request balance check and post-response token usage reporting against an external metering service |
+| [file-descriptor-limits.yaml](configs/file-descriptor-limits.yaml) | Size and protect the descriptor budget of a metered gateway: pin the process limit, shed requests with 503 before descriptors run out, cap concurrent requests and metering callouts, and close idle keep-alive clients and pooled upstream connections so they cannot pin descriptors |
 | [gcp-adc.yaml](configs/gcp-adc.yaml) | Acquires an OAuth2 access token from the GCE/GKE metadata server (source: adc or metadata) and injects "Authorization: Bearer <token>" on every proxied request to Vertex AI |
 | [identity-header-guard.yaml](configs/identity-header-guard.yaml) | Captures identity headers matching a prefix into filter metadata and strips them before forwarding upstream |
 | [intelligent-route-all-capabilities.yaml](configs/intelligent-route-all-capabilities.yaml) | Demonstrates every candidate capability and selection input handled by intelligent_route today |

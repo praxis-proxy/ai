@@ -1,0 +1,69 @@
+# File Descriptor Limits
+#
+# Size and protect the descriptor budget of a metered gateway: pin the
+# process limit, shed requests with 503 before descriptors run out, cap
+# concurrent requests and metering callouts, and close idle keep-alive
+# clients and pooled upstream connections so they cannot pin descriptors.
+# See docs/capacity-planning.md.
+#
+# Usage:
+#   cargo run -p praxis-ai-proxy -- -c examples/configs/file-descriptor-limits.yaml
+
+admin:
+  address: "127.0.0.1:9901"
+
+runtime:
+  # Soft RLIMIT_NOFILE set at startup, clamped to the hard limit. Leave it
+  # out to raise the soft limit all the way to the hard limit.
+  max_open_files: 65536
+
+  # Answer new requests with 503 and Retry-After once open descriptors reach
+  # the limit less a reserve of 5% (default: true).
+  shed_on_fd_pressure: true
+
+  # Each proxied request holds a client and an upstream descriptor.
+  max_connections: 20000
+
+  # Metering makes two callouts per request, each holding a descriptor while
+  # in flight. Cap them so they fit the budget; a callout past the cap waits
+  # for a slot within its timeout.
+  subrequest_max_connections: 8192
+
+listeners:
+  - name: default
+    address: "127.0.0.1:8080"
+    # Close HTTP/1.x keep-alive clients that stay idle for a minute.
+    downstream_keepalive_timeout_ms: 60000
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: router
+        routes:
+          - path_prefix: "/"
+            cluster: backend
+
+      - filter: external_metering
+        # Resolved through the proxy's DNS cache, not on every request.
+        metering_url: "http://localhost:9090"
+        # The metering service in this example listens on loopback, a
+        # non-public address, so callouts must be explicitly opted in.
+        allow_private_endpoint: true
+        timeout_seconds: 5
+        feature_key: "inference-tokens"
+        source: "ai-gateway"
+        fail_open: false
+        default_username: "anonymous"
+
+      - filter: load_balancer
+        clusters:
+          - name: backend
+            endpoints:
+              - "127.0.0.1:3000"
+            # Close pooled upstream connections idle for 30 seconds.
+            idle_timeout_ms: 30000
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local backend
