@@ -476,7 +476,6 @@ impl ValkeySlidingWindowBackend {
         let () = self.valkey.pipeline(&pipe).await?;
         Ok(())
     }
-
 }
 
 /// The distinct sub-window widths of `budgets`, each with the longest
@@ -544,14 +543,23 @@ impl TokenRateLimitStateBackend for ValkeySlidingWindowBackend {
         let reads = self.read_window(&id, request.now_ms).await?;
         let (keys_after, active_after) = (reads.keys, reads.active);
         match self.decide(&reads, request.estimate, request.now_ms) {
-            Decision::Denied { retry_after_ms, remaining, reason } => {
+            Decision::Denied {
+                retry_after_ms,
+                remaining,
+                reason,
+            } => {
                 self.telemetry.record(remaining, active_after, keys_after);
-                Ok(BackendReserve::Denied { retry_after_ms, remaining, reason })
+                Ok(BackendReserve::Denied {
+                    retry_after_ms,
+                    remaining,
+                    reason,
+                })
             },
             Decision::Admit { max_usage, remaining } => {
                 let reservation_id = self.admit(&id, &request).await?;
                 let keys_after = keys_after.saturating_add(usize::from(!reads.key_known));
-                self.telemetry.record(remaining, active_after.saturating_add(1), keys_after);
+                self.telemetry
+                    .record(remaining, active_after.saturating_add(1), keys_after);
                 Ok(BackendReserve::Admitted {
                     reservation_id,
                     estimate: request.estimate,
