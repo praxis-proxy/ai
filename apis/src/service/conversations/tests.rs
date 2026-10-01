@@ -79,6 +79,22 @@ fn build_item_records_generates_ids_for_items_without_them() {
 }
 
 #[test]
+fn build_item_records_normalizes_easy_input_message_without_type() {
+    let records = build_item_records(
+        &owner("alice"),
+        "conv_1",
+        1000,
+        0,
+        [json!({"role": "user", "content": "hi"})],
+        counter(),
+    )
+    .unwrap();
+    assert_eq!(records[0].item_data["type"], "message");
+    assert_eq!(records[0].item_data["content"][0]["type"], "input_text");
+    assert_eq!(records[0].item_data["content"][0]["text"], "hi");
+}
+
+#[test]
 fn build_item_records_preserves_explicit_ids_and_positions() {
     let o = owner("alice");
     let records = build_item_records(

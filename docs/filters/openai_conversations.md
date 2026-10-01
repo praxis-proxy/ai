@@ -7,7 +7,7 @@ Handles all `/v1/conversations` endpoints locally.
 
 ## Configuration Notes
 
-All matched requests are served from the owner-scoped store and never forwarded upstream. Unmatched paths pass through as `Continue`. The filter holds no state: it resolves the store from the per-request registry the serving runtime provisions, and takes an owner-bound handle at request time. `openai_operation` must precede this filter in the same chain.
+All matched requests are served from the owner-scoped store and never forwarded upstream. Unmatched paths pass through as `Continue`. The filter keeps only request-scoped state: it resolves the store from the per-request registry the serving runtime provisions, and takes an owner-bound handle. `openai_operation` must precede this filter in the same chain. For a managed `POST /v1/responses` with `conversation`, completed JSON and SSE responses append the request input and final output items to the local Conversation. Streaming append-back reads the canonical terminal response state without buffering SSE. With the default fail-closed policy, it persists before `response.completed` is released; `failure_mode: open` opts out of that guarantee. Incomplete or failed streams do not append a turn. The provider owns history on a direct OpenAI passthrough route.
 
 ## Configuration
 

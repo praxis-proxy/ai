@@ -51,7 +51,9 @@
 #      takes the direct terminal branch, while a managed binding runs the
 #      Praxis CRUD implementation. On the managed Responses response path the
 #      filter also appends input+output items back to the conversation after a
-#      successful non-streaming response.
+#      completed buffered or streamed response. For streams it writes from the
+#      canonical terminal state before releasing response.completed, including
+#      when the Response itself has store:false.
 #
 #   2. openai_responses_format classifies the request and promotes
 #      format, model, stream, and mode to internal routing headers.

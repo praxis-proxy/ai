@@ -2364,6 +2364,38 @@ class TestOpenAIResponsesVLLM:
         finally:
             openai_client.conversations.delete(conversation.id)
 
+    def test_streaming_conversation_append_back_with_store_false(self, openai_client):
+        """The SDK observes a completed SSE turn and its local Conversation items."""
+        conversation = openai_client.conversations.create()
+        try:
+            events = _collect_stream(
+                openai_client.responses.create(
+                    model=VLLM_MODEL,
+                    input=[{"role": "user", "content": "Reply with a short greeting. /no_think"}],
+                    conversation=conversation.id,
+                    stream=True,
+                    store=False,
+                    temperature=0,
+                    max_output_tokens=2048,
+                )
+            )
+            completed = [
+                event.response
+                for event in events
+                if event.type == "response.completed"
+            ]
+            assert len(completed) == 1, [event.type for event in events]
+            assert completed[0].status == "completed"
+            assert completed[0].output_text
+
+            items = openai_client.conversations.items.list(conversation.id, order="asc")
+            messages = [item for item in items.data if item.type == "message"]
+            assert [item.role for item in messages] == ["user", "assistant"]
+            assert "short greeting" in messages[0].content[0].text
+            assert messages[1].content[0].text in completed[0].output_text
+        finally:
+            openai_client.conversations.delete(conversation.id)
+
     def test_nonexistent_conversation_is_rejected(self, openai_client):
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.responses.create(
