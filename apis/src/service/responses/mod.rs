@@ -19,7 +19,10 @@ use tracing::warn;
 use crate::{
     openai::responses::append_stored_input_items,
     state_owner::StateOwner,
-    store::{OwnerScopedResponseStore, PendingApprovalRecord, ResponseRecord, StoreError},
+    store::{
+        EventLogStatus, OwnerScopedResponseStore, PendingApprovalRecord, ResponseEventRecord, ResponseRecord,
+        StoreError,
+    },
 };
 
 #[cfg(test)]
@@ -134,6 +137,48 @@ impl ResponsesService {
         self.store
             .consume_approvals(response_id, approval_ids, consumed_at)
             .await
+    }
+
+    /// Append normalized SSE events to a response's durable event log.
+    ///
+    /// Each record's owner is re-checked against the bound owner by the facade,
+    /// and the backend gates the write on the parent response existing under this
+    /// owner. Called from the store filter's output path as events leave
+    /// `openai_stream_events`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] on owner mismatch or a backend failure.
+    pub(crate) async fn append_events(
+        &self,
+        response_id: &str,
+        events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        self.store.append_events(response_id, events).await
+    }
+
+    /// List a response's event-log rows with `sequence_number > after`, ordered
+    /// ascending and capped at `limit`, for this owner. Backs incremental replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] when the backend query fails.
+    pub(crate) async fn list_events_after(
+        &self,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        self.store.list_events_after(response_id, after, limit).await
+    }
+
+    /// Summarize a response's event log for the pre-stream replay gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StoreError`] when the backend query fails.
+    pub(crate) async fn event_log_status(&self, response_id: &str) -> Result<EventLogStatus, StoreError> {
+        self.store.event_log_status(response_id).await
     }
 
     /// Assemble a persisted [`ResponseRecord`] from a completed Responses API

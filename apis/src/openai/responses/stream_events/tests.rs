@@ -5193,10 +5193,12 @@ fn first_chunk_recaps_absolute_deadline_onto_live_body() {
     let state = ctx
         .get_filter_state::<StreamEventsState>()
         .expect("parser state must remain installed");
+    let started = state.started_at.expect("first chunk must start the deadline");
+    let expected = started + state.timeout;
     let applied = ctx
-        .stream_read_timeout_cap()
-        .expect("the first chunk must publish a read timeout cap");
-    assert!(applied > Duration::from_secs(299) && applied <= state.timeout);
+        .stream_deadline_cap()
+        .expect("the first chunk must publish an absolute deadline");
+    assert_eq!(applied, expected);
     assert!(
         state.timeout <= Duration::from_secs(300),
         "unexpected test timeout budget: {:?}",
@@ -5218,18 +5220,15 @@ fn stream_deadline_cap_shrinks_after_first_chunk() {
     let adjusted_started = std::time::Instant::now() - Duration::from_millis(750);
     state.started_at = Some(adjusted_started);
     let expected = adjusted_started + state.timeout;
-    let now = std::time::Instant::now();
     ctx.insert_filter_state(state);
 
     let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "again"})));
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
 
-    let applied = ctx
-        .stream_read_timeout_cap()
-        .expect("each chunk must republish a read timeout cap");
-    assert!(
-        applied <= expected.saturating_duration_since(now),
-        "each chunk must republish the remaining absolute budget, not a fresh relative timer at now={now:?}"
+    assert_eq!(
+        ctx.stream_deadline_cap(),
+        Some(expected),
+        "each chunk must republish the same absolute cutoff, not a fresh relative timer"
     );
 }
 
@@ -5248,8 +5247,9 @@ fn stream_deadline_caps_live_body_after_first_chunk() {
     ctx.insert_filter_state(state);
     super::recap_stream_deadline(&mut ctx, expected);
 
-    assert!(
-        ctx.stream_read_timeout_cap().is_some(),
+    assert_eq!(
+        ctx.stream_deadline_cap(),
+        Some(expected),
         "absolute cutoff must be published on the live body"
     );
 }
@@ -5288,13 +5288,15 @@ async fn stream_deadline_recaps_live_body_on_irr_body_context() {
     let started = state.started_at.expect("first chunk must start the deadline");
     state.timeout = Duration::from_secs(1);
     state.started_at = Some(started.checked_sub(Duration::from_millis(750)).unwrap_or(started));
+    let expected = state.started_at.unwrap() + state.timeout;
     ctx.insert_filter_state(state);
 
     let mut body = Some(make_sse_chunk("response.output_text.delta", &json!({"text": "hi"})));
     filter.on_response_body(&mut ctx, &mut body, false).unwrap();
 
-    assert!(
-        ctx.stream_read_timeout_cap().is_some(),
+    assert_eq!(
+        ctx.stream_deadline_cap(),
+        Some(expected),
         "absolute cutoff must be published for the live body even when ctx.upstream is None"
     );
 }

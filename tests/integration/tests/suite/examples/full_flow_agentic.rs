@@ -643,6 +643,234 @@ fn full_flow_streaming_response_is_persisted_and_retrievable() {
     drop(proxy);
 }
 
+/// A completed stream updates the local Conversation even with `store:false`.
+/// A later turn must rehydrate those items from the same on-disk store.
+#[test]
+fn full_flow_streaming_conversation_updates_history() {
+    let stream = concat!(
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_conversation_stream\",",
+        "\"created_at\":1000,\"model\":\"gpt-4.1\",\"object\":\"response\",",
+        "\"status\":\"in_progress\",\"output\":[]}}\n\n",
+        "event: response.completed\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_conversation_stream\",",
+        "\"created_at\":1000,\"model\":\"gpt-4.1\",\"object\":\"response\",",
+        "\"status\":\"completed\",\"output\":[{\"type\":\"message\",",
+        "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Sure\"}]}]}}\n\n",
+    );
+    let terminal_start = stream.find("event: response.completed").expect("terminal frame");
+    let (created_chunk, terminal_chunk) = stream.split_at(terminal_start);
+    let backend_guard = Backend::chunked(vec![created_chunk.to_owned(), terminal_chunk.to_owned()])
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_streaming_conversation");
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend_guard.port())]),
+    ));
+
+    let created_raw = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(
+        parse_status(&created_raw),
+        200,
+        "conversation creation failed: {created_raw}"
+    );
+    let created: Value = serde_json::from_str(&parse_body(&created_raw)).expect("conversation JSON");
+    let conversation_id = created["id"].as_str().expect("conversation id");
+
+    let first = json!({
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": "streamed question"}],
+        "conversation": conversation_id,
+        "stream": true,
+        "store": false,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &first.to_string()));
+    assert_eq!(parse_status(&raw), 200, "streamed turn failed: {raw}");
+    assert!(parse_body(&raw).contains("event: response.completed"));
+
+    let (status, items_body) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+        None,
+    );
+    assert_eq!(status, 200, "item list failed: {items_body}");
+    let listed: Value = serde_json::from_str(&items_body).expect("item list JSON");
+    let items = listed["data"].as_array().expect("item array");
+    assert_eq!(items.len(), 2, "streamed input and output must be appended once");
+    assert_eq!(items[0]["content"][0]["text"], "streamed question");
+    assert_eq!(items[1]["content"][0]["text"], "Sure");
+
+    drop(proxy);
+    drop(backend_guard);
+    let stored_sse = stream.replace("resp_conversation_stream", "resp_conversation_store");
+    let terminal_start = stored_sse.find("event: response.completed").expect("terminal frame");
+    let (created_chunk, terminal_chunk) = stored_sse.split_at(terminal_start);
+    let stored_backend = Backend::chunked(vec![created_chunk.to_owned(), terminal_chunk.to_owned()])
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", stored_backend.port())]),
+    ));
+
+    let stored_turn = json!({
+        "model": "gpt-4.1",
+        "input": "stored question",
+        "conversation": conversation_id,
+        "stream": true,
+        "store": true,
+    });
+    let stored_raw = http_send(proxy.addr(), &json_post("/v1/responses", &stored_turn.to_string()));
+    assert_eq!(parse_status(&stored_raw), 200, "stored stream failed: {stored_raw}");
+    let stored_stream = parse_body(&stored_raw);
+    assert!(
+        stored_stream.contains("event: response.completed"),
+        "stored stream lacked completion: {stored_stream}"
+    );
+    let (status, stored_body) = http_get(proxy.addr(), "/v1/responses/resp_conversation_store", None);
+    assert_eq!(status, 200, "stored stream should be retrievable: {stored_body}");
+    let (status, replay_body) = http_get(proxy.addr(), "/v1/responses/resp_conversation_store?stream=true", None);
+    assert_eq!(status, 200, "stored stream should be replayable: {replay_body}");
+    assert!(replay_body.contains("event: response.completed"));
+
+    let (status, items_body) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+        None,
+    );
+    assert_eq!(status, 200, "second item list failed: {items_body}");
+    let listed: Value = serde_json::from_str(&items_body).expect("item list JSON");
+    let items = listed["data"].as_array().expect("item array");
+    assert_eq!(items.len(), 4, "both streamed turns must append once");
+    assert_eq!(items[2]["content"][0]["text"], "stored question");
+    assert_eq!(items[3]["content"][0]["text"], "Sure");
+
+    drop(proxy);
+    drop(stored_backend);
+    let echo_backend = start_echo_backend();
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", echo_backend.port())]),
+    ));
+    let second = json!({
+        "model": "gpt-4.1",
+        "input": "next question",
+        "conversation": conversation_id,
+        "store": false,
+    });
+    let raw = http_send(proxy.addr(), &json_post("/v1/responses", &second.to_string()));
+    assert_eq!(parse_status(&raw), 200, "next turn failed: {raw}");
+    let outbound: Value = serde_json::from_str(&parse_body(&raw)).expect("echoed request JSON");
+    assert!(
+        outbound.get("conversation").is_none(),
+        "local selector must be stripped"
+    );
+    let input = outbound["input"].as_array().expect("rehydrated input array");
+    let input_text = serde_json::to_string(input).expect("input serialization");
+    assert!(
+        input_text.contains("streamed question"),
+        "missing streamed input: {input_text}"
+    );
+    assert!(input_text.contains("Sure"), "missing streamed output: {input_text}");
+    assert!(input_text.contains("next question"), "missing next input: {input_text}");
+}
+
+/// A tool-limit completion arrives as a local IRR chunk before the empty EOS.
+/// Its terminal must still commit the streamed turn to the Conversation.
+#[test]
+fn full_flow_local_stream_completion_updates_conversation() {
+    let search_call = json!({
+        "type": "web_search_call",
+        "id": "ws_conversation_local",
+        "status": "completed",
+        "action": {"type": "search", "query": "weather"},
+    });
+    let created = json!({
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {
+            "id": "resp_conversation_local",
+            "created_at": 1000,
+            "model": "gpt-4.1",
+            "object": "response",
+            "status": "in_progress",
+            "output": [],
+        },
+    });
+    let completed = json!({
+        "type": "response.completed",
+        "sequence_number": 1,
+        "response": {
+            "id": "resp_conversation_local",
+            "created_at": 1000,
+            "model": "gpt-4.1",
+            "object": "response",
+            "status": "completed",
+            "output": [search_call],
+        },
+    });
+    let backend = Backend::chunked(vec![
+        format!("event: response.created\ndata: {created}\n\n"),
+        format!("event: response.completed\ndata: {completed}\n\n"),
+    ])
+    .header("content-type", "text/event-stream")
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let db = TempSqlite::new("full_flow_local_stream_conversation");
+    let proxy = start_proxy(&load_full_flow_config_with_db(
+        proxy_port,
+        &db,
+        &HashMap::from([("127.0.0.1:3001", backend.port())]),
+    ));
+
+    let created_raw = http_send(proxy.addr(), &json_post("/v1/conversations", r#"{}"#));
+    assert_eq!(
+        parse_status(&created_raw),
+        200,
+        "conversation creation failed: {created_raw}"
+    );
+    let created: Value = serde_json::from_str(&parse_body(&created_raw)).expect("conversation JSON");
+    let conversation_id = created["id"].as_str().expect("conversation id");
+    let turn = json!({
+        "model": "gpt-4.1",
+        "input": "search the weather",
+        "conversation": conversation_id,
+        "stream": true,
+        "store": false,
+        "max_tool_calls": 0,
+        "tools": [{"type": "web_search_preview"}],
+    });
+    let request =
+        json_post("/v1/responses", &turn.to_string()).replacen("\r\n\r\n", "\r\nx-user-brave-key: test-key\r\n\r\n", 1);
+    let raw = http_send(proxy.addr(), &request);
+    assert_eq!(parse_status(&raw), 200, "local completion failed: {raw}");
+    assert!(
+        parse_body(&raw).contains("event: response.completed"),
+        "missing local terminal: {raw}"
+    );
+
+    let (status, items_body) = http_get(
+        proxy.addr(),
+        &format!("/v1/conversations/{conversation_id}/items?order=asc"),
+        None,
+    );
+    assert_eq!(status, 200, "item list failed: {items_body}");
+    let listed: Value = serde_json::from_str(&items_body).expect("item list JSON");
+    let items = listed["data"].as_array().expect("item array");
+    assert_eq!(
+        items.len(),
+        2,
+        "local terminal and EOS must append exactly once: {items_body}"
+    );
+    assert_eq!(items[0]["content"][0]["text"], "search the weather");
+    assert_eq!(items[1]["type"], "web_search_call");
+}
+
 /// A chunked non-streaming Responses body must remain buffered until the
 /// response store sees EOS. `openai_conversations` is composed in this example
 /// but append-back is unarmed without a conversation request; it must not
@@ -651,7 +879,8 @@ fn full_flow_streaming_response_is_persisted_and_retrievable() {
 fn full_flow_chunked_response_is_persisted_and_retrievable() {
     let response = FIRST_RESPONSE_JSON;
     let split_at = response.len() / 2;
-    let backend_guard = Backend::chunked(vec![response[..split_at].to_owned(), response[split_at..].to_owned()])
+    let (first_chunk, second_chunk) = response.split_at(split_at);
+    let backend_guard = Backend::chunked(vec![first_chunk.to_owned(), second_chunk.to_owned()])
         .header("content-type", "application/json")
         .start_with_shutdown();
     let proxy_port = free_port();

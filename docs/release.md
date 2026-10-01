@@ -28,6 +28,8 @@ Before tagging a release:
 - [ ] `Cargo.lock` is regenerated with the new version
 - [ ] `.github/SECURITY.md` lists the new minor version
 - [ ] Pull request labels produce useful generated release notes
+- [ ] If native GPU qualification is desired, dispatch the existing vLLM
+      workflow on the final release commit/tag and inspect its report
 
 ## Tagging a Release
 
@@ -87,6 +89,12 @@ Praxis AI uses [GitHub Releases][gh-releases] for changelogs. The release
 workflow creates each release with generated notes. Review pull request
 labels before tagging so entries fall into the categories configured in
 `.github/release.yml`. There is no separate `CHANGELOG.md` file.
+
+Every release includes an exact-commit native vLLM qualification section and
+an attached `qualification.json` status report. Missing or unverifiable GPU
+evidence is stated as unavailable; it does not block the release. See
+[native vLLM qualification](developing/vllm-qualification.md) for the report
+schema, selection policy, and final-tag dispatch procedure.
 
 [gh-releases]: https://github.com/praxis-proxy/ai/releases
 

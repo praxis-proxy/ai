@@ -5,6 +5,12 @@
 
 Persists Responses API responses to the configured response store backend.
 
+## Configuration Notes
+
+For a stored response created with `stream: true`, `GET /v1/responses/{id}?stream=true` replays its completed SSE event log. `starting_after=N` skips events through sequence number `N`. A plain GET returns the stored response as JSON.
+
+Replay becomes available only after the original response and event log are persisted. A GET before the response is stored returns 404; a stored response without a complete replay log returns 400 for `stream=true`. This endpoint does not follow generation in progress. If the original foreground connection drops, generation and replay are not guaranteed to complete.
+
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -21,6 +27,8 @@ Persists Responses API responses to the configured response store backend.
 | `allow_private_database_url` | bool | no | Allow `PostgreSQL` URLs that target local-sensitive addresses. By default, DNS names, localhost, loopback, private, link-local, cloud metadata, unspecified, and Unix socket targets are rejected. This opt-in is intended for local development and tests. |
 | `pool` | PoolConfig | no | Connection pool tuning options. When omitted, sqlx defaults apply (`max_connections = 10`, `idle_timeout = 600s`, `acquire_timeout = 30s`). |
 | `compression` | StoreCompressionConfig | no | Optional payload compression for stored JSON columns. When omitted, payloads are stored uncompressed. Reads auto-detect the format, so enabling compression keeps existing uncompressed records readable. |
+| `max_event_count` | NonZeroU32 | no | Maximum number of SSE events retained in a streamed response's replay log (`GET /v1/responses/{id}?stream=true`). A stream that exceeds this stops event capture for that response, so its terminal event is never recorded and the response becomes non-replayable. The live client stream and the plain JSON record are unaffected. |
+| `max_event_bytes` | NonZeroU64 | no | Maximum total payload bytes retained in a streamed response's replay log. Same over-budget behavior as `max_event_count`. |
 
 ## Example
 

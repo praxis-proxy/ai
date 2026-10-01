@@ -21,7 +21,9 @@ pub use simple::{
     Backend, CapturedRequest, ChunkedBackend, RoutedBackend, StatefulBackend, StatefulCapturingBackend,
     StatefulCapturingGuard, start_backend, start_backend_v6, start_backend_with_shutdown,
 };
-pub use specialized::{BackendGuard, StatefulBackendGuard, start_stateful_backend};
+pub use specialized::{
+    BackendGuard, StatefulBackendGuard, start_keepalive_backend, start_slow_backend, start_stateful_backend,
+};
 pub use websocket::{
     CapturedWsMessage, WsBackendEvent, WsBackendGuard, WsServerAction, start_scripted_websocket_backend,
     start_scripted_websocket_backend_turns,

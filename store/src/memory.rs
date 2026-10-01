@@ -23,7 +23,10 @@ use async_trait::async_trait;
 use crate::{
     owner::StateOwner,
     traits::{ConversationItemStore, ResponseStore},
-    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
+    types::{
+        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
+        ResponseRecord, StoreError,
+    },
 };
 
 /// Owner-qualified key for owner-scoped rows.
@@ -55,6 +58,11 @@ struct Inner {
     item_ids: HashSet<OwnerKey>,
     /// `(owner, response_id, approval_id)` -> approval + consumption stamp.
     approvals: HashMap<(StateOwner, String, String), StoredApproval>,
+    /// `(owner, response_id)` -> durable SSE event log (unordered; sorted on
+    /// read). A `response_id` is globally unique with exactly one owner, so this
+    /// owner-qualified key mirrors the SQL `PRIMARY KEY (response_id,
+    /// sequence_number)` plus the owner-gated `WHERE EXISTS` insert guard.
+    events: HashMap<OwnerKey, Vec<ResponseEventRecord>>,
 }
 
 /// In-memory implementation of [`ResponseStore`] and [`ConversationItemStore`].
@@ -186,6 +194,30 @@ fn record_approvals_into(inner: &mut Inner, owner: &StateOwner, response_id: &st
     }
 }
 
+/// Append events insert-if-absent on `sequence_number`, gated on the parent
+/// response existing under `owner`.
+///
+/// Mirrors the SQL `WHERE EXISTS(... responses ... owner triple)` gate plus
+/// `ON CONFLICT (response_id, sequence_number) DO NOTHING`: events for an absent
+/// or cross-owner response are dropped, and a re-released chunk never overwrites
+/// an already-stored sequence.
+fn append_events_into(inner: &mut Inner, owner: &StateOwner, response_id: &str, events: &[ResponseEventRecord]) {
+    if !inner
+        .responses
+        .get(response_id)
+        .is_some_and(|response| &response.owner == owner)
+    {
+        return;
+    }
+    let log = inner.events.entry((owner.clone(), response_id.to_owned())).or_default();
+    for event in events {
+        if log.iter().any(|stored| stored.sequence_number == event.sequence_number) {
+            continue;
+        }
+        log.push(event.clone());
+    }
+}
+
 #[async_trait]
 impl ResponseStore for InMemoryStore {
     async fn upsert_response(&self, record: &ResponseRecord) -> Result<(), StoreError> {
@@ -209,6 +241,9 @@ impl ResponseStore for InMemoryStore {
         inner
             .approvals
             .retain(|(row_owner, response_id, _), _| !(row_owner == owner && response_id == id));
+        // The durable SSE event log is removed with the response so nothing
+        // stays replayable after a DELETE.
+        inner.events.remove(&(owner.clone(), id.to_owned()));
         Ok(removed)
     }
 
@@ -298,6 +333,53 @@ impl ResponseStore for InMemoryStore {
             }
         }
         Ok(None)
+    }
+
+    async fn append_events(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock()?;
+        append_events_into(&mut inner, owner, response_id, events);
+        Ok(())
+    }
+
+    async fn list_events_after(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        let inner = self.lock()?;
+        let Some(log) = inner.events.get(&(owner.clone(), response_id.to_owned())) else {
+            return Ok(Vec::new());
+        };
+        // Filter and order references first, then clone only the bounded page so
+        // one replay page copies at most `limit` events, not the full tail.
+        let mut ordered: Vec<&ResponseEventRecord> = log
+            .iter()
+            .filter(|event| after.is_none_or(|cursor| event.sequence_number > cursor))
+            .collect();
+        ordered.sort_unstable_by_key(|event| event.sequence_number);
+        Ok(ordered.into_iter().take(limit as usize).cloned().collect())
+    }
+
+    async fn event_log_status(&self, owner: &StateOwner, response_id: &str) -> Result<EventLogStatus, StoreError> {
+        let inner = self.lock()?;
+        let Some(log) = inner.events.get(&(owner.clone(), response_id.to_owned())) else {
+            return Ok(EventLogStatus::Absent);
+        };
+        let Some(max_sequence) = log.iter().map(|event| event.sequence_number).max() else {
+            return Ok(EventLogStatus::Absent);
+        };
+        if log.iter().any(|event| event.terminal) {
+            Ok(EventLogStatus::Replayable { max_sequence })
+        } else {
+            Ok(EventLogStatus::Incomplete { max_sequence })
+        }
     }
 }
 

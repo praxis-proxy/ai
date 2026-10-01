@@ -322,6 +322,9 @@ jobs:
       - name: Run Anthropic Python SDK tests
         run: uv run tests/integration/sdk/anthropic/test_anthropic_messages_to_chat_completions.py -s
 
+      - name: Run Anthropic web-search Python SDK tests
+        run: uv run tests/integration/sdk/anthropic/test_anthropic_web_search.py -s
+
   # ----------------------------------------------------------------------------
   # Pinned Codex CLI HTTP acceptance
   # ----------------------------------------------------------------------------

@@ -8,7 +8,10 @@ use async_trait::async_trait;
 
 use crate::{
     owner::StateOwner,
-    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord, StoreError},
+    types::{
+        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
+        ResponseRecord, StoreError,
+    },
 };
 
 // -----------------------------------------------------------------------------
@@ -58,7 +61,11 @@ pub trait ResponseStore: Send + Sync {
     ///
     /// Any server-owned pending approvals issued by the deleted response are
     /// removed in the same transaction, so deleting a response leaves no
-    /// consumable approval behind and retains no sensitive tool arguments.
+    /// consumable approval behind and retains no sensitive tool arguments. The
+    /// response's durable SSE event log (see [`append_events`]) is removed in the
+    /// same transaction as well, so a deleted response leaves nothing replayable.
+    ///
+    /// [`append_events`]: ResponseStore::append_events
     ///
     /// # Errors
     ///
@@ -217,6 +224,64 @@ pub trait ResponseStore: Send + Sync {
         approval_ids: &[&str],
         consumed_at: i64,
     ) -> Result<Option<usize>, StoreError>;
+
+    /// Append normalized SSE events to a response's durable event log.
+    ///
+    /// Called from the proxy **output** path at the terminal seam of a streamed
+    /// response: `openai_response_store` holds the sequence-stamped events in
+    /// request scope, upserts the parent record, then flushes them here in one
+    /// batch before releasing the terminal frame. This builds the log that
+    /// `GET /v1/responses/{id}?stream=true` replays.
+    ///
+    /// Writes are insert-if-absent on `(response_id, sequence_number)` and gated
+    /// on the parent response existing under the exact same owner, so a re-released
+    /// batch never double-writes and events can never attach to a response the
+    /// caller does not own. Rows for a response that does not exist (or is owned by
+    /// someone else) are silently dropped. The write serializes against
+    /// `delete_response` so a concurrent delete cannot leave orphaned event rows.
+    ///
+    /// Idempotency means the caller may safely retry the batch; ordering across
+    /// batches is defined solely by `sequence_number`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the database operation fails.
+    async fn append_events(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError>;
+
+    /// List event-log rows for a response with `sequence_number > after`.
+    ///
+    /// Returns at most `limit` rows ordered by `sequence_number` ascending,
+    /// scoped to the exact owner. `after == None` starts from the beginning of the
+    /// log; `after == Some(n)` resumes strictly after sequence `n`. Paging the
+    /// replay one bounded page at a time keeps the whole log out of memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the database operation fails.
+    async fn list_events_after(
+        &self,
+        owner: &StateOwner,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError>;
+
+    /// Summarize a response's event log for the pre-stream replay gate.
+    ///
+    /// Returns an [`EventLogStatus`] in one indexed query, distinguishing "no
+    /// log" (legacy or non-streamed record) from "incomplete log" (rows but no
+    /// terminal event) from "replayable" (`has_terminal == true`). Scoped to the
+    /// exact owner: another owner's log is invisible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError`] if the database operation fails.
+    async fn event_log_status(&self, owner: &StateOwner, response_id: &str) -> Result<EventLogStatus, StoreError>;
 }
 
 // -----------------------------------------------------------------------------

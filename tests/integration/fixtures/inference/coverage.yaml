@@ -413,3 +413,12 @@ features:
     providers:
       vllm:
         status: live_covered
+  - id: messages.error.upstream_stream
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/upstream-error-stream
+    providers:
+      synthetic:
+        status: synthetic_only

@@ -11,7 +11,10 @@
 use crate::{
     owner::StateOwner,
     traits::{ConversationItemStore, PersistedStateBackend},
-    types::{ConversationItemRecord, ConversationRecord, PendingApprovalRecord, ResponseRecord},
+    types::{
+        ConversationItemRecord, ConversationRecord, EventLogStatus, PendingApprovalRecord, ResponseEventRecord,
+        ResponseRecord,
+    },
 };
 
 /// Build a test owner from trusted parts.
@@ -42,6 +45,41 @@ fn approval(id: &str) -> PendingApprovalRecord {
     }
 }
 
+/// A normalized SSE event fixture scoped to `owner`/`response_id`.
+fn event(owner: &StateOwner, response_id: &str, sequence_number: u64, terminal: bool) -> ResponseEventRecord {
+    let event_type = if terminal {
+        "response.completed"
+    } else {
+        "response.output_text.delta"
+    };
+    ResponseEventRecord {
+        response_id: response_id.to_owned(),
+        owner: owner.clone(),
+        sequence_number,
+        event_type: event_type.to_owned(),
+        payload: serde_json::to_vec(&serde_json::json!({ "type": event_type, "sequence_number": sequence_number }))
+            .expect("event payload serializes"),
+        terminal,
+        created_at: 1,
+    }
+}
+
+/// Persist an empty parent response so its owner-scoped event log can be written.
+async fn persist_parent_response(backend: &dyn PersistedStateBackend, owner: &StateOwner, response_id: &str) {
+    backend
+        .upsert_response(&ResponseRecord {
+            id: response_id.to_owned(),
+            owner: owner.clone(),
+            created_at: 1,
+            model: "m".to_owned(),
+            response_object: serde_json::json!({}),
+            input: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("upsert parent response");
+}
+
 /// Run the whole backend contract suite. Panics on the first violation.
 ///
 /// The backend must start empty. Callers run this inside their own async test.
@@ -66,6 +104,11 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     item_ids_are_owner_scoped(backend).await;
     item_positions_are_owner_scoped_and_atomic(backend).await;
     item_writes_enforce_parent_scope(backend).await;
+    event_log_appends_and_lists_in_order(backend).await;
+    event_log_append_is_insert_if_absent(backend).await;
+    event_log_requires_owner_matched_response(backend).await;
+    event_log_status_gates_on_terminal(backend).await;
+    event_log_removed_with_response(backend).await;
 }
 
 /// A conversation id is globally unique in the SQL schema: another owner may
@@ -642,6 +685,263 @@ async fn item_writes_enforce_parent_scope(backend: &dyn PersistedStateBackend) {
             .await
             .is_err(),
         "intra-batch duplicate accepted by create_conversation_items"
+    );
+}
+
+/// Events append in any order and list ascending by `sequence_number`; the
+/// `after` cursor skips sequences `<= after`; `limit` caps the page.
+#[expect(clippy::too_many_lines, reason = "linear ordering and cursor assertions")]
+async fn event_log_appends_and_lists_in_order(backend: &dyn PersistedStateBackend) {
+    let o = owner("events-order");
+    persist_parent_response(backend, &o, "resp_events_order").await;
+
+    // Two batches, each internally out of order, prove ordering is by
+    // sequence_number and not insertion order.
+    backend
+        .append_events(
+            &o,
+            "resp_events_order",
+            &[
+                event(&o, "resp_events_order", 2, false),
+                event(&o, "resp_events_order", 0, false),
+            ],
+        )
+        .await
+        .expect("append first batch");
+    backend
+        .append_events(
+            &o,
+            "resp_events_order",
+            &[
+                event(&o, "resp_events_order", 1, false),
+                event(&o, "resp_events_order", 3, true),
+            ],
+        )
+        .await
+        .expect("append second batch");
+
+    let all = backend
+        .list_events_after(&o, "resp_events_order", None, 10)
+        .await
+        .expect("list all");
+    assert_eq!(
+        all.iter().map(|event| event.sequence_number).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3],
+        "events not listed in ascending sequence order"
+    );
+    assert!(
+        all.last().is_some_and(|event| event.terminal),
+        "terminal event missing from the replay tail"
+    );
+
+    let after_one = backend
+        .list_events_after(&o, "resp_events_order", Some(1), 10)
+        .await
+        .expect("list after 1");
+    assert_eq!(
+        after_one.iter().map(|event| event.sequence_number).collect::<Vec<_>>(),
+        vec![2, 3],
+        "cursor did not skip sequences <= after"
+    );
+
+    let paged = backend
+        .list_events_after(&o, "resp_events_order", None, 2)
+        .await
+        .expect("list limited");
+    assert_eq!(
+        paged.iter().map(|event| event.sequence_number).collect::<Vec<_>>(),
+        vec![0, 1],
+        "limit did not cap the first page in order"
+    );
+}
+
+/// Re-appending a stored sequence number is a no-op: the first write wins and no
+/// duplicate row is created.
+async fn event_log_append_is_insert_if_absent(backend: &dyn PersistedStateBackend) {
+    let o = owner("events-idem");
+    persist_parent_response(backend, &o, "resp_events_idem").await;
+
+    let mut original = event(&o, "resp_events_idem", 0, false);
+    original.payload = serde_json::to_vec(&serde_json::json!({ "v": "original" })).expect("payload serializes");
+    backend
+        .append_events(&o, "resp_events_idem", std::slice::from_ref(&original))
+        .await
+        .expect("append original");
+
+    let mut collision = event(&o, "resp_events_idem", 0, false);
+    collision.payload = serde_json::to_vec(&serde_json::json!({ "v": "overwrite" })).expect("payload serializes");
+    backend
+        .append_events(&o, "resp_events_idem", std::slice::from_ref(&collision))
+        .await
+        .expect("re-append same sequence");
+
+    let listed = backend
+        .list_events_after(&o, "resp_events_idem", None, 10)
+        .await
+        .expect("list");
+    assert_eq!(listed.len(), 1, "a duplicate sequence created a second row");
+    assert_eq!(
+        listed.first().map(|event| &event.payload),
+        Some(&serde_json::to_vec(&serde_json::json!({ "v": "original" })).expect("payload serializes")),
+        "insert-if-absent overwrote the already-stored event"
+    );
+}
+
+/// The event log is owner-scoped, and an append requires a parent response owned
+/// by the same principal; writes without one are silently dropped.
+#[expect(clippy::too_many_lines, reason = "linear owner and parent-scope assertions")]
+async fn event_log_requires_owner_matched_response(backend: &dyn PersistedStateBackend) {
+    let (a, b) = (owner("events-owner-a"), owner("events-owner-b"));
+
+    // No parent response exists: the append is a no-op.
+    backend
+        .append_events(&a, "resp_events_missing", &[event(&a, "resp_events_missing", 0, true)])
+        .await
+        .expect("append to a missing parent is a no-op");
+    assert!(
+        backend
+            .list_events_after(&a, "resp_events_missing", None, 10)
+            .await
+            .expect("list missing")
+            .is_empty(),
+        "events attached to a response that does not exist"
+    );
+
+    // Parent owned by a: b can neither write to it nor observe its log.
+    persist_parent_response(backend, &a, "resp_events_scope").await;
+    backend
+        .append_events(&b, "resp_events_scope", &[event(&b, "resp_events_scope", 0, true)])
+        .await
+        .expect("cross-owner append is a no-op");
+    assert!(
+        backend
+            .list_events_after(&b, "resp_events_scope", None, 10)
+            .await
+            .expect("list as b")
+            .is_empty(),
+        "cross-owner append committed an event"
+    );
+
+    backend
+        .append_events(&a, "resp_events_scope", &[event(&a, "resp_events_scope", 0, true)])
+        .await
+        .expect("owner append");
+    assert_eq!(
+        backend
+            .list_events_after(&a, "resp_events_scope", None, 10)
+            .await
+            .expect("list as a")
+            .len(),
+        1,
+        "owner cannot read its own event"
+    );
+    assert!(
+        backend
+            .list_events_after(&b, "resp_events_scope", None, 10)
+            .await
+            .expect("list as b after a wrote")
+            .is_empty(),
+        "owner-a event log leaked to owner b"
+    );
+    assert_eq!(
+        backend
+            .event_log_status(&b, "resp_events_scope")
+            .await
+            .expect("status as b"),
+        EventLogStatus::Absent,
+        "event-log status leaked to a non-owner"
+    );
+}
+
+/// `event_log_status` distinguishes no-log, incomplete, and replayable, marking
+/// the log replayable only once a terminal event is present.
+#[expect(clippy::too_many_lines, reason = "linear contract assertions")]
+async fn event_log_status_gates_on_terminal(backend: &dyn PersistedStateBackend) {
+    let o = owner("events-status");
+    persist_parent_response(backend, &o, "resp_events_status").await;
+
+    assert_eq!(
+        backend
+            .event_log_status(&o, "resp_events_status")
+            .await
+            .expect("status with no log"),
+        EventLogStatus::Absent,
+        "a response with no events reported a log"
+    );
+
+    backend
+        .append_events(
+            &o,
+            "resp_events_status",
+            &[
+                event(&o, "resp_events_status", 0, false),
+                event(&o, "resp_events_status", 1, false),
+            ],
+        )
+        .await
+        .expect("append non-terminal events");
+    assert_eq!(
+        backend
+            .event_log_status(&o, "resp_events_status")
+            .await
+            .expect("status incomplete"),
+        EventLogStatus::Incomplete { max_sequence: 1 },
+        "an incomplete log was misreported"
+    );
+
+    backend
+        .append_events(&o, "resp_events_status", &[event(&o, "resp_events_status", 2, true)])
+        .await
+        .expect("append terminal event");
+    assert_eq!(
+        backend
+            .event_log_status(&o, "resp_events_status")
+            .await
+            .expect("status replayable"),
+        EventLogStatus::Replayable { max_sequence: 2 },
+        "a replayable log was misreported"
+    );
+}
+
+/// Deleting the parent response removes its event log so nothing stays
+/// replayable after a DELETE.
+#[expect(clippy::too_many_lines, reason = "linear contract assertions")]
+async fn event_log_removed_with_response(backend: &dyn PersistedStateBackend) {
+    let o = owner("events-delete");
+    persist_parent_response(backend, &o, "resp_events_delete").await;
+    backend
+        .append_events(
+            &o,
+            "resp_events_delete",
+            &[
+                event(&o, "resp_events_delete", 0, false),
+                event(&o, "resp_events_delete", 1, true),
+            ],
+        )
+        .await
+        .expect("append");
+    assert!(
+        backend
+            .delete_response(&o, "resp_events_delete")
+            .await
+            .expect("delete parent response"),
+        "delete of the parent response failed"
+    );
+    assert!(
+        backend
+            .list_events_after(&o, "resp_events_delete", None, 10)
+            .await
+            .expect("list after delete")
+            .is_empty(),
+        "event log survived its response"
+    );
+    assert_eq!(
+        backend
+            .event_log_status(&o, "resp_events_delete")
+            .await
+            .expect("status after delete"),
+        EventLogStatus::Absent,
+        "event-log status survived its response"
     );
 }
 

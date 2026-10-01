@@ -26,6 +26,7 @@ use super::{
     routes::{APPLICATION_PROTOCOL, ConversationOperation, match_route},
 };
 use crate::{
+    is_event_stream_content_type,
     openai::{
         operation_classifier::OpenAiOperationMatch,
         responses::{bound_body_outcome, state::ResponsesState},
@@ -44,9 +45,16 @@ use crate::{
 ///
 /// All matched requests are served from the owner-scoped store and never
 /// forwarded upstream. Unmatched paths pass through as `Continue`. The filter
-/// holds no state: it resolves the store from the per-request registry the
-/// serving runtime provisions, and takes an owner-bound handle at request time.
+/// keeps only request-scoped state: it resolves the store from the per-request
+/// registry the serving runtime provisions, and takes an owner-bound handle.
 /// `openai_operation` must precede this filter in the same chain.
+/// For a managed `POST /v1/responses` with `conversation`, completed JSON and
+/// SSE responses append the request input and final output items to the local
+/// Conversation. Streaming append-back reads the canonical terminal response
+/// state without buffering SSE. With the default fail-closed policy, it persists
+/// before `response.completed` is released; `failure_mode: open` opts out of that
+/// guarantee. Incomplete or failed streams do not append a turn. The provider
+/// owns history on a direct OpenAI passthrough route.
 ///
 /// # YAML
 ///
@@ -75,8 +83,13 @@ struct ConversationRequestState {
 /// Per-request response-phase state that controls whether append-back
 /// should run during `on_response_body`.
 struct ConversationResponseState {
+    /// A deferred streaming terminal is followed by a separate EOS callback.
+    /// Even failure-mode-open paths must not retry a possibly committed write.
+    append_attempted: bool,
     /// Owner captured before response body buffering is armed.
     append_owner: Option<StateOwner>,
+    /// The response uses the composed SSE terminal instead of buffered JSON.
+    streaming: bool,
 }
 
 /// Owner captured on the request path before inference begins.
@@ -481,26 +494,31 @@ impl HttpFilter for OpenaiConversationsFilter {
     )]
     async fn on_response(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         if !should_append_back(ctx) {
-            ctx.insert_filter_state(ConversationResponseState { append_owner: None });
+            ctx.insert_filter_state(ConversationResponseState {
+                append_attempted: false,
+                append_owner: None,
+                streaming: false,
+            });
             return Ok(FilterAction::Continue);
         }
 
         let resp = ctx.response_header.as_ref();
         let is_success = resp.is_none_or(|r| r.status.is_success());
-        let is_json = resp
+        let content_type = resp
             .and_then(|r| r.headers.get(http::header::CONTENT_TYPE))
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| {
-                ct.split(';')
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .eq_ignore_ascii_case("application/json")
-            });
+            .unwrap_or_default();
+        let is_json = content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("application/json");
+        let is_stream = is_streaming_request(ctx) && is_event_stream_content_type(content_type);
 
-        let armed = is_success && is_json;
+        let armed = is_success && (is_json || is_stream);
         if !armed {
-            trace!("conversation append-back skipped (non-2xx or non-JSON response)");
+            trace!("conversation append-back skipped (non-2xx or unsupported response content type)");
         }
         if armed {
             let owner = ctx
@@ -509,13 +527,21 @@ impl HttpFilter for OpenaiConversationsFilter {
                 .map(|captured| captured.0.clone())
                 .ok_or_else(|| FilterError::from("openai_conversations: append-back owner was not captured"))?;
             ctx.insert_filter_state(ConversationResponseState {
+                append_attempted: false,
                 append_owner: Some(owner),
+                streaming: is_stream,
             });
-            ctx.set_response_body_mode(BodyMode::StreamBuffer {
-                max_bytes: Some(MAX_JSON_BODY_BYTES),
-            });
+            if is_json {
+                ctx.set_response_body_mode(BodyMode::StreamBuffer {
+                    max_bytes: Some(MAX_JSON_BODY_BYTES),
+                });
+            }
         } else {
-            ctx.insert_filter_state(ConversationResponseState { append_owner: None });
+            ctx.insert_filter_state(ConversationResponseState {
+                append_attempted: false,
+                append_owner: None,
+                streaming: false,
+            });
         }
 
         Ok(FilterAction::Continue)
@@ -527,11 +553,8 @@ impl HttpFilter for OpenaiConversationsFilter {
         body: &mut Option<Bytes>,
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
-        let append_owner = ctx
-            .get_filter_state::<ConversationResponseState>()
-            .and_then(|state| state.append_owner.clone());
-
-        let Some(append_owner) = append_owner else {
+        let response_state = ctx.get_filter_state::<ConversationResponseState>();
+        if response_state.is_none_or(|state| state.append_owner.is_none() || state.append_attempted) {
             // This filter is composed with other response-body consumers, such
             // as `openai_response_store`. Releasing here drains a shared
             // StreamBuffer before those filters see end-of-stream, which can
@@ -539,29 +562,44 @@ impl HttpFilter for OpenaiConversationsFilter {
             // chunks (#1265). A filter that has no work for this exchange must
             // leave release ownership to the pipeline as a whole.
             return Ok(FilterAction::Continue);
-        };
+        }
+        let streaming = response_state.is_some_and(|state| state.streaming);
 
-        if !end_of_stream {
+        if streaming {
+            // Deferred terminals are delivered in this non-EOS chunk. Local
+            // completions leave the flag unset and carry the full terminal in
+            // a single IRR chunk before the empty EOS callback. A completed-looking
+            // state without either frame must not append after a failed stream.
+            if !streaming_terminal_emitted(ctx) && !contains_completed_terminal(body) {
+                return Ok(FilterAction::Continue);
+            }
+        } else if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
+        let Some(append_owner) = response_state.and_then(|state| state.append_owner.clone()) else {
+            return Ok(FilterAction::Continue);
+        };
 
-        let Some(items) = extract_append_back_items(ctx, body, append_owner) else {
+        let items = if streaming {
+            extract_streaming_append_back_items(ctx, append_owner)
+        } else {
+            extract_append_back_items(ctx, body, append_owner)
+        };
+        let Some(items) = items else {
             return Ok(FilterAction::Continue);
         };
 
         let conv_id = items.conversation_id;
-        // Fail closed on lost items. Append-back runs at end-of-stream while the
-        // completed response body is still buffered (StreamBuffer), before any
-        // byte is released downstream. Under the default `failure_mode: closed`,
-        // the buffered body is never released after a persistence failure, so the
-        // client cannot observe a clean success that hides items which never
-        // persisted (#837). The exact downstream outcome is Pingora-timing-dependent
-        // — a not-yet-flushed header yields a clean 500, an already-committed one
-        // yields a 2xx followed by a reset — but either way the body is withheld.
+        // Append before the completed JSON body or streaming terminal frame is
+        // released. Under the default `failure_mode: closed`, a persistence
+        // failure withholds that success from the client (#837). Pingora may
+        // return a clean 500 if headers are unflushed, or reset a committed 2xx.
         // `failure_mode: open` is an explicit operator opt-out of that guarantee:
-        // the pipeline logs this error and converts it to Continue, releasing the
-        // body even though items were lost. Transactional item insertion and cache
-        // rebuild failures reach this `?` before any append-back bytes are released.
+        // the pipeline logs this error and releases the terminal even though
+        // items were lost. Item insertion and cache rebuild are transactional.
+        if let Some(state) = ctx.get_filter_state_mut::<ConversationResponseState>() {
+            state.append_attempted = true;
+        }
         Self::append_items_blocking(&items.owner, &conv_id, ctx, items.all_items)
             .inspect_err(|e| warn!(error = %e, conversation_id = %conv_id, "conversation append-back failed"))?;
 
@@ -574,8 +612,27 @@ impl HttpFilter for OpenaiConversationsFilter {
 fn should_append_back(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.get_metadata("openai_responses_format.has_conversation") == Some("true")
         && ctx.get_metadata("responses.conversation_id").is_some()
-        && ctx.get_metadata("openai_responses_format.stream") != Some("true")
         && ctx.get_metadata("openai_responses_format.background") != Some("true")
+}
+
+/// Whether the classified Responses request selected streamed delivery.
+fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.get_metadata("openai_responses_format.stream") == Some("true")
+}
+
+/// Whether the stream composer placed its canonical terminal in this chunk.
+fn streaming_terminal_emitted(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ResponsesState>()
+        .is_some_and(|state| state.logical_stream_terminal_emitted)
+}
+
+/// Check the canonical local-completion frame delivered as one IRR chunk. The
+/// composer writes this ASCII event header in one chunk; no SSE body is accumulated.
+fn contains_completed_terminal(body: &Option<Bytes>) -> bool {
+    const EVENT_HEADER: &[u8] = b"event: response.completed\n";
+    body.as_deref()
+        .is_some_and(|chunk| chunk.windows(EVENT_HEADER.len()).any(|window| window == EVENT_HEADER))
 }
 
 // -----------------------------------------------------------------------------
@@ -604,6 +661,30 @@ fn extract_append_back_items(
 
     let all_items = merge_input_output_items(ctx, bytes)?;
 
+    Some(AppendBackItems {
+        conversation_id: conv_id,
+        owner,
+        all_items,
+    })
+}
+
+/// Use the stream composer's canonical terminal resource. The event bytes stay
+/// streaming; only the completed output items cross the persistence boundary.
+fn extract_streaming_append_back_items(ctx: &HttpFilterContext<'_>, owner: StateOwner) -> Option<AppendBackItems> {
+    let state = ctx.extensions.get::<ResponsesState>()?;
+    if state.response_object.get("status").and_then(Value::as_str) != Some("completed") {
+        return None;
+    }
+    let conv_id = ctx.get_metadata("responses.conversation_id")?.to_owned();
+    // The canonical resource remains available to response-store and terminal
+    // handling, so its output must be copied at this durable item boundary.
+    let mut all_items = state.input.clone();
+    if let Some(output) = state.response_object.get("output").and_then(Value::as_array) {
+        all_items.extend(output.iter().cloned());
+    }
+    if all_items.is_empty() {
+        return None;
+    }
     Some(AppendBackItems {
         conversation_id: conv_id,
         owner,

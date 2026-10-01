@@ -3,6 +3,8 @@
 
 //! Configuration types for the response store filter.
 
+use std::num::{NonZeroU32, NonZeroU64};
+
 use percent_encoding::percent_decode_str;
 use praxis_ai_store::{PoolConfig, SslMode, validate_table_identifier};
 use praxis_filter::{FilterError, has_dot_dot_traversal};
@@ -15,6 +17,32 @@ use crate::store::{PgTlsConfig, postgres_url, validate_postgres_table_identifier
 
 /// Filter name used in SSRF validation error messages.
 const FILTER_NAME: &str = "openai_response_store";
+
+/// Default cap on the number of SSE events retained in a streamed response's
+/// replay log.
+pub(crate) const DEFAULT_MAX_EVENT_COUNT: NonZeroU32 = match NonZeroU32::new(10_000) {
+    Some(count) => count,
+    // 10_000 is non-zero, so this arm is unreachable.
+    None => NonZeroU32::MIN,
+};
+
+/// Default cap (16 MiB) on the total payload bytes retained in a streamed
+/// response's replay log.
+pub(crate) const DEFAULT_MAX_EVENT_BYTES: NonZeroU64 = match NonZeroU64::new(16 * 1024 * 1024) {
+    Some(bytes) => bytes,
+    // 16 MiB is non-zero, so this arm is unreachable.
+    None => NonZeroU64::MIN,
+};
+
+/// Serde default for [`ResponseStoreConfig::max_event_count`].
+const fn default_max_event_count() -> NonZeroU32 {
+    DEFAULT_MAX_EVENT_COUNT
+}
+
+/// Serde default for [`ResponseStoreConfig::max_event_bytes`].
+const fn default_max_event_bytes() -> NonZeroU64 {
+    DEFAULT_MAX_EVENT_BYTES
+}
 
 // -----------------------------------------------------------------------------
 // StorageBackend
@@ -132,6 +160,21 @@ pub(crate) struct ResponseStoreConfig {
     /// uncompressed records readable.
     #[serde(default)]
     pub compression: Option<StoreCompressionConfig>,
+
+    /// Maximum number of SSE events retained in a streamed response's replay
+    /// log (`GET /v1/responses/{id}?stream=true`).
+    ///
+    /// A stream that exceeds this stops event capture for that response, so its
+    /// terminal event is never recorded and the response becomes non-replayable.
+    /// The live client stream and the plain JSON record are unaffected.
+    #[serde(default = "default_max_event_count")]
+    pub max_event_count: NonZeroU32,
+
+    /// Maximum total payload bytes retained in a streamed response's replay log.
+    ///
+    /// Same over-budget behavior as `max_event_count`.
+    #[serde(default = "default_max_event_bytes")]
+    pub max_event_bytes: NonZeroU64,
 }
 
 #[cfg(feature = "store-postgres")]

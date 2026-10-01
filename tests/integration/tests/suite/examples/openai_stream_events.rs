@@ -425,9 +425,316 @@ async fn stream_events_fails_closed_when_accumulation_budget_exceeded() {
     cleanup_sqlite_files(&db_path);
 }
 
+/// A completed response created with stream=true stores its normalized event
+/// log; GET /v1/responses/{id}?stream=true replays those exact events, in
+/// original sequence order, ending with the terminal event -- without
+/// reconstructing deltas. `starting_after` resumes after a cursor, and
+/// `starting_after` without `stream=true` is rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_events_replays_stored_event_log() {
+    let sse_body = [
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream_example\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hi\"}\n\n",
+        &format!("event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{RESPONSE_JSON}}}\n\n"),
+        "event: done\ndata: [DONE]\n\n",
+    ]
+    .concat();
+    let backend_guard = Backend::fixed(&sse_body)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let (db_url, db_path) = temp_sqlite_url("stream_events_replay");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
+        .expect("example config should exist");
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let created_raw = http_send(
+        proxy.addr(),
+        &json_post_with_owner(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&created_raw),
+        200,
+        "streaming create should return 200: {created_raw}"
+    );
+    let created_events = parse_sse_events(&parse_body(&created_raw));
+    assert!(
+        created_events.iter().any(|(t, _)| t == "response.completed"),
+        "the live stream should terminate with response.completed: {created_events:?}"
+    );
+    assert!(
+        created_events.iter().all(|(_, seq)| seq.is_some()),
+        "every persisted event should carry a sequence_number: {created_events:?}"
+    );
+
+    // Replay serves the stored events in original order, ending with the terminal.
+    let replay_raw = http_send(
+        proxy.addr(),
+        &get_with_owner("/v1/responses/resp_stream_example?stream=true"),
+    );
+    assert_eq!(parse_status(&replay_raw), 200, "replay should return 200: {replay_raw}");
+    assert_eq!(
+        parse_header(&replay_raw, "content-type").as_deref(),
+        Some("text/event-stream"),
+        "replay should be served as an SSE stream"
+    );
+    let replay_events = parse_sse_events(&parse_body(&replay_raw));
+    assert_eq!(
+        replay_events, created_events,
+        "replay must serve the stored events in original order, not a reconstruction"
+    );
+    assert_eq!(
+        replay_events.last().map(|(t, _)| t.as_str()),
+        Some("response.completed"),
+        "replay must end with the terminal event: {replay_events:?}"
+    );
+
+    // starting_after resumes strictly after the cursor while keeping the terminal.
+    let first_seq = created_events[0].1.expect("first replay event has a sequence number");
+    let after_raw = http_send(
+        proxy.addr(),
+        &get_with_owner(&format!(
+            "/v1/responses/resp_stream_example?stream=true&starting_after={first_seq}"
+        )),
+    );
+    assert_eq!(
+        parse_status(&after_raw),
+        200,
+        "cursor replay should return 200: {after_raw}"
+    );
+    let after_events = parse_sse_events(&parse_body(&after_raw));
+    assert!(
+        !after_events.is_empty(),
+        "replay after the first event must still return events"
+    );
+    // Assert the exact stored suffix, not just the bounds: a replay that dropped
+    // middle events after the cursor (e.g. returned only response.completed) would
+    // still satisfy a bounds-only check.
+    let expected_after: Vec<_> = created_events
+        .iter()
+        .filter(|(_, seq)| seq.is_some_and(|s| s > first_seq))
+        .cloned()
+        .collect();
+    assert_eq!(
+        after_events, expected_after,
+        "starting_after must return exactly the stored suffix after the cursor: {after_events:?}"
+    );
+    assert_eq!(
+        after_events.last().map(|(t, _)| t.as_str()),
+        Some("response.completed"),
+        "the terminal event must survive the cursor: {after_events:?}"
+    );
+
+    // starting_after without stream=true is rejected rather than silently
+    // returning the plain JSON record.
+    let invalid_raw = http_send(
+        proxy.addr(),
+        &get_with_owner("/v1/responses/resp_stream_example?starting_after=0"),
+    );
+    assert_eq!(
+        parse_status(&invalid_raw),
+        400,
+        "starting_after without stream must be rejected: {invalid_raw}"
+    );
+
+    drop(proxy);
+    cleanup_sqlite_files(&db_path);
+}
+
+/// A legacy `openai_responses_format` classifier pipeline promotes
+/// `openai_responses_format.format=openai_responses` for a replay GET (a GET to
+/// /v1/responses/{id} is a Responses endpoint) with `stream=false` (no request
+/// body). The store filter must force streaming mode for the replay GET instead
+/// of selecting the buffered Responses-format response mode, which the runtime
+/// would reject with a 500 against the streaming replay body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_events_replay_streams_under_legacy_classifier_pipeline() {
+    let sse_body = [
+        "event: response.created\n",
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_stream_example\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.output_text.delta\n",
+        "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hi\"}\n\n",
+        &format!("event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{RESPONSE_JSON}}}\n\n"),
+        "event: done\ndata: [DONE]\n\n",
+    ]
+    .concat();
+    let backend_guard = Backend::fixed(&sse_body)
+        .header("content-type", "text/event-stream")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let (db_url, db_path) = temp_sqlite_url("stream_events_replay_legacy");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
+        .expect("example config should exist");
+    // Add the legacy `openai_responses_format` classifier alongside the modern
+    // header-promoting classifier (both run before the store filter). The modern
+    // classifier still drives create-time persistence via `responses.*` metadata
+    // and `x-praxis-*` headers, while the legacy classifier promotes
+    // `openai_responses_format.format=openai_responses` (with `stream=false` for
+    // the body-less replay GET) that `is_responses_format` reads -- reproducing
+    // the buffered-mode trap the fix targets without disabling persistence.
+    let modern_classifier = concat!(
+        "      - filter: openai_responses_request\n",
+        "        on_invalid: reject\n",
+        "        headers:\n",
+        "          format: x-praxis-ai-format\n",
+        "          model: x-praxis-ai-model\n",
+        "          stream: x-praxis-ai-stream\n",
+        "          mode: x-praxis-responses-mode\n",
+    );
+    let legacy_classifier = "      - filter: openai_responses_format\n";
+    let yaml = yaml.replace(modern_classifier, &format!("{modern_classifier}\n{legacy_classifier}"));
+    assert!(
+        yaml.contains("filter: openai_responses_format") && yaml.contains("filter: openai_responses_request"),
+        "both classifiers must be present so create persists and the replay GET is trapped"
+    );
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let created_raw = http_send(
+        proxy.addr(),
+        &json_post_with_owner(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"Hello streaming","stream":true}"#,
+        ),
+    );
+    assert_eq!(
+        parse_status(&created_raw),
+        200,
+        "streaming create should return 200 under the legacy classifier: {created_raw}"
+    );
+    let created_events = parse_sse_events(&parse_body(&created_raw));
+
+    // The replay GET must stream (200 SSE), not be rejected 500 by a buffered mode.
+    let replay_raw = http_send(
+        proxy.addr(),
+        &get_with_owner("/v1/responses/resp_stream_example?stream=true"),
+    );
+    assert_eq!(
+        parse_status(&replay_raw),
+        200,
+        "replay must stream, not 500, under the legacy classifier: {replay_raw}"
+    );
+    assert_eq!(
+        parse_header(&replay_raw, "content-type").as_deref(),
+        Some("text/event-stream"),
+        "replay should be served as an SSE stream"
+    );
+    let replay_events = parse_sse_events(&parse_body(&replay_raw));
+    assert_eq!(
+        replay_events, created_events,
+        "replay must serve the stored events in original order"
+    );
+
+    drop(proxy);
+    cleanup_sqlite_files(&db_path);
+}
+
+/// A response created without stream=true is persisted via the buffered path
+/// with no event log; replaying it must return 400 invalid_request_error --
+/// never a 404 and never a stream reconstructed from the stored JSON.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_events_replay_rejects_response_without_event_log() {
+    let backend_guard = Backend::fixed(RESPONSE_JSON)
+        .header("content-type", "application/json")
+        .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let (db_url, db_path) = temp_sqlite_url("stream_events_no_log");
+    let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
+        .expect("example config should exist");
+    let patched = patch_yaml(
+        &yaml.replace("sqlite://responses.db?mode=rwc", &db_url),
+        proxy_port,
+        &HashMap::from([("127.0.0.1:8000", backend_guard.port())]),
+    );
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("patched config should parse");
+    let proxy = start_proxy(&config);
+
+    let created_raw = http_send(
+        proxy.addr(),
+        &json_post_with_owner("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello","stream":false}"#),
+    );
+    assert_eq!(
+        parse_status(&created_raw),
+        200,
+        "buffered create should succeed: {created_raw}"
+    );
+
+    let replay_raw = http_send(
+        proxy.addr(),
+        &get_with_owner("/v1/responses/resp_stream_example?stream=true"),
+    );
+    assert_eq!(
+        parse_status(&replay_raw),
+        400,
+        "a response with no event log is not replayable: {replay_raw}"
+    );
+    let body = parse_body(&replay_raw);
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("400 body should be JSON");
+    assert_eq!(parsed["error"]["type"], "invalid_request_error", "{body}");
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replay"),
+        "the error should explain the response is not replayable: {body}"
+    );
+
+    drop(proxy);
+    cleanup_sqlite_files(&db_path);
+}
+
 // -----------------------------------------------------------------------------
 // Test Utilities
 // -----------------------------------------------------------------------------
+
+/// Parse `(event_type, sequence_number)` pairs from a normalized Responses SSE
+/// body, skipping the sentinel `[DONE]` line.
+fn parse_sse_events(body: &str) -> Vec<(String, Option<i64>)> {
+    let mut events = Vec::new();
+    for block in body.split("\n\n") {
+        let Some(data) = block.lines().find_map(|line| line.strip_prefix("data:").map(str::trim)) else {
+            continue;
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let seq = value.get("sequence_number").and_then(serde_json::Value::as_i64);
+        events.push((event_type.to_owned(), seq));
+    }
+    events
+}
+
+fn get_with_owner(path: &str) -> String {
+    format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\n\
+         x-authenticated-state-owner: {OWNER_ASSERTION}\r\nConnection: close\r\n\r\n"
+    )
+}
 
 fn temp_sqlite_url(test_name: &str) -> (String, std::path::PathBuf) {
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -2364,6 +2364,40 @@ class TestOpenAIResponsesVLLM:
         finally:
             openai_client.conversations.delete(conversation.id)
 
+    def test_streaming_conversation_append_back_with_store_false(self, openai_client):
+        """The SDK observes a completed SSE turn and its local Conversation items."""
+        conversation = openai_client.conversations.create()
+        try:
+            events = _collect_stream(
+                openai_client.responses.create(
+                    model=VLLM_MODEL,
+                    input=[{"role": "user", "content": "Reply with a short greeting. /no_think"}],
+                    conversation=conversation.id,
+                    stream=True,
+                    store=False,
+                    temperature=0,
+                    max_output_tokens=2048,
+                )
+            )
+            completed = [
+                event.response
+                for event in events
+                if event.type == "response.completed"
+            ]
+            assert len(completed) == 1, [event.type for event in events]
+            assert completed[0].status == "completed"
+            assert completed[0].output_text
+
+            items = openai_client.conversations.items.list(conversation.id, order="asc")
+            messages = [item for item in items.data if item.type == "message"]
+            assert [item.role for item in messages] == ["user", "assistant"]
+            assert "short greeting" in messages[0].content[0].text
+            assert messages[1].content[0].text == completed[0].output_text, (
+                "the appended assistant item must match the streamed terminal output"
+            )
+        finally:
+            openai_client.conversations.delete(conversation.id)
+
     def test_nonexistent_conversation_is_rejected(self, openai_client):
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.responses.create(
@@ -2478,6 +2512,163 @@ class TestOpenAIResponsesVLLM:
             "previous_response_id, matching the terminal frame the client saw; "
             f"got: {retrieved.previous_response_id!r}"
         )
+
+    def test_streaming_replay_returns_stored_events_in_order(self, openai_client):
+        """Local Responses SSE replay: ``GET /v1/responses/{id}?stream=true`` on a
+        completed response created with ``stream=true`` replays the exact stored
+        event log -- the same normalized events, in original sequence order,
+        terminating in the same terminal event -- without reconstructing deltas.
+
+        Metadata-only and provider-neutral: asserts the ``(type,
+        sequence_number)`` sequence and terminal identity, not model text, so it
+        stays deterministic on the simulator or a real backend.
+        """
+        live_events = _collect_stream(
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say exactly: REPLAY-OK /no_think",
+                store=True,
+                stream=True,
+                max_output_tokens=128,
+            )
+        )
+        terminal = _assert_stream_contract(live_events, require_usage=False)
+        response_id = terminal.id
+        live_seq = [(event.type, event.sequence_number) for event in live_events]
+
+        # The record and its event log persist as the proxy finishes the body.
+        _retrieve_with_retry(openai_client, response_id)
+
+        replay_events = _collect_replay_with_retry(openai_client, response_id)
+        replay_seq = [(event.type, event.sequence_number) for event in replay_events]
+
+        # Replay serves the identical normalized events the client observed live,
+        # in the same order -- not a reconstruction.
+        assert replay_seq == live_seq, (replay_seq, live_seq)
+        assert replay_events[0].type == "response.created", replay_seq
+        assert replay_events[-1].type in TERMINAL_RESPONSE_EVENTS, replay_seq
+        assert replay_events[-1].response.id == response_id
+        numbers = [event.sequence_number for event in replay_events]
+        assert numbers == sorted(numbers), numbers
+
+    def test_streaming_replay_starting_after_skips_earlier_events(
+        self, openai_client
+    ):
+        """``starting_after=N`` replays only events whose ``sequence_number > N``,
+        while still delivering the terminal event."""
+        live_events = _collect_stream(
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say exactly: REPLAY-CURSOR /no_think",
+                store=True,
+                stream=True,
+                max_output_tokens=128,
+            )
+        )
+        response_id = _assert_stream_contract(live_events, require_usage=False).id
+        _retrieve_with_retry(openai_client, response_id)
+
+        full = _collect_replay_with_retry(openai_client, response_id)
+        assert len(full) >= 2, [event.type for event in full]
+
+        cursor = full[0].sequence_number
+        after = _collect_replay_with_retry(
+            openai_client, response_id, starting_after=cursor
+        )
+
+        assert after, "replay after the first event must still return events"
+        assert all(event.sequence_number > cursor for event in after), [
+            event.sequence_number for event in after
+        ]
+        assert [event.sequence_number for event in after] == [
+            event.sequence_number for event in full if event.sequence_number > cursor
+        ]
+        # The terminal event always survives the cursor so a resumed reader still
+        # observes completion.
+        assert after[-1].type in TERMINAL_RESPONSE_EVENTS, [
+            event.type for event in after
+        ]
+
+    def test_streaming_replay_requires_a_stored_event_log(self, openai_client):
+        """A response created without ``stream=true`` has no replay log; replaying
+        it returns a 400 ``invalid_request_error`` -- never a 404 and never a
+        fabricated stream reconstructed from the stored JSON."""
+        buffered = openai_client.responses.create(
+            model=VLLM_MODEL,
+            input="Say exactly: NO-REPLAY /no_think",
+            store=True,
+            stream=False,
+            max_output_tokens=128,
+        )
+        _retrieve_with_retry(openai_client, buffered.id)
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.responses.retrieve(buffered.id, stream=True)
+        assert exc_info.value.status_code == 400
+        assert "replayable" in str(exc_info.value).lower(), str(exc_info.value)
+
+    def test_streaming_replay_starting_after_requires_stream(self, openai_client):
+        """``starting_after`` without ``stream=true`` is rejected with a 400 rather
+        than silently returning the plain JSON record."""
+        live_events = _collect_stream(
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say exactly: CURSOR-NEEDS-STREAM /no_think",
+                store=True,
+                stream=True,
+                max_output_tokens=128,
+            )
+        )
+        response_id = _assert_stream_contract(live_events, require_usage=False).id
+        _retrieve_with_retry(openai_client, response_id)
+
+        with pytest.raises(BadRequestError) as exc_info:
+            openai_client.responses.retrieve(response_id, starting_after=0)
+        assert exc_info.value.status_code == 400
+
+    def test_streaming_replay_is_owner_scoped(
+        self, openai_client, other_owner_openai_client
+    ):
+        """Replay honors ownership: another owner in the same tenant gets a 404,
+        never another owner's stored events, while the owner still replays."""
+        live_events = _collect_stream(
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say exactly: REPLAY-PRIVATE /no_think",
+                store=True,
+                stream=True,
+                max_output_tokens=128,
+            )
+        )
+        response_id = _assert_stream_contract(live_events, require_usage=False).id
+        _retrieve_with_retry(openai_client, response_id)
+
+        with pytest.raises(NotFoundError):
+            other_owner_openai_client.responses.retrieve(response_id, stream=True)
+
+        owner_events = _collect_replay_with_retry(openai_client, response_id)
+        assert owner_events[-1].type in TERMINAL_RESPONSE_EVENTS
+
+    def test_streaming_replay_removed_on_delete(self, openai_client):
+        """Deleting a response removes its replay log: a subsequent replay returns
+        404, matching the plain JSON record's lifecycle."""
+        live_events = _collect_stream(
+            openai_client.responses.create(
+                model=VLLM_MODEL,
+                input="Say exactly: REPLAY-DELETE /no_think",
+                store=True,
+                stream=True,
+                max_output_tokens=128,
+            )
+        )
+        response_id = _assert_stream_contract(live_events, require_usage=False).id
+        _retrieve_with_retry(openai_client, response_id)
+
+        assert _collect_replay_with_retry(openai_client, response_id)
+        assert openai_client.responses.delete(response_id) is None
+
+        with pytest.raises(NotFoundError):
+            openai_client.responses.retrieve(response_id, stream=True)
 
     @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "streaming"])
     def test_conflicting_history_selectors_error_shape(self, openai_client, stream):
@@ -5803,6 +5994,38 @@ def _retrieve_with_retry(client, response_id, attempts=15, delay=0.4):
             time.sleep(delay)
     raise AssertionError(
         f"response {response_id} not retrievable after {attempts} attempts: "
+        f"{last_exc}"
+    )
+
+
+def _collect_replay_with_retry(
+    client, response_id, *, starting_after=None, attempts=15, delay=0.4
+):
+    """Replay a stored streaming response's event log via ``GET ?stream=true``.
+
+    The replay event log is flushed as the proxy finishes serving the streamed
+    response body; a replay issued the instant the create-stream iterator
+    returns can race that write and briefly see the "no replayable event
+    stream" 400. Retry a bounded number of times, treating only that specific
+    400 as "not flushed yet" and re-raising every other error immediately.
+    """
+    from openai import BadRequestError
+
+    kwargs: dict[str, Any] = {"stream": True}
+    if starting_after is not None:
+        kwargs["starting_after"] = starting_after
+
+    last_exc = None
+    for _ in range(attempts):
+        try:
+            return _collect_stream(client.responses.retrieve(response_id, **kwargs))
+        except BadRequestError as exc:
+            if "replayable" not in str(exc).lower():
+                raise
+            last_exc = exc
+            time.sleep(delay)
+    raise AssertionError(
+        f"response {response_id} not replayable after {attempts} attempts: "
         f"{last_exc}"
     )
 

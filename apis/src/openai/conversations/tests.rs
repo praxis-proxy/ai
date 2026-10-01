@@ -29,8 +29,9 @@ use crate::{
     },
     operation::{ApplicationProtocol, Transport},
     store::{
-        ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord,
-        PersistedStateBackend, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+        ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        PersistedStateBackend, ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry,
+        SqliteResponseStore, StoreError,
     },
     test_utils::{make_owned_filter_context as base_owned_filter_context, make_request, make_response},
 };
@@ -3633,16 +3634,160 @@ async fn append_back_request_requires_owner_before_inference() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_not_armed_when_streaming() {
+async fn streaming_terminal_appends_once_without_buffering_sse() {
     let (filter, store) = harness();
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
     let req = make_request(Method::POST, "/v1/responses");
     let mut ctx = conv_ctx(&store, &req);
     ctx.current_filter_id = Some(0);
-    set_append_back_metadata(&mut ctx);
+    ctx.response_body_mode = filter.response_body_mode();
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
     ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.set_metadata("openai_responses_format.store", "false");
+    ctx.extensions.insert(ResponsesState {
+        input: vec![serde_json::json!({"role":"user","content":"streamed question"})],
+        response_object: serde_json::json!({
+            "status": "completed",
+            "output": [{"type":"message","role":"assistant","content":"streamed answer"}]
+        }),
+        logical_stream_terminal_emitted: true,
+        ..ResponsesState::default()
+    });
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
 
     let action = filter.on_response(&mut ctx).await.unwrap();
     assert!(matches!(action, FilterAction::Continue));
+    assert!(matches!(ctx.response_body_mode, BodyMode::Stream));
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    let action = filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert_eq!(
+        terminal.as_deref(),
+        Some(b"event: response.completed\ndata: {}\n\n".as_slice())
+    );
+
+    let mut eos: Option<Bytes> = None;
+    let action = filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+
+    let list_req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items?order=asc"));
+    let mut list_ctx = conv_ctx(&store, &list_req);
+    let action = filter.on_request(&mut list_ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected conversation items response");
+    };
+    assert_eq!(rejection.status, 200);
+    let listed = rejection_body(&rejection);
+    let items = listed["data"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "terminal and EOS must append the turn only once");
+    assert_eq!(items[0]["content"][0]["text"], "streamed question");
+    assert_eq!(items[1]["content"][0]["text"], "streamed answer");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_stream_completion_appends_before_eos() {
+    let (filter, store) = harness();
+    let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    ctx.set_metadata("openai_responses_format.has_conversation", "true");
+    ctx.set_metadata("responses.conversation_id", &conv_id);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.extensions.insert(ResponsesState {
+        input: vec![serde_json::json!({"type":"message","role":"user","content":"local input"})],
+        response_object: serde_json::json!({
+            "status":"completed",
+            "output":[{"type":"message","role":"assistant","content":"local output"}]
+        }),
+        logical_stream_terminal_emitted: false,
+        ..ResponsesState::default()
+    });
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let mut delta = Some(Bytes::from_static(b"event: response.output_text.delta\ndata: {}\n\n"));
+    drop(filter.on_response_body(&mut ctx, &mut delta, false).unwrap());
+    let list_req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items?order=asc"));
+    let mut list_ctx = conv_ctx(&store, &list_req);
+    let action = filter.on_request(&mut list_ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected conversation items response");
+    };
+    assert!(rejection_body(&rejection)["data"].as_array().unwrap().is_empty());
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    drop(filter.on_response_body(&mut ctx, &mut terminal, false).unwrap());
+
+    let mut eos: Option<Bytes> = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
+
+    let mut list_ctx = conv_ctx(&store, &list_req);
+    let action = filter.on_request(&mut list_ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected conversation items response");
+    };
+    let listed = rejection_body(&rejection);
+    let items = listed["data"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "local completion and EOS must append once");
+    assert_eq!(items[0]["content"][0]["text"], "local input");
+    assert_eq!(items[1]["content"][0]["text"], "local output");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_without_completed_terminal_does_not_append_conversation_items() {
+    for status in ["incomplete", "completed"] {
+        let (filter, store) = harness();
+        let conv_id = create_test_conversation(filter.as_ref(), &store, serde_json::json!({})).await;
+        let req = make_request(Method::POST, "/v1/responses");
+        let mut ctx = conv_ctx(&store, &req);
+        ctx.current_filter_id = Some(0);
+        ctx.set_metadata("openai_responses_format.has_conversation", "true");
+        ctx.set_metadata("responses.conversation_id", &conv_id);
+        ctx.set_metadata("openai_responses_format.stream", "true");
+        ctx.extensions.insert(ResponsesState {
+            input: vec![serde_json::json!({"type":"message","role":"user","content":"unfinished"})],
+            response_object: serde_json::json!({"status":status,"output":[]}),
+            logical_stream_terminal_emitted: status == "incomplete",
+            ..ResponsesState::default()
+        });
+        capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+        let mut response = make_response();
+        response
+            .headers
+            .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+        ctx.response_header = Some(&mut response);
+        drop(filter.on_response(&mut ctx).await.unwrap());
+        let mut body =
+            (status == "incomplete").then(|| Bytes::from_static(b"event: response.incomplete\ndata: {}\n\n"));
+        drop(filter.on_response_body(&mut ctx, &mut body, false).unwrap());
+        let mut eos: Option<Bytes> = None;
+        drop(filter.on_response_body(&mut ctx, &mut eos, true).unwrap());
+
+        let list_req = make_request(Method::GET, &format!("/v1/conversations/{conv_id}/items?order=asc"));
+        let mut list_ctx = conv_ctx(&store, &list_req);
+        let action = filter.on_request(&mut list_ctx).await.unwrap();
+        let FilterAction::Reject(rejection) = action else {
+            panic!("expected conversation items response");
+        };
+        assert!(
+            rejection_body(&rejection)["data"].as_array().unwrap().is_empty(),
+            "{status} state without a completed terminal must not append"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3868,7 +4013,6 @@ async fn on_response_body_appends_completed_response() {
     ctx.set_metadata("responses.conversation_id", &conv_id);
 
     let input_items = vec![serde_json::json!({
-        "type": "message",
         "role": "user",
         "content": "hello from append"
     })];
@@ -4021,6 +4165,47 @@ async fn on_response_body_surfaces_item_insert_failure() {
     assert!(
         result.is_err(),
         "item-insert failure during append-back must propagate as an error, not a silent success"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_terminal_propagates_append_failure_before_release() {
+    let (filter, store) = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::CreateItems,
+        conversation_exists: false,
+        metadata_update: MetadataUpdateOutcome::Updated,
+    });
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = conv_ctx(&store, &req);
+    ctx.current_filter_id = Some(0);
+    set_append_back_metadata(&mut ctx);
+    ctx.set_metadata("openai_responses_format.stream", "true");
+    ctx.extensions.insert(ResponsesState {
+        input: vec![serde_json::json!({"type":"message","role":"user","content":"hello"})],
+        response_object: serde_json::json!({"status":"completed","output":[]}),
+        logical_stream_terminal_emitted: true,
+        ..ResponsesState::default()
+    });
+    capture_append_owner_for_test(filter.as_ref(), &mut ctx).await;
+    let mut response = make_response();
+    response
+        .headers
+        .insert(http::header::CONTENT_TYPE, "text/event-stream".parse().unwrap());
+    ctx.response_header = Some(&mut response);
+    drop(filter.on_response(&mut ctx).await.unwrap());
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\ndata: {}\n\n"));
+    assert!(
+        filter.on_response_body(&mut ctx, &mut terminal, false).is_err(),
+        "a failed item transaction must withhold the completed stream frame"
+    );
+    let mut eos: Option<Bytes> = None;
+    assert!(
+        matches!(
+            filter.on_response_body(&mut ctx, &mut eos, true),
+            Ok(FilterAction::Continue)
+        ),
+        "a failure-mode-open terminal must not retry an ambiguous item commit at EOS"
     );
 }
 
@@ -4376,7 +4561,7 @@ async fn generated_responses_table_gates_conversations_on_schema_version() {
     let pool = sqlx::SqlitePool::connect_with(options)
         .await
         .expect("pool should connect");
-    sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {version_table} SET version = 4")))
+    sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {version_table} SET version = 5")))
         .execute(&pool)
         .await
         .expect("version bump should succeed");
@@ -4767,6 +4952,33 @@ impl ResponseStore for FailingItemStore {
     ) -> Result<Option<usize>, StoreError> {
         unreachable!("FailingItemStore is a conversations-only test double")
     }
+
+    async fn append_events(
+        &self,
+        _owner: &crate::StateOwner,
+        _response_id: &str,
+        _events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        unreachable!("FailingItemStore is a conversations-only test double")
+    }
+
+    async fn list_events_after(
+        &self,
+        _owner: &crate::StateOwner,
+        _response_id: &str,
+        _after: Option<u64>,
+        _limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        unreachable!("FailingItemStore is a conversations-only test double")
+    }
+
+    async fn event_log_status(
+        &self,
+        _owner: &crate::StateOwner,
+        _response_id: &str,
+    ) -> Result<EventLogStatus, StoreError> {
+        unreachable!("FailingItemStore is a conversations-only test double")
+    }
 }
 
 /// A [`ConversationItemStore`] that reproduces the #1144 metadata-update race.
@@ -5008,6 +5220,33 @@ impl ResponseStore for AppendDuringUpdateStore {
         self.inner
             .consume_approvals(owner, response_id, approval_ids, consumed_at)
             .await
+    }
+
+    async fn append_events(
+        &self,
+        owner: &crate::StateOwner,
+        response_id: &str,
+        events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        self.inner.append_events(owner, response_id, events).await
+    }
+
+    async fn list_events_after(
+        &self,
+        owner: &crate::StateOwner,
+        response_id: &str,
+        after: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        self.inner.list_events_after(owner, response_id, after, limit).await
+    }
+
+    async fn event_log_status(
+        &self,
+        owner: &crate::StateOwner,
+        response_id: &str,
+    ) -> Result<EventLogStatus, StoreError> {
+        self.inner.event_log_status(owner, response_id).await
     }
 }
 

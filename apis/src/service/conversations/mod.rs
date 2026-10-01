@@ -272,6 +272,11 @@ fn default_item_status(map: &mut Map<String, Value>) {
 
 /// Normalize easy SDK message inputs into conversation message response objects.
 fn normalize_message_item(map: &mut Map<String, Value>) -> Result<(), StoreError> {
+    // Responses accepts an easy input message without `type`, but persisted
+    // Conversation items require the explicit message discriminator.
+    if !map.contains_key("type") && map.contains_key("role") && map.contains_key("content") {
+        map.insert("type".to_owned(), Value::String("message".to_owned()));
+    }
     if map.get("type").and_then(Value::as_str) != Some("message") {
         return Ok(());
     }

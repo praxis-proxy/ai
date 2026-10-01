@@ -144,8 +144,8 @@ pub(super) struct StreamEventsState {
 /// elsewhere is a misconfiguration and fails closed at request time.
 /// Place it after `load_balancer` so IRR body hooks run with a selected
 /// peer when needed. `timeout_secs` is an absolute deadline from the first
-/// SSE chunk; each chunk recaps the remaining time onto the live body through
-/// [`praxis_filter::HttpFilterContext::cap_stream_read_timeout`].
+/// SSE chunk; each chunk recaps that absolute cutoff onto the live body through
+/// [`praxis_filter::HttpFilterContext::cap_stream_deadline`].
 ///
 /// # YAML
 ///
@@ -505,7 +505,7 @@ fn stream_deadline_at(state: &StreamEventsState) -> Option<Instant> {
 /// Publish the absolute stream cutoff for the streaming executor to copy onto
 /// the live body after this body-filter pass.
 fn recap_stream_deadline(ctx: &mut HttpFilterContext<'_>, deadline: Instant) {
-    ctx.cap_stream_read_timeout(deadline.saturating_duration_since(Instant::now()));
+    ctx.cap_stream_deadline(deadline);
 }
 
 /// Whether an `Io` termination is the stream deadline, not a reset.

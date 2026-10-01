@@ -17,6 +17,7 @@ on:
       - "store-backends/**"
       - "store-lifecycle/**"
       - "apis/src/openai/responses/**"
+      - "apis/src/openai/translation/**"
       - "apis/src/openai/conversations/**"
       - "apis/src/openai/sse/**"
       - "apis/src/store/**"
@@ -30,6 +31,8 @@ on:
       - "Cargo.lock"
       - "Makefile"
       - "vllm/Containerfile"
+      - ".github/scripts/vllm_qualification.py"
+      - "tests/integration/sdk/openai/qualification_plugin.py"
       - ".github/actions/build-vllm-gpu/**"
       - ".github/actions/start-vllm/**"
       - ".github/actions/wait-vllm/**"
@@ -142,6 +145,7 @@ jobs:
             'store-backends/' \
             'store-lifecycle/' \
             'apis/src/openai/responses/' \
+            'apis/src/openai/translation/' \
             'apis/src/openai/conversations/' \
             'apis/src/openai/sse/' \
             'apis/src/store/' \
@@ -155,6 +159,8 @@ jobs:
             'Cargo.lock' \
             'Makefile' \
             'vllm/Containerfile' \
+            '.github/scripts/vllm_qualification.py' \
+            'tests/integration/sdk/openai/qualification_plugin.py' \
             '.github/actions/build-vllm-gpu/' \
             '.github/actions/start-vllm/' \
             '.github/actions/wait-vllm/' \
@@ -622,7 +628,9 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-          cache-dependency-glob: tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py
+          cache-dependency-glob: |
+            tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py
+            tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py
 
       - name: Verify pins are resolvable
         run: |
@@ -832,6 +840,7 @@ jobs:
           echo "TEST_BIN=$TEST_BIN" >> "$GITHUB_ENV"
 
       - name: Run Claude Code native-vLLM acceptance test (once, no retry)
+        id: claude_native_edits
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
@@ -855,6 +864,7 @@ jobs:
           exit "${PIPESTATUS[0]}"
 
       - name: Run Claude Code transformed-vLLM acceptance test (once, no retry)
+        id: claude_translated_edits
         if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -876,6 +886,7 @@ jobs:
           exit "${PIPESTATUS[0]}"
 
       - name: Run Claude Code auto-mode native-vLLM acceptance test (once, no retry)
+        id: claude_native_auto
         if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -896,6 +907,7 @@ jobs:
           exit "${PIPESTATUS[0]}"
 
       - name: Run Claude Code auto-mode transformed-vLLM acceptance test (once, no retry)
+        id: claude_translated_auto
         if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.claude_namespace.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -915,14 +927,56 @@ jobs:
           exit "${PIPESTATUS[0]}"
 
       - name: Run Anthropic SDK Messages against real vLLM
+        id: anthropic_messages
         if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
         timeout-minutes: 15
         env:
           PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
           PRAXIS_TEST_REQUIRE_LIVE: "1"
+          PYTHONPATH: tests/integration/sdk/openai
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/anthropic-messages-cases.json
         run: |
-          uv run tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py -s -k "not image"
+          uv run tests/integration/sdk/anthropic/test_anthropic_messages_vllm.py \
+            -s -p qualification_plugin -k "not image"
+
+      - name: Run Anthropic SDK web search against real vLLM (stubbed provider)
+        id: anthropic_stubbed_web_search
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        timeout-minutes: 15
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+          PYTHONPATH: tests/integration/sdk/openai
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/anthropic-stubbed-web-search-cases.json
+        run: |
+          # The live model forces a WebSearch call answered by a local body-auth
+          # stub, so this mode is deterministic and needs no external secret.
+          uv run tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py -s \
+            -p qualification_plugin -k "not live_tavily"
+
+      - name: Run credentialed live Tavily web search against real vLLM
+        id: anthropic_credentialed_web_search
+        if: ${{ always() && !cancelled() && steps.claude_vllm_preflight.outcome == 'success' && steps.anthropic_sdk_uv.outcome == 'success' && steps.claude_test_binary.outcome == 'success' }}
+        timeout-minutes: 15
+        env:
+          PRAXIS_TEST_VLLM_BASE_URL: http://127.0.0.1:8000
+          PRAXIS_TEST_VLLM_MODEL: ${{ env.VLLM_SERVED_MODEL }}
+          PRAXIS_TEST_REQUIRE_LIVE: "1"
+          # The generated YAML keeps the ${WEB_SEARCH_API_KEY} reference, so the
+          # secret is consumed only by this one-test process and is never written
+          # into or printed with the config.
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          # Scheduled/manual full runs are controlled environments and must prove
+          # the real provider path. Labeled fork PRs do not receive secrets, so
+          # they retain deterministic coverage and skip only this credentialed test.
+          PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+          PYTHONPATH: tests/integration/sdk/openai
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/anthropic-credentialed-web-search-cases.json
+        run: |
+          uv run tests/integration/sdk/anthropic/test_anthropic_web_search_vllm.py -s \
+            -p qualification_plugin -k live_tavily
 
       - name: Acceptance log tail on failure
         if: failure()
@@ -942,8 +996,8 @@ jobs:
           "$CONTAINER_RUNTIME" logs vllm > "$RUNNER_TEMP/vllm.log" 2>&1 || true
           tail -n 400 "$RUNNER_TEMP/vllm.log" 2>/dev/null || true
 
-      - name: Upload acceptance diagnostics on failure
-        if: failure()
+      - name: Upload acceptance diagnostics
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: claude-code-vllm-diagnostics
@@ -957,7 +1011,52 @@ jobs:
             ${{ runner.temp }}/acceptance-auto-transformed.log
             ${{ runner.temp }}/vllm.log
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 30
+          overwrite: true
+
+      - name: Capture Claude and Anthropic acceptance scenarios
+        if: always()
+        env:
+          CLAUDE_NATIVE_EDITS: ${{ steps.claude_native_edits.outcome }}
+          CLAUDE_TRANSLATED_EDITS: ${{ steps.claude_translated_edits.outcome }}
+          CLAUDE_NATIVE_AUTO: ${{ steps.claude_native_auto.outcome }}
+          CLAUDE_TRANSLATED_AUTO: ${{ steps.claude_translated_auto.outcome }}
+          ANTHROPIC_MESSAGES: ${{ steps.anthropic_messages.outcome }}
+          ANTHROPIC_STUBBED_WEB_SEARCH: ${{ steps.anthropic_stubbed_web_search.outcome }}
+          ANTHROPIC_CREDENTIALED_WEB_SEARCH: ${{ steps.anthropic_credentialed_web_search.outcome }}
+        run: |
+          python3 - "$RUNNER_TEMP/claude-acceptance.json" <<'PY'
+          import json, os, pathlib, subprocess, sys
+          names = ("CLAUDE_NATIVE_EDITS", "CLAUDE_TRANSLATED_EDITS", "CLAUDE_NATIVE_AUTO",
+                   "CLAUDE_TRANSLATED_AUTO", "ANTHROPIC_MESSAGES", "ANTHROPIC_STUBBED_WEB_SEARCH",
+                   "ANTHROPIC_CREDENTIALED_WEB_SEARCH")
+          cases = [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names]
+          for case, filename in (
+              ("anthropic_messages", "anthropic-messages-cases.json"),
+              ("anthropic_stubbed_web_search", "anthropic-stubbed-web-search-cases.json"),
+              ("anthropic_credentialed_web_search", "anthropic-credentialed-web-search-cases.json"),
+          ):
+              path = pathlib.Path(os.environ["RUNNER_TEMP"]) / filename
+              if path.exists():
+                  next(item for item in cases if item["id"] == case)["pytest"] = json.loads(path.read_text())
+          data = {
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "cases": cases,
+          }
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - name: Upload Claude and Anthropic acceptance results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: claude-vllm-acceptance-results
+          path: ${{ runner.temp }}/claude-acceptance.json
+          if-no-files-found: warn
+          retention-days: 30
+          overwrite: true
 
       - name: Tear down network namespace
         if: always()
@@ -1240,6 +1339,7 @@ jobs:
           echo "TEST_BIN=$TEST_BIN" >> "$GITHUB_ENV"
 
       - name: Run Codex native-Responses vLLM acceptance test (once, no retry)
+        id: codex_native
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
           PRAXIS_TEST_CODEX_VLLM_MODEL: ${{ env.CODEX_VLLM_MODEL }}
@@ -1257,6 +1357,7 @@ jobs:
           exit "${PIPESTATUS[0]}"
 
       - name: Run Codex translated-Chat vLLM acceptance test (once, no retry)
+        id: codex_translated
         if: ${{ always() && !cancelled() && steps.codex_vllm_preflight.outcome == 'success' && steps.codex_namespace.outcome == 'success' && steps.codex_test_binary.outcome == 'success' }}
         env:
           PRAXIS_TEST_CODEX_VLLM_BASE_URL: http://127.0.0.1:8000
@@ -1288,8 +1389,8 @@ jobs:
           echo "=== PostgreSQL ==="
           tail -n 200 "$RUNNER_TEMP/codex-postgres.log" 2>/dev/null || true
 
-      - name: Upload Codex acceptance diagnostics on failure
-        if: failure()
+      - name: Upload Codex acceptance diagnostics
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: codex-vllm-gpu-diagnostics
@@ -1299,7 +1400,36 @@ jobs:
             ${{ runner.temp }}/codex-vllm.log
             ${{ runner.temp }}/codex-postgres.log
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 30
+          overwrite: true
+
+      - name: Capture Codex acceptance scenarios
+        if: always()
+        env:
+          CODEX_NATIVE: ${{ steps.codex_native.outcome }}
+          CODEX_TRANSLATED: ${{ steps.codex_translated.outcome }}
+        run: |
+          python3 - "$RUNNER_TEMP/codex-acceptance.json" <<'PY'
+          import json, os, pathlib, subprocess, sys
+          names = ("CODEX_NATIVE", "CODEX_TRANSLATED")
+          data = {
+              "run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "checkout_sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "cases": [{"id": name.lower(), "status": os.environ[name] or "unexecuted"} for name in names],
+          }
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(data, indent=2) + "\n")
+          PY
+
+      - name: Upload Codex acceptance results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-vllm-acceptance-results
+          path: ${{ runner.temp }}/codex-acceptance.json
+          if-no-files-found: warn
+          retention-days: 30
+          overwrite: true
 
       - name: Tear down Codex network namespace
         if: always()
@@ -1493,15 +1623,18 @@ jobs:
           echo $! > /tmp/ogx.pid
 
       - name: Build Praxis
+        id: qualification_build
         run: cargo build -p praxis-ai-proxy --features full
 
       - name: Wait for vLLM readiness
+        id: qualification_vllm_ready
         uses: ./.github/actions/wait-vllm
         with:
           runtime: ${{ env.CONTAINER_RUNTIME }}
           timeout: "1200"
 
       - name: Wait for OGX readiness
+        id: qualification_ogx_ready
         run: |
           dump_ogx_log() {
             echo "----- /tmp/ogx.log (tail -n 200) -----"
@@ -1529,11 +1662,16 @@ jobs:
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
           VLLM_TEST_BACKEND: live
           VLLM_MODEL: ${{ env.VLLM_GPU_MODEL }}
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/qualification-native-cases.json
         run: |
+          set +e
           uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s \
-            -k "not live_tavily_web_search_returns_real_sources"
+            -p qualification_plugin -k "not live_tavily_web_search_returns_real_sources" \
+            2>&1 | tee "$RUNNER_TEMP/qualification-native-pytest.log"
+          exit "${PIPESTATUS[0]}"
 
       - name: Run credentialed live Tavily web search
+        if: ${{ always() && !cancelled() && steps.qualification_ogx_ready.outcome == 'success' }}
         env:
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
           # The generated YAML keeps the ${TAVILY_API_KEY} reference, so the
@@ -1546,9 +1684,46 @@ jobs:
           PRAXIS_TEST_REQUIRE_LIVE_WEB_SEARCH: ${{ github.event_name != 'pull_request' && '1' || '0' }}
           VLLM_TEST_BACKEND: live
           VLLM_MODEL: ${{ env.VLLM_GPU_MODEL }}
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/qualification-credentialed-cases.json
         run: |
+          set +e
           uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s \
-            -k live_tavily_web_search_returns_real_sources
+            -p qualification_plugin -k live_tavily_web_search_returns_real_sources \
+            2>&1 | tee "$RUNNER_TEMP/qualification-credentialed-pytest.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Capture native GPU qualification and diagnostics
+        if: always()
+        env:
+          QUALIFICATION_SETUP: ${{ steps.qualification_build.outcome == 'success' && steps.qualification_vllm_ready.outcome == 'success' && steps.qualification_ogx_ready.outcome == 'success' && 'passed' || 'failed' }}
+          GPU_INSTANCE_TYPE: ${{ inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
+        run: |
+          python3 .github/scripts/vllm_qualification.py capture \
+            --native "$RUNNER_TEMP/qualification-native-cases.json" \
+            --credentialed "$RUNNER_TEMP/qualification-credentialed-cases.json" \
+            --setup "$QUALIFICATION_SETUP" \
+            --output "$RUNNER_TEMP/qualification-raw.json"
+          "${CONTAINER_RUNTIME:-docker}" logs vllm > "$RUNNER_TEMP/qualification-vllm.log" 2>&1 || true
+          "${CONTAINER_RUNTIME:-docker}" logs praxis-postgres > "$RUNNER_TEMP/qualification-postgres.log" 2>&1 || true
+          cp /tmp/ogx.log "$RUNNER_TEMP/qualification-ogx.log" 2>/dev/null || true
+
+      - name: Upload native GPU results and diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vllm-gpu-native-raw
+          path: |
+            ${{ runner.temp }}/qualification-raw.json
+            ${{ runner.temp }}/qualification-native-cases.json
+            ${{ runner.temp }}/qualification-credentialed-cases.json
+            ${{ runner.temp }}/qualification-native-pytest.log
+            ${{ runner.temp }}/qualification-credentialed-pytest.log
+            ${{ runner.temp }}/qualification-vllm.log
+            ${{ runner.temp }}/qualification-postgres.log
+            ${{ runner.temp }}/qualification-ogx.log
+          if-no-files-found: warn
+          retention-days: 30
+          overwrite: true
 
       - name: vLLM container logs
         if: failure()
@@ -1580,6 +1755,68 @@ jobs:
           if [ -f /tmp/ogx.pid ]; then
             kill "$(cat /tmp/ogx.pid)" 2>/dev/null || true
           fi
+
+  # Runs on a hosted runner so provisioning and GPU runner registration failures
+  # still produce an explicit report and Actions summary.
+  gpu-qualification-summary:
+    name: Summarize native vLLM GPU qualification
+    needs: [gpu-start-runner, vllm-gpu-full-suite, vllm-gpu-claude-acceptance, vllm-gpu-codex-acceptance]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download available native results
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/vllm-qualification-raw"
+          gh run download "$GITHUB_RUN_ID" --name vllm-gpu-native-raw \
+            --dir "$RUNNER_TEMP/vllm-qualification-raw" || true
+          mkdir -p "$RUNNER_TEMP/claude-acceptance-raw" "$RUNNER_TEMP/codex-acceptance-raw"
+          gh run download "$GITHUB_RUN_ID" --name claude-vllm-acceptance-results \
+            --dir "$RUNNER_TEMP/claude-acceptance-raw" || true
+          gh run download "$GITHUB_RUN_ID" --name codex-vllm-acceptance-results \
+            --dir "$RUNNER_TEMP/codex-acceptance-raw" || true
+
+      - name: Build report and Actions summary
+        env:
+          GPU_REQUESTED: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_live_vllm) || (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name == 'vllm-full-suite') }}
+          GPU_START_RESULT: ${{ needs.gpu-start-runner.result }}
+          GPU_SUITE_RESULT: ${{ needs.vllm-gpu-full-suite.result }}
+          CLAUDE_RESULT: ${{ needs.vllm-gpu-claude-acceptance.result }}
+          CODEX_RESULT: ${{ needs.vllm-gpu-codex-acceptance.result }}
+        run: |
+          python3 .github/scripts/vllm_qualification.py finish \
+            --raw "$RUNNER_TEMP/vllm-qualification-raw/qualification-raw.json" \
+            --claude-raw "$RUNNER_TEMP/claude-acceptance-raw/claude-acceptance.json" \
+            --codex-raw "$RUNNER_TEMP/codex-acceptance-raw/codex-acceptance.json" \
+            --requested "$GPU_REQUESTED" \
+            --start-result "$GPU_START_RESULT" \
+            --suite-result "$GPU_SUITE_RESULT" \
+            --claude-result "$CLAUDE_RESULT" \
+            --codex-result "$CODEX_RESULT" \
+            --run-id "$GITHUB_RUN_ID" \
+            --attempt "$GITHUB_RUN_ATTEMPT" \
+            --url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --sha "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/qualification.json" \
+            --markdown "$RUNNER_TEMP/qualification-summary.md"
+          cat "$RUNNER_TEMP/qualification-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload structured qualification report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vllm-qualification
+          path: ${{ runner.temp }}/qualification.json
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
 
   gpu-stop-runner:
     name: Stop ephemeral EC2 GPU runner

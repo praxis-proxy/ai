@@ -11,8 +11,8 @@ use super::*;
 use crate::{
     openai::sse::{SseFrame, SseFrameParser},
     store::{
-        ConversationItemRecord, ConversationItemStore, ConversationRecord, PendingApprovalRecord, ResponseRecord,
-        ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
+        ConversationItemRecord, ConversationItemStore, ConversationRecord, EventLogStatus, PendingApprovalRecord,
+        ResponseEventRecord, ResponseRecord, ResponseStore, ResponseStoreRegistry, SqliteResponseStore, StoreError,
     },
 };
 
@@ -3570,6 +3570,36 @@ impl ResponseStore for MockStore {
     ) -> Result<Vec<PendingApprovalRecord>, StoreError> {
         // Rehydration never issues approvals; this stub satisfies the trait.
         Ok(Vec::new())
+    }
+
+    async fn append_events(
+        &self,
+        _tenant_id: &StateOwner,
+        _response_id: &str,
+        _events: &[ResponseEventRecord],
+    ) -> Result<(), StoreError> {
+        // Rehydration never writes the event log; this stub satisfies the trait.
+        Ok(())
+    }
+
+    async fn list_events_after(
+        &self,
+        _tenant_id: &StateOwner,
+        _response_id: &str,
+        _after: Option<u64>,
+        _limit: u32,
+    ) -> Result<Vec<ResponseEventRecord>, StoreError> {
+        // Rehydration never replays the event log; this stub satisfies the trait.
+        Ok(Vec::new())
+    }
+
+    async fn event_log_status(
+        &self,
+        _tenant_id: &StateOwner,
+        _response_id: &str,
+    ) -> Result<EventLogStatus, StoreError> {
+        // Rehydration never inspects the event log; this stub satisfies the trait.
+        Ok(EventLogStatus::default())
     }
 
     async fn get_conversation(

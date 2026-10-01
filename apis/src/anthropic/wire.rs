@@ -203,11 +203,16 @@ pub(crate) fn error_body(error_type: &str, message: &str, request_id: Option<&st
     .unwrap_or_else(|_| ERROR_SERIALIZATION_FALLBACK.to_vec())
 }
 
+/// Build a schema-complete Anthropic error rejection with an explicit status.
+pub(crate) fn error_rejection(status: u16, error_type: &str, message: &str) -> Rejection {
+    Rejection::status(status)
+        .with_header("content-type", "application/json")
+        .with_body(Bytes::from(error_body(error_type, message, None)))
+}
+
 /// Build a schema-complete Anthropic invalid-request rejection.
 pub(crate) fn invalid_request_rejection(message: &str) -> Rejection {
-    Rejection::status(400)
-        .with_header("content-type", "application/json")
-        .with_body(Bytes::from(error_body("invalid_request_error", message, None)))
+    error_rejection(400, "invalid_request_error", message)
 }
 
 #[cfg(test)]
