@@ -279,6 +279,7 @@ lint-xtask:
 	cargo xtask check-inference
 	cargo xtask check-responses-registry
 	cargo xtask check-chat-completions-registry
+	cargo xtask check-crypto-inventory
 	cargo xtask openresponses-coverage
 
 # Lint the product crates with only the default-on gates. `-p` without
