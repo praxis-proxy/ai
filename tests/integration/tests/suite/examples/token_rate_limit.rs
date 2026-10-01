@@ -845,3 +845,111 @@ fn example_config_token_rate_limit_soft_tiers() {
         "team-beta's upstream request should carry the inject tier header"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Soft / shadow over-quota enforcement (ai#1241)
+// -----------------------------------------------------------------------------
+
+/// Smoke-tests `token-rate-limit-soft-enforcement.yaml`: soft and shadow
+/// forward over-quota traffic with annotation; hard still returns 429.
+#[test]
+fn example_config_token_rate_limit_soft_enforcement() {
+    let backend = StatefulCapturingBackend::new(vec![
+        (200, PLAIN_TEXT_BODY.to_owned()),
+        (200, PLAIN_TEXT_BODY.to_owned()),
+        (200, PLAIN_TEXT_BODY.to_owned()),
+        (200, PLAIN_TEXT_BODY.to_owned()),
+        (200, PLAIN_TEXT_BODY.to_owned()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+
+    let path = example_config_path("token-rate-limit-soft-enforcement.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    // Shrink budgets so two reservations exhaust each rule.
+    let yaml = yaml
+        .replace("capacity: 100000", "capacity: 100")
+        .replace("reserved_tokens: 500", "reserved_tokens: 60")
+        .replace("capacity: 50000", "capacity: 100")
+        .replace("reserved_tokens: 200", "reserved_tokens: 60");
+    let patched = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend.port())]));
+    let config = praxis_core::config::Config::from_yaml(&patched).expect("config should parse");
+    let proxy = start_proxy(&config);
+
+    // Soft: first admits, second is over-quota but still forwarded with annotation.
+    let soft_first = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "soft")]),
+    );
+    assert_eq!(parse_status(&soft_first), 200, "soft first request should be admitted");
+    let soft_second = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "soft")]),
+    );
+    assert_eq!(
+        parse_status(&soft_second),
+        200,
+        "soft over-quota must forward instead of 429"
+    );
+    let soft_upstream = backend.requests()[1].headers.to_ascii_lowercase();
+    assert!(
+        soft_upstream.contains("x-over-quota:"),
+        "soft over-quota should annotate upstream request"
+    );
+    assert!(
+        soft_upstream.contains("x-ratelimit-remaining-tokens:"),
+        "soft over-quota should include remaining metadata"
+    );
+    assert!(
+        soft_upstream.contains("x-token-quota-used:"),
+        "soft over-quota should include used metadata"
+    );
+
+    // Shadow: second request forwards without upstream request mutation.
+    let shadow_first = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "shadow")]),
+    );
+    assert_eq!(
+        parse_status(&shadow_first),
+        200,
+        "shadow first request should be admitted"
+    );
+    let shadow_second = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "shadow")]),
+    );
+    assert_eq!(
+        parse_status(&shadow_second),
+        200,
+        "shadow would-deny must forward instead of 429"
+    );
+    let shadow_upstream = backend.requests()[3].headers.to_ascii_lowercase();
+    for name in ["x-over-quota:", "x-ratelimit-remaining-tokens:", "x-token-quota-used:"] {
+        assert!(
+            !shadow_upstream.contains(name),
+            "shadow without over_quota must not annotate the upstream request ({name})"
+        );
+    }
+
+    // Hard: second request is rejected with 429.
+    let hard_first = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "hard")]),
+    );
+    assert_eq!(parse_status(&hard_first), 200, "hard first request should be admitted");
+    let hard_second = http_send(
+        proxy.addr(),
+        &json_post_with_headers("/v1/chat/completions", "{}", &[("x-app-id", "hard")]),
+    );
+    assert_eq!(
+        parse_status(&hard_second),
+        429,
+        "hard over-quota must still reject with 429"
+    );
+    assert_eq!(
+        backend.requests().len(),
+        5,
+        "hard rejection must not contact the provider"
+    );
+}

@@ -111,13 +111,15 @@ redis.call('SET', KEYS[5], active_total)
 
 redis.call('ZREMRANGEBYSCORE', KEYS[4], '-inf', now_ms)
 local key_exists = redis.call('ZSCORE', KEYS[10], KEYS[1]) ~= false
+-- Denial reason codes (must match Rust DenialReason mapping):
+-- 1 = WindowCapacity, 2 = KeyCapacity, 3 = ReservationCapacity
 if not key_exists and redis.call('ZCARD', KEYS[10]) >= max_keys then
   refresh_rule_telemetry_ttl()
-  return {2, max_window, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[10])}
+  return {0, 2, max_window, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[10])}
 end
 if active_total >= max_active then
   refresh_rule_telemetry_ttl()
-  return {0, max_window, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[10])}
+  return {0, 3, max_window, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[10])}
 end
 
 local key_remaining = nil
@@ -145,7 +147,12 @@ for i = 1, budget_count do
   if total_usage > capacity then
     update_remaining(key_remaining)
     refresh_rule_telemetry_ttl()
-    return {0, max_window, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[10])}
+    -- Denial payload: key remaining for soft/shadow annotation, plus the
+    -- rule-wide aggregate for telemetry (must not overwrite the gauge).
+    return {
+      0, 1, max_window, math.floor(key_remaining), rule_active_total,
+      redis.call('ZCARD', KEYS[10]), math.floor(reported_remaining())
+    }
   end
 end
 

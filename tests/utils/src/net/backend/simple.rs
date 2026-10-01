@@ -783,6 +783,13 @@ fn start_server(mut config: Config) -> u16 {
         }
     }
 
+    // Binary-like `praxis::run_server` refuses UID 0 unless overridden. Agent
+    // and some CI containers run tests as root; mock backends need the escape.
+    #[cfg(unix)]
+    if nix::unistd::Uid::effective().is_root() {
+        config.insecure_options.allow_root = true;
+    }
+
     std::thread::spawn(move || {
         praxis::run_server(config, None, None);
     });

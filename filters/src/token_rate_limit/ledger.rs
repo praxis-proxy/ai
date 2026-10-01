@@ -108,6 +108,8 @@ pub(super) enum Decision {
         retry_after_ms: u64,
         /// Bounded reason used for operational counters.
         reason: DenialReason,
+        /// Remaining token balance at denial time (for soft/shadow annotation).
+        remaining: u64,
     },
 }
 
@@ -304,6 +306,7 @@ impl Ledger {
             return Decision::Denied {
                 retry_after_ms: 0,
                 reason: DenialReason::InvalidKey,
+                remaining: 0,
             };
         }
 
@@ -324,6 +327,7 @@ impl Ledger {
                         return Decision::Denied {
                             retry_after_ms: 0,
                             reason: DenialReason::KeyCapacity,
+                            remaining: 0,
                         };
                     }
                     let initial_remaining = self.limit();
@@ -361,6 +365,7 @@ impl Ledger {
             return Decision::Denied {
                 retry_after_ms: state.retry_after_ms(now_ms, &self.config),
                 reason: DenialReason::WindowCapacity,
+                remaining,
             };
         }
         if self
@@ -374,6 +379,7 @@ impl Ledger {
             return Decision::Denied {
                 retry_after_ms: self.config.reservation_timeout_ms,
                 reason: DenialReason::ReservationCapacity,
+                remaining,
             };
         }
 

@@ -150,8 +150,11 @@ pub(super) enum Decision {
         /// Conservative delay before the bucket refills enough to admit
         /// the same estimate.
         retry_after_ms: u64,
-        /// Distinguishes budget exhaustion from the `max_keys` cap.
+        /// Why admission failed (shared with sliding-window ledger).
+        /// Also distinguishes budget exhaustion from the `max_keys` cap.
         reason: DenialReason,
+        /// Remaining whole-token balance at denial time.
+        remaining: u64,
     },
 }
 
@@ -327,10 +330,12 @@ impl TokenBucketLedger {
     /// admit and immediately decrement if enough tokens are available,
     /// deny otherwise.
     pub(super) fn reserve(&self, key: &str, estimate: u64, now_ms: u64) -> Decision {
+        use super::ledger::DenialReason;
         if key.is_empty() || key.len() > self.config.max_key_length || estimate == 0 {
             return Decision::Denied {
                 retry_after_ms: 0,
                 reason: DenialReason::InvalidKey,
+                remaining: 0,
             };
         }
 
@@ -351,6 +356,7 @@ impl TokenBucketLedger {
                         return Decision::Denied {
                             retry_after_ms: 0,
                             reason: DenialReason::KeyCapacity,
+                            remaining: 0,
                         };
                     }
                     let state = Arc::new(Mutex::new(BucketState::new(self.config.capacity)));
@@ -388,6 +394,7 @@ impl TokenBucketLedger {
             return Decision::Denied {
                 retry_after_ms,
                 reason: DenialReason::WindowCapacity,
+                remaining: state.reported_remaining,
             };
         }
         if self
@@ -401,6 +408,7 @@ impl TokenBucketLedger {
             return Decision::Denied {
                 retry_after_ms: self.config.reservation_timeout_ms,
                 reason: DenialReason::ReservationCapacity,
+                remaining: state.reported_remaining,
             };
         }
 

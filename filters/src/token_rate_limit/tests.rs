@@ -3844,3 +3844,301 @@ async fn the_decision_span_distinguishes_an_identity_miss_from_a_budget_denial()
         "a rejected request never reports usage"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Soft / shadow over-quota enforcement (ai#1241)
+// -----------------------------------------------------------------------------
+
+fn soft_enforcement_yaml(extra_over_quota: &str) -> serde_yaml::Value {
+    let yaml = format!(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   reserved_tokens: 60\n\
+         \x20   enforcement: soft\n\
+         \x20   over_quota:\n\
+         \x20     headers:\n\
+         \x20       X-Over-Quota: \"true\"\n\
+         {extra_over_quota}"
+    );
+    serde_yaml::from_str(&yaml).unwrap()
+}
+
+#[test]
+fn soft_enforcement_requires_over_quota() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\nenforcement: soft",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("requires over_quota"), "got: {err}");
+}
+
+#[test]
+fn hard_enforcement_rejects_over_quota_block() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\n\
+         over_quota:\n  headers:\n    X-Over-Quota: \"true\"",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(
+        err.to_string().contains("rejected when enforcement is hard")
+            || err.to_string().contains("only valid for soft or shadow"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn soft_over_quota_rejects_empty_annotation_surface() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\n\
+         enforcement: soft\nover_quota: {}",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(
+        err.to_string().contains("at least one header") || err.to_string().contains("include_remaining"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn shadow_enforcement_parses_without_over_quota() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\nenforcement: shadow",
+    );
+    assert!(TokenRateLimitFilter::from_config(&yaml).is_ok());
+}
+
+#[tokio::test]
+async fn soft_enforcement_forwards_and_annotates_when_over_quota() {
+    let yaml = soft_enforcement_yaml(
+        "      include_remaining: true\n\
+         \x20     include_used: true\n",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut first_ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let second = filter.on_request(&mut second_ctx).await.unwrap();
+    assert!(
+        matches!(second, FilterAction::Continue),
+        "soft enforcement must forward over-quota requests"
+    );
+
+    let over_quota = second_ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-over-quota");
+    assert_eq!(over_quota.expect("over-quota header").1.to_str().unwrap(), "true");
+
+    let remaining = second_ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-ratelimit-remaining-tokens");
+    let remaining_val: u64 = remaining
+        .expect("include_remaining")
+        .1
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("remaining is decimal");
+    assert_eq!(
+        remaining_val, 40,
+        "denied soft path must report the key's denial-time remaining balance (100 - 60)"
+    );
+
+    let used = second_ctx
+        .request_headers_to_set
+        .iter()
+        .find(|(name, _)| name.as_str() == "x-token-quota-used");
+    let used_val: u64 = used
+        .expect("include_used")
+        .1
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("used is decimal");
+    assert_eq!(
+        used_val,
+        100 - remaining_val,
+        "denied soft path reports used = limit - remaining"
+    );
+    assert!(
+        !second_ctx
+            .filter_metadata
+            .contains_key("token_rate_limit.reservation_id"),
+        "soft over-quota must not stash a reservation for reconciliation"
+    );
+}
+
+#[tokio::test]
+async fn hard_enforcement_still_rejects_when_over_quota() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut first_ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let second = filter.on_request(&mut second_ctx).await.unwrap();
+    assert!(
+        matches!(second, FilterAction::Reject(_)),
+        "default hard enforcement must still 429 when over quota"
+    );
+}
+
+#[tokio::test]
+async fn shadow_enforcement_forwards_without_request_mutation_when_over_quota() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\nenforcement: shadow",
+    );
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut first_ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+
+    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    let second = filter.on_request(&mut second_ctx).await.unwrap();
+    assert!(
+        matches!(second, FilterAction::Continue),
+        "shadow must forward would-deny traffic"
+    );
+    assert!(
+        second_ctx.request_headers_to_set.is_empty(),
+        "shadow without over_quota must not mutate upstream request headers"
+    );
+    assert!(
+        !second_ctx
+            .filter_metadata
+            .contains_key("token_rate_limit.reservation_id"),
+        "shadow over-quota must not stash a reservation for reconciliation"
+    );
+}
+
+#[tokio::test]
+async fn soft_enforcement_strips_spoofed_over_quota_headers() {
+    let yaml = soft_enforcement_yaml("");
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = make_request_with_header("x-over-quota", "spoofed");
+
+    let mut first_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut first_ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        first_ctx
+            .request_headers_to_remove
+            .iter()
+            .any(|name| name.as_str() == "x-over-quota"),
+        "admitted path must strip client-supplied over-quota headers"
+    );
+
+    let mut second_ctx = crate::test_utils::make_filter_context(&req);
+    assert!(matches!(
+        filter.on_request(&mut second_ctx).await.unwrap(),
+        FilterAction::Continue
+    ));
+    assert!(
+        second_ctx
+            .request_headers_to_remove
+            .iter()
+            .any(|name| name.as_str() == "x-over-quota"),
+        "client-supplied over-quota header must be stripped before inject"
+    );
+}
+
+#[tokio::test]
+async fn soft_enforcement_strips_spoofed_headers_when_estimate_is_unavailable() {
+    // Fallback-free body strategy can return Continue before reserve; spoof
+    // headers must still be stripped at match time.
+    let yaml = serde_yaml::from_str(
+        "rules:\n\
+         \x20 - name: default\n\
+         \x20   algorithm: sliding_window\n\
+         \x20   window: 1h\n\
+         \x20   capacity: 100\n\
+         \x20   enforcement: soft\n\
+         \x20   estimation:\n\
+         \x20     strategy: max_tokens\n\
+         \x20   over_quota:\n\
+         \x20     headers:\n\
+         \x20       X-Over-Quota: \"true\"\n",
+    )
+    .unwrap();
+    let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
+    let req = make_request_with_header("x-over-quota", "spoofed");
+    let mut ctx = crate::test_utils::make_filter_context(&req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    let mut body = Some(bytes::Bytes::from(r#"{"messages": []}"#));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert!(matches!(action, FilterAction::Continue));
+    assert!(
+        ctx.get_metadata("token_rate_limit.reservation_id").is_none(),
+        "no reservation when estimate is unavailable"
+    );
+    assert!(
+        ctx.request_headers_to_remove
+            .iter()
+            .any(|name| name.as_str() == "x-over-quota"),
+        "missing-estimate Continue must still strip spoofable over_quota headers"
+    );
+}
+
+#[test]
+fn over_quota_rejects_remaining_header_without_include_flag() {
+    let yaml = soft_enforcement_yaml("      remaining_header: X-Custom-Remaining\n");
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("include_remaining"), "got: {err}");
+}
+
+#[test]
+fn over_quota_rejects_collision_with_inject_tier_header() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\n\
+         enforcement: soft\n\
+         over_quota:\n  headers:\n    X-Tier: \"over\"\n\
+         tiers:\n\
+         \x20 - capacity: 50\n\
+         \x20   action:\n\
+         \x20     type: inject\n\
+         \x20     headers:\n\
+         \x20       X-Tier: warn\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(
+        err.to_string().contains("collides with an S1 inject-tier header"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn soft_enforcement_rejects_deny_tier() {
+    let yaml = single_rule_yaml(
+        "algorithm: sliding_window\nwindow: 1h\ncapacity: 100\nreserved_tokens: 60\n\
+         enforcement: soft\n\
+         over_quota:\n  headers:\n    X-Over-Quota: \"true\"\n\
+         tiers:\n\
+         \x20 - capacity: 100\n\
+         \x20   action:\n\
+         \x20     type: deny\n",
+    );
+    let err = TokenRateLimitFilter::from_config(&yaml).err().expect("should error");
+    assert!(err.to_string().contains("deny tiers are incompatible"), "got: {err}");
+}

@@ -90,9 +90,11 @@ local function refresh_rule_telemetry_ttl()
 end
 redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now_ms)
 local key_exists = redis.call('EXISTS', KEYS[1]) == 1
+-- Denial reason codes (must match Rust DenialReason mapping):
+-- 1 = WindowCapacity, 2 = KeyCapacity, 3 = ReservationCapacity
 if not key_exists and redis.call('ZCARD', KEYS[9]) >= max_keys then
   refresh_rule_telemetry_ttl()
-  return {2, 1, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[9])}
+  return {0, 2, 1, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[9])}
 end
 if active_total >= max_active then
   if key_exists then
@@ -101,16 +103,22 @@ if active_total >= max_active then
     update_remaining(math.floor(tokens))
   end
   refresh_rule_telemetry_ttl()
-  return {0, 1, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[9])}
+  return {0, 3, 1, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[9])}
 end
 if tokens < estimate then
   local deficit = estimate - tokens
   local retry_after_ms = math.max(1, math.ceil((deficit / refill_rate) * 1000))
+  local key_remaining = math.floor(tokens)
   redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill_ms', now_ms)
   redis.call('PEXPIRE', KEYS[1], ttl)
-  update_remaining(math.floor(tokens))
+  update_remaining(key_remaining)
   refresh_rule_telemetry_ttl()
-  return {0, retry_after_ms, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[9])}
+  -- Denial payload: key remaining for soft/shadow annotation, plus the
+  -- rule-wide aggregate for telemetry (must not overwrite the gauge).
+  return {
+    0, 1, retry_after_ms, key_remaining, rule_active_total,
+    redis.call('ZCARD', KEYS[9]), math.floor(reported_remaining())
+  }
 end
 
 tokens = tokens - estimate

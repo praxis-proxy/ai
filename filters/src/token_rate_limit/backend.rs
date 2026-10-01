@@ -81,8 +81,15 @@ pub(super) enum BackendReserve {
     Denied {
         /// Conservative delay before another admission attempt.
         retry_after_ms: u64,
-        /// Distinguishes budget exhaustion from the `max_keys` cap.
+        /// Why admission failed — soft/shadow only forward budget
+        /// exhaustion ([`DenialReason::WindowCapacity`]); protective
+        /// denials stay hard 429. Also distinguishes budget exhaustion
+        /// from the `max_keys` cap.
         reason: DenialReason,
+        /// Remaining token balance for the denied key at denial time
+        /// (not the rule-wide aggregate). Soft/shadow `include_remaining` /
+        /// `include_used` use this for over-quota annotation.
+        remaining: u64,
     },
 }
 
@@ -135,36 +142,6 @@ impl ValkeyTelemetryState {
         Ok(())
     }
 
-    /// Decode a Lua `reserve` reply: admitted (`1`), budget-denied (`0`),
-    /// or per-rule `max_keys` (`2`).
-    fn parse_reserve_reply(&self, response: &[i64]) -> Result<BackendReserve, BackendError> {
-        match response {
-            [1, id, estimate, usage_after, remaining, active, keys] => {
-                self.record_reply(*remaining, *active, *keys)?;
-                Ok(BackendReserve::Admitted {
-                    reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
-                    estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
-                    usage_after: u64::try_from(*usage_after).map_err(|_error| BackendError::InvalidResponse)?,
-                })
-            },
-            [0, retry_after, remaining, active, keys] => {
-                self.record_reply(*remaining, *active, *keys)?;
-                Ok(BackendReserve::Denied {
-                    retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
-                    reason: DenialReason::WindowCapacity,
-                })
-            },
-            [2, retry_after, remaining, active, keys] => {
-                self.record_reply(*remaining, *active, *keys)?;
-                Ok(BackendReserve::Denied {
-                    retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
-                    reason: DenialReason::KeyCapacity,
-                })
-            },
-            _ => Err(BackendError::InvalidResponse),
-        }
-    }
-
     /// Replace the complete last-observed snapshot.
     fn update(&self, budget_remaining: u64, active_reservations: usize, active_keys: usize) {
         self.budget_remaining.store(budget_remaining, Ordering::Relaxed);
@@ -191,6 +168,50 @@ pub(super) enum BackendError {
     /// The backend responded, but not in the expected shape.
     #[error("shared quota backend returned an invalid response")]
     InvalidResponse,
+}
+
+/// Map Lua reserve denial reason codes to [`DenialReason`].
+///
+/// Scripts return `{0, reason, retry_after_ms, remaining, active, keys}` where
+/// `reason` is `1` = [`DenialReason::WindowCapacity`], `2` =
+/// [`DenialReason::KeyCapacity`], `3` = [`DenialReason::ReservationCapacity`].
+fn denial_reason_from_lua(code: i64) -> Result<DenialReason, BackendError> {
+    match code {
+        1 => Ok(DenialReason::WindowCapacity),
+        2 => Ok(DenialReason::KeyCapacity),
+        3 => Ok(DenialReason::ReservationCapacity),
+        _ => Err(BackendError::InvalidResponse),
+    }
+}
+
+/// Parse a Valkey reserve denial reply into [`BackendReserve::Denied`].
+///
+/// Protective denials are six integers (`remaining` is the rule aggregate).
+/// Budget denials add a seventh aggregate field so soft/shadow annotation can
+/// use per-key remaining without clobbering `praxis_trl_budget_remaining`.
+fn parse_valkey_reserve_denial(
+    telemetry: &ValkeyTelemetryState,
+    reply: &[i64],
+) -> Result<BackendReserve, BackendError> {
+    match reply {
+        [0, reason, retry_after, remaining, active, keys] => {
+            telemetry.record_reply(*remaining, *active, *keys)?;
+            Ok(BackendReserve::Denied {
+                retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
+                reason: denial_reason_from_lua(*reason)?,
+                remaining: u64::try_from(*remaining).map_err(|_error| BackendError::InvalidResponse)?,
+            })
+        },
+        [0, reason, retry_after, key_remaining, active, keys, aggregate] => {
+            telemetry.record_reply(*aggregate, *active, *keys)?;
+            Ok(BackendReserve::Denied {
+                retry_after_ms: u64::try_from(*retry_after).map_err(|_error| BackendError::InvalidResponse)?,
+                reason: denial_reason_from_lua(*reason)?,
+                remaining: u64::try_from(*key_remaining).map_err(|_error| BackendError::InvalidResponse)?,
+            })
+        },
+        _ => Err(BackendError::InvalidResponse),
+    }
 }
 
 /// Where sliding-window admission state lives: in-process or shared.
@@ -293,7 +314,15 @@ impl TokenRateLimitStateBackend for InMemoryTokenRateLimitBackend {
                     estimate: reservation.estimate,
                     usage_after: reservation.usage_after,
                 },
-                Decision::Denied { retry_after_ms, reason } => BackendReserve::Denied { retry_after_ms, reason },
+                Decision::Denied {
+                    retry_after_ms,
+                    reason,
+                    remaining,
+                } => BackendReserve::Denied {
+                    retry_after_ms,
+                    reason,
+                    remaining,
+                },
             },
         )
     }
@@ -419,8 +448,14 @@ impl TokenRateLimitStateBackend for InMemoryTokenBucketBackend {
                     estimate: reservation.estimate,
                     usage_after: reservation.usage_after,
                 },
-                token_bucket_ledger::Decision::Denied { retry_after_ms, reason } => {
-                    BackendReserve::Denied { retry_after_ms, reason }
+                token_bucket_ledger::Decision::Denied {
+                    retry_after_ms,
+                    reason,
+                    remaining,
+                } => BackendReserve::Denied {
+                    retry_after_ms,
+                    reason,
+                    remaining,
                 },
             },
         )
@@ -479,10 +514,11 @@ impl TokenRateLimitStateBackend for InMemoryTokenBucketBackend {
 /// and aggregate remaining balance. `ARGV`: reservation timeout (ms),
 /// max keys, max active reservations, estimate, budget count, then
 /// `(window_ms, capacity)` pairs. Returns
-/// `[1, id, estimate, usage_after, remaining, active, keys]` on admission,
-/// `[0, retry_after_ms, remaining, active, keys]` on budget denial, or
-/// `[2, retry_after_ms, remaining, active, keys]` when the per-rule
-/// `max_keys` cap would be exceeded.
+/// `[1, id, estimate, usage_after, remaining, active, keys]` on admission or
+/// `[0, reason, retry_after_ms, remaining, active, keys]` on protective denial /
+/// `[0, reason, retry_after_ms, key_remaining, active, keys, aggregate_remaining]`
+/// on budget denial (`reason`: 1 = [`DenialReason::WindowCapacity`], 2 =
+/// [`DenialReason::KeyCapacity`], 3 = [`DenialReason::ReservationCapacity`]).
 const RESERVE_SCRIPT: &str = include_str!("lua/sliding_window_reserve.lua");
 
 /// Atomically settle a prior reservation against actual usage -- the
@@ -942,7 +978,17 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
             &self.budgets,
         );
         let response = self.valkey.eval(RESERVE_SCRIPT, &keys, &args).await?;
-        self.telemetry.parse_reserve_reply(&response)
+        match response.as_slice() {
+            [1, id, estimate, usage_after, remaining, active, keys] => {
+                self.telemetry.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendReserve::Admitted {
+                    reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
+                    estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
+                    usage_after: u64::try_from(*usage_after).map_err(|_error| BackendError::InvalidResponse)?,
+                })
+            },
+            reply => parse_valkey_reserve_denial(&self.telemetry, reply),
+        }
     }
 
     async fn reconcile(&self, request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
@@ -1020,10 +1066,11 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
 /// either algorithm's bookkeeping corrupting the other's. `ARGV`: `[1]`
 /// capacity, `[2]` `refill_rate` (tokens/sec), `[3]` reservation timeout
 /// (ms), `[4]` max keys, `[5]` max active reservations, `[6]` estimate.
-/// Returns `[1, id, estimate, usage_after, remaining, active, keys]` on admission,
-/// `[0, retry_after_ms, remaining, active, keys]` on budget denial, or
-/// `[2, retry_after_ms, remaining, active, keys]` when the per-rule
-/// `max_keys` cap would be exceeded.
+/// Returns `[1, id, estimate, usage_after, remaining, active, keys]` on admission or
+/// `[0, reason, retry_after_ms, remaining, active, keys]` on protective denial /
+/// `[0, reason, retry_after_ms, key_remaining, active, keys, aggregate_remaining]`
+/// on budget denial (`reason`: 1 = [`DenialReason::WindowCapacity`], 2 =
+/// [`DenialReason::KeyCapacity`], 3 = [`DenialReason::ReservationCapacity`]).
 pub(super) const TOKEN_BUCKET_RESERVE_SCRIPT: &str = include_str!("lua/token_bucket_reserve.lua");
 
 /// Atomically settle a prior token-bucket reservation against actual
@@ -1208,7 +1255,17 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
             request.estimate.to_string(),
         ];
         let response = self.valkey.eval(TOKEN_BUCKET_RESERVE_SCRIPT, &keys, &args).await?;
-        self.telemetry.parse_reserve_reply(&response)
+        match response.as_slice() {
+            [1, id, estimate, usage_after, remaining, active, keys] => {
+                self.telemetry.record_reply(*remaining, *active, *keys)?;
+                Ok(BackendReserve::Admitted {
+                    reservation_id: u64::try_from(*id).map_err(|_error| BackendError::InvalidResponse)?,
+                    estimate: u64::try_from(*estimate).map_err(|_error| BackendError::InvalidResponse)?,
+                    usage_after: u64::try_from(*usage_after).map_err(|_error| BackendError::InvalidResponse)?,
+                })
+            },
+            reply => parse_valkey_reserve_denial(&self.telemetry, reply),
+        }
     }
 
     async fn reconcile(&self, request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
@@ -2338,16 +2395,24 @@ mod tests {
         ));
 
         for _ in 0..2 {
-            assert!(matches!(
-                backend
-                    .reserve(ReserveRequest {
-                        key: "bob".into(),
-                        estimate: 1,
-                        now_ms: 0,
-                    })
-                    .await,
-                Ok(BackendReserve::Denied { .. })
-            ));
+            let denied = backend
+                .reserve(ReserveRequest {
+                    key: "bob".into(),
+                    estimate: 1,
+                    now_ms: 0,
+                })
+                .await
+                .expect("reserve must succeed");
+            assert!(
+                matches!(
+                    denied,
+                    BackendReserve::Denied {
+                        reason: DenialReason::KeyCapacity,
+                        ..
+                    }
+                ),
+                "max_keys denial must surface KeyCapacity, got {denied:?}"
+            );
         }
         assert_eq!(backend.snapshot().active_keys, 1);
 
@@ -2392,16 +2457,24 @@ mod tests {
                 .await,
             Ok(BackendReserve::Admitted { .. })
         ));
-        assert!(matches!(
-            backend
-                .reserve(ReserveRequest {
-                    key: "bob".into(),
-                    estimate: 1,
-                    now_ms: 0,
-                })
-                .await,
-            Ok(BackendReserve::Denied { .. })
-        ));
+        let denied = backend
+            .reserve(ReserveRequest {
+                key: "bob".into(),
+                estimate: 1,
+                now_ms: 0,
+            })
+            .await
+            .expect("reserve must succeed");
+        assert!(
+            matches!(
+                denied,
+                BackendReserve::Denied {
+                    reason: DenialReason::ReservationCapacity,
+                    ..
+                }
+            ),
+            "max_active denial must surface ReservationCapacity, got {denied:?}"
+        );
 
         let bob_keys = backend.key_parts("bob");
         let mut connection = backend.valkey.connection().await.unwrap();
@@ -2411,6 +2484,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(exists, 0, "a max-active denial for a new key must not create its hash");
+    }
+
+    #[test]
+    fn denial_reason_from_lua_maps_known_codes() {
+        assert_eq!(denial_reason_from_lua(1).unwrap(), DenialReason::WindowCapacity);
+        assert_eq!(denial_reason_from_lua(2).unwrap(), DenialReason::KeyCapacity);
+        assert_eq!(denial_reason_from_lua(3).unwrap(), DenialReason::ReservationCapacity);
+        assert!(matches!(denial_reason_from_lua(0), Err(BackendError::InvalidResponse)));
+        assert!(matches!(denial_reason_from_lua(99), Err(BackendError::InvalidResponse)));
+    }
+
+    #[test]
+    fn parse_valkey_reserve_denial_keeps_aggregate_telemetry_on_budget_deny() {
+        let telemetry = ValkeyTelemetryState::default();
+        telemetry.record_reply(500, 1, 2).unwrap();
+        let denied = parse_valkey_reserve_denial(&telemetry, &[0, 1, 60_000, 0, 3, 4, 420]).unwrap();
+        assert!(
+            matches!(
+                denied,
+                BackendReserve::Denied {
+                    retry_after_ms: 60_000,
+                    reason: DenialReason::WindowCapacity,
+                    remaining: 0,
+                }
+            ),
+            "budget denial must expose per-key remaining, got {denied:?}"
+        );
+        assert_eq!(
+            telemetry.snapshot(),
+            BackendSnapshot {
+                budget_remaining: 420,
+                active_reservations: 3,
+                active_keys: 4,
+            }
+        );
     }
 
     #[test]
