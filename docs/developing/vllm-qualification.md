@@ -118,8 +118,8 @@ section and idempotent composition; it is not real GPU qualification evidence.
 
 ## GPU runner registration timeouts
 
-The shared `start-ec2-runner` action runs a failure-only diagnostic step when
-EC2 starts but the runner does not register. It reports EC2 system and instance
+The `vLLM Integration` workflow runs a failure-only diagnostic step when EC2
+starts but the runner does not register. It reports EC2 system and instance
 checks, fixed markers from the console output, and whether the same PAT can
 list the new runner label. The raw console output is withheld because the
 instance's user data contains a short-lived registration token.
