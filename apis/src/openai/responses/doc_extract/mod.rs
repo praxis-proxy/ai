@@ -63,8 +63,12 @@ use self::{
     extract::{ExtractError, ExtractionBudget, extract_input_file},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, bound_body_outcome, content_parts::content_parts_mut,
-    openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
+    body_limits::reject_rewritten_body_too_large,
+    bound_body_outcome,
+    content_parts::{content_parts, content_parts_mut},
+    history::MessageHistory,
+    openai_responses_proxy::serialized_outbound_body_len,
+    state::ResponsesState,
 };
 use crate::{classifier::is_responses_create, json_body::serialize_json_body};
 
@@ -343,7 +347,7 @@ fn extract_state_history(ctx: &mut HttpFilterContext<'_>, budget: &mut Extractio
 /// Sync the persisted-messages mirror with independent count and
 /// byte accounting.
 fn sync_persisted_history(
-    messages: &mut [serde_json::Value],
+    messages: &mut MessageHistory,
     input_len: usize,
     resolved_input: Option<&[serde_json::Value]>,
     budget: &mut ExtractionBudget,
@@ -357,7 +361,7 @@ fn sync_persisted_history(
 /// Replace the current-input tail, then extract text-safe
 /// `input_file` parts from the history prefix.
 fn sync_message_history(
-    messages: &mut [serde_json::Value],
+    messages: &mut MessageHistory,
     input_len: usize,
     resolved_input: Option<&[serde_json::Value]>,
     budget: &mut ExtractionBudget,
@@ -373,8 +377,11 @@ fn sync_message_history(
 
 /// Copy resolved input items into the current-input tail of a
 /// message vector, starting at `history_end`.
-fn replace_tail(messages: &mut [serde_json::Value], history_end: usize, resolved_input: &[serde_json::Value]) {
+fn replace_tail(messages: &mut MessageHistory, history_end: usize, resolved_input: &[serde_json::Value]) {
     for (i, item) in resolved_input.iter().enumerate() {
+        if messages.get(history_end + i) == Some(item) {
+            continue;
+        }
         if let Some(slot) = messages.get_mut(history_end + i) {
             *slot = item.clone();
         }
@@ -384,17 +391,36 @@ fn replace_tail(messages: &mut [serde_json::Value], history_end: usize, resolved
 /// Extract text-safe `input_file` parts from history messages (the
 /// prefix before the current input).
 fn extract_history(
-    messages: &mut [serde_json::Value],
+    messages: &mut MessageHistory,
     history_end: usize,
     budget: &mut ExtractionBudget,
 ) -> Result<(), ExtractError> {
-    if history_end == 0 {
-        return Ok(());
+    for index in 0..history_end {
+        let Some(parts) = messages.get(index).and_then(content_parts) else {
+            continue;
+        };
+        // Decode from the borrowed item first. Unsupported documents still
+        // consume their normal budget, but don't detach unchanged history.
+        let mut replacements = Vec::new();
+        for (part_index, part) in parts.iter().enumerate() {
+            if part.get("type").and_then(serde_json::Value::as_str) == Some("input_file")
+                && let Some(text) = extract_input_file(part, budget)?
+            {
+                replacements.push((part_index, text));
+            }
+        }
+        if replacements.is_empty() {
+            continue;
+        }
+        if let Some(parts) = messages.get_mut(index).and_then(content_parts_mut) {
+            for (part_index, text) in replacements {
+                if let Some(part) = parts.get_mut(part_index) {
+                    *part = serde_json::json!({"type": "input_text", "text": text});
+                }
+            }
+        }
     }
-    let Some(history) = messages.get_mut(..history_end) else {
-        return Ok(());
-    };
-    extract_items(history, budget).map(|_count| ())
+    Ok(())
 }
 
 /// Enforce the body limit against the exact request shape that

@@ -1619,6 +1619,14 @@ mod tests {
         reason = "test double still uses the former tenant-oriented names"
     )]
     impl ConversationItemStore for InterferingStore {
+        async fn conversation_history(
+            &self,
+            owner: &StateOwner,
+            conversation_id: &str,
+        ) -> Result<Option<Vec<Value>>, StoreError> {
+            self.inner.conversation_history(owner, conversation_id).await
+        }
+
         async fn upsert_conversation(&self, record: &ConversationRecord) -> Result<(), StoreError> {
             self.inner.upsert_conversation(record).await
         }

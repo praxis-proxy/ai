@@ -470,7 +470,9 @@ fn build_streaming_record(
 ) -> Option<ResponseRecord> {
     let state = ctx.extensions.get::<ResponsesState>()?;
     let response_object = state.response_object.clone();
-    let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone());
+    // The durable record owns independent JSON. Materialize shared values only
+    // at this persistence boundary, not while reading or projecting history.
+    let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone().into_values());
     ResponsesService::build_record(response_object, owner, request_input, state_messages)
 }
 
@@ -485,7 +487,7 @@ fn build_buffered_record(
     let state_messages = ctx
         .extensions
         .get::<ResponsesState>()
-        .map(|state| state.persisted_messages.clone());
+        .map(|state| state.persisted_messages.clone().into_values());
     let json = decode_response_body(bytes)?;
     ResponsesService::build_record(json, owner, request_input, state_messages)
 }

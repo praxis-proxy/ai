@@ -3693,6 +3693,7 @@ name = "praxis-ai-store-backends"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "futures",
  "percent-encoding",
  "praxis-ai-store",
  "praxis-ai-store-lifecycle",

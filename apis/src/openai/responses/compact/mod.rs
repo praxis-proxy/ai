@@ -56,7 +56,9 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
-use super::{error::responses_error_rejection, is_explicit_compact_request, state::ResponsesState};
+use super::{
+    error::responses_error_rejection, history::MessageHistory, is_explicit_compact_request, state::ResponsesState,
+};
 use crate::{
     callout_policy::OnFailure,
     service::responses::ResponsesService,
@@ -1003,20 +1005,20 @@ fn build_compaction_item(id: &str, summary: &str, summary_prefix: &str) -> Value
 /// client payload, so compaction must not rebuild from `state.input`.
 fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
     let input_len = state.input.len();
-    let message_tail = split_current_turn(&mut state.messages, input_len);
-    let persisted_tail = split_current_turn(&mut state.persisted_messages, input_len);
+    let mut message_tail = split_current_turn(&mut state.messages, input_len);
+    let mut persisted_tail = split_current_turn(&mut state.persisted_messages, input_len);
 
     state.messages.clear();
     state.messages.push(compaction_item.clone());
-    state.messages.extend(message_tail);
+    state.messages.append(&mut message_tail);
 
     state.persisted_messages.clear();
     state.persisted_messages.push(compaction_item);
-    state.persisted_messages.extend(persisted_tail);
+    state.persisted_messages.append(&mut persisted_tail);
 }
 
 /// Move the current-turn tail off `items`, leaving history behind to drop.
-fn split_current_turn(items: &mut Vec<Value>, input_len: usize) -> Vec<Value> {
+fn split_current_turn(items: &mut MessageHistory, input_len: usize) -> MessageHistory {
     let start = items.len().saturating_sub(input_len);
     items.split_off(start)
 }
@@ -1046,8 +1048,9 @@ fn build_context_overhead_text(request_body: &Value) -> String {
 ///
 /// Each message becomes `<label>: <text>`, separated by blank lines.
 /// Handles regular messages, tool calls, tool outputs, and prior compaction items.
-fn build_conversation_text(messages: &[Value]) -> String {
-    let mut buf = String::with_capacity(messages.len() * 100);
+fn build_conversation_text<'a>(messages: impl IntoIterator<Item = &'a Value> + 'a) -> String {
+    let messages = messages.into_iter();
+    let mut buf = String::with_capacity(messages.size_hint().0 * 100);
     for msg in messages {
         append_item(&mut buf, msg);
     }

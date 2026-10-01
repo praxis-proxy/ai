@@ -34,7 +34,7 @@ mod config;
 )]
 mod tests;
 
-use std::{borrow::Cow, fmt};
+use std::fmt;
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -413,21 +413,21 @@ impl serde::Serialize for OutboundBody<'_> {
             return self.state.request_body.serialize(serializer);
         };
 
-        let messages = if provider_owns_conversation(self.state) && self.state.iteration > 0 {
-            self.state
-                .messages
-                .get(self.state.provider_history_len..)
-                .unwrap_or_default()
+        let start = if provider_owns_conversation(self.state) && self.state.iteration > 0 {
+            self.state.provider_history_len
         } else {
-            &self.state.messages
+            0
         };
-        let backend_messages = messages_for_backend(messages);
+        let backend_messages = BackendMessages {
+            history: &self.state.messages,
+            start,
+        };
         let mut map = serializer.serialize_map(None)?;
         let mut wrote_input = false;
         for (name, value) in object {
             match name.as_str() {
                 "input" => {
-                    map.serialize_entry(name, backend_messages.as_ref())?;
+                    map.serialize_entry(name, &backend_messages)?;
                     wrote_input = true;
                 },
                 "previous_response_id" | "conversation" if self.state.history_rehydrated => {},
@@ -435,7 +435,7 @@ impl serde::Serialize for OutboundBody<'_> {
             }
         }
         if !wrote_input {
-            map.serialize_entry("input", backend_messages.as_ref())?;
+            map.serialize_entry("input", &backend_messages)?;
         }
         map.end()
     }
@@ -455,27 +455,30 @@ fn serialize_outbound_body(state: &ResponsesState) -> Result<Vec<u8>, serde_json
     serde_json::to_vec(&OutboundBody { state })
 }
 
-/// Translate compaction items to backend-compatible messages.
-///
-/// Returns `Cow::Borrowed` when no compaction items are present, avoiding
-/// allocation. When compaction items exist, returns `Cow::Owned` with each
-/// `{"type": "compaction", "encrypted_content": "<base64>"}` translated to an assistant
-/// message — backends do not understand our internal compaction format.
-fn messages_for_backend(messages: &[serde_json::Value]) -> Cow<'_, [serde_json::Value]> {
-    let mut translated: Option<Vec<serde_json::Value>> = None;
+/// Borrow history directly, translating only compaction items while serializing.
+struct BackendMessages<'a> {
+    /// Shared canonical messages.
+    history: &'a super::history::MessageHistory,
+    /// First message not already owned by the provider.
+    start: usize,
+}
 
-    for (i, m) in messages.iter().enumerate() {
-        if m.get("type").and_then(serde_json::Value::as_str) == Some("compaction") {
-            let vec = translated.get_or_insert_with(|| messages.get(..i).unwrap_or(&[]).to_vec());
-            vec.push(compaction_to_assistant_message(m));
-        } else if let Some(vec) = &mut translated {
-            vec.push(m.clone());
+impl serde::Serialize for BackendMessages<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq as _;
+
+        let mut sequence = serializer.serialize_seq(Some(self.history.len().saturating_sub(self.start)))?;
+        for item in self.history.iter().skip(self.start) {
+            if item.get("type").and_then(serde_json::Value::as_str) == Some("compaction") {
+                sequence.serialize_element(&compaction_to_assistant_message(item))?;
+            } else {
+                sequence.serialize_element(item)?;
+            }
         }
-    }
-
-    match translated {
-        Some(vec) => Cow::Owned(vec),
-        None => Cow::Borrowed(messages),
+        sequence.end()
     }
 }
 

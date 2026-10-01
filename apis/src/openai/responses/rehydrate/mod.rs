@@ -46,12 +46,12 @@ use tracing::{debug, trace, warn};
 use super::mcp_dispatch::{OWNER_FINGERPRINT, owner_fingerprint};
 use super::{
     DEFAULT_STORE_NAME, append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
-    error::responses_error_rejection, extract_conversation_id, state::ResponsesState,
+    error::responses_error_rejection, extract_conversation_id, history::MessageHistory, state::ResponsesState,
 };
 use crate::{
     is_event_stream_content_type,
     state_owner::{StateOwner, require_state_owner},
-    store::{ConversationRecord, ResponseRecord, ResponseStoreRegistry},
+    store::{ResponseRecord, ResponseStoreRegistry},
 };
 
 // -----------------------------------------------------------------------------
@@ -173,11 +173,10 @@ impl RehydrateFilter {
             Ok(owner) => owner.clone(),
             Err(action) => return Ok(action),
         };
-        let record = match fetch_conversation(ctx, &owner, &conv_id).await {
-            Ok(r) => r,
+        let stored = match fetch_conversation(ctx, &owner, &conv_id).await {
+            Ok(history) => history,
             Err(action) => return Ok(action),
         };
-        let stored = stored_messages_for_conversation(record);
         let state = build_state(parsed_body, stored, vec![], None);
         install_rehydrated_state(ctx, state);
         debug!(conversation_id = %conv_id, "conversation rehydrated, state populated");
@@ -1138,14 +1137,6 @@ fn stored_messages_for_response(mut record: ResponseRecord) -> Vec<Value> {
     }
 }
 
-/// Stored messages from a conversation record.
-fn stored_messages_for_conversation(record: ConversationRecord) -> Vec<Value> {
-    match record.messages {
-        Value::Array(arr) => arr,
-        _ => vec![],
-    }
-}
-
 /// Fetch the previous response and validate its status in one step.
 async fn fetch_and_validate_previous(
     ctx: &HttpFilterContext<'_>,
@@ -1185,7 +1176,7 @@ async fn fetch_conversation(
     ctx: &HttpFilterContext<'_>,
     owner: &StateOwner,
     conv_id: &str,
-) -> Result<ConversationRecord, FilterAction> {
+) -> Result<Vec<Value>, FilterAction> {
     let registry = ctx.extensions.get::<ResponseStoreRegistry>().ok_or_else(|| {
         warn!("rehydrate: response store registry not available");
         reject_server_error("response store is not available")
@@ -1196,7 +1187,7 @@ async fn fetch_conversation(
         reject_server_error("response store is not available")
     })?;
 
-    let record = store.get_conversation(conv_id).await.map_err(|e| {
+    let record = store.conversation_history(conv_id).await.map_err(|e| {
         warn!(error = %e, "rehydrate: failed to fetch conversation");
         reject_server_error("failed to fetch conversation")
     })?;
@@ -1214,11 +1205,12 @@ fn build_state(
     previous_tools: Vec<Value>,
     previous_usage: Option<Value>,
 ) -> ResponsesState {
+    let stored = MessageHistory::from(stored);
     let replay = replay_messages_from_stored(&stored);
     let mut state = ResponsesState::from_request_body(parsed_body);
     state.history_rehydrated = true;
-    state.messages.splice(0..0, replay);
-    state.persisted_messages.splice(0..0, stored);
+    state.messages.prepend_shared(replay);
+    state.persisted_messages.prepend_shared(stored);
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
     state
@@ -1252,8 +1244,21 @@ fn append_stored_output_items(messages: &mut Vec<Value>, output: Value) {
 }
 
 /// Return stored items that should be replayed as backend request input.
-fn replay_messages_from_stored(stored: &[Value]) -> Vec<Value> {
-    stored.iter().filter_map(canonical_openresponses_replay_item).collect()
+fn replay_messages_from_stored(stored: &MessageHistory) -> MessageHistory {
+    let mut replay = MessageHistory::default();
+    for item in stored.shared_items() {
+        if matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("item_reference" | "reasoning" | "compaction" | "message" | "function_call" | "function_call_output")
+        ) {
+            replay.push_shared(std::sync::Arc::clone(item));
+        } else if let Some(normalized) = canonical_openresponses_replay_item(item) {
+            // Legacy normalization changes the replay value, not the exact
+            // persisted item. Only that item needs an owned copy.
+            replay.push(normalized);
+        }
+    }
+    replay
 }
 
 /// Parse the request body and extract `previous_response_id`.

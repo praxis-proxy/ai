@@ -50,10 +50,9 @@ pub struct ResponseRecord {
 
 /// A stored conversation record.
 ///
-/// Holds the conversation object and accumulated messages for a
-/// conversation ID. The `messages` field is used by the rehydrate
-/// filter for multi-turn context; `metadata` and `created_at` are
-/// exposed via the `/v1/conversations` API.
+/// Holds conversation metadata and the legacy message cache. Item rows are the
+/// history source of truth when present; use `conversation_history` for replay.
+/// `metadata` and `created_at` are exposed via the `/v1/conversations` API.
 #[derive(Clone, Debug)]
 pub struct ConversationRecord {
     /// Conversation ID (e.g., `"conv_abc123"`).
@@ -71,7 +70,9 @@ pub struct ConversationRecord {
     /// User-defined metadata as JSON (up to 16 key-value pairs).
     pub metadata: serde_json::Value,
 
-    /// Accumulated conversation messages as JSON.
+    /// Retired cache or preserved legacy prefix. Item-backed histories clear
+    /// stale arrays; a `legacy_messages` prefix remains authoritative alongside
+    /// ordered item rows. Use the history read boundary for replay.
     pub messages: serde_json::Value,
 }
 

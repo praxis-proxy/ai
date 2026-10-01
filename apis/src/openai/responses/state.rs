@@ -19,7 +19,10 @@ use std::{
 use bytes::Bytes;
 use praxis_filter::{FilterAction, body::MAX_JSON_BODY_BYTES};
 
-use super::{bounded_json_size, error::responses_error_rejection, file_search_callout::citations::annotate_response};
+use super::{
+    bounded_json_size, error::responses_error_rejection, file_search_callout::citations::annotate_response,
+    history::MessageHistory,
+};
 
 /// Maximum citation file mappings retained during one response execution.
 pub(crate) const MAX_CITATION_FILES: usize = 1_024;
@@ -461,7 +464,7 @@ pub(crate) struct ResponsesState {
     /// loops. `openai_responses_proxy` reads this as the authoritative
     /// conversation to send to the backend. Output-only metadata
     /// items must be omitted from this field.
-    pub messages: Vec<serde_json::Value>,
+    pub messages: MessageHistory,
 
     /// Number of leading messages already persisted by a provider-owned
     /// conversation. Internal continuations send only the remaining delta.
@@ -480,7 +483,7 @@ pub(crate) struct ResponsesState {
     /// This may include output-only metadata items omitted from
     /// [`Self::messages`] because it is not forwarded to backend
     /// inference.
-    pub persisted_messages: Vec<serde_json::Value>,
+    pub persisted_messages: MessageHistory,
 
     /// Server-owned pending MCP approvals emitted during this request.
     ///
@@ -882,10 +885,10 @@ impl Default for ResponsesState {
             mcp_tool_map: HashMap::new(),
             client_tool_lowering: HashMap::new(),
             client_tool_echo: None,
-            messages: Vec::new(),
+            messages: MessageHistory::default(),
             provider_history_len: 0,
             parallel_tool_calls: true,
-            persisted_messages: Vec::new(),
+            persisted_messages: MessageHistory::default(),
             #[cfg(feature = "store")]
             pending_approvals: Vec::new(),
             store_persist_armed: false,
@@ -924,6 +927,8 @@ impl ResponsesState {
     /// Create initial state from a parsed request body.
     pub(crate) fn from_request_body(body: serde_json::Value) -> Self {
         let messages = normalize_input(&body);
+        let input = messages.clone();
+        let messages = MessageHistory::from(messages);
         let persisted_messages = messages.clone();
         let tool_choice = body
             .get("tool_choice")
@@ -936,7 +941,7 @@ impl ResponsesState {
             context_management: body.get("context_management").cloned(),
             conversation: body.get("conversation").cloned(),
             include: extract_string_array(&body, "include"),
-            input: messages.clone(),
+            input,
             max_tool_calls: extract_u32(&body, "max_tool_calls"),
             messages,
             provider_history_len: 0,
