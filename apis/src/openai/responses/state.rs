@@ -346,14 +346,17 @@ pub(crate) struct ResponsesState {
     /// [`Self::response_object`] and appends that non-end-of-stream terminal
     /// frame, so the store persists synchronously BEFORE releasing the chunk
     /// (failing closed on error) and then skips the redundant end-of-stream
-    /// persist. It is deliberately **not** set for a request-phase local
-    /// completion (`encode_local_completion`): that terminal is delivered as a
-    /// buffered `TerminalResponse` at end-of-stream, where the store already
-    /// persists before the body is written, so marking it here would suppress
-    /// that end-of-stream persist and lose the record.
+    /// persist. A request-phase local completion uses the separate
+    /// [`Self::local_stream_terminal_emitted`] flag because IRR can deliver its
+    /// terminal body as a non-end-of-stream chunk too.
     ///
     /// [`emit_deferred_terminal`]: crate::openai::responses::stream_events
     pub logical_stream_terminal_emitted: bool,
+
+    /// A request-phase dispatcher encoded a local `response.completed` frame.
+    /// IRR can deliver this as a non-EOS chunk, so outer persistence filters
+    /// must commit the canonical response before releasing that chunk.
+    pub local_stream_terminal_emitted: bool,
 
     /// Index where the current model round begins in `accumulated_output`.
     ///
@@ -864,6 +867,7 @@ impl Default for ResponsesState {
             logical_stream_response_id: None,
             logical_stream_sequence: 0,
             logical_stream_terminal_emitted: false,
+            local_stream_terminal_emitted: false,
             current_round_output_start: None,
             history_rehydrated: false,
             input: Vec::new(),

@@ -22,6 +22,7 @@ Usage:
 """
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import os
@@ -32,13 +33,13 @@ import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 import httpx
 import pytest
-from openai import BadRequestError, NotFoundError, OpenAI
+from openai import APIConnectionError, BadRequestError, NotFoundError, OpenAI
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -795,12 +796,16 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
 
     Captures the JSON body of every request the backend receives, then forwards
     it transparently and streams the response back so the full
-    native Responses pipeline still completes. Tests use the captured bodies to
-    assert on what the proxy actually forwards upstream after its rewrites
-    (rehydration, ``previous_response_id`` stripping, ``truncation`` passthrough).
+    native Responses pipeline still completes. The synthetic
+    ``sdk-conversation-stream`` model returns deterministic native responses
+    for Conversation append tests. Tests use the captured bodies to assert on
+    what the proxy actually forwards upstream after its rewrites.
     """
 
     forwarded_bodies: ClassVar[list[dict]] = []
+    concurrent_barrier: ClassVar[threading.Barrier | None] = None
+    terminal_gate: ClassVar[threading.Event | None] = None
+    tool_round_count: ClassVar[int] = 0
 
     def log_message(self, fmt, *args):
         pass
@@ -808,11 +813,19 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
     def _forward(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
+        request_body = None
         if body:
             try:
-                type(self).forwarded_bodies.append(json.loads(body))
+                request_body = json.loads(body)
+                type(self).forwarded_bodies.append(request_body)
             except json.JSONDecodeError:
                 pass
+        if request_body and request_body.get("model") in {
+            "sdk-conversation-stream",
+            "sdk-conversation-tool-stream",
+        }:
+            self._send_conversation_response(request_body)
+            return
         headers = {
             k: v
             for k, v in self.headers.items()
@@ -837,6 +850,103 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
                     if chunk:
                         self.wfile.write(chunk)
                         self.wfile.flush()
+
+    def _send_conversation_response(self, request_body):
+        """Serve native Responses without a model so append/hydration is deterministic."""
+        request_input = json.dumps(request_body.get("input"))
+        local_tool_limit = "STREAM-LOCAL-DELETE-410" in request_input
+        web_call_limit = "STREAM-WEB-LIMIT-410" in request_input
+        tool_model = request_body["model"] == "sdk-conversation-tool-stream"
+        if tool_model:
+            type(self).tool_round_count += 1
+        tool_first_round = tool_model and type(self).tool_round_count == 1
+        if "STREAM-CONCURRENT-410" in request_input:
+            barrier = type(self).concurrent_barrier
+            assert barrier is not None
+            barrier.wait(timeout=15)
+        response_id = f"resp_sdk_conv_{time.time_ns()}"
+        response = {
+            "id": response_id,
+            "object": "response",
+            "created_at": int(time.time()),
+            "model": request_body["model"],
+            "status": "completed",
+            "output": (
+                [
+                    {
+                        "id": f"ws_{response_id}",
+                        "type": "web_search_call",
+                        "status": "completed",
+                        "action": {"type": "search", "queries": ["test"]},
+                    }
+                ]
+                if local_tool_limit or tool_first_round
+                else [
+                    {
+                        "id": f"msg_{response_id}",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "SDK tool answer" if tool_model else "SDK streamed turn",
+                            }
+                        ],
+                    }
+                ]
+            ),
+        }
+        if web_call_limit:
+            # The full-flow example allows 32 web calls per round. A completed
+            # upstream snapshot with 33 calls makes IRR emit an SSE error in
+            # place of the deferred response.completed terminal.
+            response["output"] = [
+                {
+                    "id": f"ws_{response_id}_{index}",
+                    "type": "web_search_call",
+                    "status": "completed",
+                    "action": {"type": "search", "queries": ["test"]},
+                }
+                for index in range(33)
+            ]
+        if request_body.get("stream"):
+            created = {**response, "status": "in_progress", "output": []}
+            if web_call_limit:
+                # Exceed the one-byte replay limit plus decoder headroom before
+                # IRR replaces the held completed terminal with an SSE error.
+                created["instructions"] = "x" * 3072
+            frames = [
+                {"type": "response.created", "sequence_number": 0, "response": created},
+                {"type": "response.completed", "sequence_number": 1, "response": response},
+            ]
+            encoded_frames = [
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                for event in frames
+            ]
+            payload = b"".join(encoded_frames) + b"data: [DONE]\n\n"
+            content_type = "text/event-stream"
+        else:
+            payload = json.dumps(response).encode()
+            content_type = "application/json"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if request_body.get("stream") and (
+            "STREAM-DELETE-410" in request_input
+            or "STREAM-DISCONNECT-410" in request_input
+            or local_tool_limit
+        ):
+            self.wfile.write(encoded_frames[0])
+            self.wfile.flush()
+            gate = type(self).terminal_gate
+            assert gate is not None
+            assert gate.wait(timeout=15), "test did not release the terminal event"
+            self.wfile.write(encoded_frames[1] + b"data: [DONE]\n\n")
+        else:
+            self.wfile.write(payload)
+        self.wfile.flush()
 
     def do_POST(self):
         self._forward()
@@ -1053,6 +1163,8 @@ def _write_witness_config(
     praxis_port: int,
     db_path: str,
     backend_port: int,
+    search_port: int | None = None,
+    max_event_bytes: int | None = None,
 ) -> str:
     """Patch full-flow-agentic.yaml to route the native backend through the shim.
 
@@ -1067,7 +1179,23 @@ def _write_witness_config(
     config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
     config = config.replace("127.0.0.1:9999", _ogx_endpoint())
     config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
+    if search_port is not None:
+        search_anchor = "api_key: test-key\n                # Require the per-user key"
+        assert config.count(search_anchor) == 1
+        config = config.replace(
+            search_anchor,
+            "api_key: test-key\n"
+            f"                base_url: http://127.0.0.1:{search_port}\n"
+            "                # Require the per-user key",
+        )
     config = _patch_store_backend(config, db_path)
+    if max_event_bytes is not None:
+        anchor = (
+            "        responses_table: openai_responses\n"
+            "        conversations_table: openai_conversations\n"
+        )
+        assert config.count(anchor) == 1
+        config = config.replace(anchor, anchor + f"        max_event_bytes: {max_event_bytes}\n")
 
     path = _persist_config(config)
     return path
@@ -1531,7 +1659,9 @@ def compact_proxy(tmp_path_factory, request, compaction_server):
         os.unlink(config_path)
 
 
-def _witness_proxy_session(tmp_path_factory, request):
+def _witness_proxy_session(
+    tmp_path_factory, request, search_port=None, max_event_bytes=None
+):
     """Start a proxy whose native backend is a recording shim in front of vLLM.
 
     Shared generator body for the witness fixtures. Yields ``(client,
@@ -1540,16 +1670,19 @@ def _witness_proxy_session(tmp_path_factory, request):
     the proxy actually forwards upstream after its rewrites.
     """
     ResponsesWitnessHandler.forwarded_bodies = []
+    ResponsesWitnessHandler.tool_round_count = 0
     forwarded = ResponsesWitnessHandler.forwarded_bodies
     backend_port = _free_port()
-    server = HTTPServer(("127.0.0.1", backend_port), ResponsesWitnessHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", backend_port), ResponsesWitnessHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-witness")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_witness_config(port, db_path, backend_port)
+    config_path = _write_witness_config(
+        port, db_path, backend_port, search_port, max_event_bytes
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1580,6 +1713,8 @@ def _witness_proxy_session(tmp_path_factory, request):
             proc.wait()
         log_file.close()
         server.shutdown()
+        ResponsesWitnessHandler.concurrent_barrier = None
+        ResponsesWitnessHandler.terminal_gate = None
         if not started or request.session.testsfailed > 0:
             with open(log_path) as f:
                 print(
@@ -1593,6 +1728,20 @@ def _witness_proxy_session(tmp_path_factory, request):
 def witness_backend_client(tmp_path_factory, request):
     """Function-scoped witness proxy with the stock rehydrate config."""
     yield from _witness_proxy_session(tmp_path_factory, request)
+
+
+@pytest.fixture()
+def witness_tool_client(tmp_path_factory, request, search_server):
+    """Full-flow witness with a deterministic hosted web-search endpoint."""
+    yield from _witness_proxy_session(tmp_path_factory, request, search_server)
+
+
+@pytest.fixture()
+def witness_replay_limited_tool_client(tmp_path_factory, request, search_server):
+    """Hosted web-search witness whose Response replay limit is one byte."""
+    yield from _witness_proxy_session(
+        tmp_path_factory, request, search_server, max_event_bytes=1
+    )
 
 
 def _reasoning_capture_session(tmp_path_factory, request):
@@ -2202,6 +2351,370 @@ class TestOpenAIResponsesVLLM:
             "client even though it strips the id from the rehydrated upstream "
             f"request; got: {second.previous_response_id!r}"
         )
+
+    def test_streamed_conversation_append_and_follow_up(self, witness_backend_client):
+        """The shipped full-flow graph appends a streamed turn before completion.
+
+        The witness backend supplies deterministic native SSE. The same test
+        runs with SQLite locally and PostgreSQL when DATABASE_URL is set.
+        """
+        client, forwarded = witness_backend_client
+        conversation = client.conversations.create(metadata={"retained": "yes"})
+        try:
+            foreign_client = OpenAI(
+                base_url=client.base_url,
+                api_key="test",
+                default_headers={**TRUSTED_OWNER_HEADERS, "x-auth-user": "other-user"},
+                max_retries=0,
+            )
+            try:
+                with pytest.raises(BadRequestError):
+                    foreign_client.responses.create(
+                        model="sdk-conversation-stream",
+                        input="foreign turn",
+                        conversation=conversation.id,
+                        stream=True,
+                    )
+            finally:
+                foreign_client.close()
+
+            events = list(
+                client.responses.create(
+                    model="sdk-conversation-stream",
+                    input="STREAM-FIRST-410",
+                    conversation=conversation.id,
+                    stream=True,
+                    store=True,
+                )
+            )
+            completed = [event for event in events if event.type == "response.completed"]
+            assert len(completed) == 1
+            first = completed[0].response
+            assert first.status == "completed"
+            assert client.responses.retrieve(first.id).output == first.output
+
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.role for item in items.data if item.type == "message"] == [
+                "user",
+                "assistant",
+            ]
+            assert len(items.data) == 2
+            assert "STREAM-FIRST-410" in json.dumps(
+                [item.model_dump() for item in items.data], default=str
+            )
+            retrieved_conversation = client.conversations.retrieve(conversation.id)
+            assert retrieved_conversation.metadata == {"retained": "yes"}
+            assert retrieved_conversation.created_at == conversation.created_at
+
+            before_follow_up = len(forwarded)
+            second = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-SECOND-410",
+                conversation=conversation.id,
+                store=True,
+            )
+            assert second.status == "completed"
+            assert len(forwarded) == before_follow_up + 1
+            replay = json.dumps(forwarded[-1]["input"])
+            assert "STREAM-FIRST-410" in replay
+            assert "SDK streamed turn" in replay
+            assert "STREAM-SECOND-410" in replay
+
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.role for item in items.data if item.type == "message"] == [
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+            ]
+
+            unstored = list(
+                client.responses.create(
+                    model="sdk-conversation-stream",
+                    input="STREAM-UNSTORED-410",
+                    conversation=conversation.id,
+                    stream=True,
+                    store=False,
+                )
+            )
+            unstored_completed = [event for event in unstored if event.type == "response.completed"]
+            assert len(unstored_completed) == 1
+            with pytest.raises(NotFoundError):
+                client.responses.retrieve(unstored_completed[0].response.id)
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.role for item in items.data if item.type == "message"] == [
+                "user", "assistant", "user", "assistant", "user", "assistant"
+            ]
+
+            # Hold both backend completions until both requests have read the
+            # same Conversation snapshot. Their inserts must then allocate
+            # distinct positions atomically instead of overwriting one turn.
+            ResponsesWitnessHandler.concurrent_barrier = threading.Barrier(2)
+
+            def concurrent_turn(marker):
+                worker = OpenAI(
+                    base_url=client.base_url,
+                    api_key="test",
+                    default_headers=TRUSTED_OWNER_HEADERS,
+                    max_retries=0,
+                    timeout=30,
+                )
+                try:
+                    events = list(
+                        worker.responses.create(
+                            model="sdk-conversation-stream",
+                            input=f"STREAM-CONCURRENT-410-{marker}",
+                            conversation=conversation.id,
+                            stream=True,
+                            store=True,
+                        )
+                    )
+                    completed = [
+                        event for event in events if event.type == "response.completed"
+                    ]
+                    assert len(completed) == 1
+                    return completed[0].response.id
+                finally:
+                    worker.close()
+
+            try:
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    ids = list(executor.map(concurrent_turn, ("A", "B")))
+            finally:
+                ResponsesWitnessHandler.concurrent_barrier = None
+            assert len(set(ids)) == 2
+            items = client.conversations.items.list(
+                conversation.id, order="asc", limit=20
+            )
+            assert len(items.data) == 10
+            payload = json.dumps([item.model_dump() for item in items.data], default=str)
+            assert "STREAM-CONCURRENT-410-A" in payload
+            assert "STREAM-CONCURRENT-410-B" in payload
+        finally:
+            client.conversations.delete(conversation.id)
+
+    def test_streamed_hosted_tool_appends_once_and_rehydrates(self, witness_tool_client):
+        """A real IRR search round appends one canonical tool item and replays its turn."""
+        client, forwarded = witness_tool_client
+        conversation = client.conversations.create()
+        searches_before = BraveSearchHandler.request_count
+        try:
+            events = list(
+                client.responses.create(
+                    model="sdk-conversation-tool-stream",
+                    input="STREAM-TOOL-410",
+                    conversation=conversation.id,
+                    stream=True,
+                    store=True,
+                    tools=[{"type": "web_search"}],
+                    max_tool_calls=1,
+                    extra_headers={"x-user-brave-key": "controlled-test-only"},
+                )
+            )
+            completed = [event for event in events if event.type == "response.completed"]
+            assert len(completed) == 1
+            output = completed[0].response.output
+            assert [item.type for item in output] == ["web_search_call", "message"]
+            assert BraveSearchHandler.request_count == searches_before + 1
+            assert len(forwarded) == 2, "one tool dispatch should produce one re-entry"
+            assert "Mock Search Result" in json.dumps(forwarded[1]["input"])
+
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.type for item in items.data] == [
+                "message",
+                "web_search_call",
+                "message",
+            ]
+            assert items.data[0].role == "user"
+            assert items.data[2].role == "assistant"
+            assert items.data[1].id == output[0].id
+
+            follow_up = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-TOOL-FOLLOW-UP-410",
+                conversation=conversation.id,
+                store=True,
+            )
+            assert follow_up.status == "completed"
+            replay = json.dumps(forwarded[-1]["input"])
+            assert "STREAM-TOOL-410" in replay
+            assert "SDK tool answer" in replay
+            items = client.conversations.items.list(conversation.id, order="asc")
+            assert [item.type for item in items.data] == [
+                "message",
+                "web_search_call",
+                "message",
+                "message",
+                "message",
+            ]
+        finally:
+            client.conversations.delete(conversation.id)
+
+    @pytest.mark.parametrize("replay_limited", [False, True], ids=["default", "replay-limit"])
+    def test_failed_irr_stream_does_not_append_completed_upstream_snapshot(
+        self, request, replay_limited
+    ):
+        """An IRR error must not hydrate a model snapshot hidden from the client."""
+        fixture = (
+            "witness_replay_limited_tool_client" if replay_limited else "witness_tool_client"
+        )
+        client, forwarded = request.getfixturevalue(fixture)
+        conversation = client.conversations.create()
+        searches_before = BraveSearchHandler.request_count
+        try:
+            events = list(
+                client.responses.create(
+                    model="sdk-conversation-stream",
+                    input="STREAM-WEB-LIMIT-410",
+                    conversation=conversation.id,
+                    stream=True,
+                    store=True,
+                    tools=[{"type": "web_search"}],
+                    extra_headers={"x-user-brave-key": "controlled-test-only"},
+                )
+            )
+            assert any(event.type == "error" for event in events)
+            assert not any(event.type == "response.completed" for event in events)
+            assert BraveSearchHandler.request_count == searches_before
+            assert len(forwarded) == 1
+            assert client.conversations.items.list(conversation.id).data == []
+            with pytest.raises(NotFoundError):
+                client.responses.retrieve(events[0].response.id)
+
+            follow_up = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-WEB-LIMIT-FOLLOW-UP-410",
+                conversation=conversation.id,
+                store=True,
+            )
+            assert follow_up.status == "completed"
+            replay = json.dumps(forwarded[-1]["input"])
+            assert "STREAM-WEB-LIMIT-410" not in replay
+            assert "STREAM-WEB-LIMIT-FOLLOW-UP-410" in replay
+            assert "web_search_call" not in replay
+        finally:
+            client.conversations.delete(conversation.id)
+
+    @pytest.mark.parametrize("client_close_pause", [0.75, 1.5])
+    def test_streamed_client_close_can_commit_completed_turn(
+        self, witness_backend_client, client_close_pause
+    ):
+        """An unobserved close may commit a terminal the SDK never consumed."""
+        client, forwarded = witness_backend_client
+        conversation = client.conversations.create()
+        gate = threading.Event()
+        ResponsesWitnessHandler.terminal_gate = gate
+        try:
+            stream = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-DISCONNECT-410",
+                conversation=conversation.id,
+                stream=True,
+                store=True,
+            )
+            first = next(iter(stream))
+            assert first.type == "response.created"
+            stream.close()
+            time.sleep(client_close_pause)
+            gate.set()
+
+            deadline = time.monotonic() + 5
+            while True:
+                items = client.conversations.items.list(conversation.id, order="asc")
+                if len(items.data) == 2 or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.1)
+            assert [item.role for item in items.data] == ["user", "assistant"]
+            assert client.responses.retrieve(first.response.id).status == "completed"
+            follow_up = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-DISCONNECT-FOLLOW-UP-410",
+                conversation=conversation.id,
+                store=True,
+            )
+            assert follow_up.status == "completed"
+            replay = json.dumps(forwarded[-1]["input"])
+            assert "STREAM-DISCONNECT-410" in replay
+            assert "SDK streamed turn" in replay
+        finally:
+            gate.set()
+            ResponsesWitnessHandler.terminal_gate = None
+            client.conversations.delete(conversation.id)
+
+    def test_streamed_append_failure_withholds_committed_terminal(
+        self, witness_backend_client
+    ):
+        """An append failure after early SSE delivery must abort before completion."""
+        client, _ = witness_backend_client
+        conversation = client.conversations.create()
+        gate = threading.Event()
+        ResponsesWitnessHandler.terminal_gate = gate
+        stream = None
+        try:
+            stream = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-DELETE-410",
+                conversation=conversation.id,
+                stream=True,
+                store=True,
+            )
+            first = next(iter(stream))
+            assert first.type == "response.created"
+            client.conversations.delete(conversation.id)
+            gate.set()
+
+            observed = []
+            try:
+                for event in stream:
+                    observed.append(event)
+            except (APIConnectionError, httpx.RemoteProtocolError, httpx.ReadError):
+                pass
+            assert not any(event.type == "response.completed" for event in observed)
+            assert client.responses.retrieve(first.response.id).status == "completed"
+        finally:
+            gate.set()
+            ResponsesWitnessHandler.terminal_gate = None
+            if stream is not None:
+                stream.close()
+
+    def test_streamed_local_completion_append_failure_withholds_terminal(
+        self, witness_backend_client
+    ):
+        """A request-side tool-limit completion must append before its SSE terminal."""
+        client, _ = witness_backend_client
+        conversation = client.conversations.create()
+        gate = threading.Event()
+        ResponsesWitnessHandler.terminal_gate = gate
+        stream = None
+        try:
+            stream = client.responses.create(
+                model="sdk-conversation-stream",
+                input="STREAM-LOCAL-DELETE-410",
+                conversation=conversation.id,
+                stream=True,
+                store=True,
+                tools=[{"type": "web_search"}],
+                max_tool_calls=0,
+                extra_headers={"x-user-brave-key": "controlled-test-only"},
+            )
+            first = next(iter(stream))
+            assert first.type == "response.created"
+            client.conversations.delete(conversation.id)
+            gate.set()
+
+            observed = []
+            try:
+                for event in stream:
+                    observed.append(event)
+            except (APIConnectionError, httpx.RemoteProtocolError, httpx.ReadError):
+                pass
+            assert not any(event.type == "response.completed" for event in observed)
+            assert client.responses.retrieve(first.response.id).status == "completed"
+        finally:
+            gate.set()
+            ResponsesWitnessHandler.terminal_gate = None
+            if stream is not None:
+                stream.close()
 
     def test_truncation_forwarded_to_backend_through_rehydration(
         self, witness_backend_client

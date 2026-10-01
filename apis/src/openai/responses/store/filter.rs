@@ -20,11 +20,12 @@
 //!   responses or responses with a content-type other than JSON or event-stream set `responses.skip_persist` and bail
 //!   early.
 //!
-//! - **`on_response_body`**: at end-of-stream, extracts the record from the buffered response JSON or accumulated
-//!   streaming [`ResponsesState`] and persists it synchronously via [`block_in_place`] before returning to Pingora.
-//!   This guarantees the record is durable before the client observes the completed response, preventing races with
-//!   subsequent operations like `DELETE /v1/responses/{id}`. Non-persistable exchanges release chunks immediately via
-//!   [`FilterAction::Release`] to avoid holding pass-through traffic in the `StreamBuffer`.
+//! - **`on_response_body`**: at the terminal chunk for streams or at end-of-stream for buffered responses, extracts the
+//!   record from the response JSON or accumulated streaming [`ResponsesState`] and persists it synchronously via
+//!   [`block_in_place`] before returning to Pingora. This guarantees the record is durable before the client observes
+//!   the completed response, preventing races with subsequent operations like `DELETE /v1/responses/{id}`.
+//!   Non-persistable exchanges release chunks immediately via [`FilterAction::Release`] to avoid holding pass-through
+//!   traffic in the `StreamBuffer`.
 //!
 //! [`block_in_place`]: tokio::task::block_in_place
 //!
@@ -133,6 +134,11 @@ pub struct ResponseStoreFilter {
     max_event_bytes: NonZeroU64,
 }
 
+/// The request-scoped persistence state was consumed by a streaming write
+/// attempt. EOS must not retry it, including when `failure_mode: open` lets a
+/// failed terminal-chunk write continue.
+struct StreamingResponsePersistenceAttempted;
+
 impl ResponseStoreFilter {
     /// Construct the filter with explicit replay-log bounds.
     ///
@@ -198,9 +204,7 @@ impl ResponseStoreFilter {
             return Ok(FilterAction::Continue);
         }
 
-        if ctx.get_metadata("responses.stream_parse_error") == Some("true")
-            || ctx.get_metadata("responses.stream_incomplete") == Some("true")
-        {
+        if stream_has_errors(ctx) {
             trace!("skipping streaming persistence: stream had errors or was incomplete");
             return Ok(FilterAction::Continue);
         }
@@ -216,6 +220,7 @@ impl ResponseStoreFilter {
             Ok(parts) => parts,
             Err(action) => return Ok(action),
         };
+        ctx.extensions.insert(StreamingResponsePersistenceAttempted);
 
         let Some(record) = build_streaming_record(ctx, persist.owner, persist.request_input) else {
             trace!("skipping streaming persistence: no persistable record");
@@ -287,6 +292,7 @@ impl ResponseStoreFilter {
             return;
         };
         let mut state = ctx.extensions.remove::<ResponseStoreRequestState>().unwrap_or_default();
+        state.error_event_detector.push(chunk);
         if !state.events_over_budget {
             self.accumulate_events(&mut state, chunk);
         }
@@ -316,8 +322,8 @@ impl ResponseStoreFilter {
         let batch = decoder.push(chunk);
         for record in &batch.records {
             if !self.capture_one(state, record) {
-                // Bound exceeded; the log is already abandoned. Stop early —
-                // later records in this batch are irrelevant.
+                // The replay log is abandoned, but the separate header scanner
+                // still checks later chunks for a client-visible error.
                 return;
             }
         }
@@ -523,6 +529,51 @@ struct CapturedEvent {
     terminal: bool,
 }
 
+/// Detect an SSE `event: error` header independently of the replay decoder.
+/// A replay byte limit can poison that decoder before a later error arrives.
+/// Only a short line prefix is retained, so oversized `data:` lines cannot
+/// prevent error detection or make this scanner buffer a response body.
+#[derive(Default)]
+struct SseErrorEventDetector {
+    /// Prefix of the current SSE line, bounded independently of replay limits.
+    line: [u8; 32],
+    /// Number of bytes retained in `line`.
+    line_len: usize,
+    /// Whether the current line exceeded the fixed prefix capacity.
+    line_overlong: bool,
+    /// Sticky signal that the stream contained an `event: error` header.
+    saw_error: bool,
+}
+
+impl SseErrorEventDetector {
+    /// Inspect SSE line headers across arbitrary chunk boundaries.
+    fn push(&mut self, chunk: &[u8]) {
+        for &byte in chunk {
+            if self.saw_error {
+                return;
+            }
+            if byte == b'\n' || byte == b'\r' {
+                if !self.line_overlong {
+                    let line = self.line.get(..self.line_len).unwrap_or_default();
+                    if let Some(value) = line.strip_prefix(b"event:") {
+                        let value = value.strip_prefix(b" ").unwrap_or(value);
+                        self.saw_error = value == b"error";
+                    }
+                }
+                self.line_len = 0;
+                self.line_overlong = false;
+            } else if !self.line_overlong {
+                if let Some(slot) = self.line.get_mut(self.line_len) {
+                    *slot = byte;
+                    self.line_len += 1;
+                } else {
+                    self.line_overlong = true;
+                }
+            }
+        }
+    }
+}
+
 /// Request-phase data needed when persisting the response.
 #[derive(Default)]
 struct ResponseStoreRequestState {
@@ -540,6 +591,8 @@ struct ResponseStoreRequestState {
     /// Sticky flag: capture exceeded a bound or the decoder was poisoned, so the
     /// partial log is abandoned and the response becomes non-replayable.
     events_over_budget: bool,
+    /// A client-visible SSE error superseded any completed upstream snapshot.
+    error_event_detector: SseErrorEventDetector,
 }
 
 /// Capture the immutable owner once, before inference or a body-first consumer.
@@ -736,20 +789,13 @@ fn is_replay_get(ctx: &HttpFilterContext<'_>) -> bool {
     matches!(parse_get_response_query(ctx.request.uri.query()), Ok(parsed) if parsed.stream)
 }
 
-/// Return whether `openai_stream_events` has emitted the client-visible terminal
-/// `response.completed` frame as a *deferred, non-end-of-stream* chunk for the
-/// current logical stream (#937).
-///
-/// Set only by `emit_deferred_terminal`. When true, [`ResponsesState::response_object`]
-/// is already canonical and the terminal frame is in the non-end-of-stream chunk
-/// this filter is about to release, so the store persists before releasing it and
-/// then skips the redundant end-of-stream persist. A buffered local completion
-/// (`encode_local_completion`) leaves this unset so it still persists at
-/// end-of-stream, where its buffered body is written only after the store runs.
+/// Return whether the canonical terminal frame is ready for release. Both a
+/// deferred upstream terminal and a locally encoded completion may reach outer
+/// filters as non-EOS chunks.
 fn streaming_terminal_emitted(ctx: &HttpFilterContext<'_>) -> bool {
     ctx.extensions
         .get::<ResponsesState>()
-        .is_some_and(|state| state.logical_stream_terminal_emitted)
+        .is_some_and(|state| state.logical_stream_terminal_emitted || state.local_stream_terminal_emitted)
 }
 
 /// Return whether the request references a previous response.
@@ -760,6 +806,16 @@ fn has_previous_response_id(ctx: &HttpFilterContext<'_>) -> bool {
 /// Check whether persistence was skipped during the response phase.
 fn should_skip_persist(ctx: &HttpFilterContext<'_>) -> bool {
     should_skip(ctx) || ctx.get_metadata("responses.skip_persist") == Some("true")
+}
+
+/// Return whether stream parsing or lifecycle completion failed.
+fn stream_has_errors(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.get_metadata("responses.stream_parse_error") == Some("true")
+        || ctx.get_metadata("responses.stream_incomplete") == Some("true")
+        || ctx
+            .extensions
+            .get::<ResponseStoreRequestState>()
+            .is_some_and(|state| state.error_event_detector.saw_error)
 }
 
 /// Return whether a `Content-Type` header is JSON.
@@ -1055,14 +1111,13 @@ impl HttpFilter for ResponseStoreFilter {
             self.capture_stream_events(ctx, body);
 
             if !end_of_stream {
-                // #937: the deferred terminal `response.completed` frame reaches
-                // this pre-IRR filter as a non-end-of-stream chunk, before the
-                // empty end-of-stream callback where streaming persistence
-                // historically ran. Once stream_events marks the terminal frame
-                // emitted, `response_object` is canonical: persist synchronously
-                // BEFORE releasing this chunk so a client never observes
-                // completion for a non-durable record.
-                if streaming_terminal_emitted(ctx) {
+                // Deferred and locally encoded terminals can both reach this
+                // pre-IRR filter before EOS. Once either marker is set,
+                // `response_object` is canonical: persist synchronously BEFORE
+                // releasing the chunk.
+                if streaming_terminal_emitted(ctx)
+                    && ctx.extensions.get::<StreamingResponsePersistenceAttempted>().is_none()
+                {
                     // `persist_from_streaming_state` returns `Continue` once the
                     // record is durable (or persistence is legitimately skipped,
                     // e.g. no store configured); we still release the frame
@@ -1078,13 +1133,11 @@ impl HttpFilter for ResponseStoreFilter {
                 }
                 return Ok(FilterAction::Release);
             }
-            // A deferred terminal frame (flag set) already persisted at the
-            // non-end-of-stream chunk above, so skip the redundant persist here.
-            // Everything else — a buffered local completion (whose terminal is
-            // delivered in this end-of-stream body) and a plain single-round
-            // stream — leaves the flag unset and persists here, before the body
-            // is written downstream.
-            if streaming_terminal_emitted(ctx) {
+            // Skip after an earlier chunk consumed persistence state. This
+            // includes fail-open errors, which cannot be retried at EOS. The
+            // fallback remains available to non-IRR streams without a terminal
+            // marker; their captured SSE errors still suppress persistence.
+            if ctx.extensions.get::<StreamingResponsePersistenceAttempted>().is_some() {
                 return Ok(FilterAction::Continue);
             }
             return Self::persist_from_streaming_state(ctx);
