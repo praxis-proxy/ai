@@ -12,7 +12,9 @@ use praxis_ai_store::{
 };
 use serde_json::{Value, json};
 
-use super::{ListParams, Order, ResponsesService, list_input_items};
+use super::{
+    ListParams, Order, ResponsesService, assemble_stored_messages, list_input_items, normalize_translated_reasoning,
+};
 use crate::{StateOwner, openai::include::IncludeFields};
 
 /// Build a validated owner for a fixed tenant and issuer.
@@ -49,13 +51,13 @@ fn sample_record(owner: &StateOwner, id: &str) -> ResponseRecord {
 
 #[test]
 fn build_record_returns_none_for_null_response_object() {
-    let record = ResponsesService::build_record(Value::Null, owner("alice"), None, None);
+    let record = ResponsesService::build_record(Value::Null, owner("alice"), None, None, &[]);
     assert!(record.is_none(), "a null response object is not persistable");
 }
 
 #[test]
 fn build_record_returns_none_for_missing_required_fields() {
-    let record = ResponsesService::build_record(json!({"id": "resp_1"}), owner("alice"), None, None);
+    let record = ResponsesService::build_record(json!({"id": "resp_1"}), owner("alice"), None, None, &[]);
     assert!(record.is_none(), "missing created_at/model is not persistable");
 }
 
@@ -70,8 +72,9 @@ fn build_record_uses_request_input_when_state_messages_absent() {
         "output": [{"type": "message", "content": "Stored streaming output"}]
     });
 
-    let record = ResponsesService::build_record(response_object, owner("alice"), Some(request_input.clone()), None)
-        .expect("streaming state should build a record");
+    let record =
+        ResponsesService::build_record(response_object, owner("alice"), Some(request_input.clone()), None, &[])
+            .expect("streaming state should build a record");
 
     assert_eq!(
         record.input, request_input,
@@ -114,6 +117,7 @@ fn build_record_preserves_mcp_metadata_from_state_messages() {
         owner("alice"),
         Some(json!([{"role": "user", "content": "What next?"}])),
         Some(state_messages),
+        &[],
     )
     .expect("streaming state should build a record");
 
@@ -141,7 +145,7 @@ fn build_record_falls_back_to_response_object_input() {
         "output": [{"type": "message", "role": "assistant", "content": "Hi"}]
     });
 
-    let record = ResponsesService::build_record(response_object, owner("alice"), None, None)
+    let record = ResponsesService::build_record(response_object, owner("alice"), None, None, &[])
         .expect("buffered response should build a record");
 
     assert_eq!(
@@ -287,4 +291,165 @@ fn list_input_items_paginates_stored_input() {
     let page = list_input_items(&record, &params, IncludeFields::default()).expect("listing should succeed");
     assert_eq!(page.data.len(), 2, "the limit caps the page size");
     assert!(page.has_more, "more items remain beyond the first page");
+}
+
+fn types(items: &[Value]) -> Vec<&str> {
+    items
+        .iter()
+        .map(|item| item.get("type").and_then(Value::as_str).unwrap_or("message"))
+        .collect()
+}
+
+#[test]
+fn trailing_reasoning_after_a_message_moves_ahead_of_its_turn() {
+    // The streaming translator emits `[message, reasoning]` when the answer
+    // streams before reasoning. The stored history must lead with reasoning so
+    // continuation replay attaches it to the message that follows.
+    let mut items = vec![
+        json!({"type": "message", "role": "assistant", "id": "msg_1"}),
+        json!({"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "late"}]}),
+    ];
+    normalize_translated_reasoning(&mut items, &[0..=1]);
+    assert_eq!(types(&items), ["reasoning", "message"]);
+}
+
+#[test]
+fn trailing_reasoning_moves_ahead_of_a_message_and_tool_call_turn() {
+    let mut items = vec![
+        json!({"type": "message", "role": "assistant", "id": "msg_1"}),
+        json!({"type": "function_call", "id": "fc_1"}),
+        json!({"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "late"}]}),
+    ];
+    normalize_translated_reasoning(&mut items, &[0..=2]);
+    assert_eq!(types(&items), ["reasoning", "message", "function_call"]);
+}
+
+#[test]
+fn reasoning_first_turns_are_left_untouched() {
+    // The finite builder and native passthrough already lead with reasoning.
+    let mut items = vec![
+        json!({"type": "reasoning", "id": "rs_1"}),
+        json!({"type": "message", "role": "assistant", "id": "msg_1"}),
+    ];
+    let before = items.clone();
+    normalize_translated_reasoning(&mut items, &[]);
+    assert_eq!(items, before);
+}
+
+#[test]
+fn multi_round_agentic_reasoning_is_not_collapsed_onto_an_earlier_turn() {
+    // Each round already leads with its own reasoning, and the trailing
+    // reasoning here (round 2) is followed by round 2's message, so it is not
+    // a trailing item: nothing moves.
+    let mut items = vec![
+        json!({"type": "reasoning", "id": "rs_1"}),
+        json!({"type": "function_call", "id": "fc_1"}),
+        json!({"type": "reasoning", "id": "rs_2"}),
+        json!({"type": "message", "role": "assistant", "id": "msg_2"}),
+    ];
+    let before = items.clone();
+    normalize_translated_reasoning(&mut items, &[]);
+    assert_eq!(items, before);
+}
+
+#[test]
+fn a_standalone_trailing_reasoning_turn_is_preserved() {
+    // The preceding turn already leads with its own reasoning, so a trailing
+    // reasoning item is a separate, standalone turn and must not be merged.
+    let mut items = vec![
+        json!({"type": "reasoning", "id": "rs_1"}),
+        json!({"type": "message", "role": "assistant", "id": "msg_1"}),
+        json!({"type": "reasoning", "id": "rs_2"}),
+    ];
+    let before = items.clone();
+    normalize_translated_reasoning(&mut items, &[]);
+    assert_eq!(items, before);
+}
+
+#[test]
+fn build_record_normalizes_replay_without_changing_the_response_object() {
+    let input = json!([{"role": "user", "content": "hi"}]);
+    let output = json!([
+        {"type": "message", "role": "assistant", "id": "msg_1"},
+        {"type": "reasoning", "id": "rs_1", "content": [{"type": "reasoning_text", "text": "late"}]}
+    ]);
+    let response = json!({"id": "resp_late", "created_at": 1, "model": "m", "output": output});
+    let record = ResponsesService::build_record(response, owner("alice"), Some(input), None, &[0..=1])
+        .expect("translated response should build a record");
+    assert_eq!(
+        types(record.response_object["output"].as_array().unwrap()),
+        ["message", "reasoning"]
+    );
+    let messages = record.messages.as_array().expect("assembled messages are an array");
+    // The user input stays first; only the stored output turn is normalized.
+    let first_role = messages
+        .first()
+        .and_then(|item| item.get("role"))
+        .and_then(Value::as_str);
+    assert_eq!(first_role, Some("user"));
+    let output_turn = messages.get(1..).expect("input item precedes the stored output");
+    assert_eq!(types(output_turn), ["reasoning", "message"]);
+}
+
+#[test]
+fn translated_reasoning_stays_with_its_round_even_when_message_ids_repeat() {
+    let output = json!([
+        {"type": "message", "role": "assistant", "id": "msg_shared", "content": "first"},
+        {"type": "message", "role": "assistant", "id": "msg_shared", "content": "second"},
+        {"type": "reasoning", "id": "rs_second", "content": [{"type": "reasoning_text", "text": "second thought"}]},
+        {"type": "message", "role": "assistant", "id": "msg_shared", "content": "third"},
+        {"type": "reasoning", "id": "rs_third", "content": [{"type": "reasoning_text", "text": "third thought"}]}
+    ]);
+    let input = assemble_stored_messages(json!([]), Some(&output), &[1..=2, 3..=4]);
+    let chat = crate::openai::translation::chat_completions::responses_request_to_chat_request(
+        &json!({"model": "m", "input": input}),
+        &crate::openai::translation::reasoning::ReasoningOptions {
+            dialect: crate::openai::translation::reasoning::ReasoningDialect::Vllm,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        chat["messages"],
+        json!([
+            {"role": "assistant", "content": "first"},
+            {"role": "assistant", "content": "second", "reasoning": "second thought"},
+            {"role": "assistant", "content": "third", "reasoning": "third thought"}
+        ])
+    );
+    assert_eq!(output[1]["type"], "message", "wire order must be unchanged");
+}
+
+#[test]
+fn late_reasoning_before_a_tool_call_replays_with_the_answer() {
+    let output = json!([
+        {"type": "message", "role": "assistant", "content": "answer"},
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "thought"}]},
+        {"type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{}"}
+    ]);
+    let input = assemble_stored_messages(json!([]), Some(&output), &[0..=1]);
+    let chat = crate::openai::translation::chat_completions::responses_request_to_chat_request(
+        &json!({"model": "m", "input": input}),
+        &crate::openai::translation::reasoning::ReasoningOptions {
+            dialect: crate::openai::translation::reasoning::ReasoningDialect::Vllm,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        chat["messages"][0],
+        json!({"role": "assistant", "content": "answer", "reasoning": "thought"})
+    );
+    assert_eq!(chat["messages"][1]["tool_calls"][0]["id"], "call_1");
+    assert!(chat["messages"][1].get("reasoning").is_none());
+}
+
+#[test]
+fn native_output_without_translator_provenance_keeps_its_order() {
+    let output = json!([
+        {"type": "message", "role": "assistant", "id": "msg_1"},
+        {"type": "message", "role": "assistant", "id": "msg_2"},
+        {"type": "reasoning", "id": "rs_native"}
+    ]);
+    assert_eq!(assemble_stored_messages(json!([]), Some(&output), &[]), output);
 }

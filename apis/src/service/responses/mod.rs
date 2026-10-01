@@ -10,6 +10,8 @@
 //! neutral [`StoreError`]s. The transport layer owns request decoding, HTTP input
 //! validation, and status mapping.
 
+use std::ops::RangeInclusive;
+
 pub(crate) mod input_items;
 
 pub(crate) use input_items::{InputItemPage, ListParams, MAX_PAGE_LIMIT, Order, list_input_items};
@@ -188,12 +190,14 @@ impl ResponsesService {
     /// missing a required field (`id`, `created_at`, `model`), i.e. it is not
     /// persistable. `request_input` is the original create-request `input`;
     /// `state_messages` is the accumulated persistence history when rehydrate
-    /// populated it.
+    /// populated it. `reasoning_replay` identifies translated streaming turns
+    /// whose late reasoning must precede their output in stored history.
     pub(crate) fn build_record(
         response_object: Value,
         owner: StateOwner,
         request_input: Option<Value>,
         state_messages: Option<Vec<Value>>,
+        reasoning_replay: &[RangeInclusive<usize>],
     ) -> Option<ResponseRecord> {
         if response_object.is_null() {
             warn!("response persistence: response_object is null (incomplete stream?)");
@@ -209,7 +213,8 @@ impl ResponsesService {
             return None;
         };
 
-        let capture = ResponseCapture::from_response_json(&response_object, request_input, state_messages);
+        let capture =
+            ResponseCapture::from_response_json(&response_object, request_input, state_messages, reasoning_replay);
 
         Some(ResponseRecord {
             id: id.to_owned(),
@@ -234,22 +239,28 @@ struct ResponseCapture {
 
 impl ResponseCapture {
     /// Extract stored input and output from a Responses API exchange.
-    fn from_response_json(json: &Value, request_input: Option<Value>, state_messages: Option<Vec<Value>>) -> Self {
+    fn from_response_json(
+        json: &Value,
+        request_input: Option<Value>,
+        state_messages: Option<Vec<Value>>,
+        reasoning_replay: &[RangeInclusive<usize>],
+    ) -> Self {
         let input = request_input
             .or_else(|| json.get("input").cloned())
             .unwrap_or(Value::Null);
         let history_input = state_messages.map_or_else(|| input.clone(), Value::Array);
-        let messages = assemble_stored_messages(history_input, json.get("output"));
+        let messages = assemble_stored_messages(history_input, json.get("output"), reasoning_replay);
 
         Self { input, messages }
     }
 }
 
 /// Build the stored conversation history from response input and output.
-fn assemble_stored_messages(input: Value, output: Option<&Value>) -> Value {
+fn assemble_stored_messages(input: Value, output: Option<&Value>, reasoning_replay: &[RangeInclusive<usize>]) -> Value {
     let mut messages = Vec::new();
 
     append_stored_input_items(&mut messages, input);
+    let output_start = messages.len();
 
     match output {
         Some(Value::Array(items)) => messages.extend(items.iter().cloned()),
@@ -257,5 +268,23 @@ fn assemble_stored_messages(input: Value, output: Option<&Value>) -> Value {
         Some(_) | None => {},
     }
 
+    if let Some(output) = messages.get_mut(output_start..) {
+        normalize_translated_reasoning(output, reasoning_replay);
+    }
+
     Value::Array(messages)
+}
+
+/// Restore reasoning-first replay only within completed Chat turns identified by
+/// the translator. Each range ends at that turn's reasoning item, regardless of
+/// any following tool calls. Rotating it leaves every other turn's positions and
+/// the client-facing response object unchanged.
+fn normalize_translated_reasoning(items: &mut [Value], reasoning_replay: &[RangeInclusive<usize>]) {
+    for range in reasoning_replay {
+        if let Some(turn) = items.get_mut(*range.start()..=*range.end())
+            && turn.last().and_then(|item| item.get("type")).and_then(Value::as_str) == Some("reasoning")
+        {
+            turn.rotate_right(1);
+        }
+    }
 }

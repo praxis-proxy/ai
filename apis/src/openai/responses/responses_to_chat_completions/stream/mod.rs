@@ -17,6 +17,7 @@
 mod chat;
 mod events;
 mod framing;
+mod reasoning;
 
 #[cfg(test)]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
@@ -38,11 +39,15 @@ use self::{
     chat::{ChatChoice, ChatChunk, ChatToolCallFragment},
     events::StreamEvent,
     framing::{Framing, FramingError},
+    reasoning::ReasoningState,
 };
-use crate::openai::translation::chat_completions::{
-    ResponseContext, chat_response_to_response_resource, context_has_web_search, function_call_output_item_from_parts,
-    in_progress_response_resource, message_output_item, output_text_item, refusal_item,
-    web_search_call_output_item_from_parts,
+use crate::openai::translation::{
+    chat_completions::{
+        ResponseContext, chat_response_to_response_resource, context_has_web_search,
+        function_call_output_item_from_parts, in_progress_response_resource, message_output_item, output_text_item,
+        refusal_item, web_search_call_output_item_from_parts,
+    },
+    reasoning::{ReasoningOptions, reasoning_item_id},
 };
 
 /// Resource limits governing one streaming translation.
@@ -59,7 +64,7 @@ pub(crate) struct StreamLimits {
     pub(super) max_tool_calls: usize,
     /// Wall-clock streaming timeout in seconds; `0` disables the guard.
     pub(super) stream_timeout_secs: u64,
-    /// Ceiling for total accumulated semantic bytes (text, refusal, arguments).
+    /// Ceiling for total accumulated semantic bytes (text, refusal, reasoning, arguments).
     pub(super) max_body_bytes: usize,
     /// Maximum number of decoded SSE frames processed in one response.
     pub(super) max_stream_frames: usize,
@@ -158,6 +163,10 @@ enum ConvertError {
     FrameLimit,
     /// The accumulated semantic byte ceiling was exceeded.
     ByteLimit,
+    /// Raw reasoning exceeded its configured byte ceiling.
+    ReasoningLimit,
+    /// A selected provider reasoning field was not a string or null.
+    MalformedReasoning,
     /// A single tool call exceeded the argument byte limit.
     ToolArgumentLimit,
     /// The tool-call count limit was exceeded.
@@ -348,6 +357,10 @@ pub(super) struct StreamConverter {
     usage: Option<Value>,
     /// Next Responses output index to allocate.
     next_output_index: usize,
+    /// Active provider reasoning contract.
+    reasoning_options: ReasoningOptions,
+    /// Raw reasoning item, if any non-empty reasoning appeared.
+    reasoning: Option<ReasoningState>,
     /// Assistant message state, if any content appeared.
     message: Option<MessageState>,
     /// Tool-call states in first-appearance order.
@@ -356,11 +369,19 @@ pub(super) struct StreamConverter {
     accumulated_bytes: usize,
     /// Count of decoded SSE frames processed.
     frames_processed: usize,
+    /// Late reasoning position from a successful terminal, consumed once by the
+    /// filter to preserve this completion's association in stored replay.
+    replay_reasoning_index: Option<usize>,
 }
 
 impl StreamConverter {
     /// Create a converter for a streaming response.
-    pub(super) fn new(response_id: String, created_at: u64, limits: StreamLimits) -> Self {
+    pub(super) fn new(
+        response_id: String,
+        created_at: u64,
+        limits: StreamLimits,
+        reasoning_options: ReasoningOptions,
+    ) -> Self {
         Self {
             framing: Framing::new(limits.max_sse_buffer_bytes),
             response_id,
@@ -380,11 +401,20 @@ impl StreamConverter {
             finish_reason: None,
             usage: None,
             next_output_index: 0,
+            reasoning_options,
+            reasoning: None,
             message: None,
             tool_calls: Vec::new(),
             accumulated_bytes: 0,
             frames_processed: 0,
+            replay_reasoning_index: None,
         }
+    }
+
+    /// Take the late reasoning position for this completed Chat turn. Earlier
+    /// output items all belong to this same completion, even if tool calls follow.
+    pub(super) fn take_replay_reasoning_index(&mut self) -> Option<usize> {
+        self.replay_reasoning_index.take()
     }
 
     /// Feed one response body chunk, returning any completed Responses SSE bytes.
@@ -645,6 +675,7 @@ impl StreamConverter {
                 // closed avoids silently completing the stream with empty output.
                 return Err(ConvertError::LegacyFunctionCall);
             }
+            self.process_reasoning(delta, out)?;
             if let Some(content) = delta.content.as_deref()
                 && !content.is_empty()
             {
@@ -661,6 +692,50 @@ impl StreamConverter {
         }
         if let Some(finish) = choice.finish_reason.as_deref() {
             self.process_finish_reason(finish)?;
+        }
+        Ok(())
+    }
+
+    /// Decode only fields belonging to the enabled provider dialect.
+    fn process_reasoning(&mut self, delta: &chat::ChatDelta<'_>, out: &mut Vec<u8>) -> Result<(), ConvertError> {
+        if let Some(text) = delta
+            .raw_reasoning(self.reasoning_options.dialect)
+            .map_err(|_error| ConvertError::MalformedReasoning)?
+        {
+            self.process_reasoning_delta(&text, out)?;
+        }
+        Ok(())
+    }
+
+    /// Emit each fragment immediately while retaining only bounded semantic text.
+    fn process_reasoning_delta(&mut self, text: &str, out: &mut Vec<u8>) -> Result<(), ConvertError> {
+        let projected = self
+            .reasoning
+            .as_ref()
+            .map_or(0, |state| state.text.len())
+            .saturating_add(text.len());
+        if projected > self.reasoning_options.max_reasoning_bytes {
+            return Err(ConvertError::ReasoningLimit);
+        }
+        self.charge_bytes(text.len())?;
+        if self.reasoning.is_none() {
+            let state = ReasoningState {
+                output_index: self.alloc_output_index(),
+                item_id: reasoning_item_id(&self.response_id, self.chat_id.as_deref()),
+                text: String::new(),
+            };
+            state.open(&mut self.emit, &self.limits, out)?;
+            self.reasoning = Some(state);
+        }
+        if let Some(state) = &mut self.reasoning {
+            emit_event(
+                &mut self.emit,
+                &self.limits,
+                true,
+                events::reasoning_text_delta(&state.item_id, state.output_index, text),
+                out,
+            )?;
+            state.text.push_str(text);
         }
         Ok(())
     }
@@ -1048,7 +1123,12 @@ impl StreamConverter {
     /// Called from [`emit_terminal`](Self::emit_terminal) — not when the finish
     /// reason arrives — so an item's `response.output_item.done` is committed to
     /// the client atomically with the terminal event.
-    fn close_open_items(&mut self, inputs: &SnapshotInputs<'_>, out: &mut Vec<u8>) -> Result<(), ConvertError> {
+    fn close_open_items(
+        &mut self,
+        resource: &Value,
+        inputs: &SnapshotInputs<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<(), ConvertError> {
         // Validate every started tool call's identity before emitting any done
         // events. `close_message` below streams the message's
         // `response.output_item.done`; if a later tool call is missing its id or
@@ -1069,19 +1149,24 @@ impl StreamConverter {
         if self.emit.events_emitted.saturating_add(needed).saturating_add(1) > self.limits.max_stream_events {
             return Err(ConvertError::EventLimit);
         }
+        if let Some(state) = &self.reasoning {
+            state.close(resource, &mut self.emit, &self.limits, out)?;
+        }
         self.close_message(inputs, out)?;
         self.close_tool_calls(out)
     }
 
     /// Count the capped events the closeout will emit.
     ///
-    /// Mirrors exactly what [`close_message`](Self::close_message) and
-    /// [`close_tool_calls`](Self::close_tool_calls) emit so the preflight in
+    /// Includes reasoning text/content/item completion and exactly what
+    /// [`close_message`](Self::close_message) and [`close_tool_calls`](Self::close_tool_calls)
+    /// emit so the preflight in
     /// [`close_open_items`](Self::close_open_items) neither over- nor
     /// under-reserves the event budget. Keep the arithmetic here in lockstep with
-    /// those two functions.
+    /// those closeout functions.
     fn closeout_event_budget(&self) -> usize {
-        let mut needed = 0;
+        // Reasoning closes its text, content part, and output item.
+        let mut needed = if self.reasoning.is_some() { 3 } else { 0 };
         // Message close: `output_text`/`refusal` done + their `content_part.done`,
         // then one `output_item.done`. Skipped when the message was never added or
         // is already closed, matching `close_message`'s early return.
@@ -1326,7 +1411,8 @@ impl StreamConverter {
     fn emit_terminal(&mut self, inputs: &SnapshotInputs<'_>, out: &mut Vec<u8>) -> Result<(), ConvertError> {
         let finish = self.finish_reason.clone().unwrap_or_default();
         let context = self.response_context(inputs, Some(inputs.now));
-        let synthetic = self.synthetic_completion(&finish);
+        let mut synthetic = self.synthetic_completion(&finish);
+        self.move_reasoning_to_completion(&mut synthetic)?;
         let mut resource = chat_response_to_response_resource(&synthetic, &context).map_err(|error| {
             tracing::trace!(%error, "accumulated stream state could not form a valid terminal response");
             ConvertError::InvalidTerminalResource
@@ -1369,6 +1455,28 @@ impl StreamConverter {
             return Err(error);
         }
         self.phase = Phase::EmittedTerminal;
+        self.replay_reasoning_index = self
+            .reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.output_index)
+            .filter(|&index| index > 0);
+        Ok(())
+    }
+
+    /// Transfer the completed reasoning buffer to the finite translation boundary.
+    fn move_reasoning_to_completion(&mut self, synthetic: &mut Value) -> Result<(), ConvertError> {
+        if let Some(state) = &mut self.reasoning {
+            // The finite translator owns the terminal item. Move the completed
+            // buffer into its input; closeout borrows the resulting item instead
+            // of retaining another full copy in the streaming state.
+            let message = synthetic
+                .get_mut("choices")
+                .and_then(|choices| choices.get_mut(0))
+                .and_then(|choice| choice.get_mut("message"))
+                .and_then(Value::as_object_mut)
+                .ok_or(ConvertError::InvalidTerminalResource)?;
+            message.insert("reasoning".to_owned(), Value::String(std::mem::take(&mut state.text)));
+        }
         Ok(())
     }
 
@@ -1385,7 +1493,7 @@ impl StreamConverter {
         inputs: &SnapshotInputs<'_>,
         out: &mut Vec<u8>,
     ) -> Result<(), ConvertError> {
-        self.close_open_items(inputs, out)?;
+        self.close_open_items(resource, inputs, out)?;
         let event = match finish {
             "length" | "content_filter" => events::response_incomplete(resource),
             _ => events::response_completed(resource),
@@ -1618,6 +1726,11 @@ impl StreamConverter {
         {
             return message.output_index;
         }
+        if let Some(reasoning) = &self.reasoning
+            && reasoning.item_id == id
+        {
+            return reasoning.output_index;
+        }
         self.tool_calls
             .iter()
             .find(|call| call.item_id.as_deref() == Some(id))
@@ -1644,7 +1757,8 @@ impl StreamConverter {
     /// Build a response context borrowing the request body.
     fn response_context<'a>(&self, inputs: &SnapshotInputs<'a>, completed_at: Option<u64>) -> ResponseContext<'a> {
         let mut context =
-            ResponseContext::from_responses_request(inputs.request_body, self.response_id.clone(), self.created_at);
+            ResponseContext::from_responses_request(inputs.request_body, self.response_id.clone(), self.created_at)
+                .with_reasoning_options(self.reasoning_options);
         // Echo the client's canonical tools/tool_choice, not any backend-lowered
         // forms in request_body (openai_file_search_callout rewrites a hosted
         // file_search tool into a private function for the backend).
@@ -1901,6 +2015,8 @@ fn failure_message(error: &ConvertError) -> &'static str {
         ConvertError::FrameSizeLimit => "upstream stream exceeded the per-event size limit",
         ConvertError::FrameLimit => "upstream stream exceeded the frame limit",
         ConvertError::ByteLimit => "upstream stream exceeded the response size limit",
+        ConvertError::ReasoningLimit => "upstream reasoning exceeded the size limit",
+        ConvertError::MalformedReasoning => "upstream returned malformed reasoning content",
         ConvertError::ToolArgumentLimit => "upstream tool-call arguments exceeded the size limit",
         ConvertError::ToolCountLimit => "upstream stream exceeded the tool-call limit",
         ConvertError::Timeout => "upstream stream exceeded the time limit",

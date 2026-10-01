@@ -99,6 +99,12 @@ impl ResponsesEvent {
                 event_type: frame.event_type.clone().unwrap_or_default(),
             })?;
 
+        // JSON escapes can decode into literal SSE delimiters. Reject them before
+        // an unknown discriminator can be forwarded as an `event:` header.
+        if data_type.contains(['\r', '\n']) {
+            return Err(SseParseError::InvalidEventType);
+        }
+
         if let Some(event_type) = frame.event_type.as_deref()
             && canonical_event_type(event_type) != canonical_event_type(data_type)
         {
@@ -446,6 +452,33 @@ mod tests {
             matches!(event, ResponsesEvent::Unknown { .. }),
             "future matching event type should remain Unknown"
         );
+    }
+
+    #[test]
+    fn rejects_line_delimiters_in_payload_event_type() {
+        for event_type in [
+            "future\rname",
+            "future\nname",
+            "future\r\nname",
+            "future\ndata: {}\n\nevent: injected",
+        ] {
+            let data = typed_data(event_type, json!({}));
+            for header in [None, Some(event_type)] {
+                let f = frame(header, &data);
+                assert!(matches!(
+                    ResponsesEvent::from_frame(&f),
+                    Err(SseParseError::InvalidEventType)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_payload_event_type_without_header_is_preserved() {
+        let data = typed_data("response.future_event", json!({"delta": "line\ntext"}));
+        let event = ResponsesEvent::from_frame(&frame(None, &data)).unwrap();
+        assert_eq!(event.event_type(), "response.future_event");
+        assert_eq!(event.payload()["delta"], "line\ntext");
     }
 
     #[test]

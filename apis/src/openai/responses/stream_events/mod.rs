@@ -1167,7 +1167,15 @@ fn append_logical_event(
         return;
     }
 
-    let event_type = event.event_type().to_owned();
+    // Parsing groups equivalent reasoning aliases into one variant. Preserve
+    // the validated wire discriminator so SSE event and data.type still agree
+    // when forwarding OpenAI's reasoning_text events through the logical stream.
+    let event_type = event
+        .payload()
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| event.event_type())
+        .to_owned();
     let mut payload = event.into_payload();
     normalize_logical_payload(ctx, &mut payload, state.output_index_offset);
     encode_sse_event(&event_type, &payload, output);

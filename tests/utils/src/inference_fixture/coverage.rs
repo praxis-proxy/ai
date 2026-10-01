@@ -1262,11 +1262,14 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
                 vec!["responses_client_tool_compat"],
                 vec!["responses_client_tool_compat"],
                 vec!["responses_client_tool_compat", "responses_to_chat_completions"],
                 vec!["responses_client_tool_compat", "responses_to_chat_completions"],
                 vec!["messages_to_chat_completions"],
+                vec!["responses_agentic_loop"],
             ]
         );
         assert_eq!(
@@ -1317,12 +1320,15 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
+                CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 42);
-        assert_eq!(report.scenarios_total, 42);
-        assert_eq!(report.recordings_total, 47);
+        assert_eq!(report.features_total, 45);
+        assert_eq!(report.scenarios_total, 47);
+        assert_eq!(report.recordings_total, 52);
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1353,6 +1359,10 @@ mod tests {
                 "responses/chat-reasoning-disabled",
                 "responses/chat-reasoning-nonstream",
                 "responses/chat-reasoning-replay",
+                "responses/chat-reasoning-stream",
+                "responses/chat-reasoning-stream-late",
+                "responses/chat-reasoning-stream-late-tool",
+                "responses/chat-reasoning-stream-malformed",
                 "responses/chat-structured-output-with-tools",
                 "responses/chat-tool-echo",
                 "responses/chat-unrepresentable-parameters",
@@ -1362,6 +1372,7 @@ mod tests {
                 "responses/client-tool-compat-chat",
                 "responses/client-tool-compat-chat-stream",
                 "responses/client-tool-compat-stream",
+                "responses/invalid-stream-event-type",
                 "responses/irr-terminal-streaming",
                 "responses/native-basic-nonstream",
                 "responses/native-basic-stream",
@@ -1370,7 +1381,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 42);
+        assert_eq!(manifest.features.len(), 45);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1544,6 +1555,18 @@ mod tests {
                     &vec!["responses/chat-tool-echo".to_owned()]
                 ),
                 (
+                    &"responses.chat.reasoning.stream".to_owned(),
+                    &vec![
+                        "responses/chat-reasoning-stream".to_owned(),
+                        "responses/chat-reasoning-stream-late".to_owned(),
+                        "responses/chat-reasoning-stream-late-tool".to_owned()
+                    ]
+                ),
+                (
+                    &"responses.chat.reasoning.stream_errors".to_owned(),
+                    &vec!["responses/chat-reasoning-stream-malformed".to_owned()]
+                ),
+                (
                     &"responses.chat.null_tool_choice".to_owned(),
                     &vec!["responses/chat-null-tool-choice".to_owned()]
                 ),
@@ -1584,6 +1607,10 @@ mod tests {
                         "messages/stop-sequence-nonstream".to_owned(),
                         "messages/stop-sequence-stream".to_owned(),
                     ]
+                ),
+                (
+                    &"responses.streaming.invalid_event_type".to_owned(),
+                    &vec!["responses/invalid-stream-event-type".to_owned()]
                 ),
             ]
         );
@@ -1699,7 +1726,7 @@ mod tests {
                 vec![("vllm", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[30..41] {
+        for feature in &manifest.features[30..43] {
             assert_eq!(
                 feature
                     .providers
@@ -1710,12 +1737,20 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[41]
+            manifest.features[43]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)]
+        );
+        assert_eq!(
+            manifest.features[44]
+                .providers
+                .iter()
+                .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
+                .collect::<Vec<_>>(),
+            vec![("synthetic", CoverageStatus::SyntheticOnly)]
         );
         assert!(manifest.features.iter().all(|feature| {
             feature.reason.is_none() && feature.providers.values().all(|coverage| coverage.reason.is_none())

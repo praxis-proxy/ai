@@ -13,6 +13,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
+    ops::RangeInclusive,
     time::Duration,
 };
 
@@ -631,6 +632,12 @@ pub(crate) struct ResponsesState {
     /// writes `mcp_call` and `mcp_approval_request` items.
     pub accumulated_output: Vec<serde_json::Value>,
 
+    /// Absolute output ranges from the first item of a translated Chat turn to
+    /// its late reasoning item. Rotate only these ranges when storing replay
+    /// history; wire output stays in its announced order. Kept across IRR rounds
+    /// so adjacent assistant turns cannot be mistaken for a single completion.
+    pub translated_reasoning_replay: Vec<RangeInclusive<usize>>,
+
     /// Aggregate wire bytes `openai_stream_events` has charged against its
     /// accumulation budget across every IRR round of this request.
     ///
@@ -905,6 +912,7 @@ impl Default for ResponsesState {
             tools: Vec::new(),
             usage: serde_json::Value::Null,
             accumulated_output: Vec::new(),
+            translated_reasoning_replay: Vec::new(),
             stream_accumulated_bytes: 0,
             emitted_output_items: HashMap::new(),
             locally_executed_output_items: HashSet::new(),

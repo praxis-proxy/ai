@@ -465,7 +465,13 @@ fn build_streaming_record(
     let state = ctx.extensions.get::<ResponsesState>()?;
     let response_object = state.response_object.clone();
     let state_messages = (!state.persisted_messages.is_empty()).then(|| state.persisted_messages.clone());
-    ResponsesService::build_record(response_object, owner, request_input, state_messages)
+    ResponsesService::build_record(
+        response_object,
+        owner,
+        request_input,
+        state_messages,
+        &state.translated_reasoning_replay,
+    )
 }
 
 /// Build the buffered record from the decoded response body and the captured
@@ -481,7 +487,7 @@ fn build_buffered_record(
         .get::<ResponsesState>()
         .map(|state| state.persisted_messages.clone());
     let json = decode_response_body(bytes)?;
-    ResponsesService::build_record(json, owner, request_input, state_messages)
+    ResponsesService::build_record(json, owner, request_input, state_messages, &[])
 }
 
 /// Decode a buffered response body, logging and skipping on invalid JSON.
