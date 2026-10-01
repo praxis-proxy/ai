@@ -2392,7 +2392,9 @@ class TestOpenAIResponsesVLLM:
             messages = [item for item in items.data if item.type == "message"]
             assert [item.role for item in messages] == ["user", "assistant"]
             assert "short greeting" in messages[0].content[0].text
-            assert messages[1].content[0].text in completed[0].output_text
+            assert messages[1].content[0].text == completed[0].output_text, (
+                "the appended assistant item must match the streamed terminal output"
+            )
         finally:
             openai_client.conversations.delete(conversation.id)
 
