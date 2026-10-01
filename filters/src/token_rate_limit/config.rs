@@ -76,21 +76,51 @@ use serde::Deserialize;
 /// Every previous `praxis_ai_token_rate_limit_*` name has moved to this
 /// prefix; no compatibility aliases are emitted.
 ///
-/// `budget_remaining` is the sum of the latest calculated remaining
-/// balances for the rule's retained keys, and `active_keys` is how many
-/// balances contribute. Window aging and refill are evaluated lazily during
-/// normal backend operations, so both are snapshots rather than
-/// continuously refreshed values. Like all Prometheus gauges they are f64
-/// and saturate at the largest exactly representable integer (2^53 - 1).
+/// `budget_remaining` is the remaining budget for the key of the most recent
+/// admission decision on this replica (admitted or denied), and
+/// `active_keys` is how many keys the backend currently retains. Both are
+/// snapshots taken as decisions happen, not continuously refreshed values.
+/// Like all Prometheus gauges they are f64 and saturate at the largest
+/// exactly representable integer (2^53 - 1).
 ///
 /// Gauge scope depends on the backend. With the `memory` backend every
 /// gauge describes this process only, so aggregate replicas with `sum`.
-/// With the `valkey` backend every replica exports the rule-wide value it
-/// last observed from the shared store, so aggregate replicas with `max`;
-/// a replica that stops seeing traffic for a rule keeps exporting its last
-/// observation until it does. Valkey applies expiry incrementally on each
-/// admission, so its counts can briefly include entries that have just
-/// expired.
+/// With the `valkey` backend, `reservations_active` is scoped to the
+/// namespace and algorithm, so summing it over rules double-counts;
+/// aggregate with `max` across replicas and rules. `active_keys` is scoped
+/// per rule, so aggregate with `max` across replicas for each rule.
+/// Each replica exports the value it last observed from the shared store.
+/// `budget_remaining` stays per replica and per
+/// last decision on either backend: it describes whichever key that
+/// replica decided last, so `max` or `sum` across replicas says little
+/// beyond "some key had this much left". A replica that stops seeing
+/// traffic for a rule keeps exporting its last observation until it does.
+///
+/// The `valkey` backend requires Valkey or Redis 7.0+ (`PEXPIRE NX`/`GT`
+/// is used). The `valkey` backend keeps
+/// sliding-window usage in 60 fixed sub-windows per window (one per
+/// second for windows under a minute); usage leaves the window up to one
+/// sub-window late, never early. Changing a window's length changes its
+/// sub-window width and so starts that window's usage from zero. On the
+/// sliding window, concurrent admissions on one key are not serialised,
+/// so they can overshoot the budget by their combined estimates for one
+/// round trip. Usage written is never lost.
+///
+/// The `valkey` token bucket, by contrast, serialises admissions per key
+/// through an optimistic transaction: one key admits at most about one
+/// request per two Valkey round trips across the whole fleet, and
+/// contention shows up first as added latency, up to the 500 ms Valkey
+/// timeout, then as 503s. Use a non-`global` `key` for high-throughput
+/// token-bucket rules so the load spreads over many buckets.
+///
+/// During a rolling upgrade from the earlier scripted `valkey` backend,
+/// replicas on the old and new versions keep separate state, so for one
+/// window (and until old token buckets have drained) combined admissions
+/// can reach about twice the budget. All `valkey` timestamps come from
+/// the proxy replicas' clocks, not Valkey's: skew between replicas can
+/// under-count usage at window edges by up to the skew, and a replica
+/// whose clock runs fast trims other replicas' live reservations and keys
+/// from the caps early.
 ///
 /// Admissions, denials, reconciliations, and backend failures also emit
 /// structured records on the `praxis_ai::token_rate_limit::accounting`
@@ -137,8 +167,8 @@ pub(super) struct TokenRateLimitConfig {
     /// rather than growing without bound.
     ///
     /// In-process ledgers enforce the cap per rule. Valkey enforces it
-    /// against the per-rule retained-key set (`{namespace}:v1:rule:{hash}:keys`,
-    /// or the token-bucket equivalent), not the namespace-wide set.
+    /// against the per-rule retained-key set (`{namespace}:v2:keys:{rule_hash}`,
+    /// or the token-bucket equivalent).
     /// Idle in-process keys are reaped by ledger cleanup, which walks a
     /// bounded number of entries per request (including busy ones) so a
     /// single in-window key cannot pin the table at this cap.

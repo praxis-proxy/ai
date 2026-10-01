@@ -199,9 +199,17 @@ fn config_with_custom_max_tools() {
 // MCP Entry Extraction
 // =========================================================================
 
+fn rewrite_tools_array_for_test(
+    mut tools: Vec<serde_json::Value>,
+    per_entry: Vec<EntryResolution>,
+) -> (Vec<serde_json::Value>, HashSet<String>) {
+    let mcp_entries = extract_mcp_entries_from_tools(&mut tools);
+    rewrite_tools_array(tools, mcp_entries, per_entry)
+}
+
 #[test]
 fn extract_mcp_entries_from_mixed_tools() {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "input": "test",
         "tools": [
             {"type": "function", "name": "calc"},
@@ -210,42 +218,56 @@ fn extract_mcp_entries_from_mixed_tools() {
             {"type": "mcp", "server_label": "calendar", "server_url": "http://localhost:8002/mcp"}
         ]
     });
-    let entries = extract_mcp_entries(body.to_string().as_bytes());
+    let entries = extract_mcp_entries(&mut body);
 
-    assert_eq!(entries.len(), 2, "should extract 2 MCP entries");
+    assert_eq!(entries.values.len(), 2, "should extract 2 MCP entries");
     assert_eq!(
-        entries[0]["server_label"].as_str(),
+        entries.values[0]["server_label"].as_str(),
         Some("weather"),
         "first entry server_label"
     );
     assert_eq!(
-        entries[1]["server_label"].as_str(),
+        entries.values[1]["server_label"].as_str(),
         Some("calendar"),
         "second entry server_label"
+    );
+    assert_eq!(
+        entries.tool_indices,
+        vec![1, 3],
+        "original positions should be retained"
+    );
+    assert!(body["tools"][1].is_null(), "first MCP entry should be moved out");
+    assert!(body["tools"][3].is_null(), "second MCP entry should be moved out");
+    assert_eq!(body["tools"][0]["name"], "calc", "non-MCP tool should remain in place");
+    assert_eq!(
+        body["tools"][2]["type"], "web_search",
+        "non-MCP tool should remain in place"
     );
 }
 
 #[test]
 fn extract_mcp_entries_empty_when_no_mcp() {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "input": "test",
         "tools": [{"type": "function", "name": "calc"}]
     });
-    let entries = extract_mcp_entries(body.to_string().as_bytes());
+    let entries = extract_mcp_entries(&mut body);
     assert!(entries.is_empty(), "should find no MCP entries");
+    assert_eq!(body["tools"][0]["name"], "calc", "non-MCP tool should remain untouched");
 }
 
 #[test]
 fn extract_mcp_entries_handles_no_tools() {
-    let body = serde_json::json!({"input": "test"});
-    let entries = extract_mcp_entries(body.to_string().as_bytes());
+    let mut body = serde_json::json!({"input": "test"});
+    let entries = extract_mcp_entries(&mut body);
     assert!(entries.is_empty(), "should handle missing tools array");
 }
 
 #[test]
-fn extract_mcp_entries_handles_invalid_json() {
-    let entries = extract_mcp_entries(b"not json");
-    assert!(entries.is_empty(), "should handle invalid JSON");
+fn extract_mcp_entries_handles_non_object() {
+    let mut body = serde_json::json!(["not", "an", "object"]);
+    let entries = extract_mcp_entries(&mut body);
+    assert!(entries.is_empty(), "should handle a non-object request body");
 }
 
 // =========================================================================
@@ -818,15 +840,13 @@ fn write_state_creates_state_when_missing() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let body_json = mcp_body("http://10.0.0.5/mcp");
-    let body_bytes = serde_json::to_vec(&body_json).unwrap();
-
     let mut map = HashMap::new();
     map.insert(
         ("weather".to_owned(), "get_weather".to_owned()),
         serde_json::json!({"tool": true}),
     );
     let context_policy = McpConnectorContextPolicy::new(Some("connector_bearer"), Some("connector_assertion"));
-    write_state(&mut ctx, &body_bytes, map, Vec::new(), context_policy.clone());
+    write_state(&mut ctx, body_json, map, Vec::new(), context_policy.clone());
 
     let state = ctx.extensions.get::<ResponsesState>().expect("state should be created");
     assert!(
@@ -852,9 +872,7 @@ fn write_state_updates_existing_state() {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     let body_json = mcp_body("http://10.0.0.5/mcp");
-    let body_bytes = serde_json::to_vec(&body_json).unwrap();
-
-    let mut state = ResponsesState::from_request_body(body_json);
+    let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_response_id = Some("resp_existing".to_owned());
     ctx.extensions.insert(state);
 
@@ -865,7 +883,7 @@ fn write_state_updates_existing_state() {
     );
     write_state(
         &mut ctx,
-        &body_bytes,
+        body_json,
         map,
         Vec::new(),
         McpConnectorContextPolicy::default(),
@@ -1362,6 +1380,40 @@ fn dedup_entries_groups_same_label_url() {
 }
 
 #[test]
+fn task_result_is_retained_only_until_its_final_consumer() {
+    let entry_to_task = [Some(0), Some(0), Some(1)];
+    let mut task_results = vec![
+        Some(vec![serde_json::json!({"name": "shared"})]),
+        Some(vec![serde_json::json!({"name": "unique"})]),
+    ];
+    let mut remaining_consumers = task_consumer_counts(&entry_to_task, task_results.len());
+
+    let first_shared = consume_task_result(0, &mut task_results, &mut remaining_consumers);
+    assert!(first_shared.is_some(), "the first shared consumer receives a result");
+    assert!(
+        task_results[0].is_some(),
+        "the shared result remains owned until its final consumer"
+    );
+
+    let final_shared = consume_task_result(0, &mut task_results, &mut remaining_consumers);
+    assert_eq!(
+        final_shared, first_shared,
+        "both shared consumers receive the same result"
+    );
+    assert!(
+        task_results[0].is_none(),
+        "the final shared consumer takes the stored result"
+    );
+
+    let unique = consume_task_result(1, &mut task_results, &mut remaining_consumers);
+    assert!(unique.is_some(), "the unique consumer receives its result");
+    assert!(
+        task_results[1].is_none(),
+        "a uniquely consumed result is moved immediately"
+    );
+}
+
+#[test]
 fn dedup_entries_keeps_credentialed_independent() {
     let entries = vec![
         serde_json::json!({"server_label": "a", "server_url": "http://10.0.0.1/mcp", "authorization": "tok_a"}),
@@ -1669,8 +1721,6 @@ fn write_state_skips_state_creation_with_previous_response_id() {
         "previous_response_id": "resp_abc",
         "tools": [{"type": "mcp", "server_label": "w", "server_url": "http://10.0.0.5/mcp"}]
     });
-    let body_bytes = serde_json::to_vec(&body_json).unwrap();
-
     let mut map = HashMap::new();
     map.insert(
         ("w".to_owned(), "get_weather".to_owned()),
@@ -1678,7 +1728,7 @@ fn write_state_skips_state_creation_with_previous_response_id() {
     );
     write_state(
         &mut ctx,
-        &body_bytes,
+        body_json,
         map,
         Vec::new(),
         McpConnectorContextPolicy::default(),
@@ -1703,7 +1753,7 @@ fn rewrite_tools_array_drops_resolved_empty_entry() {
     ];
     let per_entry = vec![EntryResolution::Resolved(Vec::new())];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 1, "resolved-empty MCP entry should be dropped");
     assert_eq!(rewritten[0]["name"], "calc", "function tool preserved");
@@ -1720,7 +1770,7 @@ fn rewrite_tools_array_preserves_passthrough_entry() {
     })];
     let per_entry = vec![EntryResolution::PassThrough];
 
-    let (rewritten, _) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, _) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 1, "passthrough entry should be preserved");
     assert_eq!(rewritten[0]["type"], "mcp", "passthrough keeps original type");
@@ -1734,7 +1784,7 @@ fn rewrite_tools_array_expands_resolved_nonempty() {
         &serde_json::json!({"name": "tool_a", "description": "A"}),
     )])];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 1, "one MCP entry → one function tool");
     assert_eq!(rewritten[0]["type"], "function");
@@ -1758,7 +1808,7 @@ fn rewrite_tools_array_expands_resolved_nonempty() {
 #[test]
 #[expect(clippy::too_many_lines, reason = "comprehensive credential-isolation assertions")]
 fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": "gpt-4o",
         "input": "hi",
         "tools": [{
@@ -1769,13 +1819,12 @@ fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
             "headers": {"x-api-key": "another-secret"}
         }]
     });
-    let body_bytes = serde_json::to_vec(&body).unwrap();
-
     let per_entry = vec![EntryResolution::Resolved(Vec::new())];
     let tool_map = HashMap::new();
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
-    let serialized = rewrite_request_body(&body_bytes, per_entry, &tool_map, &resolved_labels)
+    let mcp_entries = extract_mcp_entries(&mut body);
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
         .expect("rewrite must not error")
         .expect("a resolved-empty entry must trigger a rewrite, not forward the original body");
 
@@ -1807,7 +1856,7 @@ fn rewrite_request_body_strips_credentials_when_all_entries_resolve_empty() {
 #[test]
 #[expect(clippy::too_many_lines, reason = "comprehensive credential-isolation assertions")]
 fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": "gpt-4o",
         "input": "hi",
         "tools": [
@@ -1824,8 +1873,6 @@ fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
             }
         ]
     });
-    let body_bytes = serde_json::to_vec(&body).unwrap();
-
     let per_entry = vec![
         EntryResolution::Resolved(vec![mcp_tool_to_function_tool(
             "weather",
@@ -1836,7 +1883,8 @@ fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
     let tool_map = HashMap::new();
     let resolved_labels = HashSet::from(["weather".to_owned(), "empty".to_owned()]);
 
-    let serialized = rewrite_request_body(&body_bytes, per_entry, &tool_map, &resolved_labels)
+    let mcp_entries = extract_mcp_entries(&mut body);
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
         .expect("rewrite must not error")
         .expect("mixed request must be rewritten");
 
@@ -1863,7 +1911,7 @@ fn rewrite_request_body_strips_only_empty_entry_credentials_in_mixed_request() {
     reason = "request fixture plus tool_choice normalization and survival assertions"
 )]
 fn rewrite_request_body_normalizes_to_none_keeping_unrelated_tool_when_allowed_tools_empties() {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": "gpt-4o",
         "input": "hi",
         "tools": [
@@ -1881,14 +1929,13 @@ fn rewrite_request_body_normalizes_to_none_keeping_unrelated_tool_when_allowed_t
             "tools": [{"type": "mcp", "server_label": "weather"}]
         }
     });
-    let body_bytes = serde_json::to_vec(&body).unwrap();
-
     // The single MCP entry resolves to zero permitted tools.
     let per_entry = vec![EntryResolution::Resolved(Vec::new())];
     let tool_map = HashMap::new();
     let resolved_labels = HashSet::from(["weather".to_owned()]);
 
-    let serialized = rewrite_request_body(&body_bytes, per_entry, &tool_map, &resolved_labels)
+    let mcp_entries = extract_mcp_entries(&mut body);
+    let serialized = rewrite_request_body(&mut body, mcp_entries, per_entry, &tool_map, &resolved_labels)
         .expect("rewrite must not error")
         .expect("resolved-empty entry must trigger a rewrite");
 
@@ -1982,7 +2029,7 @@ fn rewrite_tools_array_converts_mcp_to_function() {
         "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}}
     })]];
     let resolution = make_resolution(&raw);
-    let (rewritten, generated) = rewrite_tools_array(tools, resolution.per_entry);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, resolution.per_entry);
 
     assert_eq!(rewritten.len(), 2, "should have 2 tools");
     assert_eq!(rewritten[0]["name"], "calc", "first tool unchanged");
@@ -2011,7 +2058,7 @@ fn rewrite_tools_array_preserves_unresolved_mcp() {
         "server_url": "http://10.0.0.99/mcp"
     })];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, vec![EntryResolution::PassThrough]);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, vec![EntryResolution::PassThrough]);
 
     assert_eq!(rewritten.len(), 1, "should preserve unresolved entry");
     assert_eq!(rewritten[0]["type"], "mcp", "unresolved MCP left unchanged");
@@ -2034,7 +2081,7 @@ fn rewrite_tools_array_sanitizes_deferred_connectors() {
         "require_approval": "never"
     })];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, vec![EntryResolution::SanitizeDeferred]);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, vec![EntryResolution::SanitizeDeferred]);
 
     assert_eq!(rewritten.len(), 1);
     assert_eq!(rewritten[0]["type"], "mcp");
@@ -2089,7 +2136,7 @@ fn rewrite_tools_array_expands_multiple_tools() {
         ),
     ])];
 
-    let (rewritten, generated) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, generated) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 2, "one MCP entry expands to multiple function tools");
     let names: Vec<&str> = rewritten.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -2144,13 +2191,13 @@ fn mcp_tool_to_function_tool_prefers_input_schema_camel_case() {
 #[test]
 fn mcp_list_tools_item_emits_responses_input_schema() {
     let listing = mcp_list_tools_item(
-        "weather",
-        &[serde_json::json!({
+        "weather".to_owned(),
+        vec![mcp_listing_tool_for_responses(&serde_json::json!({
             "name": "get_weather",
             "description": "Get weather",
             "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}},
             "annotations": {"readOnlyHint": true}
-        })],
+        }))],
     );
 
     assert_eq!(listing["type"], "mcp_list_tools");
@@ -2414,10 +2461,9 @@ fn write_state_syncs_request_body_and_tools_on_existing_state() {
     });
     ctx.extensions.insert(ResponsesState::from_request_body(original_body));
 
-    let body_bytes = serde_json::to_vec(&rewritten_body_json()).unwrap();
     write_state(
         &mut ctx,
-        &body_bytes,
+        rewritten_body_json(),
         weather_tool_map(),
         Vec::new(),
         McpConnectorContextPolicy::default(),
@@ -2457,7 +2503,7 @@ fn rewrite_per_entry_respects_allowed_tools_filter() {
         )]),
     ];
 
-    let (rewritten, _) = rewrite_tools_array(tools, per_entry);
+    let (rewritten, _) = rewrite_tools_array_for_test(tools, per_entry);
 
     assert_eq!(rewritten.len(), 2, "each entry expands independently");
     assert_eq!(rewritten[0]["name"], "s__tool_a", "first entry only has tool_a");
@@ -5379,7 +5425,7 @@ fn collect_resolutions_preserves_only_reusable_target_identity() {
         Some(vec![serde_json::json!({"name": "connector_tool"})]),
     ];
 
-    let resolution = collect_resolutions(&entries, &[Some(0), Some(1), Some(2)], &task_results)
+    let resolution = collect_resolutions(&entries, &[Some(0), Some(1), Some(2)], task_results)
         .expect("valid entries resolve to listings");
     let target_urls: Vec<_> = resolution
         .listings

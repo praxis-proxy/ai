@@ -56,7 +56,11 @@ use serde_json::Value;
 use tracing::{debug, warn};
 
 use self::config::{CompactFilterConfig, ValidatedConfig, build_config};
-use super::{error::responses_error_rejection, is_explicit_compact_request, state::ResponsesState};
+use super::{
+    error::responses_error_rejection,
+    is_explicit_compact_request,
+    state::{ResponsesState, mark_local_compaction_item},
+};
 use crate::{
     callout_policy::OnFailure,
     service::responses::ResponsesService,
@@ -290,7 +294,7 @@ impl CompactFilter {
         };
         replace_messages(
             state,
-            build_compaction_item(&compaction_id, summary, &self.config.summary_prefix),
+            &build_compaction_item(&compaction_id, summary, &self.config.summary_prefix),
         );
     }
 
@@ -687,13 +691,11 @@ impl CompactionWriter<'_> {
     /// compaction item.
     async fn persist_compacted(&self, summary: &Summarization) -> Result<Value, FilterAction> {
         let compaction_id = format!("compact_{}", self.ctx.id_generator.generate(self.ctx.time_source));
-        let item = Value::Array(vec![build_compaction_item(
-            &compaction_id,
-            &summary.content,
-            &self.filter.config.summary_prefix,
-        )]);
+        let item = build_compaction_item(&compaction_id, &summary.content, &self.filter.config.summary_prefix);
+        let stored_item = mark_local_compaction_item(&item);
         let usage = build_compaction_usage(self.messages, Some(summary), &self.filter.config.tiktoken_encoding);
-        self.persist_response(item.clone(), item, usage).await
+        self.persist_response(Value::Array(vec![item]), Value::Array(vec![stored_item]), usage)
+            .await
     }
 
     /// Persist an uncompacted no-op when the summarization callout fails under
@@ -1001,17 +1003,18 @@ fn build_compaction_item(id: &str, summary: &str, summary_prefix: &str) -> Value
 /// matches `state.input`. File resolution and document extraction
 /// rewrite that tail in place and leave `state.input` as the original
 /// client payload, so compaction must not rebuild from `state.input`.
-fn replace_messages(state: &mut ResponsesState, compaction_item: Value) {
+fn replace_messages(state: &mut ResponsesState, compaction_item: &Value) {
     let input_len = state.input.len();
     let message_tail = split_current_turn(&mut state.messages, input_len);
     let persisted_tail = split_current_turn(&mut state.persisted_messages, input_len);
+    let persisted_compaction_item = mark_local_compaction_item(compaction_item);
 
     state.messages.clear();
     state.messages.push(compaction_item.clone());
     state.messages.extend(message_tail);
 
     state.persisted_messages.clear();
-    state.persisted_messages.push(compaction_item);
+    state.persisted_messages.push(persisted_compaction_item);
     state.persisted_messages.extend(persisted_tail);
 }
 

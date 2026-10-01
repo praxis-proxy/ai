@@ -1690,6 +1690,35 @@ fn appends_function_calls_to_messages() {
 }
 
 #[test]
+fn appends_provider_compaction_to_replay_state() {
+    let filter = make_filter();
+    let req = make_request(Method::POST, "/v1/responses");
+    let mut ctx = make_filter_context(&req);
+
+    ctx.extensions.insert(make_state_with_tool_calls(vec![]));
+    let response_body = json!({
+        "id": "resp_1",
+        "object": "response",
+        "output": [{
+            "type": "compaction",
+            "id": "cmp_provider",
+            "encrypted_content": "provider-state"
+        }]
+    });
+    let mut body = Some(Bytes::from(serde_json::to_vec(&response_body).unwrap()));
+
+    drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
+
+    let state = ctx.extensions.get::<ResponsesState>().unwrap();
+    assert_eq!(state.messages[1]["type"], "compaction");
+    assert_eq!(state.persisted_messages[1]["id"], "cmp_provider");
+    assert!(
+        state.provider_compaction_ids.contains("cmp_provider"),
+        "provider compaction IDs must include replayable response output"
+    );
+}
+
+#[test]
 fn skips_extraction_when_body_is_none() {
     let filter = make_filter();
     let req = make_request(Method::POST, "/v1/responses");
@@ -2810,6 +2839,32 @@ fn streamed_provider_conversation_marks_persisted_history() {
         state.provider_history_len, 2,
         "prompt and function call should be persisted"
     );
+}
+
+#[test]
+fn appends_streamed_provider_compaction_to_replay_state() {
+    let compaction = json!({
+        "type": "compaction",
+        "id": "cmp_streamed",
+        "encrypted_content": "provider-state"
+    });
+    let input = json!({"type": "message", "role": "user", "content": "continue"});
+    let mut state = ResponsesState {
+        messages: vec![input.clone()],
+        persisted_messages: vec![input],
+        response_object: json!({"output": [compaction]}),
+        ..ResponsesState::default()
+    };
+
+    super::collect_streaming_output_items(&mut state);
+
+    assert_eq!(state.messages[1]["type"], "compaction");
+    assert_eq!(state.persisted_messages[1]["id"], "cmp_streamed");
+    assert!(
+        state.provider_compaction_ids.contains("cmp_streamed"),
+        "streamed provider compaction IDs must be retained for replay"
+    );
+    assert_eq!(state.accumulated_output[0]["id"], "cmp_streamed");
 }
 
 /// Regression (#955): the sole owner stamps a stable synthetic id on every

@@ -102,14 +102,14 @@ mod backend;
 mod config;
 mod keys;
 mod ledger;
-mod remaining_total;
 mod token_bucket_ledger;
+mod valkey;
 mod weights;
 
 use std::{
     collections::{BTreeMap, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -125,8 +125,6 @@ use self::{
     backend::{
         BackendError, BackendReserve, BackendSettlement, CleanupReport, InMemoryTokenBucketBackend,
         InMemoryTokenRateLimitBackend, ReconcileRequest, ReserveRequest, TokenRateLimitStateBackend,
-        ValkeyBackendConfig, ValkeyEval, ValkeyTokenBucketBackend, ValkeyTokenBucketConfig,
-        ValkeyTokenRateLimitBackend,
     },
     config::{
         ActionType, BackendConfig, BackendKind, DEFAULT_RESERVATION_TIMEOUT, EstimationConfig, EstimationStrategy,
@@ -135,6 +133,10 @@ use self::{
     keys::{CompiledKeySpec, KeyDecision, KeyInputs, compile_key_spec},
     ledger::{Budget, DenialReason, Ledger, LedgerConfig},
     token_bucket_ledger::{TokenBucketConfig, TokenBucketLedger},
+    valkey::{
+        ValkeyConnection, ValkeySlidingWindowBackend, ValkeySlidingWindowConfig, ValkeyTokenBucketBackend,
+        ValkeyTokenBucketConfig,
+    },
     weights::{TokenWeights, UsageCounts, parse_u64_meta, weighted_cost},
 };
 
@@ -156,15 +158,15 @@ const META_BUCKET_KEY: &str = "token_rate_limit.bucket_key";
 /// backend/estimate even when other rules exist.
 const META_RULE_INDEX: &str = "token_rate_limit.rule_index";
 
-/// Metadata key stashing this request's computed estimate, so
-/// reconciliation can use the actual per-request estimate (not just
-/// the compiled default) for its settlement math.
+/// Metadata key exposing this request's computed estimate for the rest of
+/// the exchange. Settlement does not read it: every backend settles
+/// against the estimate it stored with the reservation.
 const META_ESTIMATE: &str = "token_rate_limit.estimate";
 
 /// The budget key used by the backward-compatible global key mode.
 pub(super) const FALLBACK_KEY: &str = "__fallback__";
 
-/// Bound on distinct budget keys retained at once, per rule.
+/// Bound on distinct budget keys retained at once, per rule on every backend.
 ///
 /// High-cardinality dimensions (header, IP, model, composites) can
 /// create one entry per distinct resolved key. Operators can lower this
@@ -186,11 +188,12 @@ pub(super) const DEFAULT_MODEL_HEADER: HeaderName = HeaderName::from_static("x-m
 /// Bound on a single budget key's length.
 pub(super) const MAX_KEY_LENGTH: usize = 256;
 
-/// Bound on reservations awaiting reconciliation across all keys, per rule.
+/// Bound on reservations awaiting reconciliation across all keys: per rule
+/// on the in-memory backends, per namespace and algorithm on Valkey.
 const MAX_ACTIVE_RESERVATIONS: usize = 200_000;
 
 /// Largest exact integer representable by Prometheus's f64 gauge values and
-/// by Valkey's Lua numeric type. Aggregate remaining-budget gauges saturate
+/// by the token bucket's f64 balance. The remaining-budget gauge saturates
 /// here instead of wrapping or reporting backend-dependent precision loss.
 const MAX_REPORTED_REMAINING: u64 = 9_007_199_254_740_991;
 
@@ -216,20 +219,20 @@ const HEADER_RATELIMIT_RESET: &str = "X-RateLimit-Reset-Tokens";
 
 /// Resolved, ready-to-use form of the filter-level `backend:` config:
 /// either every rule uses in-process state, or every rule shares one
-/// already-open Valkey connection (see [`ValkeyEval`]'s doc comment for
-/// why this is built once and `Clone`d, not once per rule).
+/// already-open Valkey connection (see [`ValkeyConnection`]'s doc comment
+/// for why this is built once and `Clone`d, not once per rule).
 enum BackendResource {
     /// Every rule gets its own in-process ledger (the default).
     Memory,
     /// Every rule shares this one Valkey connection, differentiated by
-    /// `namespace`/rule-name key hashing. Boxed: `ValkeyEval` embeds a
-    /// `redis::Client`/`ConnectionInfo`, large enough that an unboxed
+    /// `namespace`/rule-name key hashing. Boxed: `ValkeyConnection` embeds
+    /// a `redis::Client`/`ConnectionInfo`, large enough that an unboxed
     /// field here would size the whole enum (including the zero-data
     /// `Memory` variant) up to match it.
     Valkey {
         /// Filter-shared connection, `Clone`d into each Valkey-backed
         /// rule's own backend.
-        valkey: Box<ValkeyEval>,
+        valkey: Box<ValkeyConnection>,
         /// Key namespace prefix, see [`BackendConfig::namespace`].
         namespace: String,
     },
@@ -255,7 +258,7 @@ fn build_backend_resource(backend: &BackendConfig) -> Result<BackendResource, Fi
                 .namespace
                 .clone()
                 .unwrap_or_else(|| "praxis:token_rate_limit".to_owned());
-            let valkey = Box::new(ValkeyEval::new(url)?);
+            let valkey = Box::new(ValkeyConnection::new(url)?);
             Ok(BackendResource::Valkey { valkey, namespace })
         },
     }
@@ -287,18 +290,55 @@ fn build_sliding_window_backend(
             .map_err(|error| format!("token_rate_limit: rule '{rule_name}': {error}"))?;
             Ok(Arc::new(InMemoryTokenRateLimitBackend::new(ledger)))
         },
-        BackendResource::Valkey { valkey, namespace } => {
-            Ok(Arc::new(ValkeyTokenRateLimitBackend::new(ValkeyBackendConfig {
-                valkey: (**valkey).clone(),
-                namespace: namespace.clone(),
-                rule: rule_name.to_owned(),
-                budgets,
-                reservation_timeout_ms,
-                max_keys,
-                max_active_reservations: MAX_ACTIVE_RESERVATIONS,
-            })))
-        },
+        BackendResource::Valkey { valkey, namespace } => build_sw_valkey_backend(
+            rule_name,
+            budgets,
+            reservation_timeout_ms,
+            max_keys,
+            valkey,
+            namespace.as_str(),
+        ),
     }
+}
+
+/// Validate and construct the Valkey sliding-window backend for one rule.
+///
+/// Separated from [`build_sliding_window_backend`] to keep both functions
+/// within the line-count limit enforced by `clippy::too_many_lines`.
+///
+/// # Errors
+///
+/// Returns [`FilterError`] if `reservation_timeout_ms` exceeds the shortest
+/// budget window, which would cause late settlements to miss their window.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors build_token_bucket_backend; parameters are all distinct and required"
+)]
+fn build_sw_valkey_backend(
+    rule_name: &str,
+    budgets: Vec<Budget>,
+    reservation_timeout_ms: u64,
+    max_keys: usize,
+    valkey: &ValkeyConnection,
+    namespace: &str,
+) -> Result<Arc<dyn TokenRateLimitStateBackend>, FilterError> {
+    let min_window_ms = budgets.iter().map(|b| b.window_ms).min().unwrap_or(0);
+    if reservation_timeout_ms > min_window_ms {
+        return Err(format!(
+            "token_rate_limit: rule '{rule_name}': reservation_timeout ({reservation_timeout_ms} ms) \
+             must not exceed the shortest window ({min_window_ms} ms) for the Valkey sliding_window backend"
+        )
+        .into());
+    }
+    Ok(Arc::new(ValkeySlidingWindowBackend::new(ValkeySlidingWindowConfig {
+        valkey: valkey.clone(),
+        namespace: namespace.to_owned(),
+        rule: rule_name.to_owned(),
+        budgets,
+        reservation_timeout_ms,
+        max_keys,
+        max_active_reservations: MAX_ACTIVE_RESERVATIONS,
+    })))
 }
 
 /// Build the configured state backend for a `token_bucket` rule
@@ -577,7 +617,7 @@ impl CompiledRule {
 ///
 /// # Errors
 ///
-/// Returns [`FilterError`] if `capacity` is zero, exceeds the Lua
+/// Returns [`FilterError`] if `capacity` is zero, exceeds the
 /// `f64` safe-integer bound, `reserved_tokens` is zero or exceeds
 /// `capacity`, or `reservation_timeout` isn't a valid duration.
 fn validate_rule_bounds(rule: &RuleConfig, capacity: u64) -> Result<u64, FilterError> {
@@ -605,7 +645,7 @@ fn validate_rule_bounds(rule: &RuleConfig, capacity: u64) -> Result<u64, FilterE
     )
 }
 
-/// Reject a zero `capacity`, or one beyond the Lua `f64` safe-integer
+/// Reject a zero `capacity`, or one beyond the `f64` safe-integer
 /// bound.
 ///
 /// `token_bucket_ledger` re-checks this same bound on its own
@@ -1187,8 +1227,11 @@ pub struct TokenRateLimitFilter {
     /// rule's budget by the configured dimensions.
     key_spec: CompiledKeySpec,
 
-    /// Monotonic clock reference; all timestamps are offsets from this.
+    /// In-process ledgers use monotonic elapsed time; Valkey replicas need
+    /// comparable wall-clock timestamps for their shared counters and TTLs.
     epoch: Instant,
+    /// Whether timestamps must be shared across replicas.
+    valkey_clock: bool,
 }
 
 impl TokenRateLimitFilter {
@@ -1231,16 +1274,25 @@ impl TokenRateLimitFilter {
             needs_body,
             key_spec,
             epoch: Instant::now(),
+            valkey_clock: matches!(backend, BackendResource::Valkey { .. }),
         }))
     }
 
-    /// Milliseconds elapsed since this filter's epoch.
+    /// Current time in milliseconds for the configured backend.
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "millis fit u64 for any realistic process uptime"
+        reason = "millis since Unix epoch fit u64 until year ~292 million"
     )]
     fn now_ms(&self) -> u64 {
-        self.epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+        let millis = if self.valkey_clock {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        } else {
+            self.epoch.elapsed().as_millis()
+        };
+        millis.min(u128::from(u64::MAX)) as u64
     }
 
     /// The first rule (in configured order) whose `match` is satisfied
@@ -1307,8 +1359,9 @@ impl TokenRateLimitFilter {
     /// Reclaim idle/orphaned in-process state for one rule and publish
     /// its gauges.
     ///
-    /// No-ops for a Valkey backend (`cleanup()` returns `None`): expiry
-    /// there is handled by the Lua reserve script itself.
+    /// No-ops for a Valkey backend (`cleanup()` returns `None`): Valkey
+    /// state expires by TTLs and deadline-scored trims, and the one key
+    /// without a TTL, each namespace's id sequence, never grows.
     fn cleanup_and_record_state(rule: &CompiledRule, now_ms: u64) {
         let Some(report) = rule.backend.cleanup(now_ms, CLEANUP_SCAN_LIMIT) else {
             return;
@@ -1373,6 +1426,7 @@ impl TokenRateLimitFilter {
                 reservation_id,
                 estimate,
                 usage_after,
+                ..
             }) => {
                 let admitted = AdmittedReservation {
                     key: pending.key,
@@ -1385,7 +1439,9 @@ impl TokenRateLimitFilter {
                 record_admission_span(ctx, rule, pending.request_estimate, "admitted");
                 FilterAction::Continue
             },
-            Ok(BackendReserve::Denied { retry_after_ms, reason }) => {
+            Ok(BackendReserve::Denied {
+                retry_after_ms, reason, ..
+            }) => {
                 tracing::info!(
                     estimate = pending.request_estimate,
                     key = pending.key,
@@ -1489,15 +1545,10 @@ impl TokenRateLimitFilter {
         if actual.is_none() {
             tracing::trace!("token_rate_limit: no usable token usage metadata at end of stream, charging at estimate");
         }
-        let Some(estimate) = parse_u64_meta(ctx, META_ESTIMATE) else {
-            tracing::warn!("token_rate_limit: META_ESTIMATE missing at reconciliation, skipping");
-            return None;
-        };
         let request = ReconcileRequest {
             key,
             reservation_id,
             actual,
-            estimate,
             now_ms: self.now_ms(),
         };
         Some((request, rule))
@@ -1511,8 +1562,8 @@ impl TokenRateLimitFilter {
     ///
     /// In-process state reconciles synchronously and immediately (cheap,
     /// no I/O). A Valkey backend instead enqueues the reconciliation onto
-    /// a background worker (see `backend::ValkeyTokenRateLimitBackend`/
-    /// `backend::ValkeyTokenBucketBackend`) so the response is never held
+    /// a background worker (see `valkey::ValkeySlidingWindowBackend`/
+    /// `valkey::ValkeyTokenBucketBackend`) so the response is never held
     /// up on a network round-trip that has no bearing on whether *this*
     /// request was admitted.
     fn reconcile(&self, ctx: &HttpFilterContext<'_>) {
@@ -1965,6 +2016,26 @@ mod backend_injection_tests {
         record_state_metrics, record_unauthenticated_metric,
     };
 
+    #[test]
+    fn in_process_clock_uses_elapsed_time_and_valkey_clock_uses_unix_time() {
+        let mut filter = TokenRateLimitFilter {
+            rules: Vec::new(),
+            needs_body: false,
+            key_spec: super::CompiledKeySpec::global(),
+            epoch: std::time::Instant::now() - std::time::Duration::from_secs(5),
+            valkey_clock: false,
+        };
+        assert!(
+            (5_000..6_000).contains(&filter.now_ms()),
+            "local ledgers use a monotonic elapsed clock"
+        );
+        filter.valkey_clock = true;
+        assert!(
+            filter.now_ms() > 1_000_000_000_000,
+            "shared Valkey timestamps use Unix time"
+        );
+    }
+
     /// A backend that admits every reservation but always fails to
     /// enqueue its reconciliation -- the one way
     /// [`TokenRateLimitFilter::reconcile`]'s enqueue-failure log line is
@@ -1982,6 +2053,7 @@ mod backend_injection_tests {
                 reservation_id: 1,
                 estimate: 1,
                 usage_after: 1,
+                remaining: 0,
             })
         }
 
@@ -2041,6 +2113,7 @@ mod backend_injection_tests {
             needs_body: false,
             key_spec: super::CompiledKeySpec::global(),
             epoch: std::time::Instant::now(),
+            valkey_clock: false,
         };
 
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");

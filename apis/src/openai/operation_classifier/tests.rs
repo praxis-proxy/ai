@@ -5,7 +5,7 @@
 
 #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
 
-use praxis_filter::{BodyAccess, BodyMode, Request};
+use praxis_filter::{BodyAccess, BodyMode, ErrorResponseFormatterHandle, Request};
 
 use super::*;
 use crate::test_utils::{make_filter_context, make_request};
@@ -201,6 +201,49 @@ async fn websocket_handshake_on_conversations_is_not_classified() {
     assert!(
         ctx.extensions.get::<OpenAiOperationMatch>().is_none(),
         "Conversations is HTTP-only, so its route must not bypass transport classification on upgrade"
+    );
+}
+
+/// The error formatter is installed from the request head, so an OpenAI
+/// client keeps OpenAI-shaped errors on proxy failures without any
+/// protocol-specific filter later in the chain.
+///
+/// Membership is derived from the protocol name, so a registry added later —
+/// Files and Vector Stores, for instance — is covered without touching this
+/// filter.
+#[tokio::test]
+async fn an_openai_operation_installs_the_error_formatter() {
+    for (method, path) in [
+        ("POST", "/v1/chat/completions"),
+        ("POST", "/v1/responses"),
+        ("GET", "/v1/conversations/conv_123"),
+    ] {
+        let filter = default_filter();
+        let request = req(method, path);
+        let mut ctx = make_filter_context(&request);
+
+        drop(filter.on_request(&mut ctx).await.unwrap());
+
+        assert!(
+            ctx.extensions.get::<ErrorResponseFormatterHandle>().is_some(),
+            "{method} {path} should install the OpenAI error formatter"
+        );
+    }
+}
+
+/// A request that matches no OpenAI operation is left alone, so non-OpenAI
+/// traffic on a shared listener keeps its default error shape.
+#[tokio::test]
+async fn an_unmatched_request_installs_no_error_formatter() {
+    let filter = default_filter();
+    let request = req("POST", "/v1/unknown");
+    let mut ctx = make_filter_context(&request);
+
+    drop(filter.on_request(&mut ctx).await.unwrap());
+
+    assert!(
+        ctx.extensions.get::<ErrorResponseFormatterHandle>().is_none(),
+        "an unmatched request keeps the default error formatting"
     );
 }
 

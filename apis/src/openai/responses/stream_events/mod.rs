@@ -2080,12 +2080,6 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     let sequence_number = state.logical_stream_sequence;
     state.logical_stream_sequence = state.logical_stream_sequence.saturating_add(1);
 
-    // #937: deliberately do NOT set `logical_stream_terminal_emitted` here.
-    // Unlike `emit_deferred_terminal`, this local completion is returned to the
-    // store as a buffered `TerminalResponse` at end-of-stream (see
-    // `finish_deferred_local_response`), where the store already persists before
-    // the body is written. Marking the flag would make the store skip that
-    // end-of-stream persist and lose the record (#937 review regression).
     output.extend_from_slice(b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":");
     serde_json::to_writer(&mut output, &state.response_object).ok()?;
     output.extend_from_slice(b",\"sequence_number\":");
@@ -2094,6 +2088,11 @@ pub(crate) fn encode_local_completion(ctx: &mut HttpFilterContext<'_>) -> Option
     if deferred_done {
         output.extend_from_slice(b"data: [DONE]\n\n");
     }
+    // IRR can surface the local terminal body to outer filters as a non-EOS
+    // chunk. Mark it only after encoding succeeded so they persist before
+    // releasing that chunk; the store retains an EOS fallback if no such chunk
+    // arrives.
+    state.local_stream_terminal_emitted = true;
     Some(Bytes::from(output))
 }
 

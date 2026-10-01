@@ -533,7 +533,7 @@ fn replace_messages_preserves_current_input() {
         .insert(1, json!({"role": "assistant", "content": "old answer"}));
 
     let compaction_item = build_compaction_item("compact_test", "Summary of old conversation.", DEFAULT_SUMMARY_PREFIX);
-    replace_messages(&mut state, compaction_item);
+    replace_messages(&mut state, &compaction_item);
 
     assert_eq!(state.messages.len(), 2, "should have compaction + current input");
     assert_eq!(state.messages[0]["type"], "compaction");
@@ -545,6 +545,10 @@ fn replace_messages_preserves_current_input() {
     );
     assert_eq!(state.persisted_messages.len(), 2);
     assert_eq!(state.persisted_messages[0]["type"], "compaction");
+    assert_eq!(
+        state.persisted_messages[0]["_praxis_local_compaction"], true,
+        "private persisted history must retain local compaction provenance"
+    );
     assert_eq!(
         state.persisted_messages[1]["content"], "What's next?",
         "current-turn tail from persisted_messages must be kept"
@@ -567,7 +571,8 @@ fn replace_messages_keeps_each_list_current_turn_independently() {
         json!({"role": "user", "content": "from-persisted"}),
     ];
 
-    replace_messages(&mut state, build_compaction_item("c1", "sum", DEFAULT_SUMMARY_PREFIX));
+    let compaction_item = build_compaction_item("c1", "sum", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, &compaction_item);
 
     assert_eq!(state.messages.len(), 2);
     assert_eq!(state.messages[1]["content"], "from-messages");
@@ -612,10 +617,8 @@ fn compaction_preserves_resolved_file_data_instead_of_file_url() {
         "state.input stays the original client payload"
     );
 
-    replace_messages(
-        &mut state,
-        build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX),
-    );
+    let compaction_item = build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, &compaction_item);
 
     assert_eq!(state.messages[0]["type"], "compaction");
     let current = &state.messages[1];
@@ -664,10 +667,8 @@ fn compaction_preserves_extracted_input_text_instead_of_input_file() {
     state.messages[tail] = extracted_item.clone();
     state.persisted_messages[tail] = extracted_item;
 
-    replace_messages(
-        &mut state,
-        build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX),
-    );
+    let compaction_item = build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, &compaction_item);
 
     let current = &state.messages[1];
     assert_eq!(

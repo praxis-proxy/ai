@@ -530,7 +530,7 @@ fn from_config_rejects_zero_capacity() {
 /// so this rejection has to come from the shared gate, not either
 /// algorithm's downstream validation, to protect both.
 #[test]
-fn from_config_rejects_capacity_above_the_lua_safe_integer_bound() {
+fn from_config_rejects_capacity_above_the_f64_safe_integer_bound() {
     let over_bound = super::token_bucket_ledger::MAX_F64_SAFE_INTEGER + 1;
 
     let sliding_window = single_rule_yaml(&format!(
@@ -995,35 +995,39 @@ async fn reconcile_is_a_noop_without_prior_admission_metadata() {
     ));
 }
 
-/// Missing `META_ESTIMATE` must skip settlement rather than treat the
-/// estimate as 0 (which would debit `actual - 0` on top of the original
-/// reservation and over-charge the window).
+/// Missing `META_RESERVATION_ID` must skip settlement: without the id
+/// there is nothing to settle, so the reservation stands at its estimate.
 #[tokio::test]
-async fn missing_meta_estimate_skips_reconciliation_instead_of_settling_at_zero() {
-    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 500");
+async fn missing_reservation_id_skips_reconciliation() {
+    let yaml = single_rule_yaml("algorithm: sliding_window\nwindow: 1h\ncapacity: 1000\nreserved_tokens: 400");
     let filter = TokenRateLimitFilter::from_config(&yaml).unwrap();
 
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
-    assert!(matches!(
-        filter.on_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
-    ctx.filter_metadata.remove(super::META_ESTIMATE);
+    assert!(
+        matches!(filter.on_request(&mut ctx).await.unwrap(), FilterAction::Continue),
+        "the first 400-token request fits"
+    );
+    ctx.filter_metadata.remove(super::META_RESERVATION_ID);
     ctx.set_metadata(META_TOKEN_TOTAL, "200");
     let mut body = None;
-    assert!(matches!(
-        filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(
+        matches!(
+            filter.on_response_body(&mut ctx, &mut body, true).unwrap(),
+            FilterAction::Continue
+        ),
+        "a skipped settlement still lets the response through"
+    );
 
-    // Reservation of 500 still stands (no bogus +200 overage). A second
-    // 500-token admit fits remaining capacity; it would not if settlement
-    // had charged 700.
     let mut second = crate::test_utils::make_filter_context(&req);
     assert!(
         matches!(filter.on_request(&mut second).await.unwrap(), FilterAction::Continue),
-        "skipping reconcile must leave the original 500-token reservation, not 700"
+        "400 + 400 fits in 1000"
+    );
+    let mut third = crate::test_utils::make_filter_context(&req);
+    assert!(
+        matches!(filter.on_request(&mut third).await.unwrap(), FilterAction::Reject(_)),
+        "the unsettled 400 still counts; settling it at 200 would have let a third 400 in"
     );
 }
 
@@ -1122,6 +1126,7 @@ fn debug_format_lists_configured_rule_names() {
         needs_body,
         key_spec: super::compile_key_spec(cfg.key).unwrap(),
         epoch: std::time::Instant::now(),
+        valkey_clock: false,
     };
     let debug = format!("{filter:?}");
     assert!(debug.contains("default"), "got: {debug}");
@@ -1356,7 +1361,7 @@ fn from_config_rejects_non_finite_or_negative_default_weights_from_yaml() {
 }
 
 #[test]
-fn from_config_rejects_a_refill_rate_that_would_overflow_the_valkey_reserve_scripts_pexpire_ttl() {
+fn from_config_rejects_a_refill_rate_that_would_overflow_the_valkey_pexpire_ttl() {
     // capacity / refill_rate = 1e11 seconds -- a config typo away from
     // plausible (e.g. an extra zero on refill_rate against a large
     // capacity meant for a generous burst rule), not a contrived extreme.
@@ -3625,8 +3630,8 @@ fn metrics_carry_the_values_of_an_admission_a_denial_and_a_reconciliation() {
             "praxis_trl_budget_remaining",
             &[rule, ("algorithm", "sliding_window")]
         ),
-        Some(60.0),
-        "40 settled tokens leave 60 of 100"
+        Some(40.0),
+        "the last decision (the denial) saw 40 of 100 left"
     );
     assert_eq!(
         gauge_value(&snapshot, "praxis_trl_reservations_active", &[rule]),

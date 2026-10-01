@@ -132,6 +132,82 @@ fn build_record_preserves_mcp_metadata_from_state_messages() {
 }
 
 #[test]
+fn build_record_does_not_duplicate_output_already_in_state_messages() {
+    let compaction = json!({
+        "type": "compaction",
+        "id": "cmp_provider",
+        "encrypted_content": "provider-state"
+    });
+    let message = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": "continued"
+    });
+    let response_object = json!({
+        "id": "resp_compaction",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [compaction.clone(), message.clone()]
+    });
+
+    let record = ResponsesService::build_record(
+        response_object,
+        owner("alice"),
+        Some(json!([{"role": "user", "content": "Continue"}])),
+        Some(vec![json!({"role": "user", "content": "Start"}), compaction.clone()]),
+    )
+    .expect("provider compaction response should build a record");
+
+    assert_eq!(
+        record.messages,
+        json!([
+            {"role": "user", "content": "Start"},
+            {"type": "compaction", "id": "cmp_provider", "encrypted_content": "provider-state"},
+            {"type": "message", "role": "assistant", "content": "continued"}
+        ]),
+        "provider compaction must be persisted once for replay"
+    );
+}
+
+#[test]
+fn build_record_does_not_duplicate_compaction_outside_overlap() {
+    let compaction = json!({
+        "type": "compaction",
+        "id": "cmp_provider",
+        "encrypted_content": "provider-state"
+    });
+    let response_object = json!({
+        "id": "resp_compaction_outside_overlap",
+        "created_at": 1_719_900_000,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [
+            {"type": "message", "role": "assistant", "content": "continued"},
+            compaction.clone()
+        ]
+    });
+
+    let record = ResponsesService::build_record(
+        response_object,
+        owner("alice"),
+        Some(json!([{"role": "user", "content": "Continue"}])),
+        Some(vec![json!({"role": "user", "content": "Start"}), compaction.clone()]),
+    )
+    .expect("provider compaction response should build a record");
+
+    assert_eq!(
+        record.messages,
+        json!([
+            {"role": "user", "content": "Start"},
+            {"type": "compaction", "id": "cmp_provider", "encrypted_content": "provider-state"},
+            {"type": "message", "role": "assistant", "content": "continued"}
+        ]),
+        "a replayed compaction outside the overlap must still be persisted once"
+    );
+}
+
+#[test]
 fn build_record_falls_back_to_response_object_input() {
     let response_object = json!({
         "id": "resp_buffered",

@@ -252,8 +252,31 @@ fn assemble_stored_messages(input: Value, output: Option<&Value>) -> Value {
     append_stored_input_items(&mut messages, input);
 
     match output {
-        Some(Value::Array(items)) => messages.extend(items.iter().cloned()),
-        Some(output) if !output.is_null() => messages.push(output.clone()),
+        Some(Value::Array(items)) => {
+            // A streamed response can contain state-owned input items followed
+            // by new output. Drop the largest suffix/prefix overlap so a
+            // compaction (or any other replayable item) is stored only once.
+            let overlap = (0..=messages.len().min(items.len()))
+                .rev()
+                .find(|&length| {
+                    messages
+                        .get(messages.len() - length..)
+                        .zip(items.get(..length))
+                        .is_some_and(|(message_suffix, output_prefix)| message_suffix == output_prefix)
+                })
+                .unwrap_or(0);
+            let new_items = items
+                .iter()
+                .skip(overlap)
+                .filter(|item| {
+                    item.get("type").and_then(Value::as_str) != Some("compaction")
+                        || !messages.iter().any(|message| message == *item)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            messages.extend(new_items);
+        },
+        Some(output) if !output.is_null() && messages.last() != Some(output) => messages.push(output.clone()),
         Some(_) | None => {},
     }
 

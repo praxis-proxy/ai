@@ -11,7 +11,8 @@
 
 use praxis_core::config::Config;
 use praxis_test_utils::{
-    Backend, free_port, http_send, json_post, parse_body, parse_status, start_echo_backend, start_proxy,
+    Backend, StatefulCapturingBackend, free_port, http_send, json_post, parse_body, parse_status, start_echo_backend,
+    start_proxy,
 };
 
 // -----------------------------------------------------------------------------
@@ -157,6 +158,79 @@ async fn request_without_conversation_passes_through() {
 
     let echoed: serde_json::Value = serde_json::from_str(&parse_body(&raw)).unwrap();
     assert_eq!(echoed["input"], "no conversation", "input should be unchanged");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preserves_provider_compaction_during_native_rehydration() {
+    let provider_response = serde_json::json!({
+        "id": "resp_provider_compaction",
+        "object": "response",
+        "created_at": 1,
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [{
+            "type": "compaction",
+            "id": "cmp_provider",
+            "encrypted_content": "provider-opaque-state",
+            "provider_field": {"opaque": true}
+        }]
+    })
+    .to_string();
+    let backend = StatefulCapturingBackend::new(vec![(200, provider_response.clone()), (200, provider_response)])
+        .start_with_shutdown();
+    let db = TempDb::new();
+    let proxy_port = free_port();
+    let config = Config::from_yaml(&pipeline_yaml(proxy_port, backend.port(), &db.url())).unwrap();
+    let proxy = start_proxy(&config);
+
+    let first = http_send(
+        proxy.addr(),
+        &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"first turn"}"#),
+    );
+    assert_eq!(parse_status(&first), 200, "initial response should persist");
+
+    let second = http_send(
+        proxy.addr(),
+        &json_post(
+            "/v1/responses",
+            r#"{"model":"gpt-4.1","input":"continue","previous_response_id":"resp_provider_compaction"}"#,
+        ),
+    );
+    assert_eq!(parse_status(&second), 200, "rehydrated response should succeed");
+
+    let requests = backend.requests();
+    let response_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.uri == "/v1/responses")
+        .collect();
+    assert!(
+        response_requests.len() >= 2,
+        "backend should receive both response requests, got {} captured requests",
+        requests.len()
+    );
+    let forwarded: serde_json::Value = serde_json::from_str(&response_requests[1].body).unwrap();
+    let input = forwarded["input"]
+        .as_array()
+        .expect("forwarded input should be an array");
+    assert!(
+        input.iter().any(|item| {
+            item == &serde_json::json!({
+                "type": "compaction",
+                "id": "cmp_provider",
+                "encrypted_content": "provider-opaque-state",
+                "provider_field": {"opaque": true}
+            })
+        }),
+        "native OpenAI Responses backends must receive provider compaction state unchanged; forwarded={forwarded}"
+    );
+    assert_eq!(
+        input.last().and_then(|item| item.get("content")),
+        Some(&serde_json::json!("continue"))
+    );
+    assert!(
+        forwarded.get("previous_response_id").is_none(),
+        "local rehydration should still consume previous_response_id"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -308,8 +382,6 @@ filter_chains:
 
       - filter: openai_responses_rehydrate
 
-      - filter: openai_responses_proxy
-
       - filter: router
         routes:
           - path_prefix: "/"
@@ -318,8 +390,13 @@ filter_chains:
       - filter: load_balancer
         clusters:
           - name: "backend"
+            http:
+              application_protocol: "openai_responses"
+              application_provider: "openai"
             endpoints:
               - "127.0.0.1:{backend_port}"
+
+      - filter: openai_responses_proxy
 insecure_options:
   allow_private_endpoints: true
 "#

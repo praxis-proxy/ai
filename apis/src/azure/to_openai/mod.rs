@@ -179,7 +179,7 @@ impl HttpFilter for ChatCompletionsToAzureaiChatCompletionsFilter {
         end_of_stream: bool,
     ) -> Result<FilterAction, FilterError> {
         match ctx.get_metadata(RESPONSE_TRANSFORM_KEY) {
-            Some(RESPONSE_TRANSFORM_SSE) => strip_sse_chunk(ctx, body, end_of_stream),
+            Some(RESPONSE_TRANSFORM_SSE) => strip_sse_chunk(ctx, body, end_of_stream)?,
             Some(RESPONSE_TRANSFORM_ERROR) if end_of_stream => {
                 transform_error_body(ctx, body);
             },
@@ -305,33 +305,42 @@ fn transform_success_body(body: &mut Option<Bytes>) {
 
 /// Process an SSE chunk: parse frames via [`SseFrameParser`], strip
 /// Azure-specific fields from each frame's data, and re-emit as SSE.
-fn strip_sse_chunk(ctx: &mut HttpFilterContext<'_>, body: &mut Option<Bytes>, end_of_stream: bool) {
-    let Some(bytes) = body.as_ref() else {
-        if end_of_stream {
-            *body = Some(Bytes::new());
-        }
-        return;
-    };
-
+fn strip_sse_chunk(
+    ctx: &mut HttpFilterContext<'_>,
+    body: &mut Option<Bytes>,
+    end_of_stream: bool,
+) -> Result<(), FilterError> {
     let Some(mut parser) = ctx.remove_filter_state::<SseFrameParser>() else {
-        return;
+        return Ok(());
     };
 
-    let frames = match parser.parse_chunk(bytes) {
-        Ok(frames) => frames,
-        Err(e) => {
-            debug!(error = %e, "SSE parse error in azureai_translation");
-            ctx.insert_filter_state(parser);
-            *body = Some(Bytes::new());
-            return;
+    let frames = match body.as_ref() {
+        Some(bytes) => match parser.parse_chunk(bytes) {
+            Ok(frames) => frames,
+            Err(e) => {
+                debug!(error = %e, "SSE parse error in azureai_translation");
+                return Err(FilterError::from(format!("azureai_translation: SSE parse error: {e}")));
+            },
         },
+        None => Vec::new(),
     };
 
-    if !end_of_stream {
+    if end_of_stream {
+        if parser.has_incomplete_frame() {
+            debug!("incomplete SSE frame at end of stream in azureai_translation");
+            return Err(FilterError::from(
+                "azureai_translation: incomplete SSE frame at end of stream",
+            ));
+        }
+    } else {
         ctx.insert_filter_state(parser);
     }
 
-    *body = Some(Bytes::from(rebuild_sse_frames(&frames)));
+    if body.is_some() || end_of_stream {
+        *body = Some(Bytes::from(rebuild_sse_frames(&frames)));
+    }
+
+    Ok(())
 }
 
 /// Serialize parsed [`SseFrame`]s back to SSE wire format, stripping
@@ -693,7 +702,7 @@ mod tests {
         let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"A\"},\"content_filter_results\":{}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"B\"},\"content_filter_results\":{}}]}\n\n";
         let mut body = Some(Bytes::from(chunk.to_vec()));
 
-        strip_sse_chunk(&mut ctx, &mut body, false);
+        strip_sse_chunk(&mut ctx, &mut body, false).unwrap();
 
         let bytes = body.unwrap();
         let output = std::str::from_utf8(bytes.as_ref()).unwrap();
@@ -714,7 +723,7 @@ mod tests {
 
         let chunk1 = b"data: {\"choices\":[{\"delta\":{\"con";
         let mut body1 = Some(Bytes::from(chunk1.to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body1, false);
+        strip_sse_chunk(&mut ctx, &mut body1, false).unwrap();
 
         assert!(
             ctx.get_filter_state::<SseFrameParser>().is_some(),
@@ -727,7 +736,7 @@ mod tests {
 
         let chunk2 = b"tent\":\"Hi\"},\"content_filter_results\":{}}]}\n\n";
         let mut body2 = Some(Bytes::from(chunk2.to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body2, false);
+        strip_sse_chunk(&mut ctx, &mut body2, false).unwrap();
 
         let bytes2 = body2.unwrap();
         let output = std::str::from_utf8(bytes2.as_ref()).unwrap();
@@ -736,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn strip_sse_chunk_drops_chunk_on_parse_error() {
+    fn strip_sse_chunk_returns_error_on_parse_error() {
         let request = make_request(Method::POST, "/chat/completions");
         let mut ctx = make_filter_context(&request);
         ctx.current_filter_id = Some(0);
@@ -746,21 +755,33 @@ mod tests {
         let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"content_filter_results\":{\"hate\":{\"filtered\":false}}}]}\n\n";
         let mut body = Some(Bytes::from(chunk.to_vec()));
 
-        strip_sse_chunk(&mut ctx, &mut body, false);
+        let err = strip_sse_chunk(&mut ctx, &mut body, false).unwrap_err();
+        assert!(
+            err.to_string().contains("SSE parse error"),
+            "parse error should be returned as FilterError, got: {err}"
+        );
+        assert!(
+            ctx.get_filter_state::<SseFrameParser>().is_none(),
+            "parser should NOT be retained after a parse error"
+        );
+    }
 
-        let output_bytes = body.unwrap();
+    #[test]
+    fn strip_sse_chunk_returns_error_on_incomplete_frame_at_eof() {
+        let request = make_request(Method::POST, "/chat/completions");
+        let mut ctx = make_filter_context(&request);
+        ctx.current_filter_id = Some(0);
+        ctx.insert_filter_state(SseFrameParser::new(65_536));
+
+        let chunk = b"data: {\"choices\":[{\"delta\":{\"con";
+        let mut body = Some(Bytes::from(chunk.to_vec()));
+        strip_sse_chunk(&mut ctx, &mut body, false).unwrap();
+
+        let mut eof_body = None;
+        let err = strip_sse_chunk(&mut ctx, &mut eof_body, true).unwrap_err();
         assert!(
-            output_bytes.is_empty(),
-            "parse error must drop the chunk instead of forwarding it unstripped"
-        );
-        let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();
-        assert!(
-            !output.contains("content_filter_results"),
-            "Azure filter fields must not leak on parse error"
-        );
-        assert!(
-            ctx.get_filter_state::<SseFrameParser>().is_some(),
-            "parser should be retained after a parse error"
+            err.to_string().contains("incomplete SSE frame at end of stream"),
+            "incomplete trailing frame at EOF should return FilterError, got: {err}"
         );
     }
 
@@ -776,10 +797,10 @@ mod tests {
         let split_at = full_bytes.len() / 2;
 
         let mut body1 = Some(Bytes::from(full_bytes[..split_at].to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body1, false);
+        strip_sse_chunk(&mut ctx, &mut body1, false).unwrap();
 
         let mut body2 = Some(Bytes::from(full_bytes[split_at..].to_vec()));
-        strip_sse_chunk(&mut ctx, &mut body2, false);
+        strip_sse_chunk(&mut ctx, &mut body2, false).unwrap();
 
         let bytes2 = body2.unwrap();
         let output = std::str::from_utf8(bytes2.as_ref()).unwrap();
@@ -804,7 +825,7 @@ mod tests {
         );
         let mut body = Some(Bytes::from(chunk.as_bytes().to_vec()));
 
-        strip_sse_chunk(&mut ctx, &mut body, false);
+        strip_sse_chunk(&mut ctx, &mut body, false).unwrap();
 
         let output_bytes = body.unwrap();
         let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();
@@ -832,7 +853,7 @@ mod tests {
         let chunk = "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"content_filter_results\":{\"hate\":{\"filtered\":false}}}]}\n\n";
         let mut body = Some(Bytes::from(chunk.as_bytes().to_vec()));
 
-        strip_sse_chunk(&mut ctx, &mut body, false);
+        strip_sse_chunk(&mut ctx, &mut body, false).unwrap();
 
         let output_bytes = body.unwrap();
         let output = std::str::from_utf8(output_bytes.as_ref()).unwrap();

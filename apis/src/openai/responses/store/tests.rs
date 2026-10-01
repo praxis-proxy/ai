@@ -1101,6 +1101,107 @@ async fn streaming_terminal_frame_persists_before_eos_release() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_local_terminal_persists_before_release_and_only_once() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_local", false).await;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .local_stream_terminal_emitted = true;
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\n\n"));
+    let action = filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "local completion must be durable before release"
+    );
+
+    let mut eos_body = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap());
+    assert_eq!(
+        store.upsert_count(),
+        1,
+        "EOS must not repeat the local completion write"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_local_terminal_at_eos_still_persists() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_local_eos", false).await;
+    ctx.extensions
+        .get_mut::<ResponsesState>()
+        .unwrap()
+        .local_stream_terminal_emitted = true;
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\n\n"));
+    drop(filter.on_response_body(&mut ctx, &mut terminal, true).unwrap());
+    assert_eq!(store.upsert_count(), 1, "an EOS terminal must still be durable");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_error_at_eos_does_not_persist_completed_upstream_snapshot() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_failed_irr", false).await;
+
+    // IRR can retain an upstream `status: completed` snapshot while replacing
+    // its deferred response.completed with a client-visible SSE error. The
+    // inner step's error metadata does not reach this outer filter.
+    let mut error = Some(Bytes::from_static(b"event: error\ndata: {\"type\":\"error\"}\n\n"));
+    let action = filter.on_response_body(&mut ctx, &mut error, false).unwrap();
+    assert!(matches!(action, FilterAction::Release));
+    let mut eos_body = None;
+    drop(filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap());
+    assert_eq!(store.upsert_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_error_after_replay_decoder_overflow_does_not_persist() {
+    let filter = ResponseStoreFilter::with_bounds(NonZeroU32::new(64).unwrap(), NonZeroU64::new(1).unwrap());
+    let store = Arc::new(RecordingResponseStore::new(false));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_overflow_error", false).await;
+
+    // The first client-visible frame exceeds the replay decoder's byte limit.
+    // Its poisoned decoder cannot decode the later error, which can also be
+    // split across response-body callbacks.
+    let created = format!(
+        "event: response.created\ndata: {{\"type\":\"response.created\",\"sequence_number\":0,\"padding\":\"{}\"}}\n\n",
+        "x".repeat(3072)
+    );
+    let mut body = Some(Bytes::from(created));
+    assert!(matches!(
+        filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+        FilterAction::Release
+    ));
+    for part in [b"event: er".as_slice(), b"ror\ndata: {\"type\":\"error\"}\n\n"] {
+        let mut body = Some(Bytes::copy_from_slice(part));
+        assert!(matches!(
+            filter.on_response_body(&mut ctx, &mut body, false).unwrap(),
+            FilterAction::Release
+        ));
+    }
+    drop(filter.on_response_body(&mut ctx, &mut None, true).unwrap());
+    assert_eq!(
+        store.upsert_count(),
+        0,
+        "the hidden completed snapshot must not be persisted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn streaming_terminal_frame_persist_failure_fails_closed() {
     let filter = make_filter();
     let store = Arc::new(RecordingResponseStore::new(true));
@@ -1122,6 +1223,24 @@ async fn streaming_terminal_frame_persist_failure_fails_closed() {
         1,
         "the failing upsert must have been attempted for the terminal frame"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streaming_terminal_fail_open_error_is_not_retried_at_eos() {
+    let filter = make_filter();
+    let store = Arc::new(RecordingResponseStore::new(true));
+    let store_dyn: Arc<dyn PersistedStateBackend> = Arc::<RecordingResponseStore>::clone(&store);
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/responses");
+    let mut ctx = armed_streaming_ctx(&filter, &req, store_dyn, "resp_410_open", true).await;
+
+    let mut terminal = Some(Bytes::from_static(b"event: response.completed\n\n"));
+    assert!(filter.on_response_body(&mut ctx, &mut terminal, false).is_err());
+    // A failure_mode: open pipeline suppresses the error above and delivers
+    // the chunk. EOS must not retry state already consumed by that write.
+    let mut eos_body = None;
+    let eos_action = filter.on_response_body(&mut ctx, &mut eos_body, true).unwrap();
+    assert!(matches!(eos_action, FilterAction::Continue));
+    assert_eq!(store.upsert_count(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
