@@ -17,6 +17,7 @@ on:
       - "store-backends/**"
       - "store-lifecycle/**"
       - "apis/src/openai/responses/**"
+      - "apis/src/openai/translation/**"
       - "apis/src/openai/conversations/**"
       - "apis/src/openai/sse/**"
       - "apis/src/store/**"
@@ -144,6 +145,7 @@ jobs:
             'store-backends/' \
             'store-lifecycle/' \
             'apis/src/openai/responses/' \
+            'apis/src/openai/translation/' \
             'apis/src/openai/conversations/' \
             'apis/src/openai/sse/' \
             'apis/src/store/' \
