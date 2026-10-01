@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Functional coverage for the Anthropic Messages web-search -> Chat Completions
-//! vLLM example config (`anthropic/web-search-to-openai-vllm.yaml`).
+//! Functional coverage for the Chat Completions backend path of the unified
+//! Anthropic Messages full-flow agentic example (`anthropic/full-flow-agentic.yaml`).
 //!
-//! This config combines two transformations in one pipeline:
+//! The example is a protocol-adaptive gateway: the sibling
+//! `anthropic_full_flow_agentic` suite exercises the native Anthropic Messages
+//! backend, and this suite drives the Chat Completions backend, selected by the
+//! `Qwen/Qwen3-8B` model route. On that path the pipeline combines:
 //!
-//!   * the server-owned Anthropic `WebSearch` loop from `full-flow-agentic.yaml`, and
-//!   * the Anthropic <-> Chat Completions translation from `messages-to-openai-vllm.yaml`.
+//!   * the server-owned Anthropic `WebSearch` loop, and
+//!   * the Anthropic <-> Chat Completions translation, gated on the selected upstream's `openai_chat_completions`
+//!     application protocol.
 //!
 //! A client speaks native Anthropic Messages while the model runs on a
 //! Chat-Completions-only vLLM backend. Each round the Anthropic request is
@@ -37,7 +41,7 @@ use praxis_test_utils::{
 };
 use serde_json::{Value, json};
 
-const EXAMPLE: &str = "anthropic/web-search-to-openai-vllm.yaml";
+const EXAMPLE: &str = "anthropic/full-flow-agentic.yaml";
 const TOOL_CALL_ID: &str = "call_web_search_01";
 
 // -----------------------------------------------------------------------------
@@ -84,6 +88,70 @@ fn chat_answer_round(text: &str) -> String {
             "finish_reason": "stop"
         }],
         "usage": {"prompt_tokens": 74, "completion_tokens": 18, "total_tokens": 92}
+    })
+    .to_string()
+}
+
+/// One Server-Sent-Events frame carrying a Chat Completions chunk.
+fn sse_frame(chunk: &Value) -> String {
+    format!("data: {chunk}\n\n")
+}
+
+/// A streaming Chat Completions round that forces a single `WebSearch` function
+/// call, as the SSE chunks a Chat-Completions-only backend emits for
+/// `stream: true`. The streaming translator rebuilds this as an Anthropic
+/// `tool_use` block for `anthropic_web_search` to classify and dispatch.
+fn chat_tool_call_round_sse(call_id: &str, query: &str) -> String {
+    let role = sse_frame(&json!({
+        "id": "chatcmpl-round0", "object": "chat.completion.chunk", "model": "Qwen/Qwen3-8B",
+        "choices": [{"index": 0, "delta": {"role": "assistant"}}]
+    }));
+    let call = sse_frame(&json!({
+        "id": "chatcmpl-round0", "object": "chat.completion.chunk", "model": "Qwen/Qwen3-8B",
+        "choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": 0, "id": call_id, "type": "function",
+            "function": {"name": "WebSearch", "arguments": json!({"query": query}).to_string()}
+        }]}}]
+    }));
+    let finish = sse_frame(&json!({
+        "id": "chatcmpl-round0", "object": "chat.completion.chunk", "model": "Qwen/Qwen3-8B",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+    }));
+    format!("{role}{call}{finish}data: [DONE]\n\n")
+}
+
+/// A terminal streaming Chat Completions round that answers in plain text.
+fn chat_answer_round_sse(text: &str) -> String {
+    let role = sse_frame(&json!({
+        "id": "chatcmpl-round1", "object": "chat.completion.chunk", "model": "Qwen/Qwen3-8B",
+        "choices": [{"index": 0, "delta": {"role": "assistant"}}]
+    }));
+    let content = sse_frame(&json!({
+        "id": "chatcmpl-round1", "object": "chat.completion.chunk", "model": "Qwen/Qwen3-8B",
+        "choices": [{"index": 0, "delta": {"content": text}}]
+    }));
+    let finish = sse_frame(&json!({
+        "id": "chatcmpl-round1", "object": "chat.completion.chunk", "model": "Qwen/Qwen3-8B",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 74, "completion_tokens": 18, "total_tokens": 92}
+    }));
+    format!("{role}{content}{finish}data: [DONE]\n\n")
+}
+
+/// The initial streaming client request: native Anthropic Messages with
+/// `stream: true`, forcing `WebSearch` so the small model reliably opens the loop.
+fn streaming_client_request() -> String {
+    json!({
+        "model": "Qwen/Qwen3-8B",
+        "max_tokens": 512,
+        "stream": true,
+        "messages": [{"role": "user", "content": "Use web search to look up potato, then summarize."}],
+        "tools": [{
+            "name": "WebSearch",
+            "description": "Search the web",
+            "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+        }],
+        "tool_choice": {"type": "tool", "name": "WebSearch"}
     })
     .to_string()
 }
@@ -170,8 +238,10 @@ fn load_config_full(
     translator_max_body_bytes: Option<usize>,
     web_search_max_body_bytes: Option<usize>,
 ) -> praxis_core::config::Config {
-    let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("read web-search-to-openai-vllm example");
-    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8000", model_port)]));
+    let yaml = std::fs::read_to_string(example_config_path(EXAMPLE)).expect("read full-flow-agentic example");
+    // The Chat Completions backend is the second declared cluster, at :8001; the
+    // native Messages cluster at :8000 is never dialed on this path.
+    let yaml = patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:8001", model_port)]));
     let yaml = match translator_max_body_bytes {
         Some(limit) => yaml.replace("max_body_bytes: 1048576", &format!("max_body_bytes: {limit}")),
         None => yaml,
@@ -202,7 +272,7 @@ fn load_config_full(
         "allow_private_endpoints: true",
         "allow_private_endpoints: true\n  allow_private_upstreams: true",
     );
-    praxis_core::config::Config::from_yaml(&yaml).expect("parse web-search-to-openai-vllm example")
+    praxis_core::config::Config::from_yaml(&yaml).expect("parse full-flow-agentic example")
 }
 
 // -----------------------------------------------------------------------------
@@ -520,6 +590,112 @@ fn buffered_expanding_translation_is_rejected_over_web_search_limit() {
         search.request_count(),
         0,
         "the oversized translated round is rejected before any search dispatch"
+    );
+}
+
+#[test]
+fn streaming_web_search_loop_translates_chat_sse_into_one_anthropic_lifecycle() {
+    // Acceptance proof for the streaming Chat Completions path: a `stream: true`
+    // client round forces a `WebSearch` tool call delivered as Chat SSE, the stream
+    // translator rebuilds it as an Anthropic `tool_use` block, `anthropic_web_search`
+    // suppresses that managed round and dispatches Tavily, then the re-entry's
+    // terminal Chat SSE is translated back and streamed to the client as ONE coherent
+    // Anthropic Messages SSE lifecycle. `StatefulCapturingBackend` serves any body
+    // beginning with `data: ` as a chunked `text/event-stream` response.
+    let model = StatefulCapturingBackend::new(vec![
+        (200, chat_tool_call_round_sse(TOOL_CALL_ID, "potato")),
+        (200, chat_answer_round_sse("Potato is a starchy tuber.")),
+    ])
+    .start_with_shutdown();
+    let search = TavilyStub::start(&tavily_results());
+    let proxy_port = free_port();
+    let proxy = start_proxy(&load_config(proxy_port, model.port(), search.port()));
+
+    let raw = http_send(proxy.addr(), &json_post("/v1/messages", &streaming_client_request()));
+
+    assert_eq!(parse_status(&raw), 200, "the streamed loop returns 200: {raw}");
+    let body = parse_body(&raw);
+    // Exactly one client-visible lifecycle spans both rounds: the intermediate
+    // managed search round never leaks a second message_start/message_stop.
+    assert_eq!(
+        body.matches("event: message_start").count(),
+        1,
+        "one message_start spans the whole loop: {body}"
+    );
+    assert_eq!(
+        body.matches("event: message_stop").count(),
+        1,
+        "one message_stop closes the single lifecycle: {body}"
+    );
+    assert_eq!(
+        body.matches("event: message_delta").count(),
+        1,
+        "only the terminal message_delta reaches the client: {body}"
+    );
+    // The terminal answer streams as a text content block.
+    assert!(
+        body.contains("event: content_block_start"),
+        "the terminal text block is forwarded: {body}"
+    );
+    assert!(
+        body.contains("Potato is a starchy tuber."),
+        "the translated terminal answer streams to the client: {body}"
+    );
+    // The managed WebSearch tool_use stays internal to the loop.
+    assert!(
+        !body.contains("WebSearch"),
+        "the managed WebSearch block is suppressed: {body}"
+    );
+    assert!(
+        !body.contains("\"type\":\"tool_use\""),
+        "no tool_use content block reaches the client: {body}"
+    );
+    assert!(!body.contains(TOOL_CALL_ID), "the managed tool id never leaks: {body}");
+
+    // Exactly one body-authenticated Tavily search with the reconstructed query.
+    assert_eq!(search.request_count(), 1, "the streaming loop dispatches one search");
+    let search_body = search.body_json();
+    assert_eq!(
+        search_body["query"], "potato",
+        "the reconstructed query drove the search"
+    );
+    assert_eq!(
+        search_body["api_key"], "test-key",
+        "the Tavily key must travel in the request body"
+    );
+
+    // Two Chat Completions rounds; the first requests streaming transport and the
+    // re-entry appends the translated search result as a Chat `tool` message.
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2, "the managed search re-enters the model exactly once");
+    assert_eq!(
+        requests[0].uri, "/v1/chat/completions",
+        "round 0 hits the Chat endpoint"
+    );
+    assert_eq!(
+        requests[1].uri, "/v1/chat/completions",
+        "round 1 hits the Chat endpoint"
+    );
+    let first: Value = serde_json::from_str(&requests[0].body).expect("round 0 request JSON");
+    assert_eq!(
+        first["stream"], true,
+        "the first model round must request streaming transport: {first}"
+    );
+    let reentry: Value = serde_json::from_str(&requests[1].body).expect("re-entry request JSON");
+    let messages = reentry["messages"].as_array().expect("re-entry Chat messages");
+    let tool_message = messages
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("the re-entry must append a Chat `tool` message for the search result");
+    assert_eq!(
+        tool_message["tool_call_id"], TOOL_CALL_ID,
+        "the tool result must reference the managed call id"
+    );
+    assert!(
+        tool_message["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Potato - Wikipedia")),
+        "the Tavily result must reach the model on re-entry: {tool_message}"
     );
 }
 

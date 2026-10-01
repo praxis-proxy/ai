@@ -256,9 +256,15 @@ struct ResponseEnvelope<'a> {
 /// (`stream: true`) clients: the filter selects the transport per request from
 /// the client's `stream` field, with no operator opt-in.
 ///
+/// The protocol-adaptive example also declares a Chat Completions backend whose
+/// `credential_injection` resolves `VLLM_API_KEY` at pipeline-build time, so both
+/// `WEB_SEARCH_API_KEY` and `VLLM_API_KEY` must be set for the proxy to start —
+/// even for this native-backend demo, which never dials the Chat cluster.
+///
 /// ```yaml
 /// # cargo run -p praxis-test-utils --example anthropic_messages_web_search_mock
-/// # WEB_SEARCH_API_KEY="$WEB_SEARCH_API_KEY" cargo run -p praxis-ai-proxy -- \
+/// # WEB_SEARCH_API_KEY="$WEB_SEARCH_API_KEY" VLLM_API_KEY="$VLLM_API_KEY" \
+/// #   cargo run -p praxis-ai-proxy -- \
 /// #   -c examples/configs/anthropic/full-flow-agentic.yaml
 /// # curl http://127.0.0.1:8080/v1/messages \
 /// #   -H 'content-type: application/json' \

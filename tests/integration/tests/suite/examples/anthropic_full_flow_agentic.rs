@@ -33,8 +33,6 @@ use serde_json::{Value, json};
 
 const EXAMPLE: &str = "anthropic/full-flow-agentic.yaml";
 const TOOL_USE_ID: &str = "toolu_web_search_01";
-const USER_SEARCH_HEADER: &str = "x-user-you-key";
-const USER_SEARCH_CREDENTIAL: &str = "test-user-search-key";
 
 // -----------------------------------------------------------------------------
 // SSE builders (native Anthropic Messages lifecycle)
@@ -159,11 +157,17 @@ fn answer_round(id: &str, text: &str, output_tokens: u64) -> String {
 
 /// The buffered non-streaming web-search fixture (initial request, model rounds,
 /// and search response).
+///
+/// The shared fixture carries a You.com-shaped `search_response` consumed by other
+/// suites; this example runs the Tavily provider, so override that field with the
+/// Tavily wire shape without mutating the shared JSON on disk.
 fn fixture() -> Value {
-    serde_json::from_str(include_str!(
+    let mut fixture: Value = serde_json::from_str(include_str!(
         "../../../fixtures/anthropic/messages/web_search_nonstreaming.json"
     ))
-    .expect("parse web-search fixture")
+    .expect("parse web-search fixture");
+    fixture["search_response"] = search_results();
+    fixture
 }
 
 /// The initial client request with a `WebSearch` tool and `stream: true`.
@@ -182,17 +186,14 @@ fn streaming_request() -> String {
     .to_string()
 }
 
-/// A You.com-shaped search response body.
+/// A Tavily-shaped search response body (`results[].{title,url,content}`).
 fn search_results() -> Value {
     json!({
-        "results": {
-            "web": [{
-                "title": "Potato - Wikipedia",
-                "url": "https://en.wikipedia.org/wiki/Potato",
-                "description": "The potato is a starchy tuber native to the Americas."
-            }],
-            "news": []
-        }
+        "results": [{
+            "title": "Potato - Wikipedia",
+            "url": "https://en.wikipedia.org/wiki/Potato",
+            "content": "The potato is a starchy tuber native to the Americas."
+        }]
     })
 }
 
@@ -209,6 +210,10 @@ fn base_example_yaml(proxy_port: u16, model_port: u16, search_port: u16) -> Stri
         "api_key: ${WEB_SEARCH_API_KEY}",
         &format!("api_key: test-key\n                base_url: http://127.0.0.1:{search_port}"),
     );
+    // `credential_injection` resolves its secret at pipeline-build time; repoint the
+    // Chat Completions backend Bearer to a Cargo-provided var so the build succeeds
+    // without `unsafe` `set_var`. The native path never injects it.
+    let yaml = yaml.replace("env_var: VLLM_API_KEY", "env_var: CARGO_PKG_NAME");
     // The provider callout targets a loopback mock, so the executor's SSRF check
     // requires the operator opt-in on the outbound pipeline.
     yaml.replace(
@@ -283,7 +288,7 @@ fn load_config_with_limits(
 }
 
 // -----------------------------------------------------------------------------
-// You.com search stub (serves ordered responses, captures each request)
+// Tavily search stub (serves ordered responses, captures each request)
 // -----------------------------------------------------------------------------
 
 struct SearchStub {
@@ -522,12 +527,6 @@ fn messages_web_search_round_trip_re_enters_the_model() {
 
     let requests = model.requests();
     assert_eq!(requests.len(), 2, "model should receive two Messages requests");
-    assert!(
-        requests
-            .iter()
-            .all(|request| !request.headers.to_ascii_lowercase().contains(USER_SEARCH_HEADER)),
-        "the trusted credential source header must be stripped before inference"
-    );
     assert_eq!(requests[0].uri, "/v1/messages");
     assert_eq!(requests[1].uri, "/v1/messages");
     let second: Value = serde_json::from_str(&requests[1].body).expect("second model request JSON");
@@ -547,9 +546,11 @@ fn messages_web_search_round_trip_re_enters_the_model() {
     );
     assert_eq!(search.request_count(), 1);
     assert_eq!(search.last_json()["query"], "potato");
-    let search_request = search.last_request().to_ascii_lowercase();
-    assert!(search_request.contains("x-api-key: test-user-search-key"));
-    assert!(!search_request.contains("x-api-key: test-key"));
+    assert_eq!(
+        search.last_json()["api_key"],
+        "test-key",
+        "the Tavily key must travel in the request body"
+    );
 }
 
 #[test]
@@ -622,7 +623,6 @@ fn caller_anthropic_headers_are_preserved_across_model_reentry() {
         "/v1/messages",
         &body,
         &[
-            (USER_SEARCH_HEADER, USER_SEARCH_CREDENTIAL),
             ("anthropic-version", "2024-01-01"),
             ("anthropic-beta", "test-beta-2026-01-01"),
         ],
@@ -698,11 +698,11 @@ fn two_sequential_web_searches_retain_ordered_tool_history() {
     ])
     .start_with_shutdown();
     let second_search_response = json!({
-        "results":{"web":[{
+        "results":[{
             "title":"Growing potatoes",
             "url":"https://example.com/growing-potatoes",
-            "description":"Potatoes prefer cool weather and loose soil."
-        }],"news":[]}
+            "content":"Potatoes prefer cool weather and loose soil."
+        }]
     });
     let search = SearchStub::start_many(&[fixture["search_response"].clone(), second_search_response]);
     let proxy_port = free_port();
@@ -772,7 +772,7 @@ fn state_limit_rejects_before_large_search_result_reenters_model() {
     ])
     .start_with_shutdown();
     let mut large_search_response = fixture["search_response"].clone();
-    large_search_response["results"]["web"][0]["description"] = Value::String("x".repeat(40_000));
+    large_search_response["results"][0]["content"] = Value::String("x".repeat(40_000));
     let search = SearchStub::start(&large_search_response);
     let proxy_port = free_port();
     let proxy = start_proxy(&load_config_with_max_state_bytes(
@@ -809,7 +809,7 @@ fn body_limit_rejects_before_large_rebuilt_request_reenters_model() {
     ])
     .start_with_shutdown();
     let mut large_search_response = fixture["search_response"].clone();
-    large_search_response["results"]["web"][0]["description"] = Value::String("x".repeat(40_000));
+    large_search_response["results"][0]["content"] = Value::String("x".repeat(40_000));
     let search = SearchStub::start(&large_search_response);
     let proxy_port = free_port();
     let proxy = start_proxy(&load_config_with_limits(
@@ -1372,7 +1372,7 @@ fn streaming_reentry_body_limit_streams_terminal_error_event() {
     // event instead of truncating or corrupting the open stream.
     let model = StreamingModel::start(vec![search_round("msg_1", TOOL_USE_ID, "potato", 8)]);
     let mut large_search_response = search_results();
-    large_search_response["results"]["web"][0]["description"] = Value::String("x".repeat(40_000));
+    large_search_response["results"][0]["content"] = Value::String("x".repeat(40_000));
     let search = SearchStub::start(&large_search_response);
     let proxy_port = free_port();
     let proxy = start_proxy(&load_config_with_limits(
@@ -1745,5 +1745,5 @@ fn json_post_with_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> S
 }
 
 fn json_post(path: &str, body: &str) -> String {
-    json_post_with_headers(path, body, &[(USER_SEARCH_HEADER, USER_SEARCH_CREDENTIAL)])
+    json_post_with_headers(path, body, &[])
 }

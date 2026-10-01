@@ -8,9 +8,10 @@
 # ///
 """Official Anthropic SDK -> Praxis -> real vLLM hosted web-search acceptance.
 
-Drives the shipped ``anthropic/web-search-to-openai-vllm.yaml`` example — the
-server-owned Anthropic ``WebSearch`` loop translated onto a Chat-Completions-only
-vLLM backend — against a live model in two provider modes:
+Drives the Chat Completions backend path of the shipped
+``anthropic/full-flow-agentic.yaml`` example — the server-owned Anthropic
+``WebSearch`` loop translated onto a Chat-Completions-only vLLM backend — against a
+live model in two provider modes:
 
     * Mode A (``test_web_search_loop_with_stubbed_provider``): a live vLLM model
       with a LOCAL body-authenticated search stub that fabricates a fixed result.
@@ -70,7 +71,10 @@ from anthropic import Anthropic
 
 
 ROOT = Path(__file__).resolve().parents[4]
-CONFIG_PATH = ROOT / "examples/configs/anthropic/web-search-to-openai-vllm.yaml"
+CONFIG_PATH = ROOT / "examples/configs/anthropic/full-flow-agentic.yaml"
+# The example routes this model to the Chat Completions backend; the live model is
+# substituted onto that route so the translation path is exercised end to end.
+CHAT_MODEL_ROUTE = "Qwen/Qwen3-8B"
 STUB_SEARCH_KEY = "test-key"
 TAVILY_UPSTREAM = "https://api.tavily.com/search"
 
@@ -267,22 +271,30 @@ class _TavilyRelay:
 # ---------------------------------------------------------------------------
 
 
-def _write_config(proxy_port: int, authority: str, search_port: int, *, stub_key: bool) -> str:
+def _write_config(proxy_port: int, authority: str, search_port: int, model: str, *, stub_key: bool) -> str:
     """Retarget the shipped example to live vLLM and a loopback search endpoint.
 
     ``stub_key`` swaps the ``${WEB_SEARCH_API_KEY}`` placeholder for a known literal
     (Mode A); otherwise the placeholder is left intact so the real Tavily key is
     resolved from the environment (Mode B). In both modes the provider ``base_url``
     is pointed at ``search_port`` on loopback, so the executor's SSRF opt-in is
-    required.
+    required. The live ``model`` is substituted onto the Chat Completions model route
+    and the Chat Completions backend (:8001) is pointed at the live vLLM authority.
     """
     config = CONFIG_PATH.read_text()
 
     assert config.count('address: "127.0.0.1:8080"') == 1, CONFIG_PATH
     config = config.replace('address: "127.0.0.1:8080"', f'address: "127.0.0.1:{proxy_port}"')
 
-    assert config.count('"127.0.0.1:8000"') == 1, CONFIG_PATH
-    config = config.replace('"127.0.0.1:8000"', f'"{authority}"')
+    # Route the live model to the Chat Completions backend translation path.
+    marker = f'x-praxis-ai-model: "{CHAT_MODEL_ROUTE}"'
+    assert config.count(marker) == 1, CONFIG_PATH
+    config = config.replace(marker, f'x-praxis-ai-model: "{model}"')
+
+    # Point the Chat Completions backend (:8001) at the live vLLM authority; the
+    # native Messages backend (:8000) is never dialed on this path.
+    assert config.count('"127.0.0.1:8001"') == 1, CONFIG_PATH
+    config = config.replace('"127.0.0.1:8001"', f'"{authority}"')
 
     key_line = f"api_key: {STUB_SEARCH_KEY}" if stub_key else "api_key: ${WEB_SEARCH_API_KEY}"
     replaced = config.replace(
@@ -372,7 +384,7 @@ def stubbed_search_stack(request):
     authority, model, backend_key = _live_config()
     search = _TavilyStub().start()
     proxy_port = _free_port()
-    config_path = _write_config(proxy_port, authority, search.port, stub_key=True)
+    config_path = _write_config(proxy_port, authority, search.port, model, stub_key=True)
     proc, log_file, log_path = _start_proxy(config_path, {"VLLM_API_KEY": backend_key})
     started = False
     try:
@@ -407,7 +419,7 @@ def live_tavily_stack(request):
 
     relay = _TavilyRelay().start()
     proxy_port = _free_port()
-    config_path = _write_config(proxy_port, authority, relay.port, stub_key=False)
+    config_path = _write_config(proxy_port, authority, relay.port, model, stub_key=False)
     proc, log_file, log_path = _start_proxy(
         config_path, {"VLLM_API_KEY": backend_key, "WEB_SEARCH_API_KEY": tavily_key}
     )

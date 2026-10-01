@@ -11,7 +11,7 @@ Anthropic Messages hosted web-search integration tests through the official SDK.
 
 Drives the shipped `anthropic/full-flow-agentic.yaml` example — the server-owned
 web-search loop over Praxis core's iterative_request_router — with fully local
-stub backends (a native Anthropic Messages model and a You.com-shaped search
+stub backends (a native Anthropic Messages model and a Tavily-shaped search
 provider). The single example config has no streaming opt-in: the same pipeline
 serves BOTH transports, selected per request from the client's `stream` flag.
 
@@ -47,7 +47,6 @@ import pytest
 from anthropic import Anthropic
 
 CONFIG_PATH = "examples/configs/anthropic/full-flow-agentic.yaml"
-USER_YOU_KEY = "test-user-you-key"
 TOOL_USE_ID = "toolu_web_search_01"
 FINAL_TEXT = "Potato is a starchy tuber native to the Americas."
 
@@ -314,24 +313,31 @@ class _ModelHandler(BaseHTTPRequestHandler):
 
 
 class _SearchHandler(BaseHTTPRequestHandler):
-    """You.com-shaped search provider returning one fixed web result."""
+    """Tavily-shaped body-authenticated search provider returning one web result.
+
+    Tavily takes a POST with the key in the JSON body (`api_key`), so the handler
+    captures the parsed request body and returns the Tavily response shape
+    (`{"results": [{"title", "url", "content"}]}`).
+    """
 
     protocol_version = "HTTP/1.1"
 
-    def do_GET(self):  # noqa: N802 (http.server API)
-        self.server.captured.append({"path": self.path})
+    def do_POST(self):  # noqa: N802 (http.server API)
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b""
+        try:
+            self.server.captured.append(json.loads(raw))
+        except json.JSONDecodeError:
+            self.server.captured.append({})
         body = json.dumps(
             {
-                "results": {
-                    "web": [
-                        {
-                            "title": "Potato - Wikipedia",
-                            "url": "https://en.wikipedia.org/wiki/Potato",
-                            "description": "The potato is a starchy tuber native to the Americas.",
-                        }
-                    ],
-                    "news": [],
-                }
+                "results": [
+                    {
+                        "title": "Potato - Wikipedia",
+                        "url": "https://en.wikipedia.org/wiki/Potato",
+                        "content": "The potato is a starchy tuber native to the Americas.",
+                    }
+                ]
             }
         ).encode()
         # See _ModelHandler: close so no pooled connection is reused across cases.
@@ -342,9 +348,6 @@ class _SearchHandler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
-
-    def do_POST(self):  # noqa: N802 (http.server API)
-        self.do_GET()
 
     def log_message(self, *_args):
         pass
@@ -414,7 +417,10 @@ def web_search_stack(request):
         [binary, "-c", config_path],
         stdout=log_file,
         stderr=subprocess.STDOUT,
-        env={**os.environ, "WEB_SEARCH_API_KEY": "test-key"},
+        # VLLM_API_KEY is resolved at build time by the chat backend's
+        # credential_injection even though this native path never dials that
+        # cluster, so it must be present for the proxy to start.
+        env={**os.environ, "WEB_SEARCH_API_KEY": "test-key", "VLLM_API_KEY": "test-vllm-key"},
     )
     try:
         _wait_for_proxy(proxy_port)
@@ -442,7 +448,6 @@ def anthropic_client(web_search_stack):
     return Anthropic(
         base_url=f"http://127.0.0.1:{web_search_stack['proxy_port']}",
         api_key="test-anthropic-key",
-        default_headers={"x-user-you-key": USER_YOU_KEY},
         max_retries=0,
         timeout=60,
     )
@@ -497,6 +502,9 @@ class TestAnthropicWebSearch:
         assert len(model.requests) == 2, "buffered loop re-enters the model"
         assert len(search.requests) == 1, "buffered loop dispatches one search"
         assert model.requests[0].get("stream") is not True
+        # Tavily is body-authenticated: the configured key travels in the request
+        # body, not a header.
+        assert search.requests[0].get("api_key") == "test-key", search.requests[0]
 
     def test_streaming_web_search_loop(self, anthropic_client, web_search_stack):
         model = web_search_stack["model"]
@@ -541,23 +549,6 @@ class TestAnthropicWebSearch:
         assert len(model.requests) == 2, "streaming loop re-enters the model"
         assert len(search.requests) == 1, "streaming loop dispatches one search"
         assert model.requests[0].get("stream") is True, "the first model round must request streaming transport"
-
-    def test_missing_user_credential_fails_closed(self, web_search_stack):
-        """A request without the per-user provider key is rejected before callout."""
-        from anthropic import AuthenticationError
-
-        client = Anthropic(
-            base_url=f"http://127.0.0.1:{web_search_stack['proxy_port']}",
-            api_key="test-anthropic-key",
-            max_retries=0,
-            timeout=60,
-        )
-        search = web_search_stack["search"]
-        search.requests.clear()
-
-        with pytest.raises(AuthenticationError):
-            client.messages.create(**_messages_kwargs())
-        assert len(search.requests) == 0, "no provider callout without the user credential"
 
 
 if __name__ == "__main__":

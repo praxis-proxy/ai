@@ -20,8 +20,8 @@ pub(crate) mod response;
 use async_trait::async_trait;
 use bytes::Bytes;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SubRequestResponseMode,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, SelectedUpstreamBodyOutcome,
+    SubRequestResponseMode, parse_filter_config,
 };
 use tracing::{debug, warn};
 
@@ -188,7 +188,7 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
         "anthropic_messages_to_chat_completions"
     }
 
-    fn request_body_access(&self) -> BodyAccess {
+    fn selected_upstream_request_body_access(&self) -> BodyAccess {
         BodyAccess::ReadWrite
     }
 
@@ -242,19 +242,17 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
         Ok(FilterAction::Continue)
     }
 
-    async fn on_request_body(
+    async fn on_selected_upstream_request_body(
         &self,
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
-        end_of_stream: bool,
-    ) -> Result<FilterAction, FilterError> {
-        if !end_of_stream {
-            return Ok(FilterAction::Continue);
-        }
-
+    ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
+        // The body is fully buffered post-load-balancer, so this runs only on the
+        // Chat Completions upstream the selected_upstream condition gates to; the
+        // native Anthropic path never reaches it.
         let bytes = match body.as_ref() {
             Some(b) if !b.is_empty() => b.as_ref(),
-            _ => return Ok(FilterAction::Continue),
+            _ => return Ok(SelectedUpstreamBodyOutcome::Continue),
         };
 
         let transformed = match serde_json::from_slice::<serde_json::Value>(bytes) {
@@ -397,9 +395,12 @@ pub(crate) fn client_stop_sequences(ctx: &HttpFilterContext<'_>) -> Vec<String> 
 }
 
 /// Install a translated request body, or reject when translation failed.
-fn transform_request_body(body: &mut Option<Bytes>, transformed: Result<Vec<u8>, String>) -> FilterAction {
+fn transform_request_body(
+    body: &mut Option<Bytes>,
+    transformed: Result<Vec<u8>, String>,
+) -> SelectedUpstreamBodyOutcome {
     let Some(bytes) = body.as_ref() else {
-        return FilterAction::Continue;
+        return SelectedUpstreamBodyOutcome::Continue;
     };
 
     match transformed {
@@ -410,11 +411,11 @@ fn transform_request_body(body: &mut Option<Bytes>, transformed: Result<Vec<u8>,
                 "transformed Anthropic request to Chat Completions-compatible format"
             );
             *body = Some(Bytes::from(transformed));
-            FilterAction::Continue
+            SelectedUpstreamBodyOutcome::Continue
         },
         Err(msg) => {
             warn!(error = msg.as_str(), "failed to transform Anthropic request");
-            FilterAction::Reject(wire::invalid_request_rejection(&msg))
+            SelectedUpstreamBodyOutcome::Reject(wire::invalid_request_rejection(&msg))
         },
     }
 }
@@ -895,12 +896,14 @@ mod tests {
 
     // --- extract_request_metadata ---
 
-    /// Parse a raw body the way `on_request_body` does, for the metadata pass.
+    /// Parse a raw body the way `on_selected_upstream_request_body` does, for the
+    /// metadata pass.
     fn parse(body: &[u8]) -> Option<serde_json::Value> {
         serde_json::from_slice(body).ok()
     }
 
-    /// Translate a raw body the way `on_request_body` does, parse errors included.
+    /// Translate a raw body the way `on_selected_upstream_request_body` does, parse
+    /// errors included.
     fn translate(body: &[u8]) -> Result<Vec<u8>, String> {
         let value: serde_json::Value =
             serde_json::from_slice(body).map_err(|error| format!("invalid JSON: {error}"))?;
@@ -1020,7 +1023,7 @@ mod tests {
         let mut body: Option<Bytes> = None;
         let action = transform_request_body(&mut body, translate(br#"{"model":"claude-opus-4-8"}"#));
 
-        assert!(matches!(action, FilterAction::Continue));
+        assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
         assert!(body.is_none());
     }
 
@@ -1045,7 +1048,7 @@ mod tests {
         let mut body = Some(Bytes::from(raw.to_vec()));
         let action = transform_request_body(&mut body, translate(raw));
 
-        assert!(matches!(action, FilterAction::Continue));
+        assert!(matches!(action, SelectedUpstreamBodyOutcome::Continue));
         assert!(body.is_some());
         let parsed: serde_json::Value = serde_json::from_slice(body.unwrap().as_ref()).unwrap();
         assert_eq!(parsed["messages"][0]["role"], "user");
@@ -1060,7 +1063,7 @@ mod tests {
         let mut body = Some(Bytes::from_static(b"not json"));
         let action = transform_request_body(&mut body, translate(b"not json"));
 
-        let FilterAction::Reject(rejection) = action else {
+        let SelectedUpstreamBodyOutcome::Reject(rejection) = action else {
             panic!("invalid body should produce a rejection");
         };
         let parsed: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
