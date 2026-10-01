@@ -3533,6 +3533,7 @@ dependencies = [
  "http",
  "jsonschema",
  "openssl",
+ "openssl-sys",
  "percent-encoding",
  "praxis-ai-store",
  "praxis-ai-store-backends",

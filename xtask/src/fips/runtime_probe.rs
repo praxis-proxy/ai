@@ -333,11 +333,17 @@ fn status_line(log: &str) -> Result<String, String> {
         "provider=\"openssl\"",
         "provider_fips=true",
         "kernel_fips=Some(true)",
+        "openssl_fips_properties=true",
         "fips_required=true",
     ] {
         if !line.contains(field) {
             return Err(format!("the startup status line lacks {field}: {line}"));
         }
+    }
+    if !line.contains("crypto_policy=Some(\"FIPS") {
+        return Err(format!(
+            "the startup status line must show a FIPS crypto policy: {line}"
+        ));
     }
     Ok(line.trim().to_owned())
 }
@@ -492,10 +498,11 @@ mod tests {
     #[test]
     fn the_status_line_must_report_fips_on_both_signals() {
         let good = "\u{1b}[2m2026-09-24T00:00:00Z\u{1b}[0m INFO praxis::server: installed rustls crypto provider \
-                    provider=\"openssl\" provider_fips=true kernel_fips=Some(true) fips_required=true\n";
+                    provider=\"openssl\" provider_fips=true kernel_fips=Some(true) \
+                    openssl_fips_properties=true crypto_policy=Some(\"FIPS\") fips_required=true\n";
         assert!(status_line(good).is_ok_and(|line| line.contains("kernel_fips=Some(true)")));
         let bad = "installed rustls crypto provider provider=\"openssl\" provider_fips=false kernel_fips=Some(false) \
-                   fips_required=true\n";
+                   openssl_fips_properties=false crypto_policy=Some(\"DEFAULT\") fips_required=true\n";
         let err = status_line(bad).expect_err("not FIPS");
         assert!(err.contains("provider_fips=true"), "{err}");
         assert!(status_line("starting server\n").is_err(), "no line at all");

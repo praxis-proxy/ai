@@ -18,6 +18,7 @@ mod callout_identity;
 pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
+pub mod crypto_readiness;
 pub mod hash;
 pub mod http_hop;
 pub mod json_body;

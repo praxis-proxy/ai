@@ -618,9 +618,10 @@ pub fn fips_blocker(registry: &FilterRegistry) -> Option<String> {
 /// Call it before anything that might build a TLS configuration, including
 /// `--validate` and `--dump`. With `PRAXIS_REQUIRE_FIPS` set the process
 /// refuses to start unless FIPS mode is in effect (the provider reports
-/// FIPS-approved algorithms and the kernel flag is on), naming each missing
-/// signal. It is a check, never a switch: FIPS mode comes from the host, and
-/// praxis-ai never enables a provider on its own.
+/// FIPS-approved algorithms, the kernel flag is on, and the system crypto
+/// policy is FIPS), naming each missing signal. It is a check, never a
+/// switch: FIPS mode comes from the host, and praxis-ai never enables a
+/// provider on its own.
 pub fn install_crypto_provider() {
     praxis_tls::provider::install();
 
@@ -632,23 +633,58 @@ pub fn install_crypto_provider() {
     }
 
     let status = praxis_tls::provider::status();
+    let readiness = praxis_ai_apis::crypto_readiness::CryptoReadiness::check();
     info!(
         provider = status.name,
         provider_fips = status.provider_fips,
         kernel_fips = ?status.kernel_fips,
+        openssl_fips_properties = readiness.openssl_fips_properties,
+        crypto_policy = ?readiness.crypto_policy,
         fips_required = praxis_tls::provider::required(),
         "installed rustls crypto provider"
     );
 
     if praxis_tls::provider::required() {
-        let unmet = status.unmet();
-        if !unmet.is_empty() {
-            fatal(&format!(
-                "{} is set but FIPS mode is not in effect: {}",
-                praxis_tls::provider::REQUIRE_FIPS_ENV,
-                unmet.join("; ")
-            ));
+        enforce_crypto_readiness(&status, &readiness);
+    }
+}
+
+/// Refuse to start when `PRAXIS_REQUIRE_FIPS` is set and the crypto
+/// readiness signals are not all positive.
+fn enforce_crypto_readiness(
+    status: &praxis_tls::provider::Status,
+    readiness: &praxis_ai_apis::crypto_readiness::CryptoReadiness,
+) {
+    let mut unmet: Vec<String> = status.unmet().into_iter().map(str::to_owned).collect();
+
+    if !readiness.openssl_fips_properties && status.provider_fips {
+        unmet.push(
+            "the direct EVP_default_properties_is_fips_enabled check reports false but the \
+             provider reports FIPS-approved algorithms; the OpenSSL state is inconsistent"
+                .to_owned(),
+        );
+    }
+
+    for reason in readiness.unmet() {
+        if reason.contains("crypto policy") && !reason.contains("is absent") {
+            unmet.push(reason);
         }
+    }
+
+    if readiness.unsupported() {
+        tracing::warn!(
+            "crypto readiness: this platform does not support all readiness checks \
+             (crypto-policies or /proc may be absent); FIPS enforcement covers the \
+             OpenSSL provider and kernel flag only"
+        );
+    }
+
+    if !unmet.is_empty() {
+        fatal(&format!(
+            "{} is set but FIPS mode is not in effect: {}",
+            praxis_tls::provider::REQUIRE_FIPS_ENV,
+            unmet.join("; ")
+        ));
     }
 }
 
