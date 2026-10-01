@@ -98,3 +98,12 @@ runs:
         ec2-instance-type: ${{ inputs.instance-type }}
         subnet-id: ${{ inputs.subnet-id }}
         security-group-id: ${{ inputs.security-group-id }}
+
+    - name: Diagnose runner registration failure
+      if: ${{ failure() && steps.start-ec2-runner.outputs.ec2-instance-id != '' }}
+      shell: bash
+      env:
+        INSTANCE_ID: ${{ steps.start-ec2-runner.outputs.ec2-instance-id }}
+        RUNNER_LABEL: ${{ steps.start-ec2-runner.outputs.label }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: bash "$GITHUB_WORKSPACE/.github/scripts/diagnose_ec2_runner.sh"
