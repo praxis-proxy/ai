@@ -3,12 +3,13 @@
 
 //! Functional integration tests for the `guardrails.yaml` example config.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path};
 
 use praxis_test_utils::{
     Backend, BackendGuard, StatefulCapturingBackend, free_port, http_post, http_send, json_post,
     start_backend_with_shutdown, start_proxy, start_stateful_backend,
 };
+use tempfile::TempDir;
 
 use super::load_example_config;
 
@@ -36,7 +37,7 @@ fn nemo_guardrails_forwards_to_backend() {
     )])
     .start_with_shutdown();
     let proxy_port = free_port();
-    let config = load_example_config(
+    let (_token_dir, config) = load_authenticated_example_config(
         "nemo-guardrails.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", nemo.port())]),
@@ -117,7 +118,7 @@ fn nemo_guardrails_callout_runs_outbound_chain() {
     let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"safe"}"#.to_owned())])
         .start_with_shutdown();
     let proxy_port = free_port();
-    let config = load_example_config(
+    let (_token_dir, config) = load_authenticated_example_config(
         "nemo-guardrails.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", nemo.port())]),
@@ -145,12 +146,82 @@ fn nemo_guardrails_callout_runs_outbound_chain() {
             .any(|line| line.to_ascii_lowercase().starts_with("x-request-id: ")),
         "outbound chain should run request_id for the callout"
     );
-    assert!(!requests[0].headers.to_ascii_lowercase().contains("authorization:"));
+    assert!(
+        requests[0]
+            .headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Authorization: Bearer sa-jwt")),
+        "outbound chain should overwrite Authorization with the service account token: {}",
+        requests[0].headers
+    );
+    assert!(
+        !requests[0].headers.contains("client-secret"),
+        "the client's Authorization header must not reach NeMo"
+    );
     assert!(!requests[0].headers.to_ascii_lowercase().contains("x-client-secret:"));
     assert_eq!(requests[0].method, "POST");
     assert_eq!(requests[0].uri, "/v1/checks");
     let payload: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
     assert_eq!(payload["guardrails"]["rail_types"], serde_json::json!(["input"]));
+}
+
+/// `service_account_token` re-reads the token file on every callout, so a
+/// Kubernetes-style atomic-rename rotation of the token must be
+/// observed on the very next request, with no config reload or restart.
+#[test]
+fn nemo_guardrails_service_account_token_rotation_is_observed_without_reload() {
+    let (_token_dir, token_path) = write_token_file("token-a\n");
+    let backend = start_backend_with_shutdown("ok");
+    let nemo = StatefulCapturingBackend::new(vec![
+        (200, r#"{"status":"passed","content":"first"}"#.to_owned()),
+        (200, r#"{"status":"passed","content":"second"}"#.to_owned()),
+    ])
+    .start_with_shutdown();
+    let proxy_port = free_port();
+    let mut config = load_example_config(
+        "nemo-guardrails.yaml",
+        proxy_port,
+        HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", nemo.port())]),
+    );
+    set_token_file(&mut config, &token_path);
+    let proxy = start_proxy(&config);
+
+    let (status, _) = http_post(
+        proxy.addr(),
+        "/v1/checks",
+        r#"{"model":"test","messages":[{"role":"user","content":"first"}]}"#,
+    );
+    assert_eq!(status, 200);
+
+    // Kubernetes rotates a token via an atomic rename; mirror
+    // that here instead of an in-place write.
+    let replacement = token_path.with_extension("next");
+    std::fs::write(&replacement, "token-b\n").unwrap();
+    std::fs::rename(&replacement, &token_path).unwrap();
+
+    let (status, _) = http_post(
+        proxy.addr(),
+        "/v1/checks",
+        r#"{"model":"test","messages":[{"role":"user","content":"second"}]}"#,
+    );
+    assert_eq!(status, 200);
+
+    let requests = nemo.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[0]
+            .headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Authorization: Bearer token-a")),
+        "first callout must use the token present at construction time"
+    );
+    assert!(
+        requests[1]
+            .headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Authorization: Bearer token-b")),
+        "second callout must observe the rotated token without a config reload"
+    );
 }
 
 #[test]
@@ -162,7 +233,7 @@ fn nemo_guardrails_response_phase_runs_outbound_chain() {
     let nemo = StatefulCapturingBackend::new(vec![(200, r#"{"status":"passed","content":"safe"}"#.to_owned())])
         .start_with_shutdown();
     let proxy_port = free_port();
-    let config = load_example_config(
+    let (_token_dir, config) = load_authenticated_example_config(
         "nemo-guardrails-response.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", nemo.port())]),
@@ -201,7 +272,7 @@ fn nemo_guardrails_checks_each_user_turn_with_cumulative_history() {
     ])
     .start_with_shutdown();
     let proxy_port = free_port();
-    let config = load_example_config(
+    let (_token_dir, config) = load_authenticated_example_config(
         "nemo-guardrails.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", nemo.port())]),
@@ -232,7 +303,7 @@ fn nemo_guardrails_block_rejects_with_403() {
     let backend = start_backend_with_shutdown("ok");
     let nemo = nemo_mock(r#"{"status":"blocked","content":"blocked","rail":"jailbreak"}"#);
     let proxy_port = free_port();
-    let config = load_example_config(
+    let (_token_dir, config) = load_authenticated_example_config(
         "nemo-guardrails.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", nemo.port())]),
@@ -259,7 +330,7 @@ fn nemo_guardrails_unknown_status_does_not_forward() {
     let backend = start_backend_with_shutdown("ok");
     let nemo = nemo_mock(r#"{"status":"error","content":""}"#);
     let proxy_port = free_port();
-    let config = load_example_config(
+    let (_token_dir, config) = load_authenticated_example_config(
         "nemo-guardrails.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", nemo.port())]),
@@ -285,7 +356,7 @@ fn nemo_guardrails_provider_down_does_not_forward() {
     let backend = start_backend_with_shutdown("ok");
     let dead_port = free_port();
     let proxy_port = free_port();
-    let config = load_example_config(
+    let (_token_dir, config) = load_authenticated_example_config(
         "nemo-guardrails.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", dead_port)]),
@@ -313,7 +384,7 @@ fn nemo_guardrails_oversized_provider_response_fails_closed() {
     );
     let nemo = start_stateful_backend(vec![(200, oversized)]);
     let proxy_port = free_port();
-    let config = load_example_config(
+    let (_token_dir, config) = load_authenticated_example_config(
         "nemo-guardrails.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", nemo.port())]),
@@ -333,7 +404,7 @@ fn nemo_guardrails_private_endpoint_requires_global_opt_in() {
     let backend = start_backend_with_shutdown("ok");
     let nemo = nemo_mock(r#"{"status":"passed","content":"safe"}"#);
     let proxy_port = free_port();
-    let mut config = load_example_config(
+    let (_token_dir, mut config) = load_authenticated_example_config(
         "nemo-guardrails.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", nemo.port())]),
@@ -361,7 +432,7 @@ fn nemo_guardrails_invalid_json_body_does_not_forward() {
     let backend = start_backend_with_shutdown("ok");
     let dead_port = free_port();
     let proxy_port = free_port();
-    let config = load_example_config(
+    let (_token_dir, config) = load_authenticated_example_config(
         "nemo-guardrails.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", dead_port)]),
@@ -381,7 +452,7 @@ fn nemo_guardrails_missing_messages_key_does_not_forward() {
     let backend = start_backend_with_shutdown("ok");
     let dead_port = free_port();
     let proxy_port = free_port();
-    let config = load_example_config(
+    let (_token_dir, config) = load_authenticated_example_config(
         "nemo-guardrails.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", dead_port)]),
@@ -402,7 +473,7 @@ fn nemo_guardrails_messages_not_array_does_not_forward() {
     let backend = start_backend_with_shutdown("ok");
     let dead_port = free_port();
     let proxy_port = free_port();
-    let config = load_example_config(
+    let (_token_dir, config) = load_authenticated_example_config(
         "nemo-guardrails.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend.port()), ("127.0.0.1:3001", dead_port)]),
@@ -427,4 +498,56 @@ fn nemo_mock(body: &'static str) -> BackendGuard {
     Backend::status(200, body)
         .header("Content-Type", "application/json")
         .start_with_shutdown()
+}
+
+/// Write a `service_account_token` token file with the given contents.
+///
+/// Returns the owning [`TempDir`] alongside the token path; keep the
+/// `TempDir` alive for as long as the token file needs to exist (dropping
+/// it removes the directory).
+///
+/// Shared with `guardrails_response.rs`, which also exercises the
+/// `nemo-outbound` chain's `service_account_token` filter.
+pub(super) fn write_token_file(contents: &str) -> (TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("create tempdir for service account token");
+    let path = dir.path().join("token");
+    std::fs::write(&path, contents).expect("write service account token file");
+    (dir, path)
+}
+
+/// Point the example's `nemo-outbound` chain's `service_account_token`
+/// filter at a token file under the caller's control.
+pub(super) fn set_token_file(config: &mut praxis_core::config::Config, path: &Path) {
+    let outbound = config
+        .filter_chains
+        .iter_mut()
+        .find(|chain| chain.name == "nemo-outbound")
+        .expect("example should define the nemo-outbound chain");
+    let filter = outbound
+        .filters
+        .iter_mut()
+        .find(|entry| entry.filter_type == "service_account_token")
+        .expect("example should configure service_account_token on the outbound chain");
+    filter
+        .config
+        .as_mapping_mut()
+        .expect("service_account_token config should be a mapping")
+        .insert(
+            serde_yaml::Value::from("token_file"),
+            serde_yaml::Value::from(path.to_str().expect("tempdir path must be valid UTF-8")),
+        );
+}
+
+/// Load an example config and point its `service_account_token` filter at a
+/// freshly written token file, so `start_proxy` can build the `nemo-outbound`
+/// chain. Keep the returned [`TempDir`] alive for the duration of the test.
+fn load_authenticated_example_config(
+    filename: &str,
+    listener_port: u16,
+    port_map: HashMap<&str, u16>,
+) -> (TempDir, praxis_core::config::Config) {
+    let (token_dir, token_path) = write_token_file("sa-jwt\n");
+    let mut config = load_example_config(filename, listener_port, port_map);
+    set_token_file(&mut config, &token_path);
+    (token_dir, config)
 }
