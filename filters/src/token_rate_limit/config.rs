@@ -97,14 +97,15 @@ use serde::Deserialize;
 /// beyond "some key had this much left". A replica that stops seeing
 /// traffic for a rule keeps exporting its last observation until it does.
 ///
-/// The `valkey` backend keeps sliding-window usage in 60 fixed
-/// sub-windows per window (one per second for windows under a minute);
-/// usage leaves the window up to one sub-window late, never early. Changing
-/// a window's length changes its sub-window width and so starts that
-/// window's usage from zero. On the sliding window, concurrent admissions
-/// on one key are not serialised, so they can overshoot the budget by
-/// their combined estimates for one round trip. Usage written is never
-/// lost.
+/// The `valkey` backend requires Valkey or Redis 7.0+ (`GETDEL` and
+/// `PEXPIRE NX`/`GT` are both used). The `valkey` backend keeps
+/// sliding-window usage in 60 fixed sub-windows per window (one per
+/// second for windows under a minute); usage leaves the window up to one
+/// sub-window late, never early. Changing a window's length changes its
+/// sub-window width and so starts that window's usage from zero. On the
+/// sliding window, concurrent admissions on one key are not serialised,
+/// so they can overshoot the budget by their combined estimates for one
+/// round trip. Usage written is never lost.
 ///
 /// The `valkey` token bucket, by contrast, serialises admissions per key
 /// through an optimistic transaction: one key admits at most about one

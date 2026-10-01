@@ -360,11 +360,7 @@ impl ValkeyTokenBucketBackend {
             .arg("last_refill_ms")
             .arg(last_refill_ms)
             .ignore();
-        pipe.cmd("PEXPIRE")
-            .arg(&bucket.key)
-            .arg(self.state_ttl_ms())
-            .arg("GT")
-            .ignore();
+        extend_shared_ttl(pipe, &bucket.key, self.state_ttl_ms());
     }
 
     // -------------------------------------------------------------------------

@@ -336,8 +336,9 @@ impl ValkeySlidingWindowBackend {
         }
     }
 
-    /// The admission decision given `reads` after a pre-charge has been
-    /// applied (counters already include the estimate; pass `estimate = 0`).
+    /// The admission decision for `estimate` tokens given the current window
+    /// `reads`. Two concurrent requests that both read before either charges
+    /// may both be admitted (overshoot bounded by their combined estimates).
     ///
     /// `max_keys` and `max_active_reservations` are enforced without a
     /// distributed lock: two requests on any replica that race past the cap
@@ -413,35 +414,19 @@ impl ValkeySlidingWindowBackend {
         extend_shared_ttl(pipe, &keys, self.state_ttl_ms());
     }
 
-    /// Charge the estimate into the current sub-window counters before
-    /// reading; paired with [`Self::undo_charge`] on denial.
-    async fn pre_charge(&self, prefix: &str, now_ms: u64, estimate: u64) -> Result<(), BackendError> {
-        let mut pipe = redis::pipe();
-        let delta = i64::try_from(estimate).unwrap_or(i64::MAX);
-        self.add_usage_delta(&mut pipe, prefix, now_ms, delta);
-        let () = self.valkey.pipeline(&pipe).await?;
-        Ok(())
-    }
-
-    /// Undo a pre-charge that was denied.
-    async fn undo_charge(&self, prefix: &str, now_ms: u64, estimate: u64) -> Result<(), BackendError> {
-        let mut pipe = redis::pipe();
-        let delta = -(i64::try_from(estimate).unwrap_or(i64::MAX));
-        self.add_usage_delta(&mut pipe, prefix, now_ms, delta);
-        let () = self.valkey.pipeline(&pipe).await?;
-        Ok(())
-    }
-
-    /// Record an admitted reservation in its own key and the two
-    /// namespace-wide deadline zsets, without re-charging the counters
-    /// (the pre-charge already did that).
-    async fn record_reservation(&self, key_id: &str, request: &ReserveRequest) -> Result<u64, BackendError> {
+    /// Charge the estimate and record the reservation atomically.
+    /// Called only on the admit path; two requests that race between the read
+    /// and this write may both be admitted (overshoot bounded by concurrency).
+    async fn admit(&self, key_id: &str, request: &ReserveRequest) -> Result<u64, BackendError> {
+        let prefix = self.key_prefix(key_id);
         let mut seq = redis::pipe();
         seq.cmd("INCR").arg(self.seq_key());
         let (id,): (i64,) = self.valkey.pipeline(&seq).await?;
         let id = amount(id)?;
+        let delta = i64::try_from(request.estimate).unwrap_or(i64::MAX);
         let mut pipe = redis::pipe();
         pipe.atomic();
+        self.add_usage_delta(&mut pipe, &prefix, request.now_ms, delta);
         self.record_active_reservation(&mut pipe, key_id, id, request);
         let () = self.valkey.pipeline(&pipe).await?;
         Ok(id)
@@ -459,7 +444,7 @@ impl ValkeySlidingWindowBackend {
         for width in &self.widths {
             let key = Self::usage_key_at(prefix, width.bucket_ms, bucket_index(admitted_at_ms, width.bucket_ms));
             pipe.cmd("INCRBY").arg(&key).arg(delta).ignore();
-            pipe.cmd("PEXPIRE").arg(&key).arg(width.ttl_ms).arg("GT").ignore();
+            extend_shared_ttl(pipe, &key, width.ttl_ms);
         }
     }
 
@@ -492,47 +477,6 @@ impl ValkeySlidingWindowBackend {
         Ok(())
     }
 
-    /// Decide and record after a pre-charge has been applied. Separated from
-    /// `reserve` to keep both functions within the line-count limit.
-    async fn reserve_after_charge(
-        &self,
-        id: String,
-        prefix: String,
-        request: ReserveRequest,
-        reads: WindowReads,
-    ) -> Result<BackendReserve, BackendError> {
-        let (keys_after, active_after) = (reads.keys, reads.active);
-        // Pass estimate=0: counters already include our charge.
-        match self.decide(&reads, 0, request.now_ms) {
-            Decision::Denied {
-                retry_after_ms,
-                remaining,
-                reason,
-            } => {
-                // Best-effort undo; a failed undo leaves a conservative
-                // over-count that expires with the sub-window TTL.
-                drop(self.undo_charge(&prefix, request.now_ms, request.estimate).await);
-                self.telemetry.record(remaining, active_after, keys_after);
-                Ok(BackendReserve::Denied {
-                    retry_after_ms,
-                    remaining,
-                    reason,
-                })
-            },
-            Decision::Admit { max_usage, remaining } => {
-                let reservation_id = self.record_reservation(&id, &request).await?;
-                let keys_after = keys_after.saturating_add(usize::from(!reads.key_known));
-                self.telemetry
-                    .record(remaining, active_after.saturating_add(1), keys_after);
-                Ok(BackendReserve::Admitted {
-                    reservation_id,
-                    estimate: request.estimate,
-                    usage_after: max_usage,
-                    remaining,
-                })
-            },
-        }
-    }
 }
 
 /// The distinct sub-window widths of `budgets`, each with the longest
@@ -595,18 +539,27 @@ fn next_i64(values: &mut impl Iterator<Item = redis::Value>) -> Result<i64, Back
 
 #[async_trait]
 impl TokenRateLimitStateBackend for ValkeySlidingWindowBackend {
-    #[expect(
-        clippy::large_stack_frames,
-        reason = "async reserve touches pre_charge, read_window, and reserve_after_charge; acceptable depth"
-    )]
     async fn reserve(&self, request: ReserveRequest) -> Result<BackendReserve, BackendError> {
         let id = self.key_id(&request.key);
-        let prefix = self.key_prefix(&id);
-        // Charge first so concurrent requests see each other's estimates
-        // during the read; undo on denial.
-        self.pre_charge(&prefix, request.now_ms, request.estimate).await?;
         let reads = self.read_window(&id, request.now_ms).await?;
-        self.reserve_after_charge(id, prefix, request, reads).await
+        let (keys_after, active_after) = (reads.keys, reads.active);
+        match self.decide(&reads, request.estimate, request.now_ms) {
+            Decision::Denied { retry_after_ms, remaining, reason } => {
+                self.telemetry.record(remaining, active_after, keys_after);
+                Ok(BackendReserve::Denied { retry_after_ms, remaining, reason })
+            },
+            Decision::Admit { max_usage, remaining } => {
+                let reservation_id = self.admit(&id, &request).await?;
+                let keys_after = keys_after.saturating_add(usize::from(!reads.key_known));
+                self.telemetry.record(remaining, active_after.saturating_add(1), keys_after);
+                Ok(BackendReserve::Admitted {
+                    reservation_id,
+                    estimate: request.estimate,
+                    usage_after: max_usage,
+                    remaining,
+                })
+            },
+        }
     }
 
     async fn reconcile(&self, request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
