@@ -135,6 +135,12 @@ and promotes it to a configurable header (default
 `X-Model`). Enables header-based routing to
 provider-specific clusters.
 
+Any client-supplied copy of the header is stripped so
+routing cannot be spoofed. When a trusted hop in front
+of Praxis already sets the header, the opt-in
+`trust_existing_header: true` keeps it and skips the
+body parse instead; the body is still buffered.
+
 ### `openai_responses_format`
 
 Classifies AI API request bodies and promotes format,

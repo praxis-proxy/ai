@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::HeaderName;
 use praxis_filter::{
-    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, builtins::JsonBodyFieldFilter,
-    parse_filter_config,
+    BodyAccess, BodyMode, FilterAction, FilterError, HttpFilter, HttpFilterContext, PendingHeaderResult,
+    builtins::JsonBodyFieldFilter, parse_filter_config,
 };
 use serde::Deserialize;
 
@@ -33,6 +33,18 @@ struct ModelToHeaderConfig {
     /// internal `x-praxis-*` header. Defaults to `X-Model`.
     #[serde(default = "default_header")]
     header: String,
+
+    /// Keep a model header the request already carries and skip the body
+    /// parse. Defaults to `false`.
+    ///
+    /// When `true` and the request already has a single non-empty `header`
+    /// (from the client or from an earlier filter), the filter leaves it as is:
+    /// it is not stripped, the body is not parsed, and nothing is promoted. The
+    /// value is trusted exactly as it arrived and is never compared with the
+    /// body's `model`, so enable this only when a trusted hop in front of
+    /// Praxis sets the header. The body is still buffered.
+    #[serde(default)]
+    trust_existing_header: bool,
 }
 
 /// Default header name.
@@ -50,11 +62,19 @@ fn default_header() -> String {
 /// (for example `llmisvc_model_provider_resolver`) can observe the pending
 /// header in the same `StreamBuffer` pre-read pass.
 ///
+/// With `trust_existing_header: true`, a request that already carries the
+/// header keeps it and skips the body parse. That turns off the anti-spoofing
+/// strip for this filter, so whoever sends the header picks the model: only
+/// enable it when a trusted hop in front of Praxis sets or scrubs the header.
+/// The body is still buffered, because the pipeline fixes its body mode when it
+/// is built, not per request.
+///
 /// # YAML configuration
 ///
 /// ```yaml
 /// filter: model_to_header
-/// header: X-Model   # optional, defaults to X-Model
+/// header: X-Model               # optional, defaults to X-Model
+/// trust_existing_header: false  # optional; true keeps an existing header
 /// ```
 ///
 /// # Example
@@ -73,12 +93,16 @@ pub struct ModelToHeaderFilter {
     /// The promotion-target header this filter owns; a client-supplied copy is
     /// stripped before promotion so routing cannot be spoofed. See #1039.
     header: HeaderName,
+    /// Operator opt-in to keep an existing `header` and skip the body parse,
+    /// which turns off the strip above for requests that carry one.
+    trust_existing_header: bool,
 }
 
 impl ModelToHeaderFilter {
     /// Create from parsed YAML config.
     ///
-    /// Accepts an optional `header` field (defaults to `X-Model`).
+    /// Accepts an optional `header` field (defaults to `X-Model`) and an
+    /// optional `trust_existing_header` flag (defaults to `false`).
     ///
     /// # Errors
     ///
@@ -111,7 +135,11 @@ impl ModelToHeaderFilter {
 
         let inner = JsonBodyFieldFilter::from_config(&serde_yaml::Value::Mapping(inner_config))?;
 
-        Ok(Box::new(Self { inner, header }))
+        Ok(Box::new(Self {
+            inner,
+            header,
+            trust_existing_header: cfg.trust_existing_header,
+        }))
     }
 }
 
@@ -158,6 +186,13 @@ impl HttpFilter for ModelToHeaderFilter {
         if !end_of_stream {
             return Ok(FilterAction::Continue);
         }
+        if self.trust_existing_header && header_already_set(ctx, &self.header) {
+            tracing::debug!(
+                header = %self.header,
+                "model_to_header: keeping existing header and skipping the body parse (trust_existing_header)"
+            );
+            return Ok(FilterAction::Continue);
+        }
         if !ctx.request_headers_to_remove.contains(&self.header) {
             ctx.request_headers_to_remove.push(self.header.clone());
             tracing::debug!(
@@ -179,6 +214,61 @@ impl HttpFilter for ModelToHeaderFilter {
 }
 
 // -----------------------------------------------------------------------------
+// Utilities
+// -----------------------------------------------------------------------------
+
+/// Whether the request already carries a usable `header`, as the upstream
+/// would see it once pending pre-read mutations are applied.
+///
+/// Resolves in the same last-writer-wins order as Praxis's effective-header
+/// view for body-phase conditions: this pass's grouped queues, then the
+/// ordered pre-read log, then the original request. So an earlier filter's
+/// removal hides a client copy, and an earlier filter's value counts even when
+/// the client sent none. Anything ambiguous counts as absent, which falls back
+/// to the stripping path.
+fn header_already_set(ctx: &HttpFilterContext<'_>, header: &HeaderName) -> bool {
+    pending_header_state(ctx, header)
+        .or_else(|| trusted_log_state(ctx, header))
+        .unwrap_or_else(|| original_header_set(ctx, header))
+}
+
+/// Presence per this pass's grouped mutation queues, or `None` when they do
+/// not mention `header`.
+fn pending_header_state(ctx: &HttpFilterContext<'_>, header: &HeaderName) -> Option<bool> {
+    match ctx.pending_header_value(header) {
+        Ok(PendingHeaderResult::Value(value)) => Some(is_usable_value(&value)),
+        Ok(PendingHeaderResult::Removed) | Err(_) => Some(false),
+        Ok(PendingHeaderResult::Absent) => None,
+    }
+}
+
+/// Presence per the ordered pre-read log (earlier passes, then this one), or
+/// `None` when no entry touches `header`.
+fn trusted_log_state(ctx: &HttpFilterContext<'_>, header: &HeaderName) -> Option<bool> {
+    let touched = ctx
+        .prior_pre_read_mutations
+        .iter()
+        .chain(&ctx.pre_read_mutations)
+        .any(|mutation| mutation.matches_header(header));
+
+    touched.then(|| matches!(ctx.resolve_trusted_header(header), Ok(Some(value)) if is_usable_value(&value)))
+}
+
+/// Whether the original request carries exactly one non-blank text `header`.
+fn original_header_set(ctx: &HttpFilterContext<'_>, header: &HeaderName) -> bool {
+    let mut values = ctx.request.headers.get_all(header).iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) => value.to_str().is_ok_and(is_usable_value),
+        _ => false,
+    }
+}
+
+/// Whether a header value has anything in it besides whitespace.
+fn is_usable_value(value: &str) -> bool {
+    !value.trim().is_empty()
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 
@@ -192,7 +282,13 @@ impl HttpFilter for ModelToHeaderFilter {
     reason = "tests"
 )]
 mod tests {
+    use http::HeaderValue;
+    use praxis_filter::TrustedHeaderMutation;
+
     use super::*;
+
+    /// Request body naming a different model than the headers the tests send.
+    const LLAMA_BODY: &[u8] = br#"{"model":"llama-3.2-8b","messages":[]}"#;
 
     #[test]
     fn from_config_default_header() {
@@ -452,5 +548,221 @@ mod tests {
             matches!(action, FilterAction::Continue),
             "on_response_body should delegate to inner and return Continue"
         );
+    }
+
+    #[test]
+    fn config_trust_existing_header_defaults_off() {
+        let cfg: ModelToHeaderConfig = serde_yaml::from_str("header: X-Model").unwrap();
+        assert!(
+            !cfg.trust_existing_header,
+            "trust_existing_header must default to false so the strip stays on"
+        );
+    }
+
+    #[test]
+    fn config_trust_existing_header_parses() {
+        let cfg: ModelToHeaderConfig = serde_yaml::from_str("trust_existing_header: true").unwrap();
+        assert!(cfg.trust_existing_header, "trust_existing_header: true should parse");
+        assert_eq!(cfg.header, DEFAULT_HEADER, "header should keep its default");
+    }
+
+    #[test]
+    fn config_rejects_misspelled_trust_field() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("trust_existing_headers: true").unwrap();
+        let err = ModelToHeaderFilter::from_config(&yaml)
+            .err()
+            .expect("a misspelled field should be rejected");
+        assert!(
+            err.to_string().contains("trust_existing_headers"),
+            "deny_unknown_fields should name the unknown field: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trust_existing_header_keeps_client_header_and_skips_parse() {
+        let filter = trusting_filter();
+        let req = request_with_model_headers(&[b"granite-3.3-8b"]);
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut body = Some(Bytes::from_static(LLAMA_BODY));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(
+            matches!(action, FilterAction::Continue),
+            "a trusted existing header should continue"
+        );
+        assert!(
+            ctx.request_headers_to_remove.is_empty(),
+            "the existing header must not be queued for removal"
+        );
+        assert!(
+            ctx.extra_request_headers.is_empty(),
+            "the body model must not be promoted over the existing header"
+        );
+        assert_eq!(
+            body.as_deref(),
+            Some(LLAMA_BODY),
+            "the body must pass through untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn trust_existing_header_keeps_pending_value_from_earlier_filter() {
+        let filter = trusting_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.request_headers_to_set
+            .push((model_header(), HeaderValue::from_static("granite-3.3-8b")));
+        let mut body = Some(Bytes::from_static(LLAMA_BODY));
+
+        let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(
+            ctx.request_headers_to_remove.is_empty(),
+            "a value an earlier filter set this pass must not be stripped"
+        );
+        assert!(
+            ctx.extra_request_headers.is_empty(),
+            "a value an earlier filter set this pass must not be overridden"
+        );
+    }
+
+    #[tokio::test]
+    async fn trust_existing_header_keeps_value_from_earlier_pass() {
+        let filter = trusting_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.prior_pre_read_mutations
+            .push(TrustedHeaderMutation::Add(model_header(), "granite-3.3-8b".to_owned()));
+        let mut body = Some(Bytes::from_static(LLAMA_BODY));
+
+        let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(
+            ctx.request_headers_to_remove.is_empty(),
+            "a value an earlier pre-read pass promoted must not be stripped"
+        );
+        assert!(
+            ctx.extra_request_headers.is_empty(),
+            "a value an earlier pre-read pass promoted must not be overridden"
+        );
+    }
+
+    #[tokio::test]
+    async fn trust_existing_header_promotes_after_pending_removal() {
+        let filter = trusting_filter();
+        let req = request_with_model_headers(&[b"granite-3.3-8b"]);
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.request_headers_to_remove.push(model_header());
+        let mut body = Some(Bytes::from_static(LLAMA_BODY));
+
+        let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert_promoted_from_body(&ctx, "a header an earlier filter removed this pass is absent");
+    }
+
+    #[tokio::test]
+    async fn trust_existing_header_promotes_after_logged_removal() {
+        let filter = trusting_filter();
+        let req = request_with_model_headers(&[b"granite-3.3-8b"]);
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        ctx.prior_pre_read_mutations
+            .push(TrustedHeaderMutation::Remove(model_header()));
+        let mut body = Some(Bytes::from_static(LLAMA_BODY));
+
+        let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert_promoted_from_body(&ctx, "a header an earlier pre-read pass removed is absent");
+    }
+
+    #[tokio::test]
+    async fn trust_existing_header_promotes_when_header_missing() {
+        let filter = trusting_filter();
+        let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut body = Some(Bytes::from_static(LLAMA_BODY));
+
+        let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert!(
+            matches!(action, FilterAction::BodyDone),
+            "promotion should complete with BodyDone"
+        );
+        assert_promoted_from_body(&ctx, "with no header the body model is promoted");
+    }
+
+    #[tokio::test]
+    async fn trust_existing_header_ignores_unusable_header_values() {
+        let cases: [(&[&[u8]], &str); 4] = [
+            (&[b""], "empty"),
+            (&[b"   "], "whitespace-only"),
+            (&[b"\xff\xfe"], "non-UTF-8"),
+            (&[b"granite-3.3-8b", b"llama-3.2-8b"], "multi-valued"),
+        ];
+        for (values, label) in cases {
+            let filter = trusting_filter();
+            let req = request_with_model_headers(values);
+            let mut ctx = crate::test_utils::make_filter_context(&req);
+            let mut body = Some(Bytes::from_static(LLAMA_BODY));
+
+            let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+            assert_promoted_from_body(&ctx, &format!("a {label} header counts as absent"));
+        }
+    }
+
+    #[tokio::test]
+    async fn trust_existing_header_off_strips_client_header() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("trust_existing_header: false").unwrap();
+        let filter = ModelToHeaderFilter::from_config(&yaml).unwrap();
+        let req = request_with_model_headers(&[b"granite-3.3-8b"]);
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+        let mut body = Some(Bytes::from_static(LLAMA_BODY));
+
+        let _action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+        assert_promoted_from_body(&ctx, "with the knob off a client header is never trusted");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
+
+    /// A filter with `trust_existing_header` on and the default header.
+    fn trusting_filter() -> Box<dyn HttpFilter> {
+        let yaml: serde_yaml::Value = serde_yaml::from_str("trust_existing_header: true").unwrap();
+        ModelToHeaderFilter::from_config(&yaml).unwrap()
+    }
+
+    /// The default promotion header, parsed.
+    fn model_header() -> HeaderName {
+        HeaderName::from_static("x-model")
+    }
+
+    /// A POST carrying one `X-Model` line per entry in `values`.
+    fn request_with_model_headers(values: &[&[u8]]) -> praxis_filter::Request {
+        let mut req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+        for value in values {
+            req.headers
+                .append(model_header(), HeaderValue::from_bytes(value).unwrap());
+        }
+        req
+    }
+
+    /// Assert the filter took the stripping path: the header is queued for
+    /// removal and the body's model is promoted in its place.
+    fn assert_promoted_from_body(ctx: &HttpFilterContext<'_>, why: &str) {
+        assert!(
+            ctx.request_headers_to_remove.contains(&model_header()),
+            "{why}: the header should be queued for removal"
+        );
+        assert_eq!(
+            ctx.extra_request_headers.len(),
+            1,
+            "{why}: the body model should be promoted"
+        );
+        let (name, value) = &ctx.extra_request_headers[0];
+        assert!(name.eq_ignore_ascii_case("x-model"), "{why}: promoted to X-Model");
+        assert_eq!(value, "llama-3.2-8b", "{why}: the promoted value is the body model");
     }
 }

@@ -9,15 +9,19 @@ Promotes the JSON `"model"` field from the request body to a request header.
 
 Promotion is deferred until end-of-stream so a later body-writing filter (for example `llmisvc_model_provider_resolver`) can observe the pending header in the same `StreamBuffer` pre-read pass.
 
+With `trust_existing_header: true`, a request that already carries the header keeps it and skips the body parse. That turns off the anti-spoofing strip for this filter, so whoever sends the header picks the model: only enable it when a trusted hop in front of Praxis sets or scrubs the header. The body is still buffered, because the pipeline fixes its body mode when it is built, not per request.
+
 ## Configuration
 
 | Field | Type | Required | Description |
 |-------|------|---------|-------------|
 | `header` | string | no | Header name for the promoted model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or internal `x-praxis-*` header. Defaults to `X-Model`. |
+| `trust_existing_header` | bool | no | Keep a model header the request already carries and skip the body parse. Defaults to `false`. When `true` and the request already has a single non-empty `header` (from the client or from an earlier filter), the filter leaves it as is: it is not stripped, the body is not parsed, and nothing is promoted. The value is trusted exactly as it arrived and is never compared with the body's `model`, so enable this only when a trusted hop in front of Praxis sets the header. The body is still buffered. |
 
 ## Example
 
 ```yaml
 filter: model_to_header
-header: X-Model   # optional, defaults to X-Model
+header: X-Model               # optional, defaults to X-Model
+trust_existing_header: false  # optional; true keeps an existing header
 ```
