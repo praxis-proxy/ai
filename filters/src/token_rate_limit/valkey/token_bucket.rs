@@ -7,7 +7,7 @@
 //! `WATCH` the bucket hash in the same pipeline that reads it, compute the
 //! refill client-side, and write under `MULTI`/`EXEC`: two round trips per
 //! attempt. An aborted `EXEC` (another writer touched the bucket) is
-//! retried after a short jittered backoff until [`VALKEY_TIMEOUT`] has
+//! retried after a short jittered backoff until [`super::connection::VALKEY_TIMEOUT`] has
 //! passed since the operation started, then the backend fails closed. One
 //! key therefore admits at most about one request per two round trips
 //! across the fleet, and contention costs latency before it costs a 503.
@@ -20,7 +20,7 @@
 //! | `{ns}:v2:tb:{rk}:r:{id}` | string `"estimate\|admitted_at_ms"` | `PX` timeout |
 //! | `{ns}:v2:tb:seq` | integer | none (one key per namespace) |
 //! | `{ns}:v2:tb:active` | zset `"{rk}\|{id}"` scored by deadline | extended only (`NX`, then `GT`) |
-//! | `{ns}:v2:tb:keys` | zset `rk` scored by expiry | extended only (`NX`, then `GT`) |
+//! | `{ns}:v2:tb:keys:{rule_hash}` | zset `rk` scored by expiry | extended only (`NX`, then `GT`) |
 //!
 //! Reserve, on a checked-out connection:
 //!
@@ -58,14 +58,9 @@
 //! too means one that expires between the `GET` and the `EXEC` aborts the
 //! transaction, so an abandoned reservation is never refunded.
 
-use std::{
-    future::Future,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{future::Future, sync::Arc};
 
 use async_trait::async_trait;
-use rand::RngExt as _;
 use redis::aio::MultiplexedConnection;
 
 use super::{
@@ -78,20 +73,9 @@ use super::{
         token_bucket_ledger,
     },
     RuleTelemetry, ValkeyConnection, amount,
-    connection::{VALKEY_TIMEOUT, command_error},
+    connection::{AbortRetry, command_error, unwatch},
     count, extend_shared_ttl, key_hash, parse_reservation,
 };
-
-/// First pause after an aborted `EXEC`; it doubles on every further abort
-/// up to [`MAX_ABORT_BACKOFF`].
-const FIRST_ABORT_BACKOFF: Duration = Duration::from_millis(1);
-
-/// Longest pause between attempts after an aborted `EXEC`. Short against
-/// the [`VALKEY_TIMEOUT`] retry deadline, so a waiting request still gets
-/// many attempts, but long enough for the writer that won to finish. Each
-/// pause is drawn from the upper half of the current backoff so replicas
-/// racing on one key spread out instead of colliding again in lockstep.
-const MAX_ABORT_BACKOFF: Duration = Duration::from_millis(16);
 
 /// Construction parameters for [`ValkeyTokenBucketBackend`].
 pub(in crate::token_rate_limit) struct ValkeyTokenBucketConfig {
@@ -108,7 +92,7 @@ pub(in crate::token_rate_limit) struct ValkeyTokenBucketConfig {
     /// After this long an unsettled reservation stops counting as active
     /// (it stays charged at its estimate).
     pub(in crate::token_rate_limit) reservation_timeout_ms: u64,
-    /// Maximum retained keys per namespace and algorithm.
+    /// Maximum retained keys for this rule.
     pub(in crate::token_rate_limit) max_keys: usize,
     /// Maximum unsettled reservations per namespace and algorithm.
     pub(in crate::token_rate_limit) max_active_reservations: usize,
@@ -169,7 +153,7 @@ struct BucketReads {
     bucket: Bucket,
     /// Namespace-wide unsettled reservations after trimming.
     active: usize,
-    /// Namespace-wide retained keys after trimming.
+    /// This rule's retained keys after trimming.
     keys: usize,
     /// Whether this key is already retained.
     key_known: bool,
@@ -274,9 +258,9 @@ impl ValkeyTokenBucketBackend {
         format!("{}:v2:tb:active", self.namespace)
     }
 
-    /// Namespace-wide retained-key expiry zset.
+    /// Per-rule retained-key expiry zset.
     fn keys_key(&self) -> String {
-        format!("{}:v2:tb:keys", self.namespace)
+        format!("{}:v2:tb:keys:{}", self.namespace, key_hash(&[self.rule.as_bytes()]))
     }
 
     /// Time for an empty bucket to refill, plus the reservation timeout:
@@ -374,7 +358,7 @@ impl ValkeyTokenBucketBackend {
     /// # Errors
     ///
     /// Returns [`BackendError::Unavailable`] on Valkey errors and when
-    /// aborted transactions outlast [`VALKEY_TIMEOUT`].
+    /// aborted transactions outlast [`super::connection::VALKEY_TIMEOUT`].
     #[expect(
         clippy::significant_drop_tightening,
         reason = "transaction.finish() consumes the connection; the lint misidentifies the borrow across .await as a retained drop"
@@ -471,7 +455,8 @@ impl ValkeyTokenBucketBackend {
     /// or `None` to admit. A key refused by `max_keys` has no budget here,
     /// so it reports `0` remaining, as the in-memory ledger does.
     ///
-    /// `max_keys` and `max_active_reservations` are enforced without a
+    /// `max_keys` (per rule) and `max_active_reservations` (per namespace)
+    /// are enforced without a
     /// distributed lock: two requests on any replica that race past the cap
     /// before either increments the shared counter may both be admitted. The
     /// overshoot is bounded by the number of concurrent requests fleet-wide at
@@ -640,62 +625,6 @@ impl ValkeyTokenBucketBackend {
     }
 }
 
-/// `UNWATCH` before handing a connection back without a transaction.
-async fn unwatch(connection: &mut MultiplexedConnection) -> Result<(), BackendError> {
-    redis::cmd("UNWATCH")
-        .exec_async(connection)
-        .await
-        .map_err(|error| command_error(&error))
-}
-
-/// Deadline and backoff for retrying aborted `EXEC`s within one operation.
-struct AbortRetry {
-    /// When the operation started; it fails closed [`VALKEY_TIMEOUT`] later.
-    started: Instant,
-    /// Upper bound of the next pause.
-    backoff: Duration,
-}
-
-impl AbortRetry {
-    /// Start the deadline now.
-    fn start() -> Self {
-        Self {
-            started: Instant::now(),
-            backoff: FIRST_ABORT_BACKOFF,
-        }
-    }
-
-    /// Pause before the next attempt, never past the deadline, and double
-    /// the backoff up to [`MAX_ABORT_BACKOFF`]. The deadline bounds only
-    /// when a new attempt may start: one already under way can add up to
-    /// its own command timeouts.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BackendError::Unavailable`] once [`VALKEY_TIMEOUT`] has
-    /// elapsed since [`Self::start`].
-    async fn pause(&mut self) -> Result<(), BackendError> {
-        let left = VALKEY_TIMEOUT
-            .checked_sub(self.started.elapsed())
-            .filter(|left| !left.is_zero())
-            .ok_or_else(contended)?;
-        tokio::time::sleep(jitter(self.backoff).min(left)).await;
-        self.backoff = self.backoff.saturating_mul(2).min(MAX_ABORT_BACKOFF);
-        Ok(())
-    }
-}
-
-/// A random pause in the upper half of `backoff`.
-fn jitter(backoff: Duration) -> Duration {
-    let upper = u64::try_from(backoff.as_micros()).unwrap_or(u64::MAX);
-    Duration::from_micros(rand::rng().random_range(upper / 2..=upper))
-}
-
-/// The fail-closed error once aborted transactions outlast [`VALKEY_TIMEOUT`].
-fn contended() -> BackendError {
-    BackendError::Unavailable("Valkey token bucket contended".into())
-}
-
 #[async_trait]
 impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
     async fn reserve(&self, request: ReserveRequest) -> Result<BackendReserve, BackendError> {
@@ -761,7 +690,7 @@ mod tests {
                     BackendError, BackendReserve, BackendSettlement, ReconcileRequest, ReserveRequest,
                     TokenRateLimitStateBackend as _,
                 },
-                ledger::Budget,
+                ledger::{Budget, DenialReason},
                 token_bucket_ledger::{MAX_CAPACITY_REFILL_RATE_RATIO_SECS, MAX_F64_SAFE_INTEGER},
             },
             ValkeyConnection, ValkeySlidingWindowBackend, ValkeySlidingWindowConfig,
@@ -1083,6 +1012,47 @@ mod tests {
         assert_eq!(backend.snapshot().active_keys, 2, "two retained keys");
         assert_eq!(backend.snapshot().active_reservations, 2, "two pending reservations");
         drop(backend);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one live test covers both rules and the cap within the second rule"
+    )]
+    async fn live_valkey_bucket_key_cap_is_independent_for_each_rule() {
+        let (Some(mut first), Some(mut second)) = (
+            backend("tb-rule-cap", 100, 1.0, 5_000),
+            backend("tb-rule-cap", 100, 1.0, 5_000),
+        ) else {
+            return;
+        };
+        first.rule = "first".into();
+        second.rule = "second".into();
+        first.max_keys = 1;
+        second.max_keys = 1;
+        first.max_active_reservations = 8;
+        second.max_active_reservations = 8;
+        let now = 1_000_000;
+        assert_ne!(
+            first.keys_key(),
+            second.keys_key(),
+            "the rules need distinct retained-key indexes"
+        );
+        assert!(matches!(
+            first.reserve(reserve("alice", 1, now)).await.unwrap(),
+            BackendReserve::Admitted { .. }
+        ));
+        assert!(matches!(
+            second.reserve(reserve("bob", 1, now)).await.unwrap(),
+            BackendReserve::Admitted { .. }
+        ));
+        assert!(matches!(
+            second.reserve(reserve("carol", 1, now)).await.unwrap(),
+            BackendReserve::Denied {
+                reason: DenialReason::KeyCapacity,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

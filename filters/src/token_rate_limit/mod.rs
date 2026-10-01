@@ -109,7 +109,7 @@ mod weights;
 use std::{
     collections::{BTreeMap, HashSet},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -166,8 +166,7 @@ const META_ESTIMATE: &str = "token_rate_limit.estimate";
 /// The budget key used by the backward-compatible global key mode.
 pub(super) const FALLBACK_KEY: &str = "__fallback__";
 
-/// Bound on distinct budget keys retained at once: per rule on the
-/// in-memory backends, per namespace and algorithm on Valkey.
+/// Bound on distinct budget keys retained at once, per rule on every backend.
 ///
 /// High-cardinality dimensions (header, IP, model, composites) can
 /// create one entry per distinct resolved key. Operators can lower this
@@ -1227,6 +1226,12 @@ pub struct TokenRateLimitFilter {
     /// Compiled budget-key spec (ai#123). Partition every matching
     /// rule's budget by the configured dimensions.
     key_spec: CompiledKeySpec,
+
+    /// In-process ledgers use monotonic elapsed time; Valkey replicas need
+    /// comparable wall-clock timestamps for their shared counters and TTLs.
+    epoch: Instant,
+    /// Whether timestamps must be shared across replicas.
+    valkey_clock: bool,
 }
 
 impl TokenRateLimitFilter {
@@ -1268,20 +1273,26 @@ impl TokenRateLimitFilter {
             rules,
             needs_body,
             key_spec,
+            epoch: Instant::now(),
+            valkey_clock: matches!(backend, BackendResource::Valkey { .. }),
         }))
     }
 
-    /// Current wall-clock time in milliseconds since Unix epoch.
+    /// Current time in milliseconds for the configured backend.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "millis since Unix epoch fit u64 until year ~292 million"
     )]
-    fn now_ms() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64
+    fn now_ms(&self) -> u64 {
+        let millis = if self.valkey_clock {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        } else {
+            self.epoch.elapsed().as_millis()
+        };
+        millis.min(u128::from(u64::MAX)) as u64
     }
 
     /// The first rule (in configured order) whose `match` is satisfied
@@ -1538,7 +1549,7 @@ impl TokenRateLimitFilter {
             key,
             reservation_id,
             actual,
-            now_ms: Self::now_ms(),
+            now_ms: self.now_ms(),
         };
         Some((request, rule))
     }
@@ -1815,7 +1826,7 @@ impl HttpFilter for TokenRateLimitFilter {
         if self.needs_body {
             return Ok(FilterAction::Continue);
         }
-        let now_ms = Self::now_ms();
+        let now_ms = self.now_ms();
         let Some((rule_index, rule)) = self.matching_rule(&ctx.request.headers) else {
             return Ok(FilterAction::Continue);
         };
@@ -1852,7 +1863,7 @@ impl HttpFilter for TokenRateLimitFilter {
         if !end_of_stream || !self.needs_body {
             return Ok(FilterAction::Continue);
         }
-        let now_ms = Self::now_ms();
+        let now_ms = self.now_ms();
         let Some((rule_index, rule)) = self.matching_rule(&ctx.request.headers) else {
             return Ok(FilterAction::Continue);
         };
@@ -2005,6 +2016,26 @@ mod backend_injection_tests {
         record_state_metrics, record_unauthenticated_metric,
     };
 
+    #[test]
+    fn in_process_clock_uses_elapsed_time_and_valkey_clock_uses_unix_time() {
+        let mut filter = TokenRateLimitFilter {
+            rules: Vec::new(),
+            needs_body: false,
+            key_spec: super::CompiledKeySpec::global(),
+            epoch: std::time::Instant::now() - std::time::Duration::from_secs(5),
+            valkey_clock: false,
+        };
+        assert!(
+            (5_000..6_000).contains(&filter.now_ms()),
+            "local ledgers use a monotonic elapsed clock"
+        );
+        filter.valkey_clock = true;
+        assert!(
+            filter.now_ms() > 1_000_000_000_000,
+            "shared Valkey timestamps use Unix time"
+        );
+    }
+
     /// A backend that admits every reservation but always fails to
     /// enqueue its reconciliation -- the one way
     /// [`TokenRateLimitFilter::reconcile`]'s enqueue-failure log line is
@@ -2081,6 +2112,8 @@ mod backend_injection_tests {
             rules: vec![enqueue_always_fails_rule("default")],
             needs_body: false,
             key_spec: super::CompiledKeySpec::global(),
+            epoch: std::time::Instant::now(),
+            valkey_clock: false,
         };
 
         let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");

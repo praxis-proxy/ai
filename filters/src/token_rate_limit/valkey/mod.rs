@@ -10,9 +10,9 @@
 //! overshoot; what is never lost is the usage they write. The token bucket's
 //! refill is a read-modify-write, so it runs under `WATCH`/`MULTI`/`EXEC`.
 //! In both, each reservation lives in its own key that expires with the
-//! reservation timeout, and it is settled exactly once: the sliding window
-//! claims it with `GETDEL`, the token bucket deletes it with `DEL` inside a
-//! transaction that `WATCH` aborts when another settlement got there first.
+//! reservation timeout, and it is settled exactly once: both algorithms
+//! delete it in a transaction that `WATCH` aborts when another settlement
+//! got there first.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -31,8 +31,8 @@ pub(super) use token_bucket::{ValkeyTokenBucketBackend, ValkeyTokenBucketConfig}
 
 /// Last values a rule's Valkey backend observed, published as gauges under
 /// the rule's label. Only `remaining` is the rule's own; `active` and
-/// `keys` are shared by every rule of the same algorithm in the namespace,
-/// so every such rule reports the same value and they aggregate with `max`.
+/// `active` is shared by every rule of the same algorithm in the namespace;
+/// `keys` is scoped to this rule.
 #[derive(Debug, Default)]
 pub(super) struct RuleTelemetry {
     /// Remaining budget for the key this replica last decided.
@@ -40,7 +40,7 @@ pub(super) struct RuleTelemetry {
     /// Active reservations of this namespace and algorithm, after the last
     /// decision.
     active: AtomicUsize,
-    /// Retained keys of this namespace and algorithm, after the last
+    /// Retained keys of this rule, after the last
     /// decision.
     keys: AtomicUsize,
 }

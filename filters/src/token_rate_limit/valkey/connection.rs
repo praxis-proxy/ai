@@ -5,8 +5,12 @@
 //! multiplexed connection for pipelines, and a small pool of dedicated
 //! connections for `WATCH` transactions, which are per-connection state.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
+use rand::RngExt as _;
 use redis::aio::MultiplexedConnection;
 
 use super::super::backend::BackendError;
@@ -22,9 +26,15 @@ pub(super) const VALKEY_TIMEOUT: Duration = Duration::from_millis(500);
 /// connection is one potential failed request after an outage.
 const MAX_IDLE_TRANSACTION_CONNECTIONS: usize = 8;
 
-/// Maximum total transaction connections alive at once (idle + checked out).
-/// Requests block for up to [`VALKEY_TIMEOUT`] for a slot before failing.
+/// Maximum checked-out transaction connections. At most
+/// [`MAX_IDLE_TRANSACTION_CONNECTIONS`] more can be idle. A permit is
+/// released when a connection is returned so waiters can reuse it.
 const MAX_TRANSACTION_CONNECTIONS: usize = 64;
+
+/// Backoff range after an aborted optimistic transaction.
+const FIRST_ABORT_BACKOFF: Duration = Duration::from_millis(1);
+/// Longest pause between retries, short against the overall timeout.
+const MAX_ABORT_BACKOFF: Duration = Duration::from_millis(16);
 
 /// Filter-wide Valkey access, cloned into every Valkey-backed rule.
 ///
@@ -87,16 +97,15 @@ impl ValkeyConnection {
     /// be opened, or when [`MAX_TRANSACTION_CONNECTIONS`] are all in use
     /// and none becomes available within [`VALKEY_TIMEOUT`].
     pub(super) async fn transaction(&self) -> Result<TransactionConnection, BackendError> {
+        let permit = tokio::time::timeout(VALKEY_TIMEOUT, Arc::clone(&self.transactions.semaphore).acquire_owned())
+            .await
+            .map_err(|_elapsed| BackendError::Unavailable("transaction pool exhausted: timeout".into()))?
+            .map_err(|_closed| BackendError::Unavailable("transaction pool closed".into()))?;
         let idle = self.transactions.idle.lock().await.pop();
-        let (connection, permit) = if let Some(PooledConnection { connection, permit }) = idle {
-            (connection, permit)
+        let connection = if let Some(PooledConnection { connection }) = idle {
+            connection
         } else {
-            let permit = tokio::time::timeout(VALKEY_TIMEOUT, Arc::clone(&self.transactions.semaphore).acquire_owned())
-                .await
-                .map_err(|_elapsed| BackendError::Unavailable("transaction pool exhausted: timeout".into()))?
-                .map_err(|_closed| BackendError::Unavailable("transaction pool closed".into()))?;
-            let connection = self.open().await?;
-            (connection, permit)
+            self.open().await?
         };
         Ok(TransactionConnection {
             connection,
@@ -131,12 +140,10 @@ impl ValkeyConnection {
     }
 }
 
-/// An idle connection paired with its semaphore permit.
+/// An idle connection. Only checked-out connections hold semaphore permits.
 struct PooledConnection {
     /// The idle connection ready for reuse.
     connection: MultiplexedConnection,
-    /// Permit held while the connection is alive; released on drop.
-    permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 /// Idle dedicated connections, reused across transactions.
@@ -164,7 +171,7 @@ pub(super) struct TransactionConnection {
     connection: MultiplexedConnection,
     /// Pool to return it to.
     pool: Arc<TransactionConnections>,
-    /// Held while checked out; returned to the pool alongside the connection.
+    /// Held only while checked out; released when the connection is returned.
     permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -184,9 +191,49 @@ impl TransactionConnection {
         } = self;
         let mut idle = pool.idle.lock().await;
         if idle.len() < MAX_IDLE_TRANSACTION_CONNECTIONS {
-            idle.push(PooledConnection { connection, permit });
+            idle.push(PooledConnection { connection });
         }
-        // Both connection and permit drop here when pool is full.
+        drop(idle);
+        drop(permit);
+    }
+}
+
+/// Clear a watch before returning a connection without executing a transaction.
+pub(super) async fn unwatch(connection: &mut MultiplexedConnection) -> Result<(), BackendError> {
+    redis::cmd("UNWATCH")
+        .exec_async(connection)
+        .await
+        .map_err(|error| command_error(&error))
+}
+
+/// Retry aborted optimistic transactions within the Valkey deadline.
+pub(super) struct AbortRetry {
+    /// Monotonic start time for the retry deadline.
+    started: Instant,
+    /// Upper bound of the next jittered pause.
+    backoff: Duration,
+}
+
+impl AbortRetry {
+    /// Start the bounded retry window.
+    pub(super) fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            backoff: FIRST_ABORT_BACKOFF,
+        }
+    }
+
+    /// Pause before another attempt, failing closed once the deadline passes.
+    pub(super) async fn pause(&mut self) -> Result<(), BackendError> {
+        let left = VALKEY_TIMEOUT
+            .checked_sub(self.started.elapsed())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| BackendError::Unavailable("Valkey transaction contended".into()))?;
+        let upper = u64::try_from(self.backoff.as_micros()).unwrap_or(u64::MAX);
+        let jitter = Duration::from_micros(rand::rng().random_range(upper / 2..=upper));
+        tokio::time::sleep(jitter.min(left)).await;
+        self.backoff = self.backoff.saturating_mul(2).min(MAX_ABORT_BACKOFF);
+        Ok(())
     }
 }
 
@@ -255,6 +302,38 @@ mod tests {
         );
         drop(second);
         drop(connection);
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the checked-out connection and spawned waiter are consumed by finish and join"
+    )]
+    async fn live_valkey_waiter_reuses_connection_returned_at_pool_limit() {
+        let Some(url) = valkey_url() else {
+            return;
+        };
+        let mut connection = ValkeyConnection::new(url).unwrap();
+        connection.transactions = Arc::new(super::TransactionConnections {
+            idle: tokio::sync::Mutex::new(Vec::new()),
+            semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        let first = connection.transaction().await.unwrap();
+        let waiting = connection.clone();
+        let waiter = tokio::spawn(async move { waiting.transaction().await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "the sole checkout slot is still held");
+        first.finish().await;
+        let second = tokio::time::timeout(VALKEY_TIMEOUT, waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            connection.transactions.idle.lock().await.is_empty(),
+            "the waiter checked out the returned connection"
+        );
+        drop(second);
     }
 
     #[tokio::test]

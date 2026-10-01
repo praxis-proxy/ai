@@ -7,12 +7,14 @@
 //! counters covering the window with one `MGET`, then charges the current
 //! sub-window with one `INCRBY`. Each reservation lives in its own key
 //! that carries its own `PX reservation_timeout_ms` expiry; reconcile
-//! claims it with one `GETDEL`, the exactly-once settlement guard -- a nil
-//! reply means the reservation was already settled by another reconcile,
+//! watches it before reading, then atomically applies the delta and deletes
+//! it -- a nil reply means the reservation was already settled by another
+//! reconcile,
 //! or was abandoned and has since expired unclaimed, and either way
 //! reconcile is a no-op rather than a stale or duplicate charge. Caps are
 //! deadline-scored zsets trimmed with one range delete; those two zsets
-//! are shared by every rule in a namespace, so their own TTL is only ever
+//! include a namespace-wide active set and a per-rule key set, so their TTL
+//! is only ever
 //! extended (`PEXPIRE ... NX` then `PEXPIRE ... GT`) rather than
 //! overwritten, so a short-window rule's reserve can never shorten a
 //! longer-window rule's still-live entries in the same namespace. No
@@ -27,7 +29,7 @@
 //! | `{ns}:v2:{rk}:r:{id}` | string `"estimate\|admitted_at_ms"` | `PX` timeout |
 //! | `{ns}:v2:seq` | integer | none (one key per namespace) |
 //! | `{ns}:v2:active` | zset `"{rk}\|{id}"` scored by deadline | extended only (`NX`, then `GT`) |
-//! | `{ns}:v2:keys` | zset `rk` scored by expiry | extended only (`NX`, then `GT`) |
+//! | `{ns}:v2:keys:{rule_hash}` | zset `rk` scored by expiry | extended only (`NX`, then `GT`) |
 //!
 //! Counters are keyed by sub-window width, not by budget position, so
 //! adding, removing, or reordering budgets on a reload (or replicas on
@@ -39,6 +41,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use redis::aio::MultiplexedConnection;
 
 use super::{
     super::{
@@ -48,7 +51,9 @@ use super::{
         },
         ledger::{Budget, DenialReason},
     },
-    RuleTelemetry, ValkeyConnection, amount, count, extend_shared_ttl, key_hash, parse_reservation,
+    RuleTelemetry, ValkeyConnection, amount,
+    connection::{AbortRetry, command_error, unwatch},
+    count, extend_shared_ttl, key_hash, parse_reservation,
     window::{BucketRange, bucket_index, bucket_ms, retry_after_ms},
 };
 
@@ -64,7 +69,7 @@ pub(in crate::token_rate_limit) struct ValkeySlidingWindowConfig {
     pub(in crate::token_rate_limit) budgets: Vec<Budget>,
     /// After this long an unsettled reservation stops counting as active.
     pub(in crate::token_rate_limit) reservation_timeout_ms: u64,
-    /// Maximum retained keys per namespace and algorithm.
+    /// Maximum retained keys for this rule.
     pub(in crate::token_rate_limit) max_keys: usize,
     /// Maximum unsettled reservations per namespace and algorithm.
     pub(in crate::token_rate_limit) max_active_reservations: usize,
@@ -114,7 +119,7 @@ struct WindowReads {
     buckets: Vec<Vec<Option<i64>>>,
     /// Namespace-wide unsettled reservations after trimming.
     active: usize,
-    /// Namespace-wide retained keys after trimming.
+    /// This rule's retained keys after trimming.
     keys: usize,
     /// Whether this key is already retained.
     key_known: bool,
@@ -227,12 +232,12 @@ impl ValkeySlidingWindowBackend {
         format!("{}:v2:active", self.namespace)
     }
 
-    /// Namespace-wide retained-key deadline zset.
+    /// Per-rule retained-key deadline zset.
     fn keys_key(&self) -> String {
-        format!("{}:v2:keys", self.namespace)
+        format!("{}:v2:keys:{}", self.namespace, key_hash(&[self.rule.as_bytes()]))
     }
 
-    /// TTL for namespace-wide bookkeeping keys.
+    /// TTL for the bookkeeping keys.
     fn state_ttl_ms(&self) -> u64 {
         self.max_window_ms
             .saturating_add(self.reservation_timeout_ms)
@@ -244,7 +249,7 @@ impl ValkeySlidingWindowBackend {
     // -------------------------------------------------------------------------
 
     /// Build the read pipeline for [`Self::read_window`]: one `MGET` per
-    /// budget covering its window, plus the namespace-wide trims/counts.
+    /// budget covering its window, plus the active and per-rule key caps.
     fn build_read_pipeline(&self, prefix: &str, id: &str, now_ms: u64) -> redis::Pipeline {
         let mut pipe = redis::pipe();
         for budget in &self.budgets {
@@ -323,25 +328,37 @@ impl ValkeySlidingWindowBackend {
                 retry_after_ms: 0,
             };
         }
-        let range = BucketRange::covering(now_ms, budget.window_ms);
-        let oldest = range
-            .indexes()
-            .zip(counters)
-            .find(|(_, value)| value.is_some_and(|v| v > 0))
-            .map_or(range.first, |(index, _)| index);
+        let retry_after_ms = Self::retry_when_enough_usage_expires(counters, budget, now_ms, after);
         BudgetUsage {
             remaining,
             after,
-            retry_after_ms: retry_after_ms(now_ms, budget.window_ms, oldest),
+            retry_after_ms,
         }
+    }
+
+    /// The first expiry that frees enough counted usage for this estimate.
+    fn retry_when_enough_usage_expires(counters: &[Option<i64>], budget: &Budget, now_ms: u64, after: u64) -> u64 {
+        let range = BucketRange::covering(now_ms, budget.window_ms);
+        let needed = after.saturating_sub(budget.capacity);
+        let mut expiring = 0_u64;
+        let mut freeing = range.first;
+        for (index, value) in range.indexes().zip(counters) {
+            expiring = expiring.saturating_add(u64::try_from(value.unwrap_or(0).max(0)).unwrap_or(u64::MAX));
+            freeing = index;
+            if expiring >= needed {
+                break;
+            }
+        }
+        retry_after_ms(now_ms, budget.window_ms, freeing)
     }
 
     /// The admission decision for `estimate` tokens given the current window
     /// `reads`. Two concurrent requests that both read before either charges
     /// may both be admitted (overshoot bounded by their combined estimates).
     ///
-    /// `max_keys` and `max_active_reservations` are enforced without a
-    /// distributed lock: two requests on any replica that race past the cap
+    /// `max_keys` (per rule) and `max_active_reservations` (per namespace)
+    /// are enforced without a distributed lock: two requests on any
+    /// replica that race past the cap
     /// before either increments the shared counter may both be admitted. The
     /// overshoot is bounded by the number of concurrent requests fleet-wide at
     /// the instant the cap is crossed.
@@ -388,7 +405,7 @@ impl ValkeySlidingWindowBackend {
     }
 
     /// Record the reservation itself in its own key and the two
-    /// namespace-wide deadline zsets, extending (never shortening) their
+    /// deadline zsets, extending (never shortening) their
     /// shared TTL.
     fn record_active_reservation(&self, pipe: &mut redis::Pipeline, key_id: &str, id: u64, request: &ReserveRequest) {
         let reservation = Self::reservation_key(&self.key_prefix(key_id), id);
@@ -448,33 +465,81 @@ impl ValkeySlidingWindowBackend {
         }
     }
 
-    /// Apply the settled usage delta and drop the reservation from the
-    /// namespace-wide active-index zset, in one pipeline -- the second
-    /// (and last) round trip of [`Self::reconcile`]. `GETDEL` having
-    /// returned the reservation is already the exactly-once guard, so
-    /// this has no conditional revert. A settle write that fails after
-    /// `GETDEL` claimed the reservation is not applied again: the worker's
-    /// retry finds the reservation gone and records a `Noop`. The delta is
-    /// then lost either way round -- a lost refund keeps the reservation
-    /// charged at its estimate (conservative), a lost overage under-charges
-    /// the window by that overage -- and the active-index member stays
-    /// until its deadline trim.
-    async fn settle(
+    /// Read the reservation under `WATCH`. The same connection executes
+    /// the settlement so an expired or concurrently settled reservation
+    /// aborts `EXEC` instead of applying a stale delta.
+    async fn read_reservation(
+        &self,
+        connection: &mut MultiplexedConnection,
+        reservation: &str,
+    ) -> Result<Option<String>, BackendError> {
+        let mut read = redis::pipe();
+        read.cmd("WATCH").arg(reservation).ignore();
+        read.cmd("GET").arg(reservation);
+        let (value,): (Option<String>,) = read
+            .query_async(connection)
+            .await
+            .map_err(|error| command_error(&error))?;
+        Ok(value)
+    }
+
+    /// Apply the delta and delete the watched reservation in one transaction.
+    /// A lost `EXEC` reply can safely be retried: either all writes happened
+    /// and the next read finds no reservation, or none happened and it can
+    /// still be settled.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "transaction fields are kept explicit at the Valkey write boundary"
+    )]
+    fn settlement_pipeline(
         &self,
         prefix: &str,
+        reservation: &str,
         active_member: &str,
         admitted_at_ms: u64,
         delta: i64,
-    ) -> Result<(), BackendError> {
+    ) -> redis::Pipeline {
         let mut pipe = redis::pipe();
         pipe.atomic();
         self.add_usage_delta(&mut pipe, prefix, admitted_at_ms, delta);
+        pipe.cmd("DEL").arg(reservation).ignore();
         pipe.cmd("ZREM")
             .arg(self.active_index_key())
             .arg(active_member)
             .ignore();
-        let () = self.valkey.pipeline(&pipe).await?;
-        Ok(())
+        pipe
+    }
+
+    /// One settlement attempt; `None` means another writer changed the
+    /// reservation before `EXEC`, so the caller retries within its deadline.
+    async fn reconcile_attempt(
+        &self,
+        connection: &mut MultiplexedConnection,
+        request: &ReconcileRequest,
+    ) -> Result<Option<BackendSettlement>, BackendError> {
+        let id = self.key_id(&request.key);
+        let prefix = self.key_prefix(&id);
+        let reservation = Self::reservation_key(&prefix, request.reservation_id);
+        let Some(value) = self.read_reservation(connection, &reservation).await? else {
+            unwatch(connection).await?;
+            return Ok(Some(BackendSettlement::Noop));
+        };
+        let (estimate, admitted_at_ms) = parse_reservation(&value)?;
+        let actual = request.actual.unwrap_or(estimate);
+        let delta = i64::try_from(actual)
+            .unwrap_or(i64::MAX)
+            .saturating_sub(i64::try_from(estimate).unwrap_or(i64::MAX));
+        let active_member = format!("{id}|{}", request.reservation_id);
+        let pipe = self.settlement_pipeline(&prefix, &reservation, &active_member, admitted_at_ms, delta);
+        let executed: Option<()> = pipe
+            .query_async(connection)
+            .await
+            .map_err(|error| command_error(&error))?;
+        Ok(executed.map(|()| BackendSettlement::Applied {
+            actual,
+            refund: estimate.saturating_sub(actual),
+            overage: actual.saturating_sub(estimate),
+        }))
     }
 }
 
@@ -570,29 +635,21 @@ impl TokenRateLimitStateBackend for ValkeySlidingWindowBackend {
         }
     }
 
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "transaction.finish() consumes the connection after the borrowed attempt"
+    )]
     async fn reconcile(&self, request: ReconcileRequest) -> Result<BackendSettlement, BackendError> {
-        let id = self.key_id(&request.key);
-        let prefix = self.key_prefix(&id);
-        let mut claim = redis::pipe();
-        claim
-            .cmd("GETDEL")
-            .arg(Self::reservation_key(&prefix, request.reservation_id));
-        let (value,): (Option<String>,) = self.valkey.pipeline(&claim).await?;
-        let Some(value) = value else {
-            return Ok(BackendSettlement::Noop);
-        };
-        let (estimate, admitted_at_ms) = parse_reservation(&value)?;
-        let actual = request.actual.unwrap_or(estimate);
-        let delta = i64::try_from(actual)
-            .unwrap_or(i64::MAX)
-            .saturating_sub(i64::try_from(estimate).unwrap_or(i64::MAX));
-        let active_member = format!("{id}|{}", request.reservation_id);
-        self.settle(&prefix, &active_member, admitted_at_ms, delta).await?;
-        Ok(BackendSettlement::Applied {
-            actual,
-            refund: estimate.saturating_sub(actual),
-            overage: actual.saturating_sub(estimate),
-        })
+        let mut retry = AbortRetry::start();
+        loop {
+            let mut transaction = self.valkey.transaction().await?;
+            let outcome = self.reconcile_attempt(transaction.inner(), &request).await?;
+            transaction.finish().await;
+            if let Some(settlement) = outcome {
+                return Ok(settlement);
+            }
+            retry.pause().await?;
+        }
     }
 
     fn enqueue_reconcile(&self, request: ReconcileRequest) -> Result<(), BackendError> {
@@ -637,7 +694,8 @@ mod tests {
             },
             ValkeyConnection,
         },
-        CounterWidth, ValkeySlidingWindowBackend, ValkeySlidingWindowConfig, counter_widths,
+        BucketRange, CounterWidth, DenialReason, ValkeySlidingWindowBackend, ValkeySlidingWindowConfig, counter_widths,
+        retry_after_ms,
     };
     use crate::token_rate_limit::ledger::Budget;
 
@@ -760,6 +818,68 @@ mod tests {
             }],
             "a 60 s and a 30 s window share one-second counters that outlive the 60 s window"
         );
+    }
+
+    #[test]
+    fn retry_waits_until_enough_sub_windows_expire_for_the_estimate() {
+        let now = 1_000_000;
+        let budget = Budget {
+            window_ms: 60_000,
+            capacity: 100,
+        };
+        let range = BucketRange::covering(now, budget.window_ms);
+        let mut counters = vec![None; range.count];
+        *counters.get_mut(0).unwrap() = Some(20);
+        *counters.get_mut(1).unwrap() = Some(50);
+        let usage = ValkeySlidingWindowBackend::evaluate_budget(&counters, &budget, 80, now);
+        assert_eq!(usage.remaining, 30);
+        assert_eq!(
+            usage.retry_after_ms,
+            retry_after_ms(now, budget.window_ms, range.first + 1)
+        );
+        assert!(
+            usage.retry_after_ms > retry_after_ms(now, budget.window_ms, range.first),
+            "the oldest 20 tokens alone do not make room for an 80-token estimate"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one live test covers both rules and the cap within the second rule"
+    )]
+    async fn live_valkey_key_cap_is_independent_for_each_rule() {
+        let (Some(mut first), Some(mut second)) = (
+            backend_with("sw-rule-cap", "first", one_budget(60_000), 5_000),
+            backend_with("sw-rule-cap", "second", one_budget(60_000), 5_000),
+        ) else {
+            return;
+        };
+        first.max_keys = 1;
+        second.max_keys = 1;
+        first.max_active_reservations = 8;
+        second.max_active_reservations = 8;
+        let now = 1_000_000;
+        assert_ne!(
+            first.keys_key(),
+            second.keys_key(),
+            "the rules need distinct retained-key indexes"
+        );
+        assert!(matches!(
+            first.reserve(reserve("alice", 1, now)).await.unwrap(),
+            BackendReserve::Admitted { .. }
+        ));
+        assert!(matches!(
+            second.reserve(reserve("bob", 1, now)).await.unwrap(),
+            BackendReserve::Admitted { .. }
+        ));
+        assert!(matches!(
+            second.reserve(reserve("carol", 1, now)).await.unwrap(),
+            BackendReserve::Denied {
+                reason: DenialReason::KeyCapacity,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -952,6 +1072,68 @@ mod tests {
             panic!("40 used, 60 fits exactly");
         };
         assert_eq!(remaining, 0, "100 - 40 - 60");
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the fault injection and retry assertions form one transaction scenario"
+    )]
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the transaction is consumed by finish after the aborted EXEC"
+    )]
+    async fn live_valkey_aborted_settlement_keeps_reservation_and_usage_for_retry() {
+        let Some(backend) = backend("sw-aborted-settle", 100, 60_000, 5_000) else {
+            return;
+        };
+        let now = 1_000_000;
+        let BackendReserve::Admitted { reservation_id, .. } = backend.reserve(reserve("alice", 10, now)).await.unwrap()
+        else {
+            panic!("admitted");
+        };
+        let id = backend.key_id("alice");
+        let prefix = backend.key_prefix(&id);
+        let reservation = ValkeySlidingWindowBackend::reservation_key(&prefix, reservation_id);
+        let mut transaction = backend.valkey.transaction().await.unwrap();
+        let value = backend
+            .read_reservation(transaction.inner(), &reservation)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut concurrent = redis::pipe();
+        concurrent
+            .cmd("SET")
+            .arg(&reservation)
+            .arg(&value)
+            .arg("PX")
+            .arg(5_000)
+            .ignore();
+        let () = backend.valkey.pipeline(&concurrent).await.unwrap();
+        let member = format!("{id}|{reservation_id}");
+        let pipe = backend.settlement_pipeline(&prefix, &reservation, &member, now, 40);
+        let executed: Option<()> = pipe.query_async(transaction.inner()).await.unwrap();
+        assert!(executed.is_none(), "a changed reservation aborts the whole settlement");
+        transaction.finish().await;
+        assert_eq!(
+            counter_value(&backend, &backend.usage_key("alice", 60_000, now)).await,
+            10
+        );
+        assert_eq!(
+            backend
+                .reconcile(reconcile("alice", reservation_id, 50, now + 1))
+                .await
+                .unwrap(),
+            BackendSettlement::Applied {
+                actual: 50,
+                refund: 0,
+                overage: 40
+            }
+        );
+        assert_eq!(
+            counter_value(&backend, &backend.usage_key("alice", 60_000, now)).await,
+            50
+        );
     }
 
     #[tokio::test]

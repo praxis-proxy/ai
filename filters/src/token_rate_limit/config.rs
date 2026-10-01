@@ -85,20 +85,19 @@ use serde::Deserialize;
 ///
 /// Gauge scope depends on the backend. With the `memory` backend every
 /// gauge describes this process only, so aggregate replicas with `sum`.
-/// With the `valkey` backend, `reservations_active` and `active_keys`, like
-/// the `max_keys` and `max_active_reservations` caps they report on, are
-/// scoped to the namespace and algorithm, not to the rule: every rule of
-/// one algorithm sharing a namespace reports the same value, so summing
-/// over `rule` double-counts. Each replica exports the value it last
-/// observed from the shared store, so aggregate with `max`, across
-/// replicas and across rules. `budget_remaining` stays per replica and per
+/// With the `valkey` backend, `reservations_active` is scoped to the
+/// namespace and algorithm, so summing it over rules double-counts;
+/// aggregate with `max` across replicas and rules. `active_keys` is scoped
+/// per rule, so aggregate with `max` across replicas for each rule.
+/// Each replica exports the value it last observed from the shared store.
+/// `budget_remaining` stays per replica and per
 /// last decision on either backend: it describes whichever key that
 /// replica decided last, so `max` or `sum` across replicas says little
 /// beyond "some key had this much left". A replica that stops seeing
 /// traffic for a rule keeps exporting its last observation until it does.
 ///
-/// The `valkey` backend requires Valkey or Redis 7.0+ (`GETDEL` and
-/// `PEXPIRE NX`/`GT` are both used). The `valkey` backend keeps
+/// The `valkey` backend requires Valkey or Redis 7.0+ (`PEXPIRE NX`/`GT`
+/// is used). The `valkey` backend keeps
 /// sliding-window usage in 60 fixed sub-windows per window (one per
 /// second for windows under a minute); usage leaves the window up to one
 /// sub-window late, never early. Changing a window's length changes its
@@ -168,8 +167,8 @@ pub(super) struct TokenRateLimitConfig {
     /// rather than growing without bound.
     ///
     /// In-process ledgers enforce the cap per rule. Valkey enforces it
-    /// against the per-rule retained-key set (`{namespace}:v1:rule:{hash}:keys`,
-    /// or the token-bucket equivalent), not the namespace-wide set.
+    /// against the per-rule retained-key set (`{namespace}:v2:keys:{rule_hash}`,
+    /// or the token-bucket equivalent).
     /// Idle in-process keys are reaped by ledger cleanup, which walks a
     /// bounded number of entries per request (including busy ones) so a
     /// single in-window key cannot pin the table at this cap.
