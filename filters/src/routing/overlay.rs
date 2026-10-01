@@ -1821,6 +1821,55 @@ mod tests {
     }
 
     #[test]
+    fn weighted_reload_applies_new_weights_with_new_overlay_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        let first = make_weighted_envelope_json([70, 30]);
+        let initial = RouteSnapshot::from_overlay(first.as_bytes()).unwrap();
+        let initial_revision = initial.semantic_revision.as_deref().map(str::to_owned);
+        let snapshot = Arc::new(ArcSwap::from_pointee(initial));
+
+        let updated = make_weighted_envelope_json([25, 75]);
+        std::fs::write(&path, updated).unwrap();
+        handle_overlay_reload(&path, &snapshot, None);
+
+        assert_weighted_snapshot_weights(&snapshot, initial_revision.as_deref(), [25, 75]);
+    }
+
+    fn assert_weighted_snapshot_weights(
+        snapshot: &ArcSwap<RouteSnapshot>,
+        previous_revision: Option<&str>,
+        expected: [u32; 2],
+    ) {
+        let serving = snapshot.load();
+        assert_ne!(serving.semantic_revision.as_deref(), previous_revision);
+        assert_eq!(
+            serving
+                .candidates
+                .iter()
+                .map(|candidate| candidate.traffic_weight)
+                .collect::<Vec<_>>(),
+            [Some(expected[0]), Some(expected[1])]
+        );
+        let group = serving
+            .group_index
+            .get(&CapabilityKind::InferenceModel)
+            .and_then(|by_name| by_name.get("llama"))
+            .and_then(|groups| groups.first())
+            .expect("updated weighted overlay has an indexed selection group");
+        let total_weight = expected.iter().map(|weight| u64::from(*weight)).sum::<u64>();
+        assert_eq!(group.total_weight, total_weight);
+        assert_eq!(
+            group
+                .weighted_entries
+                .iter()
+                .map(|entry| entry.cumulative_upper_bound)
+                .collect::<Vec<_>>(),
+            [u64::from(expected[0]), total_weight]
+        );
+    }
+
+    #[test]
     fn retain_on_read_failure() {
         let (snap, hash) = make_valid_snapshot();
         handle_overlay_reload(Path::new("/nonexistent/overlay.json"), &snap, None);
@@ -2011,6 +2060,37 @@ mod tests {
             "overlay": overlay_obj
         }))
         .unwrap()
+    }
+
+    fn make_weighted_envelope_json(weights: [u32; 2]) -> String {
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(&make_envelope_json("site-a", "llama", "cluster-a", "test-net")).unwrap();
+        let overlay = envelope.get_mut("overlay").expect("generated envelope has overlay");
+        overlay["selection_policy"] = serde_json::json!({"mode": "weightedRandom"});
+        overlay["candidates"] = serde_json::json!([
+            {
+                "kind": "inference_model",
+                "name": "llama",
+                "site": "site-a",
+                "cluster": "cluster-a",
+                "fresh": true,
+                "selection_group": 0,
+                "traffic_weight": weights[0]
+            },
+            {
+                "kind": "inference_model",
+                "name": "llama",
+                "site": "site-a",
+                "cluster": "cluster-b",
+                "fresh": true,
+                "selection_group": 0,
+                "traffic_weight": weights[1]
+            }
+        ]);
+        let digest = compute_semantic_digest(overlay).unwrap();
+        envelope["revision"]["value"] = serde_json::json!(digest);
+        envelope["content_digest"]["value"] = serde_json::json!(digest);
+        serde_json::to_string(&envelope).unwrap()
     }
 
     #[test]
@@ -2923,8 +3003,15 @@ mod tests {
     fn weighted_overlay_rejects_missing_or_out_of_range_weights() {
         let missing = br#"{"local_site":"s","selection_policy":{"mode":"weightedRandom"},"candidates":[{"kind":"inference_model","name":"m","site":"a","cluster":"a","selection_group":0}]}"#;
         assert!(RouteSnapshot::from_overlay(missing).is_err());
-        let invalid = br#"{"local_site":"s","selection_policy":{"mode":"weightedRandom"},"candidates":[{"kind":"inference_model","name":"m","site":"a","cluster":"a","selection_group":0,"traffic_weight":0}]}"#;
-        assert!(RouteSnapshot::from_overlay(invalid).is_err());
+        for weight in ["0", "1001", "-1", "1.5"] {
+            let invalid = format!(
+                r#"{{"local_site":"s","selection_policy":{{"mode":"weightedRandom"}},"candidates":[{{"kind":"inference_model","name":"m","site":"a","cluster":"a","selection_group":0,"traffic_weight":{weight}}}]}}"#
+            );
+            assert!(
+                RouteSnapshot::from_overlay(invalid.as_bytes()).is_err(),
+                "invalid weighted value {weight} must be rejected"
+            );
+        }
     }
 
     #[test]

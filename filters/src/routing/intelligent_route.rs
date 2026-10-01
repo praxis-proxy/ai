@@ -336,6 +336,10 @@ enum AffinityOutcome<'a> {
 /// overlay's selection mode within the first viable producer-defined group.
 /// Missing group or policy metadata uses deterministic first-admitted ordering.
 /// Praxis AI does not recompute source geography, load, or score.
+/// `weightedRandom` is overlay-only: every candidate must have a selection
+/// group and an integer `traffic_weight` from 1 through 1000. Weights are
+/// applied only among candidates in the first viable group. Inline static
+/// candidates cannot enable weighted selection.
 /// `admission_state=none` is never eligible. `existing_only` is eligible only
 /// through an already-bound session affinity entry.
 ///
@@ -645,6 +649,14 @@ fn build_static_snapshot(candidates_raw: Vec<CandidateConfig>, local_site: Optio
     let local_site_str = local_site
         .ok_or_else(|| FilterError::from("intelligent_route: local_site is required when candidates is set"))?;
     descriptor::validate_local_site(&local_site_str)?;
+    if candidates_raw
+        .iter()
+        .any(|candidate| candidate.traffic_weight.is_some())
+    {
+        return Err(
+            "intelligent_route: traffic_weight requires overlay mode with selection_policy.mode=weightedRandom".into(),
+        );
+    }
     let candidates = descriptor::validate_candidates(candidates_raw)?;
     let snap = RouteSnapshot::from_static(candidates, Arc::from(local_site_str.as_str()));
     Ok((Arc::new(ArcSwap::from_pointee(snap)), None))
@@ -1198,6 +1210,17 @@ mod tests {
     fn valid_minimal_config() {
         let yaml = "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf\n    fresh: true\n";
         assert!(parse(yaml).is_ok(), "minimal valid config should parse");
+    }
+
+    #[test]
+    fn static_candidates_reject_ignored_traffic_weights() {
+        let err = parse_err(
+            "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf\n    traffic_weight: 70\n",
+        );
+        assert!(
+            err.to_string().contains("traffic_weight requires overlay mode"),
+            "static weights must fail clearly instead of being ignored: {err}"
+        );
     }
 
     #[tokio::test]
@@ -2895,6 +2918,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn weighted_affinity_keeps_binding_when_overlay_weights_change() {
+        let shared = Arc::new(ArcSwap::from_pointee(make_weighted_snapshot(90, 10)));
+        let filter = make_affinity_filter(Arc::clone(&shared), Some(make_test_affinity()));
+
+        let mut first = crate::test_utils::make_request(Method::POST, "/chat");
+        first.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        first.headers.insert("x-session-id", HeaderValue::from_static("sticky"));
+        let mut first_ctx = crate::test_utils::make_filter_context(&first);
+        let _unused = filter.on_request(&mut first_ctx).await.unwrap();
+        let first_cluster = first_ctx.cluster.clone().expect("weighted route selects a candidate");
+
+        shared.store(Arc::new(make_weighted_snapshot(10, 90)));
+
+        let mut second = crate::test_utils::make_request(Method::POST, "/chat");
+        second.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        second
+            .headers
+            .insert("x-session-id", HeaderValue::from_static("sticky"));
+        let mut second_ctx = crate::test_utils::make_filter_context(&second);
+        let _unused = filter.on_request(&mut second_ctx).await.unwrap();
+
+        assert_eq!(second_ctx.cluster.as_deref(), Some(first_cluster.as_ref()));
+        assert_eq!(
+            second_ctx.get_metadata("intelligent_route.session.reused"),
+            Some("true")
+        );
+    }
+
     // ---- Overlay revision header ----
 
     #[tokio::test]
@@ -3189,5 +3241,17 @@ mod tests {
             });
         }
         RouteSnapshot::from_static(route_candidates, Arc::from("site-a"))
+    }
+
+    fn make_weighted_snapshot(weight_a: u32, weight_b: u32) -> RouteSnapshot {
+        let json = serde_json::json!({
+            "local_site": "site-a",
+            "selection_policy": {"mode": "weightedRandom"},
+            "candidates": [
+                {"kind": "inference_model", "name": "llama", "site": "site-a", "cluster": "c-a", "selection_group": 0, "traffic_weight": weight_a},
+                {"kind": "inference_model", "name": "llama", "site": "site-b", "cluster": "c-b", "selection_group": 0, "traffic_weight": weight_b}
+            ]
+        });
+        RouteSnapshot::from_overlay(serde_json::to_vec(&json).unwrap().as_slice()).unwrap()
     }
 }
