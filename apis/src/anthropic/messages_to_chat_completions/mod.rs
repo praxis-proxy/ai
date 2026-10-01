@@ -247,9 +247,8 @@ impl HttpFilter for AnthropicMessagesToChatCompletionsFilter {
         ctx: &mut HttpFilterContext<'_>,
         body: &mut Option<Bytes>,
     ) -> Result<SelectedUpstreamBodyOutcome, FilterError> {
-        // The body is fully buffered post-load-balancer, so this runs only on the
-        // Chat Completions upstream the selected_upstream condition gates to; the
-        // native Anthropic path never reaches it.
+        // Translate only after upstream selection so a protocol-gated pipeline can
+        // keep the native Anthropic body for a Messages backend.
         let bytes = match body.as_ref() {
             Some(b) if !b.is_empty() => b.as_ref(),
             _ => return Ok(SelectedUpstreamBodyOutcome::Continue),
