@@ -450,7 +450,7 @@ const POSTGRES_MAX_RESPONSES_TABLE_LEN_FOR_APPROVALS: usize =
 /// suffix in the derived event log table name. Shorter than both the
 /// `_schema_version` and `_pending_approvals` suffixes, so it is never the
 /// binding constraint; validated for symmetry with the other derived tables.
-#[cfg(feature = "postgres")]
+#[cfg(feature = "_postgres")]
 const POSTGRES_MAX_RESPONSES_TABLE_LEN_FOR_EVENTS: usize = POSTGRES_MAX_IDENTIFIER_LEN - EVENTS_SUFFIX.len();
 
 /// Validate the items table name and ensure it is distinct from the
