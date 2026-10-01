@@ -146,7 +146,8 @@ fn build_listener_pipelines(
     gate_store_traffic: impl Fn(&Listener) -> bool,
     attach: impl Fn(&Listener, &mut FilterPipeline),
 ) -> Result<ListenerPipelines, Box<dyn std::error::Error + Send + Sync>> {
-    praxis_filter::set_policy_subrequest_connector(subrequest_client.connector());
+    let mut registry = registry.clone();
+    registry.set_policy_connector(subrequest_client.connector());
     let chains: HashMap<&str, &[_]> = config
         .filter_chains
         .iter()
@@ -181,7 +182,7 @@ fn build_listener_pipelines(
         let _ = &gate_store_traffic;
 
         let mut pipeline =
-            FilterPipeline::build_with_chains(&mut entries, registry, &chains, &config.insecure_options)?;
+            FilterPipeline::build_with_chains(&mut entries, &registry, &chains, &config.insecure_options)?;
         configure_pipeline(&mut pipeline, config, health_registry, kv_stores, subrequest_client)?;
         attach(listener, &mut pipeline);
 

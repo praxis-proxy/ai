@@ -115,7 +115,7 @@ The production image is a minimal Alpine container:
   dynamically against Alpine's OpenSSL (all cryptography goes through the
   system library)
 - Runs as non-root user (`praxis`)
-- Exposes ports `8080` (proxy) and `9901` (admin)
+- Exposes ports `8080` (proxy) and `9901` (health/metrics)
 - Built-in health check at
   `http://127.0.0.1:9901/healthy`
 - Config directory and working directory: `/etc/praxis` (root-owned; mount the

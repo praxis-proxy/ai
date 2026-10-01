@@ -79,7 +79,7 @@ store pools.
 
 ## Monitoring
 
-The admin endpoint's `/metrics` carries
+The listener configured by `admin.metrics_address` serves `/metrics`, carrying
 `praxis_process_open_fds`, `praxis_process_max_fds`, and
 `praxis_overload_rejects_total{reason="file_descriptors"}`
 (shed requests), and `praxis_ai_metering_report_failures_total`
