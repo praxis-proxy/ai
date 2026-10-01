@@ -11,6 +11,25 @@ local budget_count = tonumber(ARGV[5])
 local settled = KEYS[2]
 local active = KEYS[3]
 
+local max_window = 0
+for i = 1, budget_count do
+  local window = tonumber(ARGV[5 + (i * 2) - 1])
+  if window > max_window then max_window = window end
+end
+
+-- A rule/algorithm identity may have exactly one accounting interpretation.
+-- Reject skew before pruning, expiry, counters, or any other state mutation.
+local config_fingerprint = ARGV[6 + (budget_count * 2)]
+local stored_fingerprint = redis.call('GET', KEYS[13])
+if stored_fingerprint and stored_fingerprint ~= config_fingerprint then return {3} end
+if not stored_fingerprint then redis.call('SET', KEYS[13], config_fingerprint, 'NX') end
+
+-- Never let one operation shorten another operation's live-state horizon.
+local function extend_expiry(key, ttl)
+  redis.call('PEXPIRE', key, ttl, 'NX')
+  redis.call('PEXPIRE', key, ttl, 'GT')
+end
+
 local active_total = tonumber(redis.call('GET', KEYS[5]) or '0')
 local rule_active_total = tonumber(redis.call('GET', KEYS[8]) or '0')
 local function reported_remaining()
@@ -50,7 +69,7 @@ for i = 1, #expired_rule do
   redis.call('ZREM', KEYS[7], member)
   redis.call('ZREM', KEYS[9], member)
 end
-redis.call('SET', KEYS[8], rule_active_total)
+redis.call('SET', KEYS[8], rule_active_total, 'KEEPTTL')
 
 local expired_global = redis.call('ZRANGE', KEYS[7], '-inf', now_ms, 'BYSCORE', 'LIMIT', 0, SWEEP_BATCH)
 for i = 1, #expired_global do
@@ -72,7 +91,7 @@ for i = 1, #expired_global do
   end
   redis.call('ZREM', KEYS[7], member)
 end
-redis.call('SET', KEYS[5], active_total)
+redis.call('SET', KEYS[5], active_total, 'KEEPTTL')
 
 local expired_keys = redis.call('ZRANGE', KEYS[10], '-inf', now_ms, 'BYSCORE', 'LIMIT', 0, SWEEP_BATCH)
 for i = 1, #expired_keys do
@@ -82,15 +101,10 @@ for i = 1, #expired_keys do
   redis.call('ZREM', KEYS[10], expired_keys[i])
 end
 
-local max_window = 0
-for i = 1, budget_count do
-  local window = tonumber(ARGV[5 + (i * 2) - 1])
-  if window > max_window then max_window = window end
-  redis.call('ZREMRANGEBYSCORE', settled, '-inf', now_ms - window)
-end
+redis.call('ZREMRANGEBYSCORE', settled, '-inf', now_ms - max_window)
 local telemetry_ttl = math.max(max_window + timeout_ms, 1000)
 local function refresh_rule_telemetry_ttl()
-  for i = 8, 12 do redis.call('PEXPIRE', KEYS[i], telemetry_ttl) end
+  for i = 8, 12 do extend_expiry(KEYS[i], telemetry_ttl) end
 end
 
 local expired = {}
@@ -107,7 +121,7 @@ for i = 1, #active_values, 2 do
     active_total = math.max(0, active_total - 1)
   end
 end
-redis.call('SET', KEYS[5], active_total)
+redis.call('SET', KEYS[5], active_total, 'KEEPTTL')
 
 redis.call('ZREMRANGEBYSCORE', KEYS[4], '-inf', now_ms)
 local key_exists = redis.call('ZSCORE', KEYS[10], KEYS[1]) ~= false
@@ -153,15 +167,15 @@ local id = redis.call('INCR', KEYS[6])
 redis.call('HSET', active, id, estimate .. '|' .. now_ms)
 redis.call('INCR', KEYS[5])
 rule_active_total = rule_active_total + 1
-redis.call('SET', KEYS[8], rule_active_total)
+redis.call('SET', KEYS[8], rule_active_total, 'KEEPTTL')
 redis.call('ZADD', KEYS[7], now_ms + timeout_ms, KEYS[1] .. '|' .. id)
 redis.call('ZADD', KEYS[9], now_ms + timeout_ms, KEYS[1] .. '|' .. id)
 local ttl = math.max(max_window + timeout_ms, 1000)
 redis.call('ZADD', KEYS[4], now_ms + ttl, KEYS[1])
 redis.call('ZADD', KEYS[10], now_ms + ttl, KEYS[1])
-redis.call('PEXPIRE', settled, ttl)
-redis.call('PEXPIRE', active, ttl)
-redis.call('PEXPIRE', KEYS[1], ttl)
+extend_expiry(settled, ttl)
+extend_expiry(active, ttl)
+extend_expiry(KEYS[1], ttl)
 update_remaining(math.max(0, (key_remaining or 0) - estimate))
 refresh_rule_telemetry_ttl()
 return {1, id, estimate, max_usage, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[10])}

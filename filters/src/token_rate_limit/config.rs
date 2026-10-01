@@ -830,8 +830,26 @@ pub(super) struct BackendConfig {
     pub url: Option<String>,
 
     /// Key namespace prefix, so multiple filter rules or deployments can
-    /// share one Valkey instance without colliding. Ignored for
-    /// `kind: memory`. Defaults to `"praxis:token_rate_limit"` when unset.
+    /// share one Valkey instance without colliding. The namespace is
+    /// configured once for the whole filter, not per rule, so changing it
+    /// starts a fresh accounting generation and fresh budgets for every rule
+    /// in that filter. Ignored for `kind: memory`. Defaults to
+    /// `"praxis:token_rate_limit"` when unset.
+    ///
+    /// Valkey permanently records a schema-versioned fingerprint for each
+    /// namespace/rule/algorithm identity. Replicas with a different window,
+    /// capacity, refill rate, reservation timeout, or state bound fail closed
+    /// with 503 before mutating shared state. The compatibility markers use
+    /// `{namespace}:v1:rule:{hash}:accounting-config` for sliding windows and
+    /// `{namespace}:v1:tb:rule:{hash}:accounting-config` for token buckets.
+    ///
+    /// To make an intentional semantic change, quiesce the old generation,
+    /// cut every writer over to a new namespace generation, and only then
+    /// retire the complete old namespace. Do not delete only a compatibility
+    /// marker: doing so can bind a new configuration to incompatible residual
+    /// quota state. Avoid serving traffic from both generations during the
+    /// cutover because their budgets are independent. Changing configuration
+    /// in place is deliberately rejected.
     #[serde(default)]
     pub namespace: Option<String>,
 }

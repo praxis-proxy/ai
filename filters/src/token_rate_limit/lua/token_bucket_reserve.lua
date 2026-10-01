@@ -9,6 +9,20 @@ local timeout_ms = tonumber(ARGV[3])
 local max_keys = tonumber(ARGV[4])
 local max_active = tonumber(ARGV[5])
 local estimate = tonumber(ARGV[6])
+local ttl = math.max(math.ceil((capacity / refill_rate) * 1000) + timeout_ms, 1000)
+
+-- A rule/algorithm identity may have exactly one accounting interpretation.
+-- Reject skew before refill, expiry, counters, or any other state mutation.
+local config_fingerprint = ARGV[7]
+local stored_fingerprint = redis.call('GET', KEYS[12])
+if stored_fingerprint and stored_fingerprint ~= config_fingerprint then return {3} end
+if not stored_fingerprint then redis.call('SET', KEYS[12], config_fingerprint, 'NX') end
+
+-- Never let one operation shorten another operation's live-state horizon.
+local function extend_expiry(key, expiry_ms)
+  redis.call('PEXPIRE', key, expiry_ms, 'NX')
+  redis.call('PEXPIRE', key, expiry_ms, 'GT')
+end
 
 local active_total = tonumber(redis.call('GET', KEYS[4]) or '0')
 local rule_active_total = tonumber(redis.call('GET', KEYS[7]) or '0')
@@ -43,7 +57,7 @@ for i = 1, #expired_rule do
   redis.call('ZREM', KEYS[6], member)
   redis.call('ZREM', KEYS[8], member)
 end
-redis.call('SET', KEYS[7], rule_active_total)
+redis.call('SET', KEYS[7], rule_active_total, 'KEEPTTL')
 
 local expired_global = redis.call('ZRANGE', KEYS[6], '-inf', now_ms, 'BYSCORE', 'LIMIT', 0, SWEEP_BATCH)
 for i = 1, #expired_global do
@@ -64,7 +78,7 @@ for i = 1, #expired_global do
   end
   redis.call('ZREM', KEYS[6], member)
 end
-redis.call('SET', KEYS[4], active_total)
+redis.call('SET', KEYS[4], active_total, 'KEEPTTL')
 
 local expired_keys = redis.call('ZRANGE', KEYS[9], '-inf', now_ms, 'BYSCORE', 'LIMIT', 0, SWEEP_BATCH)
 for i = 1, #expired_keys do
@@ -84,9 +98,8 @@ end
 local elapsed_ms = math.max(0, now_ms - last_refill_ms)
 tokens = math.min(capacity, tokens + (elapsed_ms / 1000.0) * refill_rate)
 
-local ttl = math.max(math.ceil((capacity / refill_rate) * 1000) + timeout_ms, 1000)
 local function refresh_rule_telemetry_ttl()
-  for i = 7, 11 do redis.call('PEXPIRE', KEYS[i], ttl) end
+  for i = 7, 11 do extend_expiry(KEYS[i], ttl) end
 end
 redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', now_ms)
 local key_exists = redis.call('EXISTS', KEYS[1]) == 1
@@ -97,7 +110,7 @@ end
 if active_total >= max_active then
   if key_exists then
     redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill_ms', now_ms)
-    redis.call('PEXPIRE', KEYS[1], ttl)
+    extend_expiry(KEYS[1], ttl)
     update_remaining(math.floor(tokens))
   end
   refresh_rule_telemetry_ttl()
@@ -107,7 +120,7 @@ if tokens < estimate then
   local deficit = estimate - tokens
   local retry_after_ms = math.max(1, math.ceil((deficit / refill_rate) * 1000))
   redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill_ms', now_ms)
-  redis.call('PEXPIRE', KEYS[1], ttl)
+  extend_expiry(KEYS[1], ttl)
   update_remaining(math.floor(tokens))
   refresh_rule_telemetry_ttl()
   return {0, retry_after_ms, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[9])}
@@ -119,14 +132,14 @@ local id = redis.call('INCR', KEYS[5])
 redis.call('HSET', KEYS[2], id, estimate .. '|' .. now_ms)
 redis.call('INCR', KEYS[4])
 rule_active_total = rule_active_total + 1
-redis.call('SET', KEYS[7], rule_active_total)
+redis.call('SET', KEYS[7], rule_active_total, 'KEEPTTL')
 redis.call('ZADD', KEYS[6], now_ms + timeout_ms, KEYS[1] .. '|' .. id)
 redis.call('ZADD', KEYS[8], now_ms + timeout_ms, KEYS[1] .. '|' .. id)
 redis.call('HSET', KEYS[1], 'tokens', tokens, 'last_refill_ms', now_ms)
 redis.call('ZADD', KEYS[3], now_ms + ttl, KEYS[1])
 redis.call('ZADD', KEYS[9], now_ms + ttl, KEYS[1])
-redis.call('PEXPIRE', KEYS[1], ttl)
-redis.call('PEXPIRE', KEYS[2], ttl)
+extend_expiry(KEYS[1], ttl)
+extend_expiry(KEYS[2], ttl)
 update_remaining(math.floor(tokens))
 refresh_rule_telemetry_ttl()
 return {1, id, estimate, usage_after, math.floor(reported_remaining()), rule_active_total, redis.call('ZCARD', KEYS[9])}

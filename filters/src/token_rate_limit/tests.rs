@@ -1488,6 +1488,19 @@ async fn assert_denied(filter: &dyn HttpFilter, req: &praxis_filter::Request, wh
     );
 }
 
+/// Assert `req` is rejected with one exact HTTP status.
+async fn assert_rejected_with_status(
+    filter: &dyn HttpFilter,
+    req: &praxis_filter::Request,
+    expected_status: u16,
+    why: &str,
+) {
+    match request_action(filter, req).await {
+        FilterAction::Reject(rejection) => assert_eq!(rejection.status, expected_status, "{why}"),
+        other => panic!("{why}: expected status {expected_status}, got {other:?}"),
+    }
+}
+
 /// Poll `filter.on_request` for `req` up to `attempts` times, sleeping
 /// briefly between each, until it's admitted. Used to await an
 /// asynchronous (background-worker) Valkey reconciliation without a
@@ -1590,6 +1603,49 @@ async fn valkey_budget_exhausted_on_one_instance_is_denied_on_another() {
 }
 
 #[tokio::test]
+async fn valkey_sliding_window_config_skew_fails_closed_with_503() {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-sw-config-skew-{}", std::process::id());
+    let owner = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 10s\ncapacity: 5\nreserved_tokens: 5\nreservation_timeout: 5s",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let mismatched = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: sliding_window\nwindow: 1s\ncapacity: 5\nreserved_tokens: 1\nreservation_timeout: 5s",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    assert_admitted(
+        owner.as_ref(),
+        &req,
+        "the first writer registers and consumes its budget",
+    )
+    .await;
+    assert_rejected_with_status(
+        mismatched.as_ref(),
+        &req,
+        503,
+        "a different window for the same shared rule must fail closed",
+    )
+    .await;
+    assert_rejected_with_status(
+        owner.as_ref(),
+        &req,
+        429,
+        "the rejected writer must not erase or reinterpret the original reservation",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn valkey_worker_reconciles_usage_off_the_response_path() {
     let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
         tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
@@ -1684,6 +1740,49 @@ async fn valkey_token_bucket_budget_exhausted_on_one_instance_is_denied_on_anoth
         instance_two.as_ref(),
         &req,
         "exhausted bucket visible via shared Valkey state",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn valkey_token_bucket_config_skew_fails_closed_with_503() {
+    let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+        tracing::warn!("skipping: TOKEN_RATE_LIMIT_VALKEY_URL not set");
+        return;
+    };
+    let namespace = format!("praxis-test-tb-config-skew-{}", std::process::id());
+    let owner = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: token_bucket\ncapacity: 10\nrefill_rate: 0.001\nreserved_tokens: 10\nreservation_timeout: 5s",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let mismatched = TokenRateLimitFilter::from_config(&single_rule_valkey_yaml(
+        "algorithm: token_bucket\ncapacity: 10\nrefill_rate: 10\nreserved_tokens: 1\nreservation_timeout: 5s",
+        &url,
+        &namespace,
+    ))
+    .unwrap();
+    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
+
+    assert_admitted(
+        owner.as_ref(),
+        &req,
+        "the first writer registers and depletes its bucket",
+    )
+    .await;
+    assert_rejected_with_status(
+        mismatched.as_ref(),
+        &req,
+        503,
+        "a different refill rate for the same shared rule must fail closed",
+    )
+    .await;
+    assert_rejected_with_status(
+        owner.as_ref(),
+        &req,
+        429,
+        "the rejected writer must not refill or reset the original bucket",
     )
     .await;
 }

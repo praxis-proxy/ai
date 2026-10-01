@@ -34,6 +34,83 @@ use super::{
 /// closed quickly rather than hanging the request indefinitely.
 const VALKEY_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// Version of the accounting semantics encoded by Valkey configuration
+/// fingerprints. Bump this whenever an existing state value would be
+/// interpreted differently by new Lua code.
+const ACCOUNTING_CONFIG_SCHEMA: &str = "v1";
+
+/// Finish a schema-versioned accounting configuration digest.
+fn accounting_config_fingerprint(digest: Sha256) -> String {
+    let hash = digest
+        .finish()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{ACCOUNTING_CONFIG_SCHEMA}:{hash}")
+}
+
+/// Canonical fingerprint for state interpreted by the sliding-window Lua
+/// scripts. Budget ordering is not semantic, so sort `(window, capacity)`
+/// pairs before hashing them.
+fn sliding_window_config_fingerprint(
+    budgets: &[Budget],
+    reservation_timeout_ms: u64,
+    max_keys: usize,
+    max_active_reservations: usize,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"praxis:token_rate_limit:accounting_config");
+    digest.update(&[0]);
+    digest.update(ACCOUNTING_CONFIG_SCHEMA.as_bytes());
+    digest.update(&[0]);
+    digest.update(b"sliding_window");
+    digest.update(&[0]);
+
+    let mut canonical_budgets = budgets
+        .iter()
+        .map(|budget| (budget.window_ms, budget.capacity))
+        .collect::<Vec<_>>();
+    canonical_budgets.sort_unstable();
+    digest.update(&(canonical_budgets.len() as u64).to_be_bytes());
+    for (window_ms, capacity) in canonical_budgets {
+        digest.update(&window_ms.to_be_bytes());
+        digest.update(&capacity.to_be_bytes());
+    }
+    digest.update(&reservation_timeout_ms.to_be_bytes());
+    digest.update(max_keys.to_string().as_bytes());
+    digest.update(&[0]);
+    digest.update(max_active_reservations.to_string().as_bytes());
+
+    accounting_config_fingerprint(digest)
+}
+
+/// Canonical fingerprint for state interpreted by the token-bucket Lua
+/// scripts. Hash the exact IEEE-754 refill value passed to Lua rather than a
+/// display-format approximation.
+fn token_bucket_config_fingerprint(
+    capacity: u64,
+    refill_rate: f64,
+    reservation_timeout_ms: u64,
+    max_keys: usize,
+    max_active_reservations: usize,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"praxis:token_rate_limit:accounting_config");
+    digest.update(&[0]);
+    digest.update(ACCOUNTING_CONFIG_SCHEMA.as_bytes());
+    digest.update(&[0]);
+    digest.update(b"token_bucket");
+    digest.update(&[0]);
+    digest.update(&capacity.to_be_bytes());
+    digest.update(&refill_rate.to_bits().to_be_bytes());
+    digest.update(&reservation_timeout_ms.to_be_bytes());
+    digest.update(max_keys.to_string().as_bytes());
+    digest.update(&[0]);
+    digest.update(max_active_reservations.to_string().as_bytes());
+
+    accounting_config_fingerprint(digest)
+}
+
 /// Request to admit an estimated token cost against a key's budget.
 #[derive(Debug, Clone)]
 pub(super) struct ReserveRequest {
@@ -139,6 +216,7 @@ impl ValkeyTelemetryState {
     /// or per-rule `max_keys` (`2`).
     fn parse_reserve_reply(&self, response: &[i64]) -> Result<BackendReserve, BackendError> {
         match response {
+            [3] => Err(BackendError::ConfigurationMismatch),
             [1, id, estimate, usage_after, remaining, active, keys] => {
                 self.record_reply(*remaining, *active, *keys)?;
                 Ok(BackendReserve::Admitted {
@@ -191,6 +269,10 @@ pub(super) enum BackendError {
     /// The backend responded, but not in the expected shape.
     #[error("shared quota backend returned an invalid response")]
     InvalidResponse,
+    /// Existing shared state belongs to a different accounting
+    /// configuration for the same namespace/rule/algorithm identity.
+    #[error("shared quota backend accounting configuration does not match existing state")]
+    ConfigurationMismatch,
 }
 
 /// Where sliding-window admission state lives: in-process or shared.
@@ -476,13 +558,15 @@ impl TokenRateLimitStateBackend for InMemoryTokenBucketBackend {
 /// `[6]` namespace reservation-id sequence, `[7]` namespace active-index
 /// zset (global reservation-expiry tracking), followed by five rule-level
 /// telemetry keys: active count/index, retained keys, per-key balances,
-/// and aggregate remaining balance. `ARGV`: reservation timeout (ms),
-/// max keys, max active reservations, estimate, budget count, then
-/// `(window_ms, capacity)` pairs. Returns
+/// and aggregate remaining balance, then `[13]` the rule's persistent
+/// accounting-configuration fingerprint. `ARGV`: reservation timeout (ms),
+/// max keys, max active reservations, estimate, budget count,
+/// `(window_ms, capacity)` pairs, then the expected fingerprint. Returns
 /// `[1, id, estimate, usage_after, remaining, active, keys]` on admission,
 /// `[0, retry_after_ms, remaining, active, keys]` on budget denial, or
 /// `[2, retry_after_ms, remaining, active, keys]` when the per-rule
-/// `max_keys` cap would be exceeded.
+/// `max_keys` cap would be exceeded. `[3]` is an accounting-configuration
+/// mismatch and is mapped to a fail-closed backend error.
 const RESERVE_SCRIPT: &str = include_str!("lua/sliding_window_reserve.lua");
 
 /// Atomically settle a prior reservation against actual usage -- the
@@ -490,9 +574,10 @@ const RESERVE_SCRIPT: &str = include_str!("lua/sliding_window_reserve.lua");
 ///
 /// `KEYS`: same layout as [`RESERVE_SCRIPT`]. `ARGV`: `[1]` reservation
 /// ID, `[2]` actual usage, `[3]` budget count, `[4]` reservation timeout,
-/// then `(window_ms, capacity)` pairs. Returns `[0, remaining, active, keys]` if the reservation
-/// was already reconciled/expired (no-op), or
-/// `[1, actual, refund, overage, remaining, active, keys]`.
+/// `(window_ms, capacity)` pairs, then the expected fingerprint. Returns
+/// `[0, remaining, active, keys]` if the reservation was already
+/// reconciled/expired (no-op), `[1, actual, refund, overage, remaining,
+/// active, keys]` when applied, or `[3]` on configuration mismatch.
 const RECONCILE_SCRIPT: &str = include_str!("lua/sliding_window_reconcile.lua");
 
 /// Drain `receiver`, reconciling each request against `worker`'s backend
@@ -780,6 +865,9 @@ pub(super) struct ValkeyTokenRateLimitBackend {
     max_keys: usize,
     /// See [`ValkeyBackendConfig::max_active_reservations`].
     max_active_reservations: usize,
+    /// Schema-versioned digest of every setting that interprets or bounds
+    /// this rule's shared accounting state.
+    config_fingerprint: String,
     /// Smallest configured budget capacity, for rate-limit headers.
     limit: u64,
     /// Shared background-reconciliation scaffolding, see [`ReconcileWorker`].
@@ -816,6 +904,12 @@ impl ValkeyTokenRateLimitBackend {
     /// [`ValkeyEval`] connection.
     pub(super) fn new(config: ValkeyBackendConfig) -> Self {
         let limit = config.budgets.iter().map(|budget| budget.capacity).min().unwrap_or(0);
+        let config_fingerprint = sliding_window_config_fingerprint(
+            &config.budgets,
+            config.reservation_timeout_ms,
+            config.max_keys,
+            config.max_active_reservations,
+        );
         Self {
             valkey: config.valkey,
             namespace: config.namespace,
@@ -824,6 +918,7 @@ impl ValkeyTokenRateLimitBackend {
             reservation_timeout_ms: config.reservation_timeout_ms,
             max_keys: config.max_keys,
             max_active_reservations: config.max_active_reservations,
+            config_fingerprint,
             limit,
             worker: ReconcileWorker::new(),
             telemetry: Arc::new(ValkeyTelemetryState::default()),
@@ -842,6 +937,7 @@ impl ValkeyTokenRateLimitBackend {
             reservation_timeout_ms: self.reservation_timeout_ms,
             max_keys: self.max_keys,
             max_active_reservations: self.max_active_reservations,
+            config_fingerprint: self.config_fingerprint.clone(),
             limit: self.limit,
             worker: ReconcileWorker::detached(),
             telemetry: Arc::clone(&self.telemetry),
@@ -867,7 +963,7 @@ impl ValkeyTokenRateLimitBackend {
         clippy::too_many_lines,
         reason = "the key layout is kept in one place so Lua KEYS indexes remain auditable"
     )]
-    fn key_parts(&self, key: &str) -> [String; 12] {
+    fn key_parts(&self, key: &str) -> [String; 13] {
         let mut rule_digest = Sha256::new();
         rule_digest.update(self.namespace.as_bytes());
         rule_digest.update(&[0]);
@@ -903,44 +999,35 @@ impl ValkeyTokenRateLimitBackend {
             format!("{rule_prefix}:keys"),
             format!("{rule_prefix}:balances"),
             format!("{rule_prefix}:remaining-total"),
+            format!("{rule_prefix}:accounting-config"),
         ]
     }
-}
 
-/// Arguments for [`RESERVE_SCRIPT`]: timeout/bounds, then one
-/// `(window_ms, capacity)` pair per configured budget.
-fn reserve_args(
-    reservation_timeout_ms: u64,
-    max_keys: usize,
-    max_active_reservations: usize,
-    request: &ReserveRequest,
-    budgets: &[Budget],
-) -> Vec<String> {
-    let mut args = vec![
-        reservation_timeout_ms.to_string(),
-        max_keys.to_string(),
-        max_active_reservations.to_string(),
-        request.estimate.to_string(),
-        budgets.len().to_string(),
-    ];
-    for budget in budgets {
-        args.push(budget.window_ms.to_string());
-        args.push(budget.capacity.to_string());
+    /// Arguments for [`RESERVE_SCRIPT`]: timeout/bounds, then one
+    /// `(window_ms, capacity)` pair per configured budget and the expected
+    /// accounting fingerprint.
+    fn reserve_args(&self, request: &ReserveRequest) -> Vec<String> {
+        let mut args = vec![
+            self.reservation_timeout_ms.to_string(),
+            self.max_keys.to_string(),
+            self.max_active_reservations.to_string(),
+            request.estimate.to_string(),
+            self.budgets.len().to_string(),
+        ];
+        for budget in &self.budgets {
+            args.push(budget.window_ms.to_string());
+            args.push(budget.capacity.to_string());
+        }
+        args.push(self.config_fingerprint.clone());
+        args
     }
-    args
 }
 
 #[async_trait]
 impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
     async fn reserve(&self, request: ReserveRequest) -> Result<BackendReserve, BackendError> {
         let keys = self.key_parts(&request.key);
-        let args = reserve_args(
-            self.reservation_timeout_ms,
-            self.max_keys,
-            self.max_active_reservations,
-            &request,
-            &self.budgets,
-        );
+        let args = self.reserve_args(&request);
         let response = self.valkey.eval(RESERVE_SCRIPT, &keys, &args).await?;
         self.telemetry.parse_reserve_reply(&response)
     }
@@ -958,8 +1045,10 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
             args.push(budget.window_ms.to_string());
             args.push(budget.capacity.to_string());
         }
+        args.push(self.config_fingerprint.clone());
         let response = self.valkey.eval(RECONCILE_SCRIPT, &keys, &args).await?;
         match response.as_slice() {
+            [3] => Err(BackendError::ConfigurationMismatch),
             [0, remaining, active, keys] => {
                 self.telemetry.record_reply(*remaining, *active, *keys)?;
                 Ok(BackendSettlement::Noop)
@@ -1013,17 +1102,20 @@ impl TokenRateLimitStateBackend for ValkeyTokenRateLimitBackend {
 /// active hash, `[3]` namespace keys zset, `[4]` namespace active-count
 /// string, `[5]` namespace reservation-id sequence, `[6]` namespace
 /// active-index zset, followed by the equivalent five rule-level telemetry
-/// keys. Deliberately namespaced with a `:tb:` segment
+/// keys, then `[12]` the rule's persistent accounting-configuration
+/// fingerprint. Deliberately namespaced with a `:tb:` segment
 /// distinct from [`RESERVE_SCRIPT`]'s sliding-window keys (see
 /// [`ValkeyTokenBucketBackend::key_parts`]) so a `token_bucket` rule and
 /// a `sliding_window` rule can safely share one `namespace:` without
 /// either algorithm's bookkeeping corrupting the other's. `ARGV`: `[1]`
 /// capacity, `[2]` `refill_rate` (tokens/sec), `[3]` reservation timeout
-/// (ms), `[4]` max keys, `[5]` max active reservations, `[6]` estimate.
+/// (ms), `[4]` max keys, `[5]` max active reservations, `[6]` estimate,
+/// `[7]` expected fingerprint.
 /// Returns `[1, id, estimate, usage_after, remaining, active, keys]` on admission,
 /// `[0, retry_after_ms, remaining, active, keys]` on budget denial, or
 /// `[2, retry_after_ms, remaining, active, keys]` when the per-rule
-/// `max_keys` cap would be exceeded.
+/// `max_keys` cap would be exceeded. `[3]` is an accounting-configuration
+/// mismatch and is mapped to a fail-closed backend error.
 pub(super) const TOKEN_BUCKET_RESERVE_SCRIPT: &str = include_str!("lua/token_bucket_reserve.lua");
 
 /// Atomically settle a prior token-bucket reservation against actual
@@ -1031,10 +1123,11 @@ pub(super) const TOKEN_BUCKET_RESERVE_SCRIPT: &str = include_str!("lua/token_buc
 ///
 /// `KEYS`: same layout as [`TOKEN_BUCKET_RESERVE_SCRIPT`]. `ARGV`: `[1]`
 /// reservation ID, `[2]` actual usage, `[3]` capacity, `[4]` `refill_rate`,
-/// `[5]` reservation timeout.
+/// `[5]` reservation timeout, `[6]` expected fingerprint.
 /// Returns `[0, remaining, active, keys]` if the reservation was already
 /// reconciled/expired (no-op), or
-/// `[1, actual, refund, overage, remaining, active, keys]`.
+/// `[1, actual, refund, overage, remaining, active, keys]`, or `[3]` on
+/// configuration mismatch.
 const TOKEN_BUCKET_RECONCILE_SCRIPT: &str = include_str!("lua/token_bucket_reconcile.lua");
 
 /// Valkey/Redis-backed token-bucket state, shared across every gateway
@@ -1056,6 +1149,9 @@ pub(super) struct ValkeyTokenBucketBackend {
     max_keys: usize,
     /// See [`ValkeyBackendConfig::max_active_reservations`].
     max_active_reservations: usize,
+    /// Schema-versioned digest of every setting that interprets or bounds
+    /// this rule's shared accounting state.
+    config_fingerprint: String,
     /// Shared background-reconciliation scaffolding, see [`ReconcileWorker`].
     worker: ReconcileWorker,
     /// Last state returned by this rule's Lua operations, shared with its worker clone.
@@ -1100,6 +1196,13 @@ impl ValkeyTokenBucketBackend {
     pub(super) fn new(config: ValkeyTokenBucketConfig) -> Result<Self, BackendError> {
         token_bucket_ledger::validate_capacity_and_refill_rate(config.capacity, config.refill_rate)
             .map_err(BackendError::Unavailable)?;
+        let config_fingerprint = token_bucket_config_fingerprint(
+            config.capacity,
+            config.refill_rate,
+            config.reservation_timeout_ms,
+            config.max_keys,
+            config.max_active_reservations,
+        );
         Ok(Self {
             valkey: config.valkey,
             namespace: config.namespace,
@@ -1109,6 +1212,7 @@ impl ValkeyTokenBucketBackend {
             reservation_timeout_ms: config.reservation_timeout_ms,
             max_keys: config.max_keys,
             max_active_reservations: config.max_active_reservations,
+            config_fingerprint,
             worker: ReconcileWorker::new(),
             telemetry: Arc::new(ValkeyTelemetryState::default()),
         })
@@ -1125,6 +1229,7 @@ impl ValkeyTokenBucketBackend {
             reservation_timeout_ms: self.reservation_timeout_ms,
             max_keys: self.max_keys,
             max_active_reservations: self.max_active_reservations,
+            config_fingerprint: self.config_fingerprint.clone(),
             worker: ReconcileWorker::detached(),
             telemetry: Arc::clone(&self.telemetry),
         }
@@ -1152,7 +1257,7 @@ impl ValkeyTokenBucketBackend {
         clippy::too_many_lines,
         reason = "the key layout is kept in one place so Lua KEYS indexes remain auditable"
     )]
-    fn key_parts(&self, key: &str) -> [String; 11] {
+    fn key_parts(&self, key: &str) -> [String; 12] {
         let mut rule_digest = Sha256::new();
         rule_digest.update(self.namespace.as_bytes());
         rule_digest.update(&[0]);
@@ -1191,6 +1296,7 @@ impl ValkeyTokenBucketBackend {
             format!("{rule_prefix}:keys"),
             format!("{rule_prefix}:balances"),
             format!("{rule_prefix}:remaining-total"),
+            format!("{rule_prefix}:accounting-config"),
         ]
     }
 }
@@ -1206,6 +1312,7 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
             self.max_keys.to_string(),
             self.max_active_reservations.to_string(),
             request.estimate.to_string(),
+            self.config_fingerprint.clone(),
         ];
         let response = self.valkey.eval(TOKEN_BUCKET_RESERVE_SCRIPT, &keys, &args).await?;
         self.telemetry.parse_reserve_reply(&response)
@@ -1220,9 +1327,11 @@ impl TokenRateLimitStateBackend for ValkeyTokenBucketBackend {
             self.capacity.to_string(),
             self.refill_rate.to_string(),
             self.reservation_timeout_ms.to_string(),
+            self.config_fingerprint.clone(),
         ];
         let response = self.valkey.eval(TOKEN_BUCKET_RECONCILE_SCRIPT, &keys, &args).await?;
         match response.as_slice() {
+            [3] => Err(BackendError::ConfigurationMismatch),
             [0, remaining, active, keys] => {
                 self.telemetry.record_reply(*remaining, *active, *keys)?;
                 Ok(BackendSettlement::Noop)
@@ -1305,6 +1414,61 @@ mod tests {
             telemetry.record_reply(-1, 0, 0),
             Err(BackendError::InvalidResponse)
         ));
+        assert!(matches!(
+            telemetry.parse_reserve_reply(&[3]),
+            Err(BackendError::ConfigurationMismatch)
+        ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one focused test proves canonicalization plus every field covered by both fingerprints"
+    )]
+    fn accounting_config_fingerprints_are_canonical_and_cover_shared_semantics() {
+        let budgets = vec![
+            Budget {
+                window_ms: 60_000,
+                capacity: 1_000,
+            },
+            Budget {
+                window_ms: 1_000,
+                capacity: 100,
+            },
+        ];
+        let mut reversed = budgets.clone();
+        reversed.reverse();
+        let sliding = sliding_window_config_fingerprint(&budgets, 30_000, 100, 1_000);
+        assert!(sliding.starts_with("v1:"));
+        assert_eq!(
+            sliding,
+            sliding_window_config_fingerprint(&reversed, 30_000, 100, 1_000),
+            "budget declaration order must not create false configuration skew"
+        );
+        assert_ne!(
+            sliding,
+            sliding_window_config_fingerprint(
+                &[Budget {
+                    window_ms: 60_000,
+                    capacity: 1_000
+                }],
+                30_000,
+                100,
+                1_000
+            )
+        );
+        assert_ne!(sliding, sliding_window_config_fingerprint(&budgets, 30_001, 100, 1_000));
+        assert_ne!(sliding, sliding_window_config_fingerprint(&budgets, 30_000, 101, 1_000));
+        assert_ne!(sliding, sliding_window_config_fingerprint(&budgets, 30_000, 100, 1_001));
+
+        let bucket = token_bucket_config_fingerprint(1_000, 1.25, 30_000, 100, 1_000);
+        assert!(bucket.starts_with("v1:"));
+        assert_ne!(sliding, bucket, "algorithm identity is part of the fingerprint");
+        assert_ne!(bucket, token_bucket_config_fingerprint(1_001, 1.25, 30_000, 100, 1_000));
+        assert_ne!(bucket, token_bucket_config_fingerprint(1_000, 1.5, 30_000, 100, 1_000));
+        assert_ne!(bucket, token_bucket_config_fingerprint(1_000, 1.25, 30_001, 100, 1_000));
+        assert_ne!(bucket, token_bucket_config_fingerprint(1_000, 1.25, 30_000, 101, 1_000));
+        assert_ne!(bucket, token_bucket_config_fingerprint(1_000, 1.25, 30_000, 100, 1_001));
     }
 
     #[tokio::test]
@@ -2023,6 +2187,602 @@ mod tests {
         }
     }
 
+    #[test]
+    fn valkey_accounting_config_key_is_rule_wide_but_algorithm_isolated() {
+        let (bucket, sliding) = same_namespace_backends();
+        let bucket_alice = bucket.key_parts("alice");
+        let bucket_bob = bucket.key_parts("bob");
+        let sliding_alice = sliding.key_parts("alice");
+        let sliding_bob = sliding.key_parts("bob");
+
+        assert_eq!(bucket_alice[11], bucket_bob[11]);
+        assert_eq!(sliding_alice[12], sliding_bob[12]);
+        assert_ne!(bucket_alice[11], sliding_alice[12]);
+        assert_ne!(bucket_alice[0], bucket_bob[0]);
+        assert_ne!(sliding_alice[0], sliding_bob[0]);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct RawValkeyState {
+        values: Vec<Option<Vec<u8>>>,
+        pttls: Vec<i64>,
+    }
+
+    async fn raw_valkey_state<const N: usize>(valkey: &ValkeyEval, keys: &[String; N]) -> RawValkeyState {
+        let mut connection = valkey.connection().await.unwrap();
+        let mut values = Vec::with_capacity(N);
+        let mut pttls = Vec::with_capacity(N);
+        for key in keys {
+            let value: Option<Vec<u8>> = redis::cmd("DUMP").arg(key).query_async(&mut connection).await.unwrap();
+            let pttl: i64 = redis::cmd("PTTL").arg(key).query_async(&mut connection).await.unwrap();
+            values.push(value);
+            pttls.push(pttl);
+        }
+        RawValkeyState { values, pttls }
+    }
+
+    fn assert_mismatch_did_not_change_state(before: &RawValkeyState, after: &RawValkeyState) {
+        assert_eq!(
+            after.values, before.values,
+            "a rejected configuration mismatch mutated shared values"
+        );
+        for (before_ttl, after_ttl) in before.pttls.iter().zip(&after.pttls) {
+            match *before_ttl {
+                ttl @ 1.. => {
+                    assert!(
+                        *after_ttl > 0,
+                        "a rejected mismatch expired live state: {before_ttl} -> {after_ttl}"
+                    );
+                    assert!(
+                        *after_ttl <= ttl,
+                        "a rejected mismatch extended a TTL despite performing no mutation: {before_ttl} -> {after_ttl}"
+                    );
+                    assert!(
+                        ttl - *after_ttl < 1_000,
+                        "a rejected mismatch shortened a TTL horizon: {before_ttl} -> {after_ttl}"
+                    );
+                },
+                _ => assert_eq!(after_ttl, before_ttl),
+            }
+        }
+    }
+
+    async fn assert_mismatched_reserve_preserves_state<const N: usize>(
+        owner: &ValkeyEval,
+        keys: &[String; N],
+        mismatched: &impl TokenRateLimitStateBackend,
+        estimate: u64,
+    ) {
+        let before = raw_valkey_state(owner, keys).await;
+        let outcome = mismatched
+            .reserve(ReserveRequest {
+                key: "shared-subject".into(),
+                estimate,
+                now_ms: 0,
+            })
+            .await;
+        assert!(
+            matches!(outcome, Err(BackendError::ConfigurationMismatch)),
+            "configuration skew must fail closed distinctly, got {outcome:?}"
+        );
+        let after = raw_valkey_state(owner, keys).await;
+        assert_mismatch_did_not_change_state(&before, &after);
+    }
+
+    async fn assert_mismatched_reconcile_preserves_state<const N: usize>(
+        owner: &ValkeyEval,
+        keys: &[String; N],
+        mismatched: &impl TokenRateLimitStateBackend,
+        reservation_id: u64,
+        estimate: u64,
+    ) {
+        let before = raw_valkey_state(owner, keys).await;
+        let outcome = mismatched
+            .reconcile(ReconcileRequest {
+                key: "shared-subject".into(),
+                reservation_id,
+                actual: Some(estimate),
+                estimate,
+                now_ms: 0,
+            })
+            .await;
+        assert!(
+            matches!(outcome, Err(BackendError::ConfigurationMismatch)),
+            "configuration-skewed reconciliation must fail before mutation, got {outcome:?}"
+        );
+        let after = raw_valkey_state(owner, keys).await;
+        assert_mismatch_did_not_change_state(&before, &after);
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test constructor keeps each mismatched field explicit"
+    )]
+    fn live_sliding_backend(
+        valkey: &ValkeyEval,
+        namespace: &str,
+        window_ms: u64,
+        capacity: u64,
+        timeout_ms: u64,
+        max_keys: usize,
+        max_active_reservations: usize,
+    ) -> ValkeyTokenRateLimitBackend {
+        ValkeyTokenRateLimitBackend::new(ValkeyBackendConfig {
+            valkey: valkey.clone(),
+            namespace: namespace.into(),
+            rule: "shared-rule".into(),
+            budgets: vec![Budget { window_ms, capacity }],
+            reservation_timeout_ms: timeout_ms,
+            max_keys,
+            max_active_reservations,
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test constructor keeps each mismatched field explicit"
+    )]
+    fn live_bucket_backend(
+        valkey: &ValkeyEval,
+        namespace: &str,
+        capacity: u64,
+        refill_rate: f64,
+        timeout_ms: u64,
+        max_keys: usize,
+        max_active_reservations: usize,
+    ) -> ValkeyTokenBucketBackend {
+        ValkeyTokenBucketBackend::new(ValkeyTokenBucketConfig {
+            valkey: valkey.clone(),
+            namespace: namespace.into(),
+            rule: "shared-rule".into(),
+            capacity,
+            refill_rate,
+            reservation_timeout_ms: timeout_ms,
+            max_keys,
+            max_active_reservations,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one live regression covers every sliding-window fingerprint field and post-mismatch reconciliation"
+    )]
+    async fn live_valkey_sliding_window_rejects_config_skew_before_mutation() {
+        let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+            return;
+        };
+        let valkey = ValkeyEval::new(url).unwrap();
+        let namespace = format!("praxis:test:sw-config-guard:{}", std::process::id());
+        let owner = live_sliding_backend(&valkey, &namespace, 10_000, 5, 5_000, 10, 100);
+        let peer = live_sliding_backend(&valkey, &namespace, 10_000, 5, 5_000, 10, 100);
+        let keys = owner.key_parts("shared-subject");
+
+        let BackendReserve::Admitted { reservation_id, .. } = owner
+            .reserve(ReserveRequest {
+                key: "shared-subject".into(),
+                estimate: 5,
+                now_ms: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("the owning writer must admit its initial reservation")
+        };
+        assert!(
+            matches!(
+                peer.reserve(ReserveRequest {
+                    key: "shared-subject".into(),
+                    estimate: 1,
+                    now_ms: 0
+                })
+                .await,
+                Ok(BackendReserve::Denied { .. })
+            ),
+            "an independent writer with the same fingerprint must share the exhausted budget"
+        );
+
+        for mismatched in [
+            live_sliding_backend(&valkey, &namespace, 1_000, 5, 5_000, 10, 100),
+            live_sliding_backend(&valkey, &namespace, 10_000, 6, 5_000, 10, 100),
+            live_sliding_backend(&valkey, &namespace, 10_000, 5, 1_000, 10, 100),
+            live_sliding_backend(&valkey, &namespace, 10_000, 5, 5_000, 11, 100),
+            live_sliding_backend(&valkey, &namespace, 10_000, 5, 5_000, 10, 101),
+        ] {
+            assert_mismatched_reserve_preserves_state(&valkey, &keys, &mismatched, 1).await;
+        }
+        let mismatched_reconciler = live_sliding_backend(&valkey, &namespace, 1_000, 5, 5_000, 10, 100);
+        assert_mismatched_reconcile_preserves_state(&valkey, &keys, &mismatched_reconciler, reservation_id, 5).await;
+
+        assert_eq!(
+            peer.reconcile(ReconcileRequest {
+                key: "shared-subject".into(),
+                reservation_id,
+                actual: Some(5),
+                estimate: 5,
+                now_ms: 0,
+            })
+            .await
+            .unwrap(),
+            BackendSettlement::Applied {
+                actual: 5,
+                refund: 0,
+                overage: 0,
+            },
+            "the original reservation must still reconcile through a same-config writer after rejected skew"
+        );
+        assert_eq!(
+            owner
+                .reconcile(ReconcileRequest {
+                    key: "shared-subject".into(),
+                    reservation_id,
+                    actual: Some(5),
+                    estimate: 5,
+                    now_ms: 0,
+                })
+                .await
+                .unwrap(),
+            BackendSettlement::Noop,
+            "the reservation must reconcile exactly once"
+        );
+        assert!(matches!(
+            owner
+                .reserve(ReserveRequest {
+                    key: "shared-subject".into(),
+                    estimate: 1,
+                    now_ms: 0
+                })
+                .await,
+            Ok(BackendReserve::Denied { .. })
+        ));
+
+        let reverse_namespace = format!("{namespace}:reverse");
+        let short_owner = live_sliding_backend(&valkey, &reverse_namespace, 1_000, 5, 5_000, 10, 100);
+        short_owner
+            .reserve(ReserveRequest {
+                key: "shared-subject".into(),
+                estimate: 1,
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        let reverse_keys = short_owner.key_parts("shared-subject");
+        let long_writer = live_sliding_backend(&valkey, &reverse_namespace, 10_000, 5, 5_000, 10, 100);
+        assert_mismatched_reserve_preserves_state(&valkey, &reverse_keys, &long_writer, 1).await;
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the live regression keeps the cross-writer reserve/reconcile sequence visible"
+    )]
+    async fn live_valkey_sliding_window_uses_canonical_budget_order_and_maximum_retention() {
+        let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+            return;
+        };
+        let valkey = ValkeyEval::new(url).unwrap();
+        let namespace = format!("praxis:test:sw-canonical-budgets:{}", std::process::id());
+        let long = Budget {
+            window_ms: 10_000,
+            capacity: 5,
+        };
+        let short = Budget {
+            window_ms: 10,
+            capacity: 100,
+        };
+        let backend = |budgets| {
+            ValkeyTokenRateLimitBackend::new(ValkeyBackendConfig {
+                valkey: valkey.clone(),
+                namespace: namespace.clone(),
+                rule: "shared-rule".into(),
+                budgets,
+                reservation_timeout_ms: 5_000,
+                max_keys: 10,
+                max_active_reservations: 100,
+            })
+        };
+        let owner = backend(vec![long.clone(), short.clone()]);
+        let peer = backend(vec![short, long]);
+        let keys = owner.key_parts("shared-subject");
+
+        let BackendReserve::Admitted { reservation_id, .. } = owner
+            .reserve(ReserveRequest {
+                key: "shared-subject".into(),
+                estimate: 5,
+                now_ms: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("the owning writer must admit its initial reservation")
+        };
+        owner
+            .reconcile(ReconcileRequest {
+                key: "shared-subject".into(),
+                reservation_id,
+                actual: Some(5),
+                estimate: 5,
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        assert!(matches!(
+            peer.reserve(ReserveRequest {
+                key: "shared-subject".into(),
+                estimate: 1,
+                now_ms: 0,
+            })
+            .await,
+            Ok(BackendReserve::Denied {
+                reason: DenialReason::WindowCapacity,
+                ..
+            })
+        ));
+        let mut connection = valkey.connection().await.unwrap();
+        let settled_entries: usize = redis::cmd("ZCARD")
+            .arg(&keys[1])
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            settled_entries, 1,
+            "the short budget must not prune history still required by the long budget"
+        );
+    }
+
+    async fn set_long_ttl(valkey: &ValkeyEval, key: &str) -> i64 {
+        let mut connection = valkey.connection().await.unwrap();
+        let changed: bool = redis::cmd("PEXPIRE")
+            .arg(key)
+            .arg(120_000)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(changed, "test key {key} must exist before its TTL is extended");
+        redis::cmd("PTTL").arg(key).query_async(&mut connection).await.unwrap()
+    }
+
+    async fn assert_long_ttl_was_not_shortened(valkey: &ValkeyEval, key: &str, before: i64) {
+        let mut connection = valkey.connection().await.unwrap();
+        let after: i64 = redis::cmd("PTTL").arg(key).query_async(&mut connection).await.unwrap();
+        assert!(after <= before, "TTL unexpectedly grew for {key}: {before} -> {after}");
+        assert!(
+            after > 100_000,
+            "an accounting operation shortened the deliberately longer TTL for {key}: {before} -> {after}"
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the live regression covers both reserve and reconcile TTL updates"
+    )]
+    async fn live_valkey_sliding_window_reserve_and_reconcile_never_shorten_ttls() {
+        let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+            return;
+        };
+        let valkey = ValkeyEval::new(url).unwrap();
+        let namespace = format!("praxis:test:sw-monotonic-ttl:{}", std::process::id());
+        let backend = live_sliding_backend(&valkey, &namespace, 10_000, 10, 1_000, 10, 100);
+        let keys = backend.key_parts("shared-subject");
+        let BackendReserve::Admitted { reservation_id, .. } = backend
+            .reserve(ReserveRequest {
+                key: "shared-subject".into(),
+                estimate: 1,
+                now_ms: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("the initial reservation must be admitted")
+        };
+
+        let mut before = Vec::new();
+        for key in [&keys[2], &keys[7]] {
+            before.push((key, set_long_ttl(&valkey, key).await));
+        }
+        backend
+            .reserve(ReserveRequest {
+                key: "shared-subject".into(),
+                estimate: 1,
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        for (key, ttl) in before {
+            assert_long_ttl_was_not_shortened(&valkey, key, ttl).await;
+        }
+
+        let mut before = Vec::new();
+        for key in [&keys[2], &keys[7]] {
+            before.push((key, set_long_ttl(&valkey, key).await));
+        }
+        backend
+            .reconcile(ReconcileRequest {
+                key: "shared-subject".into(),
+                reservation_id,
+                actual: Some(1),
+                estimate: 1,
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        for (key, ttl) in before {
+            assert_long_ttl_was_not_shortened(&valkey, key, ttl).await;
+        }
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one live regression covers every token-bucket fingerprint field and post-mismatch reconciliation"
+    )]
+    async fn live_valkey_token_bucket_rejects_config_skew_before_mutation() {
+        let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+            return;
+        };
+        let valkey = ValkeyEval::new(url).unwrap();
+        let namespace = format!("praxis:test:tb-config-guard:{}", std::process::id());
+        let owner = live_bucket_backend(&valkey, &namespace, 10, 1.0, 5_000, 10, 100);
+        let peer = live_bucket_backend(&valkey, &namespace, 10, 1.0, 5_000, 10, 100);
+        let keys = owner.key_parts("shared-subject");
+
+        let BackendReserve::Admitted { reservation_id, .. } = owner
+            .reserve(ReserveRequest {
+                key: "shared-subject".into(),
+                estimate: 10,
+                now_ms: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("the owning writer must admit its initial reservation")
+        };
+        assert!(
+            matches!(
+                peer.reserve(ReserveRequest {
+                    key: "shared-subject".into(),
+                    estimate: 10,
+                    now_ms: 0
+                })
+                .await,
+                Ok(BackendReserve::Denied { .. })
+            ),
+            "an independent writer with the same fingerprint must share the depleted bucket"
+        );
+
+        for mismatched in [
+            live_bucket_backend(&valkey, &namespace, 11, 1.0, 5_000, 10, 100),
+            live_bucket_backend(&valkey, &namespace, 10, 10.0, 5_000, 10, 100),
+            live_bucket_backend(&valkey, &namespace, 10, 1.0, 1_000, 10, 100),
+            live_bucket_backend(&valkey, &namespace, 10, 1.0, 5_000, 11, 100),
+            live_bucket_backend(&valkey, &namespace, 10, 1.0, 5_000, 10, 101),
+        ] {
+            assert_mismatched_reserve_preserves_state(&valkey, &keys, &mismatched, 1).await;
+        }
+        let mismatched_reconciler = live_bucket_backend(&valkey, &namespace, 10, 10.0, 5_000, 10, 100);
+        assert_mismatched_reconcile_preserves_state(&valkey, &keys, &mismatched_reconciler, reservation_id, 10).await;
+
+        assert_eq!(
+            peer.reconcile(ReconcileRequest {
+                key: "shared-subject".into(),
+                reservation_id,
+                actual: Some(10),
+                estimate: 10,
+                now_ms: 0,
+            })
+            .await
+            .unwrap(),
+            BackendSettlement::Applied {
+                actual: 10,
+                refund: 0,
+                overage: 0,
+            },
+            "the original reservation must still reconcile through a same-config writer after rejected skew"
+        );
+        assert_eq!(
+            owner
+                .reconcile(ReconcileRequest {
+                    key: "shared-subject".into(),
+                    reservation_id,
+                    actual: Some(10),
+                    estimate: 10,
+                    now_ms: 0,
+                })
+                .await
+                .unwrap(),
+            BackendSettlement::Noop,
+            "the reservation must reconcile exactly once"
+        );
+        assert!(matches!(
+            owner
+                .reserve(ReserveRequest {
+                    key: "shared-subject".into(),
+                    estimate: 10,
+                    now_ms: 0
+                })
+                .await,
+            Ok(BackendReserve::Denied { .. })
+        ));
+
+        let reverse_namespace = format!("{namespace}:reverse");
+        let fast_owner = live_bucket_backend(&valkey, &reverse_namespace, 10, 10.0, 5_000, 10, 100);
+        fast_owner
+            .reserve(ReserveRequest {
+                key: "shared-subject".into(),
+                estimate: 1,
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        let reverse_keys = fast_owner.key_parts("shared-subject");
+        let slow_writer = live_bucket_backend(&valkey, &reverse_namespace, 10, 1.0, 5_000, 10, 100);
+        assert_mismatched_reserve_preserves_state(&valkey, &reverse_keys, &slow_writer, 1).await;
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the live regression covers both reserve and reconcile TTL updates"
+    )]
+    async fn live_valkey_token_bucket_reserve_and_reconcile_never_shorten_ttls() {
+        let Ok(url) = std::env::var("TOKEN_RATE_LIMIT_VALKEY_URL") else {
+            return;
+        };
+        let valkey = ValkeyEval::new(url).unwrap();
+        let namespace = format!("praxis:test:tb-monotonic-ttl:{}", std::process::id());
+        let backend = live_bucket_backend(&valkey, &namespace, 10, 1.0, 1_000, 10, 100);
+        let keys = backend.key_parts("shared-subject");
+        let BackendReserve::Admitted { reservation_id, .. } = backend
+            .reserve(ReserveRequest {
+                key: "shared-subject".into(),
+                estimate: 1,
+                now_ms: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("the initial reservation must be admitted")
+        };
+
+        let mut before = Vec::new();
+        for key in [&keys[0], &keys[1], &keys[6]] {
+            before.push((key, set_long_ttl(&valkey, key).await));
+        }
+        backend
+            .reserve(ReserveRequest {
+                key: "shared-subject".into(),
+                estimate: 1,
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        for (key, ttl) in before {
+            assert_long_ttl_was_not_shortened(&valkey, key, ttl).await;
+        }
+
+        let mut before = Vec::new();
+        for key in [&keys[0], &keys[1], &keys[6]] {
+            before.push((key, set_long_ttl(&valkey, key).await));
+        }
+        backend
+            .reconcile(ReconcileRequest {
+                key: "shared-subject".into(),
+                reservation_id,
+                actual: Some(1),
+                estimate: 1,
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        for (key, ttl) in before {
+            assert_long_ttl_was_not_shortened(&valkey, key, ttl).await;
+        }
+    }
+
     #[tokio::test]
     #[expect(
         clippy::too_many_lines,
@@ -2064,7 +2824,7 @@ mod tests {
 
         let keys = backend.key_parts("alice");
         let mut connection = backend.valkey.connection().await.unwrap();
-        for key in &keys[7..] {
+        for key in &keys[7..12] {
             let ttl_ms: i64 = redis::cmd("PTTL").arg(key).query_async(&mut connection).await.unwrap();
             assert!(ttl_ms > 0, "rule telemetry key {key} must expire, got PTTL={ttl_ms}");
             assert!(
@@ -2072,6 +2832,15 @@ mod tests {
                 "rule telemetry key {key} outlived its state: PTTL={ttl_ms}"
             );
         }
+        let config_ttl_ms: i64 = redis::cmd("PTTL")
+            .arg(&keys[12])
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            config_ttl_ms, -1,
+            "accounting configuration must persist until an explicit reset"
+        );
     }
 
     #[tokio::test]
@@ -2223,10 +2992,19 @@ mod tests {
 
         let keys = backend.key_parts("alice");
         let mut connection = backend.valkey.connection().await.unwrap();
-        for key in &keys[6..] {
+        for key in &keys[6..11] {
             let ttl_ms: i64 = redis::cmd("PTTL").arg(key).query_async(&mut connection).await.unwrap();
             assert!(ttl_ms > 0, "rule telemetry key {key} must expire, got PTTL={ttl_ms}");
         }
+        let config_ttl_ms: i64 = redis::cmd("PTTL")
+            .arg(&keys[11])
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            config_ttl_ms, -1,
+            "accounting configuration must persist until an explicit reset"
+        );
     }
 
     #[tokio::test]
