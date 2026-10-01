@@ -45,16 +45,8 @@ const PLATFORM_CEILING: u64 = 10_240;
 /// when it is low. Returns the soft limit now in effect, or `None` when the
 /// platform does not report one.
 #[cfg(unix)]
-#[expect(
-    clippy::allow_attributes,
-    reason = "the lint only fires with some tracing feature sets"
-)]
-#[allow(
-    clippy::cognitive_complexity,
-    reason = "tracing macro expansion varies with enabled features; kept identical to the praxis original"
-)]
 pub(crate) fn apply(config: &Config) -> Option<u64> {
-    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    use nix::sys::resource::{Resource, getrlimit};
 
     let (soft, hard) = match getrlimit(Resource::RLIMIT_NOFILE) {
         Ok(limits) => limits,
@@ -75,17 +67,26 @@ pub(crate) fn apply(config: &Config) -> Option<u64> {
         );
     }
 
-    let current = if plan.target == soft {
-        soft
-    } else if let Err(errno) = setrlimit(Resource::RLIMIT_NOFILE, plan.target, hard) {
-        warn!(%errno, soft, target = plan.target, "cannot set the open file limit; keeping the current one");
-        soft
-    } else {
-        plan.target
-    };
+    let current = set_soft_limit(soft, hard, plan.target);
     info!(previous = soft, current, hard, "open file limit set");
     warn_if_low(config, current);
     Some(current)
+}
+
+/// Move the soft limit from `soft` to `target`. Returns the soft limit now in
+/// effect, which stays `soft` when the platform refuses the change.
+#[cfg(unix)]
+fn set_soft_limit(soft: u64, hard: u64, target: u64) -> u64 {
+    use nix::sys::resource::{Resource, setrlimit};
+
+    if target == soft {
+        return soft;
+    }
+    if let Err(errno) = setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
+        warn!(%errno, soft, target, "cannot set the open file limit; keeping the current one");
+        return soft;
+    }
+    target
 }
 
 /// Warn when `limit` is below what `config` can need at peak.
