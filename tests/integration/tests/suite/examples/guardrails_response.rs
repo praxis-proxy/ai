@@ -9,8 +9,12 @@ use std::collections::HashMap;
 use praxis_test_utils::{
     Backend, BackendGuard, free_port, http_post, start_backend_with_shutdown, start_capturing_backend, start_proxy,
 };
+use tempfile::TempDir;
 
-use super::load_example_config;
+use super::{
+    guardrails::{set_token_file, write_token_file},
+    load_example_config,
+};
 
 // -----------------------------------------------------------------------------
 // Helpers
@@ -55,12 +59,19 @@ fn chat_backend(content: &str) -> BackendGuard {
         .start_with_shutdown()
 }
 
-fn load_response_config(proxy_port: u16, backend_port: u16, nemo_port: u16) -> praxis_core::config::Config {
-    load_example_config(
+/// Load `nemo-guardrails-response.yaml` with its `service_account_token`
+/// filter pointed at a freshly written token file, so `start_proxy` can
+/// build the `nemo-outbound` chain. Keep the returned [`TempDir`] alive for
+/// the duration of the test.
+fn load_response_config(proxy_port: u16, backend_port: u16, nemo_port: u16) -> (TempDir, praxis_core::config::Config) {
+    let (token_dir, token_path) = write_token_file("sa-jwt\n");
+    let mut config = load_example_config(
         "nemo-guardrails-response.yaml",
         proxy_port,
         HashMap::from([("127.0.0.1:3000", backend_port), ("127.0.0.1:3001", nemo_port)]),
-    )
+    );
+    set_token_file(&mut config, &token_path);
+    (token_dir, config)
 }
 
 // -----------------------------------------------------------------------------
@@ -69,7 +80,7 @@ fn load_response_config(proxy_port: u16, backend_port: u16, nemo_port: u16) -> p
 
 #[test]
 fn response_guardrails_config_parses_correctly() {
-    let config = load_response_config(free_port(), 29990, 29991);
+    let (_token_dir, config) = load_response_config(free_port(), 29990, 29991);
     assert_eq!(config.listeners.len(), 1, "should have 1 listener");
 }
 
@@ -80,7 +91,7 @@ fn response_guardrails_pass_forwards_upstream_body() {
     let backend = chat_backend("Hello! I'm doing well.");
     let nemo = start_capturing_backend(r#"{"status":"passed","content":"Hello! I'm doing well."}"#);
     let proxy_port = free_port();
-    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let (_token_dir, config) = load_response_config(proxy_port, backend.port(), nemo.port());
     let proxy = start_proxy(&config);
 
     let (status, body) = http_post(
@@ -120,7 +131,7 @@ fn response_guardrails_block_replaces_body() {
     let backend = chat_backend("toxic content that should be blocked");
     let nemo = nemo_mock(r#"{"status":"blocked","content":"blocked","rail":"toxicity"}"#);
     let proxy_port = free_port();
-    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let (_token_dir, config) = load_response_config(proxy_port, backend.port(), nemo.port());
     let proxy = start_proxy(&config);
 
     let (status, body) = http_post(
@@ -156,7 +167,7 @@ fn response_guardrails_provider_http_error_replaces_body() {
         .header("Content-Type", "application/json")
         .start_with_shutdown();
     let proxy_port = free_port();
-    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let (_token_dir, config) = load_response_config(proxy_port, backend.port(), nemo.port());
     let proxy = start_proxy(&config);
 
     let (status, body) = http_post(
@@ -180,7 +191,7 @@ fn response_guardrails_provider_down_replaces_body() {
     let backend = chat_backend("hello world, this is a safe response from the upstream");
     let dead_port = free_port();
     let proxy_port = free_port();
-    let config = load_response_config(proxy_port, backend.port(), dead_port);
+    let (_token_dir, config) = load_response_config(proxy_port, backend.port(), dead_port);
     let proxy = start_proxy(&config);
 
     let (status, body) = http_post(
@@ -207,7 +218,7 @@ fn response_guardrails_non_chat_body_replaces_body() {
     let backend = start_backend_with_shutdown(&long_text);
     let nemo = nemo_mock(r#"{"status":"passed","content":"ok"}"#);
     let proxy_port = free_port();
-    let config = load_response_config(proxy_port, backend.port(), nemo.port());
+    let (_token_dir, config) = load_response_config(proxy_port, backend.port(), nemo.port());
     let proxy = start_proxy(&config);
 
     let (status, body) = http_post(
