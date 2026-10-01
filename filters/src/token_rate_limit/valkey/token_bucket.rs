@@ -31,7 +31,7 @@
 //!   INCR seq                    (an id wasted on a denial or an abort is harmless)
 //!   -> refill and decide client-side; on deny: UNWATCH, return Denied
 //! MULTI
-//!   HSET {bucket} tokens last_refill_ms ; PEXPIRE {bucket}
+//!   HSET {bucket} tokens last_refill_ms ; PEXPIRE {bucket} NX ; PEXPIRE {bucket} GT
 //!   SET {bucket}:r:{id} "estimate|now" PX timeout
 //!   ZADD active deadline "rk|id" ; PEXPIRE active NX ; PEXPIRE active GT
 //!   ZADD keys expiry rk ; PEXPIRE keys NX ; PEXPIRE keys GT
@@ -47,7 +47,7 @@
 //! WATCH {bucket} {bucket}:r:{id} ; GET {bucket}:r:{id} ; HMGET {bucket} tokens last_refill_ms
 //!   -> nil: UNWATCH, return Noop (already settled, or abandoned and expired)
 //! MULTI
-//!   HSET {bucket} tokens last_refill_ms ; PEXPIRE {bucket}
+//!   HSET {bucket} tokens last_refill_ms ; PEXPIRE {bucket} NX ; PEXPIRE {bucket} GT
 //!   DEL {bucket}:r:{id} ; ZREM active "rk|id"
 //! EXEC                          (nil: back off and retry)
 //! ```
