@@ -5043,7 +5043,7 @@ fn streaming_failure_snapshot_uses_api_defaults_without_captured_options() {
     }
 }
 
-/// `capture_echoed_options` copies only the whitelisted request options -- never
+/// `capture_echoed_options` retains only the whitelisted request options -- never
 /// `input` or the credentialed `tools` array -- so nothing that could leak a
 /// secret or bloat the snapshot survives the capture.
 #[test]
@@ -5093,6 +5093,126 @@ fn capture_echoed_options_none_without_whitelisted_fields() {
         capture_echoed_options(b"not json").is_none(),
         "an unparseable body captures nothing"
     );
+    assert!(
+        capture_echoed_options(br#"{"model":"x"#).is_none(),
+        "truncated JSON captures nothing"
+    );
+    assert!(
+        capture_echoed_options(b"[]").is_none(),
+        "a non-object body captures nothing"
+    );
+}
+
+/// The cap applies to the serialized value size. A field ending exactly at the
+/// cap survives; one byte beyond it is omitted rather than truncated.
+#[test]
+fn capture_echoed_options_respects_serialized_size_boundary() {
+    for (payload_len, captured_expected) in [
+        (MAX_ECHOED_OPTIONS_BYTES - 3, true),
+        (MAX_ECHOED_OPTIONS_BYTES - 2, true),
+        (MAX_ECHOED_OPTIONS_BYTES - 1, false),
+    ] {
+        let instructions = "x".repeat(payload_len);
+        let body = serde_json::to_vec(&serde_json::json!({"instructions": instructions})).unwrap();
+        let captured = capture_echoed_options(&body);
+        assert_eq!(
+            captured.as_ref().and_then(|value| value["instructions"].as_str()),
+            captured_expected.then_some(instructions.as_str()),
+            "payload length {payload_len} must honor the serialized-size cap"
+        );
+    }
+}
+
+/// Whitelist order, rather than input JSON order, decides which of two fields
+/// fits. A skipped metadata value leaves room for a later small instruction.
+#[test]
+fn capture_echoed_options_preserves_whitelist_order_and_skips_individual_fields() {
+    let metadata = serde_json::json!({"pad": "x".repeat(MAX_ECHOED_OPTIONS_BYTES - 64)});
+    let body = serde_json::to_vec(&serde_json::json!({
+        "instructions": "y".repeat(100),
+        "metadata": metadata,
+    }))
+    .unwrap();
+    let captured = capture_echoed_options(&body).expect("metadata fits independently");
+    assert_eq!(
+        captured["metadata"], metadata,
+        "metadata precedes instructions in the whitelist"
+    );
+    assert!(
+        captured.get("instructions").is_none(),
+        "the later field exceeds the aggregate cap"
+    );
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "metadata": {"pad": "x".repeat(MAX_ECHOED_OPTIONS_BYTES)},
+        "instructions": "small",
+    }))
+    .unwrap();
+    let captured = capture_echoed_options(&body).expect("a later small field survives");
+    assert!(captured.get("metadata").is_none(), "the oversized field is skipped");
+    assert_eq!(
+        captured["instructions"], "small",
+        "capture continues after a skipped field"
+    );
+}
+
+/// A near-cap field can be transferred from the disposable parse tree without
+/// allocating a second copy of its string. Compare the complete capture path
+/// with the previous get-and-clone implementation on the same request bytes.
+#[test]
+fn capture_echoed_options_moves_near_cap_field_without_deep_clone() {
+    fn legacy_capture(body: &[u8]) -> Option<serde_json::Value> {
+        let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+        let obj = parsed.as_object()?;
+        let mut total = 0_usize;
+        let mut captured = serde_json::Map::new();
+        for &field in ECHOED_REQUEST_FIELDS {
+            let Some(value) = obj.get(field) else {
+                continue;
+            };
+            let len = serialized_len(value).unwrap_or(usize::MAX);
+            if total.saturating_add(len) > MAX_ECHOED_OPTIONS_BYTES {
+                continue;
+            }
+            total += len;
+            captured.insert(field.to_owned(), value.clone());
+        }
+        (!captured.is_empty()).then_some(serde_json::Value::Object(captured))
+    }
+
+    for (field, value) in [
+        (
+            "instructions",
+            serde_json::json!("x".repeat(MAX_ECHOED_OPTIONS_BYTES - 2)),
+        ),
+        (
+            "metadata",
+            serde_json::json!({"pad": "x".repeat(MAX_ECHOED_OPTIONS_BYTES - 64)}),
+        ),
+    ] {
+        let mut request = serde_json::Map::new();
+        request.insert(field.to_owned(), value);
+        let body = serde_json::to_vec(&serde_json::Value::Object(request)).unwrap();
+        assert_eq!(
+            capture_echoed_options(&body),
+            legacy_capture(&body),
+            "{field} capture remains equivalent"
+        );
+
+        let moved = allocation_counter::measure(|| {
+            drop(std::hint::black_box(capture_echoed_options(&body)));
+        });
+        let cloned = allocation_counter::measure(|| {
+            drop(std::hint::black_box(legacy_capture(&body)));
+        });
+        assert!(
+            cloned.bytes_total.saturating_sub(moved.bytes_total)
+                >= u64::try_from(MAX_ECHOED_OPTIONS_BYTES - 64).expect("cap fits in u64"),
+            "moving near-cap {field} must save its deep copy: moved={} cloned={} bytes",
+            moved.bytes_total,
+            cloned.bytes_total
+        );
+    }
 }
 
 /// A single oversized field (`instructions`) is dropped from the capture so it
