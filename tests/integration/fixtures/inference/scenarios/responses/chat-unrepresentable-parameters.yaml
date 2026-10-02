@@ -1,6 +1,6 @@
 version: 1
 id: responses/chat-unrepresentable-parameters
-description: Responses parameters the Chat Completions adapter cannot represent fail closed instead of being silently downgraded or dropped.
+description: Responses parameters the managed Chat pipeline cannot honor fail closed at their owning validation or translation boundary.
 protocol: openai_responses
 example_config: openai/responses/responses-to-chat-completions.yaml
 upstream_authority: 127.0.0.1:3001

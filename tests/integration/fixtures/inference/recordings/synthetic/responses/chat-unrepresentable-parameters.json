@@ -112,7 +112,7 @@
             "value": {
               "error": {
                 "code": "invalid_request_error",
-                "message": "Responses `prompt` has no Chat Completions representation: got object, this adapter supports only `prompt` null",
+                "message": "prompt templates are supported only for OpenAI-owned upstreams",
                 "param": null,
                 "type": "invalid_request_error"
               }

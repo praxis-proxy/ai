@@ -848,6 +848,7 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
         pass
 
     def _forward(self):
+        """Capture the request and serve a synthetic or forwarded response."""
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         request_body = None
@@ -948,9 +949,32 @@ class ResponsesWitnessHandler(BaseHTTPRequestHandler):
             "background": False,
             "output": [],
         }
-        payload = json.dumps(response).encode()
+
+        if request_body.get("stream"):
+            created = {**response, "status": "in_progress"}
+            events = [
+                {
+                    "type": "response.created",
+                    "sequence_number": 0,
+                    "response": created,
+                },
+                {
+                    "type": "response.completed",
+                    "sequence_number": 1,
+                    "response": response,
+                },
+            ]
+            payload = b"".join(
+                f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+                for event in events
+            ) + b"data: [DONE]\n\n"
+            content_type = "text/event-stream"
+        else:
+            payload = json.dumps(response).encode()
+            content_type = "application/json"
+
         self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -3452,12 +3476,30 @@ class TestOpenAIResponsesVLLM:
         )
         assert response.status == "completed"
 
+        stream = client.responses.create(
+            model="gpt-5",
+            input="Stream the OpenAI-owned prompt template.",
+            prompt=prompt,
+            store=False,
+            stream=True,
+        )
+        events = list(stream)
+        assert [event.type for event in events] == [
+            "response.created",
+            "response.completed",
+        ]
+        assert events[-1].response.status == "completed"
+
         prompt_creates = [
             body for body in forwarded if body.get("prompt") is not None
         ]
-        assert len(prompt_creates) == 1
-        assert prompt_creates[0]["model"] == "gpt-5"
-        assert prompt_creates[0]["prompt"] == prompt
+        assert len(prompt_creates) == 2
+        assert {body.get("stream", False) for body in prompt_creates} == {
+            False,
+            True,
+        }
+        assert all(body["model"] == "gpt-5" for body in prompt_creates)
+        assert all(body["prompt"] == prompt for body in prompt_creates)
 
     @pytest.mark.critical_vllm
     @requires_real_inference
