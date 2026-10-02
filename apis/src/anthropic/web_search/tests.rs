@@ -1538,6 +1538,51 @@ fn managed_reentry_matches_borrowed_response_classification() {
             "managed",
         ),
         (
+            "sequence-shaped tool block",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[["tool_use","WebSearch","toolu_1",{"query":"potato"}]]}"#,
+            "managed",
+        ),
+        (
+            "sequence-shaped input",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"WebSearch","id":"toolu_1","input":["potato"]}]}"#,
+            "managed",
+        ),
+        (
+            "sequence-shaped block and input",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[["tool_use","WebSearch","toolu_1",["potato"]]]}"#,
+            "managed",
+        ),
+        (
+            "normal and sequence-shaped tools are multiple calls",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"WebSearch","id":"toolu_1","input":{"query":"potato"}},["tool_use","Other","toolu_2",{}]]}"#,
+            "done",
+        ),
+        (
+            "short sequence-shaped block is ignored",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[["tool_use","WebSearch","toolu_1"]]}"#,
+            "done",
+        ),
+        (
+            "long sequence-shaped block is ignored",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[["tool_use","WebSearch","toolu_1",{"query":"potato"},"extra"]]}"#,
+            "done",
+        ),
+        (
+            "short sequence-shaped input is invalid",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"WebSearch","id":"toolu_1","input":[]}]}"#,
+            "invalid",
+        ),
+        (
+            "long sequence-shaped input is invalid",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"WebSearch","id":"toolu_1","input":["potato","extra"]}]}"#,
+            "invalid",
+        ),
+        (
+            "sequence-shaped block with duplicate query is invalid",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[["tool_use","WebSearch","toolu_1",{"query":"potato","query":"tomato"}]]}"#,
+            "invalid",
+        ),
+        (
             "malformed JSON",
             br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":["#,
             "done",

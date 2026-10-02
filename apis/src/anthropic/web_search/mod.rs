@@ -164,7 +164,7 @@ impl TextField<'_> {
     }
 }
 
-/// Borrowed input object for a candidate managed search.
+/// Borrowed input fields for a candidate managed search.
 #[derive(Deserialize)]
 struct SearchInput<'a> {
     /// Candidate search query.
@@ -172,13 +172,13 @@ struct SearchInput<'a> {
     query: Option<TextField<'a>>,
 }
 
-/// A search input object or an ignored value of another type.
+/// A parsed search input or an ignored value.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum InputField<'a> {
-    /// Parsed input object.
+    /// Parsed search input.
     Input(#[serde(borrow)] SearchInput<'a>),
-    /// Input with a non-object value.
+    /// Input that could not be parsed as a search input.
     Other(IgnoredAny),
 }
 
@@ -199,13 +199,13 @@ struct ResponseBlock<'a> {
     input: Option<InputField<'a>>,
 }
 
-/// A response content object or an ignored value of another type.
+/// A parsed response content block or an ignored value.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ContentField<'a> {
     /// Parsed content block.
     Block(#[serde(borrow)] ResponseBlock<'a>),
-    /// Non-object content value.
+    /// Content value that could not be parsed as a response block.
     Other(IgnoredAny),
 }
 
@@ -363,10 +363,29 @@ impl<'de> Visitor<'de> for TrackedValueVisitor {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let mut values = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-        while let Some(value) = seq.next_element()? {
-            values.push(value);
+        let mut input_valid = true;
+        loop {
+            if self.scope == TrackedScope::Block && values.len() == 3 {
+                let Some(input) = seq.next_element_seed(TrackedValueSeed {
+                    scope: TrackedScope::Input,
+                })?
+                else {
+                    break;
+                };
+                input_valid &= input.valid;
+                values.push(input.value);
+            } else {
+                let Some(value) = seq.next_element()? else {
+                    break;
+                };
+                values.push(value);
+            }
         }
-        Ok(Self::plain(Value::Array(values)))
+        Ok(TrackedContentValue {
+            value: Value::Array(values),
+            valid: true,
+            input_valid,
+        })
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
@@ -1440,24 +1459,38 @@ fn reentry_tool_call(field: &TrackedContentValue) -> Option<ToolCall<'_>> {
     if !field.valid {
         return None;
     }
-    let block = field.value.as_object()?;
-    if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+    let (kind, name, id, input) = match &field.value {
+        Value::Object(block) => (
+            block.get("type").and_then(Value::as_str),
+            block.get("name").and_then(Value::as_str),
+            block.get("id").and_then(Value::as_str),
+            block.get("input"),
+        ),
+        Value::Array(block) => {
+            let [kind, name, id, input] = block.as_slice() else {
+                return None;
+            };
+            (kind.as_str(), name.as_str(), id.as_str(), Some(input))
+        },
+        _ => return None,
+    };
+    if kind != Some("tool_use") {
         return None;
     }
-    let query = if field.input_valid {
-        block
-            .get("input")
-            .and_then(Value::as_object)
-            .and_then(|input| input.get("query"))
-            .and_then(Value::as_str)
-    } else {
-        None
-    };
-    Some(ToolCall {
-        name: block.get("name").and_then(Value::as_str),
-        id: block.get("id").and_then(Value::as_str),
-        query,
-    })
+    let query = if field.input_valid { reentry_query(input) } else { None };
+    Some(ToolCall { name, id, query })
+}
+
+/// Read a query from either map or sequence form of Serde's `SearchInput`.
+fn reentry_query(input: Option<&Value>) -> Option<&str> {
+    match input? {
+        Value::Object(input) => input.get("query").and_then(Value::as_str),
+        Value::Array(input) => match input.as_slice() {
+            [query] => query.as_str(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Append the assistant tool call and matching user result block.
