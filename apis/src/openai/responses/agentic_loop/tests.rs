@@ -449,9 +449,13 @@ fn continuation_headers_keep_order_in_the_legacy_queue() {
         vec![
             (http::header::AUTHORIZATION, "Bearer token".parse().unwrap()),
             (http::header::CONTENT_TYPE, "application/json".parse().unwrap()),
-        ]
+        ],
+        "continuation headers must queue into the legacy list in call order"
     );
-    assert!(ctx.pre_read_mutations.is_empty());
+    assert!(
+        ctx.pre_read_mutations.is_empty(),
+        "an empty ordered log must stay empty when no pre-read mutations exist"
+    );
 }
 
 #[test]
@@ -469,8 +473,16 @@ fn continuation_headers_join_an_active_ordered_log() {
         "application/json".parse().unwrap(),
     );
 
-    assert_eq!(ctx.request_headers_to_set.len(), 2);
-    assert_eq!(ctx.pre_read_mutations.len(), 3);
+    assert_eq!(
+        ctx.request_headers_to_set.len(),
+        2,
+        "both continuation headers must reach the legacy queue"
+    );
+    assert_eq!(
+        ctx.pre_read_mutations.len(),
+        3,
+        "both continuation headers must also join the pre-existing ordered log"
+    );
     for ((name, value), mutation) in ctx
         .request_headers_to_set
         .iter()
@@ -479,10 +491,22 @@ fn continuation_headers_join_an_active_ordered_log() {
         let TrustedHeaderMutation::Set(ordered_name, ordered_value) = mutation else {
             panic!("continuation header must be an ordered Set");
         };
-        assert_eq!((name, value), (ordered_name, ordered_value));
+        assert_eq!(
+            (name, value),
+            (ordered_name, ordered_value),
+            "legacy queue and ordered log must carry identical continuation headers in the same order"
+        );
     }
-    assert_eq!(ctx.request_headers_to_set[0].0, http::header::AUTHORIZATION);
-    assert_eq!(ctx.request_headers_to_set[1].0, http::header::CONTENT_TYPE);
+    assert_eq!(
+        ctx.request_headers_to_set[0].0,
+        http::header::AUTHORIZATION,
+        "the first queued continuation header must be authorization"
+    );
+    assert_eq!(
+        ctx.request_headers_to_set[1].0,
+        http::header::CONTENT_TYPE,
+        "the second queued continuation header must be content-type"
+    );
 }
 
 #[tokio::test]

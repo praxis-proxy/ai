@@ -1668,7 +1668,8 @@ fn translate_call_id_only_when_it_is_a_string_and_public_id_is_missing() {
 
     assert_eq!(
         translate_function_calls_to_file_search(&mut response),
-        vec![0, 1, 2, 3, 4, 5]
+        vec![0, 1, 2, 3, 4, 5],
+        "every file_search function_call must be translated regardless of call_id shape"
     );
     let output = response["output"].as_array().unwrap();
     for (item, expected_id) in output.iter().zip([
@@ -1679,8 +1680,15 @@ fn translate_call_id_only_when_it_is_a_string_and_public_id_is_missing() {
         Some("fc_5"),
         Some("fs_call_6"),
     ]) {
-        assert_eq!(item.get("id").and_then(Value::as_str), expected_id);
-        assert!(item.get("call_id").is_none());
+        assert_eq!(
+            item.get("id").and_then(Value::as_str),
+            expected_id,
+            "public id must derive from a string call_id only when no id is already present"
+        );
+        assert!(
+            item.get("call_id").is_none(),
+            "the private call_id must never remain on the translated item"
+        );
     }
 }
 
