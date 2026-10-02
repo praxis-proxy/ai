@@ -15,9 +15,15 @@ then exercises the Conversations API using the official OpenAI Python
 SDK to verify wire-format compatibility.
 
 Usage:
-    cargo build -p praxis-ai-proxy --features full
-    cargo build -p praxis-test-utils --example conversations_tenant_proxy
-    uv run tests/integration/sdk/openai/test_openai_conversations.py -v
+    cargo build -p praxis-ai-proxy --features full,store-sqlite
+    cargo build -p praxis-test-utils --example conversations_tenant_proxy \
+        --features full,store-sqlite
+    PRAXIS_AI_BIN=target/debug/praxis-ai \
+        uv run tests/integration/sdk/openai/test_openai_conversations.py -v
+
+Both builds need `store-sqlite` explicitly: each crate's `full` feature selects
+`store-postgres` only, so the tenant-isolation proxy below would otherwise
+start with the SQLite backend compiled out and fail to bind.
 """
 
 import base64
@@ -835,6 +841,26 @@ class TestOpenAIConversations:
             )
         assert exc_info.value.status_code == 404, "deleted conversation must hide preserved item rows with 404"
 
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.create(
+                conversation.id,
+                items=[{"type": "message", "role": "user", "content": "too late"}],
+            )
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.create(conversation.id, items=[])
+        assert exc_info.value.status_code == 404, (
+            "an empty item batch must not bypass the missing-parent check"
+        )
+
+        with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.delete(
+                "item_keep",
+                conversation_id=conversation.id,
+            )
+        assert exc_info.value.status_code == 404
+
     def test_same_tenant_other_owner_cannot_access_state(
         self, openai_client, other_owner_client
     ):
@@ -867,6 +893,27 @@ class TestOpenAIConversations:
 
         retrieved = openai_client.conversations.retrieve(conversation.id)
         assert retrieved.metadata["visibility"] == "private", "owner must still see private state unchanged after denied cross-owner access"
+
+    def test_empty_item_batch_preserves_existing_items(self, openai_client):
+        conversation = openai_client.conversations.create(
+            items=[
+                {
+                    "id": "item_empty_keep",
+                    "type": "message",
+                    "role": "user",
+                    "content": "keep me",
+                }
+            ]
+        )
+
+        page = openai_client.conversations.items.create(conversation.id, items=[])
+        assert page.object == "list", "an empty batch must return the list envelope"
+        assert page.data == [], "an empty batch must not create items"
+
+        remaining = openai_client.conversations.items.list(conversation.id)
+        assert [item.id for item in remaining.data] == [
+            "item_empty_keep"
+        ], "an empty batch must leave existing items untouched"
 
     def test_empty_item_list_is_sdk_compatible(self, openai_client):
         conversation = openai_client.conversations.create()

@@ -31,3 +31,7 @@ The same recreate-only policy applies to standalone `openai_response_store`,
 standalone `openai_conversations`, and compatible deployments where the two
 filters share one backend. When a PostgreSQL database contains unrelated data,
 create a new database for Praxis AI rather than dropping the shared database.
+
+For historical pre-#570 data recovery only, see
+[repair duplicate item positions](legacy-item-position-repair.md). That repair
+is not a supported upgrade to schema v5.

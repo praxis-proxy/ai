@@ -193,6 +193,16 @@ pub(crate) fn generate_ddl(tables: &TableNames, dialect: SqlDialect) -> Result<V
     Ok(stmts)
 }
 
+/// Add a repair pointer when legacy duplicate positions prevent index creation.
+pub(crate) fn ddl_error(statement: &str, error: impl std::fmt::Display) -> StoreError {
+    let hint = if statement.starts_with("CREATE UNIQUE INDEX IF NOT EXISTS idx_") && statement.contains("_position ") {
+        "; see docs/store/legacy-item-position-repair.md for pre-index data repair"
+    } else {
+        ""
+    };
+    StoreError::Database(format!("{error}{hint}"))
+}
+
 /// Validate identifiers against `PostgreSQL`-specific DDL constraints.
 ///
 /// `PostgreSQL` truncates identifiers above 63 bytes. The
@@ -326,6 +336,8 @@ fn append_items_ddl(stmts: &mut Vec<String>, i: &str) {
         "CREATE INDEX IF NOT EXISTS idx_{i}_conversation \
          ON {i}(conversation_id, position, item_id)"
     ));
+    // Pre-index databases with duplicate positions need the operator-run repair in
+    // docs/store/legacy-item-position-repair.md before this DDL can succeed.
     stmts.push(format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_{i}_position \
          ON {i}(tenant_id, owner_issuer, owner_subject, conversation_id, position)"
@@ -1083,6 +1095,87 @@ mod tests {
         let long = "a".repeat(MAX_IDENTIFIER_LEN + 1);
         let err = validate_identifier(&long).unwrap_err();
         assert!(err.to_string().contains("exceeds"), "should reject long name: {err}");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_pre_index_duplicate_positions_report_repair_at_startup() {
+        let dir = tempfile::tempdir().expect("tempdir should succeed");
+        let url = format!("sqlite://{}?mode=rwc", dir.path().join("legacy_items.db").display());
+        let initial =
+            crate::SqliteResponseStore::new(&url, "legacy_responses", "legacy_conversations", None, None, None)
+                .await
+                .expect("store without items should initialize");
+        drop(initial);
+
+        let tables = TableNames {
+            responses: "legacy_responses".to_owned(),
+            conversations: "legacy_conversations".to_owned(),
+            items: Some("legacy_items".to_owned()),
+        };
+        let ddl = generate_ddl(&tables, SqlDialect::Sqlite).unwrap();
+        let items_table = ddl
+            .iter()
+            .find(|statement| statement.starts_with("CREATE TABLE IF NOT EXISTS legacy_items "))
+            .expect("items DDL should be generated");
+        let pool = sqlx::SqlitePool::connect(&url)
+            .await
+            .expect("existing database should open");
+        sqlx::query(sqlx::AssertSqlSafe(items_table.as_str()))
+            .execute(&pool)
+            .await
+            .expect("legacy items table should be created without the new index");
+        for id in ["a", "b"] {
+            sqlx::query(
+                "INSERT INTO legacy_items \
+                 (item_id, tenant_id, owner_issuer, owner_subject, conversation_id, item_data, created_at, position) \
+                 VALUES (?, 'tenant', 'issuer', 'subject', 'conv', '{}', 1, 1)",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("legacy store permitted duplicate positions");
+        }
+        pool.close().await;
+
+        let err = crate::SqliteResponseStore::new(
+            &url,
+            "legacy_responses",
+            "legacy_conversations",
+            Some("legacy_items"),
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("new unique index must reject duplicate legacy positions");
+        assert!(
+            err.to_string().contains("docs/store/legacy-item-position-repair.md"),
+            "startup must provide the repair path: {err}"
+        );
+        let pool = sqlx::SqlitePool::connect(&url)
+            .await
+            .expect("database should remain readable");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM legacy_items")
+            .fetch_one(&pool)
+            .await
+            .expect("legacy rows should still exist");
+        assert_eq!(count, 2, "failed startup must not discard legacy rows");
+    }
+
+    #[test]
+    fn position_index_error_points_to_legacy_repair() {
+        let index = "CREATE UNIQUE INDEX IF NOT EXISTS idx_items_position ON items(conversation_id, position)";
+        let err = ddl_error(index, "duplicate position");
+        assert!(
+            err.to_string().contains("docs/store/legacy-item-position-repair.md"),
+            "startup error should identify the operator-run repair: {err}"
+        );
+        let unrelated = ddl_error("CREATE TABLE items (...) ", "syntax error");
+        assert!(
+            !unrelated.to_string().contains("legacy-item-position-repair"),
+            "unrelated SQL errors must not suggest a duplicate-position repair"
+        );
     }
 
     #[test]

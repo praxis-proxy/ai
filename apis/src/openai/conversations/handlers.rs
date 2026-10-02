@@ -355,11 +355,17 @@ pub(super) async fn handle_create_items(
         )?));
     }
 
-    if let Err(e) = store
+    match store
         .create_items_and_sync_messages(conversation_id, &item_records)
         .await
     {
-        return Ok(FilterAction::Reject(store_error_response(&e)?));
+        Ok(()) => {},
+        Err(StoreError::NotFound) => {
+            return Ok(FilterAction::Reject(not_found_response(
+                &conversation_not_found_message(conversation_id),
+            )?));
+        },
+        Err(e) => return Ok(FilterAction::Reject(store_error_response(&e)?)),
     }
     debug!(
         conversation_id,
@@ -521,6 +527,9 @@ pub(super) async fn handle_delete_item(
                 item_id,
             ))?))
         },
+        Err(StoreError::NotFound) => Ok(FilterAction::Reject(not_found_response(
+            &conversation_not_found_message(conversation_id),
+        )?)),
         Err(e) => Ok(FilterAction::Reject(store_error_response(&e)?)),
     }
 }

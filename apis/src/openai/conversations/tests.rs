@@ -4438,6 +4438,50 @@ async fn update_conversation_metadata_concurrent_delete_returns_404() {
 }
 
 #[tokio::test]
+async fn create_items_concurrent_delete_returns_404() {
+    let (filter, store) = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::ConversationDeleted,
+        conversation_exists: true,
+        metadata_update: MetadataUpdateOutcome::Updated,
+    });
+    let req = make_request(Method::POST, "/v1/conversations/conv_gone/items");
+    let mut ctx = conv_ctx(&store, &req);
+    drop(filter.on_request(&mut ctx).await.unwrap());
+    let mut body = Some(Bytes::from_static(
+        br#"{"items":[{"id":"item_1","type":"message","role":"user","content":"hi"}]}"#,
+    ));
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject for deleted conversation, got {action:?}");
+    };
+    assert_eq!(
+        rejection.status, 404,
+        "deletion after the first read must not become a 500"
+    );
+    assert_eq!(rejection_body(&rejection)["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn delete_item_concurrent_delete_returns_404() {
+    let (filter, store) = build_failing_filter(FailingItemStore {
+        append_failure: AppendFailure::ConversationDeleted,
+        conversation_exists: true,
+        metadata_update: MetadataUpdateOutcome::Updated,
+    });
+    let req = make_request(Method::DELETE, "/v1/conversations/conv_gone/items/item_1");
+    let mut ctx = conv_ctx(&store, &req);
+    let action = filter.on_request(&mut ctx).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("expected Reject for deleted conversation, got {action:?}");
+    };
+    assert_eq!(
+        rejection.status, 404,
+        "deletion before the item mutation must not become a 500"
+    );
+    assert_eq!(rejection_body(&rejection)["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
 async fn update_conversation_metadata_store_error_returns_500() {
     // A database failure on the metadata write must propagate as a 500 store
     // error, not a partial success.
@@ -4652,6 +4696,8 @@ enum MetadataUpdateOutcome {
 
 /// Which append-path operation the fault-injecting store forces to error.
 enum AppendFailure {
+    /// The parent row vanished after the handler's initial read.
+    ConversationDeleted,
     /// Fail the item-insert path (`create_conversation_items` and the insert
     /// step of `create_items_and_sync_messages`).
     CreateItems,
@@ -4769,6 +4815,7 @@ impl ConversationItemStore for FailingItemStore {
             AppendFailure::MessageSync => {
                 return Err(StoreError::Database("mock message sync failure".to_owned()));
             },
+            AppendFailure::ConversationDeleted => return Err(StoreError::NotFound),
             AppendFailure::None => {},
         }
         Ok(())
@@ -4835,6 +4882,9 @@ impl ConversationItemStore for FailingItemStore {
         _conversation_id: &str,
         _item_id: &str,
     ) -> Result<bool, StoreError> {
+        if matches!(self.append_failure, AppendFailure::ConversationDeleted) {
+            return Err(StoreError::NotFound);
+        }
         Ok(false)
     }
 }
