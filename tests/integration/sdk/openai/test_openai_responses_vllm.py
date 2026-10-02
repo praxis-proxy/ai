@@ -8632,17 +8632,21 @@ class TestFileResolveOutboundChain:
             store=False,
         )
 
-        assert response.status == "completed"
-        assert len(backend.captured) == 1, backend.captured
+        assert response.status == "completed", "file resolution should complete"
+        assert len(backend.captured) == 1, "one Responses request should reach the backend"
         content = backend.captured[0]["input"][0]["content"]
         assert [part["file_data"] for part in content] == [
             _FILE_RESOLVE_B64,
             _FILE_RESOLVE_B64,
             f"data:text/plain;base64,{_FILE_RESOLVE_B64}",
             f"data:text/plain;base64,{_FILE_RESOLVE_B64}",
-        ]
-        assert len(files_stub.callout_headers) == 2, files_stub.callout_headers
-        assert _FileUrlStubHandler.requests == 1
+        ], "repeated file IDs and URLs should inline in input order"
+        assert len(files_stub.callout_headers) == 2, (
+            "one metadata and one content fetch should serve both file_id parts"
+        )
+        assert _FileUrlStubHandler.requests == 1, (
+            "repeated file_url parts should share one fetch"
+        )
 
 
 # ---------------------------------------------------------------------------

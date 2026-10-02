@@ -685,6 +685,8 @@ mod tests {
         assert!(origin.matches_url(&url), "host matching should be case-insensitive");
     }
 
+    /// Covers host normalization and effective-port comparison from RFC 6454
+    /// Sections 4 and 5.
     #[test]
     fn matches_url_preserves_normalized_host_and_authority_rules() {
         let origin = NormalizedOrigin::parse("https://BÜCHER.example:443").unwrap();
