@@ -44,9 +44,10 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from anthropic import Anthropic
+from anthropic import Anthropic, AuthenticationError
 
 CONFIG_PATH = "examples/configs/anthropic/full-flow-agentic.yaml"
+SCOPED_CONFIG_PATH = "examples/configs/anthropic/web-search-scoped-credentials.yaml"
 TOOL_USE_ID = "toolu_web_search_01"
 FINAL_TEXT = "Potato is a starchy tuber native to the Americas."
 
@@ -453,6 +454,64 @@ def anthropic_client(web_search_stack):
     )
 
 
+@pytest.fixture(scope="module")
+def scoped_credential_client(web_search_stack, request):
+    """Run the shipped per-user credential example through the Anthropic SDK."""
+    proxy_port = _free_port()
+    model_port = web_search_stack["model"].port
+    search_port = web_search_stack["search"].port
+    with open(SCOPED_CONFIG_PATH) as f:
+        config = f.read()
+    for old, new in [
+        ("127.0.0.1:8080", f"127.0.0.1:{proxy_port}"),
+        ('endpoints: ["127.0.0.1:8000"]', f'endpoints: ["127.0.0.1:{model_port}"]'),
+        (
+            "api_key: ${WEB_SEARCH_API_KEY}",
+            f"api_key: test-key\n                base_url: http://127.0.0.1:{search_port}",
+        ),
+        (
+            "allow_private_endpoints: true",
+            "allow_private_endpoints: true\n  allow_private_upstreams: true",
+        ),
+    ]:
+        assert old in config, f"scoped example drift: {old} not found"
+        config = config.replace(old, new)
+
+    config_fd, config_path = tempfile.mkstemp(suffix=".yaml")
+    with os.fdopen(config_fd, "w") as f:
+        f.write(config)
+    log_fd, log_path = tempfile.mkstemp(suffix=".log")
+    log_file = os.fdopen(log_fd, "w")
+    proc = subprocess.Popen(
+        [_find_binary(), "-c", config_path],
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "WEB_SEARCH_API_KEY": "test-key"},
+    )
+    try:
+        _wait_for_proxy(proxy_port)
+        yield Anthropic(
+            base_url=f"http://127.0.0.1:{proxy_port}",
+            api_key="test-anthropic-key",
+            max_retries=0,
+            timeout=10,
+        )
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_file.close()
+        if request.session.testsfailed > 0:
+            with open(log_path) as f:
+                print(f"\n=== Scoped Praxis logs ===\n{f.read()}", file=sys.stderr)
+        os.unlink(config_path)
+        os.unlink(log_path)
+
+
 def _messages_kwargs() -> dict:
     return {
         "model": "openai/gpt-oss-20b",
@@ -549,6 +608,30 @@ class TestAnthropicWebSearch:
         assert len(model.requests) == 2, "streaming loop re-enters the model"
         assert len(search.requests) == 1, "streaming loop dispatches one search"
         assert model.requests[0].get("stream") is True, "the first model round must request streaming transport"
+
+
+class TestAnthropicWebSearchCredential:
+    def test_missing_user_key_surfaces_authentication_error(
+        self, scoped_credential_client, web_search_stack
+    ):
+        model = web_search_stack["model"]
+        search = web_search_stack["search"]
+        model.requests.clear()
+        search.requests.clear()
+
+        with pytest.raises(AuthenticationError) as exc_info:
+            scoped_credential_client.messages.create(
+                **_messages_kwargs(),
+                extra_headers={"x-auth-tenant": "acme", "x-auth-user": "alice"},
+            )
+
+        error = exc_info.value
+        assert error.status_code == 401
+        assert error.body["type"] == "error"
+        assert error.body["error"]["type"] == "authentication_error"
+        assert "brave_search" in error.body["error"]["message"]
+        assert model.requests == [], "missing credential must fail before inference"
+        assert search.requests == [], "missing credential must not reach the provider"
 
 
 if __name__ == "__main__":
