@@ -3353,6 +3353,11 @@ class TestOpenAIResponsesVLLM:
             if body.get("background") is True and body.get("model") == "gpt-5"
         ]
         assert len(background_creates) == 2
+        assert [body.get("input") for body in background_creates] == [
+            "SDK finite background passthrough",
+            "SDK streaming background passthrough",
+        ]
+        assert all(body.get("store") is True for body in background_creates)
         assert {body.get("stream", False) for body in background_creates} == {
             False,
             True,
