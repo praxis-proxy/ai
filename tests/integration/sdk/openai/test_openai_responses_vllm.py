@@ -2156,7 +2156,7 @@ class TestOpenAIResponsesVLLM:
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.retrieve(response.id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "store=false response must not be retrievable"
 
     def test_store_and_retrieve(self, openai_client):
         response = openai_client.responses.create(
@@ -2270,15 +2270,15 @@ class TestOpenAIResponsesVLLM:
         missing_id = "resp_missing_sdk_integration"
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.retrieve(missing_id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "retrieving a missing response must return 404"
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.input_items.list(missing_id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "listing input items for a missing response must return 404"
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.responses.delete(missing_id)
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "deleting a missing response must return 404"
 
     def test_invalid_previous_response_id_is_rejected(self, openai_client):
         with pytest.raises(BadRequestError) as exc_info:
@@ -2288,8 +2288,8 @@ class TestOpenAIResponsesVLLM:
                 previous_response_id="resp_missing_sdk_integration",
                 store=True,
             )
-        assert exc_info.value.status_code == 400
-        assert "resp_missing_sdk_integration" in str(exc_info.value)
+        assert exc_info.value.status_code == 400, "unknown previous_response_id must return 400"
+        assert "resp_missing_sdk_integration" in str(exc_info.value), "error must name the missing previous_response_id"
 
     def test_streaming_validation_failure_returns_json_not_sse(self, openai_client):
         """Issue #1001: a request that fails pre-stream validation must return
@@ -2316,8 +2316,8 @@ class TestOpenAIResponsesVLLM:
                 stream=True,
                 store=True,
             )
-        assert exc_info.value.status_code == 400
-        assert "resp_missing_sdk_integration" in str(exc_info.value)
+        assert exc_info.value.status_code == 400, "stream:true rejection must return 400"
+        assert "resp_missing_sdk_integration" in str(exc_info.value), "error must name the missing previous_response_id"
 
         # Assert the wire shape precisely: a stream:true rejection must be an
         # application/json error envelope, not an SSE error event.
@@ -2333,16 +2333,16 @@ class TestOpenAIResponsesVLLM:
             },
             timeout=10,
         )
-        assert raw.status_code == 400
+        assert raw.status_code == 400, "stream:true pre-stream rejection must return 400"
         content_type = raw.headers.get("content-type", "")
         assert content_type.startswith("application/json"), (
             "a stream:true pre-stream rejection must use application/json, not "
             f"text/event-stream; got: {content_type!r}"
         )
         error = raw.json()["error"]
-        assert isinstance(error["message"], str) and error["message"]
-        assert isinstance(error["type"], str) and error["type"]
-        assert "resp_missing_sdk_integration" in error["message"]
+        assert isinstance(error["message"], str) and error["message"], "error envelope must carry a non-empty message string"
+        assert isinstance(error["type"], str) and error["type"], "error envelope must carry a non-empty type string"
+        assert "resp_missing_sdk_integration" in error["message"], "error message must name the missing previous_response_id"
 
     def test_malformed_request_has_sdk_compatible_error(self, openai_client):
         response = httpx.post(
@@ -2351,12 +2351,12 @@ class TestOpenAIResponsesVLLM:
             json={},
             timeout=10,
         )
-        assert response.status_code == 400
+        assert response.status_code == 400, "malformed request must return 400"
         error = response.json()["error"]
-        assert isinstance(error["message"], str)
-        assert error["message"]
-        assert isinstance(error["type"], str)
-        assert error["type"]
+        assert isinstance(error["message"], str), "error envelope message must be a string"
+        assert error["message"], "error envelope message must be non-empty"
+        assert isinstance(error["type"], str), "error envelope type must be a string"
+        assert error["type"], "error envelope type must be non-empty"
 
     def test_invalid_input_container_is_rejected(self, openai_client):
         with pytest.raises(BadRequestError) as exc_info:
@@ -2365,7 +2365,7 @@ class TestOpenAIResponsesVLLM:
                 input=["not-an-input-item"],
                 store=False,
             )
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "invalid input item must return 400"
 
     @pytest.mark.critical_vllm
     @requires_real_inference
@@ -3037,8 +3037,8 @@ class TestOpenAIResponsesVLLM:
                 conversation="conv_00000000000000000000000000000000",
                 store=True,
             )
-        assert exc_info.value.status_code == 400
-        assert "conv_00000000000000000000000000000000" in str(exc_info.value)
+        assert exc_info.value.status_code == 400, "unknown conversation must return 400"
+        assert "conv_00000000000000000000000000000000" in str(exc_info.value), "error must name the missing conversation id"
 
     def test_streaming_rehydrated_response_echoes_previous_response_id(
         self, openai_client
@@ -3235,7 +3235,7 @@ class TestOpenAIResponsesVLLM:
 
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.responses.retrieve(buffered.id, stream=True)
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "replaying a non-streamed response must return 400"
         assert "replayable" in str(exc_info.value).lower(), str(exc_info.value)
 
     def test_streaming_replay_starting_after_requires_stream(self, openai_client):
@@ -3255,7 +3255,7 @@ class TestOpenAIResponsesVLLM:
 
         with pytest.raises(BadRequestError) as exc_info:
             openai_client.responses.retrieve(response_id, starting_after=0)
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "starting_after without stream must return 400"
 
     def test_streaming_replay_is_owner_scoped(
         self, openai_client, other_owner_openai_client
@@ -3313,7 +3313,7 @@ class TestOpenAIResponsesVLLM:
             )
 
         error = exc_info.value
-        assert error.status_code == 400
+        assert error.status_code == 400, "conflicting history selectors must return 400"
         assert error.body == {
             "code": "mutually_exclusive_parameters",
             "message": (
@@ -3322,7 +3322,7 @@ class TestOpenAIResponsesVLLM:
             ),
             "param": None,
             "type": "invalid_request_error",
-        }
+        }, "error envelope must report mutually_exclusive_parameters"
 
     def test_background_mode_is_rejected_before_inference(self, openai_client):
         with pytest.raises(BadRequestError) as exc_info:
@@ -3333,13 +3333,13 @@ class TestOpenAIResponsesVLLM:
             )
 
         error = exc_info.value
-        assert error.status_code == 400
+        assert error.status_code == 400, "background mode must return 400"
         assert error.body == {
             "code": "invalid_request_error",
             "message": "background mode is not supported",
             "param": None,
             "type": "invalid_request_error",
-        }
+        }, "error envelope must report background mode is unsupported"
 
     def test_openai_bound_background_create_and_stream(self, witness_backend_client):
         """The stock full-flow pipeline preserves OpenAI-owned background creates."""
@@ -3680,7 +3680,7 @@ class TestResponsesReasoningVLLM:
                 store=False,
                 max_output_tokens=64,
             )
-        assert exc_info.value.status_code == 400
+        assert exc_info.value.status_code == 400, "reasoning summary request must return 400"
 
     def test_non_object_reasoning_is_rejected(self, reasoning_client):
         """A proxy-owned `reasoning` field that is neither object nor null is a 400."""
@@ -3695,9 +3695,9 @@ class TestResponsesReasoningVLLM:
             },
             timeout=30,
         )
-        assert response.status_code == 400
+        assert response.status_code == 400, "non-object reasoning must return 400"
         error = response.json()["error"]
-        assert error["type"] == "invalid_request_error"
+        assert error["type"] == "invalid_request_error", "error envelope type must be invalid_request_error"
 
     def test_reasoning_dialect_promotes_raw_reasoning_to_an_item(
         self, reasoning_client,
@@ -3859,8 +3859,8 @@ class TestResponsesCompactionVLLM:
                 ],
                 store=False,
             )
-        assert exc_info.value.status_code == 400
-        assert "compact_threshold" in str(exc_info.value)
+        assert exc_info.value.status_code == 400, "invalid compaction threshold must return 400"
+        assert "compact_threshold" in str(exc_info.value), "error must name the compact_threshold field"
 
     def test_below_threshold_skips_compaction(self, compact_client):
         first = compact_client.responses.create(
@@ -4028,8 +4028,8 @@ class TestResponsesToChatCompletionsVLLM:
                     ],
                     store=False,
                 )
-            assert exc_info.value.status_code == 400
-            assert reason in str(exc_info.value)
+            assert exc_info.value.status_code == 400, "unsupported output must return 400"
+            assert reason in str(exc_info.value), "error message must name the unsupported field"
             assert not forwarded, "unsupported output must not reach the Chat backend"
 
     def test_prompt_template_is_rejected_before_chat_backend(
@@ -4044,9 +4044,11 @@ class TestResponsesToChatCompletionsVLLM:
             )
 
         error = exc_info.value
-        assert error.status_code == 400
-        assert error.type == "invalid_request_error"
-        assert error.param is None
+        assert error.status_code == 400, "prompt template rejection must return 400"
+        assert (
+            error.type == "invalid_request_error"
+        ), "prompt template rejection must be an invalid_request_error"
+        assert error.param is None, "prompt template rejection must not set param"
         assert error.body == {
             "message": (
                 "Responses `prompt` has no Chat Completions representation: "
@@ -4055,7 +4057,7 @@ class TestResponsesToChatCompletionsVLLM:
             "type": "invalid_request_error",
             "param": None,
             "code": "invalid_request_error",
-        }
+        }, "prompt template rejection must return the full invalid_request_error envelope"
 
     def test_finite_response_round_trip(self, chat_streaming_client):
         response = chat_streaming_client.responses.create(
@@ -4349,7 +4351,7 @@ class TestResponsesToChatCompletionsVLLM:
                 input="This request must fail.",
                 store=False,
             )
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, "unknown backend model must surface as 404"
 
     @requires_vllm_compat
     def test_web_search_streams_terminal_round_as_one_logical_response(
@@ -8217,7 +8219,7 @@ def test_invalid_model_raises_not_found_error(openai_client):
             input="Hello",
         )
 
-    assert exc_info.value.status_code == 404
+    assert exc_info.value.status_code == 404, "unknown model must return 404"
 
 
 @pytest.mark.xfail(
@@ -8234,8 +8236,8 @@ def test_invalid_max_tool_calls_raises_bad_request(openai_client):
             max_tool_calls=0,
         )
 
-    assert exc_info.value.status_code == 400
-    assert "max_tool_calls" in str(exc_info.value).lower()
+    assert exc_info.value.status_code == 400, "max_tool_calls=0 must return 400"
+    assert "max_tool_calls" in str(exc_info.value).lower(), "error must name max_tool_calls"
 
 
 @requires_vllm_compat
@@ -8248,8 +8250,8 @@ def test_invalid_temperature_raises_bad_request(openai_client):
             temperature=-1.0,
         )
 
-    assert exc_info.value.status_code == 400
-    assert "temperature" in str(exc_info.value).lower()
+    assert exc_info.value.status_code == 400, "invalid temperature must return 400"
+    assert "temperature" in str(exc_info.value).lower(), "error must name temperature"
 
 
 @requires_vllm_compat
@@ -8269,8 +8271,8 @@ def test_invalid_tool_choice_raises_bad_request(openai_client):
             tool_choice="invalid_choice",
         )
 
-    assert exc_info.value.status_code == 400
-    assert "tool_choice" in str(exc_info.value).lower()
+    assert exc_info.value.status_code == 400, "invalid tool_choice must return 400"
+    assert "tool_choice" in str(exc_info.value).lower(), "error must name tool_choice"
 
 
 def test_null_tool_choice_succeeds_sdk(chat_streaming_client):
@@ -8411,8 +8413,10 @@ def test_malformed_tool_choice_variants_raw_http(
         },
         timeout=30,
     )
-    assert raw.status_code == 400
-    assert "tool_choice" in raw.text.lower() or "invalid" in raw.text.lower()
+    assert raw.status_code == 400, "malformed tool_choice must return 400"
+    assert (
+        "tool_choice" in raw.text.lower() or "invalid" in raw.text.lower()
+    ), "error must identify the invalid tool_choice"
 
 
 # ---------------------------------------------------------------------------

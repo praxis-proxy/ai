@@ -669,9 +669,9 @@ class TestVertexGeminiChatCompletions:
             )
 
         error = exc_info.value
-        assert error.status_code == 429
-        assert error.body["message"] == "Quota exceeded by fake Vertex backend"
-        assert error.body["type"] == "server_error"
+        assert error.status_code == 429, "upstream 429 must surface with its status preserved"
+        assert error.body["message"] == "Quota exceeded by fake Vertex backend", "error body must carry the upstream message"
+        assert error.body["type"] == "server_error", "error envelope type must be server_error"
         request_body = json.loads(FakeVertexGeminiHandler.last_request_body)
         assert request_body["contents"] == [
             {"role": "user", "parts": [{"text": "Trigger upstream error"}]}
@@ -718,7 +718,7 @@ class TestVertexGeminiChatCompletions:
             for chunk in chunks
             if chunk.choices
         )
-        assert content == "partial"
+        assert content == "partial", "valid data before truncation must be preserved"
 
     def test_frames_after_stream_error_are_suppressed(self, openai_client: OpenAI) -> None:
         """An invalid frame makes the stream terminal and drops later frames."""
@@ -736,7 +736,7 @@ class TestVertexGeminiChatCompletions:
             for chunk in chunks
             if chunk.choices
         )
-        assert "must-not-leak" not in content
+        assert "must-not-leak" not in content, "frames after a stream error must not leak to the client"
 
     def test_invalid_include_usage_is_rejected(self, openai_client: OpenAI) -> None:
         """The proxy rejects an invalid include_usage type before Vertex."""
@@ -748,8 +748,8 @@ class TestVertexGeminiChatCompletions:
                 stream_options={"include_usage": "true"},
             )
 
-        assert exc_info.value.status_code == 400
-        assert "stream_options.include_usage" in exc_info.value.body["message"]
+        assert exc_info.value.status_code == 400, "invalid include_usage must return 400"
+        assert "stream_options.include_usage" in exc_info.value.body["message"], "error message must name the rejected stream_options.include_usage field"
 
     def test_malformed_tool_arguments_are_rejected(self, openai_client: OpenAI) -> None:
         """Malformed assistant tool arguments are never replaced with an empty object."""
@@ -774,8 +774,8 @@ class TestVertexGeminiChatCompletions:
                 ],
             )
 
-        assert exc_info.value.status_code == 400
-        assert "arguments are not valid JSON" in exc_info.value.body["message"]
+        assert exc_info.value.status_code == 400, "malformed tool arguments must return 400"
+        assert "arguments are not valid JSON" in exc_info.value.body["message"], "error message must explain the arguments are not valid JSON"
 
     def test_request_body_translation(self, openai_client: OpenAI) -> None:
         """Request is correctly translated from OpenAI to Gemini format."""

@@ -252,8 +252,8 @@ class TestRequestFieldHandling:
 
         assert response.content[0].text == "4"
         [upstream] = RecordingBackend.bodies
-        assert "n" not in upstream
-        assert "service_tier" not in upstream
+        assert "n" not in upstream, "default-valued n must be dropped, not forwarded"
+        assert "service_tier" not in upstream, "default-valued service_tier must be dropped, not forwarded"
 
     def test_unrepresentable_field_is_rejected_before_the_backend(self, anthropic_client):
         RecordingBackend.bodies.clear()
@@ -266,8 +266,8 @@ class TestRequestFieldHandling:
                 messages=[{"role": "user", "content": "What is 2+2?"}],
             )
 
-        assert "`service_tier` is not supported" in str(excinfo.value)
-        assert RecordingBackend.bodies == []
+        assert "`service_tier` is not supported" in str(excinfo.value), "error message must name the unsupported service_tier field"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
 
     def test_matched_stop_sequence_is_reported(self, anthropic_client):
         RecordingBackend.bodies.clear()
@@ -309,8 +309,8 @@ class TestRequestFieldHandling:
                 messages=[{"role": "user", "content": "What is 2+2?"}],
             )
 
-        assert "`moderation` is not supported" in str(excinfo.value)
-        assert RecordingBackend.bodies == []
+        assert "`moderation` is not supported" in str(excinfo.value), "error message must name the unsupported moderation field"
+        assert RecordingBackend.bodies == [], "rejected request must not reach the backend"
 
 
 class TestResponseUsage:
@@ -341,20 +341,20 @@ class TestStreamingResponseValidation:
                 events.extend(stream)
 
         error = excinfo.value
-        assert error.body.get("type") == "error"
-        assert error.body.get("error", {}).get("type") == "api_error"
+        assert error.body.get("type") == "error", "error envelope type must be error"
+        assert error.body.get("error", {}).get("type") == "api_error", "error envelope error type must be api_error"
         assert (
             error.body.get("error", {}).get("message")
             == "upstream response could not be transformed"
-        )
-        assert not any(event.type == "message_stop" for event in events)
+        ), "error message must report the failed transformation"
+        assert not any(event.type == "message_stop" for event in events), "aborted stream must not emit message_stop"
         assert not any(
             event.type == "content_block_start"
             and event.content_block.type == "tool_use"
             for event in events
-        )
+        ), "aborted stream must not start a tool_use block"
         [upstream] = RecordingBackend.bodies
-        assert upstream["stream"] is True
+        assert upstream["stream"] is True, "forwarded request must have been a stream"
 
 
 if __name__ == "__main__":
