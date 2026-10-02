@@ -159,13 +159,7 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
             Err(format) => return handle_unclassifiable(ctx, format, &self.config),
         };
 
-        if let Some(action) = super::handle_unsupported_background(&classified) {
-            return Ok(action);
-        }
-
-        if classified.format == AiRequestFormat::Responses
-            && let Some(action) = super::reject_prompt_template(&parsed)
-        {
+        if let Some(action) = reject_unsupported_managed_fields(&classified, &parsed) {
             return Ok(action);
         }
 
@@ -182,6 +176,18 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Reject provider-owned fields that gateway-managed create requests cannot honor.
+fn reject_unsupported_managed_fields(
+    classified: &ClassifiedRequest,
+    parsed: &serde_json::Value,
+) -> Option<FilterAction> {
+    super::handle_unsupported_background(classified).or_else(|| {
+        (classified.format == AiRequestFormat::Responses)
+            .then(|| super::reject_prompt_template(parsed))
+            .flatten()
+    })
+}
 
 /// Publish everything the one parse produced.
 ///

@@ -445,16 +445,19 @@ async fn prompt_template_is_rejected_before_state_initialization() {
     ));
 
     let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-    let FilterAction::Reject(rejection) = action else {
-        panic!("the managed request processor must reject prompt templates");
-    };
-    assert_eq!(rejection.status, 400);
-    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
-    assert_eq!(body["error"]["type"], "invalid_request_error");
-    assert_eq!(
-        body["error"]["message"],
-        "prompt templates are supported only for OpenAI-owned upstreams"
-    );
+    assert!(matches!(&action, FilterAction::Reject(_)));
+    if let FilterAction::Reject(rejection) = action {
+        assert_eq!(rejection.status, 400);
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body.pointer("/error/type").and_then(serde_json::Value::as_str),
+            Some("invalid_request_error")
+        );
+        assert_eq!(
+            body.pointer("/error/message").and_then(serde_json::Value::as_str),
+            Some("prompt templates are supported only for OpenAI-owned upstreams")
+        );
+    }
     assert!(
         ctx.extensions.get::<ResponsesState>().is_none(),
         "rejected prompt templates must not initialize gateway-owned state"
