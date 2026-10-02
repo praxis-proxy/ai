@@ -125,6 +125,41 @@ pub(crate) struct ResponsesFormatConfig {
     pub headers: ResponsesFormatHeaders,
 }
 
+/// Configuration for the create request processor.
+///
+/// Extends the shared classification settings with the one option that only
+/// this filter honours, so the classifier it replaces does not advertise an
+/// option it ignores.
+#[cfg(feature = "openai-responses")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResponsesRequestConfig {
+    /// Classification and promotion settings, shared with the classifier.
+    #[serde(flatten)]
+    pub shared: ResponsesFormatConfig,
+
+    /// Whether to initialize `ResponsesState` for a create request.
+    ///
+    /// On by default, because the stateful Responses filters read it. A
+    /// passthrough chain that only classifies and routes consumes none of it,
+    /// and building it there costs an identifier, a conversation resolution,
+    /// and retaining the parsed body for the rest of the request.
+    ///
+    /// Classification metadata, headers, and filter results are published
+    /// either way, so routing is unaffected.
+    #[serde(default = "default_initialize_state")]
+    pub initialize_state: bool,
+}
+
+/// `ResponsesState` is initialized unless a chain opts out.
+///
+/// Only the create request processor honours this, and that filter is compiled
+/// in with the Responses feature.
+#[cfg(feature = "openai-responses")]
+const fn default_initialize_state() -> bool {
+    true
+}
+
 // -----------------------------------------------------------------------------
 // Config Validation
 // -----------------------------------------------------------------------------

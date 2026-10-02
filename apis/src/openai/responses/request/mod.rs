@@ -48,7 +48,7 @@ use praxis_filter::{
 use tracing::{debug, trace};
 
 use super::{
-    config::{ResponsesFormatConfig, build_config},
+    config::{ResponsesFormatConfig, ResponsesRequestConfig, build_config},
     error::responses_error_rejection_with_code,
     extract_conversation_id,
     routes::{self as responses_routes, ResponsesOperation},
@@ -84,8 +84,8 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// `responses.conversation_id`, `responses.store`, `responses.background`, and
 /// `responses.stream`.
 pub struct OpenaiResponsesRequestFilter {
-    /// Classification and promotion configuration.
-    config: ResponsesFormatConfig,
+    /// Classification, promotion, and state configuration.
+    config: ResponsesRequestConfig,
 }
 
 impl OpenaiResponsesRequestFilter {
@@ -95,9 +95,11 @@ impl OpenaiResponsesRequestFilter {
     ///
     /// Returns [`FilterError`] when configuration is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: ResponsesFormatConfig = parse_filter_config(FILTER_NAME, config)?;
-        let validated = build_config(FILTER_NAME, cfg)?;
-        Ok(Box::new(Self { config: validated }))
+        let cfg: ResponsesRequestConfig = parse_filter_config(FILTER_NAME, config)?;
+        let shared = build_config(FILTER_NAME, cfg.shared)?;
+        Ok(Box::new(Self {
+            config: ResponsesRequestConfig { shared, ..cfg },
+        }))
     }
 }
 
@@ -148,14 +150,14 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
                 path = ctx.request.uri.path(),
                 "optional request body absent, publishing operation identity only"
             );
-            return publish_bodyless_operation(ctx, &self.config);
+            return publish_bodyless_operation(ctx, &self.config.shared);
         }
 
         // The one parse feeds classification, promotion, and state alike. A body
         // that cannot be classified follows `on_invalid` instead.
         let (parsed, classified) = match parse_and_classify_create_body(body) {
             Ok(pair) => pair,
-            Err(format) => return handle_unclassifiable(ctx, format, &self.config),
+            Err(format) => return handle_unclassifiable(ctx, format, &self.config.shared),
         };
 
         if let Some(action) = super::handle_unsupported_background(&classified) {
@@ -188,38 +190,17 @@ fn publish_request_facts(
     ctx: &mut HttpFilterContext<'_>,
     classified: &ClassifiedRequest,
     parsed: serde_json::Value,
-    config: &ResponsesFormatConfig,
+    config: &ResponsesRequestConfig,
     operation: ResponsesOperation,
 ) -> Result<(), FilterError> {
     let mode = super::compute_mode(classified);
 
     // Classification is published for every body, whatever it turned out to
     // be, exactly as the standalone classifier did.
-    publish_classification(ctx, classified, config, mode)?;
+    publish_classification(ctx, classified, &config.shared, mode)?;
 
-    // Proxy-owned identifiers and `ResponsesState` are Responses-only. A body
-    // positively identified as another protocol keeps that identity and must
-    // not gain Responses state, or state-driven filters such as the agentic
-    // loop would pick up traffic the previous validation stage released
-    // untouched.
-    if classified.format != AiRequestFormat::Responses {
-        trace!(
-            format = classified.format.as_str(),
-            "classified as another protocol, leaving Responses state uninitialized"
-        );
-        return Ok(());
-    }
-
-    // `ResponsesState` describes a response being created — it carries the
-    // conversation, the generated identifier, and the MCP approval state the
-    // agentic loop acts on. Compact and input-token-count are not creating a
-    // response, so giving them that state lets downstream filters read a
-    // token-count request as an approval submission.
-    if operation != ResponsesOperation::CreateResponse {
-        trace!(
-            operation = ?operation,
-            "body-bearing operation that does not create a response, leaving state uninitialized"
-        );
+    if let Some(reason) = state_skip_reason(classified, config, operation) {
+        trace!(reason, "leaving Responses state uninitialized");
         return Ok(());
     }
 
@@ -245,6 +226,38 @@ struct MatchedOperation {
     operation: ResponsesOperation,
     /// The body shape the registry declares for it.
     body: RequestBody,
+}
+
+/// Why this request should not receive `ResponsesState`, if it should not.
+///
+/// `ResponsesState` describes a response being created: it carries the
+/// conversation, the generated identifier, and the MCP approval state the
+/// agentic loop acts on.
+///
+/// Returns `None` when state belongs, and otherwise the reason it does not, so
+/// the caller logs one line rather than repeating a guard per case.
+fn state_skip_reason(
+    classified: &ClassifiedRequest,
+    config: &ResponsesRequestConfig,
+    operation: ResponsesOperation,
+) -> Option<&'static str> {
+    if classified.format != AiRequestFormat::Responses {
+        // Another protocol keeps its own identity. Giving it Responses state
+        // would let state-driven filters pick up traffic the validation stage
+        // this replaces released untouched.
+        return Some("body is classified as another protocol");
+    }
+    if !config.initialize_state {
+        // The chain consumes no state. Classification is still published, so
+        // routing and branching are unaffected.
+        return Some("initialize_state is disabled for this chain");
+    }
+    if operation != ResponsesOperation::CreateResponse {
+        // Compact and input-token-count are not creating a response, and
+        // giving them create state lets a token count read as an approval.
+        return Some("operation does not create a response");
+    }
+    None
 }
 
 /// Publish the classification facts for one body.

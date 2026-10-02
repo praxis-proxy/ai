@@ -15,6 +15,8 @@ Rejects `background=true` with a 400, matching `openai_responses_format`, becaus
 
 Promotes `openai_responses_format.*` metadata, publishes filter results under `openai_responses_request`, and generates `responses.response_id` (`resp_` + 32 hex chars, CSPRNG), `responses.conversation_id`, `responses.store`, `responses.background`, and `responses.stream`.
 
+Extends the shared classification settings with the one option that only this filter honours, so the classifier it replaces does not advertise an option it ignores.
+
 ## Configuration
 
 | Field | Type | Required | Description |
@@ -25,6 +27,7 @@ Promotes `openai_responses_format.*` metadata, publishes filter results under `o
 | `headers.model` | string | no | Header name for the extracted model value. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-model` remains allowed. Must not overwrite other classification facts such as `x-praxis-ai-format`. |
 | `headers.stream` | string | no | Header name for the extracted stream flag. Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-ai-stream` remains allowed. |
 | `headers.mode` | string | no | Header name for the computed mode (`stateless` or `stateful`). Must not be a hop-by-hop, framing, Host, credential, API-key, or other internal `x-praxis-*` header. Dedicated default `x-praxis-responses-mode` remains allowed. |
+| `initialize_state` | bool | no | Whether to initialize `ResponsesState` for a create request. On by default, because the stateful Responses filters read it. A passthrough chain that only classifies and routes consumes none of it, and building it there costs an identifier, a conversation resolution, and retaining the parsed body for the rest of the request. Classification metadata, headers, and filter results are published either way, so routing is unaffected. |
 
 ## Example
 

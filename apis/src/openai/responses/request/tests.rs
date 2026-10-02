@@ -258,6 +258,62 @@ async fn filter_results_are_published_under_this_filter() {
     );
 }
 
+/// A passthrough chain consumes no state, so it can opt out of building it.
+/// Classification is still published, since routing depends on it.
+#[tokio::test]
+async fn initialize_state_false_classifies_without_building_state() {
+    let filter = filter("initialize_state: false\n");
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi", "stream": true})).unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Release));
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.format")
+            .map(String::as_str),
+        Some("openai_responses"),
+        "classification is still published so routing is unaffected"
+    );
+    assert_eq!(
+        ctx.filter_metadata
+            .get("openai_responses_format.stream")
+            .map(String::as_str),
+        Some("true"),
+        "promoted routing facts are still published"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "no state is built when the chain opted out"
+    );
+    assert!(
+        !ctx.filter_metadata.contains_key("responses.response_id"),
+        "no identifier is generated when the chain opted out"
+    );
+}
+
+/// The default is unchanged, so an existing chain keeps its state.
+#[tokio::test]
+async fn state_is_initialized_by_default() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi"})).unwrap(),
+    ));
+
+    drop(filter.on_request_body(&mut ctx, &mut body, true).await.unwrap());
+
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_some(),
+        "omitting initialize_state must keep the previous behaviour"
+    );
+}
+
 #[tokio::test]
 async fn bodyless_responses_operations_are_left_alone() {
     // The registry declares these as carrying no body, so there is nothing to
