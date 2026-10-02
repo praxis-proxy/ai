@@ -11,6 +11,14 @@ use praxis_test_utils::{
 };
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// Public address used to reach the runtime connection-failure path without
+/// triggering the non-public-address policy first.
+const PUBLIC_MCP_FAILURE_HOST: &str = "8.8.8.8";
+
+// =============================================================================
 // Pass-Through (no MCP tools)
 // =============================================================================
 
@@ -140,7 +148,7 @@ fn mcp_unreachable_server_returns_502() {
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"dead","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"dead","server_url":"http://{PUBLIC_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -158,7 +166,7 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","stream":true,"tools":[{{"type":"mcp","server_label":"dead","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","stream":true,"tools":[{{"type":"mcp","server_label":"dead","server_url":"http://{PUBLIC_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -296,11 +304,10 @@ fn run_streaming_mcp_failure_with_yaml(
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): guaranteed unreachable, so the
-    // discovery attempt reaches runtime I/O and fails (a runtime failure), not a
-    // local request-policy failure like SSRF.
+    // Use a public address so the discovery attempt reaches runtime I/O and
+    // fails there, rather than being rejected first as a local policy failure.
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","stream":true{extra_fields},"tools":[{{"type":"mcp","server_label":"weather","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","stream":true{extra_fields},"tools":[{{"type":"mcp","server_label":"weather","server_url":"http://{PUBLIC_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
     assert_eq!(
@@ -747,7 +754,7 @@ fn authorization_with_unreachable_server_returns_502() {
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"auth","server_url":"http://192.0.2.1:{dead_port}/mcp","authorization":"tok_secret","headers":{{"x-custom":"val"}},"allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"auth","server_url":"http://{PUBLIC_MCP_FAILURE_HOST}:{dead_port}/mcp","authorization":"tok_secret","headers":{{"x-custom":"val"}},"allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -773,7 +780,7 @@ fn mcp_tool_names_filter_object_accepted() {
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"srv","server_url":"http://192.0.2.1:{dead_port}/mcp","allowed_tools":{{"tool_names":["get_weather"]}}}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"srv","server_url":"http://{PUBLIC_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":{{"tool_names":["get_weather"]}}}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
