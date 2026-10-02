@@ -10,7 +10,7 @@ persisted ordering without a backup or while writers are active is unsafe.
 These statements apply to the **pre-#570, version 1** items table, before its
 `(tenant_id, conversation_id, position)` unique index exists. They are for
 **historical data recovery only**, not an upgrade to the current schema.
-Current releases require a new, empty schema-v4 store; follow the
+Current releases require a new, empty schema-v5 store; follow the
 [recreate-only upgrade policy](schema-migration.md) rather than repairing an
 older database for reuse. Do not change the schema-version stamp to make a
 newer binary accept an older schema. Index definitions have also changed;

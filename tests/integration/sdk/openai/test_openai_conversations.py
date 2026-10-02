@@ -849,6 +849,10 @@ class TestOpenAIConversations:
         assert exc_info.value.status_code == 404
 
         with pytest.raises(NotFoundError) as exc_info:
+            openai_client.conversations.items.create(conversation.id, items=[])
+        assert exc_info.value.status_code == 404
+
+        with pytest.raises(NotFoundError) as exc_info:
             openai_client.conversations.items.delete(
                 "item_keep",
                 conversation_id=conversation.id,
@@ -887,6 +891,25 @@ class TestOpenAIConversations:
 
         retrieved = openai_client.conversations.retrieve(conversation.id)
         assert retrieved.metadata["visibility"] == "private"
+
+    def test_empty_item_batch_preserves_existing_items(self, openai_client):
+        conversation = openai_client.conversations.create(
+            items=[
+                {
+                    "id": "item_empty_keep",
+                    "type": "message",
+                    "role": "user",
+                    "content": "keep me",
+                }
+            ]
+        )
+
+        page = openai_client.conversations.items.create(conversation.id, items=[])
+        assert page.object == "list"
+        assert page.data == []
+
+        remaining = openai_client.conversations.items.list(conversation.id)
+        assert [item.id for item in remaining.data] == ["item_empty_keep"]
 
     def test_empty_item_list_is_sdk_compatible(self, openai_client):
         conversation = openai_client.conversations.create()

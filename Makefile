@@ -16,7 +16,9 @@ V                ?=
 # crate; it is not a praxis-ai-filters feature.
 FILTER_EXPERIMENTAL_FEATURES := azure-ad-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-ceiling-filter
 INTEGRATION_EXPERIMENTAL_FEATURES := azure-ad-filter,basic-auth-filter,gcp-adc-filter,http-callout-filter,token-rate-limit-filter,token-ceiling-filter
-# Features for `make release`; `full` matches the published container image.
+# Features for `make release`. The published container image builds
+# `full,store-sqlite` so it can also serve the SQLite-backed examples; `make
+# release` stays on `full` (PostgreSQL only), which is the production backend.
 PRAXIS_AI_FEATURES ?= full
 # Crates that must never enter the explicit lean (`standard`) proxy graph.
 # openssl-sys is not on the list: praxis performs all cryptography through the
@@ -284,6 +286,7 @@ lint-xtask:
 	cargo xtask sync-example-readme
 	cargo xtask sync-inference-readme
 	cargo xtask sync-responses-readme
+	cargo xtask sync-flow-visualizers
 	cargo xtask check-inference
 	cargo xtask check-responses-registry
 	cargo xtask check-chat-completions-registry
@@ -353,8 +356,8 @@ coverage-check:
 # FIPS
 # -------------------------------------------------------------------
 #
-# The published image (`full`) enables every non-experimental filter. The
-# FIPS build turns off what is known not to be FIPS 140-3 compliant yet, so
+# The published image (`full,store-sqlite`) enables every non-experimental
+# filter. The FIPS build turns off what is known not to be FIPS 140-3 compliant, so
 # nobody has to know which features to pick:
 #
 #   policy-engine        praxis-policy carries its own cryptography (sha2,

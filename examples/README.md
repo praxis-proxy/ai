@@ -14,6 +14,17 @@ Configs use local ports (`3000`, `3001`, ...) for
 upstreams — start a real backend or stub on those ports
 before sending requests.
 
+## Flow visualizers
+
+Some configs ship a companion **flow visualizer** — a single, self-contained
+HTML file that diagrams how a request moves through the pipeline. Open
+[full-flow-agentic.visualizer.html](configs/openai/responses/full-flow-agentic.visualizer.html)
+in a browser (no server or network needed) to explore the two-path topology
+of `full-flow-agentic.yaml`: direct-OpenAI passthrough vs. managed providers,
+with the agentic iterative_request_router loop. See
+[docs/developing/flow-visualizers.md](../docs/developing/flow-visualizers.md)
+for how these are authored and regenerated.
+
 ## Configs
 
 ### General
@@ -76,6 +87,12 @@ before sending requests.
 | File | Description |
 | ------ | ------------- |
 | [chat-completions-to-openai.yaml](configs/azure/chat-completions-to-openai.yaml) | Proxies standard Chat Completions requests to an Azure OpenAI deployment |
+
+### Bedrock
+
+| File | Description |
+| ------ | ------------- |
+| [chat-completions-to-converse.yaml](configs/bedrock/chat-completions-to-converse.yaml) | Accepts OpenAI Chat Completions requests and transparently forwards them to AWS Bedrock Converse, translating both the request and response bodies on the fly |
 
 ### Inference
 

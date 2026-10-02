@@ -34,4 +34,4 @@ create a new database for Praxis AI rather than dropping the shared database.
 
 For historical pre-#570 data recovery only, see
 [repair duplicate item positions](legacy-item-position-repair.md). That repair
-is not a supported upgrade to schema v4.
+is not a supported upgrade to schema v5.

@@ -1324,9 +1324,6 @@ impl ConversationItemStore for SqliteResponseStore {
         conversation_id: &str,
         items: &[ConversationItemRecord],
     ) -> Result<(), StoreError> {
-        if items.is_empty() {
-            return Ok(());
-        }
         require_matching_item_scope(owner, conversation_id, items)?;
 
         let items_table = self
@@ -1343,6 +1340,10 @@ impl ConversationItemStore for SqliteResponseStore {
             .map_err(|e| StoreError::Database(e.to_string()))?;
 
         sqlite_require_conversation(&mut tx, conv_table, owner, conversation_id).await?;
+        if items.is_empty() {
+            tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;
+            return Ok(());
+        }
         sqlite_create_items_and_sync(&mut tx, items_table, conv_table, owner, conversation_id, items).await?;
 
         tx.commit().await.map_err(|e| StoreError::Database(e.to_string()))?;

@@ -12,8 +12,8 @@ use praxis_ai_store::{
 };
 use serde_json::{Value, json};
 
-use super::{ListParams, Order, ResponsesService, list_input_items};
-use crate::{StateOwner, openai::include::IncludeFields};
+use super::{ListParams, Order, build_record, list_input_items};
+use crate::{StateOwner, openai::include::IncludeFields, store::OwnerScopedResponseStore};
 
 /// Build a validated owner for a fixed tenant and issuer.
 fn owner(subject: &str) -> StateOwner {
@@ -29,9 +29,9 @@ fn registry() -> StoreRegistry {
     reg
 }
 
-/// Bind a service to the default backend for `owner`.
-fn service(reg: &StoreRegistry, owner: &StateOwner) -> ResponsesService {
-    ResponsesService::new(reg.get_scoped("default", owner).unwrap())
+/// Bind a store handle to the default backend for `owner`.
+fn scoped_store(reg: &StoreRegistry, owner: &StateOwner) -> OwnerScopedResponseStore {
+    reg.get_scoped("default", owner).unwrap()
 }
 
 /// A minimal persistable record owned by `owner`.
@@ -49,13 +49,13 @@ fn sample_record(owner: &StateOwner, id: &str) -> ResponseRecord {
 
 #[test]
 fn build_record_returns_none_for_null_response_object() {
-    let record = ResponsesService::build_record(Value::Null, owner("alice"), None, None);
+    let record = build_record(Value::Null, owner("alice"), None, None);
     assert!(record.is_none(), "a null response object is not persistable");
 }
 
 #[test]
 fn build_record_returns_none_for_missing_required_fields() {
-    let record = ResponsesService::build_record(json!({"id": "resp_1"}), owner("alice"), None, None);
+    let record = build_record(json!({"id": "resp_1"}), owner("alice"), None, None);
     assert!(record.is_none(), "missing created_at/model is not persistable");
 }
 
@@ -70,7 +70,7 @@ fn build_record_uses_request_input_when_state_messages_absent() {
         "output": [{"type": "message", "content": "Stored streaming output"}]
     });
 
-    let record = ResponsesService::build_record(response_object, owner("alice"), Some(request_input.clone()), None)
+    let record = build_record(response_object, owner("alice"), Some(request_input.clone()), None)
         .expect("streaming state should build a record");
 
     assert_eq!(
@@ -109,7 +109,7 @@ fn build_record_preserves_mcp_metadata_from_state_messages() {
         json!({"role": "user", "content": "What next?"}),
     ];
 
-    let record = ResponsesService::build_record(
+    let record = build_record(
         response_object,
         owner("alice"),
         Some(json!([{"role": "user", "content": "What next?"}])),
@@ -151,7 +151,7 @@ fn build_record_does_not_duplicate_output_already_in_state_messages() {
         "output": [compaction.clone(), message.clone()]
     });
 
-    let record = ResponsesService::build_record(
+    let record = build_record(
         response_object,
         owner("alice"),
         Some(json!([{"role": "user", "content": "Continue"}])),
@@ -188,7 +188,7 @@ fn build_record_does_not_duplicate_compaction_outside_overlap() {
         ]
     });
 
-    let record = ResponsesService::build_record(
+    let record = build_record(
         response_object,
         owner("alice"),
         Some(json!([{"role": "user", "content": "Continue"}])),
@@ -217,8 +217,8 @@ fn build_record_falls_back_to_response_object_input() {
         "output": [{"type": "message", "role": "assistant", "content": "Hi"}]
     });
 
-    let record = ResponsesService::build_record(response_object, owner("alice"), None, None)
-        .expect("buffered response should build a record");
+    let record =
+        build_record(response_object, owner("alice"), None, None).expect("buffered response should build a record");
 
     assert_eq!(
         record.input,
@@ -231,14 +231,15 @@ fn build_record_falls_back_to_response_object_input() {
 async fn persist_and_get_round_trip() {
     let reg = registry();
     let alice = owner("alice");
-    let svc = service(&reg, &alice);
+    let store = scoped_store(&reg, &alice);
 
-    svc.persist(&sample_record(&alice, "resp_rt"), &[])
+    store
+        .persist_response_with_pending_approvals(&sample_record(&alice, "resp_rt"), &[])
         .await
         .expect("persist should succeed");
 
-    let fetched = svc
-        .get("resp_rt")
+    let fetched = store
+        .get_response("resp_rt")
         .await
         .expect("get should succeed")
         .expect("record should exist");
@@ -250,19 +251,22 @@ async fn persist_and_get_round_trip() {
 async fn delete_removes_record_and_reports_missing() {
     let reg = registry();
     let alice = owner("alice");
-    let svc = service(&reg, &alice);
-    svc.persist(&sample_record(&alice, "resp_del"), &[]).await.unwrap();
+    let store = scoped_store(&reg, &alice);
+    store
+        .persist_response_with_pending_approvals(&sample_record(&alice, "resp_del"), &[])
+        .await
+        .unwrap();
 
     assert!(
-        svc.delete("resp_del").await.unwrap(),
+        store.delete_response("resp_del").await.unwrap(),
         "deleting an existing record returns true"
     );
     assert!(
-        svc.get("resp_del").await.unwrap().is_none(),
+        store.get_response("resp_del").await.unwrap().is_none(),
         "the record is gone after delete"
     );
     assert!(
-        !svc.delete("resp_del").await.unwrap(),
+        !store.delete_response("resp_del").await.unwrap(),
         "deleting a missing record returns false"
     );
 }
@@ -272,12 +276,15 @@ async fn get_is_owner_scoped() {
     let reg = registry();
     let alice = owner("alice");
     let bob = owner("bob");
-    service(&reg, &alice)
-        .persist(&sample_record(&alice, "resp_iso"), &[])
+    scoped_store(&reg, &alice)
+        .persist_response_with_pending_approvals(&sample_record(&alice, "resp_iso"), &[])
         .await
         .unwrap();
 
-    let bob_view = service(&reg, &bob).get("resp_iso").await.expect("get should succeed");
+    let bob_view = scoped_store(&reg, &bob)
+        .get_response("resp_iso")
+        .await
+        .expect("get should succeed");
     assert!(
         bob_view.is_none(),
         "a record persisted by one owner is invisible to another"
@@ -290,9 +297,9 @@ async fn persist_rejects_record_owned_by_another_owner() {
     let alice = owner("alice");
     let bob = owner("bob");
 
-    // Service bound to alice, record built for bob: the owner-scoped facade must reject it.
-    let err = service(&reg, &alice)
-        .persist(&sample_record(&bob, "resp_forge"), &[])
+    // Store handle bound to alice, record built for bob: the owner-scoped facade must reject it.
+    let err = scoped_store(&reg, &alice)
+        .persist_response_with_pending_approvals(&sample_record(&bob, "resp_forge"), &[])
         .await
         .expect_err("an owner mismatch must fail closed");
     assert!(
@@ -301,7 +308,11 @@ async fn persist_rejects_record_owned_by_another_owner() {
     );
 
     assert!(
-        service(&reg, &bob).get("resp_forge").await.unwrap().is_none(),
+        scoped_store(&reg, &bob)
+            .get_response("resp_forge")
+            .await
+            .unwrap()
+            .is_none(),
         "the rejected record must not be written under any owner"
     );
 }
@@ -310,7 +321,7 @@ async fn persist_rejects_record_owned_by_another_owner() {
 async fn pending_approvals_persist_then_consume_and_reject_replay() {
     let reg = registry();
     let alice = owner("alice");
-    let svc = service(&reg, &alice);
+    let store = scoped_store(&reg, &alice);
     let approval = PendingApprovalRecord {
         approval_id: "call_1".to_owned(),
         server_label: "weather".to_owned(),
@@ -319,20 +330,21 @@ async fn pending_approvals_persist_then_consume_and_reject_replay() {
         target_fingerprint: "fp".to_owned(),
     };
 
-    svc.persist(&sample_record(&alice, "resp_appr"), std::slice::from_ref(&approval))
+    store
+        .persist_response_with_pending_approvals(&sample_record(&alice, "resp_appr"), std::slice::from_ref(&approval))
         .await
         .expect("persist with pending approvals should succeed");
 
-    let pending = svc.get_pending_approvals("resp_appr", &["call_1"]).await.unwrap();
+    let pending = store.get_pending_approvals("resp_appr", &["call_1"]).await.unwrap();
     assert_eq!(pending.len(), 1, "the pending approval should be readable");
 
-    let consumed = svc
+    let consumed = store
         .consume_approvals("resp_appr", &["call_1"], 1_719_900_100)
         .await
         .unwrap();
     assert!(consumed.is_none(), "the first consumption claims the whole batch");
 
-    let replay = svc
+    let replay = store
         .consume_approvals("resp_appr", &["call_1"], 1_719_900_200)
         .await
         .unwrap();

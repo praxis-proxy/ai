@@ -5,8 +5,9 @@
 //! token usage reporting via [`CloudEvents`] to an external metering service.
 //!
 //! Reads token counts from [`filter_metadata`] keys set by the `token_count`
-//! filter (`token.input`, `token.output`, `token.total`, and the prompt cache
-//! breakdown `token.cache_read` / `token.cache_write`). The metering filter
+//! filter (`token.input`, `token.output`, `token.total`, the prompt cache
+//! breakdown `token.cache_read` / `token.cache_write`, and the reasoning
+//! breakdown `token.reasoning`). The metering filter
 //! must be declared *before* `token_count` in the YAML filter chain so that
 //! response hooks (which run in reverse order) execute after token extraction.
 //!
@@ -45,6 +46,12 @@ use serde::Deserialize;
 use tracing::{debug, trace, warn};
 
 use self::config::{ExternalMeteringConfig, validate_config};
+// Import the token metadata keys from `token_count`, their sole writer, so this
+// reader can never drift to a stale literal and silently meter zero tokens.
+use crate::token_usage::{
+    META_TOKEN_CACHE_READ, META_TOKEN_CACHE_WRITE, META_TOKEN_INPUT, META_TOKEN_OUTPUT, META_TOKEN_REASONING,
+    META_TOKEN_TOTAL,
+};
 
 // -----------------------------------------------------------------------------
 // Constants
@@ -62,23 +69,6 @@ const CE_TYPE_USAGE: &str = "inference.tokens.used";
 /// Metadata key holding the resolved model name, written during the request
 /// body phase and read during the response body phase.
 const META_METERING_MODEL: &str = "metering.model";
-
-/// Well-known `filter_metadata` key for input tokens (set by `token_count`).
-const META_TOKEN_INPUT: &str = "token.input";
-
-/// Well-known `filter_metadata` key for output tokens (set by `token_count`).
-const META_TOKEN_OUTPUT: &str = "token.output";
-
-/// Well-known `filter_metadata` key for total tokens (set by `token_count`).
-const META_TOKEN_TOTAL: &str = "token.total";
-
-/// Well-known `filter_metadata` key for prompt cache reads (set by
-/// `token_count`). A breakdown of [`META_TOKEN_INPUT`], not an addition to it.
-const META_TOKEN_CACHE_READ: &str = "token.cache_read";
-
-/// Well-known `filter_metadata` key for prompt cache writes (set by
-/// `token_count`). A breakdown of [`META_TOKEN_INPUT`], not an addition to it.
-const META_TOKEN_CACHE_WRITE: &str = "token.cache_write";
 
 /// Counter incremented whenever a usage or error event fails to reach the
 /// metering service (transport failure or non-2xx acknowledgement).
@@ -144,6 +134,7 @@ const STATUS_METERING_UNAVAILABLE: u16 = 503;
 /// timeout_seconds: 5
 /// feature_key: "inference-tokens"
 /// source: "ai-gateway"
+/// provider: "openai"
 /// fail_open: true
 /// identity_header_prefix: "x-tenant-"
 /// identity_metadata_namespace: "identity"
@@ -179,6 +170,11 @@ pub struct ExternalMeteringFilter {
 
     /// Base URL of the external metering service.
     metering_url: String,
+
+    /// Static provider name for emitted events. Takes precedence over the
+    /// routed cluster name; the only source of provider attribution on the
+    /// ext-proc data path, where `ctx.cluster_name()` is always `None`.
+    provider: Option<String>,
 
     /// `CloudEvents` `source` attribute for emitted events.
     source: String,
@@ -236,6 +232,7 @@ impl ExternalMeteringFilter {
             identity_header_prefix: cfg.identity_header_prefix.to_ascii_lowercase(),
             identity_metadata_namespace: cfg.identity_metadata_namespace,
             metering_url: cfg.metering_url,
+            provider: cfg.provider,
             source: cfg.source,
             subrequest_client,
             timeout: Duration::from_secs(cfg.timeout_seconds),
@@ -303,16 +300,24 @@ impl ExternalMeteringFilter {
         self.default_model.clone().unwrap_or_default()
     }
 
+    /// Resolve the provider to attribute usage to: the static config value,
+    /// else the routed cluster name, else empty.
+    fn resolve_provider<'a>(&'a self, ctx: &'a HttpFilterContext<'_>) -> &'a str {
+        self.provider
+            .as_deref()
+            .or_else(|| ctx.cluster_name())
+            .unwrap_or_default()
+    }
+
     /// Emit the terminal usage or error event for a completed request.
     fn report(&self, ctx: &HttpFilterContext<'_>, mut state: MeteringState) {
         state.model = self.resolve_report_model(ctx, &state);
 
         let request_id = ctx.id_generator.generate(ctx.time_source);
-        let provider = ctx.cluster_name().unwrap_or_default().to_owned();
         let event_ctx = EventContext {
             duration_ms: u64::try_from(state.request_start.elapsed().as_millis()).unwrap_or(u64::MAX),
             event_id: &request_id,
-            provider: &provider,
+            provider: self.resolve_provider(ctx),
             source: &self.source,
             state: &state,
         };
@@ -487,6 +492,9 @@ struct TokenCounts {
 
     /// Prompt tokens written to the provider's cache; a subset of `input`.
     cache_write: u64,
+
+    /// Reasoning/thinking tokens; a subset of `output`.
+    reasoning: u64,
 }
 
 impl TokenCounts {
@@ -498,6 +506,7 @@ impl TokenCounts {
             total: read_token_meta(ctx, META_TOKEN_TOTAL),
             cache_read: read_token_meta(ctx, META_TOKEN_CACHE_READ),
             cache_write: read_token_meta(ctx, META_TOKEN_CACHE_WRITE),
+            reasoning: read_token_meta(ctx, META_TOKEN_REASONING),
         }
     }
 }
@@ -854,6 +863,7 @@ fn build_usage_event(ctx: &EventContext<'_>, tokens: &TokenCounts) -> serde_json
         data.insert("total_tokens".to_owned(), tokens.total.into());
         data.insert("cached_input_tokens".to_owned(), tokens.cache_read.into());
         data.insert("cache_creation_tokens".to_owned(), tokens.cache_write.into());
+        data.insert("reasoning_tokens".to_owned(), tokens.reasoning.into());
     }
 
     event

@@ -1,13 +1,14 @@
-# Run Codex or Claude Code through Praxis and vLLM
+# Run Codex, Claude Code, or OpenCode through Praxis and vLLM
 
 This guide runs a real coding client through a local Praxis gateway while vLLM
 provides inference. The supported paths are:
 
 ```text
-Codex       -> Praxis /v1/responses -> vLLM /v1/responses (native)
-Codex       -> Praxis /v1/responses -> vLLM /v1/chat/completions (translated)
-Claude Code -> Praxis /v1/messages  -> vLLM /v1/messages (native)
-Claude Code -> Praxis /v1/messages  -> vLLM /v1/chat/completions (translated)
+Codex       -> Praxis /v1/responses        -> vLLM /v1/responses (native)
+Codex       -> Praxis /v1/responses        -> vLLM /v1/chat/completions (translated)
+Claude Code -> Praxis /v1/messages         -> vLLM /v1/messages (native)
+Claude Code -> Praxis /v1/messages         -> vLLM /v1/chat/completions (translated)
+OpenCode    -> Praxis /v1/chat/completions -> vLLM /v1/chat/completions (native)
 ```
 
 Use the native paths when vLLM exposes the corresponding Responses or
@@ -99,7 +100,7 @@ beside a working prompt, so section 4 also sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
 
 ## 2. Point a Praxis example at vLLM
 
-Choose one example and copy it outside `examples/`:
+Choose one example for your client and copy it outside `examples/`:
 
 ```console
 # Codex, native Responses API (preferred for vLLM)
@@ -108,12 +109,19 @@ cp examples/configs/openai/responses/client-tool-compat.yaml praxis-vllm.yaml
 # Codex, translated to Chat Completions
 cp examples/configs/openai/responses/codex-http-chat-translation.yaml praxis-vllm.yaml
 
-# Claude Code, native Anthropic API (preferred for vLLM)
+# Claude Code, native Anthropic API (preferred for vLLM), or OpenCode
 cp examples/configs/anthropic/messages-native-vllm.yaml praxis-vllm.yaml
 
 # Claude Code, translated to Chat Completions
 cp examples/configs/anthropic/messages-to-openai-vllm.yaml praxis-vllm.yaml
 ```
+
+OpenCode was tested with the
+[native Claude configuration](../../examples/configs/anthropic/messages-native-vllm.yaml).
+Its catch-all route forwards `/v1/chat/completions` to vLLM without body
+translation, and Anthropic validation is scoped to `/v1/messages`.
+The same gateway can serve both Claude Code and OpenCode, provided vLLM
+supports their respective endpoints.
 
 The native Codex example uses `127.0.0.1:3001` as its fixture backend; change
 that endpoint to `127.0.0.1:8000` for the local vLLM server. The other examples
@@ -196,7 +204,7 @@ docker run -d --rm --name praxis-vllm \
   ghcr.io/praxis-proxy/ai:latest -c /etc/praxis/praxis.yaml
 ```
 
-Praxis listens at `http://127.0.0.1:8080`, and sections 3 and 4 apply
+Praxis listens at `http://127.0.0.1:8080`, and sections 3 through 5 apply
 unchanged. Docker's `--network host` is Linux-only.
 
 To publish a port instead of sharing the host network stack, make three edits
@@ -244,7 +252,7 @@ The admin endpoint must bind loopback unless
 container with
 `docker exec praxis-vllm wget -qO- http://127.0.0.1:9901/healthy` (or directly
 from the host under `--network host`). When finished, replace the `kill` in
-section 4 with `docker rm -f praxis-vllm`.
+the cleanup section with `docker rm -f praxis-vllm`.
 
 #### The native Codex example needs a rebuilt image
 
@@ -257,7 +265,7 @@ cannot run on the stock image; `--validate` rejects it up front:
 invalid configuration: openai_response_store: backend 'sqlite' is unavailable; rebuild with the 'store-sqlite' feature
 ```
 
-The other three examples in this section have no store filter and run on the
+The other three configurations in this section have no store filter and run on the
 published image unchanged. For the native Codex path, build the image locally
 with SQLite compiled in:
 
@@ -380,6 +388,87 @@ Claude Code's `auto` permission mode; the classifier still consumes model
 inference and is not an on-device check. Do not set it to `1` for this setup.
 See [Anthropic's auto-mode classifier documentation](https://code.claude.com/docs/en/auto-mode-classifier-billing).
 
+## 5. Connect OpenCode
+
+This example targets OpenCode 1.x. Check your version with `opencode --version`.
+OpenCode 2.x requires a different plugin implementation; see the
+[OpenCode migration guide](https://opencode.ai/v2/docs/migrate-v1/).
+
+Use the native Claude configuration from section 2. It forwards OpenCode's
+`/v1/chat/completions` requests to vLLM and authenticates clients with Basic
+auth using username `gateway` and password from `GATEWAY_AUTH_PASSWORD`.
+Add this configuration to
+`~/.config/opencode/opencode.jsonc`, merging the `plugin` and `provider`
+entries with any existing settings:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["./praxis-auth.ts"],
+  "provider": {
+    "praxis": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Praxis",
+      "options": { "baseURL": "http://127.0.0.1:8080/v1" },
+      "models": {
+        "qwen3-8b": {
+          "name": "Qwen3 8B",
+          "limit": { "context": 32768, "output": 8192 }
+        }
+      }
+    }
+  }
+}
+```
+
+Replace `qwen3-8b` with the exact served name in `VLLM_MODEL` and adjust the
+limits to match your vLLM server. For a remote Praxis gateway, replace the
+`baseURL` with its HTTPS address, keeping the `/v1` suffix. Use HTTP only for
+a loopback gateway. Export the same URL from your shell so the plugin can
+verify the destination independently of project configuration:
+
+```console
+export PRAXIS_BASE_URL="https://gateway.example.com/v1"
+```
+
+For the local `http://127.0.0.1:8080/v1` example, no URL export is needed.
+
+Create `~/.config/opencode/praxis-auth.ts`:
+
+```typescript
+export default async () => ({
+  config: async (config) => {
+    const options = config.provider.praxis.options
+    const trustedURL = process.env.PRAXIS_BASE_URL ?? "http://127.0.0.1:8080/v1"
+    if (options.baseURL !== trustedURL) {
+      throw new Error("Praxis baseURL does not match the trusted gateway")
+    }
+    const password = process.env.GATEWAY_AUTH_PASSWORD
+    if (!password) throw new Error("GATEWAY_AUTH_PASSWORD is required for Praxis")
+    const token = Buffer.from(`gateway:${password}`).toString("base64")
+    options.headers = { ...options.headers, Authorization: `Basic ${token}` }
+  },
+})
+```
+
+The plugin checks the merged provider URL before attaching Basic auth with
+username `gateway`. It rejects project overrides that change the destination.
+Set `PRAXIS_BASE_URL` only to a gateway you trust; it must exactly match
+`baseURL`, including any trailing slash.
+
+Launch OpenCode from the shell where `GATEWAY_AUTH_PASSWORD` was exported in
+section 2. It must match the password in the Praxis process environment;
+OpenCode does not need `VLLM_API_KEY`:
+
+```console
+opencode --model "praxis/$VLLM_MODEL"
+```
+
+Quit and restart OpenCode after changing its configuration or plugin. You can
+also select the configured model with `/models`.
+
+## Cleanup
+
 When finished, stop local Praxis and cancel the on-demand endpoint workflow:
 
 ```console
@@ -388,7 +477,9 @@ kill "$PRAXIS_PID"
 
 ## Troubleshooting
 
-- `401` from Praxis on the Claude path: verify the Basic authorization header.
+- `401` from Praxis on the Claude or OpenCode path: verify the Basic
+  authorization header and that the client's `GATEWAY_AUTH_PASSWORD` matches
+  the gateway's password.
 - `401` from vLLM: `VLLM_API_KEY` does not match the key passed to vLLM.
 - Model not found: use the exact slash-free served name, normally `qwen3-8b`.
 - `400` with `maximum context length is 32768 tokens` and a requested output

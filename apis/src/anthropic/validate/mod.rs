@@ -91,7 +91,9 @@ impl HttpFilter for AnthropicValidateFilter {
         }
 
         let Some(bytes) = body.as_deref().filter(|b| !b.is_empty()) else {
-            return Ok(FilterAction::Reject(reject("request body is required")));
+            return Ok(FilterAction::Reject(wire::invalid_request_rejection(
+                "request body is required",
+            )));
         };
 
         if let Some(rejection) = validate_request(bytes) {
@@ -110,11 +112,11 @@ impl HttpFilter for AnthropicValidateFilter {
 /// Validate the JSON envelope in the request body.
 fn validate_request(body: &[u8]) -> Option<Rejection> {
     if serde_json::from_slice::<IgnoredAny>(body).is_err() {
-        return Some(reject("request body is not valid JSON"));
+        return Some(wire::invalid_request_rejection("request body is not valid JSON"));
     }
 
     if !is_json_object(body) {
-        return Some(reject("request body is not a JSON object"));
+        return Some(wire::invalid_request_rejection("request body is not a JSON object"));
     }
 
     None
@@ -136,13 +138,4 @@ fn is_json_whitespace(byte: u8) -> bool {
 fn is_json_object(body: &[u8]) -> bool {
     let root = body.iter().find(|&&byte| !is_json_whitespace(byte));
     root == Some(&b'{')
-}
-
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
-
-/// Build a 400 rejection with a JSON error body.
-fn reject(message: &str) -> Rejection {
-    wire::invalid_request_rejection(message)
 }

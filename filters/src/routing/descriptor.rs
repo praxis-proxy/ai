@@ -356,13 +356,8 @@ pub(crate) fn validate_local_site(value: &str) -> Result<(), FilterError> {
     validate_name("local_site", value)
 }
 
-/// Validate a cluster identifier used outside an inline candidate.
-pub(crate) fn validate_cluster_name(field: &str, value: &str) -> Result<(), FilterError> {
-    validate_name(field, value)
-}
-
 /// Validate a bounded, non-blank identifier.
-fn validate_name(field: &str, value: &str) -> Result<(), FilterError> {
+pub(crate) fn validate_name(field: &str, value: &str) -> Result<(), FilterError> {
     if value.trim().is_empty() || value.len() > MAX_NAME_LEN {
         return Err(format!("routing: {field} must be 1-{MAX_NAME_LEN} non-blank characters").into());
     }

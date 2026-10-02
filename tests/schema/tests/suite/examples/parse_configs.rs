@@ -25,6 +25,10 @@ fn all_example_configs_parse() {
 // -----------------------------------------------------------------------------
 
 /// Recursively collect all `.yaml` files under `root`.
+///
+/// Flow-visualizer sidecars (`*.visualizer.yaml`) are curated documentation
+/// data, not Praxis configs, so they never parse as `Config` and are skipped
+/// here — mirroring the same exclusion in `xtask`'s `sync_example_readme`.
 fn walkdir(root: &str) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     let mut dirs = vec![std::path::PathBuf::from(root)];
@@ -33,7 +37,9 @@ fn walkdir(root: &str) -> Vec<std::path::PathBuf> {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 dirs.push(path);
-            } else if path.extension().is_some_and(|e| e == "yaml") {
+            } else if path.extension().is_some_and(|e| e == "yaml")
+                && !path.to_string_lossy().ends_with(".visualizer.yaml")
+            {
                 files.push(path);
             }
         }

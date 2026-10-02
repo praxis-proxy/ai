@@ -20,7 +20,7 @@ use praxis_filter::{
 
 use super::{
     config::{AiGuardrailsConfig, PhaseConfig, ProviderType},
-    providers::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult, nemo},
+    providers::{GuardCalloutRuntime, GuardPhase, GuardResult, nemo},
 };
 
 /// Maximum request body size to buffer (1 MiB).
@@ -72,7 +72,7 @@ const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 /// ```
 pub struct AiGuardrailsFilter {
     /// Guard provider instance.
-    provider: Box<dyn GuardProvider>,
+    provider: nemo::NemoProvider,
     /// Which phases to evaluate.
     phase: PhaseConfig,
     /// Prebuilt outbound filter chain for provider callouts.
@@ -93,11 +93,11 @@ impl AiGuardrailsFilter {
         outbound: Arc<FilterPipeline>,
         client: SubRequestClient,
     ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let (provider, callout_timeout): (Box<dyn GuardProvider>, _) = match config.provider.provider_type {
+        let (provider, callout_timeout) = match config.provider.provider_type {
             ProviderType::Nemo => {
                 let provider = nemo::NemoProvider::from_config(&config.provider.config, client)?;
                 let timeout = provider.callout_timeout();
-                (Box::new(provider), timeout)
+                (provider, timeout)
             },
         };
 

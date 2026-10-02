@@ -1,0 +1,94 @@
+# OpenAI Chat Completions to AWS Bedrock Converse
+#
+# Accepts OpenAI Chat Completions requests and transparently forwards
+# them to AWS Bedrock Converse, translating both the request and
+# response bodies on the fly.
+#
+# Pipeline overview
+# ─────────────────
+# 1. `openai_chat_completions_to_bedrock_converse` — Praxis pre-reads the
+#    full request body before processing the filter chain. During pre-read,
+#    this filter translates the Chat Completions payload to the Bedrock
+#    Converse shape and sets the upstream path to:
+#      /model/{model-id}/converse       (non-streaming)
+#      /model/{model-id}/converse-stream (streaming)
+#    Both the rewritten path and the translated body are available to
+#    subsequent filters during their request-header phase.
+#
+# 2. `router` — routes on the rewritten /model/{id}/... path prefix,
+#    selecting the Bedrock Runtime cluster.
+#
+# 3. `load_balancer` — forwards requests to the Bedrock Runtime endpoint.
+#
+# 4. `aws_sigv4_sign` — signs the upstream request with AWS Signature
+#    Version 4. Because Praxis delivers the translated body and rewritten
+#    path to this filter's request-header phase (see step 1 above), the
+#    signature covers the correct Bedrock path and body hash. It also
+#    injects the Host header and strips the client-supplied Authorization.
+#
+# Non-streaming and streaming responses are both handled by the
+# translation filter:
+#   - Non-streaming: the full Bedrock Converse JSON is buffered and
+#     rewritten to a Chat Completions response.
+#   - Streaming: each binary AWS EventStream frame is decoded and
+#     emitted as an OpenAI SSE `data: {chunk}\n\n` event. The stream
+#     ends with `data: [DONE]\n\n`.
+#
+# Required environment variables:
+#   AWS_ACCESS_KEY_ID
+#   AWS_SECRET_ACCESS_KEY
+#
+# In this example the backend cluster points at a local test double
+# (127.0.0.1:3000). In production, replace the endpoint with the real
+# Bedrock Runtime regional hostname and enable TLS:
+#
+#   endpoints:
+#     - "bedrock-runtime.us-east-1.amazonaws.com:443"
+#   tls:
+#     sni: bedrock-runtime.us-east-1.amazonaws.com
+#
+# The `host` field in `aws_sigv4_sign` must match the cluster's actual
+# TLS SNI/hostname — Praxis does not reconcile them automatically.
+
+listeners:
+  - name: gateway
+    address: "0.0.0.0:8080"
+    filter_chains:
+      - bedrock-translate
+
+filter_chains:
+  - name: bedrock-translate
+    filters:
+      # Step 1 — Translate Chat Completions ↔ Bedrock Converse.
+      # This filter pre-reads the full request body; the translated body
+      # and rewritten upstream path are ready before any subsequent
+      # on_request callbacks run.
+      - filter: openai_chat_completions_to_bedrock_converse
+        max_body_bytes: 4194304        # optional; default 4 MiB
+
+      # Step 2 — Route on the rewritten /model/… path.
+      - filter: router
+        routes:
+          - path_prefix: "/model/"
+            cluster: bedrock
+
+      # Step 3 — Select the Bedrock Runtime endpoint.
+      - filter: load_balancer
+        clusters:
+          - name: bedrock
+            endpoints:
+              - "127.0.0.1:3000"      # replace with bedrock-runtime.{region}.amazonaws.com:443
+
+      # Step 4 — Sign the request with AWS SigV4.
+      # Reads ctx.rewritten_path (/model/{id}/converse[-stream]) and
+      # ctx.buffered_request_body (the translated Bedrock JSON) so the
+      # signature covers the actual upstream path and body.
+      - filter: aws_sigv4_sign
+        region: us-east-1
+        service: bedrock
+        host: 127.0.0.1:3000             # replace with the production Bedrock Runtime hostname
+        access_key_env_var: AWS_ACCESS_KEY_ID
+        secret_key_env_var: AWS_SECRET_ACCESS_KEY
+
+insecure_options:
+  allow_private_endpoints: true # example proxies to a local test double
