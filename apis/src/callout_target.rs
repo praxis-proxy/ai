@@ -31,7 +31,8 @@ pub enum AddressPolicy {
 }
 
 impl AddressPolicy {
-    /// Build a policy from a filter's explicit private-target opt-in.
+    /// Keep the generic private-target opt-in separate from protocol-owned
+    /// credential endpoints.
     #[must_use]
     pub const fn from_allow_private(allow_private: bool) -> Self {
         if allow_private {
@@ -41,13 +42,13 @@ impl AddressPolicy {
         }
     }
 
-    /// Return whether the generic private-address opt-in is enabled.
+    /// Dedicated protocol exceptions must not inherit generic private access.
     #[must_use]
     pub const fn allows_private(self) -> bool {
         matches!(self, Self::AllowPrivate)
     }
 
-    /// Return whether Google's metadata endpoints are allowed.
+    /// Google metadata access is isolated from the operator's generic opt-in.
     #[must_use]
     pub const fn allows_google_metadata(self) -> bool {
         matches!(self, Self::AllowGoogleMetadata)

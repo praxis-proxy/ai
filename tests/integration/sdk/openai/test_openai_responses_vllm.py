@@ -8684,9 +8684,11 @@ class TestFileResolveOutboundChain:
                 store=False,
             )
 
-        assert exc_info.value.status_code == 403
-        assert "blocked by security policy" in str(exc_info.value)
-        assert backend.captured == []
+        assert exc_info.value.status_code == 403, "metadata file URLs should return 403"
+        assert "blocked by security policy" in str(
+            exc_info.value
+        ), "metadata file URLs should report the security-policy rejection"
+        assert backend.captured == [], "blocked metadata requests must not reach the backend"
 
 
 # ---------------------------------------------------------------------------
