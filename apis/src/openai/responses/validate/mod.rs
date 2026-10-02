@@ -139,7 +139,7 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
         if let Some(action) = reject_conflicting_history_selectors(&parsed) {
             return Ok(action);
         }
-        if let Some(action) = reject_prompt_template(&parsed) {
+        if let Some(action) = super::reject_prompt_template(&parsed) {
             return Ok(action);
         }
 
@@ -253,17 +253,6 @@ fn reject_conflicting_history_selectors(body: &serde_json::Value) -> Option<Filt
             "invalid_request_error",
             "mutually_exclusive_parameters",
             "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
-        ))
-    })
-}
-
-/// Reject OpenAI-managed prompt templates on gateway-managed routes.
-fn reject_prompt_template(body: &serde_json::Value) -> Option<FilterAction> {
-    body.get("prompt").is_some_and(|prompt| !prompt.is_null()).then(|| {
-        FilterAction::Reject(responses_error_rejection(
-            400,
-            "invalid_request_error",
-            "prompt templates are supported only for OpenAI-owned upstreams",
         ))
     })
 }

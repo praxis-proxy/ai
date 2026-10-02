@@ -432,6 +432,54 @@ async fn background_mode_is_rejected_before_upstream_contact() {
 }
 
 #[tokio::test]
+async fn prompt_template_is_rejected_before_state_initialization() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4.1",
+            "prompt": {"id": "pmpt_123", "variables": {"name": "Ada"}}
+        }))
+        .unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    let FilterAction::Reject(rejection) = action else {
+        panic!("the managed request processor must reject prompt templates");
+    };
+    assert_eq!(rejection.status, 400);
+    let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(
+        body["error"]["message"],
+        "prompt templates are supported only for OpenAI-owned upstreams"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "rejected prompt templates must not initialize gateway-owned state"
+    );
+}
+
+#[tokio::test]
+async fn null_prompt_is_allowed() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi", "prompt": null})).unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(matches!(action, FilterAction::Release));
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_some(),
+        "a null prompt is semantically absent and must pass validation"
+    );
+}
+
+#[tokio::test]
 async fn an_unclassifiable_body_follows_on_invalid_continue() {
     // The default is `continue`. The classifier this replaces forwarded such a
     // body and still published its format, so chains that route on those keys

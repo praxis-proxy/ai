@@ -491,6 +491,21 @@ fn handle_unsupported_background(classified: &ClassifiedRequest) -> Option<Filte
     None
 }
 
+/// Reject a non-null provider-owned prompt template on a gateway-managed path.
+///
+/// Callers own provider routing: direct OpenAI traffic must bypass the
+/// gateway-managed request processor or validator before reaching this check.
+#[cfg(feature = "openai-responses")]
+fn reject_prompt_template(body: &serde_json::Value) -> Option<FilterAction> {
+    body.get("prompt").is_some_and(|prompt| !prompt.is_null()).then(|| {
+        FilterAction::Reject(error::responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "prompt templates are supported only for OpenAI-owned upstreams",
+        ))
+    })
+}
+
 /// Determine the routing mode for a Responses API request.
 ///
 /// Returns `Some("stateful")` when the request needs orchestration

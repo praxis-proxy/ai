@@ -10,8 +10,9 @@
 //! metadata, the promoted headers and filter results, the proxy-owned
 //! identifiers, and [`ResponsesState`].
 //!
-//! Create requests with `background=true` are rejected, because Praxis does not
-//! implement the asynchronous Responses lifecycle.
+//! Create requests with `background=true` or a non-null `prompt` are rejected,
+//! because Praxis does not implement the asynchronous Responses lifecycle or
+//! provider-owned prompt templates on gateway-managed paths.
 //!
 //! This replaces the pair of `openai_responses_format` and
 //! `openai_responses_validate`. Those two each parsed the
@@ -75,8 +76,8 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// and the `WebSocket` handshake — are released untouched, as is Conversations
 /// API traffic. `on_invalid` governs only bodies that fail to parse.
 ///
-/// Rejects `background=true` with a 400, matching `openai_responses_format`,
-/// because Praxis does not implement the asynchronous Responses lifecycle.
+/// Rejects `background=true` and non-null `prompt` with a 400, matching the
+/// managed-path policy enforced by `openai_responses_validate`.
 ///
 /// Promotes `openai_responses_format.*` metadata, publishes filter results
 /// under `openai_responses_request`, and generates
@@ -159,6 +160,12 @@ impl HttpFilter for OpenaiResponsesRequestFilter {
         };
 
         if let Some(action) = super::handle_unsupported_background(&classified) {
+            return Ok(action);
+        }
+
+        if classified.format == AiRequestFormat::Responses
+            && let Some(action) = super::reject_prompt_template(&parsed)
+        {
             return Ok(action);
         }
 
