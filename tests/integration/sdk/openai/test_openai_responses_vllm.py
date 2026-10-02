@@ -286,7 +286,6 @@ def _write_full_flow_config(
         CONFIG_PATH,
         praxis_port,
         backend_endpoint=backend_endpoint or _vllm_endpoint(),
-        db_path=db_path,
     )
     config = config.replace("127.0.0.1:9999", _ogx_endpoint())
     # The unified gateway wires openai_web_search into the IRR; its config
@@ -313,6 +312,7 @@ def _write_full_flow_config(
     if compression:
         config = _enable_response_store_compression(config)
 
+    config = _patch_store_backend(config, db_path)
     return _persist_config(config)
 
 
@@ -439,7 +439,7 @@ def _write_compact_config(
     compaction_port: int,
 ) -> str:
     """Patch the compact example for inference and a deterministic summary."""
-    config = _load_example_config(COMPACT_CONFIG_PATH, praxis_port, db_path=db_path)
+    config = _load_example_config(COMPACT_CONFIG_PATH, praxis_port)
     config = config.replace("127.0.0.1:9999", _ogx_endpoint())
     config = config.replace(
         "http://localhost:11434/v1/chat/completions",
@@ -450,7 +450,28 @@ def _write_compact_config(
     )
     config = config.replace("timeout_ms: 60000", "timeout_ms: 300000")
     config = config.replace("127.0.0.1:11434", _vllm_endpoint())
+    config = _patch_store_backend(config, db_path)
     return _persist_config(config)
+
+
+@pytest.mark.parametrize(
+    ("writer", "args", "postgres_port"),
+    [
+        (_write_full_flow_config, (18_080, "/unused.db"), 9999),
+        (_write_compact_config, (18_080, "/unused.db", 18_081), 9999),
+        (_write_compact_config, (18_080, "/unused.db", 18_081), 11434),
+    ],
+)
+def test_store_url_survives_endpoint_rewrites(writer, args, postgres_port, monkeypatch):
+    database_url = f"postgres://test:test@127.0.0.1:{postgres_port}/responses"
+    monkeypatch.setattr(sys.modules[__name__], "DATABASE_URL", database_url)
+    path = writer(*args)
+    try:
+        with open(path) as config_file:
+            config = config_file.read()
+        assert f'database_url: "{database_url}"' in config
+    finally:
+        os.unlink(path)
 
 
 def _write_web_search_chat_streaming_config(
