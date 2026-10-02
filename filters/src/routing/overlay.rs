@@ -15,7 +15,7 @@
 //! [`ArcSwap`]: arc_swap::ArcSwap
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fmt::Write as _,
     io::Read as _,
     path::{Path, PathBuf},
@@ -313,6 +313,10 @@ pub(crate) struct OverlayCandidate {
     /// Deterministic identifier assigned by the configuration producer.
     #[serde(default)]
     pub(crate) stable_id: Option<String>,
+
+    /// Attributes a request claim may fence on (e.g. `region: eu-west-1`).
+    #[serde(default)]
+    pub(crate) labels: BTreeMap<String, String>,
 }
 
 /// Default freshness for overlay candidates.
@@ -786,6 +790,7 @@ fn overlay_to_candidates(doc: &OverlayDocument) -> Result<Vec<RouteCandidate>, F
                 name: oc.name.clone(),
                 site: oc.site.clone(),
                 traffic_weight: oc.traffic_weight,
+                labels: oc.labels.clone(),
             })
         })
         .collect::<Result<Vec<_>, FilterError>>()?;
@@ -2449,6 +2454,7 @@ mod tests {
             CapabilityKind::InferenceModel,
             "m",
             snapshot.selection_mode,
+            &crate::routing::picker::Eligibility::All,
         )
         .unwrap()
         .0
