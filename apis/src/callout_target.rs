@@ -22,9 +22,8 @@ pub enum AddressPolicy {
     /// Private, loopback, link-local, and other non-public addresses are
     /// accepted because the operator explicitly opted in.
     AllowPrivate,
-    /// Known cloud metadata endpoints and loopback test servers are accepted
-    /// for a dedicated credential provider whose target authority is
-    /// independently restricted.
+    /// Known cloud metadata endpoints are accepted for a dedicated credential
+    /// provider whose target authority is independently restricted.
     ///
     /// This is not exposed as a generic configuration opt-in. Unspecified and
     /// multicast destinations remain forbidden.
@@ -63,9 +62,7 @@ impl AddressPolicy {
     pub fn blocks(self, ip: &IpAddr) -> bool {
         let class = classify_ip(ip);
         if self.allows_cloud_metadata() {
-            return class.is_unspecified()
-                || class.is_multicast()
-                || !(class.is_cloud_metadata() || class.is_loopback());
+            return !class.is_cloud_metadata();
         }
         (class.is_cloud_metadata() && !self.allows_cloud_metadata())
             || class.is_unspecified()
@@ -359,8 +356,8 @@ mod tests {
             "the dedicated credential-provider policy should permit cloud metadata"
         );
         assert!(
-            validate_ip("test", "127.0.0.1".parse().unwrap(), AddressPolicy::AllowCloudMetadata).is_ok(),
-            "the dedicated policy should permit a loopback metadata stub"
+            validate_ip("test", "127.0.0.1".parse().unwrap(), AddressPolicy::AllowCloudMetadata).is_err(),
+            "the dedicated policy must not permit a production loopback target"
         );
         for address in ["8.8.8.8", "10.0.0.1", "0.0.0.0", "::", "224.0.0.1", "ff02::1"] {
             assert!(

@@ -927,6 +927,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resolver_blocks_metadata_even_when_origin_selects_private_policy() {
+        let resolver = FileUrlResolver {
+            // Construct directly because configuration correctly rejects
+            // metadata origins before a resolver can be built.
+            allowed_private_origins: vec![NormalizedOrigin {
+                scheme: "http".to_owned(),
+                host: "169.254.169.254".to_owned(),
+                port: 80,
+            }],
+            client: test_client(),
+        };
+
+        let result = resolver
+            .resolve_url(
+                "http://169.254.169.254/latest/meta-data/",
+                tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+                1024,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ResolveError::FileUrlBlocked { .. })),
+            "cloud metadata must remain blocked after selecting the private-origin policy"
+        );
+    }
+
     #[test]
     fn ssrf_blocks_ecs_credential_endpoint() {
         assert!(

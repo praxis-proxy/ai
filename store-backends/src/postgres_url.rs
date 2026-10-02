@@ -769,6 +769,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_mapped_cloud_metadata_with_opt_in() {
+        let err =
+            validate_postgres_database_url(FILTER, "postgres://[::ffff:169.254.169.254]:5432/db", true).unwrap_err();
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "mapped cloud metadata must remain blocked with allow_private_database_url"
+        );
+    }
+
+    #[test]
     fn allows_unix_socket_with_opt_in() {
         validate_postgres_database_url(FILTER, "postgres:///db?host=/var/run/postgresql", true).unwrap();
     }
