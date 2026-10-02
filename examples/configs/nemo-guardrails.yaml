@@ -10,6 +10,33 @@
 #
 # Start a local NeMo Guardrails instance before running this config.
 #
+# The nemo-outbound chain authenticates every NeMo callout with a
+# Kubernetes projected `serviceAccountToken` volume instead of a static
+# inline credential (see credential-injection.yaml). `service_account_token`
+# re-reads the token file fresh on every callout, so Kubernetes' own
+# rotation of the projected volume is picked up without a config reload
+# or a Praxis restart.
+#
+# Use this when the endpoint, such as NeMo, sits behind a component that
+# validates Kubernetes bearer tokens, such as a kube-rbac-proxy sidecar
+# performing a SubjectAccessReview before forwarding to NeMo.
+#
+# Project the token with a Pod spec along these lines:
+#
+#   volumes:
+#     - name: nemo-token
+#       projected:
+#         sources:
+#           - serviceAccountToken:
+#               path: token
+#               audience: nemoguardrails-default
+#               expirationSeconds: 3600
+#   containers:
+#     - volumeMounts:
+#         - name: nemo-token
+#           mountPath: /var/run/secrets/tokens/nemo
+#           readOnly: true
+#
 # Example requests:
 #
 #   # Clean prompt - passes request-side guardrails and is forwarded upstream
@@ -37,9 +64,9 @@ filter_chains:
         outbound_chain: nemo-outbound
         provider:
           type: nemo
-          # NeMo callouts are anonymous; no downstream authentication
-          # headers are forwarded to this endpoint.
-          # Requires NeMo Guardrails 0.24.0 or newer.
+          # Requires NeMo Guardrails 0.24.0 or newer. In production this
+          # points at the endpoint that validates the injected bearer
+          # token (e.g. a kube-rbac-proxy sidecar in front of NeMo).
           endpoint: "http://127.0.0.1:3001/v1/checks"
           guardrails:
             config_ids: ["your-config"] # replace with a configuration deployed in NeMo
@@ -60,10 +87,14 @@ filter_chains:
             endpoints:
               - "127.0.0.1:3000"
 
-  # Every NeMo callout traverses this independently built chain. Add
-  # destination-bound authentication, authorization, and audit filters here.
+  # Every NeMo callout traverses this independently built chain.
+  # service_account_token reads the projected token fresh on every
+  # callout and sets it as `Authorization: Bearer <token>` before the
+  # request leaves the proxy.
   - name: nemo-outbound
     filters:
+      - filter: service_account_token
+        token_file: /var/run/secrets/tokens/nemo/token
       - filter: request_id
 
 insecure_options:
