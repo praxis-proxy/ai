@@ -14,9 +14,10 @@ use praxis_test_utils::{
 // Constants
 // =============================================================================
 
-/// Public address used to reach the runtime connection-failure path without
-/// triggering the non-public-address policy first.
-const PUBLIC_MCP_FAILURE_HOST: &str = "8.8.8.8";
+/// Controlled loopback address used for runtime connection-failure tests.
+/// Their configs explicitly opt into private upstreams so the requests pass
+/// address validation without contacting an external service.
+const CONTROLLED_MCP_FAILURE_HOST: &str = "127.0.0.1";
 
 // =============================================================================
 // Pass-Through (no MCP tools)
@@ -143,12 +144,12 @@ fn mcp_unreachable_server_returns_502() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"dead","server_url":"http://{PUBLIC_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"dead","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -161,12 +162,12 @@ fn streaming_mcp_unreachable_server_emits_failed_event() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","stream":true,"tools":[{{"type":"mcp","server_label":"dead","server_url":"http://{PUBLIC_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","stream":true,"tools":[{{"type":"mcp","server_label":"dead","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -300,14 +301,12 @@ fn run_streaming_mcp_failure_with_yaml(
     let dead_port = free_port();
     let db = TempSqlite::new(test_name);
 
-    let yaml = build_yaml(proxy_port, backend.port(), db.url(), 500);
+    let yaml = with_private_upstreams(build_yaml(proxy_port, backend.port(), db.url(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
-    // Use a public address so the discovery attempt reaches runtime I/O and
-    // fails there, rather than being rejected first as a local policy failure.
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","stream":true{extra_fields},"tools":[{{"type":"mcp","server_label":"weather","server_url":"http://{PUBLIC_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","stream":true{extra_fields},"tools":[{{"type":"mcp","server_label":"weather","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
     assert_eq!(
@@ -749,12 +748,12 @@ fn authorization_with_unreachable_server_returns_502() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"auth","server_url":"http://{PUBLIC_MCP_FAILURE_HOST}:{dead_port}/mcp","authorization":"tok_secret","headers":{{"x-custom":"val"}},"allowed_tools":["x"]}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"auth","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","authorization":"tok_secret","headers":{{"x-custom":"val"}},"allowed_tools":["x"]}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -775,12 +774,12 @@ fn mcp_tool_names_filter_object_accepted() {
     let proxy_port = free_port();
     let dead_port = free_port();
 
-    let yaml = resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500);
+    let yaml = with_private_upstreams(resolve_yaml_with_timeout(proxy_port, backend_guard.port(), 500));
     let config = Config::from_yaml(&yaml).unwrap();
     let proxy = start_proxy(&config);
 
     let body = format!(
-        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"srv","server_url":"http://{PUBLIC_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":{{"tool_names":["get_weather"]}}}}]}}"#
+        r#"{{"model":"gpt-4.1","input":"test","tools":[{{"type":"mcp","server_label":"srv","server_url":"http://{CONTROLLED_MCP_FAILURE_HOST}:{dead_port}/mcp","allowed_tools":{{"tool_names":["get_weather"]}}}}]}}"#
     );
     let raw = http_send(proxy.addr(), &json_post("/v1/responses", &body));
 
@@ -1516,6 +1515,19 @@ fn direct_url_alongside_connector_both_resolved() {
 
 fn resolve_yaml(proxy_port: u16, backend_port: u16) -> String {
     resolve_yaml_with_timeout(proxy_port, backend_port, 5000)
+}
+
+/// Enable loopback MCP targets for tests that deliberately exercise transport
+/// failures after address-policy validation.
+fn with_private_upstreams(yaml: String) -> String {
+    if yaml.contains("  allow_private_upstreams: true") {
+        return yaml;
+    }
+    yaml.replacen(
+        "insecure_options:\n",
+        "insecure_options:\n  allow_private_upstreams: true\n",
+        1,
+    )
 }
 
 /// Pipeline mirroring the relevant shipped `full-flow-agentic.yaml` ordering for
