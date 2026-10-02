@@ -35,6 +35,90 @@ Conversations supplies the items table, and both must select the same
 conversations table. Both registry names then resolve the same backend lease and
 SQL pool.
 
+## Conversation History
+
+Conversation item rows are authoritative for Responses continuation. History is
+read in `(position, item_id)` order from one owner-scoped snapshot. SQLite uses a
+read transaction and enables WAL for file-backed databases so a snapshot reader
+does not block a writer's commit. In-memory databases retain their native journal
+and single-connection pool. PostgreSQL uses a repeatable-read, read-only transaction. SQLx
+streams rows into the owned history vector instead of collecting all raw SQL rows
+alongside their decoded JSON. Replay and persistence share unchanged JSON through
+item-level copy-on-write history. Legacy normalization and content/tool rewrites
+detach only changed items; hosted-tool items remain in exact persisted order.
+Native request serialization borrows the projected history directly. Independent
+JSON values are materialized only at the existing durable-record ownership
+boundary. Rehydration does not serialize history a second time for sizing or
+impose a total-history item-count or byte-size limit. The backend owns model
+context overflow through the client's `truncation` setting, which is preserved
+for native Responses requests. Other gateway limits still apply: file-search
+continuations enforce `max_state_bytes` over replay and persisted state, and
+transport, request-body, and storage safeguards remain in effect.
+
+Adding or deleting items assigns positions and invalidates the retired `messages`
+cache in the same transaction without decoding other item payloads. Clearing the
+cache after the last deletion prevents stale items from reappearing. Existing
+per-request item limits and exact tenant/issuer/subject isolation are unchanged.
+
+The schema and its version are unchanged. Existing conversations that have both
+item rows and a cache replay from item rows. Cache-only legacy records remain
+readable, including Responses-only configurations without an items table. The
+first append to a nonempty cache-only record preserves its original array as an
+internal `legacy_messages` prefix in the existing JSON column. This one-time
+requested mutation reads and rewrites the legacy cache, not existing item rows;
+subsequent mutations preserve the prefix without decoding it. History reads
+prepend that prefix to ordered item rows, including after deleting the last new
+item. No startup migration, schema change, or item-row backfill runs automatically.
+
+A mixed-version rolling upgrade against the same conversation tables is not
+supported. An older writer can rebuild `messages` from item rows and permanently
+erase the preserved legacy prefix; the older reader also cannot replay the new
+representation. Before upgrading, stop conversation traffic, drain in-flight
+requests and all old writers, and back up the tables. Replace every instance
+sharing those tables before resuming traffic. Separate tables are required if
+old and new binaries must run at the same time.
+
+File-backed SQLite databases must use local storage that supports WAL shared
+memory, not a network filesystem. Use SQLite's backup facilities rather than
+copying an active database file alone; committed changes may still be in its WAL.
+Long-lived readers can delay checkpoints and grow the WAL, so monitor disk usage
+and transaction duration. WAL does not remove contention between writers or
+promise a latency bound.
+
+Startup validation checks the conversation `messages` column as well as table
+structure: PostgreSQL requires built-in `TEXT` (not JSON/JSONB or a domain), while
+SQLite requires TEXT affinity, accepting VARCHAR/CLOB but rejecting INTEGER,
+BLOB, and JSONB declarations. Incompatible custom schemas fail before the schema
+version is stamped and require an explicit reviewed schema repair. No type
+conversion or history rewrite runs automatically.
+
+### Invalid legacy cache recovery
+
+A cache-only row containing unsupported JSON objects or scalar values rejects
+appends with a serialization error. The failed transaction preserves both the
+original cache and item positions; it does not silently replace history with an
+empty array. Item-backed conversations continue to ignore a stale array cache.
+
+To recover, stop traffic for the affected conversation, back up its row and
+items, and verify the intended complete legacy history from trustworthy evidence.
+For a cache-only row, use the store's owner-scoped
+`compare_and_swap_conversation_messages` with the exact observed invalid value
+and the verified replacement array. A stale expected value or different owner
+returns false; reread and investigate rather than forcing the write. If history
+cannot be recovered, leaving the conversation rejected is safer than silently
+losing data. The protected `legacy_messages` prefix must not be overwritten by
+this repair path. Confirm complete history and a successful append before
+resuming traffic. This is an integration/operator recovery procedure, not a new
+public HTTP repair endpoint.
+
+Before rolling back to a binary that reads only the cache, stop conversation
+traffic and drain all new writers. Explicitly rebuild each affected cache from
+its legacy prefix and ordered item rows using a backup and the deployment's
+migration procedure, then replace every instance before resuming traffic. An old
+binary must not serve continuations against invalidated caches. The new `conversation_history` store
+method is the replay boundary; raw `get_conversation` still returns metadata and
+legacy cache data, not reconstructed item history.
+
 ## Backend Features
 
 The default `praxis-ai-proxy` build uses `full`, so PostgreSQL-backed Responses

@@ -171,14 +171,15 @@ impl ResponsesProxyFilter {
         let members = scan_top_level_object(body).map_err(|error| -> FilterError {
             format!("openai_responses_proxy: invalid selected request body: {error}").into()
         })?;
-        let state_messages = if provider_owns_conversation(state) && state.iteration > 0 {
-            state.messages.get(state.provider_history_len..).unwrap_or_default()
+        let message_start = if provider_owns_conversation(state) && state.iteration > 0 {
+            state.provider_history_len
         } else {
-            &state.messages
+            0
         };
+        let state_messages = state.messages.values_in(message_start, state.messages.len());
         let live_input = selected_input_messages(body, &members)?;
         let state_backend_messages = messages_for_backend(
-            state_messages,
+            &state_messages,
             preserve_native_compaction,
             &state.provider_compaction_ids,
         );
@@ -193,21 +194,21 @@ impl ResponsesProxyFilter {
             } else if state.history_rehydrated {
                 let appended = appended_state_messages(state);
                 let history_len = state.messages.len().saturating_sub(state.input.len() + appended.len());
-                let history = state.messages.get(..history_len).unwrap_or_default();
+                let history = state.messages.values_in(0, history_len);
                 let projected_history =
-                    messages_for_backend(history, preserve_native_compaction, &state.provider_compaction_ids);
+                    messages_for_backend(&history, preserve_native_compaction, &state.provider_compaction_ids);
                 if live_input.len() >= projected_history.len()
                     && live_input.get(..projected_history.len()) == Some(projected_history.as_ref())
                 {
                     // A prior rebuild has already included local history. Keep
                     // the live body so later filters' edits remain visible,
                     // while retaining any agentic results appended afterward.
-                    reconciled_messages = Some(append_state_messages(live_input, appended));
+                    reconciled_messages = Some(append_state_messages(live_input, &appended));
                 } else {
                     // A direct selected-body invocation may still contain only
                     // the current input. Reattach the locally replayed history
                     // and any agentic results appended after it.
-                    let mut merged = history.to_vec();
+                    let mut merged = history.clone();
                     merged.extend(live_input);
                     merged.extend(appended.iter().cloned());
                     reconciled_messages = Some(merged);
@@ -216,14 +217,15 @@ impl ResponsesProxyFilter {
                 // Provider-owned continuations send only the new delta. A
                 // later body filter may restore the original input, but it
                 // must not replace the accumulated tool result for this round.
-                reconciled_messages = Some(append_state_messages(live_input, state_messages));
+                reconciled_messages = Some(append_state_messages(live_input, &state_messages));
             } else {
                 // Preserve later filters' input edits while retaining agentic
                 // results appended after the original stateless input.
-                reconciled_messages = Some(append_state_messages(live_input, appended_state_messages(state)));
+                let trailing = appended_state_messages(state);
+                reconciled_messages = Some(append_state_messages(live_input, &trailing));
             }
         }
-        let messages = reconciled_messages.as_deref().unwrap_or(state_messages);
+        let messages = reconciled_messages.as_deref().unwrap_or(&state_messages);
         let provider_compaction_ids = reconciled_messages.as_ref().map_or_else(
             || Cow::Borrowed(&state.provider_compaction_ids),
             |messages| {
@@ -405,19 +407,15 @@ fn append_state_messages(
 }
 
 /// Return messages appended after the original request input.
-fn appended_state_messages(state: &ResponsesState) -> &[serde_json::Value] {
+fn appended_state_messages(state: &ResponsesState) -> Vec<serde_json::Value> {
     let input_len = state.input.len();
     if input_len == 0 {
-        return &state.messages;
+        return state.messages.iter().cloned().collect();
     }
-    let Some(input_start) = state
-        .messages
-        .windows(input_len)
-        .rposition(|window| window == state.input.as_slice())
-    else {
-        return &[];
-    };
-    state.messages.get(input_start + input_len..).unwrap_or_default()
+    match state.messages.rposition_run(state.input.as_slice()) {
+        Some(input_start) => state.messages.values_in(input_start + input_len, state.messages.len()),
+        None => Vec::new(),
+    }
 }
 
 /// Locate top-level members without materializing the complete JSON value.
@@ -761,22 +759,23 @@ impl serde::Serialize for OutboundBody<'_> {
             return self.state.request_body.serialize(serializer);
         };
 
-        let messages = if provider_owns_conversation(self.state) && self.state.iteration > 0 {
-            self.state
-                .messages
-                .get(self.state.provider_history_len..)
-                .unwrap_or_default()
+        let start = if provider_owns_conversation(self.state) && self.state.iteration > 0 {
+            self.state.provider_history_len
         } else {
-            &self.state.messages
+            0
         };
-        let backend_messages =
-            messages_for_backend(messages, self.preserve_native_compaction, self.provider_compaction_ids);
+        let backend_messages = BackendMessages {
+            history: &self.state.messages,
+            start,
+            preserve_native_compaction: self.preserve_native_compaction,
+            provider_compaction_ids: self.provider_compaction_ids,
+        };
         let mut map = serializer.serialize_map(None)?;
         let mut wrote_input = false;
         for (name, value) in object {
             match name.as_str() {
                 "input" => {
-                    map.serialize_entry(name, backend_messages.as_ref())?;
+                    map.serialize_entry(name, &backend_messages)?;
                     wrote_input = true;
                 },
                 "previous_response_id" | "conversation" if self.state.history_rehydrated => {},
@@ -784,7 +783,7 @@ impl serde::Serialize for OutboundBody<'_> {
             }
         }
         if !wrote_input {
-            map.serialize_entry("input", backend_messages.as_ref())?;
+            map.serialize_entry("input", &backend_messages)?;
         }
         map.end()
     }
@@ -809,6 +808,19 @@ fn serialize_outbound_body(
         preserve_native_compaction,
         provider_compaction_ids: &state.provider_compaction_ids,
     })
+}
+
+/// Borrow history directly, translating only compaction items while serializing.
+struct BackendMessages<'a> {
+    /// Shared canonical messages.
+    history: &'a super::history::MessageHistory,
+    /// First message not already owned by the provider.
+    start: usize,
+    /// Preserve provider-native compaction items instead of translating them
+    /// to Chat-style assistant messages.
+    preserve_native_compaction: bool,
+    /// IDs of compaction items known to have come from a provider response.
+    provider_compaction_ids: &'a HashSet<String>,
 }
 
 /// Project compaction items into the selected backend's input format.
@@ -845,6 +857,35 @@ fn messages_for_backend<'a>(
     match translated {
         Some(vec) => Cow::Owned(vec),
         None => Cow::Borrowed(messages),
+    }
+}
+
+impl serde::Serialize for BackendMessages<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq as _;
+
+        let mut sequence = serializer.serialize_seq(Some(self.history.len().saturating_sub(self.start)))?;
+        for item in self.history.iter().skip(self.start) {
+            let is_provider_compaction = self.preserve_native_compaction
+                && item.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+                && item
+                    .get(crate::openai::responses::state::LOCAL_COMPACTION_MARKER)
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                && match item.get("id").and_then(serde_json::Value::as_str) {
+                    Some(id) => self.provider_compaction_ids.contains(id),
+                    None => true,
+                };
+            if item.get("type").and_then(serde_json::Value::as_str) == Some("compaction") && !is_provider_compaction {
+                sequence.serialize_element(&compaction_to_assistant_message(item))?;
+            } else {
+                sequence.serialize_element(item)?;
+            }
+        }
+        sequence.end()
     }
 }
 

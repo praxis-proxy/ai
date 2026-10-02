@@ -87,8 +87,8 @@ use self::{
     resolve_url::{FileUrlResolver, NormalizedOrigin},
 };
 use super::{
-    body_limits::reject_rewritten_body_too_large, bound_body_outcome,
-    openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
+    body_limits::reject_rewritten_body_too_large, bound_body_outcome, content_parts::content_parts,
+    history::MessageHistory, openai_responses_proxy::serialized_outbound_body_len, state::ResponsesState,
 };
 use crate::{
     callout_headers::effective_body_callout_headers,
@@ -446,7 +446,11 @@ async fn resolve_and_rewrite(
     let max_bytes = filter.config.max_rewritten_body_bytes;
     let needs_files_api = body_has_file_id_reference(&parsed)
         || ctx.extensions.get::<ResponsesState>().is_some_and(|state| {
-            items_have_file_id_reference(&state.messages) || items_have_file_id_reference(&state.persisted_messages)
+            state
+                .messages
+                .iter()
+                .chain(state.persisted_messages.iter())
+                .any(|item| items_have_file_id_reference(std::slice::from_ref(item)))
         });
     let identity = if needs_files_api {
         match stage_callout_identity(ctx, filter.user_credential_slot.as_deref()) {
@@ -706,7 +710,7 @@ struct HistoryResolver<'a> {
 /// Resolve the persistence mirror with independent count and byte
 /// accounting while reusing the request-wide cache and deadline.
 async fn sync_persisted_history(
-    messages: &mut [serde_json::Value],
+    messages: &mut MessageHistory,
     input_len: usize,
     resolved_input: Option<&[serde_json::Value]>,
     resolver: HistoryResolver<'_>,
@@ -721,7 +725,7 @@ async fn sync_persisted_history(
 /// Update the current-input tail, when provided, then resolve the
 /// independently sized history prefix.
 async fn sync_message_history(
-    messages: &mut [serde_json::Value],
+    messages: &mut MessageHistory,
     input_len: usize,
     resolved_input: Option<&[serde_json::Value]>,
     resolver: HistoryResolver<'_>,
@@ -738,8 +742,11 @@ async fn sync_message_history(
 
 /// Copy resolved input items into the current-input tail of a
 /// message vector, starting at `history_end`.
-fn replace_tail(messages: &mut [serde_json::Value], history_end: usize, resolved_input: &[serde_json::Value]) {
+fn replace_tail(messages: &mut MessageHistory, history_end: usize, resolved_input: &[serde_json::Value]) {
     for (i, item) in resolved_input.iter().enumerate() {
+        if messages.get(history_end + i) == Some(item) {
+            continue;
+        }
         if let Some(slot) = messages.get_mut(history_end + i) {
             *slot = item.clone();
         }
@@ -748,28 +755,45 @@ fn replace_tail(messages: &mut [serde_json::Value], history_end: usize, resolved
 
 /// Resolve file references in history messages (the prefix
 /// before the current input).
+#[expect(
+    clippy::too_many_lines,
+    reason = "check borrowed references before detaching only items needing resolution"
+)]
 async fn resolve_history(
-    messages: &mut [serde_json::Value],
+    messages: &mut MessageHistory,
     history_end: usize,
     resolver: HistoryResolver<'_>,
     budget: &mut ResolutionBudget,
 ) -> Result<(), ResolveError> {
-    if history_end == 0 {
-        return Ok(());
+    for index in 0..history_end {
+        let needs_resolution = messages.get(index).is_some_and(|item| {
+            items_have_file_id_reference(std::slice::from_ref(item))
+                || (resolver.url_resolver.is_some()
+                    && content_parts(item).is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type").and_then(serde_json::Value::as_str) == Some("input_file")
+                                && part.get("file_url").and_then(serde_json::Value::as_str).is_some()
+                                && part.get("file_data").is_none_or(serde_json::Value::is_null)
+                                && part.get("file_id").is_none_or(serde_json::Value::is_null)
+                        })
+                    }))
+        });
+        if !needs_resolution {
+            continue;
+        }
+        if let Some(item) = messages.get_mut(index) {
+            resolve_items(
+                std::slice::from_mut(item),
+                resolver.client,
+                resolver.on_missing,
+                resolver.request_headers,
+                resolver.url_resolver,
+                budget,
+            )
+            .await?;
+        }
     }
-    let Some(history) = messages.get_mut(..history_end) else {
-        return Ok(());
-    };
-    resolve_items(
-        history,
-        resolver.client,
-        resolver.on_missing,
-        resolver.request_headers,
-        resolver.url_resolver,
-        budget,
-    )
-    .await
-    .map(|_count| ())
+    Ok(())
 }
 
 /// Map one resolution error to an HTTP status and safe client message.

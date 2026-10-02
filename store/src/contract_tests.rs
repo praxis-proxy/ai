@@ -100,6 +100,9 @@ pub async fn run_contract_suite(backend: &dyn PersistedStateBackend) {
     conversation_messages_cas(backend).await;
     conversation_id_is_globally_unique(backend).await;
     items_sync_positions_and_messages(backend).await;
+    legacy_history_survives_incremental_mutations(backend).await;
+    history_orders_positions_without_truncation(backend).await;
+    malformed_cache_requires_explicit_repair(backend).await;
     item_sync_delete_rolls_back_without_parent(backend).await;
     item_ids_are_owner_scoped(backend).await;
     item_positions_are_owner_scoped_and_atomic(backend).await;
@@ -407,8 +410,8 @@ async fn conversation_messages_cas(backend: &dyn PersistedStateBackend) {
     );
 }
 
-/// `create_items_and_sync_messages` assigns sequential positions and rebuilds
-/// the cache; `delete_item_and_sync_messages` rebuilds it again.
+/// Item mutations assign sequential positions and invalidate the cache;
+/// complete history remains available through the history reader.
 #[expect(clippy::too_many_lines, reason = "linear contract assertions")]
 async fn items_sync_positions_and_messages(backend: &dyn PersistedStateBackend) {
     let o = owner("items");
@@ -451,11 +454,84 @@ async fn items_sync_positions_and_messages(backend: &dyn PersistedStateBackend) 
         2,
         "max position is 2"
     );
+    assert_eq!(
+        backend
+            .conversation_history(&o, "conv_items")
+            .await
+            .expect("complete history")
+            .expect("parent"),
+        vec![
+            item(&o, "conv_items", "it1").item_data,
+            item(&o, "conv_items", "it2").item_data
+        ],
+        "complete history follows assigned positions"
+    );
     let listed = backend
         .list_conversation_items(&o, "conv_items", None, 10, true)
         .await
         .expect("list");
     assert_eq!(listed.len(), 2, "both items listed");
+    invalidate_existing_legacy_cache(backend).await;
+}
+
+/// Existing item rows override a legacy cache and allow invalidating mutations.
+#[expect(clippy::too_many_lines, reason = "linear delete and cache assertions")]
+async fn invalidate_existing_legacy_cache(backend: &dyn PersistedStateBackend) {
+    let o = owner("items");
+    backend
+        .upsert_conversation(&ConversationRecord {
+            owner: o.clone(),
+            conversation_id: "conv_items".into(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([{"id": "stale-cache"}]),
+        })
+        .await
+        .expect("legacy cache with existing rows");
+    assert_eq!(
+        backend
+            .conversation_history(&o, "conv_items")
+            .await
+            .expect("rows override legacy cache")
+            .expect("parent"),
+        vec![
+            item(&o, "conv_items", "it1").item_data,
+            item(&o, "conv_items", "it2").item_data
+        ],
+        "item rows override stale legacy cache"
+    );
+    backend
+        .create_items_and_sync_messages(&o, "conv_items", &[item(&o, "conv_items", "it3")])
+        .await
+        .expect("append with existing rows invalidates the stale cache");
+    assert_eq!(
+        ConversationItemStore::get_conversation(backend, &o, "conv_items")
+            .await
+            .expect("raw cache after append")
+            .expect("parent")
+            .messages,
+        serde_json::json!([]),
+        "the nonempty append must invalidate the stale cache before any delete"
+    );
+    assert_eq!(
+        backend
+            .conversation_history(&o, "conv_items")
+            .await
+            .expect("appended history"),
+        Some(vec![
+            item(&o, "conv_items", "it1").item_data,
+            item(&o, "conv_items", "it2").item_data,
+            item(&o, "conv_items", "it3").item_data,
+        ]),
+        "existing item rows remain authoritative after the append"
+    );
+    assert!(
+        backend
+            .delete_item_and_sync_messages(&o, "conv_items", "it3")
+            .await
+            .expect("remove appended fixture"),
+        "the appended row must exist"
+    );
     assert!(
         backend
             .delete_item_and_sync_messages(&o, "conv_items", "it1")
@@ -467,14 +543,352 @@ async fn items_sync_positions_and_messages(backend: &dyn PersistedStateBackend) 
         .await
         .expect("get conversation")
         .expect("conversation present");
+    assert_eq!(remaining.messages, serde_json::json!([]), "retired cache is empty");
     assert_eq!(
-        remaining.messages.as_array().map(Vec::len),
-        Some(1),
-        "message cache rebuilt after delete"
+        backend
+            .conversation_history(&o, "conv_items")
+            .await
+            .expect("history")
+            .expect("parent"),
+        vec![item(&o, "conv_items", "it2").item_data],
+        "deleted item is absent from history"
+    );
+    assert!(
+        backend
+            .delete_item_and_sync_messages(&o, "conv_items", "it2")
+            .await
+            .expect("last delete"),
+        "last item existed"
+    );
+    assert_eq!(
+        backend
+            .conversation_history(&o, "conv_items")
+            .await
+            .expect("empty history"),
+        Some(vec![]),
+        "last delete leaves empty history"
     );
 }
 
-/// Deleting an item and rebuilding its message cache is atomic when the parent
+/// Cache-only history becomes an explicit prefix only on the first append.
+#[expect(clippy::too_many_lines, reason = "linear legacy rollback assertions")]
+async fn legacy_history_survives_incremental_mutations(backend: &dyn PersistedStateBackend) {
+    let o = owner("legacy");
+    let legacy = serde_json::json!([{"role": "user", "content": "legacy"}]);
+    backend
+        .upsert_conversation(&ConversationRecord {
+            owner: o.clone(),
+            conversation_id: "conv_legacy".into(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: legacy.clone(),
+        })
+        .await
+        .expect("legacy parent");
+    assert_eq!(
+        backend
+            .conversation_history(&o, "conv_legacy")
+            .await
+            .expect("legacy read"),
+        Some(legacy.as_array().expect("array").clone()),
+        "cache-only history remains readable before mutation"
+    );
+    let new = item(&o, "conv_legacy", "new");
+    backend
+        .create_items_and_sync_messages(&o, "conv_legacy", std::slice::from_ref(&new))
+        .await
+        .expect("append preserves prefix");
+    let mut expected = legacy.as_array().expect("array").clone();
+    expected.push(new.item_data.clone());
+    assert_eq!(
+        backend
+            .conversation_history(&o, "conv_legacy")
+            .await
+            .expect("complete read"),
+        Some(expected),
+        "legacy prefix precedes appended item rows"
+    );
+    assert_eq!(
+        ConversationItemStore::get_conversation(backend, &o, "conv_legacy")
+            .await
+            .expect("raw read")
+            .expect("parent")
+            .messages,
+        serde_json::json!({"legacy_messages": legacy}),
+        "first append stores the explicit internal prefix"
+    );
+    assert!(
+        backend
+            .create_items_and_sync_messages(&o, "conv_legacy", std::slice::from_ref(&new))
+            .await
+            .is_err(),
+        "duplicate append rolls back without changing the prefix"
+    );
+    assert_eq!(
+        backend
+            .conversation_history(&o, "conv_legacy")
+            .await
+            .expect("rollback history")
+            .expect("parent")
+            .len(),
+        2,
+        "duplicate append preserves the complete history"
+    );
+    assert!(
+        backend
+            .delete_item_and_sync_messages(&o, "conv_legacy", "new")
+            .await
+            .expect("delete last row"),
+        "the appended item existed"
+    );
+    assert_eq!(
+        backend
+            .conversation_history(&o, "conv_legacy")
+            .await
+            .expect("prefix survives"),
+        Some(legacy.as_array().expect("array").clone()),
+        "last-row deletion preserves the legacy prefix"
+    );
+    backend
+        .create_items_and_sync_messages(&o, "conv_legacy", std::slice::from_ref(&new))
+        .await
+        .expect("append again does not nest prefix");
+    assert_eq!(
+        ConversationItemStore::get_conversation(backend, &o, "conv_legacy")
+            .await
+            .expect("raw read")
+            .expect("parent")
+            .messages,
+        serde_json::json!({"legacy_messages": legacy}),
+        "a later append preserves the same prefix without nesting"
+    );
+    Box::pin(check_legacy_cache_writer_guards(backend)).await;
+}
+
+/// Exercise cache writers against the prefix seeded by the preceding contract.
+#[expect(clippy::too_many_lines, reason = "linear assertions for three cache writers")]
+async fn check_legacy_cache_writer_guards(backend: &dyn PersistedStateBackend) {
+    let o = owner("legacy");
+    let expected = backend
+        .conversation_history(&o, "conv_legacy")
+        .await
+        .expect("initial complete history");
+    let protected = ConversationItemStore::get_conversation(backend, &o, "conv_legacy")
+        .await
+        .expect("read protected prefix")
+        .expect("parent");
+    let stale = ConversationRecord {
+        messages: serde_json::json!([]),
+        metadata: serde_json::json!({"stale": true}),
+        ..protected.clone()
+    };
+    assert!(
+        backend.upsert_conversation(&stale).await.is_err(),
+        "a full-record upsert must reject replacing the authoritative legacy prefix"
+    );
+    assert!(
+        !backend
+            .update_conversation_messages(&o, "conv_legacy", &serde_json::json!([]))
+            .await
+            .expect("protected cache update"),
+        "a cache update must not erase the prefix"
+    );
+    assert!(
+        !backend
+            .compare_and_swap_conversation_messages(&o, "conv_legacy", &protected.messages, &serde_json::json!([]))
+            .await
+            .expect("protected compare-and-swap"),
+        "even a matching CAS must not erase the prefix"
+    );
+    let unchanged = ConversationItemStore::get_conversation(backend, &o, "conv_legacy")
+        .await
+        .expect("unchanged conversation")
+        .expect("parent");
+    assert_eq!(
+        unchanged.messages, protected.messages,
+        "rejected writes preserve the prefix"
+    );
+    assert_eq!(
+        unchanged.metadata, protected.metadata,
+        "rejected upserts preserve metadata"
+    );
+    assert_eq!(
+        backend
+            .conversation_history(&o, "conv_legacy")
+            .await
+            .expect("protected history"),
+        expected,
+        "all rejected writers preserve prefix plus item rows"
+    );
+    backend
+        .upsert_conversation(&protected)
+        .await
+        .expect("identical prefix upsert");
+    assert!(
+        backend
+            .update_conversation_messages(&o, "conv_legacy", &protected.messages)
+            .await
+            .expect("identical prefix update"),
+        "an unchanged prefix remains writable"
+    );
+    assert!(
+        backend
+            .compare_and_swap_conversation_messages(&o, "conv_legacy", &protected.messages, &protected.messages)
+            .await
+            .expect("identical prefix CAS"),
+        "an unchanged prefix remains compatible with CAS"
+    );
+    assert!(
+        backend
+            .update_conversation_metadata(&o, "conv_legacy", &serde_json::json!({"updated": true}))
+            .await
+            .expect("metadata update with prefix"),
+        "the supported metadata-only writer still succeeds"
+    );
+    let updated = ConversationItemStore::get_conversation(backend, &o, "conv_legacy")
+        .await
+        .expect("updated metadata")
+        .expect("parent");
+    assert_eq!(
+        updated.messages, protected.messages,
+        "metadata-only updates preserve the prefix"
+    );
+    assert_eq!(
+        updated.metadata,
+        serde_json::json!({"updated": true}),
+        "metadata-only updates still apply"
+    );
+}
+
+/// Complete history includes position-ordered items beyond a normal list page.
+#[expect(clippy::too_many_lines, reason = "linear complete-history contract assertions")]
+async fn history_orders_positions_without_truncation(backend: &dyn PersistedStateBackend) {
+    let o = owner("many");
+    backend
+        .upsert_conversation(&ConversationRecord {
+            owner: o.clone(),
+            conversation_id: "conv_many".into(),
+            created_at: 1,
+            metadata: serde_json::json!({}),
+            messages: serde_json::json!([]),
+        })
+        .await
+        .expect("many parent");
+    // Reverse insertion exercises ordering independently of write order.
+    // The schema rejects position ties within a conversation.
+    let many: Vec<_> = (0..257)
+        .rev()
+        .map(|n| {
+            let mut record = item(&o, "conv_many", &format!("item_{n:04}"));
+            record.position = n;
+            record
+        })
+        .collect();
+    backend.create_conversation_items(&many).await.expect("many items");
+    let mut expected: Vec<_> = many.iter().map(|record| record.item_data.clone()).collect();
+    expected.reverse();
+    assert_eq!(
+        backend
+            .conversation_history(&o, "conv_many")
+            .await
+            .expect("untruncated ordered history"),
+        Some(expected),
+        "complete history includes every item in position order"
+    );
+}
+
+/// Unsupported cache-only values are rejected without mutation, then repaired
+/// only by an owner-scoped CAS using verified replacement history.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear malformed-cache rollback and repair assertions"
+)]
+async fn malformed_cache_requires_explicit_repair(backend: &dyn PersistedStateBackend) {
+    let o = owner("cache-repair");
+    let other = owner("cache-repair-other");
+    for (index, malformed) in [
+        serde_json::json!({"unexpected": [1]}),
+        serde_json::json!(42),
+        serde_json::json!("invalid"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("conv_repair_{index}");
+        backend
+            .upsert_conversation(&ConversationRecord {
+                owner: o.clone(),
+                conversation_id: id.clone(),
+                created_at: 1,
+                metadata: serde_json::json!({}),
+                messages: malformed.clone(),
+            })
+            .await
+            .expect("unexpected cache fixture");
+        let new = item(&o, &id, &format!("repair_item_{index}"));
+        let err = backend
+            .create_items_and_sync_messages(&o, &id, std::slice::from_ref(&new))
+            .await
+            .expect_err("unsupported history must not be discarded automatically");
+        assert!(
+            matches!(err, crate::StoreError::Serialization(_)),
+            "typed history error"
+        );
+        assert_eq!(
+            backend
+                .max_item_position(&o, &id)
+                .await
+                .expect("position after rejection"),
+            0,
+            "failed append must not insert any item"
+        );
+        assert_eq!(
+            ConversationItemStore::get_conversation(backend, &o, &id)
+                .await
+                .expect("raw cache")
+                .expect("parent")
+                .messages,
+            malformed,
+            "failed append preserves recovery evidence"
+        );
+        let restored = serde_json::json!([{"role": "user", "content": "verified recovery"}]);
+        assert!(
+            !backend
+                .compare_and_swap_conversation_messages(&other, &id, &malformed, &restored)
+                .await
+                .expect("other-owner repair"),
+            "another owner cannot repair this cache"
+        );
+        assert!(
+            !backend
+                .compare_and_swap_conversation_messages(&o, &id, &serde_json::json!([]), &restored)
+                .await
+                .expect("stale repair"),
+            "repair must match the observed invalid value"
+        );
+        assert!(
+            backend
+                .compare_and_swap_conversation_messages(&o, &id, &malformed, &restored)
+                .await
+                .expect("verified repair"),
+            "explicit owner-scoped repair must succeed"
+        );
+        backend
+            .create_items_and_sync_messages(&o, &id, std::slice::from_ref(&new))
+            .await
+            .expect("append after repair");
+        assert_eq!(
+            backend.conversation_history(&o, &id).await.expect("recovered history"),
+            Some(vec![
+                serde_json::json!({"role": "user", "content": "verified recovery"}),
+                new.item_data
+            ]),
+            "repair preserves verified history and permits later appends"
+        );
+    }
+}
+
+/// Deleting an item and invalidating its message cache is atomic when the parent
 /// conversation has already been deleted.
 #[expect(clippy::too_many_lines, reason = "linear rollback contract assertions")]
 async fn item_sync_delete_rolls_back_without_parent(backend: &dyn PersistedStateBackend) {

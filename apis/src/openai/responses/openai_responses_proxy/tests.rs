@@ -284,7 +284,8 @@ async fn native_openai_backend_preserves_provider_compaction_in_rebuilt_state() 
             "role": "user",
             "content": "continue"
         }),
-    ];
+    ]
+    .into();
     state.provider_compaction_ids.insert("cmp_provider".to_owned());
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from_static(
@@ -471,7 +472,7 @@ async fn selected_rebuild_keeps_selector_only_body_valid_when_adding_state_field
         "tool_choice": "auto"
     }));
     state.history_rehydrated = true;
-    state.messages = vec![json!({"role": "user", "content": "continue"})];
+    state.messages = vec![json!({"role": "user", "content": "continue"})].into();
     state.mark_request_body_for_rebuild();
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from_static(br#"{"previous_response_id":"resp_previous"}"#));
@@ -794,7 +795,8 @@ fn serialized_body_cap_uses_conservative_native_projection() {
         "type": "compaction",
         "id": "cmp_provider",
         "encrypted_content": opaque_state
-    })];
+    })]
+    .into();
     state.provider_compaction_ids.insert("cmp_provider".to_owned());
 
     let translated = super::serialize_outbound_body(&state, false).unwrap().len();
@@ -1105,18 +1107,68 @@ fn messages_for_backend_borrows_when_no_compaction() {
         json!({"role": "user", "content": "hello"}),
         json!({"role": "assistant", "content": "hi"}),
     ];
-    let result = super::messages_for_backend(&msgs, false, &std::collections::HashSet::new());
+    let history = msgs.clone().into();
+    let result = serde_json::to_value(super::BackendMessages {
+        history: &history,
+        start: 0,
+        preserve_native_compaction: false,
+        provider_compaction_ids: &std::collections::HashSet::new(),
+    })
+    .unwrap();
+    assert_eq!(result, json!(msgs));
+}
+
+#[test]
+fn backend_message_projection_skips_provider_history_without_mutating_shared_items() {
+    let history: super::super::history::MessageHistory = vec![
+        json!({"role": "user", "content": "previous"}),
+        json!({"role": "assistant", "content": "new"}),
+    ]
+    .into();
+    let snapshot = history.clone();
+    let projected = serde_json::to_value(super::BackendMessages {
+        history: &history,
+        start: 1,
+        preserve_native_compaction: false,
+        provider_compaction_ids: &std::collections::HashSet::new(),
+    })
+    .unwrap();
+    assert_eq!(projected, json!([{"role": "assistant", "content": "new"}]));
+    let empty = serde_json::to_value(super::BackendMessages {
+        history: &history,
+        start: 3,
+        preserve_native_compaction: false,
+        provider_compaction_ids: &std::collections::HashSet::new(),
+    })
+    .unwrap();
+    assert_eq!(empty, json!([]));
     assert!(
-        matches!(result, std::borrow::Cow::Borrowed(_)),
-        "should borrow when no compaction items"
+        history
+            .iter()
+            .zip(snapshot.iter())
+            .all(|(item, original)| std::ptr::eq(item, original))
     );
-    assert_eq!(result.len(), 2);
 }
 
 #[test]
 fn messages_for_backend_translates_compaction_item() {
     let encoded = base64::engine::general_purpose::STANDARD.encode("summary text");
     let msgs = vec![json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded})];
+    let history = msgs.clone().into();
+    let projected = serde_json::to_value(super::BackendMessages {
+        history: &history,
+        start: 0,
+        preserve_native_compaction: false,
+        provider_compaction_ids: &std::collections::HashSet::new(),
+    })
+    .unwrap();
+    assert_eq!(projected.as_array().unwrap().len(), 1);
+    assert_eq!(projected[0]["role"], "assistant");
+    assert!(
+        projected[0]["content"].as_str().unwrap().contains("summary text"),
+        "inserted summary message must contain the supplied summary"
+    );
+
     let result = super::messages_for_backend(&msgs, false, &std::collections::HashSet::new());
     assert!(
         matches!(result, std::borrow::Cow::Owned(_)),
@@ -1137,6 +1189,18 @@ fn messages_for_backend_mixed_items() {
         json!({"type": "compaction", "id": "c_1", "encrypted_content": encoded}),
         json!({"role": "user", "content": "hello"}),
     ];
+    let history = msgs.clone().into();
+    let projected = serde_json::to_value(super::BackendMessages {
+        history: &history,
+        start: 0,
+        preserve_native_compaction: false,
+        provider_compaction_ids: &std::collections::HashSet::new(),
+    })
+    .unwrap();
+    assert_eq!(projected.as_array().unwrap().len(), 2);
+    assert_eq!(projected[0]["role"], "assistant");
+    assert_eq!(projected[1]["role"], "user");
+
     let result = super::messages_for_backend(&msgs, false, &std::collections::HashSet::new());
     assert_eq!(result.len(), 2);
     assert_eq!(result[0]["role"], "assistant");
@@ -1220,7 +1284,8 @@ async fn compacted_outbound_serializes_resolved_file_data_not_file_url() {
             "role": "user",
             "content": [{"type": "input_file", "file_data": "SGVsbG8="}]
         }),
-    ];
+    ]
+    .into();
     ctx.extensions.insert(state);
     let mut body = Some(Bytes::from_static(
         br#"{"model":"gpt-4o","input":[{"type":"message","role":"user","content":[{"type":"input_file","file_url":"https://files.internal/secret.bin"}]}],"previous_response_id":"resp_prev"}"#,
