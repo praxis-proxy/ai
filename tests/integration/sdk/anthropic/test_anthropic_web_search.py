@@ -50,6 +50,7 @@ CONFIG_PATH = "examples/configs/anthropic/full-flow-agentic.yaml"
 SCOPED_CONFIG_PATH = "examples/configs/anthropic/web-search-scoped-credentials.yaml"
 TOOL_USE_ID = "toolu_web_search_01"
 FINAL_TEXT = "Potato is a starchy tuber native to the Americas."
+LARGE_ASSISTANT_TEXT = "Searching first. " + "x" * (256 * 1024)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -195,21 +196,25 @@ def _answer_round_sse() -> bytes:
     return body
 
 
-def _search_round_json() -> bytes:
+def _search_round_json(large_assistant_content: bool = False) -> bytes:
+    content = []
+    if large_assistant_content:
+        content.append({"type": "text", "text": LARGE_ASSISTANT_TEXT})
+    content.append(
+        {
+            "type": "tool_use",
+            "id": TOOL_USE_ID,
+            "name": "WebSearch",
+            "input": {"query": "potato"},
+        }
+    )
     return json.dumps(
         {
             "id": "msg_search_1",
             "type": "message",
             "role": "assistant",
             "model": "openai/gpt-oss-20b",
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": TOOL_USE_ID,
-                    "name": "WebSearch",
-                    "input": {"query": "potato"},
-                }
-            ],
+            "content": content,
             "stop_reason": "tool_use",
             "stop_sequence": None,
             "usage": {"input_tokens": 20, "output_tokens": 8},
@@ -295,7 +300,16 @@ class _ModelHandler(BaseHTTPRequestHandler):
             body = _answer_round_sse() if answering else _search_round_sse()
             content_type = "text/event-stream"
         else:
-            body = _answer_round_json() if answering else _search_round_json()
+            large_assistant_content = any(
+                isinstance(message.get("content"), str)
+                and "large assistant content" in message["content"]
+                for message in request.get("messages", [])
+            )
+            body = (
+                _answer_round_json()
+                if answering
+                else _search_round_json(large_assistant_content)
+            )
             content_type = "application/json"
 
         # Close after each response so the proxy never pools a keep-alive
@@ -564,6 +578,35 @@ class TestAnthropicWebSearch:
         # Tavily is body-authenticated: the configured key travels in the request
         # body, not a header.
         assert search.requests[0].get("api_key") == "test-key", search.requests[0]
+
+    def test_buffered_large_assistant_content_reenters_complete(
+        self, anthropic_client, web_search_stack
+    ):
+        model = web_search_stack["model"]
+        search = web_search_stack["search"]
+        model.requests.clear()
+        search.requests.clear()
+        kwargs = _messages_kwargs()
+        kwargs["messages"][0]["content"] = "Use web search with large assistant content."
+
+        response = anthropic_client.messages.create(**kwargs)
+
+        assert response.content[0].text == FINAL_TEXT
+        assert len(model.requests) == 2
+        assert len(search.requests) == 1
+        assistant_turns = [
+            message for message in model.requests[1]["messages"] if message["role"] == "assistant"
+        ]
+        assert len(assistant_turns) == 1
+        assert assistant_turns[0]["content"] == [
+            {"type": "text", "text": LARGE_ASSISTANT_TEXT},
+            {
+                "type": "tool_use",
+                "id": TOOL_USE_ID,
+                "name": "WebSearch",
+                "input": {"query": "potato"},
+            },
+        ]
 
     def test_streaming_web_search_loop(self, anthropic_client, web_search_stack):
         model = web_search_stack["model"]
