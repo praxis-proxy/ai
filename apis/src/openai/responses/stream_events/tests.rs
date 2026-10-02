@@ -50,7 +50,12 @@ fn make_filter_from(yaml: &str) -> OpenaiStreamEventsFilter {
 /// through `arm_decision`; the end-to-end arming effect with a real IRR-inserted
 /// `IterationState` is covered by the functional integration tests.
 fn make_armed_context() -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
-    let filter = make_filter();
+    make_armed_context_with_filter(make_filter())
+}
+
+fn make_armed_context_with_filter(
+    filter: OpenaiStreamEventsFilter,
+) -> (OpenaiStreamEventsFilter, praxis_filter::HttpFilterContext<'static>) {
     let req = make_request(http::Method::POST, "/v1/responses");
     let mut ctx = make_filter_context(Box::leak(Box::new(req)));
     ctx.set_metadata("openai_responses_format.format", "openai_responses".to_owned());
@@ -3628,6 +3633,50 @@ async fn logical_stream_error_does_not_fabricate_lifecycle_for_unexecuted_placeh
 
 fn make_done_chunk() -> Bytes {
     Bytes::from("data: [DONE]\n\n")
+}
+
+#[test]
+fn done_after_terminal_at_max_events_is_allowed() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter_from("max_events: 1"));
+    let completed =
+        json!({"id": "resp_1", "status": "completed", "model": "m", "created_at": 0, "output": [], "usage": {}});
+
+    let mut terminal = Some(make_sse_chunk("response.completed", &completed));
+    filter.on_response_body(&mut ctx, &mut terminal, false).unwrap();
+    assert_eq!(ctx.get_filter_state::<StreamEventsState>().unwrap().event_count, 1);
+
+    let mut done = Some(make_done_chunk());
+    filter.on_response_body(&mut ctx, &mut done, false).unwrap();
+    let state = ctx.get_filter_state::<StreamEventsState>().unwrap();
+    assert_eq!(state.event_count, 1, "[DONE] must not consume an event slot");
+    assert_eq!(state.completion_state, CompletionState::TerminalLifecycle);
+    assert!(state.deferred_done, "the downstream sentinel must be retained");
+    assert!(ctx.get_metadata("responses.stream_parse_error").is_none());
+
+    let mut eos = None;
+    filter.on_response_body(&mut ctx, &mut eos, true).unwrap();
+    assert!(ctx.get_metadata("responses.stream_error_code").is_none());
+    assert!(ctx.get_metadata("responses.stream_incomplete").is_none());
+    assert!(
+        eos.as_deref().is_some_and(|bytes| bytes.ends_with(b"data: [DONE]\n\n")),
+        "a valid terminal stream must forward its [DONE] sentinel"
+    );
+}
+
+#[test]
+fn counted_event_beyond_max_events_is_rejected() {
+    let (filter, mut ctx) = make_armed_context_with_filter(make_filter_from("max_events: 1"));
+    let mut first = Some(make_sse_chunk("response.output_text.delta", &json!({"delta": "first"})));
+    filter.on_response_body(&mut ctx, &mut first, false).unwrap();
+    assert!(ctx.get_metadata("responses.stream_parse_error").is_none());
+
+    let mut second = Some(make_sse_chunk(
+        "response.output_text.delta",
+        &json!({"delta": "second"}),
+    ));
+    filter.on_response_body(&mut ctx, &mut second, false).unwrap();
+    assert_eq!(ctx.get_metadata("responses.stream_parse_error"), Some("true"));
+    assert_eq!(ctx.get_metadata("responses.skip_persist"), Some("true"));
 }
 
 #[tokio::test]
