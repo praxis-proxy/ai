@@ -21,7 +21,7 @@ pub(crate) use crate::service::responses::input_items::DEFAULT_PAGE_LIMIT;
 pub(crate) use crate::service::responses::{InputItemPage, ListParams, MAX_PAGE_LIMIT, Order, list_input_items};
 
 #[cfg(test)]
-#[cfg(all(feature = "store-postgres", feature = "store-sqlite"))]
+#[cfg(all(feature = "_store-postgres", feature = "store-sqlite"))]
 #[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
 #[allow(
     clippy::unwrap_used,

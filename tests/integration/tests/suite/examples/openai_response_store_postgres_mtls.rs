@@ -17,6 +17,8 @@
 
 use std::collections::HashMap;
 
+#[cfg(all(feature = "store-postgres-cert-auth", not(feature = "store-postgres")))]
+use praxis_test_utils::start_postgres_scram_auth_tls;
 use praxis_test_utils::{
     Backend, PostgresCertAuthGuard, example_config_path, free_port, http_send, json_post, parse_body, parse_status,
     patch_yaml, start_postgres_cert_auth, start_proxy,
@@ -71,7 +73,11 @@ async fn response_store_persists_over_certificate_authenticated_tls() {
         proxy.addr(),
         &json_post("/v1/responses", r#"{"model":"gpt-4.1","input":"Hello over mTLS"}"#),
     );
-    assert_eq!(parse_status(&raw), 200, "Responses API POST should return 200");
+    assert_eq!(
+        parse_status(&raw),
+        200,
+        "Responses API POST should return 200; raw response:\n{raw}"
+    );
     assert_eq!(
         parse_body(&raw),
         RESPONSE_JSON,
@@ -113,6 +119,26 @@ async fn response_store_persists_over_certificate_authenticated_tls() {
     );
     let body: serde_json::Value = serde_json::from_str(&parse_body(&raw)).expect("GET body should be valid JSON");
     assert_eq!(body["id"], "resp_mtls_abc", "retrieved id should match");
+}
+
+/// Prove the reduced SQLx build refuses the server-selected authentication
+/// method before it can attempt a password exchange.
+#[cfg(all(feature = "store-postgres-cert-auth", not(feature = "store-postgres")))]
+#[tokio::test]
+#[ignore = "requires container engine (podman or docker)"]
+async fn certificate_only_profile_rejects_unexpected_scram_challenge() {
+    let pg = start_postgres_scram_auth_tls();
+    // This peer does not request a client certificate: it deliberately asks
+    // for SCRAM instead. Trust and verify the TLS server, then leave client
+    // identity out so the observed failure is the SQLx authentication gate
+    // itself (and not platform-specific identity parsing).
+    let result = Box::pin(PgPool::connect_with(verified_tls_options(&pg))).await;
+    let error = result.expect_err("certificate-only SQLx must reject a server-selected SCRAM challenge");
+    let message = error.to_string();
+    assert!(
+        message.contains("PostgreSQL password authentication is disabled"),
+        "the refusal must come from the compiled-out password-auth boundary, got: {message}"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -165,17 +191,27 @@ fn patched_config(
 /// Build a verification connection pool that authenticates the same way
 /// the proxy does: verified TLS with the client certificate.
 async fn verification_pool(pg: &PostgresCertAuthGuard) -> PgPool {
-    let options: PgConnectOptions = pg
-        .url_without_password()
+    Box::pin(PgPool::connect_with(connection_options(pg)))
+        .await
+        .expect("verification connection should authenticate over cert-auth TLS")
+}
+
+/// Build password-less, verified-TLS connection options that present the
+/// generated client identity.
+fn connection_options(pg: &PostgresCertAuthGuard) -> PgConnectOptions {
+    verified_tls_options(pg)
+        .ssl_client_cert(pg.client_cert_path())
+        .ssl_client_key(pg.client_key_path())
+}
+
+/// Build password-less connection options that verify the TLS server without
+/// configuring a client identity.
+fn verified_tls_options(pg: &PostgresCertAuthGuard) -> PgConnectOptions {
+    pg.url_without_password()
         .parse::<PgConnectOptions>()
         .expect("password-less URL should parse")
         .ssl_mode(PgSslMode::VerifyFull)
         .ssl_root_cert(pg.ca_cert_path())
-        .ssl_client_cert(pg.client_cert_path())
-        .ssl_client_key(pg.client_key_path());
-    Box::pin(PgPool::connect_with(options))
-        .await
-        .expect("verification connection should authenticate over cert-auth TLS")
 }
 
 /// Generate a unique suffix for table names to allow parallel test

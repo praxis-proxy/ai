@@ -12,6 +12,7 @@ description = "llm-d environment integration tests for Praxis AI"
 # group is needed by default.
 default = []
 store-postgres = ["praxis-ai-proxy/store-postgres", "praxis-test-utils/store-postgres"]
+store-postgres-cert-auth = ["praxis-ai-proxy/store-postgres-cert-auth", "praxis-test-utils/store-postgres-cert-auth"]
 store-sqlite = ["praxis-ai-proxy/store-sqlite", "praxis-test-utils/store-sqlite"]
 store-all = ["store-postgres", "store-sqlite"]
 llmd-ext-proc = ["praxis-ai-proxy/llmd-ext-proc", "praxis-test-utils/llmd-ext-proc"]

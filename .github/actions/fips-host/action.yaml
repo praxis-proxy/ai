@@ -2,8 +2,9 @@ name: FIPS host checks
 description: >-
   The runtime proof of the FIPS build, on a RHEL 9 host in FIPS mode: attest
   the host and the FIPS image's module build, run the test suites as the
-  FIPS build inside the UBI 9 toolchain image, and probe the running image
-  from outside. Expects the image under test at
+  FIPS build inside the UBI 9 toolchain image, exercise the certificate-only
+  PostgreSQL store on the host, and probe the running image from outside.
+  Expects the image under test at
   localhost/praxis-ai:<version>-fips (make fips-image-load, or
   make fips-image-tag for a pulled digest).
 
@@ -13,7 +14,9 @@ description: >-
 # installed, checked up front by .github/actions/fips-runner-check; the Rust
 # toolchain is set up here. The host-side commands (make fips-host-check, the
 # probe orchestration) are `cargo xtask fips` and compile on the host; the
-# test suites compile and run inside the toolchain image.
+# test suites compile and run inside the toolchain image. The PostgreSQL
+# boundary test runs on the host so it can start a sibling container through
+# rootless podman.
 # ------------------------------------------------------------------------------
 
 inputs:
@@ -54,6 +57,11 @@ runs:
       if: inputs.run-suites == 'true'
       shell: bash
       run: make test-fips-host
+
+    - name: Exercise certificate-only PostgreSQL on the FIPS host
+      if: inputs.run-suites == 'true'
+      shell: bash
+      run: make test-postgres-fips-host
 
     - name: Run the image under PRAXIS_REQUIRE_FIPS=1 and probe its listener
       shell: bash
