@@ -22,6 +22,8 @@ use std::collections::HashMap;
 
 #[cfg(feature = "basic-auth-filter")]
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+#[cfg(feature = "basic-auth-filter")]
+use praxis_test_utils::build_pipeline;
 use praxis_test_utils::{
     Backend, StatefulCapturingBackend, example_config_path, free_port, http_send, json_post, load_example_config,
     parse_body, parse_header, parse_status, patch_yaml, start_proxy,
@@ -366,8 +368,8 @@ fn mixed_algorithm_rules_config(proxy_port: u16, backend_port: u16, valkey_url: 
          \x20     - filter: token_rate_limit\n\
          \x20       backend:\n\
          \x20         kind: valkey\n\
-         \x20         url: {valkey_url}\n\
-         \x20         namespace: {namespace}\n\
+         \x20         url: \"{valkey_url}\"\n\
+         \x20         namespace: \"{namespace}\"\n\
          \x20       rules:\n\
          \x20         - name: team-alpha\n\
          \x20           match:\n\
@@ -522,6 +524,11 @@ fn basic_auth_json_post(
 
 /// Derive test-only credentials from runtime-only identifiers. The values
 /// never appear in diagnostics or source as hard-coded password literals.
+///
+/// The `{pid:x}-{port:x}` shape can collide with YAML scientific notation:
+/// pid `0x1e` and port `0x400` render as `1e-400`, a valid float literal that
+/// underflows to `0.0`. Any config consumer must therefore quote the value so
+/// it parses as a string rather than a number (see `authenticated_quota_config`).
 #[cfg(feature = "basic-auth-filter")]
 fn test_credential(nonce: u16) -> String {
     format!("{:x}-{:x}", std::process::id(), nonce)
@@ -560,9 +567,9 @@ fn authenticated_quota_config(
          \x20       strip_authorization: true\n\
          \x20       credentials:\n\
          \x20         - username: subject-a\n\
-         \x20           password: {subject_a_credential}\n\
+         \x20           password: \"{subject_a_credential}\"\n\
          \x20         - username: subject-b\n\
-         \x20           password: {subject_b_credential}\n\
+         \x20           password: \"{subject_b_credential}\"\n\
          \x20     - filter: token_rate_limit\n\
          {key_line}{backend_block}\
          \x20       rules:\n\
@@ -778,6 +785,36 @@ fn global_key_remains_the_default_with_basic_auth() {
         1,
         "global quota rejection must not contact the provider"
     );
+}
+
+/// Regression for the intermittent `token_rate_limit` Valkey job failure
+/// ("basic_auth: invalid type: floating point 0.0, expected a string").
+///
+/// `test_credential` produces `{pid:x}-{port:x}` values; some combinations
+/// (pid `0x1e` → `1e`, port `0x400` → `400`) form `1e-400`, which YAML resolves
+/// as scientific notation that underflows to `0.0`. Left unquoted in the config,
+/// the `password: Option<String>` field then fails to deserialize and
+/// `build_pipeline` panics. `authenticated_quota_config` now quotes the value,
+/// so such credentials stay strings through pipeline construction.
+#[test]
+#[cfg(feature = "basic-auth-filter")]
+fn sci_notation_shaped_credentials_stay_strings_in_config() {
+    let proxy_port = free_port();
+    let backend_port = free_port();
+    // `1e-400` underflows to 0.0; `2e-300` is a representable tiny float. Both
+    // parse as non-string YAML scalars unless quoted, yet must survive config
+    // parsing and pipeline construction unchanged.
+    let config = praxis_core::config::Config::from_yaml(&authenticated_quota_config(
+        proxy_port,
+        backend_port,
+        None,
+        None,
+        ("1e-400", "2e-300"),
+    ))
+    .expect("scientific-notation-shaped credentials must parse as strings");
+    // `build_pipeline` is the exact step that panicked in CI once the password
+    // resolved to a float; it must now build the basic_auth filter cleanly.
+    let _pipeline = build_pipeline(&config);
 }
 
 // -----------------------------------------------------------------------------
