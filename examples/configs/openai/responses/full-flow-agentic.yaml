@@ -67,8 +67,8 @@
 #      The filters then run once against the buffered request. The OpenAI route
 #      is true passthrough; on managed routes openai_responses_validate checks
 #      JSON, initializes ResponsesState, and rejects gateway-unsupported fields
-#      such as background=true. Prompt-template compatibility is checked later,
-#      after load-balancer selection, by openai_responses_proxy.
+#      such as background=true and non-null prompt templates. Protocol adapters
+#      later in the IRR assume this managed-provider validation already ran.
 #
 #   4. On managed routes, openai_tool_parse parses the tools array and
 #      tool_choice from Responses API requests and promotes summary facts
@@ -753,9 +753,9 @@ filter_chains:
               # declared application_protocol. selected_upstream fails closed:
               # always declare http.application_protocol on the cluster above.
 
-              # Native Responses upstream: enforce provider-aware prompt
-              # support, rebuild the outbound body from ResponsesState, and
-              # select the typed streaming transport for `stream: true`.
+              # Native Responses upstream: rebuild the outbound body from
+              # ResponsesState and select the typed streaming transport for
+              # `stream: true`.
               - filter: openai_responses_proxy
                 conditions:
                   - when:
@@ -770,9 +770,7 @@ filter_chains:
               # converts the raw Chat response into Responses BEFORE
               # openai_agentic_loop and openai_stream_events observe it (both
               # require Responses). It fully owns outbound body build for Chat
-              # backends. It also rejects OpenAI prompt templates, which have no
-              # Chat representation. Stream bounds stay at/under
-              # openai_stream_events'
+              # backends. Stream bounds stay at/under openai_stream_events'
               # limits so no frame the client receives is dropped from the store
               # (cf. responses-to-chat-completions.yaml).
               - filter: responses_to_chat_completions

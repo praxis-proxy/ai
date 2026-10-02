@@ -12,6 +12,14 @@ redirect following are disabled for direct callouts. URL userinfo is rejected,
 and forwarded or configured credentials remain bound to the validated target
 origin.
 
+Private-target opt-ins allow loopback, private, shared-address-space,
+link-local, and other special-use destinations. They never allow recognized
+cloud metadata endpoints, unspecified addresses, or multicast addresses.
+IPv4-mapped IPv6 and well-known-prefix NAT64 forms receive the same verdict as
+their embedded IPv4 address. GCP ADC is the only exception: its dedicated,
+non-configurable metadata policy accepts recognized metadata addresses (and
+loopback test stubs) only after its authority has been independently restricted.
+
 ## Callout inventory
 
 `No-follow` means a redirect response is returned to the caller and its
@@ -34,8 +42,8 @@ origin.
 The request-derived `file_url` and MCP transports retain stricter policies:
 they resolve once per attempt, validate every address against `AddressPolicy`,
 do not follow redirects, and allow private access only through their narrow
-origin/loopback controls. GCP metadata intentionally allows its protocol-owned
-private destination via `AddressPolicy::AllowPrivate`.
+origin/loopback controls. GCP metadata intentionally allows only Google's two
+protocol-owned metadata addresses via `AddressPolicy::AllowGoogleMetadata`.
 
 `external_metering` calls out twice per request, so it resolves its configured
 host through the upstream DNS cache rather than on every call. Every cached

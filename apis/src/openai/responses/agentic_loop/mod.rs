@@ -629,8 +629,10 @@ fn preserve_original_request_headers(ctx: &mut HttpFilterContext<'_>) {
 /// the legacy grouped queues for this pass, so replayed credentials must join
 /// that log as well as remaining available to the normal request phase.
 fn queue_continuation_header(ctx: &mut HttpFilterContext<'_>, name: http::HeaderName, value: HeaderValue) {
-    ctx.request_headers_to_set.push((name.clone(), value.clone()));
-    if !ctx.pre_read_mutations.is_empty() {
+    if ctx.pre_read_mutations.is_empty() {
+        ctx.request_headers_to_set.push((name, value));
+    } else {
+        ctx.request_headers_to_set.push((name.clone(), value.clone()));
         ctx.pre_read_mutations.push(TrustedHeaderMutation::Set(name, value));
     }
 }

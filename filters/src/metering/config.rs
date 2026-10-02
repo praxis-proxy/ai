@@ -46,7 +46,8 @@ pub(super) struct ExternalMeteringConfig {
 
     /// Allow the metering endpoint to resolve to non-public addresses
     /// (loopback, private, link-local). Defaults to `false`, so callouts
-    /// are rejected before connecting unless the operator opts in.
+    /// are rejected before connecting unless the operator opts in. Cloud
+    /// metadata, unspecified, and multicast addresses remain blocked.
     #[serde(default)]
     pub allow_private_endpoint: bool,
 

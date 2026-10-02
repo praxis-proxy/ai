@@ -440,7 +440,7 @@ fn insert_chat_tool_choice(
     Ok(())
 }
 
-/// Copy supported scalar parameters into the Chat Completions request.
+/// Copy shared parameters and map Responses-only fields into the Chat request.
 fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value>) {
     copy_field(obj, chat, "model");
     copy_field(obj, chat, "temperature");
@@ -449,11 +449,16 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
     copy_field(obj, chat, "frequency_penalty");
     copy_field(obj, chat, "parallel_tool_calls");
     copy_field(obj, chat, "prompt_cache_key");
+    copy_field(obj, chat, "prompt_cache_retention");
+    copy_field(obj, chat, "prompt_cache_options");
+    copy_field(obj, chat, "safety_identifier");
+    copy_field(obj, chat, "user");
     copy_field(obj, chat, "service_tier");
     copy_field(obj, chat, "extra_body");
     map_top_logprobs(obj, chat);
     map_reasoning_effort(obj, chat);
     map_text_format(obj, chat);
+    map_text_verbosity(obj, chat);
     map_stream_options(obj, chat);
 
     if let Some(max_output_tokens) = obj.get("max_output_tokens") {
@@ -463,11 +468,12 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 
 /// Reject request parameters this adapter cannot represent.
 ///
-/// `background`, `truncation`, and `prompt` describe behaviors the Chat
+/// `background`, `truncation`, and `moderation` describe behaviors the Chat
 /// Completions translation does not implement. Accepting an unsupported value
 /// would silently change the request semantics, so the request fails closed
 /// instead. Rejecting `background` and `truncation` here is what lets
-/// [`response_resource`] state their defaults truthfully.
+/// [`response_resource`] state their defaults truthfully. Managed-provider
+/// `prompt` policy belongs to request validation, before protocol translation.
 ///
 /// Unlike parameters this translator forwards, these fields are dropped rather
 /// than sent upstream, so the backend never sees them and cannot validate them
@@ -475,8 +481,7 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 /// not demonstrably the default would otherwise be silently discarded and then
 /// reported back as the default.
 fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
-    validate_prompt_parameter(obj)?;
-
+    validate_moderation_parameter(obj)?;
     if let Some(background) = obj.get("background").filter(|value| !value.is_null())
         && background.as_bool() != Some(false)
     {
@@ -508,19 +513,22 @@ fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), Tra
     Ok(())
 }
 
-/// Reject a non-null prompt because Chat Completions cannot resolve it.
-fn validate_prompt_parameter(obj: &Map<String, Value>) -> Result<(), TranslationError> {
-    let Some(prompt) = obj.get("prompt").filter(|value| !value.is_null()) else {
-        return Ok(());
-    };
-    Err(TranslationError::UnrepresentableRequestParameter {
-        parameter: "prompt",
-        value: json_type_name(prompt),
-        supported: "`prompt` null",
-    })
+/// Reject moderation until both finite and streaming results can be represented.
+fn validate_moderation_parameter(obj: &Map<String, Value>) -> Result<(), TranslationError> {
+    // Chat moderation results have a different shape from Responses results,
+    // and Chat streaming chunks have no moderation field. Forwarding the
+    // request would falsely suggest the synthesized resource reports its result.
+    if let Some(moderation) = obj.get("moderation").filter(|value| !value.is_null()) {
+        return Err(TranslationError::UnrepresentableRequestParameter {
+            parameter: "moderation",
+            value: json_type_name(moderation),
+            supported: "`moderation` null",
+        });
+    }
+    Ok(())
 }
 
-/// Copy a field from one JSON object to another.
+/// Copy a field into the owned Chat request while borrowing the Responses source.
 fn copy_field(source: &Map<String, Value>, target: &mut Map<String, Value>, key: &str) {
     if let Some(value) = source.get(key) {
         target.insert(key.to_owned(), value.clone());
@@ -564,6 +572,13 @@ fn map_text_format(source: &Map<String, Value>, target: &mut Map<String, Value>)
             target.insert("response_format".to_owned(), json_schema_response_format(format));
         },
         _ => {},
+    }
+}
+
+/// Convert `Responses` text verbosity to the Chat Completions field.
+fn map_text_verbosity(source: &Map<String, Value>, target: &mut Map<String, Value>) {
+    if let Some(verbosity) = source.get("text").and_then(|text| text.get("verbosity")) {
+        target.insert("verbosity".to_owned(), verbosity.clone());
     }
 }
 
@@ -956,7 +971,14 @@ impl ConvertedContentParts {
             ));
         };
         self.text_parts.push(text.to_owned());
-        self.chat_parts.push(json!({"type": "text", "text": text}));
+        let mut chat_part = Map::new();
+        chat_part.insert("type".to_owned(), Value::String("text".to_owned()));
+        chat_part.insert("text".to_owned(), Value::String(text.to_owned()));
+        if copy_prompt_cache_breakpoint(part, &mut chat_part) {
+            // A string cannot carry a breakpoint at this content boundary.
+            self.all_text = false;
+        }
+        self.chat_parts.push(Value::Object(chat_part));
         Ok(())
     }
 
@@ -974,6 +996,15 @@ impl ConvertedContentParts {
             Value::Array(self.chat_parts)
         }
     }
+}
+
+/// Preserve an explicit cache boundary on the corresponding Chat content part.
+fn copy_prompt_cache_breakpoint(source: &Value, target: &mut Map<String, Value>) -> bool {
+    let Some(breakpoint) = source.get("prompt_cache_breakpoint").filter(|value| !value.is_null()) else {
+        return false;
+    };
+    target.insert("prompt_cache_breakpoint".to_owned(), breakpoint.clone());
+    true
 }
 
 impl Default for ConvertedContentParts {
@@ -1004,10 +1035,11 @@ fn convert_input_image_part(part: &Value) -> Result<Value, TranslationError> {
     image_url.insert("url".to_owned(), url);
     copy_field(obj, &mut image_url, "detail");
 
-    Ok(json!({
-        "type": "image_url",
-        "image_url": Value::Object(image_url)
-    }))
+    let mut chat_part = Map::new();
+    chat_part.insert("type".to_owned(), Value::String("image_url".to_owned()));
+    chat_part.insert("image_url".to_owned(), Value::Object(image_url));
+    copy_prompt_cache_breakpoint(part, &mut chat_part);
+    Ok(Value::Object(chat_part))
 }
 
 /// Convert a `Responses` file content part into Chat Completions shape.
@@ -1029,10 +1061,11 @@ fn convert_input_file_part(part: &Value) -> Result<Value, TranslationError> {
         ));
     }
 
-    Ok(json!({
-        "type": "file",
-        "file": Value::Object(file)
-    }))
+    let mut chat_part = Map::new();
+    chat_part.insert("type".to_owned(), Value::String("file".to_owned()));
+    chat_part.insert("file".to_owned(), Value::Object(file));
+    copy_prompt_cache_breakpoint(part, &mut chat_part);
+    Ok(Value::Object(chat_part))
 }
 
 /// Chat tool translation plus facts needed to validate `tool_choice`.

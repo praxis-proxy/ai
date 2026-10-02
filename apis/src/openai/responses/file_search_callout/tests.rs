@@ -90,7 +90,7 @@ fn config_rejects_ambiguous_or_invalid_urls() {
 }
 
 #[test]
-fn config_defers_private_targets_to_the_connect_time_ssrf_gate() {
+fn config_defers_permitted_private_targets_to_the_connect_time_ssrf_gate() {
     // Private/loopback literals and DNS names all pass config-time structural
     // validation. SSRF is decided at connect time by `prepare_url_target`, which
     // honours `insecure_options.allow_private_upstreams`; startup cannot see that
@@ -100,7 +100,7 @@ fn config_defers_private_targets_to_the_connect_time_ssrf_gate() {
         "http://localhost:8001",
         "http://127.0.0.1:8001",
         "http://10.0.0.1:8001",
-        "http://169.254.169.254:8001",
+        "http://169.254.1.1:8001",
         "http://100.64.0.1:8001",
         "http://0.7.8.9:8001",
         "http://[::1]:8001",
@@ -112,6 +112,14 @@ fn config_defers_private_targets_to_the_connect_time_ssrf_gate() {
             "private-address gating is deferred to the runtime hook: {url}"
         );
     }
+}
+
+#[test]
+fn config_rejects_cloud_metadata_before_runtime() {
+    assert!(
+        parse_config("vector_store_url: 'http://169.254.169.254:8001'\n").is_err(),
+        "cloud metadata must remain blocked independently of the runtime private-target opt-in"
+    );
 }
 
 #[tokio::test]
@@ -1651,6 +1659,45 @@ fn translate_single_query() {
     assert!(item.get("name").is_none(), "name should be removed");
     assert!(item.get("arguments").is_none(), "arguments should be removed");
     assert!(item.get("call_id").is_none(), "call_id should be removed");
+}
+
+#[test]
+fn translate_call_id_only_when_it_is_a_string_and_public_id_is_missing() {
+    let mut response = json!({
+        "output": [
+            {"type": "function_call", "name": "file_search", "call_id": "call_1"},
+            {"type": "function_call", "name": "file_search", "call_id": ""},
+            {"type": "function_call", "name": "file_search"},
+            {"type": "function_call", "name": "file_search", "call_id": 42},
+            {"type": "function_call", "name": "file_search", "id": "fc_5", "call_id": "call_5"},
+            {"type": "function_call", "name": "file_search", "id": "", "call_id": "call_6"}
+        ]
+    });
+
+    assert_eq!(
+        translate_function_calls_to_file_search(&mut response),
+        vec![0, 1, 2, 3, 4, 5],
+        "every file_search function_call must be translated regardless of call_id shape"
+    );
+    let output = response["output"].as_array().unwrap();
+    for (item, expected_id) in output.iter().zip([
+        Some("fs_call_1"),
+        Some("fs_"),
+        None,
+        None,
+        Some("fc_5"),
+        Some("fs_call_6"),
+    ]) {
+        assert_eq!(
+            item.get("id").and_then(Value::as_str),
+            expected_id,
+            "public id must derive from a string call_id only when no id is already present"
+        );
+        assert!(
+            item.get("call_id").is_none(),
+            "the private call_id must never remain on the translated item"
+        );
+    }
 }
 
 #[test]

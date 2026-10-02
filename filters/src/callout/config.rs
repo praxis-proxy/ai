@@ -6,6 +6,7 @@
 use std::{net::IpAddr, time::Duration};
 
 use praxis_ai_apis::callout_policy::OnFailure;
+use praxis_core::connectivity::classify_ip;
 use praxis_filter::FilterError;
 use serde::Deserialize;
 use tracing::warn;
@@ -67,9 +68,9 @@ pub(crate) struct TargetConfig {
     /// Defaults to `false`. Set to `true` explicitly when a trusted
     /// loopback/sidecar or private service is the intended destination.
     /// When disabled, the callout is rejected at request time if any
-    /// resolved peer address is private/loopback/link-local — including a
-    /// hostname that resolves to such an address (e.g. cloud metadata at
-    /// `169.254.169.254`).
+    /// resolved peer address is private/loopback/link-local. Cloud metadata,
+    /// unspecified, and multicast addresses remain blocked when this option
+    /// is enabled.
     #[serde(default)]
     pub allow_private_addresses: bool,
 
@@ -252,20 +253,6 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 // SSRF Validation
 // -----------------------------------------------------------------------------
 
-/// Returns `true` if the address is a private or loopback IP.
-fn is_private_or_loopback(addr: &IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => v6.is_loopback(),
-    }
-}
-
-// The request-time SSRF / DNS-rebinding block defers to the shared
-// classifier `praxis_core::connectivity::is_private_ip` (used directly in
-// `resolve_peer`) rather than defining another private-address predicate
-// here. See praxis-proxy/ai#771 for the effort to unify the several
-// hand-rolled classifiers that still exist across this codebase.
-
 /// Validate the URL scheme is `http` or `https`.
 fn validate_scheme(parsed: &http::Uri, url: &str) -> Result<(), FilterError> {
     match parsed.scheme_str() {
@@ -301,11 +288,11 @@ pub(crate) fn validate_callout_url(url: &str) -> Result<(), FilterError> {
         .ok_or_else(|| FilterError::from(format!("http_callout: URL must have a non-empty host: {url}")))?;
 
     if let Ok(ip) = host.parse::<IpAddr>()
-        && is_private_or_loopback(&ip)
+        && classify_ip(&ip).is_non_public()
     {
         warn!(
             url = %url,
-            "http_callout: callout URL resolves to a private/loopback address"
+            "http_callout: callout URL targets a non-public address"
         );
     }
 

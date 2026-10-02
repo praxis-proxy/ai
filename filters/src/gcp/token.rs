@@ -18,7 +18,7 @@ use bytes::Bytes;
 use http::HeaderValue;
 use praxis_ai_apis::{
     callout_target::AddressPolicy,
-    subrequest::{SubRequest, SubRequestClient},
+    subrequest::{SubRequest, SubRequestClient, execute_url},
 };
 use praxis_filter::FilterError;
 use serde::Deserialize;
@@ -92,8 +92,7 @@ pub(super) async fn fetch(
 /// Acquire a token through `SubRequestClient` targeting the metadata server.
 ///
 /// The metadata protocol intentionally targets a private endpoint. The
-/// configured host is separately restricted to Google's metadata hostname
-/// or a literal loopback test host.
+/// configured host is separately restricted to Google's metadata hostname.
 pub(super) async fn fetch_pinned(
     client: &SubRequestClient,
     source: &TokenSource,
@@ -109,7 +108,23 @@ pub(super) async fn fetch_pinned(
     };
 
     let url = metadata_token_url(metadata_host, service_account, scope);
-    fetch_metadata_token_url(client, &url, timeout).await
+    fetch_metadata_token_url(client, &url, timeout, metadata_address_policy(metadata_host)).await
+}
+
+/// Use the production metadata-only policy except for literal loopback mocks
+/// compiled into this crate's unit tests.
+#[cfg(test)]
+fn metadata_address_policy(metadata_host: &str) -> AddressPolicy {
+    if metadata_host.split(':').next().unwrap_or(metadata_host) == "127.0.0.1" {
+        return AddressPolicy::AllowPrivate;
+    }
+    AddressPolicy::AllowGoogleMetadata
+}
+
+/// Use the metadata-only policy in every production build.
+#[cfg(not(test))]
+fn metadata_address_policy(_metadata_host: &str) -> AddressPolicy {
+    AddressPolicy::AllowGoogleMetadata
 }
 
 /// Acquire a token from the GCE/GKE metadata server.
@@ -122,7 +137,7 @@ async fn fetch_metadata_token(
     timeout: Duration,
 ) -> Result<(HeaderValue, Duration), FilterError> {
     let url = metadata_token_url(metadata_host, service_account, scope);
-    fetch_metadata_token_url(client, &url, timeout).await
+    fetch_metadata_token_url(client, &url, timeout, AddressPolicy::AllowPrivate).await
 }
 
 /// Build the metadata token URL from already validated components.
@@ -138,6 +153,7 @@ async fn fetch_metadata_token_url(
     client: &SubRequestClient,
     url: &str,
     timeout: Duration,
+    address_policy: AddressPolicy,
 ) -> Result<(HeaderValue, Duration), FilterError> {
     let mut headers = http::HeaderMap::new();
     headers.insert(
@@ -151,10 +167,9 @@ async fn fetch_metadata_token_url(
         body: Bytes::new(),
     };
 
-    let response =
-        praxis_ai_apis::subrequest::execute_url(client, url, request, 65_536, timeout, AddressPolicy::AllowPrivate)
-            .await
-            .map_err(|e| FilterError::from(format!("gcp_adc: metadata token request failed: {e}")))?;
+    let response = execute_url(client, url, request, 65_536, timeout, address_policy)
+        .await
+        .map_err(|e| FilterError::from(format!("gcp_adc: metadata token request failed: {e}")))?;
 
     let status = http::StatusCode::from_u16(response.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
     if !status.is_success() {
@@ -172,6 +187,7 @@ async fn fetch_metadata_token_url(
 
     Ok((authorization, Duration::from_secs(token.expires_in)))
 }
+
 
 // -----------------------------------------------------------------------------
 // GoogleApplicationCredentials

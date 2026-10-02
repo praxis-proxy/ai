@@ -47,6 +47,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: messages.request.tool_input_presence
+    scopes:
+      - messages_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - messages/tool-input-presence
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.response.text
     scopes:
       - messages_to_chat_completions
@@ -225,6 +234,15 @@ features:
     scenarios:
       - responses/chat-basic-nonstream
       - responses/chat-basic-stream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: responses.chat.shared_controls
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-basic-nonstream
     providers:
       synthetic:
         status: synthetic_only

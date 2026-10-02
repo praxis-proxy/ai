@@ -703,10 +703,14 @@ class TestAnthropicWebSearchCredential:
             )
 
         error = exc_info.value
-        assert error.status_code == 401
-        assert error.body["type"] == "error"
-        assert error.body["error"]["type"] == "authentication_error"
-        assert "brave_search" in error.body["error"]["message"]
+        assert error.status_code == 401, "missing credential must return 401"
+        assert error.body["type"] == "error", "error envelope type must be error"
+        assert error.body["error"]["type"] == "authentication_error", (
+            "error type must be authentication_error"
+        )
+        assert "brave_search" in error.body["error"]["message"], (
+            "error message must name the missing brave_search credential"
+        )
         assert model.requests == [], "missing credential must fail before inference"
         assert search.requests == [], "missing credential must not reach the provider"
 
