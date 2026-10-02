@@ -18,6 +18,7 @@ use praxis_filter::{
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Value, json};
 
+use super::wire;
 use crate::{
     anthropic::messages_to_chat_completions::RESPONSE_RAW_BYTES_KEY,
     callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
@@ -413,7 +414,7 @@ impl AnthropicWebSearchFilter {
     fn resolve_callout_identity(&self, ctx: &HttpFilterContext<'_>) -> Result<CalloutIdentity, Rejection> {
         stage_callout_identity(ctx, self.user_credential_slot.as_deref()).map_err(
             |CalloutContextMissing::Credential { slot }| {
-                anthropic_rejection(
+                wire::error_rejection(
                     401,
                     "authentication_error",
                     &format!("web search requires the '{slot}' per-user credential, which was not provided"),
@@ -537,7 +538,7 @@ impl AnthropicWebSearchFilter {
             },
         };
         if request.get("messages").and_then(Value::as_array).is_none() {
-            return Ok(FilterAction::Reject(anthropic_rejection(
+            return Ok(FilterAction::Reject(wire::error_rejection(
                 400,
                 "invalid_request_error",
                 "messages must be an array for web search re-entry",
@@ -605,7 +606,7 @@ impl AnthropicWebSearchFilter {
     /// response phase, so the loop ends without emitting anything further.
     fn reject_oversized_reentry(ctx: &mut HttpFilterContext<'_>, streaming: bool) -> FilterAction {
         if !streaming {
-            return FilterAction::Reject(anthropic_rejection(
+            return FilterAction::Reject(wire::error_rejection(
                 413,
                 "request_too_large",
                 "web search request exceeds configured max_body_bytes",
@@ -663,7 +664,7 @@ impl AnthropicWebSearchFilter {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(observed_len);
         if raw_len > self.max_body_bytes || observed_len > self.max_body_bytes {
-            return Ok(FilterAction::Reject(anthropic_rejection(
+            return Ok(FilterAction::Reject(wire::error_rejection(
                 502,
                 "api_error",
                 "web-search upstream response exceeded the configured max_body_bytes",
@@ -685,14 +686,14 @@ impl AnthropicWebSearchFilter {
             ResponseDecision::Done => set_action(ctx, ACTION_DONE)?,
             ResponseDecision::Managed(_) => set_action(ctx, ACTION_LOOP)?,
             ResponseDecision::InvalidManagedCall => {
-                return Ok(FilterAction::Reject(anthropic_rejection(
+                return Ok(FilterAction::Reject(wire::error_rejection(
                     400,
                     "invalid_request_error",
                     "WebSearch tool use requires a non-empty id and input.query",
                 )));
             },
             ResponseDecision::QueryTooLong => {
-                return Ok(FilterAction::Reject(anthropic_rejection(
+                return Ok(FilterAction::Reject(wire::error_rejection(
                     400,
                     "invalid_request_error",
                     "WebSearch input.query must not exceed 8192 bytes",
@@ -1241,7 +1242,7 @@ fn append_search_turns(
     outcome: &SearchOutcome,
 ) -> Result<(), Rejection> {
     let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) else {
-        return Err(anthropic_rejection(
+        return Err(wire::error_rejection(
             400,
             "invalid_request_error",
             "messages must be an array for web search re-entry",
@@ -1291,13 +1292,6 @@ fn set_action(ctx: &mut HttpFilterContext<'_>, action: &'static str) -> Result<(
         .or_default()
         .set("action", action)?;
     Ok(())
-}
-
-/// Build an Anthropic JSON error response.
-fn anthropic_rejection(status: u16, error_type: &str, message: &str) -> Rejection {
-    Rejection::status(status)
-        .with_header("content-type", "application/json")
-        .with_body(Bytes::from(super::wire::error_body(error_type, message, None)))
 }
 
 #[cfg(test)]
