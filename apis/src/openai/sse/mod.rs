@@ -11,9 +11,11 @@
     allow(dead_code, reason = "used by filter implementations")
 )]
 
+#[cfg(feature = "openai-responses")]
 mod config;
 mod frame;
 pub(crate) mod responses;
 
+#[cfg(feature = "openai-responses")]
 pub(crate) use config::SseParserConfig;
 pub(crate) use frame::{SseFrame, SseFrameParser, SseParseError};
