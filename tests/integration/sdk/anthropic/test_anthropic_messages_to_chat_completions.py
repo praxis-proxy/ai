@@ -76,6 +76,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
     """Chat Completions stub that keeps the last request body it received."""
 
     bodies: list[dict] = []
+    response_content_type = "application/json"
 
     def do_POST(self):
         length = int(self.headers.get("content-length", "0"))
@@ -105,7 +106,7 @@ class RecordingBackend(BaseHTTPRequestHandler):
             }
         ).encode()
         self.send_response(200)
-        self.send_header("content-type", "application/json")
+        self.send_header("content-type", self.response_content_type)
         self.send_header("content-length", str(len(reply)))
         self.end_headers()
         self.wfile.write(reply)
@@ -220,6 +221,44 @@ def anthropic_client():
 
 
 class TestRequestFieldHandling:
+    def test_tool_input_presence_is_preserved(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+
+        anthropic_client.messages.create(
+            model=MODEL,
+            max_tokens=64,
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "call_missing", "name": "f"},
+                        {"type": "tool_use", "id": "call_null", "name": "g", "input": None},
+                        {"type": "tool_use", "id": "call_object", "name": "h", "input": {}},
+                        {"type": "tool_use", "id": "call_array", "name": "i", "input": [1, 2]},
+                    ],
+                }
+            ],
+        )
+
+        [upstream] = RecordingBackend.bodies
+        arguments = [call["function"]["arguments"] for call in upstream["messages"][0]["tool_calls"]]
+        assert arguments == ["{}", "null", "{}", "[1,2]"]
+
+    def test_mixed_case_vendor_json_response_is_transformed(self, anthropic_client):
+        RecordingBackend.bodies.clear()
+        RecordingBackend.response_content_type = "Application/Problem+JsOn; charset=utf-8"
+        try:
+            response = anthropic_client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                messages=[{"role": "user", "content": "What is 2+2?"}],
+            )
+        finally:
+            RecordingBackend.response_content_type = "application/json"
+
+        assert response.content[0].text == "4"
+        assert len(RecordingBackend.bodies) == 1
+
     def test_unmapped_fields_reach_the_backend(self, anthropic_client):
         RecordingBackend.bodies.clear()
 

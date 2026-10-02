@@ -494,7 +494,9 @@ fn response_transform(ctx: &HttpFilterContext<'_>) -> Option<&'static str> {
                     .is_none_or(|value| {
                         let media_type = value.split(';').next().unwrap_or_default().trim();
                         media_type.eq_ignore_ascii_case("application/json")
-                            || media_type.to_ascii_lowercase().ends_with("+json")
+                            || media_type
+                                .get(media_type.len().saturating_sub("+json".len())..)
+                                .is_some_and(|suffix| suffix.eq_ignore_ascii_case("+json"))
                     })
         });
 
@@ -1101,6 +1103,28 @@ mod tests {
             should_transform_response(&ctx),
             "non-streaming success should be transformed"
         );
+    }
+
+    #[test]
+    fn should_transform_json_media_types_without_changing_parameter_handling() {
+        for (content_type, expected) in [
+            ("application/json; charset=utf-8", true),
+            ("Application/Problem+JsOn; charset=utf-8", true),
+            ("application/vnd.example+JSON", true),
+            ("application/problem+json-seq", false),
+            ("text/plain; charset=utf-8", false),
+        ] {
+            let request = make_request(Method::POST, "/v1/messages");
+            let mut ctx = make_filter_context(&request);
+            ctx.set_metadata("anthropic_messages_to_chat_completions.streaming", "false");
+            let mut response = make_response();
+            response
+                .headers
+                .insert(http::header::CONTENT_TYPE, content_type.parse().unwrap());
+            ctx.response_header = Some(&mut response);
+
+            assert_eq!(should_transform_response(&ctx), expected, "{content_type}");
+        }
     }
 
     #[test]

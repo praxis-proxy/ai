@@ -1654,6 +1654,37 @@ fn translate_single_query() {
 }
 
 #[test]
+fn translate_call_id_only_when_it_is_a_string_and_public_id_is_missing() {
+    let mut response = json!({
+        "output": [
+            {"type": "function_call", "name": "file_search", "call_id": "call_1"},
+            {"type": "function_call", "name": "file_search", "call_id": ""},
+            {"type": "function_call", "name": "file_search"},
+            {"type": "function_call", "name": "file_search", "call_id": 42},
+            {"type": "function_call", "name": "file_search", "id": "fc_5", "call_id": "call_5"},
+            {"type": "function_call", "name": "file_search", "id": "", "call_id": "call_6"}
+        ]
+    });
+
+    assert_eq!(
+        translate_function_calls_to_file_search(&mut response),
+        vec![0, 1, 2, 3, 4, 5]
+    );
+    let output = response["output"].as_array().unwrap();
+    for (item, expected_id) in output.iter().zip([
+        Some("fs_call_1"),
+        Some("fs_"),
+        None,
+        None,
+        Some("fc_5"),
+        Some("fs_call_6"),
+    ]) {
+        assert_eq!(item.get("id").and_then(Value::as_str), expected_id);
+        assert!(item.get("call_id").is_none());
+    }
+}
+
+#[test]
 fn translate_queries_array() {
     let mut response = json!({
         "output": [{

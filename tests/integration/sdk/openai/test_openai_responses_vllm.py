@@ -7239,6 +7239,10 @@ class TestFileSearchVLLM:
             assert item.status in ("completed", "incomplete"), (
                 f"file_search_call status should be terminal; got: {item.status}"
             )
+            assert item.id, "the translated file_search_call must retain a public id"
+            assert "call_id" not in item.model_dump(), (
+                "the private function call_id must not reach the OpenAI client"
+            )
 
         decoded_results = [
             result
@@ -7467,6 +7471,10 @@ class TestFileSearchChatCompletionsVLLM:
             f"contain the indexed marker {marker!r}; got: {payload}"
         )
         if VLLM_TEST_BACKEND == "simulator":
+            # The Chat shim scripts this ID; native Responses generates its own.
+            assert any(
+                item.id == "fc_call_simulator_file_search" for item in file_search_items
+            ), "the scripted Chat function call's public id must be preserved"
             _assert_simulator_auto_tool_round(
                 recorded_request_count,
                 tool_name="file_search",

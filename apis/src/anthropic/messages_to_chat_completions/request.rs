@@ -398,7 +398,7 @@ fn convert_tool_use_block(mut block: Map<String, Value>, tool_calls: &mut Vec<Va
 
     let args = match block.remove("input") {
         Some(input) => serde_json::to_string(&input).unwrap_or_default(),
-        None => serde_json::to_string(&Value::Object(Map::new())).unwrap_or_default(),
+        None => "{}".to_owned(),
     };
 
     let mut function = Map::new();
@@ -1921,7 +1921,7 @@ mod tests {
 
     #[test]
     fn tool_use_without_input_serializes_an_empty_object() {
-        let body = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"f"},{"type":"tool_use","id":"c2","name":"g","input":null}]}]}"#;
+        let body = br#"{"model":"m","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"f"},{"type":"tool_use","id":"c2","name":"g","input":null},{"type":"tool_use","id":"c3","name":"h","input":{}},{"type":"tool_use","id":"c4","name":"i","input":[1,2]},{"type":"tool_use","id":"c5","name":"j","input":"text"}]}]}"#;
         let result = transform_bytes(body).unwrap();
         let parsed: Value = serde_json::from_slice(&result).unwrap();
 
@@ -1934,6 +1934,9 @@ mod tests {
             calls[1]["function"]["arguments"], "null",
             "an explicit null input is preserved as null"
         );
+        assert_eq!(calls[2]["function"]["arguments"], "{}");
+        assert_eq!(calls[3]["function"]["arguments"], "[1,2]");
+        assert_eq!(calls[4]["function"]["arguments"], "\"text\"");
     }
 
     #[test]
