@@ -454,6 +454,7 @@ def _write_compact_config(
     return _persist_config(config)
 
 
+@qualification_profile("supporting")
 @pytest.mark.parametrize(
     ("writer", "args", "postgres_port"),
     [
