@@ -347,6 +347,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.tools.text_output
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-tool-text-output
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.null_tool_choice
     scopes:
       - responses_to_chat_completions

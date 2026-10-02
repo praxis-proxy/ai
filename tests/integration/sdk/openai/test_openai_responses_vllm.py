@@ -3959,6 +3959,85 @@ class TestResponsesToChatCompletionsVLLM:
     # pipeline, not native Responses passthrough, so it measures the contract
     # owned by the translation filter.
 
+    def test_function_call_output_text_reaches_chat_backend(
+        self, reasoning_capture_client
+    ):
+        """The SDK path lowers text parts to tool text in a real Chat request."""
+        client, forwarded = reasoning_capture_client
+        for output, expected in [
+            ("plain result", "plain result"),
+            (
+                [
+                    {"type": "input_text", "text": "first "},
+                    {"type": "input_text", "text": "result"},
+                ],
+                "first result",
+            ),
+        ]:
+            response = client.responses.create(
+                model=VLLM_MODEL,
+                input=[
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": output,
+                    },
+                ],
+                store=False,
+            )
+            assert response.status == "completed"
+            assert forwarded[-1]["messages"][1] == {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": expected,
+            }
+
+        assert len(forwarded) == 2
+
+    def test_function_call_output_unsupported_shapes_stop_before_backend(
+        self, reasoning_capture_client
+    ):
+        """Valid multimodal and invalid scalar outputs cannot become tool text."""
+        client, forwarded = reasoning_capture_client
+        for output, reason in [
+            (
+                [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}],
+                "input_image",
+            ),
+            ([{"type": "input_file", "file_id": "file_123"}], "input_file"),
+            (42, "must be a string or array of input_text parts"),
+            ({"result": 42}, "must be a string or array of input_text parts"),
+            (True, "must be a string or array of input_text parts"),
+            (None, "must be a string or array of input_text parts"),
+        ]:
+            with pytest.raises(BadRequestError) as exc_info:
+                client.responses.create(
+                    model=VLLM_MODEL,
+                    input=[
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "lookup",
+                            "arguments": "{}",
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_1",
+                            "output": output,
+                        },
+                    ],
+                    store=False,
+                )
+            assert exc_info.value.status_code == 400
+            assert reason in str(exc_info.value)
+            assert not forwarded, "unsupported output must not reach the Chat backend"
+
     def test_prompt_template_is_rejected_before_chat_backend(
         self, chat_streaming_client
     ):

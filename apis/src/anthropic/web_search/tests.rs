@@ -1494,6 +1494,180 @@ fn accounted_previous_response_recovers_complete_assistant_content() {
     assert_eq!(recovered, content.as_array().unwrap().clone());
 }
 
+#[test]
+fn managed_reentry_large_content_avoids_second_parse_allocations() {
+    let content = json!([
+        {"type":"text","text":"x".repeat(256 * 1024)},
+        {"type":"tool_use","id":"toolu_search_1","name":"WebSearch","input":{"query":"potato"}}
+    ]);
+    let response = message_response(content.clone(), "tool_use");
+
+    // The previous implementation classifies the complete response and then
+    // deserializes it again to recover owned assistant content.
+    let legacy = allocation_counter::measure(|| {
+        let ResponseDecision::Managed(pending) = classify_response(&response) else {
+            panic!("expected managed search");
+        };
+        let mut value: Value = serde_json::from_slice(&response).unwrap();
+        let recovered = std::mem::take(value["content"].as_array_mut().unwrap());
+        std::hint::black_box((pending, recovered));
+    });
+    let current = allocation_counter::measure(|| {
+        std::hint::black_box(managed_search_from_response(&response).unwrap());
+    });
+
+    assert!(
+        current.bytes_total < legacy.bytes_total,
+        "managed re-entry should allocate less than two complete parses: current={} legacy={}",
+        current.bytes_total,
+        legacy.bytes_total
+    );
+}
+
+#[test]
+fn managed_reentry_matches_borrowed_response_classification() {
+    let cases: &[(&str, &[u8], &str)] = &[
+        (
+            "valid with owned surrounding content",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[true,2,null,["nested"],{"type":"text","text":"first","metadata":{"x":1,"x":2}},{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{"query":"  potato  "}},{"type":"text","text":"last"}]}"#,
+            "managed",
+        ),
+        (
+            "vllm end turn",
+            br#"{"type":"message","role":"assistant","stop_reason":"end_turn","content":[{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{"query":"potato"}}]}"#,
+            "managed",
+        ),
+        (
+            "sequence-shaped tool block",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[["tool_use","WebSearch","toolu_1",{"query":"potato"}]]}"#,
+            "managed",
+        ),
+        (
+            "sequence-shaped input",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"WebSearch","id":"toolu_1","input":["potato"]}]}"#,
+            "managed",
+        ),
+        (
+            "sequence-shaped block and input",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[["tool_use","WebSearch","toolu_1",["potato"]]]}"#,
+            "managed",
+        ),
+        (
+            "normal and sequence-shaped tools are multiple calls",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"WebSearch","id":"toolu_1","input":{"query":"potato"}},["tool_use","Other","toolu_2",{}]]}"#,
+            "done",
+        ),
+        (
+            "short sequence-shaped block is ignored",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[["tool_use","WebSearch","toolu_1"]]}"#,
+            "done",
+        ),
+        (
+            "long sequence-shaped block is ignored",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[["tool_use","WebSearch","toolu_1",{"query":"potato"},"extra"]]}"#,
+            "done",
+        ),
+        (
+            "short sequence-shaped input is invalid",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"WebSearch","id":"toolu_1","input":[]}]}"#,
+            "invalid",
+        ),
+        (
+            "long sequence-shaped input is invalid",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","name":"WebSearch","id":"toolu_1","input":["potato","extra"]}]}"#,
+            "invalid",
+        ),
+        (
+            "sequence-shaped block with duplicate query is invalid",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[["tool_use","WebSearch","toolu_1",{"query":"potato","query":"tomato"}]]}"#,
+            "invalid",
+        ),
+        (
+            "malformed JSON",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":["#,
+            "done",
+        ),
+        (
+            "duplicate envelope field",
+            br#"{"type":"message","role":"assistant","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{"query":"potato"}}]}"#,
+            "done",
+        ),
+        (
+            "duplicate block field",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"WebSearch","name":"WebSearch","input":{"query":"potato"}}]}"#,
+            "done",
+        ),
+        (
+            "duplicate block ignored alongside valid tool",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_2","name":"Other","name":"Other","input":{}},{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{"query":"potato"}}]}"#,
+            "managed",
+        ),
+        (
+            "duplicate query field",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{"query":"potato","query":"tomato"}}]}"#,
+            "invalid",
+        ),
+        (
+            "missing query",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{}}]}"#,
+            "invalid",
+        ),
+        (
+            "non-object input",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":"potato"}]}"#,
+            "invalid",
+        ),
+        (
+            "empty tool id",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"","name":"WebSearch","input":{"query":"potato"}}]}"#,
+            "invalid",
+        ),
+        (
+            "multiple tool uses",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{"query":"potato"}},{"type":"tool_use","id":"toolu_2","name":"Other","input":{}}]}"#,
+            "done",
+        ),
+        (
+            "unknown tool",
+            br#"{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"Other","input":{"query":"potato"}}]}"#,
+            "done",
+        ),
+        (
+            "wrong role",
+            br#"{"type":"message","role":"user","stop_reason":"tool_use","content":[{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{"query":"potato"}}]}"#,
+            "done",
+        ),
+    ];
+
+    for (name, bytes, expected) in cases {
+        let decision = match classify_response(bytes) {
+            ResponseDecision::Done => "done",
+            ResponseDecision::Managed(_) => "managed",
+            ResponseDecision::InvalidManagedCall => "invalid",
+            ResponseDecision::QueryTooLong => "too long",
+        };
+        assert_eq!(decision, *expected, "borrowed classifier: {name}");
+        let recovered = managed_search_from_response(bytes);
+        assert_eq!(recovered.is_ok(), decision == "managed", "re-entry: {name}");
+        if let Ok((pending, content)) = recovered {
+            assert_eq!(pending.id, "toolu_1", "{name}");
+            assert_eq!(pending.query, "potato", "{name}");
+            let original: Value = serde_json::from_slice(bytes).unwrap();
+            assert_eq!(Value::Array(content), original["content"], "{name}");
+        }
+    }
+
+    let long_query = "x".repeat(MAX_SEARCH_QUERY_BYTES + 1);
+    let oversized = format!(
+        r#"{{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{{"query":"{long_query}"}}}}]}}"#
+    );
+    assert!(matches!(
+        classify_response(oversized.as_bytes()),
+        ResponseDecision::QueryTooLong
+    ));
+    assert!(managed_search_from_response(oversized.as_bytes()).is_err());
+}
+
 /// Feed a managed `WebSearch` round into a fresh logical stream, returning the
 /// terminal `drive_streaming_chunk` output and published action.
 fn drive_managed_round(reentry: Reentry) -> (String, Option<&'static str>) {

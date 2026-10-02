@@ -240,6 +240,12 @@ pub(crate) enum TranslationError {
         /// String field whose value had another JSON type.
         field: &'static str,
     },
+    /// A function output has no faithful Chat tool-message representation.
+    #[error("Responses function_call_output input item field `output` must be a string or array of input_text parts")]
+    InvalidFunctionCallOutput,
+    /// A function output array contains a part that cannot become tool text.
+    #[error("unsupported Responses function_call_output part for Chat Completions translation: {0}")]
+    UnsupportedFunctionCallOutputPart(String),
     /// A compaction item's `encrypted_content` is not valid base64 or UTF-8.
     #[error("Responses compaction input item field `encrypted_content` {0}")]
     InvalidCompactionContent(&'static str),
@@ -812,13 +818,50 @@ fn append_tool_output(messages: &mut Vec<Value>, obj: &Map<String, Value>) -> Re
         item_type: "function_call_output",
         field: "output",
     })?;
+    let content = convert_function_call_output(output)?;
 
     messages.push(json!({
         "role": "tool",
         "tool_call_id": call_id,
-        "content": chat_string_field(Some(output))
+        "content": content
     }));
     Ok(())
+}
+
+/// Chat tool messages carry text, so only Responses text output parts can be
+/// lowered. Join their text in order, as for text-only message content.
+fn convert_function_call_output(output: &Value) -> Result<String, TranslationError> {
+    match output {
+        // The request history is borrowed; the owned Chat request keeps this text.
+        Value::String(text) => Ok(text.clone()),
+        Value::Array(parts) => {
+            let mut content = String::new();
+            for part in parts {
+                match part.get("type").and_then(Value::as_str) {
+                    Some("input_text") => {
+                        let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                            TranslationError::UnsupportedFunctionCallOutputPart(
+                                "input_text requires a string `text` field".to_owned(),
+                            )
+                        })?;
+                        content.push_str(text);
+                    },
+                    Some(part_type) => {
+                        return Err(TranslationError::UnsupportedFunctionCallOutputPart(
+                            part_type.to_owned(),
+                        ));
+                    },
+                    None => {
+                        return Err(TranslationError::UnsupportedFunctionCallOutputPart(
+                            "unknown".to_owned(),
+                        ));
+                    },
+                }
+            }
+            Ok(content)
+        },
+        _ => Err(TranslationError::InvalidFunctionCallOutput),
+    }
 }
 
 /// Validate the outer Responses input shape before canonical state overrides
@@ -845,15 +888,6 @@ fn required_input_item_string<'a>(
         Some(Value::String(value)) => Ok(value),
         Some(_) => Err(TranslationError::InvalidInputItemStringField { item_type, field }),
         None => Err(TranslationError::MissingInputItemField { item_type, field }),
-    }
-}
-
-/// Convert an optional JSON field to Chat's string-valued history fields.
-fn chat_string_field(value: Option<&Value>) -> Value {
-    match value {
-        Some(Value::String(text)) => Value::String(text.clone()),
-        Some(value) => Value::String(value.to_string()),
-        None => Value::String(String::new()),
     }
 }
 
