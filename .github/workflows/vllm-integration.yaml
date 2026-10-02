@@ -1662,12 +1662,12 @@ jobs:
           DATABASE_URL: postgres://praxis:praxis@127.0.0.1:5432/praxis
           VLLM_TEST_BACKEND: live
           VLLM_MODEL: ${{ env.VLLM_GPU_MODEL }}
-          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/qualification-native-cases.json
+          PRAXIS_QUALIFICATION_RESULTS: ${{ runner.temp }}/qualification-responses-cases.json
         run: |
           set +e
           uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s \
             -p qualification_plugin -k "not live_tavily_web_search_returns_real_sources" \
-            2>&1 | tee "$RUNNER_TEMP/qualification-native-pytest.log"
+            2>&1 | tee "$RUNNER_TEMP/qualification-responses-pytest.log"
           exit "${PIPESTATUS[0]}"
 
       - name: Run credentialed live Tavily web search
@@ -1692,14 +1692,14 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/qualification-credentialed-pytest.log"
           exit "${PIPESTATUS[0]}"
 
-      - name: Capture native GPU qualification and diagnostics
+      - name: Capture Responses gateway GPU qualification and diagnostics
         if: always()
         env:
           QUALIFICATION_SETUP: ${{ steps.qualification_build.outcome == 'success' && steps.qualification_vllm_ready.outcome == 'success' && steps.qualification_ogx_ready.outcome == 'success' && 'passed' || 'failed' }}
           GPU_INSTANCE_TYPE: ${{ inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
         run: |
           python3 .github/scripts/vllm_qualification.py capture \
-            --native "$RUNNER_TEMP/qualification-native-cases.json" \
+            --responses "$RUNNER_TEMP/qualification-responses-cases.json" \
             --credentialed "$RUNNER_TEMP/qualification-credentialed-cases.json" \
             --setup "$QUALIFICATION_SETUP" \
             --output "$RUNNER_TEMP/qualification-raw.json"
@@ -1707,16 +1707,16 @@ jobs:
           "${CONTAINER_RUNTIME:-docker}" logs praxis-postgres > "$RUNNER_TEMP/qualification-postgres.log" 2>&1 || true
           cp /tmp/ogx.log "$RUNNER_TEMP/qualification-ogx.log" 2>/dev/null || true
 
-      - name: Upload native GPU results and diagnostics
+      - name: Upload Responses gateway GPU results and diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: vllm-gpu-native-raw
+          name: vllm-gpu-responses-raw
           path: |
             ${{ runner.temp }}/qualification-raw.json
-            ${{ runner.temp }}/qualification-native-cases.json
+            ${{ runner.temp }}/qualification-responses-cases.json
             ${{ runner.temp }}/qualification-credentialed-cases.json
-            ${{ runner.temp }}/qualification-native-pytest.log
+            ${{ runner.temp }}/qualification-responses-pytest.log
             ${{ runner.temp }}/qualification-credentialed-pytest.log
             ${{ runner.temp }}/qualification-vllm.log
             ${{ runner.temp }}/qualification-postgres.log
@@ -1759,7 +1759,7 @@ jobs:
   # Runs on a hosted runner so provisioning and GPU runner registration failures
   # still produce an explicit report and Actions summary.
   gpu-qualification-summary:
-    name: Summarize native vLLM GPU qualification
+    name: Summarize vLLM Responses gateway GPU qualification
     needs: [gpu-start-runner, vllm-gpu-full-suite, vllm-gpu-claude-acceptance, vllm-gpu-codex-acceptance]
     if: always()
     runs-on: ubuntu-24.04
@@ -1770,12 +1770,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Download available native results
+      - name: Download available Responses gateway results
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/vllm-qualification-raw"
-          gh run download "$GITHUB_RUN_ID" --name vllm-gpu-native-raw \
+          gh run download "$GITHUB_RUN_ID" --name vllm-gpu-responses-raw \
             --dir "$RUNNER_TEMP/vllm-qualification-raw" || true
           mkdir -p "$RUNNER_TEMP/claude-acceptance-raw" "$RUNNER_TEMP/codex-acceptance-raw"
           gh run download "$GITHUB_RUN_ID" --name claude-vllm-acceptance-results \

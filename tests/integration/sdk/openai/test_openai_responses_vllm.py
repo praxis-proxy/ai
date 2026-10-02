@@ -112,6 +112,14 @@ def requires_vllm_compat(test):
         reason="test requires real vLLM compatibility behavior",
     )(test)
 
+
+def qualification_profile(name):
+    """Override GPU report attribution for a test with dynamic fixtures."""
+    def decorate(test):
+        test.qualification_profile = name
+        return test
+    return decorate
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -397,6 +405,7 @@ def _write_reasoning_backend_config(
     return _persist_config(config)
 
 
+@qualification_profile("supporting")
 def test_reasoning_config_writers_inherit_root_override(tmp_path, monkeypatch):
     """Keep every reasoning fixture compatible with the root-run GPU worker."""
     monkeypatch.setattr(os, "geteuid", lambda: 0)
@@ -2643,6 +2652,7 @@ class TestOpenAIResponsesVLLM:
         finally:
             client.conversations.delete(conversation.id)
 
+    @qualification_profile("supporting")
     @pytest.mark.parametrize("replay_limited", [False, True], ids=["default", "replay-limit"])
     def test_failed_irr_stream_does_not_append_completed_upstream_snapshot(
         self, request, replay_limited
