@@ -106,6 +106,13 @@ struct IntelligentRouteConfig {
     /// Static list of route candidates (mutually exclusive with `overlay_file`).
     candidates: Option<Vec<CandidateConfig>>,
 
+    /// Explicit selection policy for an empty inline candidate list.
+    ///
+    /// Generated Grid consumer configuration uses `weightedRandom` to
+    /// represent an intentional no-provider state. Non-empty inline
+    /// candidates continue to use the existing static selection behavior.
+    selection_policy: Option<overlay::SelectionPolicy>,
+
     /// Name of the local site (required in static mode, provided by overlay
     /// in overlay mode).
     local_site: Option<String>,
@@ -336,6 +343,10 @@ enum AffinityOutcome<'a> {
 /// overlay's selection mode within the first viable producer-defined group.
 /// Missing group or policy metadata uses deterministic first-admitted ordering.
 /// Praxis AI does not recompute source geography, load, or score.
+/// `weightedRandom` is overlay-only: every candidate must have a selection
+/// group and an integer `traffic_weight` from 1 through 1000. Weights are
+/// applied only among candidates in the first viable group. Inline static
+/// candidates cannot enable weighted selection.
 /// `admission_state=none` is never eligible. `existing_only` is eligible only
 /// through an already-bound session affinity entry.
 ///
@@ -592,13 +603,16 @@ fn build_route_snapshot(cfg: &mut IntelligentRouteConfig) -> SnapshotResult {
         return Err("intelligent_route: expected_overlay_scope requires envelope overlay_file mode".into());
     }
     if let Some(path) = cfg.overlay_file.take() {
+        if cfg.selection_policy.is_some() {
+            return Err("intelligent_route: selection_policy must be provided by overlay_file content".into());
+        }
         let reload = cfg.reload.take().unwrap_or_default();
         build_overlay_snapshot(path, &reload, cfg.expected_overlay_scope.take())
     } else if let Some(candidates_raw) = cfg.candidates.take() {
         if cfg.reload.is_some() {
             return Err("intelligent_route: reload block is not valid with static candidates".into());
         }
-        build_static_snapshot(candidates_raw, cfg.local_site.take())
+        build_static_snapshot(candidates_raw, cfg.local_site.take(), cfg.selection_policy.take())
     } else {
         Err("intelligent_route: either overlay_file or candidates must be set".into())
     }
@@ -641,10 +655,33 @@ fn build_overlay_snapshot(
 }
 
 /// Build a static snapshot from inline candidates.
-fn build_static_snapshot(candidates_raw: Vec<CandidateConfig>, local_site: Option<String>) -> SnapshotResult {
+fn build_static_snapshot(
+    candidates_raw: Vec<CandidateConfig>,
+    local_site: Option<String>,
+    selection_policy: Option<overlay::SelectionPolicy>,
+) -> SnapshotResult {
     let local_site_str = local_site
         .ok_or_else(|| FilterError::from("intelligent_route: local_site is required when candidates is set"))?;
     descriptor::validate_local_site(&local_site_str)?;
+    if candidates_raw
+        .iter()
+        .any(|candidate| candidate.traffic_weight.is_some())
+    {
+        return Err(
+            "intelligent_route: traffic_weight requires overlay mode with selection_policy.mode=weightedRandom".into(),
+        );
+    }
+    if candidates_raw.is_empty() {
+        if selection_policy.is_some_and(|policy| policy.mode == PickerPolicy::WeightedRandom) {
+            let mut snap = RouteSnapshot::from_static(Vec::new(), Arc::from(local_site_str.as_str()));
+            snap.selection_mode = PickerPolicy::WeightedRandom;
+            return Ok((Arc::new(ArcSwap::from_pointee(snap)), None));
+        }
+        return Err("routing: candidates list must not be empty".into());
+    }
+    if selection_policy.is_some() {
+        return Err("intelligent_route: selection_policy is only valid for an empty inline candidate list".into());
+    }
     let candidates = descriptor::validate_candidates(candidates_raw)?;
     let snap = RouteSnapshot::from_static(candidates, Arc::from(local_site_str.as_str()));
     Ok((Arc::new(ArcSwap::from_pointee(snap)), None))
@@ -1200,6 +1237,17 @@ mod tests {
         assert!(parse(yaml).is_ok(), "minimal valid config should parse");
     }
 
+    #[test]
+    fn static_candidates_reject_ignored_traffic_weights() {
+        let err = parse_err(
+            "local_site: site-a\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: inf\n    traffic_weight: 70\n",
+        );
+        assert!(
+            err.to_string().contains("traffic_weight requires overlay mode"),
+            "static weights must fail clearly instead of being ignored: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn default_model_header_is_x_model() {
         let f = make_filter(&[("inference_model", "llama", "site-a", "inf")]);
@@ -1232,6 +1280,32 @@ mod tests {
         assert!(
             err.to_string().contains("empty"),
             "empty candidates should be rejected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_empty_weighted_inline_config_rejects_requests() {
+        let yaml = "local_site: site-a\nselection_policy:\n  mode: weightedRandom\ncandidates: []\n";
+        let filter = parse(yaml).expect("explicit weighted empty list is a valid no-provider state");
+        let mut req = crate::test_utils::make_request(Method::POST, "/chat");
+        req.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        let mut ctx = crate::test_utils::make_filter_context(&req);
+
+        let action = filter.on_request(&mut ctx).await.unwrap();
+
+        assert!(matches!(action, FilterAction::Reject(rejection) if rejection.status == 404));
+        assert!(ctx.cluster.is_none());
+    }
+
+    #[test]
+    fn non_empty_inline_config_cannot_set_selection_policy() {
+        let yaml = "local_site: site-a\nselection_policy:\n  mode: weightedRandom\ncandidates:\n  - kind: inference_model\n    name: llama\n    site: site-a\n    cluster: provider-a\n";
+        let error = parse_err(yaml);
+        assert!(
+            error
+                .to_string()
+                .contains("only valid for an empty inline candidate list"),
+            "selection policy must not change non-empty inline routing: {error}"
         );
     }
 
@@ -2895,6 +2969,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn weighted_affinity_keeps_binding_when_overlay_weights_change() {
+        let shared = Arc::new(ArcSwap::from_pointee(make_weighted_snapshot(90, 10)));
+        let filter = make_affinity_filter(Arc::clone(&shared), Some(make_test_affinity()));
+
+        let mut first = crate::test_utils::make_request(Method::POST, "/chat");
+        first.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        first.headers.insert("x-session-id", HeaderValue::from_static("sticky"));
+        let mut first_ctx = crate::test_utils::make_filter_context(&first);
+        let _unused = filter.on_request(&mut first_ctx).await.unwrap();
+        let first_cluster = first_ctx.cluster.clone().expect("weighted route selects a candidate");
+
+        shared.store(Arc::new(make_weighted_snapshot(10, 90)));
+
+        let mut second = crate::test_utils::make_request(Method::POST, "/chat");
+        second.headers.insert("X-Model", HeaderValue::from_static("llama"));
+        second
+            .headers
+            .insert("x-session-id", HeaderValue::from_static("sticky"));
+        let mut second_ctx = crate::test_utils::make_filter_context(&second);
+        let _unused = filter.on_request(&mut second_ctx).await.unwrap();
+
+        assert_eq!(second_ctx.cluster.as_deref(), Some(first_cluster.as_ref()));
+        assert_eq!(
+            second_ctx.get_metadata("intelligent_route.session.reused"),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_weighted_overlay_reload_advances_revision_and_denies_new_requests() {
+        let initial = include_bytes!("../../../tests/fixtures/overlay-contract/v1/valid-minimal.json");
+        let initial_snapshot = RouteSnapshot::from_overlay(initial).unwrap();
+        let initial_revision = initial_snapshot
+            .semantic_revision
+            .as_deref()
+            .expect("fixture has semantic revision")
+            .to_owned();
+        let shared = Arc::new(ArcSwap::from_pointee(initial_snapshot));
+        let filter = make_affinity_filter(Arc::clone(&shared), None);
+
+        let mut before_req = crate::test_utils::make_request(Method::POST, "/chat");
+        before_req
+            .headers
+            .insert("X-Model", HeaderValue::from_static("model-a"));
+        let mut before_ctx = crate::test_utils::make_filter_context(&before_req);
+        let before_action = filter.on_request(&mut before_ctx).await.unwrap();
+        assert!(matches!(before_action, FilterAction::Continue));
+        assert!(before_ctx.cluster.is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routing-overlay.json");
+        std::fs::write(&path, make_empty_weighted_envelope_json()).unwrap();
+        overlay::handle_overlay_reload(&path, &shared, None);
+
+        let serving = shared.load();
+        let serving_revision = serving.semantic_revision.as_deref().expect("new envelope revision");
+        assert_ne!(serving_revision, initial_revision);
+        assert!(serving.candidates.is_empty());
+
+        let mut after_req = crate::test_utils::make_request(Method::POST, "/chat");
+        after_req.headers.insert("X-Model", HeaderValue::from_static("model-a"));
+        let mut after_ctx = crate::test_utils::make_filter_context(&after_req);
+        let after_action = filter.on_request(&mut after_ctx).await.unwrap();
+        assert!(matches!(after_action, FilterAction::Reject(rejection) if rejection.status == 404));
+        assert!(after_ctx.cluster.is_none());
+    }
+
     // ---- Overlay revision header ----
 
     #[tokio::test]
@@ -3189,5 +3331,48 @@ mod tests {
             });
         }
         RouteSnapshot::from_static(route_candidates, Arc::from("site-a"))
+    }
+
+    fn make_weighted_snapshot(weight_a: u32, weight_b: u32) -> RouteSnapshot {
+        let json = serde_json::json!({
+            "local_site": "site-a",
+            "selection_policy": {"mode": "weightedRandom"},
+            "candidates": [
+                {"kind": "inference_model", "name": "llama", "site": "site-a", "cluster": "c-a", "selection_group": 0, "traffic_weight": weight_a},
+                {"kind": "inference_model", "name": "llama", "site": "site-b", "cluster": "c-b", "selection_group": 0, "traffic_weight": weight_b}
+            ]
+        });
+        RouteSnapshot::from_overlay(serde_json::to_vec(&json).unwrap().as_slice()).unwrap()
+    }
+
+    fn make_empty_weighted_envelope_json() -> String {
+        let overlay_payload = serde_json::json!({
+            "local_site": "site-a",
+            "network": "test-net",
+            "selection_policy": {"mode": "weightedRandom"},
+            "candidates": []
+        });
+        let digest = overlay::compute_semantic_digest(&overlay_payload).unwrap();
+        serde_json::to_string(&serde_json::json!({
+            "schema_version": "1.0.0",
+            "revision": {"kind": "content_addressed", "algorithm": "sha256", "value": digest},
+            "content_digest": {"algorithm": "sha256", "value": digest},
+            "scope": {
+                "network": "test-net",
+                "gateway": "gw",
+                "namespace": "ns",
+                "local_site": "site-a"
+            },
+            "provenance": {
+                "producer": "test",
+                "producer_version": "0.1.0",
+                "source_name": "test-net",
+                "source_uid": "test-uid",
+                "source_generation": 1,
+                "rendered_at": "2026-10-01T00:00:00Z"
+            },
+            "overlay": overlay_payload
+        }))
+        .unwrap()
     }
 }
