@@ -372,11 +372,22 @@ mod tests {
 
     #[test]
     fn truncate_keeps_short_lines_and_marks_long_ones() {
-        assert_eq!(truncate("short"), "short");
+        assert_eq!(
+            truncate("short"),
+            "short",
+            "lines within the width are returned unchanged"
+        );
         let long = "x".repeat(200);
         let cut = truncate(&long);
-        assert!(cut.ends_with('…'));
-        assert_eq!(cut.chars().count(), 121);
+        assert!(
+            cut.ends_with('…'),
+            "an over-width line must be marked truncated with an ellipsis"
+        );
+        assert_eq!(
+            cut.chars().count(),
+            121,
+            "a truncated line keeps the 120-char cap plus the ellipsis"
+        );
     }
 
     #[test]

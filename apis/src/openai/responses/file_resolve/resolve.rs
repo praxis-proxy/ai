@@ -1671,7 +1671,10 @@ mod tests {
 
         let miss = allocation_counter::measure(|| {
             let (part_type, source) = resolvable_reference(&miss_part).unwrap();
-            assert!(budget.cached(part_type, source).is_none());
+            assert!(
+                budget.cached(part_type, source).is_none(),
+                "an uncached reference must miss before it is inserted"
+            );
             budget.cache.entry((part_type, source.kind())).or_default().insert(
                 source.value().to_owned(),
                 Err(ResolveError::TooManyReferences { limit: 1 }),

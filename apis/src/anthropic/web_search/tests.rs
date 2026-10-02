@@ -1661,11 +1661,14 @@ fn managed_reentry_matches_borrowed_response_classification() {
     let oversized = format!(
         r#"{{"type":"message","role":"assistant","stop_reason":"tool_use","content":[{{"type":"tool_use","id":"toolu_1","name":"WebSearch","input":{{"query":"{long_query}"}}}}]}}"#
     );
-    assert!(matches!(
-        classify_response(oversized.as_bytes()),
-        ResponseDecision::QueryTooLong
-    ));
-    assert!(managed_search_from_response(oversized.as_bytes()).is_err());
+    assert!(
+        matches!(classify_response(oversized.as_bytes()), ResponseDecision::QueryTooLong),
+        "a query over MAX_SEARCH_QUERY_BYTES must classify as QueryTooLong"
+    );
+    assert!(
+        managed_search_from_response(oversized.as_bytes()).is_err(),
+        "managed re-entry must refuse to recover an over-length query"
+    );
 }
 
 /// Feed a managed `WebSearch` round into a fresh logical stream, returning the

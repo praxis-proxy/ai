@@ -312,7 +312,10 @@ mod tests {
             parsed["choices"][0].get("content_filter_results").is_none(),
             "content_filter_results must be stripped"
         );
-        assert_eq!(parsed["choices"][0]["delta"]["content"], "Hi");
+        assert_eq!(
+            parsed["choices"][0]["delta"]["content"], "Hi",
+            "delta content must survive Azure-field stripping"
+        );
     }
 
     #[test]
@@ -333,7 +336,10 @@ mod tests {
             "terminal finish_reason must be forwarded as rewritten JSON, got {action:?}"
         );
         let parsed: Value = serde_json::from_slice(rewritten).unwrap();
-        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            parsed["choices"][0]["finish_reason"], "stop",
+            "terminal finish_reason must be preserved after stripping Azure filter fields"
+        );
         assert!(
             parsed["choices"][0].get("content_filter_results").is_none(),
             "terminal chunks must keep finish_reason and drop Azure filter fields"

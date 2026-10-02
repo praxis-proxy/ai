@@ -701,7 +701,12 @@ fn translate_tool_choice(obj: &Map<String, Value>) -> Result<Option<Value>, Stri
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
+#[expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    reason = "tests"
+)]
 mod tests {
     use serde_json::Value;
 
@@ -722,7 +727,10 @@ mod tests {
     fn model_extracted_not_in_body() {
         let req = r#"{"model":"anthropic.claude-3-sonnet-20240229-v1:0","messages":[{"role":"user","content":"hi"}]}"#;
         let result = translate_result(req);
-        assert_eq!(result.model, "anthropic.claude-3-sonnet-20240229-v1:0");
+        assert_eq!(
+            result.model, "anthropic.claude-3-sonnet-20240229-v1:0",
+            "model must be extracted verbatim from the request body"
+        );
         let body: Value = serde_json::from_slice(&result.body).unwrap();
         assert!(body.get("model").is_none(), "model must not appear in body");
     }
@@ -753,7 +761,11 @@ mod tests {
 
         for model in models {
             let request = format!(r#"{{"model":"{model}","messages":[]}}"#);
-            assert_eq!(transform_request(request.as_bytes()).unwrap().model, model);
+            assert_eq!(
+                transform_request(request.as_bytes()).unwrap().model,
+                model,
+                "valid model ID `{model}` must be accepted and returned verbatim"
+            );
         }
     }
 
@@ -789,12 +801,19 @@ mod tests {
     fn model_id_length_is_validated() {
         let maximum = "a".repeat(MAX_MODEL_ID_LEN);
         let request = format!(r#"{{"model":"{maximum}","messages":[]}}"#);
-        assert_eq!(transform_request(request.as_bytes()).unwrap().model, maximum);
+        assert_eq!(
+            transform_request(request.as_bytes()).unwrap().model,
+            maximum,
+            "a model ID at the maximum length must be accepted"
+        );
 
         let over_limit = "a".repeat(MAX_MODEL_ID_LEN + 1);
         let request = format!(r#"{{"model":"{over_limit}","messages":[]}}"#);
         let error = transform_request(request.as_bytes()).unwrap_err();
-        assert!(error.contains("between 1 and 2048"));
+        assert!(
+            error.contains("between 1 and 2048"),
+            "over-length model ID must be rejected with a length error: {error}"
+        );
     }
 
     // ── Request semantics ────────────────────────────────────────────────
@@ -806,16 +825,32 @@ mod tests {
                 "temperature":0.4,"top_p":0.8,"stop":["done"]}"#,
         );
 
-        assert_eq!(body["inferenceConfig"]["maxTokens"], 128);
-        assert_eq!(body["inferenceConfig"]["temperature"], 0.4);
-        assert_eq!(body["inferenceConfig"]["topP"], 0.8);
-        assert_eq!(body["inferenceConfig"]["stopSequences"], serde_json::json!(["done"]));
+        assert_eq!(
+            body["inferenceConfig"]["maxTokens"], 128,
+            "max_completion_tokens must map to inferenceConfig.maxTokens"
+        );
+        assert_eq!(
+            body["inferenceConfig"]["temperature"], 0.4,
+            "temperature must map to inferenceConfig.temperature"
+        );
+        assert_eq!(
+            body["inferenceConfig"]["topP"], 0.8,
+            "top_p must map to inferenceConfig.topP"
+        );
+        assert_eq!(
+            body["inferenceConfig"]["stopSequences"],
+            serde_json::json!(["done"]),
+            "stop must map to inferenceConfig.stopSequences"
+        );
     }
 
     #[test]
     fn null_max_tokens_uses_max_completion_tokens_fallback() {
         let body = translate(r#"{"model":"m","messages":[],"max_tokens":null,"max_completion_tokens":128}"#);
-        assert_eq!(body["inferenceConfig"]["maxTokens"], 128);
+        assert_eq!(
+            body["inferenceConfig"]["maxTokens"], 128,
+            "null max_tokens must fall back to max_completion_tokens"
+        );
     }
 
     #[test]
@@ -848,7 +883,10 @@ mod tests {
             serde_json::json!({"model": "m", "messages": {}}),
         ] {
             let error = transform_request(request.to_string().as_bytes()).unwrap_err();
-            assert!(error.contains("messages"));
+            assert!(
+                error.contains("messages"),
+                "missing or non-array `messages` must be rejected with a `messages` error: {error}"
+            );
         }
     }
 
@@ -903,7 +941,10 @@ mod tests {
             "seed": null,
         });
 
-        assert!(transform_request(request.to_string().as_bytes()).is_ok());
+        assert!(
+            transform_request(request.to_string().as_bytes()).is_ok(),
+            "unsupported fields carrying their documented no-op defaults must be accepted"
+        );
     }
 
     #[test]
@@ -916,8 +957,11 @@ mod tests {
         });
 
         let result = transform_request(request.to_string().as_bytes()).unwrap();
-        assert!(result.stream);
-        assert!(result.include_usage);
+        assert!(result.stream, "stream: true must set the streaming flag");
+        assert!(
+            result.include_usage,
+            "stream_options.include_usage: true must enable the streaming usage chunk"
+        );
     }
 
     #[test]
@@ -933,7 +977,10 @@ mod tests {
             }
 
             let result = transform_request(request.to_string().as_bytes()).unwrap();
-            assert!(!result.include_usage);
+            assert!(
+                !result.include_usage,
+                "include_usage must stay disabled when false or omitted"
+            );
         }
     }
 
@@ -946,7 +993,10 @@ mod tests {
         });
 
         let error = transform_request(request.to_string().as_bytes()).unwrap_err();
-        assert!(error.contains("stream_options"));
+        assert!(
+            error.contains("stream_options"),
+            "stream_options without stream: true must be rejected: {error}"
+        );
     }
 
     #[test]
@@ -959,7 +1009,10 @@ mod tests {
         });
 
         let error = transform_request(request.to_string().as_bytes()).unwrap_err();
-        assert!(error.contains("stream_options.include_obfuscation"));
+        assert!(
+            error.contains("stream_options.include_obfuscation"),
+            "an unknown stream_options field must be named in the rejection: {error}"
+        );
     }
 
     #[test]
@@ -972,7 +1025,10 @@ mod tests {
         });
 
         let error = transform_request(request.to_string().as_bytes()).unwrap_err();
-        assert!(error.contains("stream_options.include_usage"));
+        assert!(
+            error.contains("stream_options.include_usage"),
+            "a non-boolean include_usage must be rejected: {error}"
+        );
     }
 
     #[test]
@@ -984,7 +1040,10 @@ mod tests {
         });
 
         let error = transform_request(request.to_string().as_bytes()).unwrap_err();
-        assert!(error.contains("reasoning_effort"));
+        assert!(
+            error.contains("reasoning_effort"),
+            "reasoning_effort has no no-op default and must be rejected: {error}"
+        );
     }
 
     // ── Stream flag ───────────────────────────────────────────────────────
@@ -992,7 +1051,7 @@ mod tests {
     #[test]
     fn stream_flag_extracted_true() {
         let result = translate_result(r#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#);
-        assert!(result.stream);
+        assert!(result.stream, "stream: true must set the streaming flag");
         let body: Value = serde_json::from_slice(&result.body).unwrap();
         assert!(body.get("stream").is_none(), "stream must not be in body");
     }
@@ -1000,7 +1059,7 @@ mod tests {
     #[test]
     fn stream_flag_defaults_to_false() {
         let result = translate_result(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
-        assert!(!result.stream);
+        assert!(!result.stream, "stream must default to false when absent");
     }
 
     // ── System message extraction ─────────────────────────────────────────
@@ -1014,10 +1073,16 @@ mod tests {
             ]}"#,
         );
         let system = &body["system"];
-        assert_eq!(system[0]["text"], "You are helpful.");
+        assert_eq!(
+            system[0]["text"], "You are helpful.",
+            "system message text must be hoisted into the top-level system array"
+        );
         // system role must NOT appear in messages
         let msgs = body["messages"].as_array().unwrap();
-        assert!(!msgs.iter().any(|m| m["role"] == "system"));
+        assert!(
+            !msgs.iter().any(|m| m["role"] == "system"),
+            "system role must not remain in the messages array"
+        );
     }
 
     #[test]
@@ -1028,7 +1093,10 @@ mod tests {
                 {"role":"user","content":"Hi"}
             ]}"#,
         );
-        assert_eq!(body["system"][0]["text"], "Be concise.");
+        assert_eq!(
+            body["system"][0]["text"], "Be concise.",
+            "developer message must be hoisted into the system array like system"
+        );
     }
 
     #[test]
@@ -1042,14 +1110,23 @@ mod tests {
                 {"role":"user","content":"Hi"}
             ]}"#,
         );
-        assert_eq!(body["system"][0]["text"], "First.");
-        assert_eq!(body["system"][1]["text"], "Second.");
+        assert_eq!(
+            body["system"][0]["text"], "First.",
+            "first multipart system text part must be preserved"
+        );
+        assert_eq!(
+            body["system"][1]["text"], "Second.",
+            "second multipart system text part must be preserved"
+        );
     }
 
     #[test]
     fn no_system_message_omits_system_field() {
         let body = translate(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
-        assert!(body.get("system").is_none());
+        assert!(
+            body.get("system").is_none(),
+            "system field must be omitted when no system message is present"
+        );
     }
 
     // ── User message ──────────────────────────────────────────────────────
@@ -1058,8 +1135,11 @@ mod tests {
     fn user_string_content_wrapped_in_text_block() {
         let body = translate(r#"{"model":"m","messages":[{"role":"user","content":"Hello!"}]}"#);
         let msg = &body["messages"][0];
-        assert_eq!(msg["role"], "user");
-        assert_eq!(msg["content"][0]["text"], "Hello!");
+        assert_eq!(msg["role"], "user", "user message role must be preserved");
+        assert_eq!(
+            msg["content"][0]["text"], "Hello!",
+            "user string content must be wrapped in a single text block"
+        );
     }
 
     #[test]
@@ -1071,9 +1151,12 @@ mod tests {
             ]}]}"#,
         );
         let content = body["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["text"], "part one");
-        assert_eq!(content[1]["text"], "part two");
+        assert_eq!(content.len(), 2, "both user text parts must be translated");
+        assert_eq!(content[0]["text"], "part one", "first user text part must be preserved");
+        assert_eq!(
+            content[1]["text"], "part two",
+            "second user text part must be preserved"
+        );
     }
 
     #[test]
@@ -1085,7 +1168,10 @@ mod tests {
             ]}]}"#,
         )
         .unwrap_err();
-        assert!(err.contains("image_url"));
+        assert!(
+            err.contains("image_url"),
+            "image_url content parts must be rejected, not silently dropped: {err}"
+        );
     }
 
     // ── Assistant message ─────────────────────────────────────────────────
@@ -1099,8 +1185,11 @@ mod tests {
             ]}"#,
         );
         let msg = &body["messages"][1];
-        assert_eq!(msg["role"], "assistant");
-        assert_eq!(msg["content"][0]["text"], "Hello there!");
+        assert_eq!(msg["role"], "assistant", "assistant message role must be preserved");
+        assert_eq!(
+            msg["content"][0]["text"], "Hello there!",
+            "assistant string content must be wrapped in a single text block"
+        );
     }
 
     #[test]
@@ -1115,11 +1204,23 @@ mod tests {
             ]}"#,
         );
         let msg = &body["messages"][1];
-        assert_eq!(msg["role"], "assistant");
+        assert_eq!(
+            msg["role"], "assistant",
+            "assistant role must be preserved for tool-call messages"
+        );
         let block = &msg["content"][0]["toolUse"];
-        assert_eq!(block["toolUseId"], "call_1");
-        assert_eq!(block["name"], "get_weather");
-        assert_eq!(block["input"]["city"], "Paris");
+        assert_eq!(
+            block["toolUseId"], "call_1",
+            "tool call id must map to toolUse.toolUseId"
+        );
+        assert_eq!(
+            block["name"], "get_weather",
+            "tool call function name must map to toolUse.name"
+        );
+        assert_eq!(
+            block["input"]["city"], "Paris",
+            "tool call arguments string must be parsed into toolUse.input"
+        );
     }
 
     #[test]
@@ -1135,8 +1236,14 @@ mod tests {
         );
         let content = body["messages"][1]["content"].as_array().unwrap();
         // First block is text, second is toolUse.
-        assert_eq!(content[0]["text"], "Let me check.");
-        assert!(content[1].get("toolUse").is_some());
+        assert_eq!(
+            content[0]["text"], "Let me check.",
+            "assistant text block must come before tool-use blocks"
+        );
+        assert!(
+            content[1].get("toolUse").is_some(),
+            "tool-use block must follow the assistant text block"
+        );
     }
 
     #[test]
@@ -1150,7 +1257,10 @@ mod tests {
             ]}"#,
         )
         .unwrap_err();
-        assert!(err.contains("not valid JSON"));
+        assert!(
+            err.contains("not valid JSON"),
+            "malformed tool arguments must be rejected, not silently replaced: {err}"
+        );
     }
 
     // ── Tool result message ───────────────────────────────────────────────
@@ -1168,10 +1278,16 @@ mod tests {
             ]}"#,
         );
         let msg = &body["messages"][2];
-        assert_eq!(msg["role"], "user");
+        assert_eq!(msg["role"], "user", "tool role must become a user-role message");
         let tr = &msg["content"][0]["toolResult"];
-        assert_eq!(tr["toolUseId"], "call_abc");
-        assert_eq!(tr["content"][0]["text"], "{\"temp\":18}");
+        assert_eq!(
+            tr["toolUseId"], "call_abc",
+            "tool_call_id must map to toolResult.toolUseId"
+        );
+        assert_eq!(
+            tr["content"][0]["text"], "{\"temp\":18}",
+            "tool result content must be preserved as text"
+        );
     }
 
     /// A translated tool result has the Bedrock `user` role, so it must merge
@@ -1185,9 +1301,15 @@ mod tests {
             ]}"#,
         );
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0]["content"][0]["text"], "here is some context");
-        assert!(msgs[0]["content"][1].get("toolResult").is_some());
+        assert_eq!(msgs.len(), 1, "tool result must merge into the preceding user message");
+        assert_eq!(
+            msgs[0]["content"][0]["text"], "here is some context",
+            "original user text must be retained after the merge"
+        );
+        assert!(
+            msgs[0]["content"][1].get("toolResult").is_some(),
+            "toolResult block must be appended to the merged user message"
+        );
     }
 
     #[test]
@@ -1201,9 +1323,21 @@ mod tests {
             ]}"#,
         );
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 2);
-        assert_eq!(msgs[1]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            msgs.len(),
+            2,
+            "adjacent same-role messages must collapse into one per role"
+        );
+        assert_eq!(
+            msgs[0]["content"].as_array().unwrap().len(),
+            2,
+            "both user blocks must merge into one user message"
+        );
+        assert_eq!(
+            msgs[1]["content"].as_array().unwrap().len(),
+            2,
+            "both assistant blocks must merge into one assistant message"
+        );
     }
 
     #[test]
@@ -1222,9 +1356,19 @@ mod tests {
         let content = body["messages"][1]["content"][0]["toolResult"]["content"]
             .as_array()
             .unwrap();
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["text"], "first");
-        assert_eq!(content[1]["text"], "second");
+        assert_eq!(
+            content.len(),
+            2,
+            "both multipart tool-result text parts must be preserved"
+        );
+        assert_eq!(
+            content[0]["text"], "first",
+            "first tool-result text part must be preserved"
+        );
+        assert_eq!(
+            content[1]["text"], "second",
+            "second tool-result text part must be preserved"
+        );
     }
 
     #[test]
@@ -1235,7 +1379,10 @@ mod tests {
             ]}"#,
         )
         .unwrap_err();
-        assert!(error.contains("tool content part type"));
+        assert!(
+            error.contains("tool content part type"),
+            "an unsupported tool-result part type must be rejected: {error}"
+        );
     }
 
     /// Parallel tool calls produce multiple back-to-back `tool` messages.
@@ -1261,9 +1408,15 @@ mod tests {
             3,
             "consecutive tool messages must collapse into one user message"
         );
-        assert_eq!(msgs[0]["role"], "user");
-        assert_eq!(msgs[1]["role"], "assistant");
-        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[0]["role"], "user", "first message must be the user turn");
+        assert_eq!(
+            msgs[1]["role"], "assistant",
+            "second message must be the assistant turn"
+        );
+        assert_eq!(
+            msgs[2]["role"], "user",
+            "merged tool results must form a single user turn"
+        );
 
         let content = msgs[2]["content"].as_array().unwrap();
         assert_eq!(
@@ -1271,8 +1424,14 @@ mod tests {
             2,
             "both toolResult blocks must appear in one content array"
         );
-        assert_eq!(content[0]["toolResult"]["toolUseId"], "c1");
-        assert_eq!(content[1]["toolResult"]["toolUseId"], "c2");
+        assert_eq!(
+            content[0]["toolResult"]["toolUseId"], "c1",
+            "first merged toolResult must keep its source tool_call_id"
+        );
+        assert_eq!(
+            content[1]["toolResult"]["toolUseId"], "c2",
+            "second merged toolResult must keep its source tool_call_id"
+        );
     }
 
     /// `toolResult` blocks must appear in the same order as their source `tool`
@@ -1293,17 +1452,39 @@ mod tests {
             ]}"#,
         );
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(
+            msgs.len(),
+            3,
+            "three turns must remain after merging consecutive tool results"
+        );
+        assert_eq!(msgs[2]["role"], "user", "merged tool results must form a user turn");
 
         let content = msgs[2]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 3);
-        assert_eq!(content[0]["toolResult"]["toolUseId"], "t1");
-        assert_eq!(content[1]["toolResult"]["toolUseId"], "t2");
-        assert_eq!(content[2]["toolResult"]["toolUseId"], "t3");
-        assert_eq!(content[0]["toolResult"]["content"][0]["text"], "first");
-        assert_eq!(content[1]["toolResult"]["content"][0]["text"], "second");
-        assert_eq!(content[2]["toolResult"]["content"][0]["text"], "third");
+        assert_eq!(content.len(), 3, "all three toolResult blocks must be present");
+        assert_eq!(
+            content[0]["toolResult"]["toolUseId"], "t1",
+            "first toolResult must preserve source order"
+        );
+        assert_eq!(
+            content[1]["toolResult"]["toolUseId"], "t2",
+            "second toolResult must preserve source order"
+        );
+        assert_eq!(
+            content[2]["toolResult"]["toolUseId"], "t3",
+            "third toolResult must preserve source order"
+        );
+        assert_eq!(
+            content[0]["toolResult"]["content"][0]["text"], "first",
+            "first toolResult content must be preserved"
+        );
+        assert_eq!(
+            content[1]["toolResult"]["content"][0]["text"], "second",
+            "second toolResult content must be preserved"
+        );
+        assert_eq!(
+            content[2]["toolResult"]["content"][0]["text"], "third",
+            "third toolResult content must be preserved"
+        );
     }
 
     /// Tool results from separate agentic rounds (each preceded by its own
@@ -1328,7 +1509,11 @@ mod tests {
             ]}"#,
         );
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 5);
+        assert_eq!(
+            msgs.len(),
+            5,
+            "tool results from separate agentic rounds must not be merged"
+        );
 
         // Verify strict alternation.
         for (i, expected) in ["user", "assistant", "user", "assistant", "user"].iter().enumerate() {
@@ -1337,12 +1522,26 @@ mod tests {
 
         // Each tool round produces its own user message with exactly one block.
         let first_result = &msgs[2];
-        assert_eq!(first_result["content"].as_array().unwrap().len(), 1);
-        assert_eq!(first_result["content"][0]["toolResult"]["toolUseId"], "x1");
+        assert_eq!(
+            first_result["content"].as_array().unwrap().len(),
+            1,
+            "first round's user turn must hold exactly one toolResult"
+        );
+        assert_eq!(
+            first_result["content"][0]["toolResult"]["toolUseId"], "x1",
+            "first round's toolResult must reference x1"
+        );
 
         let second_result = &msgs[4];
-        assert_eq!(second_result["content"].as_array().unwrap().len(), 1);
-        assert_eq!(second_result["content"][0]["toolResult"]["toolUseId"], "x2");
+        assert_eq!(
+            second_result["content"].as_array().unwrap().len(),
+            1,
+            "second round's user turn must hold exactly one toolResult"
+        );
+        assert_eq!(
+            second_result["content"][0]["toolResult"]["toolUseId"], "x2",
+            "second round's toolResult must reference x2"
+        );
     }
 
     // ── Inference config ──────────────────────────────────────────────────
@@ -1350,7 +1549,10 @@ mod tests {
     #[test]
     fn max_tokens_maps_to_max_tokens() {
         let body = translate(r#"{"model":"m","max_tokens":512,"messages":[{"role":"user","content":"hi"}]}"#);
-        assert_eq!(body["inferenceConfig"]["maxTokens"], 512);
+        assert_eq!(
+            body["inferenceConfig"]["maxTokens"], 512,
+            "max_tokens must map to inferenceConfig.maxTokens"
+        );
     }
 
     #[test]
@@ -1358,21 +1560,30 @@ mod tests {
         let body =
             translate(r#"{"model":"m","temperature":0.7,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}"#);
         let cfg = &body["inferenceConfig"];
-        assert!((cfg["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-9);
-        assert!((cfg["topP"].as_f64().unwrap() - 0.9).abs() < 1e-9);
+        assert!(
+            (cfg["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-9,
+            "temperature must map to inferenceConfig.temperature"
+        );
+        assert!(
+            (cfg["topP"].as_f64().unwrap() - 0.9).abs() < 1e-9,
+            "top_p must map to inferenceConfig.topP"
+        );
     }
 
     #[test]
     fn stop_string_wrapped_in_array() {
         let body = translate(r#"{"model":"m","stop":"\n\n","messages":[{"role":"user","content":"hi"}]}"#);
-        assert_eq!(body["inferenceConfig"]["stopSequences"][0], "\n\n");
+        assert_eq!(
+            body["inferenceConfig"]["stopSequences"][0], "\n\n",
+            "a string `stop` must be wrapped in a stopSequences array"
+        );
     }
 
     #[test]
     fn stop_array_preserved() {
         let body = translate(r#"{"model":"m","stop":["END","STOP"],"messages":[{"role":"user","content":"hi"}]}"#);
         let seqs = body["inferenceConfig"]["stopSequences"].as_array().unwrap();
-        assert_eq!(seqs.len(), 2);
+        assert_eq!(seqs.len(), 2, "all `stop` array entries must be preserved");
     }
 
     #[test]
@@ -1397,9 +1608,18 @@ mod tests {
             }}]}"#,
         );
         let spec = &body["toolConfig"]["tools"][0]["toolSpec"];
-        assert_eq!(spec["name"], "get_weather");
-        assert_eq!(spec["description"], "Get weather");
-        assert_eq!(spec["inputSchema"]["json"]["type"], "object");
+        assert_eq!(
+            spec["name"], "get_weather",
+            "tool function name must map to toolSpec.name"
+        );
+        assert_eq!(
+            spec["description"], "Get weather",
+            "tool description must map to toolSpec.description"
+        );
+        assert_eq!(
+            spec["inputSchema"]["json"]["type"], "object",
+            "tool parameters must map to toolSpec.inputSchema.json"
+        );
     }
 
     #[test]
@@ -1409,7 +1629,10 @@ mod tests {
             "tools":[{"type":"function","function":{"name":"f","parameters":{}}}]}"#,
         );
         let spec = &body["toolConfig"]["tools"][0]["toolSpec"];
-        assert!(spec.get("description").is_none());
+        assert!(
+            spec.get("description").is_none(),
+            "a tool without a description must omit toolSpec.description"
+        );
     }
 
     #[test]
@@ -1420,7 +1643,10 @@ mod tests {
                 "name":"f","strict":true,"parameters":{"type":"object","additionalProperties":false}
             }}]}"#,
         );
-        assert_eq!(body["toolConfig"]["tools"][0]["toolSpec"]["strict"], true);
+        assert_eq!(
+            body["toolConfig"]["tools"][0]["toolSpec"]["strict"], true,
+            "the strict flag must be preserved on toolSpec"
+        );
     }
 
     #[test]
@@ -1430,7 +1656,10 @@ mod tests {
             "tools":[{"type":"function","function":{"name":"f","parameters":{}}}],
             "tool_choice":"auto"}"#,
         );
-        assert!(body["toolConfig"]["toolChoice"]["auto"].is_object());
+        assert!(
+            body["toolConfig"]["toolChoice"]["auto"].is_object(),
+            "tool_choice `auto` must emit a toolChoice.auto object"
+        );
     }
 
     #[test]
@@ -1440,7 +1669,10 @@ mod tests {
             "tools":[{"type":"function","function":{"name":"f","parameters":{}}}],
             "tool_choice":"required"}"#,
         );
-        assert!(body["toolConfig"]["toolChoice"]["any"].is_object());
+        assert!(
+            body["toolConfig"]["toolChoice"]["any"].is_object(),
+            "tool_choice `required` must emit a toolChoice.any object"
+        );
     }
 
     #[test]
@@ -1450,7 +1682,10 @@ mod tests {
             "tools":[{"type":"function","function":{"name":"f","parameters":{}}}],
             "tool_choice":"none"}"#,
         );
-        assert!(body.get("toolConfig").is_none());
+        assert!(
+            body.get("toolConfig").is_none(),
+            "tool_choice `none` must omit the entire toolConfig"
+        );
     }
 
     #[test]
@@ -1460,13 +1695,19 @@ mod tests {
             "tools":[{"type":"function","function":{"name":"f","parameters":{}}}],
             "tool_choice":{"type":"function","function":{"name":"f"}}}"#,
         );
-        assert_eq!(body["toolConfig"]["toolChoice"]["tool"]["name"], "f");
+        assert_eq!(
+            body["toolConfig"]["toolChoice"]["tool"]["name"], "f",
+            "a specific function tool_choice must map to toolChoice.tool.name"
+        );
     }
 
     #[test]
     fn no_tools_omits_tool_config() {
         let body = translate(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
-        assert!(body.get("toolConfig").is_none());
+        assert!(
+            body.get("toolConfig").is_none(),
+            "toolConfig must be omitted when no tools are defined"
+        );
     }
 
     // ── Edge cases ─────────────────────────────────────────────────────────
@@ -1474,18 +1715,28 @@ mod tests {
     #[test]
     fn invalid_json_returns_error() {
         let err = transform_request(b"not json").unwrap_err();
-        assert!(err.contains("invalid JSON"));
+        assert!(
+            err.contains("invalid JSON"),
+            "invalid JSON input must be reported as such: {err}"
+        );
     }
 
     #[test]
     fn non_object_body_returns_error() {
         let err = transform_request(b"[1,2,3]").unwrap_err();
-        assert!(err.contains("not a JSON object"));
+        assert!(
+            err.contains("not a JSON object"),
+            "a non-object request body must be rejected: {err}"
+        );
     }
 
     #[test]
     fn empty_messages_produces_empty_array() {
         let body = translate(r#"{"model":"m","messages":[]}"#);
-        assert_eq!(body["messages"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            body["messages"].as_array().unwrap().len(),
+            0,
+            "an empty messages input must produce an empty messages array"
+        );
     }
 }

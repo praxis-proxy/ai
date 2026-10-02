@@ -141,9 +141,18 @@ mod tests {
         let body = build_openai_error_body("bad model", "invalid_request_error", "model_not_found");
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(parsed["error"]["message"], "bad model");
-        assert_eq!(parsed["error"]["type"], "invalid_request_error");
-        assert_eq!(parsed["error"]["code"], "model_not_found");
+        assert_eq!(
+            parsed["error"]["message"], "bad model",
+            "error envelope must carry the provided message"
+        );
+        assert_eq!(
+            parsed["error"]["type"], "invalid_request_error",
+            "error envelope must carry the provided type"
+        );
+        assert_eq!(
+            parsed["error"]["code"], "model_not_found",
+            "error envelope must carry the provided code"
+        );
     }
 
     #[test]
@@ -151,7 +160,10 @@ mod tests {
         let body = build_openai_error_body("bad \"model\"\nnewline", "invalid_request_error", "invalid_request");
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        assert_eq!(parsed["error"]["message"], "bad \"model\"\nnewline");
+        assert_eq!(
+            parsed["error"]["message"], "bad \"model\"\nnewline",
+            "special characters in the message must round-trip through JSON encoding"
+        );
     }
 
     // --- normalize_error_response ---
@@ -162,9 +174,18 @@ mod tests {
         let result = normalize_error_response(body, StatusCode::BAD_REQUEST);
         let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
-        assert_eq!(parsed["error"]["message"], "The input fails to satisfy the constraints");
-        assert_eq!(parsed["error"]["type"], "invalid_request_error");
-        assert_eq!(parsed["error"]["code"], "invalid_request");
+        assert_eq!(
+            parsed["error"]["message"], "The input fails to satisfy the constraints",
+            "Bedrock message must be preserved in the normalized envelope"
+        );
+        assert_eq!(
+            parsed["error"]["type"], "invalid_request_error",
+            "HTTP 400 must map to invalid_request_error"
+        );
+        assert_eq!(
+            parsed["error"]["code"], "invalid_request",
+            "HTTP 400 must map to the invalid_request code"
+        );
     }
 
     #[test]
@@ -173,8 +194,14 @@ mod tests {
         let result = normalize_error_response(body, StatusCode::TOO_MANY_REQUESTS);
         let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
-        assert_eq!(parsed["error"]["type"], "rate_limit_error");
-        assert_eq!(parsed["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(
+            parsed["error"]["type"], "rate_limit_error",
+            "HTTP 429 must map to rate_limit_error"
+        );
+        assert_eq!(
+            parsed["error"]["code"], "rate_limit_exceeded",
+            "HTTP 429 must map to the rate_limit_exceeded code"
+        );
     }
 
     #[test]
@@ -183,8 +210,14 @@ mod tests {
         let result = normalize_error_response(body, StatusCode::FORBIDDEN);
         let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
-        assert_eq!(parsed["error"]["type"], "invalid_request_error");
-        assert_eq!(parsed["error"]["code"], "access_denied");
+        assert_eq!(
+            parsed["error"]["type"], "invalid_request_error",
+            "HTTP 403 must map to invalid_request_error"
+        );
+        assert_eq!(
+            parsed["error"]["code"], "access_denied",
+            "HTTP 403 must map to the access_denied code"
+        );
     }
 
     #[test]
@@ -193,8 +226,14 @@ mod tests {
         let result = normalize_error_response(body, StatusCode::NOT_FOUND);
         let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
-        assert_eq!(parsed["error"]["type"], "invalid_request_error");
-        assert_eq!(parsed["error"]["code"], "model_not_found");
+        assert_eq!(
+            parsed["error"]["type"], "invalid_request_error",
+            "HTTP 404 must map to invalid_request_error"
+        );
+        assert_eq!(
+            parsed["error"]["code"], "model_not_found",
+            "HTTP 404 must map to the model_not_found code"
+        );
     }
 
     #[test]
@@ -203,8 +242,14 @@ mod tests {
         let result = normalize_error_response(body, StatusCode::from_u16(424).unwrap());
         let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
-        assert_eq!(parsed["error"]["type"], "server_error");
-        assert_eq!(parsed["error"]["code"], "model_error");
+        assert_eq!(
+            parsed["error"]["type"], "server_error",
+            "HTTP 424 must map to server_error"
+        );
+        assert_eq!(
+            parsed["error"]["code"], "model_error",
+            "HTTP 424 must map to the model_error code"
+        );
     }
 
     #[test]
@@ -213,8 +258,14 @@ mod tests {
         let result = normalize_error_response(body, StatusCode::REQUEST_TIMEOUT);
         let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
-        assert_eq!(parsed["error"]["type"], "server_error");
-        assert_eq!(parsed["error"]["code"], "timeout");
+        assert_eq!(
+            parsed["error"]["type"], "server_error",
+            "HTTP 408 must map to server_error"
+        );
+        assert_eq!(
+            parsed["error"]["code"], "timeout",
+            "HTTP 408 must map to the timeout code"
+        );
     }
 
     #[test]
@@ -223,8 +274,14 @@ mod tests {
         let result = normalize_error_response(body, StatusCode::SERVICE_UNAVAILABLE);
         let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
-        assert_eq!(parsed["error"]["type"], "server_error");
-        assert_eq!(parsed["error"]["code"], "service_unavailable");
+        assert_eq!(
+            parsed["error"]["type"], "server_error",
+            "HTTP 503 must map to server_error"
+        );
+        assert_eq!(
+            parsed["error"]["code"], "service_unavailable",
+            "HTTP 503 must map to the service_unavailable code"
+        );
     }
 
     #[test]
@@ -233,8 +290,14 @@ mod tests {
         let result = normalize_error_response(body, StatusCode::INTERNAL_SERVER_ERROR);
         let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
-        assert_eq!(parsed["error"]["type"], "server_error");
-        assert_eq!(parsed["error"]["code"], "internal_error");
+        assert_eq!(
+            parsed["error"]["type"], "server_error",
+            "HTTP 500 must map to server_error"
+        );
+        assert_eq!(
+            parsed["error"]["code"], "internal_error",
+            "HTTP 500 must map to the internal_error code"
+        );
     }
 
     #[test]
@@ -243,8 +306,14 @@ mod tests {
         let result = normalize_error_response(body, StatusCode::BAD_REQUEST);
         let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
-        assert_eq!(parsed["error"]["message"], "Bedrock returned HTTP 400 Bad Request");
-        assert_eq!(parsed["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            parsed["error"]["message"], "Bedrock returned HTTP 400 Bad Request",
+            "an unparseable body must fall back to a status-derived message"
+        );
+        assert_eq!(
+            parsed["error"]["type"], "invalid_request_error",
+            "status mapping must still apply when the body is unparseable"
+        );
     }
 
     #[test]
@@ -253,8 +322,14 @@ mod tests {
         let result = normalize_error_response(body, StatusCode::FORBIDDEN);
         let parsed: serde_json::Value = serde_json::from_slice(&result).unwrap();
 
-        assert_eq!(parsed["error"]["message"], "Bedrock returned HTTP 403 Forbidden");
-        assert_eq!(parsed["error"]["code"], "access_denied");
+        assert_eq!(
+            parsed["error"]["message"], "Bedrock returned HTTP 403 Forbidden",
+            "an empty message must fall back to a status-derived message"
+        );
+        assert_eq!(
+            parsed["error"]["code"], "access_denied",
+            "status mapping must still apply when the message is empty"
+        );
     }
 
     // --- openai_mapping_for_http_status ---
@@ -262,14 +337,23 @@ mod tests {
     #[test]
     fn unknown_4xx_maps_to_invalid_request() {
         let (t, c) = openai_mapping_for_http_status(StatusCode::GONE);
-        assert_eq!(t, "invalid_request_error");
-        assert_eq!(c, "invalid_request");
+        assert_eq!(
+            t, "invalid_request_error",
+            "an unmapped 4xx must default to invalid_request_error"
+        );
+        assert_eq!(
+            c, "invalid_request",
+            "an unmapped 4xx must default to the invalid_request code"
+        );
     }
 
     #[test]
     fn unknown_5xx_maps_to_server_error() {
         let (t, c) = openai_mapping_for_http_status(StatusCode::BAD_GATEWAY);
-        assert_eq!(t, "server_error");
-        assert_eq!(c, "internal_error");
+        assert_eq!(t, "server_error", "an unmapped 5xx must default to server_error");
+        assert_eq!(
+            c, "internal_error",
+            "an unmapped 5xx must default to the internal_error code"
+        );
     }
 }

@@ -476,7 +476,9 @@ def test_store_url_survives_endpoint_rewrites(writer, args, postgres_port, monke
     try:
         with open(path) as config_file:
             config = config_file.read()
-        assert f'database_url: "{database_url}"' in config
+        assert f'database_url: "{database_url}"' in config, (
+            "endpoint rewrites must not clobber the store database_url"
+        )
     finally:
         os.unlink(path)
 
@@ -2829,7 +2831,7 @@ class TestOpenAIResponsesVLLM:
             store=True,
         )
 
-        assert second.status == "completed"
+        assert second.status == "completed", "the continuation after provider compaction must complete"
         assert len(forwarded) == 2, forwarded
         replayed = forwarded[1]
         assert replayed.get("previous_response_id") is None, replayed
@@ -3357,8 +3359,8 @@ class TestOpenAIResponsesVLLM:
             background=True,
             store=True,
         )
-        assert queued.status == "queued"
-        assert queued.background is True
+        assert queued.status == "queued", "a background create must come back queued"
+        assert queued.background is True, "the queued response must stay flagged background"
 
         stream = client.responses.create(
             model="gpt-5",
@@ -3371,26 +3373,28 @@ class TestOpenAIResponsesVLLM:
         assert [event.type for event in events] == [
             "response.created",
             "response.completed",
-        ]
+        ], "the streamed background create must emit created then completed"
         streamed = events[-1].response
-        assert streamed.status == "completed"
-        assert streamed.background is True
+        assert streamed.status == "completed", "the streamed background response must complete"
+        assert streamed.background is True, "the streamed response must stay flagged background"
 
         background_creates = [
             body
             for body in forwarded
             if body.get("background") is True and body.get("model") == "gpt-5"
         ]
-        assert len(background_creates) == 2
+        assert len(background_creates) == 2, "both background creates must reach the backend"
         assert [body.get("input") for body in background_creates] == [
             "SDK finite background passthrough",
             "SDK streaming background passthrough",
-        ]
-        assert all(body.get("store") is True for body in background_creates)
+        ], "the backend must receive both inputs in order"
+        assert all(
+            body.get("store") is True for body in background_creates
+        ), "both background creates must preserve store=True"
         assert {body.get("stream", False) for body in background_creates} == {
             False,
             True,
-        }
+        }, "the backend must see one finite and one streaming create"
 
     @pytest.mark.critical_vllm
     @requires_real_inference
@@ -4091,14 +4095,14 @@ class TestResponsesToChatCompletionsVLLM:
                 ],
                 store=False,
             )
-            assert response.status == "completed"
+            assert response.status == "completed", "lowering text parts must still complete"
             assert forwarded[-1]["messages"][1] == {
                 "role": "tool",
                 "tool_call_id": "call_1",
                 "content": expected,
-            }
+            }, "text parts must lower to tool text in the Chat request"
 
-        assert len(forwarded) == 2
+        assert len(forwarded) == 2, "each output variant must produce one Chat request"
 
     def test_function_call_output_unsupported_shapes_stop_before_backend(
         self, reasoning_capture_client

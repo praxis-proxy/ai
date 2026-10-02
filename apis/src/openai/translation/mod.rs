@@ -1968,7 +1968,10 @@ mod tests {
             ]
         }));
 
-        assert_eq!(mapped["messages"][1]["content"], "result");
+        assert_eq!(
+            mapped["messages"][1]["content"], "result",
+            "string function_call_output must pass through unchanged as tool content"
+        );
     }
 
     #[test]
@@ -1990,7 +1993,8 @@ mod tests {
                 "role": "tool",
                 "tool_call_id": "c1",
                 "content": "first result"
-            })
+            }),
+            "input_text output parts must concatenate into a single tool message content"
         );
     }
 
@@ -2003,7 +2007,8 @@ mod tests {
             }));
             assert_eq!(
                 error,
-                "Responses function_call_output input item field `output` must be a string or array of input_text parts"
+                "Responses function_call_output input item field `output` must be a string or array of input_text parts",
+                "non-string, non-array `output` must fail closed: {output}"
             );
         }
 
@@ -2030,7 +2035,8 @@ mod tests {
             }));
             assert_eq!(
                 error,
-                format!("unsupported Responses function_call_output part for Chat Completions translation: {reason}")
+                format!("unsupported Responses function_call_output part for Chat Completions translation: {reason}"),
+                "unsupported output part must fail closed: {output}"
             );
         }
     }

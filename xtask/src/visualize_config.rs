@@ -370,8 +370,16 @@ mod tests {
         let empty = BTreeMap::new();
         let model = build_model("min", &graph, &empty);
         let node = find_filter(&model, "c", "trace_context").expect("filter present");
-        assert_eq!(node.get("known").and_then(Json::as_bool), Some(false));
-        assert_eq!(node.get("description"), Some(&Json::Null));
+        assert_eq!(
+            node.get("known").and_then(Json::as_bool),
+            Some(false),
+            "a filter with no repo-defined description must be marked unknown"
+        );
+        assert_eq!(
+            node.get("description"),
+            Some(&Json::Null),
+            "an unknown filter must not carry a fabricated description"
+        );
         assert!(node.get("config").is_some(), "raw config is still surfaced");
     }
 
@@ -383,10 +391,26 @@ mod tests {
             "endpoints": ["10.0.0.1:80"],
         });
         let out = redact(&input);
-        assert_eq!(out.get("authorization"), Some(&Json::String(REDACTED.to_owned())));
-        assert_eq!(out.pointer("/nested/api_key"), Some(&Json::String(REDACTED.to_owned())));
-        assert_eq!(out.pointer("/nested/timeout_ms").and_then(Json::as_u64), Some(5000));
-        assert_eq!(out.pointer("/endpoints/0").and_then(Json::as_str), Some("10.0.0.1:80"));
+        assert_eq!(
+            out.get("authorization"),
+            Some(&Json::String(REDACTED.to_owned())),
+            "sensitive `authorization` value must be redacted"
+        );
+        assert_eq!(
+            out.pointer("/nested/api_key"),
+            Some(&Json::String(REDACTED.to_owned())),
+            "sensitive `api_key` must be redacted even when nested"
+        );
+        assert_eq!(
+            out.pointer("/nested/timeout_ms").and_then(Json::as_u64),
+            Some(5000),
+            "non-sensitive `timeout_ms` knob must survive redaction"
+        );
+        assert_eq!(
+            out.pointer("/endpoints/0").and_then(Json::as_str),
+            Some("10.0.0.1:80"),
+            "non-sensitive `endpoints` value must survive redaction"
+        );
     }
 
     #[test]

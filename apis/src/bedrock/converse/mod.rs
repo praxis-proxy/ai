@@ -547,6 +547,7 @@ fn response_id_seed() -> u128 {
     clippy::unwrap_used,
     clippy::indexing_slicing,
     clippy::panic,
+    clippy::too_many_lines,
     unused_must_use,
     reason = "tests"
 )]
@@ -591,13 +592,13 @@ mod tests {
     fn default_config_parses() {
         let yaml: serde_yaml::Value = serde_yaml::from_str("{}").unwrap();
         let filter = OpenaiChatCompletionsToBedrockConverseFilter::from_config(&yaml).unwrap();
-        assert_eq!(filter.name(), FILTER_NAME);
+        assert_eq!(filter.name(), FILTER_NAME, "filter must report its registered name");
     }
 
     #[test]
     fn name_matches_filter_name_constant() {
         let filter = make_filter("{}");
-        assert_eq!(filter.name(), FILTER_NAME);
+        assert_eq!(filter.name(), FILTER_NAME, "filter must report its registered name");
     }
 
     // ── on_request ────────────────────────────────────────────────────────
@@ -668,7 +669,11 @@ mod tests {
             Some("/model/anthropic.claude-3-sonnet-20240229-v1:0/converse-stream"),
             "streaming path must end in /converse-stream"
         );
-        assert_eq!(ctx.get_metadata(INCLUDE_USAGE_KEY), Some("true"));
+        assert_eq!(
+            ctx.get_metadata(INCLUDE_USAGE_KEY),
+            Some("true"),
+            "stream_options.include_usage opt-in must be persisted for the response phase"
+        );
     }
 
     #[tokio::test]
@@ -695,10 +700,16 @@ mod tests {
         let FilterAction::Reject(rejection) = action else {
             panic!("malformed input must be rejected");
         };
-        assert_eq!(rejection.status, 400);
-        assert!(rejection.preserve_keepalive);
+        assert_eq!(rejection.status, 400, "malformed JSON must be rejected with 400");
+        assert!(
+            rejection.preserve_keepalive,
+            "rejection must preserve keepalive so the connection is reused"
+        );
         let error: Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
-        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            error["error"]["type"], "invalid_request_error",
+            "malformed input must surface an OpenAI invalid_request_error"
+        );
     }
 
     #[tokio::test]
@@ -710,7 +721,10 @@ mod tests {
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
 
-        assert!(matches!(action, FilterAction::Reject(r) if r.status == 400));
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 400),
+            "path-traversal model must be rejected with 400"
+        );
         assert!(
             ctx.rewritten_path.is_none(),
             "invalid model must not set an upstream path"
@@ -732,11 +746,20 @@ mod tests {
         let FilterAction::Reject(rejection) = action else {
             panic!("unsupported request semantics must be rejected");
         };
-        assert_eq!(rejection.status, 400);
+        assert_eq!(rejection.status, 400, "unsupported field must be rejected with 400");
         let error: Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
-        assert_eq!(error["error"]["type"], "invalid_request_error");
-        assert_eq!(error["error"]["code"], "invalid_request");
-        assert!(error["error"]["message"].as_str().unwrap().contains("`n`"));
+        assert_eq!(
+            error["error"]["type"], "invalid_request_error",
+            "unsupported field must surface an OpenAI invalid_request_error"
+        );
+        assert_eq!(
+            error["error"]["code"], "invalid_request",
+            "error envelope must carry the invalid_request code"
+        );
+        assert!(
+            error["error"]["message"].as_str().unwrap().contains("`n`"),
+            "error message must name the unsupported `n` field"
+        );
     }
 
     #[tokio::test]
@@ -747,7 +770,10 @@ mod tests {
         let mut body = None;
 
         let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
-        assert!(matches!(action, FilterAction::Reject(r) if r.status == 400));
+        assert!(
+            matches!(action, FilterAction::Reject(r) if r.status == 400),
+            "empty request body must be rejected with 400"
+        );
     }
 
     // ── on_response — error ───────────────────────────────────────────────
@@ -765,8 +791,16 @@ mod tests {
 
         filter.on_response(&mut ctx).await.unwrap();
 
-        assert_eq!(ctx.get_metadata(RESPONSE_PATH_KEY), Some(RESPONSE_PATH_ERROR));
-        assert_eq!(ctx.get_metadata(RESPONSE_STATUS_KEY), Some("429"));
+        assert_eq!(
+            ctx.get_metadata(RESPONSE_PATH_KEY),
+            Some(RESPONSE_PATH_ERROR),
+            "non-2xx status must select the error response path"
+        );
+        assert_eq!(
+            ctx.get_metadata(RESPONSE_STATUS_KEY),
+            Some("429"),
+            "upstream status must be saved for error-body normalization"
+        );
     }
 
     // ── on_response_body — error ──────────────────────────────────────────
@@ -784,12 +818,16 @@ mod tests {
         filter.on_response_body(&mut ctx, &mut body, true).unwrap();
 
         let result: Value = serde_json::from_slice(&body.unwrap()).unwrap();
-        assert_eq!(result["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            result["error"]["type"], "invalid_request_error",
+            "400 Bedrock error must map to invalid_request_error"
+        );
         assert!(
             result["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("Invalid model identifier")
+                .contains("Invalid model identifier"),
+            "normalized error must preserve the Bedrock message text"
         );
     }
 
@@ -805,7 +843,11 @@ mod tests {
         filter.on_response_body(&mut ctx, &mut body, false).unwrap();
 
         // Body must be untouched while waiting for the full buffer.
-        assert_eq!(body.as_deref(), Some(b"partial".as_ref()));
+        assert_eq!(
+            body.as_deref(),
+            Some(b"partial".as_ref()),
+            "body must be left untouched until the full buffer arrives"
+        );
     }
 
     // ── on_response_body — non-streaming success ──────────────────────────
@@ -833,10 +875,22 @@ mod tests {
         filter.on_response_body(&mut ctx, &mut body, true).unwrap();
 
         let result: Value = serde_json::from_slice(&body.unwrap()).unwrap();
-        assert_eq!(result["id"], "chatcmpl-test");
-        assert_eq!(result["object"], "chat.completion");
-        assert_eq!(result["choices"][0]["message"]["content"], "Hello!");
-        assert_eq!(result["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            result["id"], "chatcmpl-test",
+            "translated response must carry the synthetic response id"
+        );
+        assert_eq!(
+            result["object"], "chat.completion",
+            "translated response must be a chat.completion object"
+        );
+        assert_eq!(
+            result["choices"][0]["message"]["content"], "Hello!",
+            "assistant text content must survive translation"
+        );
+        assert_eq!(
+            result["choices"][0]["finish_reason"], "stop",
+            "Bedrock end_turn must map to finish_reason stop"
+        );
     }
 
     #[test]
@@ -850,7 +904,10 @@ mod tests {
         let mut body = Some(Bytes::from_static(b"{}"));
         let error = filter.on_response_body(&mut ctx, &mut body, true).unwrap_err();
 
-        assert!(error.to_string().contains("response translation failed"));
+        assert!(
+            error.to_string().contains("response translation failed"),
+            "malformed Bedrock response must fail with a translation error"
+        );
     }
 
     // ── on_response_body — streaming ──────────────────────────────────────
@@ -928,8 +985,14 @@ mod tests {
 
             let output = body.unwrap();
             let text = std::str::from_utf8(&output).unwrap();
-            assert!(!text.contains("\"usage\""));
-            assert!(text.ends_with("data: [DONE]\n\n"));
+            assert!(
+                !text.contains("\"usage\""),
+                "usage must be suppressed without stream_options.include_usage"
+            );
+            assert!(
+                text.ends_with("data: [DONE]\n\n"),
+                "stream must still terminate with the [DONE] sentinel"
+            );
         }
     }
 
@@ -965,7 +1028,10 @@ mod tests {
         let out2 = body2.unwrap();
         let text2 = std::str::from_utf8(&out2).unwrap();
         assert!(text2.contains("Hello"), "completed frame must appear in second chunk");
-        assert!(text2.ends_with("data: [DONE]\n\n"));
+        assert!(
+            text2.ends_with("data: [DONE]\n\n"),
+            "completed stream must terminate with the [DONE] sentinel"
+        );
     }
 
     #[test]
@@ -981,8 +1047,14 @@ mod tests {
         filter.on_response_body(&mut ctx, &mut body, true).unwrap();
 
         let text = std::str::from_utf8(body.as_deref().unwrap()).unwrap();
-        assert!(text.contains("incomplete_stream"));
-        assert!(!text.contains("[DONE]"));
+        assert!(
+            text.contains("incomplete_stream"),
+            "truncated stream must emit an incomplete_stream error"
+        );
+        assert!(
+            !text.contains("[DONE]"),
+            "a failed stream must not emit the [DONE] sentinel"
+        );
     }
 
     #[test]
@@ -1000,8 +1072,14 @@ mod tests {
         filter.on_response_body(&mut ctx, &mut body, true).unwrap();
 
         let text = std::str::from_utf8(body.as_deref().unwrap()).unwrap();
-        assert!(text.contains("stream_decode_error"));
-        assert!(!text.contains("[DONE]"));
+        assert!(
+            text.contains("stream_decode_error"),
+            "corrupt frame must emit a stream_decode_error"
+        );
+        assert!(
+            !text.contains("[DONE]"),
+            "a failed stream must not emit the [DONE] sentinel"
+        );
     }
 
     #[test]
@@ -1016,7 +1094,13 @@ mod tests {
         filter.on_response_body(&mut ctx, &mut body, true).unwrap();
 
         let text = std::str::from_utf8(body.as_deref().unwrap()).unwrap();
-        assert!(text.contains("stream_translation_error"));
-        assert!(!text.contains("[DONE]"));
+        assert!(
+            text.contains("stream_translation_error"),
+            "malformed event payload must emit a stream_translation_error"
+        );
+        assert!(
+            !text.contains("[DONE]"),
+            "a failed stream must not emit the [DONE] sentinel"
+        );
     }
 }

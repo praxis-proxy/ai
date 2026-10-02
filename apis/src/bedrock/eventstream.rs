@@ -620,9 +620,20 @@ mod tests {
         dec.push(&raw);
         let msg = dec.decode().unwrap().expect("must yield a message");
 
-        assert_eq!(msg.event_type(), Some("messageStart"));
-        assert_eq!(msg.message_type(), Some("event"));
-        assert_eq!(&*msg.payload, payload);
+        assert_eq!(
+            msg.event_type(),
+            Some("messageStart"),
+            "decoded :event-type must round-trip from the built frame"
+        );
+        assert_eq!(
+            msg.message_type(),
+            Some("event"),
+            "decoded :message-type must round-trip from the built frame"
+        );
+        assert_eq!(
+            &*msg.payload, payload,
+            "decoded payload must match the bytes passed to build_frame"
+        );
     }
 
     // ── Single frame ───────────────────────────────────────────────────────
@@ -636,8 +647,15 @@ mod tests {
         dec.push(&raw);
         let msg = dec.decode().unwrap().unwrap();
 
-        assert_eq!(msg.event_type(), Some("contentBlockDelta"));
-        assert_eq!(&*msg.payload, payload);
+        assert_eq!(
+            msg.event_type(),
+            Some("contentBlockDelta"),
+            "decoded :event-type must be contentBlockDelta"
+        );
+        assert_eq!(
+            &*msg.payload, payload,
+            "contentBlockDelta payload must round-trip unchanged"
+        );
     }
 
     #[test]
@@ -649,7 +667,11 @@ mod tests {
         dec.push(&raw);
         let msg = dec.decode().unwrap().unwrap();
 
-        assert_eq!(msg.event_type(), Some("messageStop"));
+        assert_eq!(
+            msg.event_type(),
+            Some("messageStop"),
+            "decoded :event-type must be messageStop"
+        );
     }
 
     #[test]
@@ -661,14 +683,20 @@ mod tests {
         prelude.extend_from_slice(&crc32fast::hash(&prelude).to_be_bytes());
         dec.push(&prelude);
 
-        assert!(matches!(
-            dec.decode(),
-            Err(DecodeError::FrameTooLarge {
-                total_len: 65,
-                max_frame_len: 64
-            })
-        ));
-        assert!(dec.is_empty());
+        assert!(
+            matches!(
+                dec.decode(),
+                Err(DecodeError::FrameTooLarge {
+                    total_len: 65,
+                    max_frame_len: 64
+                })
+            ),
+            "a declared frame larger than max_frame_len must be rejected with FrameTooLarge"
+        );
+        assert!(
+            dec.is_empty(),
+            "buffer must be cleared after rejecting an oversized frame"
+        );
     }
 
     #[test]
@@ -679,8 +707,15 @@ mod tests {
         dec.push(&raw);
         let msg = dec.decode().unwrap().unwrap();
 
-        assert_eq!(msg.event_type(), Some("contentBlockStop"));
-        assert!(msg.payload.is_empty());
+        assert_eq!(
+            msg.event_type(),
+            Some("contentBlockStop"),
+            "decoded :event-type must be contentBlockStop"
+        );
+        assert!(
+            msg.payload.is_empty(),
+            "a frame built with an empty payload must decode to an empty payload"
+        );
     }
 
     #[test]
@@ -692,9 +727,16 @@ mod tests {
         dec.push(&raw);
         let msg = dec.decode().unwrap().unwrap();
 
-        assert!(msg.is_exception());
-        assert_eq!(msg.header_str(":exception-type"), Some("throttlingException"));
-        assert_eq!(&*msg.payload, payload);
+        assert!(
+            msg.is_exception(),
+            "a frame with :message-type exception must report is_exception()"
+        );
+        assert_eq!(
+            msg.header_str(":exception-type"),
+            Some("throttlingException"),
+            "decoded :exception-type header must match the built frame"
+        );
+        assert_eq!(&*msg.payload, payload, "exception payload must round-trip unchanged");
     }
 
     // ── Multiple frames ────────────────────────────────────────────────────
@@ -714,10 +756,22 @@ mod tests {
         dec.push(&all);
         let msgs = dec.decode_all().unwrap();
 
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[0].event_type(), Some("messageStart"));
-        assert_eq!(msgs[1].event_type(), Some("contentBlockDelta"));
-        assert_eq!(msgs[2].event_type(), Some("messageStop"));
+        assert_eq!(msgs.len(), 3, "decode_all must return all three concatenated frames");
+        assert_eq!(
+            msgs[0].event_type(),
+            Some("messageStart"),
+            "first decoded frame must be messageStart"
+        );
+        assert_eq!(
+            msgs[1].event_type(),
+            Some("contentBlockDelta"),
+            "second decoded frame must be contentBlockDelta"
+        );
+        assert_eq!(
+            msgs[2].event_type(),
+            Some("messageStop"),
+            "third decoded frame must be messageStop"
+        );
     }
 
     #[test]
@@ -729,7 +783,7 @@ mod tests {
         let mut dec = EventStreamDecoder::new();
         dec.push(&buf);
         let msgs = dec.decode_all().unwrap();
-        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs.len(), 2, "both frames in a single contiguous push must decode");
     }
 
     // ── Partial / split chunks ─────────────────────────────────────────────
@@ -750,7 +804,11 @@ mod tests {
         // Feed the last byte — now the frame is complete.
         dec.push(&raw[raw.len() - 1..]);
         let msg = dec.decode().unwrap().expect("must decode after final byte");
-        assert_eq!(msg.event_type(), Some("messageStart"));
+        assert_eq!(
+            msg.event_type(),
+            Some("messageStart"),
+            "a frame fed one byte at a time must decode to messageStart"
+        );
     }
 
     #[test]
@@ -764,7 +822,11 @@ mod tests {
 
         dec.push(&raw[mid..]);
         let msg = dec.decode().unwrap().expect("must decode after second half");
-        assert_eq!(msg.event_type(), Some("contentBlockDelta"));
+        assert_eq!(
+            msg.event_type(),
+            Some("contentBlockDelta"),
+            "a frame split at its midpoint must decode to contentBlockDelta"
+        );
     }
 
     #[test]
@@ -778,16 +840,27 @@ mod tests {
 
         // Deliver first frame completely.
         let m1 = dec.decode().unwrap().expect("first frame");
-        assert_eq!(m1.event_type(), Some("messageStart"));
+        assert_eq!(
+            m1.event_type(),
+            Some("messageStart"),
+            "first delivered frame must be messageStart"
+        );
 
         // Deliver second frame split in two.
         let mid = f2.len() / 2;
         dec.push(&f2[..mid]);
-        assert!(dec.decode().unwrap().is_none());
+        assert!(
+            dec.decode().unwrap().is_none(),
+            "a partial second frame must not decode until all bytes arrive"
+        );
 
         dec.push(&f2[mid..]);
         let m2 = dec.decode().unwrap().expect("second frame");
-        assert_eq!(m2.event_type(), Some("messageStop"));
+        assert_eq!(
+            m2.event_type(),
+            Some("messageStop"),
+            "second delivered frame must be messageStop"
+        );
     }
 
     // ── Error cases ────────────────────────────────────────────────────────
@@ -843,7 +916,10 @@ mod tests {
     fn insufficient_bytes_returns_none() {
         let mut dec = EventStreamDecoder::new();
         dec.push(&[0x00, 0x00, 0x00]); // only 3 bytes, prelude is 12
-        assert!(dec.decode().unwrap().is_none());
+        assert!(
+            dec.decode().unwrap().is_none(),
+            "fewer bytes than the 12-byte prelude must yield None"
+        );
     }
 
     // ── Payload integrity ─────────────────────────────────────────────────
@@ -860,7 +936,10 @@ mod tests {
         dec.push(&raw);
         let msg = dec.decode().unwrap().unwrap();
 
-        assert_eq!(&*msg.payload, json);
+        assert_eq!(
+            &*msg.payload, json,
+            "decoded payload must be byte-identical to the input JSON"
+        );
     }
 
     #[test]
@@ -872,8 +951,12 @@ mod tests {
         dec.push(&raw);
         let msg = dec.decode().unwrap().unwrap();
 
-        assert_eq!(msg.event_type(), Some("metadata"));
-        assert_eq!(&*msg.payload, payload);
+        assert_eq!(
+            msg.event_type(),
+            Some("metadata"),
+            "decoded :event-type must be metadata"
+        );
+        assert_eq!(&*msg.payload, payload, "metadata payload must round-trip unchanged");
     }
 
     // ── Header helpers ────────────────────────────────────────────────────
@@ -884,7 +967,10 @@ mod tests {
         let mut dec = EventStreamDecoder::new();
         dec.push(&raw);
         let msg = dec.decode().unwrap().unwrap();
-        assert!(msg.header_str(":no-such-header").is_none());
+        assert!(
+            msg.header_str(":no-such-header").is_none(),
+            "header_str must return None for an absent header"
+        );
     }
 
     #[test]
@@ -893,7 +979,10 @@ mod tests {
         let mut dec = EventStreamDecoder::new();
         dec.push(&raw);
         let msg = dec.decode().unwrap().unwrap();
-        assert!(!msg.is_exception());
+        assert!(
+            !msg.is_exception(),
+            "an event frame must not be reported as an exception"
+        );
     }
 
     #[test]
@@ -902,6 +991,9 @@ mod tests {
         let mut dec = EventStreamDecoder::new();
         dec.push(&raw);
         let msg = dec.decode().unwrap().unwrap();
-        assert!(msg.is_exception());
+        assert!(
+            msg.is_exception(),
+            "a validationException frame must be reported as an exception"
+        );
     }
 }

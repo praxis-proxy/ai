@@ -415,12 +415,22 @@ mod tests {
     fn full_flow_node_types_and_depths_match_yaml() {
         let graph = full_flow_graph();
         let nodes = graph.flatten_chain(PIPELINE_CHAIN).expect("chain exists");
-        assert_eq!(nodes[0].filter_type, "trace_context");
+        assert_eq!(
+            nodes[0].filter_type, "trace_context",
+            "the full-flow chain opens with trace_context"
+        );
         assert_eq!(nodes[18].filter_type, IRR_FILTER, "IRR is the 19th filter");
         assert_eq!(nodes[18].depth, 0, "the IRR itself is main-chain");
         assert_eq!(nodes[19].depth, 1, "first inference-step filter is nested");
-        assert_eq!(nodes[19].irr_step.as_deref(), Some("inference"));
-        assert_eq!(nodes[19].filter_type, "project_state_owner_headers");
+        assert_eq!(
+            nodes[19].irr_step.as_deref(),
+            Some("inference"),
+            "the first hoisted node is owned by the inference IRR step"
+        );
+        assert_eq!(
+            nodes[19].filter_type, "project_state_owner_headers",
+            "the inference step's first filter is project_state_owner_headers"
+        );
         assert_eq!(
             nodes[27].filter_type, "openai_responses_proxy",
             "proxy after the step load balancer"
@@ -436,10 +446,15 @@ mod tests {
             .iter()
             .find(|node| node.filter_type == IRR_FILTER)
             .expect("IRR router");
-        assert_eq!(router.config.get("max_iterations").and_then(Json::as_u64), Some(8));
+        assert_eq!(
+            router.config.get("max_iterations").and_then(Json::as_u64),
+            Some(8),
+            "the flattened router node preserves its max_iterations limit of 8"
+        );
         assert_eq!(
             router.config.get("initial_step").and_then(Json::as_str),
-            Some("inference")
+            Some("inference"),
+            "the flattened router node preserves its initial_step of inference"
         );
     }
 
@@ -448,16 +463,30 @@ mod tests {
         let two = FlowGraph::from_yaml_str(&minimal_config(&["trace_context", "trace_context"])).expect("valid config");
         let three = FlowGraph::from_yaml_str(&minimal_config(&["trace_context", "trace_context", "trace_context"]))
             .expect("valid config");
-        assert_eq!(two.flatten_chain("c").expect("chain").len(), 2);
-        assert_eq!(three.flatten_chain("c").expect("chain").len(), 3);
+        assert_eq!(
+            two.flatten_chain("c").expect("chain").len(),
+            2,
+            "two declared filters flatten to two nodes"
+        );
+        assert_eq!(
+            three.flatten_chain("c").expect("chain").len(),
+            3,
+            "adding a third filter flattens to three nodes"
+        );
     }
 
     #[test]
     fn reordering_filters_changes_node_order() {
         let graph = FlowGraph::from_yaml_str(&minimal_config(&["state_owner", "trace_context"])).expect("valid config");
         let nodes = graph.flatten_chain("c").expect("chain");
-        assert_eq!(nodes[0].filter_type, "state_owner");
-        assert_eq!(nodes[1].filter_type, "trace_context");
+        assert_eq!(
+            nodes[0].filter_type, "state_owner",
+            "declaration order is preserved: state_owner stays first"
+        );
+        assert_eq!(
+            nodes[1].filter_type, "trace_context",
+            "declaration order is preserved: trace_context stays second"
+        );
     }
 
     #[test]
@@ -466,7 +495,11 @@ mod tests {
             .expect("valid config");
         let after =
             FlowGraph::from_yaml_str(&minimal_config(&["trace_context", "trace_context"])).expect("valid config");
-        assert_eq!(before.flatten_chain("c").expect("chain").len(), 3);
+        assert_eq!(
+            before.flatten_chain("c").expect("chain").len(),
+            3,
+            "the pre-removal config flattens to three nodes"
+        );
         let after_nodes = after.flatten_chain("c").expect("chain");
         assert_eq!(after_nodes.len(), 2, "removing the middle filter drops one node");
         assert_eq!(
@@ -489,8 +522,14 @@ mod tests {
         // Only the two declared main-chain filters are flattened; the branch's
         // inner trace_context is NOT hoisted inline (unlike IRR steps).
         assert_eq!(nodes.len(), 2, "branch chains are not flattened into the main chain");
-        assert_eq!(nodes[0].filter_type, "headers");
-        assert_eq!(nodes[1].filter_type, "state_owner");
+        assert_eq!(
+            nodes[0].filter_type, "headers",
+            "the branch-carrier filter stays first in the flattened chain"
+        );
+        assert_eq!(
+            nodes[1].filter_type, "state_owner",
+            "the unbranched filter follows the carrier in the flattened chain"
+        );
 
         // ...but the full branch topology (name and inner filter) is recorded
         // verbatim on the carrier node, and the unbranched filter has none.

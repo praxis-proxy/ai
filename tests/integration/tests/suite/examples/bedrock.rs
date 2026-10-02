@@ -59,8 +59,14 @@ fn bedrock_converse_translates_capital_of_france_end_to_end() {
         response["choices"][0]["message"]["content"], "Paris is the capital of France.",
         "caller should receive OpenAI Chat Completions content"
     );
-    assert_eq!(response["choices"][0]["finish_reason"], "stop");
-    assert_eq!(response["usage"]["total_tokens"], 19);
+    assert_eq!(
+        response["choices"][0]["finish_reason"], "stop",
+        "Bedrock stopReason end_turn must map to OpenAI finish_reason stop"
+    );
+    assert_eq!(
+        response["usage"]["total_tokens"], 19,
+        "Converse token usage must surface as OpenAI total_tokens"
+    );
     assert_eq!(
         upstream["messages"][0]["content"][0]["text"], "What is the capital of France?",
         "Bedrock should receive the translated Converse content block"

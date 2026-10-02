@@ -225,7 +225,8 @@ async fn preserves_provider_compaction_during_native_rehydration() {
     );
     assert_eq!(
         input.last().and_then(|item| item.get("content")),
-        Some(&serde_json::json!("continue"))
+        Some(&serde_json::json!("continue")),
+        "the new user turn must be appended as the final rehydrated input item"
     );
     assert!(
         forwarded.get("previous_response_id").is_none(),

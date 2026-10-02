@@ -1269,9 +1269,13 @@ fn rehydration_preserves_provider_compaction_provenance_only() {
     );
     assert_eq!(
         state.provider_compaction_ids,
-        HashSet::from(["cmp_current".to_owned(), "cmp_provider".to_owned()])
+        HashSet::from(["cmp_current".to_owned(), "cmp_provider".to_owned()]),
+        "only current-input and stored provider compaction IDs are tracked, excluding local summaries"
     );
-    assert_eq!(state.messages[0]["id"], "compact_local");
+    assert_eq!(
+        state.messages[0]["id"], "compact_local",
+        "stored local compaction item must replay first in history order"
+    );
     assert!(
         state.messages[0].get("_praxis_local_compaction").is_none(),
         "private provenance must not be sent to the backend"

@@ -1710,8 +1710,14 @@ fn appends_provider_compaction_to_replay_state() {
     drop(filter.on_response_body(&mut ctx, &mut body, true).unwrap());
 
     let state = ctx.extensions.get::<ResponsesState>().unwrap();
-    assert_eq!(state.messages[1]["type"], "compaction");
-    assert_eq!(state.persisted_messages[1]["id"], "cmp_provider");
+    assert_eq!(
+        state.messages[1]["type"], "compaction",
+        "provider compaction output must be appended to replay messages as a compaction item"
+    );
+    assert_eq!(
+        state.persisted_messages[1]["id"], "cmp_provider",
+        "persisted history must retain the provider compaction item id"
+    );
     assert!(
         state.provider_compaction_ids.contains("cmp_provider"),
         "provider compaction IDs must include replayable response output"
@@ -2858,13 +2864,22 @@ fn appends_streamed_provider_compaction_to_replay_state() {
 
     super::collect_streaming_output_items(&mut state);
 
-    assert_eq!(state.messages[1]["type"], "compaction");
-    assert_eq!(state.persisted_messages[1]["id"], "cmp_streamed");
+    assert_eq!(
+        state.messages[1]["type"], "compaction",
+        "streamed provider compaction must be appended to replay messages as a compaction item"
+    );
+    assert_eq!(
+        state.persisted_messages[1]["id"], "cmp_streamed",
+        "persisted history must retain the streamed compaction item id"
+    );
     assert!(
         state.provider_compaction_ids.contains("cmp_streamed"),
         "streamed provider compaction IDs must be retained for replay"
     );
-    assert_eq!(state.accumulated_output[0]["id"], "cmp_streamed");
+    assert_eq!(
+        state.accumulated_output[0]["id"], "cmp_streamed",
+        "accumulated output must retain the streamed compaction item id"
+    );
 }
 
 /// Regression (#955): the sole owner stamps a stable synthetic id on every

@@ -588,7 +588,12 @@ fn chunk_bytes(
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
+#[expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    reason = "tests"
+)]
 mod tests {
     use super::*;
     use crate::bedrock::eventstream::build_frame;
@@ -633,19 +638,46 @@ mod tests {
         let body = serde_json::to_vec(&bedrock).unwrap();
         let result: Value = serde_json::from_slice(&transform_response(&body, MODEL, ID).unwrap()).unwrap();
 
-        assert_eq!(result["id"], ID);
-        assert_eq!(result["object"], "chat.completion");
-        assert_eq!(result["model"], MODEL);
-        assert_eq!(result["choices"][0]["message"]["role"], "assistant");
         assert_eq!(
-            result["choices"][0]["message"]["content"],
-            "Paris is the capital of France."
+            result["id"], ID,
+            "translated response must echo the supplied response id"
         );
-        assert_eq!(result["choices"][0]["finish_reason"], "stop");
-        assert!(result["choices"][0]["logprobs"].is_null());
-        assert_eq!(result["usage"]["prompt_tokens"], 20);
-        assert_eq!(result["usage"]["completion_tokens"], 8);
-        assert_eq!(result["usage"]["total_tokens"], 28);
+        assert_eq!(
+            result["object"], "chat.completion",
+            "non-streaming responses use object chat.completion"
+        );
+        assert_eq!(
+            result["model"], MODEL,
+            "translated response must report the requested model"
+        );
+        assert_eq!(
+            result["choices"][0]["message"]["role"], "assistant",
+            "translated assistant message must keep role assistant"
+        );
+        assert_eq!(
+            result["choices"][0]["message"]["content"], "Paris is the capital of France.",
+            "text content blocks must be concatenated into message.content"
+        );
+        assert_eq!(
+            result["choices"][0]["finish_reason"], "stop",
+            "end_turn stopReason must map to finish_reason stop"
+        );
+        assert!(
+            result["choices"][0]["logprobs"].is_null(),
+            "logprobs must be null when Bedrock provides none"
+        );
+        assert_eq!(
+            result["usage"]["prompt_tokens"], 20,
+            "inputTokens must map to usage.prompt_tokens"
+        );
+        assert_eq!(
+            result["usage"]["completion_tokens"], 8,
+            "outputTokens must map to usage.completion_tokens"
+        );
+        assert_eq!(
+            result["usage"]["total_tokens"], 28,
+            "totalTokens must map to usage.total_tokens"
+        );
     }
 
     #[test]
@@ -670,14 +702,23 @@ mod tests {
         let body = serde_json::to_vec(&bedrock).unwrap();
         let result: Value = serde_json::from_slice(&transform_response(&body, MODEL, ID).unwrap()).unwrap();
 
-        assert_eq!(result["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            result["choices"][0]["finish_reason"], "tool_calls",
+            "tool_use stopReason must map to finish_reason tool_calls"
+        );
         let tc = &result["choices"][0]["message"]["tool_calls"][0];
-        assert_eq!(tc["id"], "call_abc");
-        assert_eq!(tc["type"], "function");
-        assert_eq!(tc["function"]["name"], "get_weather");
+        assert_eq!(tc["id"], "call_abc", "toolUse.toolUseId must map to the tool_call id");
+        assert_eq!(tc["type"], "function", "translated tool calls must have type function");
+        assert_eq!(
+            tc["function"]["name"], "get_weather",
+            "toolUse.name must map to the tool_call function name"
+        );
         // arguments should be a JSON string
         let args: Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap()).unwrap();
-        assert_eq!(args["city"], "Paris");
+        assert_eq!(
+            args["city"], "Paris",
+            "toolUse.input must be serialized into the tool_call arguments JSON"
+        );
     }
 
     #[test]
@@ -698,10 +739,14 @@ mod tests {
         let body = serde_json::to_vec(&bedrock).unwrap();
         let result: Value = serde_json::from_slice(&transform_response(&body, MODEL, ID).unwrap()).unwrap();
 
-        assert_eq!(result["choices"][0]["message"]["content"], "Let me check.");
+        assert_eq!(
+            result["choices"][0]["message"]["content"], "Let me check.",
+            "text blocks must be preserved alongside tool calls"
+        );
         assert_eq!(
             result["choices"][0]["message"]["tool_calls"].as_array().unwrap().len(),
-            1
+            1,
+            "a single toolUse block must produce exactly one tool_call"
         );
     }
 
@@ -739,12 +784,18 @@ mod tests {
         });
         let body = serde_json::to_vec(&bedrock).unwrap();
         let error = transform_response(&body, MODEL, ID).unwrap_err();
-        assert!(error.contains("output.message"));
+        assert!(
+            error.contains("output.message"),
+            "missing output.message must be named in the error: {error}"
+        );
     }
 
     #[test]
     fn transform_response_invalid_json_errors() {
-        assert!(transform_response(b"not json", MODEL, ID).is_err());
+        assert!(
+            transform_response(b"not json", MODEL, ID).is_err(),
+            "non-JSON response bodies must be rejected"
+        );
     }
 
     // ── Streaming: messageStart ────────────────────────────────────────────
@@ -756,11 +807,26 @@ mod tests {
         let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert_eq!(chunk["object"], "chat.completion.chunk");
-        assert_eq!(chunk["created"], state.created);
-        assert_eq!(chunk["choices"][0]["delta"]["role"], "assistant");
-        assert!(chunk["choices"][0]["logprobs"].is_null());
-        assert!(state.role_emitted);
+        assert_eq!(
+            chunk["object"], "chat.completion.chunk",
+            "streaming frames must use object chat.completion.chunk"
+        );
+        assert_eq!(
+            chunk["created"], state.created,
+            "every chunk must carry the shared stream creation timestamp"
+        );
+        assert_eq!(
+            chunk["choices"][0]["delta"]["role"], "assistant",
+            "messageStart must emit an assistant role delta"
+        );
+        assert!(
+            chunk["choices"][0]["logprobs"].is_null(),
+            "streaming delta chunks must set logprobs to null"
+        );
+        assert!(
+            state.role_emitted,
+            "messageStart must record that the role delta was emitted"
+        );
     }
 
     // ── Streaming: contentBlockDelta (text) ───────────────────────────────
@@ -773,8 +839,14 @@ mod tests {
         let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert_eq!(chunk["choices"][0]["delta"]["content"], "Hello!");
-        assert!(chunk["choices"][0]["finish_reason"].is_null());
+        assert_eq!(
+            chunk["choices"][0]["delta"]["content"], "Hello!",
+            "contentBlockDelta text must map to the delta content"
+        );
+        assert!(
+            chunk["choices"][0]["finish_reason"].is_null(),
+            "text delta chunks must not set a finish_reason"
+        );
     }
 
     // ── Streaming: contentBlockStart (toolUse) ────────────────────────────
@@ -788,9 +860,18 @@ mod tests {
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
         let tc = &chunk["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(tc["id"], "tc1");
-        assert_eq!(tc["function"]["name"], "lookup");
-        assert_eq!(state.tool_call_index, 1);
+        assert_eq!(
+            tc["id"], "tc1",
+            "contentBlockStart toolUseId must become the tool_call id"
+        );
+        assert_eq!(
+            tc["function"]["name"], "lookup",
+            "contentBlockStart toolUse name must become the function name"
+        );
+        assert_eq!(
+            state.tool_call_index, 1,
+            "contentBlockStart must advance the tool-call index"
+        );
     }
 
     // ── Streaming: contentBlockDelta (toolUse arguments) ──────────────────
@@ -807,8 +888,14 @@ mod tests {
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
         let tc = &chunk["choices"][0]["delta"]["tool_calls"][0];
-        assert_eq!(tc["index"], 0); // saturating_sub(1)
-        assert_eq!(tc["function"]["arguments"], "{\"city\":");
+        assert_eq!(
+            tc["index"], 0,
+            "argument deltas must target the tool call opened by contentBlockStart"
+        ); // saturating_sub(1)
+        assert_eq!(
+            tc["function"]["arguments"], "{\"city\":",
+            "toolUse input deltas must stream through as partial arguments"
+        );
     }
 
     // ── Streaming: contentBlockStop ───────────────────────────────────────
@@ -818,7 +905,10 @@ mod tests {
         let msg = decoded_msg("contentBlockStop", br#"{"contentBlockIndex":0}"#);
         let mut state = StreamState::default();
         let result = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap();
-        assert!(result.is_none());
+        assert!(
+            result.is_none(),
+            "contentBlockStop must produce no client-visible chunk"
+        );
     }
 
     // ── Streaming: messageStop ────────────────────────────────────────────
@@ -831,8 +921,15 @@ mod tests {
         let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert_eq!(chunk["choices"][0]["finish_reason"], "stop");
-        assert_eq!(state.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            chunk["choices"][0]["finish_reason"], "stop",
+            "messageStop end_turn must emit finish_reason stop"
+        );
+        assert_eq!(
+            state.finish_reason.as_deref(),
+            Some("stop"),
+            "messageStop must record the mapped finish reason in stream state"
+        );
     }
 
     #[test]
@@ -842,7 +939,10 @@ mod tests {
         let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert_eq!(chunk["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            chunk["choices"][0]["finish_reason"], "tool_calls",
+            "messageStop tool_use must emit finish_reason tool_calls"
+        );
     }
 
     // ── Streaming: metadata ───────────────────────────────────────────────
@@ -855,11 +955,26 @@ mod tests {
         let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert_eq!(chunk["created"], state.created);
-        assert_eq!(chunk["usage"]["prompt_tokens"], 10);
-        assert_eq!(chunk["usage"]["completion_tokens"], 5);
-        assert_eq!(chunk["usage"]["total_tokens"], 15);
-        assert!(chunk["choices"].as_array().unwrap().is_empty());
+        assert_eq!(
+            chunk["created"], state.created,
+            "the usage chunk must reuse the shared stream creation timestamp"
+        );
+        assert_eq!(
+            chunk["usage"]["prompt_tokens"], 10,
+            "metadata inputTokens must map to usage.prompt_tokens"
+        );
+        assert_eq!(
+            chunk["usage"]["completion_tokens"], 5,
+            "metadata outputTokens must map to usage.completion_tokens"
+        );
+        assert_eq!(
+            chunk["usage"]["total_tokens"], 15,
+            "metadata totalTokens must map to usage.total_tokens"
+        );
+        assert!(
+            chunk["choices"].as_array().unwrap().is_empty(),
+            "the usage-only chunk must carry no choices"
+        );
     }
 
     // ── Streaming: exception frame ────────────────────────────────────────
@@ -871,10 +986,22 @@ mod tests {
         let bytes = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap().unwrap();
         let chunk: Value = serde_json::from_slice(&bytes).unwrap();
 
-        assert_eq!(chunk["created"], state.created);
-        assert!(chunk["choices"][0]["logprobs"].is_null());
-        assert_eq!(chunk["error"]["message"], "Too many requests");
-        assert_eq!(chunk["error"]["code"], "throttlingException");
+        assert_eq!(
+            chunk["created"], state.created,
+            "the error chunk must reuse the shared stream creation timestamp"
+        );
+        assert!(
+            chunk["choices"][0]["logprobs"].is_null(),
+            "the error chunk must set logprobs to null"
+        );
+        assert_eq!(
+            chunk["error"]["message"], "Too many requests",
+            "the exception message must surface in the error envelope"
+        );
+        assert_eq!(
+            chunk["error"]["code"], "throttlingException",
+            "the exception type must surface as the error code"
+        );
     }
 
     // ── Streaming: unknown event type ─────────────────────────────────────
@@ -884,7 +1011,10 @@ mod tests {
         let msg = decoded_msg("someFutureEvent", b"{}");
         let mut state = StreamState::default();
         let result = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap();
-        assert!(result.is_none());
+        assert!(
+            result.is_none(),
+            "unknown event types must be ignored rather than error"
+        );
     }
 
     #[test]
@@ -895,7 +1025,10 @@ mod tests {
         );
         let mut state = StreamState::default();
         let result = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap();
-        assert!(result.is_none());
+        assert!(
+            result.is_none(),
+            "valid but unexposed delta variants must be dropped without breaking the stream"
+        );
     }
 
     #[test]
@@ -913,22 +1046,52 @@ mod tests {
         let msg = decoded_msg("messageStop", b"{}");
         let mut state = StreamState::default();
         let error = transform_stream_event(&msg, MODEL, ID, &mut state).unwrap_err();
-        assert!(error.contains("stopReason"));
-        assert!(state.finish_reason.is_none());
+        assert!(
+            error.contains("stopReason"),
+            "messageStop without a reason must name stopReason: {error}"
+        );
+        assert!(
+            state.finish_reason.is_none(),
+            "a rejected messageStop must not record a finish reason"
+        );
     }
 
     // ── map_stop_reason exhaustive ────────────────────────────────────────
 
     #[test]
     fn stop_reason_mapping_complete() {
-        assert_eq!(map_stop_reason("end_turn"), "stop");
-        assert_eq!(map_stop_reason("stop_sequence"), "stop");
-        assert_eq!(map_stop_reason("tool_use"), "tool_calls");
-        assert_eq!(map_stop_reason("max_tokens"), "length");
-        assert_eq!(map_stop_reason("model_context_window_exceeded"), "length");
-        assert_eq!(map_stop_reason("content_filtered"), "content_filter");
-        assert_eq!(map_stop_reason("guardrail_intervened"), "content_filter");
-        assert_eq!(map_stop_reason("malformed_tool_use"), "stop");
-        assert_eq!(map_stop_reason(""), "stop");
+        assert_eq!(map_stop_reason("end_turn"), "stop", "end_turn must map to stop");
+        assert_eq!(
+            map_stop_reason("stop_sequence"),
+            "stop",
+            "stop_sequence must map to stop"
+        );
+        assert_eq!(
+            map_stop_reason("tool_use"),
+            "tool_calls",
+            "tool_use must map to tool_calls"
+        );
+        assert_eq!(map_stop_reason("max_tokens"), "length", "max_tokens must map to length");
+        assert_eq!(
+            map_stop_reason("model_context_window_exceeded"),
+            "length",
+            "model_context_window_exceeded must map to length"
+        );
+        assert_eq!(
+            map_stop_reason("content_filtered"),
+            "content_filter",
+            "content_filtered must map to content_filter"
+        );
+        assert_eq!(
+            map_stop_reason("guardrail_intervened"),
+            "content_filter",
+            "guardrail_intervened must map to content_filter"
+        );
+        assert_eq!(
+            map_stop_reason("malformed_tool_use"),
+            "stop",
+            "unrecognized stop reasons must default to stop"
+        );
+        assert_eq!(map_stop_reason(""), "stop", "an empty stop reason must default to stop");
     }
 }

@@ -601,13 +601,13 @@ class TestAnthropicWebSearch:
 
         response = anthropic_client.messages.create(**kwargs)
 
-        assert response.content[0].text == FINAL_TEXT
-        assert len(model.requests) == 2
-        assert len(search.requests) == 1
+        assert response.content[0].text == FINAL_TEXT, "buffered loop must return the terminal answer"
+        assert len(model.requests) == 2, "buffered loop re-enters the model after search"
+        assert len(search.requests) == 1, "buffered loop dispatches exactly one search"
         assistant_turns = [
             message for message in model.requests[1]["messages"] if message["role"] == "assistant"
         ]
-        assert len(assistant_turns) == 1
+        assert len(assistant_turns) == 1, "re-entry replays a single assistant turn"
         assert assistant_turns[0]["content"] == [
             {"type": "text", "text": LARGE_ASSISTANT_TEXT},
             {
@@ -616,7 +616,7 @@ class TestAnthropicWebSearch:
                 "name": "WebSearch",
                 "input": {"query": "potato"},
             },
-        ]
+        ], "re-entry preserves the large assistant text with the tool_use block"
 
     def test_buffered_sequence_tool_block_reenters_complete(
         self, anthropic_client, web_search_stack
@@ -630,17 +630,17 @@ class TestAnthropicWebSearch:
 
         response = anthropic_client.messages.create(**kwargs)
 
-        assert response.content[0].text == FINAL_TEXT
-        assert len(model.requests) == 2
-        assert len(search.requests) == 1
-        assert search.requests[0]["query"] == "potato"
+        assert response.content[0].text == FINAL_TEXT, "buffered loop must return the terminal answer"
+        assert len(model.requests) == 2, "buffered loop re-enters the model after search"
+        assert len(search.requests) == 1, "buffered loop dispatches exactly one search"
+        assert search.requests[0]["query"] == "potato", "the search must receive the parsed query"
         assistant_turns = [
             message for message in model.requests[1]["messages"] if message["role"] == "assistant"
         ]
-        assert len(assistant_turns) == 1
+        assert len(assistant_turns) == 1, "re-entry replays a single assistant turn"
         assert assistant_turns[0]["content"] == [
             ["tool_use", "WebSearch", TOOL_USE_ID, ["potato"]]
-        ]
+        ], "re-entry preserves the sequence-shaped tool block verbatim"
 
     def test_streaming_web_search_loop(self, anthropic_client, web_search_stack):
         model = web_search_stack["model"]

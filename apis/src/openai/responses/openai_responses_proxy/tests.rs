@@ -553,28 +553,46 @@ async fn native_openai_backend_preserves_provider_compaction_in_rebuilt_state() 
         .execute_http_request_body(&mut ctx, &mut body, true)
         .await
         .unwrap();
-    assert!(matches!(body_action, FilterAction::Continue));
+    assert!(
+        matches!(body_action, FilterAction::Continue),
+        "request-body phase must continue so the rebuilt state is carried forward"
+    );
     let mut downstream_body: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     downstream_body["model"] = json!("rewritten-model");
     body = Some(Bytes::from(serde_json::to_vec(&downstream_body).unwrap()));
-    assert!(matches!(
-        pipeline.execute_http_request(&mut ctx).await.unwrap(),
-        FilterAction::Continue
-    ));
+    assert!(
+        matches!(
+            pipeline.execute_http_request(&mut ctx).await.unwrap(),
+            FilterAction::Continue
+        ),
+        "request phase must continue so upstream selection proceeds"
+    );
     let selected_action = pipeline
         .execute_http_selected_upstream_request_body(&mut ctx, &mut body)
         .await
         .unwrap();
-    assert!(matches!(selected_action, FilterAction::Continue));
+    assert!(
+        matches!(selected_action, FilterAction::Continue),
+        "selected-upstream body phase must continue so the rebuilt body is emitted"
+    );
 
     let rebuilt: serde_json::Value = serde_json::from_slice(body.as_deref().unwrap()).unwrap();
     assert_eq!(
         rebuilt["model"], "rewritten-model",
         "selected serialization must retain downstream body changes"
     );
-    assert_eq!(rebuilt["input"][0], provider_compaction);
-    assert_eq!(rebuilt["input"][1]["content"], "continue");
-    assert!(rebuilt.get("previous_response_id").is_none());
+    assert_eq!(
+        rebuilt["input"][0], provider_compaction,
+        "native backend must preserve the provider compaction item unchanged"
+    );
+    assert_eq!(
+        rebuilt["input"][1]["content"], "continue",
+        "rebuilt input must retain the user turn following the compaction item"
+    );
+    assert!(
+        rebuilt.get("previous_response_id").is_none(),
+        "previous_response_id must be stripped once history is rehydrated"
+    );
 }
 
 #[tokio::test]
@@ -1141,7 +1159,11 @@ fn serialized_body_cap_uses_conservative_native_projection() {
         native > translated,
         "native opaque state should exceed translated summary size"
     );
-    assert_eq!(super::serialized_outbound_body_len(&state).unwrap(), native);
+    assert_eq!(
+        super::serialized_outbound_body_len(&state).unwrap(),
+        native,
+        "serialized length cap must use the conservative native projection"
+    );
 }
 
 #[tokio::test]
@@ -1516,7 +1538,10 @@ fn messages_for_native_backend_preserves_idless_provider_compaction_item() {
         matches!(result, std::borrow::Cow::Borrowed(_)),
         "native Responses backends must preserve valid ID-less compaction items"
     );
-    assert_eq!(result[0], item);
+    assert_eq!(
+        result[0], item,
+        "ID-less compaction item must pass through unchanged for native backends"
+    );
 }
 
 #[test]
@@ -1529,8 +1554,14 @@ fn messages_for_native_backend_translates_local_compaction_item() {
     })];
     let result = super::messages_for_backend(&msgs, true, &std::collections::HashSet::new());
 
-    assert_eq!(result[0]["role"], "assistant");
-    assert_eq!(result[0]["content"], "[Previous conversation summary]\n\nlocal summary");
+    assert_eq!(
+        result[0]["role"], "assistant",
+        "a local compaction item must be translated into an assistant summary message"
+    );
+    assert_eq!(
+        result[0]["content"], "[Previous conversation summary]\n\nlocal summary",
+        "translated summary must prefix the decoded local summary content"
+    );
 }
 
 #[tokio::test]

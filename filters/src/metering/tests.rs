@@ -116,7 +116,11 @@ provider: "openai-prod"
     .unwrap();
     let filter = build_filter(&yaml).unwrap();
 
-    assert_eq!(filter.provider.as_deref(), Some("openai-prod"));
+    assert_eq!(
+        filter.provider.as_deref(),
+        Some("openai-prod"),
+        "configured provider must be parsed from config"
+    );
 }
 
 #[test]
@@ -129,7 +133,10 @@ metering_url: "http://metering:8080"
     .unwrap();
     let filter = build_filter(&yaml).unwrap();
 
-    assert!(filter.provider.is_none());
+    assert!(
+        filter.provider.is_none(),
+        "provider must stay unset when absent from config"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -146,7 +153,11 @@ fn resolve_provider_prefers_configured_value() {
     // Even when a cluster is routed, the static config value wins.
     ctx.cluster = Some(std::sync::Arc::from("routed-cluster"));
 
-    assert_eq!(filter.resolve_provider(&ctx), "configured");
+    assert_eq!(
+        filter.resolve_provider(&ctx),
+        "configured",
+        "configured provider must win over the routed cluster name"
+    );
 }
 
 #[test]
@@ -157,7 +168,11 @@ fn resolve_provider_falls_back_to_cluster_name() {
     let mut ctx = make_filter_context(&req);
     ctx.cluster = Some(std::sync::Arc::from("routed-cluster"));
 
-    assert_eq!(filter.resolve_provider(&ctx), "routed-cluster");
+    assert_eq!(
+        filter.resolve_provider(&ctx),
+        "routed-cluster",
+        "provider must fall back to the routed cluster name when unconfigured"
+    );
 }
 
 #[test]
@@ -168,7 +183,11 @@ fn resolve_provider_empty_when_neither_present() {
     // No configured provider and no routed cluster (the ext-proc data path).
     let ctx = make_filter_context(&req);
 
-    assert_eq!(filter.resolve_provider(&ctx), "");
+    assert_eq!(
+        filter.resolve_provider(&ctx),
+        "",
+        "provider must be empty when neither config nor routed cluster is present"
+    );
 }
 
 // -----------------------------------------------------------------------------
@@ -390,7 +409,10 @@ fn usage_event_has_correct_structure() {
     assert_eq!(event["data"]["total_tokens"], 150);
     assert_eq!(event["data"]["cached_input_tokens"], 80);
     assert_eq!(event["data"]["cache_creation_tokens"], 20);
-    assert_eq!(event["data"]["reasoning_tokens"], 30);
+    assert_eq!(
+        event["data"]["reasoning_tokens"], 30,
+        "reasoning tokens must be published on the usage CloudEvent"
+    );
     assert_eq!(event["data"]["duration_ms"], 500);
     assert_eq!(event["data"]["model"], "gpt-4");
 }

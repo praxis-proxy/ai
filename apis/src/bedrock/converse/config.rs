@@ -75,7 +75,11 @@ mod tests {
         let cfg: BedrockConverseConfig = parse_filter_config(FILTER_NAME, &yaml).unwrap();
         let validated = build_config(cfg).unwrap();
 
-        assert_eq!(validated.max_body_bytes, 4 * 1_048_576);
+        assert_eq!(
+            validated.max_body_bytes,
+            4 * 1_048_576,
+            "an empty config must apply the 4 MiB default max_body_bytes"
+        );
     }
 
     #[test]
@@ -84,7 +88,10 @@ mod tests {
         let cfg: BedrockConverseConfig = parse_filter_config(FILTER_NAME, &yaml).unwrap();
         let validated = build_config(cfg).unwrap();
 
-        assert_eq!(validated.max_body_bytes, 2_097_152);
+        assert_eq!(
+            validated.max_body_bytes, 2_097_152,
+            "a configured max_body_bytes must override the default"
+        );
     }
 
     #[test]

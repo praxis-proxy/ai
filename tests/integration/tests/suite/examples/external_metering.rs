@@ -207,7 +207,10 @@ fn external_metering_event_carries_provider_and_reasoning_tokens() {
     let json: serde_json::Value = serde_json::from_str(&event).expect("usage event body should be valid JSON");
 
     assert_eq!(json["type"], "inference.tokens.used", "should be a usage event");
-    assert_eq!(json["subject"], "alice");
+    assert_eq!(
+        json["subject"], "alice",
+        "usage event subject must be the tenant username"
+    );
     assert_eq!(
         json["data"]["provider"], "openai",
         "the configured provider must appear on the ext-proc data path where cluster_name() is None"
@@ -216,9 +219,18 @@ fn external_metering_event_carries_provider_and_reasoning_tokens() {
         json["data"]["reasoning_tokens"], 64,
         "reasoning tokens published by token_count must reach the usage CloudEvent"
     );
-    assert_eq!(json["data"]["completion_tokens"], 90);
-    assert_eq!(json["data"]["prompt_tokens"], 10);
-    assert_eq!(json["data"]["user"], "alice");
+    assert_eq!(
+        json["data"]["completion_tokens"], 90,
+        "completion tokens from upstream usage must reach the CloudEvent"
+    );
+    assert_eq!(
+        json["data"]["prompt_tokens"], 10,
+        "prompt tokens from upstream usage must reach the CloudEvent"
+    );
+    assert_eq!(
+        json["data"]["user"], "alice",
+        "usage event user must be the tenant username"
+    );
 }
 
 /// Poll the metering mock until the fire-and-forget usage report POST

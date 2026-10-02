@@ -1656,7 +1656,9 @@ mod tests {
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
-            vec![("synthetic", CoverageStatus::SyntheticOnly)]
+            vec![("synthetic", CoverageStatus::SyntheticOnly)],
+            "feature `{}` must advertise synthetic-only coverage",
+            manifest.features[3].id
         );
         assert_eq!(
             manifest.features[4]
@@ -1667,7 +1669,9 @@ mod tests {
             vec![
                 ("openai", CoverageStatus::Covered),
                 ("vllm", CoverageStatus::LiveCovered),
-            ]
+            ],
+            "feature `{}` must be covered by openai (recorded) and vllm (live)",
+            manifest.features[4].id
         );
         for feature in &manifest.features[0..2] {
             assert_eq!(
@@ -1676,7 +1680,9 @@ mod tests {
                     .iter()
                     .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                     .collect::<Vec<_>>(),
-                vec![("synthetic", CoverageStatus::SyntheticOnly)]
+                vec![("synthetic", CoverageStatus::SyntheticOnly)],
+                "bedrock Converse feature `{}` must advertise synthetic-only coverage",
+                feature.id
             );
         }
         for feature in &manifest.features[5..7] {
@@ -1786,7 +1792,9 @@ mod tests {
                     .iter()
                     .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                     .collect::<Vec<_>>(),
-                vec![("synthetic", CoverageStatus::SyntheticOnly)]
+                vec![("synthetic", CoverageStatus::SyntheticOnly)],
+                "feature `{}` must advertise synthetic-only coverage",
+                feature.id
             );
         }
         assert!(manifest.features.iter().all(|feature| {

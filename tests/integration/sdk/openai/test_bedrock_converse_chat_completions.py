@@ -168,16 +168,20 @@ class BedrockSimulatorHandler(BaseHTTPRequestHandler):
             f"{expected_base}converse",
             f"{expected_base}converse-stream",
         }, self.path
-        assert self.headers.get("Authorization", "").startswith("AWS4-HMAC-SHA256 ")
-        assert self.headers.get("X-Amz-Date")
-        assert self.headers.get("X-Amz-Content-Sha256")
-        assert "model" not in request
+        assert self.headers.get("Authorization", "").startswith(
+            "AWS4-HMAC-SHA256 "
+        ), "the proxy must sign the Converse request with SigV4"
+        assert self.headers.get("X-Amz-Date"), "SigV4 requires a signing date header"
+        assert self.headers.get(
+            "X-Amz-Content-Sha256"
+        ), "SigV4 requires a payload hash header"
+        assert "model" not in request, "the model must move to the path, not the Converse body"
         assert request["messages"] == [
             {
                 "role": "user",
                 "content": [{"text": "What is the capital of France?"}],
             }
-        ]
+        ], "the Converse body must carry the translated user turn"
 
 
 def _write_config(proxy_port: int, backend_port: int) -> str:
@@ -253,12 +257,14 @@ def test_finite_chat_completion(openai_client: OpenAI) -> None:
         messages=[{"role": "user", "content": "What is the capital of France?"}],
     )
 
-    assert response.object == "chat.completion"
-    assert response.model == MODEL
-    assert response.choices[0].message.content == "Paris is the capital of France."
-    assert response.choices[0].finish_reason == "stop"
-    assert response.usage is not None
-    assert response.usage.total_tokens == 19
+    assert response.object == "chat.completion", "the SDK must receive a chat.completion object"
+    assert response.model == MODEL, "the response must echo the requested model"
+    assert response.choices[0].message.content == "Paris is the capital of France.", (
+        "the translated Converse answer must reach the client"
+    )
+    assert response.choices[0].finish_reason == "stop", "end_turn must map to the stop finish reason"
+    assert response.usage is not None, "usage must be populated on a finite completion"
+    assert response.usage.total_tokens == 19, "usage totals must survive translation"
 
 
 def test_streaming_chat_completion(openai_client: OpenAI) -> None:
@@ -273,9 +279,9 @@ def test_streaming_chat_completion(openai_client: OpenAI) -> None:
     text = "".join(chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices)
     finish_reasons = [chunk.choices[0].finish_reason for chunk in chunks if chunk.choices]
     usage = [chunk.usage for chunk in chunks if chunk.usage is not None]
-    assert text == "Paris is the capital of France."
-    assert "stop" in finish_reasons
-    assert usage[-1].total_tokens == 19
+    assert text == "Paris is the capital of France.", "streamed deltas must reassemble the answer"
+    assert "stop" in finish_reasons, "the stream must carry a stop finish reason"
+    assert usage[-1].total_tokens == 19, "include_usage must emit a final usage chunk"
 
 
 def test_streaming_chat_completion_without_usage(openai_client: OpenAI) -> None:
@@ -289,9 +295,9 @@ def test_streaming_chat_completion_without_usage(openai_client: OpenAI) -> None:
     text = "".join(chunk.choices[0].delta.content or "" for chunk in chunks if chunk.choices)
     finish_reasons = [chunk.choices[0].finish_reason for chunk in chunks if chunk.choices]
     usage = [chunk.usage for chunk in chunks if chunk.usage is not None]
-    assert text == "Paris is the capital of France."
-    assert "stop" in finish_reasons
-    assert usage == []
+    assert text == "Paris is the capital of France.", "streamed deltas must reassemble the answer"
+    assert "stop" in finish_reasons, "the stream must carry a stop finish reason"
+    assert usage == [], "no usage chunk is emitted without include_usage"
 
 
 if __name__ == "__main__":
