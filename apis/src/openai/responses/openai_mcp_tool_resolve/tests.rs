@@ -631,7 +631,7 @@ async fn cache_hit_populates_mcp_tool_map_on_existing_state() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -667,7 +667,7 @@ async fn rewritten_body_over_limit_rejected_with_413() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -694,7 +694,7 @@ async fn rewritten_body_under_limit_committed() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -3119,7 +3119,7 @@ async fn expanded_body_exceeding_limit_returns_413() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -3156,7 +3156,7 @@ async fn expanded_body_within_limit_continues() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![serde_json::json!({
@@ -3197,7 +3197,7 @@ async fn measure_expanded_body_len(server_url: &str, cached: &[serde_json::Value
 /// accepted (the guard rejects strictly *over* the limit).
 #[tokio::test]
 async fn expanded_body_at_exact_limit_continues() {
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let cached = vec![serde_json::json!({
         "name": "get_weather", "description": "Get weather",
         "inputSchema": {"type": "object"},
@@ -5584,7 +5584,7 @@ async fn cache_hit_seeds_mcp_list_tools_output_item() {
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.set_metadata("openai_tool_parse.has_mcp", "true");
 
-    let server_url = "http://203.0.113.5/mcp";
+    let server_url = "http://8.8.8.8/mcp";
     let body_json = mcp_body(server_url);
     let mut state = ResponsesState::from_request_body(body_json.clone());
     state.previous_tools = vec![cached_weather_listing(server_url)];

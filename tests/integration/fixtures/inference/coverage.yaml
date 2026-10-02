@@ -237,6 +237,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.shared_controls
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.response.text
     scopes:
       - responses_to_chat_completions

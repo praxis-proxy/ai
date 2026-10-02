@@ -30,7 +30,6 @@ mod tests;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    net::{IpAddr, Ipv4Addr},
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -83,15 +82,6 @@ pub(crate) struct McpConnectorContext<'a> {
 /// union. It is deliberately generous relative to a realistic listing (128
 /// tools averaging 32 KiB) so well-behaved servers are never rejected.
 pub(super) const MAX_LISTING_RESPONSE_BYTES: usize = 4 * MAX_CONTROL_RESPONSE_BYTES;
-
-/// Cloud instance-metadata IPv4 endpoints that the generic loopback,
-/// link-local, and unspecified checks do not already cover. Any request that
-/// resolves to one of these is treated as an SSRF attempt.
-const CLOUD_METADATA_IPV4: &[Ipv4Addr] = &[
-    // Alibaba Cloud ECS metadata service. Lives in 100.64.0.0/10 shared
-    // address space, so it is not flagged as link-local.
-    Ipv4Addr::new(100, 100, 100, 200),
-];
 
 // -----------------------------------------------------------------------------
 // McpDisplayUrl
@@ -953,49 +943,6 @@ pub(crate) fn is_blocked_mcp_header(name: &http::HeaderName) -> bool {
     s.starts_with("x-forwarded-") || s.starts_with("x-praxis-") || s.starts_with("x-mcp-") || s.starts_with("x-a2a-")
 }
 
-/// Whether `v4` matches a known cloud instance-metadata endpoint that the
-/// generic loopback, link-local, and unspecified checks miss.
-fn is_cloud_metadata_ipv4(v4: Ipv4Addr) -> bool {
-    CLOUD_METADATA_IPV4.contains(&v4)
-}
-
-/// Addresses refused as MCP dial targets even when the operator has enabled
-/// private upstreams (`allow_private`): the unspecified address, link-local
-/// ranges (which include the cloud instance-metadata endpoints), the known
-/// cloud-metadata IPv4 endpoints, and IPv6 unique-local/site-local.
-///
-/// Loopback and the RFC1918/CGNAT private ranges are deliberately *not* here —
-/// those are gated on `allow_private` by [`is_ssrf_blocked_ip`], so an operator
-/// can opt into reaching them.
-fn is_always_sensitive(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_link_local() || v4.is_unspecified() || is_cloud_metadata_ipv4(*v4),
-        IpAddr::V6(v6) => {
-            let [a, b, ..] = v6.octets();
-            v6.is_unspecified() || (a == 0xFE && (b & 0xC0) == 0x80) || (a & 0xFE) == 0xFC
-        },
-    }
-}
-
-/// Whether an MCP dial target IP must be refused under the SSRF policy.
-///
-/// Two tiers:
-/// - [`is_always_sensitive`] addresses (link-local/metadata, unspecified, IPv6 unique-local) are refused
-///   unconditionally, even with `allow_private`.
-/// - The remaining private ranges — loopback, RFC1918, CGNAT (`100.64.0.0/10`), and `0.0.0.0/8` — are refused only when
-///   `allow_private` is `false`. This matches the policy the filtered-subrequest executor applies to DNS-resolved
-///   hostnames, closing the gap where a pinned literal address (which the executor's `resolve_address_checked`
-///   short-circuits) would otherwise reach an RFC1918 host with private upstreams disabled.
-///
-/// IPv4-mapped IPv6 addresses are normalized first so a mapped private address
-/// cannot slip past either tier.
-fn is_ssrf_blocked_ip(ip: &IpAddr, allow_private: bool) -> bool {
-    let ip = praxis_core::connectivity::normalize_mapped_ipv4(*ip);
-    if is_always_sensitive(&ip) {
-        return true;
-    }
-    !allow_private && praxis_core::connectivity::is_private_ip(&ip)
-}
 /// Convert `rmcp::model::Tool` values to opaque JSON.
 fn tools_to_json(tools: Vec<rmcp::model::Tool>) -> Result<Vec<serde_json::Value>, McpClientError> {
     tools

@@ -1252,6 +1252,7 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
@@ -1316,6 +1317,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
@@ -1337,9 +1339,9 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 50);
-        assert_eq!(report.scenarios_total, 46);
-        assert_eq!(report.recordings_total, 51);
+        assert_eq!(report.features_total, 51, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 46, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 51, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1391,7 +1393,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 50);
+        assert_eq!(manifest.features.len(), 51, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1517,6 +1519,10 @@ mod tests {
                         "responses/chat-basic-nonstream".to_owned(),
                         "responses/chat-basic-stream".to_owned(),
                     ]
+                ),
+                (
+                    &"responses.chat.shared_controls".to_owned(),
+                    &vec!["responses/chat-basic-nonstream".to_owned()]
                 ),
                 (
                     &"responses.chat.response.text".to_owned(),
@@ -1752,7 +1758,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[20..31] {
+        for feature in &manifest.features[20..32] {
             assert_eq!(
                 feature
                     .providers
@@ -1762,7 +1768,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[31..33] {
+        for feature in &manifest.features[32..34] {
             assert_eq!(
                 feature
                     .providers
@@ -1772,7 +1778,7 @@ mod tests {
                 vec![("vllm", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[33..45] {
+        for feature in &manifest.features[34..46] {
             assert_eq!(
                 feature
                     .providers
@@ -1783,14 +1789,14 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[45]
+            manifest.features[46]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)]
         );
-        for feature in &manifest.features[46..50] {
+        for feature in &manifest.features[47..51] {
             assert_eq!(
                 feature
                     .providers
@@ -2049,6 +2055,7 @@ mod tests {
                 "responses.chat.response.text",
                 "responses.chat.continuation",
                 "responses.chat.auto_tool_choice_without_tools",
+                "responses.chat.shared_controls",
             ]
         );
         assert_eq!(responses_chat.turns.len(), 2);
@@ -2064,11 +2071,46 @@ mod tests {
             panic!("translated Responses request body must be JSON");
         };
         assert_eq!(value["model"], "${MODEL}");
-        assert_eq!(value["input"], "What is 2+2? Reply with just the number.");
+        assert_eq!(value["input"][0]["role"], "user");
+        assert_eq!(
+            value["input"][0]["content"][0]["text"],
+            "What is 2+2? Reply with just the number."
+        );
+        assert_eq!(
+            value["input"][0]["content"][0]["prompt_cache_breakpoint"],
+            serde_json::json!({"mode": "explicit"}),
+            "explicit cache breakpoint must survive content conversion"
+        );
         assert_eq!(value["store"], true);
         assert_eq!(value["stream"], false);
         assert_eq!(value["tool_choice"], "auto");
-        assert_eq!(value.as_object().map(serde_json::Map::len), Some(5));
+        assert_eq!(
+            value["safety_identifier"], "tenant-user",
+            "safety_identifier must reach the Chat backend"
+        );
+        assert_eq!(value["user"], "legacy-user", "user must reach the Chat backend");
+        assert_eq!(
+            value["prompt_cache_key"], "cache-key",
+            "prompt_cache_key must reach the Chat backend"
+        );
+        assert_eq!(
+            value["prompt_cache_retention"], "24h",
+            "prompt_cache_retention must reach the Chat backend"
+        );
+        assert_eq!(
+            value["prompt_cache_options"],
+            serde_json::json!({"ttl": "30m", "mode": "explicit"}),
+            "prompt_cache_options must reach the Chat backend"
+        );
+        assert_eq!(
+            value["text"]["verbosity"], "high",
+            "text.verbosity must map to Chat verbosity"
+        );
+        assert_eq!(
+            value.as_object().map(serde_json::Map::len),
+            Some(11),
+            "translated request must carry exactly the expected keys"
+        );
         assert!(
             turn.expect.client_sse_events.is_empty(),
             "non-streaming initial turn must have no client SSE events"

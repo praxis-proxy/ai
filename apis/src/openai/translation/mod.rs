@@ -101,6 +101,27 @@ mod tests {
     }
 
     #[test]
+    fn moderation_is_rejected_until_results_can_be_translated() {
+        let request = json!({
+            "model": "m",
+            "input": "hello",
+            "moderation": {"model": "omni-moderation-latest"}
+        });
+        let expected = "Responses `moderation` has no Chat Completions representation: got object, \
+                        this adapter supports only `moderation` null";
+        assert_eq!(map_error(&request), expected);
+        let error = super::chat_completions::responses_state_to_chat_request(
+            &request,
+            &[json!({"role": "user", "content": "hello"})],
+            &[],
+            &json!("auto"),
+            &ReasoningOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+    }
+
+    #[test]
     fn null_prompt_is_treated_as_absent() {
         let chat = map(&json!({"model": "m", "input": "hello", "prompt": Value::Null}));
         assert_eq!(chat["model"], "m", "null prompt must not disturb mapped fields");
@@ -302,6 +323,94 @@ mod tests {
                     "parameters": {"type": "object", "properties": {"memory": {"type": "string"}}, "required": ["memory"]}
                 }
             })
+        );
+    }
+
+    #[test]
+    fn shared_safety_cache_and_verbosity_controls_reach_chat_completions() {
+        let request = json!({
+            "model": "m",
+            "input": "hello",
+            "safety_identifier": "tenant-user",
+            "user": "legacy-user",
+            "prompt_cache_key": "cache-key",
+            "prompt_cache_retention": "24h",
+            "prompt_cache_options": {"ttl": "30m", "mode": "explicit"},
+            "text": {"format": {"type": "text"}, "verbosity": "high"}
+        });
+
+        for mapped in [
+            map(&request),
+            map_state(
+                &request,
+                &[json!({"role": "user", "content": "hello"})],
+                &[],
+                &json!("auto"),
+            ),
+        ] {
+            for field in [
+                "safety_identifier",
+                "user",
+                "prompt_cache_key",
+                "prompt_cache_retention",
+                "prompt_cache_options",
+            ] {
+                assert_eq!(mapped[field], request[field], "{field} must reach the Chat backend");
+            }
+            assert_eq!(mapped["verbosity"], request["text"]["verbosity"]);
+            assert!(mapped.get("text").is_none(), "Responses text must map to Chat fields");
+        }
+    }
+
+    #[test]
+    fn explicit_cache_breakpoints_survive_content_conversion() {
+        let input = json!({
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "prefix", "prompt_cache_breakpoint": {"mode": "explicit"}},
+                {"type": "input_text", "text": "suffix"},
+                {"type": "input_image", "image_url": "https://example.com/image.png", "prompt_cache_breakpoint": {"mode": "explicit"}},
+                {"type": "input_file", "file_id": "file_123", "prompt_cache_breakpoint": {"mode": "explicit"}}
+            ]
+        });
+        let request = json!({
+            "model": "m",
+            "input": [input],
+            "prompt_cache_options": {"mode": "explicit"}
+        });
+
+        for mapped in [
+            map(&request),
+            map_state(&request, request["input"].as_array().unwrap(), &[], &json!("auto")),
+        ] {
+            let parts = mapped["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(parts.len(), 4);
+            assert_eq!(
+                parts[0],
+                json!({"type": "text", "text": "prefix", "prompt_cache_breakpoint": {"mode": "explicit"}})
+            );
+            assert_eq!(parts[1], json!({"type": "text", "text": "suffix"}));
+            assert_eq!(parts[2]["type"], "image_url");
+            assert_eq!(parts[2]["prompt_cache_breakpoint"], json!({"mode": "explicit"}));
+            assert_eq!(parts[3]["type"], "file");
+            assert_eq!(parts[3]["prompt_cache_breakpoint"], json!({"mode": "explicit"}));
+        }
+    }
+
+    #[test]
+    fn text_only_breakpoint_prevents_string_collapse() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "prefix", "prompt_cache_breakpoint": {"mode": "explicit"}},
+                {"type": "input_text", "text": "suffix"}
+            ]}],
+            "prompt_cache_options": {"mode": "explicit"}
+        }));
+        assert_eq!(mapped["messages"][0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            mapped["messages"][0]["content"][0]["prompt_cache_breakpoint"],
+            json!({"mode": "explicit"})
         );
     }
 
