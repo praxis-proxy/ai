@@ -2930,12 +2930,16 @@ class TestOpenAIResponsesVLLM:
             expected.append(appended)
 
             before = len(forwarded)
+            # The replayed prompt is ~1.2k tokens. The CI inference simulator
+            # runs in echo mode and rejects max_output_tokens below the prompt
+            # length, so a small budget fails before the replay is observable.
+            # A real backend stops at the end of the reply regardless.
             response = client.responses.create(
                 model=VLLM_MODEL,
                 conversation=conversation.id,
                 input="Reply OK. /no_think",
                 store=True,
-                max_output_tokens=64,
+                max_output_tokens=2048,
             )
             assert response.status == "completed"
             requests = forwarded[before:]
