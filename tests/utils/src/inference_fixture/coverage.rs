@@ -1251,6 +1251,7 @@ mod tests {
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
                 vec!["responses_to_chat_completions"],
+                vec!["responses_to_chat_completions"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
                 vec!["responses_agentic_loop"],
@@ -1313,6 +1314,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
                 CoverageStatus::SyntheticOnly,
+                CoverageStatus::SyntheticOnly,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::LiveCovered,
                 CoverageStatus::SyntheticOnly,
@@ -1333,7 +1335,7 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 48);
+        assert_eq!(report.features_total, 49);
         assert_eq!(report.scenarios_total, 44);
         assert_eq!(report.recordings_total, 49);
         assert_eq!(
@@ -1385,7 +1387,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 48);
+        assert_eq!(manifest.features.len(), 49);
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -1507,6 +1509,10 @@ mod tests {
                         "responses/chat-basic-nonstream".to_owned(),
                         "responses/chat-basic-stream".to_owned(),
                     ]
+                ),
+                (
+                    &"responses.chat.shared_controls".to_owned(),
+                    &vec!["responses/chat-basic-nonstream".to_owned()]
                 ),
                 (
                     &"responses.chat.response.text".to_owned(),
@@ -1728,7 +1734,7 @@ mod tests {
                 ]
             );
         }
-        for feature in &manifest.features[19..30] {
+        for feature in &manifest.features[19..31] {
             assert_eq!(
                 feature
                     .providers
@@ -1738,7 +1744,7 @@ mod tests {
                 vec![("synthetic", CoverageStatus::SyntheticOnly)]
             );
         }
-        for feature in &manifest.features[30..32] {
+        for feature in &manifest.features[31..33] {
             assert_eq!(
                 feature
                     .providers
@@ -1748,7 +1754,7 @@ mod tests {
                 vec![("vllm", CoverageStatus::LiveCovered)]
             );
         }
-        for feature in &manifest.features[32..43] {
+        for feature in &manifest.features[33..44] {
             assert_eq!(
                 feature
                     .providers
@@ -1759,14 +1765,14 @@ mod tests {
             );
         }
         assert_eq!(
-            manifest.features[43]
+            manifest.features[44]
                 .providers
                 .iter()
                 .map(|(provider, coverage)| (provider.as_str(), coverage.status.clone()))
                 .collect::<Vec<_>>(),
             vec![("vllm", CoverageStatus::LiveCovered)]
         );
-        for feature in &manifest.features[44..48] {
+        for feature in &manifest.features[45..49] {
             assert_eq!(
                 feature
                     .providers
@@ -2025,6 +2031,7 @@ mod tests {
                 "responses.chat.response.text",
                 "responses.chat.continuation",
                 "responses.chat.auto_tool_choice_without_tools",
+                "responses.chat.shared_controls",
             ]
         );
         assert_eq!(responses_chat.turns.len(), 2);
@@ -2040,11 +2047,28 @@ mod tests {
             panic!("translated Responses request body must be JSON");
         };
         assert_eq!(value["model"], "${MODEL}");
-        assert_eq!(value["input"], "What is 2+2? Reply with just the number.");
+        assert_eq!(value["input"][0]["role"], "user");
+        assert_eq!(
+            value["input"][0]["content"][0]["text"],
+            "What is 2+2? Reply with just the number."
+        );
+        assert_eq!(
+            value["input"][0]["content"][0]["prompt_cache_breakpoint"],
+            serde_json::json!({"mode": "explicit"})
+        );
         assert_eq!(value["store"], true);
         assert_eq!(value["stream"], false);
         assert_eq!(value["tool_choice"], "auto");
-        assert_eq!(value.as_object().map(serde_json::Map::len), Some(5));
+        assert_eq!(value["safety_identifier"], "tenant-user");
+        assert_eq!(value["user"], "legacy-user");
+        assert_eq!(value["prompt_cache_key"], "cache-key");
+        assert_eq!(value["prompt_cache_retention"], "24h");
+        assert_eq!(
+            value["prompt_cache_options"],
+            serde_json::json!({"ttl": "30m", "mode": "explicit"})
+        );
+        assert_eq!(value["text"]["verbosity"], "high");
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(11));
         assert!(
             turn.expect.client_sse_events.is_empty(),
             "non-streaming initial turn must have no client SSE events"

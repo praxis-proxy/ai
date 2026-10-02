@@ -4007,6 +4007,89 @@ class TestResponsesToChatCompletionsVLLM:
     # pipeline, not native Responses passthrough, so it measures the contract
     # owned by the translation filter.
 
+    def test_shared_controls_reach_chat_backend(self, reasoning_capture_client):
+        """The SDK request's provider controls survive the checked-in pipeline."""
+        client, forwarded = reasoning_capture_client
+
+        response = client.responses.create(
+            model=VLLM_MODEL,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "hello",
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                        },
+                        {"type": "input_text", "text": "world"},
+                    ],
+                }
+            ],
+            store=False,
+            extra_body={
+                "safety_identifier": "tenant-user",
+                "user": "legacy-user",
+                "prompt_cache_key": "cache-key",
+                "prompt_cache_retention": "24h",
+                "prompt_cache_options": {"ttl": "30m", "mode": "explicit"},
+                "text": {"format": {"type": "text"}, "verbosity": "high"},
+            },
+        )
+
+        assert response.status == "completed"
+        assert response.safety_identifier == "tenant-user"
+        assert response.prompt_cache_key == "cache-key"
+        assert response.text.verbosity == "high"
+        assert len(forwarded) == 1, forwarded
+        chat = forwarded[0]
+        assert chat["messages"][0]["content"] == [
+            {
+                "type": "text",
+                "text": "hello",
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            },
+            {"type": "text", "text": "world"},
+        ]
+        assert chat["safety_identifier"] == "tenant-user"
+        assert chat["user"] == "legacy-user"
+        assert chat["prompt_cache_key"] == "cache-key"
+        assert chat["prompt_cache_retention"] == "24h"
+        assert chat["prompt_cache_options"] == {"ttl": "30m", "mode": "explicit"}
+        assert chat["verbosity"] == "high"
+
+    def test_moderation_is_rejected_before_chat_backend(self, reasoning_capture_client):
+        client, forwarded = reasoning_capture_client
+
+        with pytest.raises(BadRequestError) as exc_info:
+            client.responses.create(
+                model=VLLM_MODEL,
+                input="hello",
+                store=False,
+                extra_body={"moderation": {"model": "omni-moderation-latest"}},
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "`moderation` has no Chat Completions representation" in str(
+            exc_info.value
+        )
+        assert not forwarded
+
+    def test_streaming_moderation_is_rejected(self, chat_streaming_client):
+        with pytest.raises(BadRequestError) as exc_info:
+            chat_streaming_client.responses.create(
+                model=VLLM_MODEL,
+                input="hello",
+                stream=True,
+                store=False,
+                extra_body={"moderation": {"model": "omni-moderation-latest"}},
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "`moderation` has no Chat Completions representation" in str(
+            exc_info.value
+        )
+
     def test_prompt_template_is_rejected_before_chat_backend(
         self, chat_streaming_client
     ):
