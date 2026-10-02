@@ -368,8 +368,8 @@ fn mixed_algorithm_rules_config(proxy_port: u16, backend_port: u16, valkey_url: 
          \x20     - filter: token_rate_limit\n\
          \x20       backend:\n\
          \x20         kind: valkey\n\
-         \x20         url: \"{valkey_url}\"\n\
-         \x20         namespace: \"{namespace}\"\n\
+         \x20         url: {valkey_url}\n\
+         \x20         namespace: {namespace}\n\
          \x20       rules:\n\
          \x20         - name: team-alpha\n\
          \x20           match:\n\
