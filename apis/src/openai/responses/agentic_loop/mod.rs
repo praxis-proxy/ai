@@ -973,6 +973,19 @@ fn collect_output_items(response: &Value, state: &mut ResponsesState, private_in
             Some("reasoning") => {
                 append_shared_history(state, item.clone());
             },
+            Some("compaction") => {
+                // Provider compaction items are valid replayable input. Keep
+                // them in both projections so a later continuation can send
+                // the opaque provider state back instead of translating it
+                // into an assistant summary.
+                state.messages.push(item.clone());
+                state.persisted_messages.push(item.clone());
+                state
+                    .provider_compaction_ids
+                    .extend(ResponsesState::provider_compaction_ids_from_messages(
+                        std::slice::from_ref(item),
+                    ));
+            },
             Some("web_search_call") => {
                 // A hosted web_search_call is not a valid OpenResponses input
                 // item (issue #808), so it must not enter `messages`. The
@@ -1118,6 +1131,19 @@ fn collect_streaming_output_items(state: &mut ResponsesState) {
         match item.get("type").and_then(Value::as_str) {
             Some("function_call" | "reasoning") => {
                 append_shared_history(state, item.clone());
+                state.accumulated_output.push(item);
+            },
+            Some("compaction") => {
+                // Provider compaction items are replayable input. Preserve them
+                // in both state projections before moving the item into the
+                // public streamed output accumulator.
+                state.messages.push(item.clone());
+                state.persisted_messages.push(item.clone());
+                state
+                    .provider_compaction_ids
+                    .extend(ResponsesState::provider_compaction_ids_from_messages(
+                        std::slice::from_ref(&item),
+                    ));
                 state.accumulated_output.push(item);
             },
             Some("web_search_call") => {

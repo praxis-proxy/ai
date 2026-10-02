@@ -11,6 +11,7 @@
 
 pub mod anthropic;
 pub mod azure;
+pub mod bedrock;
 mod callout_credentials;
 pub mod callout_headers;
 mod callout_identity;

@@ -61,12 +61,14 @@
 #      Conversations API traffic is not rejected before the conversations
 #      filter can handle it in the body phase.
 #
-#   3. The binding router selects the logical provider/protocol. The filters
-#      below that declare bound-body access then run once against the buffered
-#      request. Their `unless application_provider=openai` conditions make the
-#      OpenAI route true passthrough. openai_responses_validate checks JSON,
-#      initializes ResponsesState, and rejects gateway-unsupported fields such
-#      as background=true only on managed routes.
+#   3. The binding router must run before the conditional body filters below.
+#      This order is required: it binds the logical provider/protocol before
+#      their `unless application_provider=openai` conditions are evaluated.
+#      The filters then run once against the buffered request. The OpenAI route
+#      is true passthrough; on managed routes openai_responses_validate checks
+#      JSON, initializes ResponsesState, and rejects gateway-unsupported fields
+#      such as background=true. Prompt-template compatibility is checked later,
+#      after load-balancer selection, by openai_responses_proxy.
 #
 #   4. On managed routes, openai_tool_parse parses the tools array and
 #      tool_choice from Responses API requests and promotes summary facts

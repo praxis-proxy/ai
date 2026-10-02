@@ -198,8 +198,8 @@ impl FileResolveFilter {
     /// Create a filter from parsed YAML config.
     ///
     /// Uses an isolated [`SubRequestClient`] with a default pool
-    /// size of 4. Prefer [`from_config_with_client`] when a shared
-    /// client is available.
+    /// size of 4. Production registration uses [`Self::from_config_with_outbound`]
+    /// with the selected client and a bound outbound chain.
     ///
     /// # Errors
     ///
@@ -207,28 +207,9 @@ impl FileResolveFilter {
     /// callout client cannot be constructed.
     ///
     /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-    /// [`from_config_with_client`]: Self::from_config_with_client
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
         let client = crate::subrequest::isolated_client(4);
         Self::build(config, &client, None)
-    }
-
-    /// Create a filter using the shared [`SubRequestClient`].
-    ///
-    /// The shared client inherits the server-level pool size and
-    /// connection limits from the runtime configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FilterError`] if the YAML config is invalid or the
-    /// callout client cannot be constructed.
-    ///
-    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
-    pub fn from_config_with_client(
-        config: &serde_yaml::Value,
-        client: &SubRequestClient,
-    ) -> Result<Box<dyn HttpFilter>, FilterError> {
-        Self::build(config, client, None)
     }
 
     /// Create a filter with a pre-bound outbound filter chain.

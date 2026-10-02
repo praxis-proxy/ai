@@ -94,10 +94,15 @@ pub(crate) fn run(_args: Args) {
 // File Collection
 // -----------------------------------------------------------------------------
 
-/// Collect all `.yaml` file paths relative to `root`.
+/// Collect all example-config `.yaml` file paths relative to `root`.
+///
+/// Flow-visualizer sidecars (`*.visualizer.yaml`) are curated documentation data
+/// consumed by `cargo xtask sync-flow-visualizers`, not Praxis configs, so they
+/// are excluded from the integration-test requirement here.
 fn collect_yaml_files(root: &std::path::Path) -> Vec<String> {
     let mut files = Vec::new();
     walk_dir(root, root, "yaml", &mut files);
+    files.retain(|path| !path.ends_with(".visualizer.yaml"));
     files.sort();
     files
 }

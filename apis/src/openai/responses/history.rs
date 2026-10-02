@@ -45,6 +45,41 @@ impl MessageHistory {
         self.0.get(index).map(AsRef::as_ref)
     }
 
+    /// Materialize a contiguous position range, clamped to the history length.
+    ///
+    /// A shared history stores `Arc<Value>` handles rather than contiguous
+    /// values, so it cannot lend a `&[Value]`. Callers that must hand a
+    /// contiguous slice to a projection API copy only the requested range, not
+    /// the complete history.
+    #[must_use]
+    pub fn values_in(&self, start: usize, end: usize) -> Vec<Value> {
+        let len = self.0.len();
+        self.0
+            .get(start.min(len)..end.clamp(start, len))
+            .unwrap_or_default()
+            .iter()
+            .map(AsRef::as_ref)
+            .cloned()
+            .collect()
+    }
+
+    /// Find the highest position whose contiguous run equals `needle`.
+    #[must_use]
+    pub fn rposition_run(&self, needle: &[Value]) -> Option<usize> {
+        let needle_len = needle.len();
+        if needle_len == 0 || needle_len > self.0.len() {
+            return None;
+        }
+        (0..=self.0.len().saturating_sub(needle_len)).rev().find(|&start| {
+            (0..needle_len).all(|offset| {
+                self.0
+                    .get(start + offset)
+                    .zip(needle.get(offset))
+                    .is_some_and(|(item, want)| item.as_ref() == want)
+            })
+        })
+    }
+
     /// Mutably borrow one item, copying its payload only if shared.
     pub fn get_mut(&mut self, index: usize) -> Option<&mut Value> {
         self.0.get_mut(index).map(Arc::make_mut)

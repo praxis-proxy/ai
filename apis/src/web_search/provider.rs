@@ -436,14 +436,6 @@ impl SearchClient {
         Some(extensions)
     }
 
-    /// The request header a header-authenticated provider carries its API key in,
-    /// or `None` for a body-authenticated provider (Tavily, whose key travels in
-    /// the request body and is protected instead by the executor re-pinning the
-    /// staged upstream against mid-chain retargeting).
-    fn auth_header(&self) -> Option<http::HeaderName> {
-        provider_auth_header(self.provider)
-    }
-
     /// Stage a header-authenticated provider's API key as an exact-authority-bound
     /// [`DeferredCredential`].
     ///
@@ -466,7 +458,7 @@ impl SearchClient {
         url: &str,
         identity: &CalloutIdentity,
     ) -> Result<Option<PendingCredentials>, FilterError> {
-        let Some(header) = self.auth_header() else {
+        let Some(header) = provider_auth_header(self.provider) else {
             return Ok(None);
         };
         // Bind to the exact `host:port` authority the executor resolves from this

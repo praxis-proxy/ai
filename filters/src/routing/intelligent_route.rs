@@ -679,7 +679,7 @@ fn build_session_affinity(config: Option<SessionAffinityConfig>) -> Result<Optio
 fn validate_provider_hop_clusters(clusters: Vec<String>) -> Result<BTreeSet<String>, FilterError> {
     let mut validated = BTreeSet::new();
     for cluster in clusters {
-        descriptor::validate_cluster_name("provider_hop_clusters", &cluster)?;
+        descriptor::validate_name("provider_hop_clusters", &cluster)?;
         if !validated.insert(cluster) {
             return Err("intelligent_route: duplicate provider_hop_clusters entry".into());
         }
@@ -699,7 +699,7 @@ fn validate_management_cluster(
     let Some(cluster) = management_cluster else {
         return Ok(None);
     };
-    descriptor::validate_cluster_name("management_cluster", cluster)?;
+    descriptor::validate_name("management_cluster", cluster)?;
     if skip_paths.is_empty() {
         return Err("intelligent_route: management_cluster requires a non-empty skip_paths".into());
     }

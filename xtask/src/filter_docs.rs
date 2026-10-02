@@ -84,6 +84,23 @@ pub(crate) fn lint(_args: LintArgs) {
     }
 }
 
+/// The curated one-line description of every discoverable filter, keyed by the
+/// filter's registered `name()` (e.g. `"openai_responses_proxy"`).
+///
+/// This is the authoritative "known filter" catalog: it is derived from the same
+/// `syn`-parsed source metadata that drives `docs/filters/`, so a filter is
+/// "known" precisely when THIS repository defines it. Filters that live in
+/// praxis core (e.g. `trace_context`, `load_balancer`) are intentionally absent
+/// and are rendered as "semantics unavailable" by [`crate::visualize_config`],
+/// which never fabricates a description it cannot ground in source.
+pub(crate) fn filter_descriptions(root: &Path) -> BTreeMap<String, String> {
+    let shared_items = parse_shared_config_items(root);
+    discover_all_filters(root, &shared_items)
+        .into_iter()
+        .map(|entry| (entry.filter.name, entry.filter.description))
+        .collect()
+}
+
 /// Return generated doc paths that differ from current source metadata.
 fn collect_stale_doc_paths(root: &Path, docs_dir: &Path, all_filters: &[FilterEntry]) -> Vec<PathBuf> {
     let mut stale = Vec::new();

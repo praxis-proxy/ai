@@ -29,6 +29,7 @@ provider API integrations on top of [Praxis](https://github.com/praxis-proxy/pra
 - [Development setup](developing/getting-started.md)
 - [Run Codex or Claude Code through Praxis and vLLM](developing/cli-vllm-through-praxis.md)
 - [Adding filters](developing/adding-filters.md)
+- [Flow visualizers](developing/flow-visualizers.md)
 - [Type design](developing/type-design.md)
 - [FIPS tooling](developing/fips.md)
 - [Project management](developing/project-management.md)

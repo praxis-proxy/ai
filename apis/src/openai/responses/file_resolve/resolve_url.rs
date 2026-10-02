@@ -74,7 +74,7 @@ impl NormalizedOrigin {
         };
         let default_port = if url_scheme == "https" { 443 } else { 80 };
         let url_port = url.port().unwrap_or(default_port);
-        self.scheme == url_scheme && self.host == url_host.to_ascii_lowercase() && self.port == url_port
+        self.scheme == url_scheme && self.host.eq_ignore_ascii_case(url_host) && self.port == url_port
     }
 
     /// Reject IPs that are never valid in an allowlist: unspecified,
@@ -481,8 +481,10 @@ impl FileUrlResolver {
 
 /// Check if a hostname is blocked (localhost and *.localhost).
 fn is_blocked_hostname(host: &str) -> bool {
-    let lower = host.to_ascii_lowercase();
-    lower == "localhost" || lower.ends_with(".localhost")
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .rsplit_once('.')
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("localhost"))
 }
 
 #[cfg(test)]
@@ -681,6 +683,20 @@ mod tests {
         let origin = NormalizedOrigin::parse("https://files.example.com").unwrap();
         let url = url::Url::parse("https://Files.Example.Com/file.pdf").unwrap();
         assert!(origin.matches_url(&url), "host matching should be case-insensitive");
+    }
+
+    /// Covers host normalization and effective-port comparison from RFC 6454
+    /// Sections 4 and 5.
+    #[test]
+    fn matches_url_preserves_normalized_host_and_authority_rules() {
+        let origin = NormalizedOrigin::parse("https://BÜCHER.example:443").unwrap();
+        let matching = url::Url::parse("https://bücher.EXAMPLE/file.pdf").unwrap();
+        let different_port = url::Url::parse("https://bücher.example:8443/file.pdf").unwrap();
+        assert!(origin.matches_url(&matching), "IDNA host and default port should match");
+        assert!(
+            !origin.matches_url(&different_port),
+            "a different effective port must not match"
+        );
     }
 
     #[test]
@@ -1736,6 +1752,29 @@ mod tests {
             !is_blocked_hostname("example.com"),
             "non-localhost should not be blocked"
         );
+        for host in ["LOCALHOST", "a.LoCaLhOsT", "A.B.LOCALHOST"] {
+            assert!(
+                is_blocked_hostname(host),
+                "mixed-case localhost must be blocked: {host}"
+            );
+        }
+        for host in ["notlocalhost", "a.localhost.example", "a.localhosť", "a.localhostx"] {
+            assert!(
+                !is_blocked_hostname(host),
+                "non-suffix host must remain allowed: {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostname_checks_allocate_no_lowercase_copy() {
+        let origin = NormalizedOrigin::parse("https://files.example.com").unwrap();
+        let url = url::Url::parse("https://Files.Example.Com/file.pdf").unwrap();
+        let allocations = allocation_counter::measure(|| {
+            std::hint::black_box(origin.matches_url(&url));
+            std::hint::black_box(is_blocked_hostname("A.B.LOCALHOST"));
+        });
+        assert_eq!(allocations.count_total, 0, "hostname checks allocated: {allocations:?}");
     }
 
     // Coverage: NormalizedOrigin::parse with non-IP hostname

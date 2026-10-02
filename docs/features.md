@@ -61,7 +61,8 @@ A default production-proxy build (`cargo build -p praxis-ai-proxy`) compiles
 library crates keep `standard` as their lean default, and explicit
 `--no-default-features` proxy builds can select the backend-free, SQLite-only,
 PostgreSQL-only, or combined persistence profiles described below. The
-published container image and `make release` also build `full`. The FIPS build
+published container image builds `full,store-sqlite`, while `make release`
+builds `full`. The FIPS build
 (`make release-fips`, the `-fips` image) compiles only `openai-responses` and
 `aws-sigv4-filter` on top of the always-on filters; [FIPS 140-3](fips.md)
 lists what is left out and why.

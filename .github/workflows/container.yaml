@@ -5,6 +5,17 @@ name: Container
 # ------------------------------------------------------------------------------
 
 on:
+  pull_request:
+    paths:
+      - .github/scripts/container-sqlite-smoke.sh
+      - .github/workflows/container.yaml
+      - Containerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - '**/Cargo.toml'
+      - '**/*.rs'
+      - examples/configs/openai/responses/response-store.yaml
   push:
     branches: [main]
 
@@ -43,6 +54,9 @@ jobs:
             test -s /usr/share/licenses/praxis-ai/integrations/llmd/ext-proc/NOTICE
           ' || { echo "::error::missing legal files in runtime image"; exit 1; }
           echo "License label and legal files verified"
+
+      - name: Verify SQLite persistence in the runtime image
+        run: .github/scripts/container-sqlite-smoke.sh praxis-ai:ci
 
       - name: Run container
         run: docker run -d --name praxis-ai praxis-ai:ci

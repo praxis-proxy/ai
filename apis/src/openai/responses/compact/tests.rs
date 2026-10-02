@@ -533,7 +533,7 @@ fn replace_messages_preserves_current_input() {
         .insert(1, json!({"role": "assistant", "content": "old answer"}));
 
     let compaction_item = build_compaction_item("compact_test", "Summary of old conversation.", DEFAULT_SUMMARY_PREFIX);
-    replace_messages(&mut state, compaction_item);
+    replace_messages(&mut state, &compaction_item);
 
     assert_eq!(state.messages.len(), 2, "should have compaction + current input");
     assert_eq!(state.messages[0]["type"], "compaction");
@@ -545,6 +545,10 @@ fn replace_messages_preserves_current_input() {
     );
     assert_eq!(state.persisted_messages.len(), 2);
     assert_eq!(state.persisted_messages[0]["type"], "compaction");
+    assert_eq!(
+        state.persisted_messages[0]["_praxis_local_compaction"], true,
+        "private persisted history must retain local compaction provenance"
+    );
     assert_eq!(
         state.persisted_messages[1]["content"], "What's next?",
         "current-turn tail from persisted_messages must be kept"
@@ -572,7 +576,8 @@ fn replace_messages_keeps_each_list_current_turn_independently() {
     let original_messages = state.messages.clone();
     let original_persisted = state.persisted_messages.clone();
     let original_order = serde_json::to_value(&original_persisted).unwrap();
-    replace_messages(&mut state, build_compaction_item("c1", "sum", DEFAULT_SUMMARY_PREFIX));
+    let compaction_item = build_compaction_item("c1", "sum", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, &compaction_item);
 
     assert_eq!(serde_json::to_value(&original_persisted).unwrap(), original_order);
     assert!(std::sync::Arc::ptr_eq(
@@ -626,10 +631,8 @@ fn compaction_preserves_resolved_file_data_instead_of_file_url() {
         "state.input stays the original client payload"
     );
 
-    replace_messages(
-        &mut state,
-        build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX),
-    );
+    let compaction_item = build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, &compaction_item);
 
     assert_eq!(state.messages[0]["type"], "compaction");
     let current = &state.messages[1];
@@ -678,10 +681,8 @@ fn compaction_preserves_extracted_input_text_instead_of_input_file() {
     state.messages[tail] = extracted_item.clone();
     state.persisted_messages[tail] = extracted_item;
 
-    replace_messages(
-        &mut state,
-        build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX),
-    );
+    let compaction_item = build_compaction_item("compact_1", "summary", DEFAULT_SUMMARY_PREFIX);
+    replace_messages(&mut state, &compaction_item);
 
     let current = &state.messages[1];
     assert_eq!(
@@ -1025,14 +1026,14 @@ async fn explicit_compaction_loads_previous_response_only_for_exact_owner() {
     )))
     .unwrap();
 
-    let wrong_service = ResponsesService::new(registry.get_scoped("default", &other).unwrap());
-    let Err(FilterAction::Reject(rejection)) = collect_compact_messages(&wrong_service, &request).await else {
+    let wrong_store = registry.get_scoped("default", &other).unwrap();
+    let Err(FilterAction::Reject(rejection)) = collect_compact_messages(&wrong_store, &request).await else {
         panic!("wrong-owner compaction must fail before its callout");
     };
     assert_eq!(rejection.status, 404);
 
-    let owner_service = ResponsesService::new(registry.get_scoped("default", &owner).unwrap());
-    let messages = collect_compact_messages(&owner_service, &request).await.unwrap();
+    let owner_store = registry.get_scoped("default", &owner).unwrap();
+    let messages = collect_compact_messages(&owner_store, &request).await.unwrap();
     assert_eq!(messages, vec![json!({"role": "user", "content": "private"})]);
 }
 

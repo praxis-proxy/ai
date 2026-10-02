@@ -46,7 +46,10 @@ use tracing::{debug, trace, warn};
 use super::mcp_dispatch::{OWNER_FINGERPRINT, owner_fingerprint};
 use super::{
     DEFAULT_STORE_NAME, append_stored_input_items, bound_body_outcome, canonical_openresponses_replay_item,
-    error::responses_error_rejection, extract_conversation_id, history::MessageHistory, state::ResponsesState,
+    error::responses_error_rejection,
+    extract_conversation_id,
+    history::MessageHistory,
+    state::{LOCAL_COMPACTION_MARKER, ResponsesState, strip_local_compaction_marker},
 };
 use crate::{
     is_event_stream_content_type,
@@ -1210,6 +1213,9 @@ fn build_state(
     let mut state = ResponsesState::from_request_body(parsed_body);
     state.history_rehydrated = true;
     state.messages.prepend_shared(replay);
+    state
+        .provider_compaction_ids
+        .extend(ResponsesState::provider_compaction_ids_from_messages(&stored));
     state.persisted_messages.prepend_shared(stored);
     state.previous_tools = previous_tools;
     state.previous_usage = previous_usage;
@@ -1247,15 +1253,25 @@ fn append_stored_output_items(messages: &mut Vec<Value>, output: Value) {
 fn replay_messages_from_stored(stored: &MessageHistory) -> MessageHistory {
     let mut replay = MessageHistory::default();
     for item in stored.shared_items() {
-        if matches!(
-            item.get("type").and_then(Value::as_str),
-            Some("item_reference" | "reasoning" | "compaction" | "message" | "function_call" | "function_call_output")
-        ) {
+        let is_locally_marked = item.get(LOCAL_COMPACTION_MARKER).and_then(Value::as_bool) == Some(true);
+        if !is_locally_marked
+            && matches!(
+                item.get("type").and_then(Value::as_str),
+                Some(
+                    "item_reference"
+                        | "reasoning"
+                        | "compaction"
+                        | "message"
+                        | "function_call"
+                        | "function_call_output"
+                )
+            )
+        {
             replay.push_shared(std::sync::Arc::clone(item));
         } else if let Some(normalized) = canonical_openresponses_replay_item(item) {
-            // Legacy normalization changes the replay value, not the exact
-            // persisted item. Only that item needs an owned copy.
-            replay.push(normalized);
+            // Legacy normalization and marker removal change the replay value,
+            // not the exact persisted item. Only that item needs an owned copy.
+            replay.push(strip_local_compaction_marker(normalized));
         }
     }
     replay

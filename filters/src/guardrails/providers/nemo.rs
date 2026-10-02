@@ -6,7 +6,6 @@
 
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method};
 use praxis_ai_apis::{
@@ -20,7 +19,7 @@ use praxis_filter::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{GuardCalloutRuntime, GuardPhase, GuardProvider, GuardResult};
+use super::{GuardCalloutRuntime, GuardPhase, GuardResult};
 
 /// Default timeout for `NeMo` HTTP calls (10 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -182,9 +181,13 @@ impl NemoProvider {
     }
 }
 
-#[async_trait]
-impl GuardProvider for NemoProvider {
-    async fn evaluate(
+#[expect(
+    clippy::multiple_inherent_impl,
+    reason = "separates construction from the async callout path"
+)]
+impl NemoProvider {
+    /// Evaluate extracted messages against the configured `NeMo` service.
+    pub(in crate::guardrails) async fn evaluate(
         &self,
         messages: Vec<serde_json::Value>,
         phase: GuardPhase,
@@ -205,12 +208,9 @@ impl GuardProvider for NemoProvider {
 
         let mut pending_redact = None;
         for end in indices {
-            runtime
-                .deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| -> FilterError {
-                    "ai_guardrails (nemo): overall evaluation deadline exceeded".into()
-                })?;
+            if runtime.deadline < Instant::now() {
+                return Err("ai_guardrails (nemo): overall evaluation deadline exceeded".into());
+            }
             let messages = messages
                 .get(..=end)
                 .ok_or_else(|| -> FilterError { "ai_guardrails (nemo): invalid message index".into() })?;
@@ -222,13 +222,7 @@ impl GuardProvider for NemoProvider {
 
         Ok(pending_redact.unwrap_or(GuardResult::Pass))
     }
-}
 
-#[expect(
-    clippy::multiple_inherent_impl,
-    reason = "separates construction from the async callout path"
-)]
-impl NemoProvider {
     /// POST one message slice to `/v1/checks` through the outbound chain.
     async fn check_messages(
         &self,

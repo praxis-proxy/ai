@@ -1,5 +1,6 @@
 version: 1
 scope:
+  - chat_completions_to_bedrock_converse
   - messages_to_chat_completions
   - messages_native_passthrough
   - responses_agentic_loop
@@ -7,6 +8,24 @@ scope:
   - responses_to_chat_completions
   - responses_client_tool_compat
 features:
+  - id: bedrock.converse.request.text
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: bedrock.converse.response.text
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: messages.request.minimal
     scopes:
       - messages_to_chat_completions
@@ -328,6 +347,15 @@ features:
     providers:
       synthetic:
         status: synthetic_only
+  - id: responses.chat.tools.text_output
+    scopes:
+      - responses_to_chat_completions
+    status: synthetic_only
+    scenarios:
+      - responses/chat-tool-text-output
+    providers:
+      synthetic:
+        status: synthetic_only
   - id: responses.chat.null_tool_choice
     scopes:
       - responses_to_chat_completions
@@ -419,6 +447,33 @@ features:
     status: synthetic_only
     scenarios:
       - messages/upstream-error-stream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: bedrock.converse.request.tool_results
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: bedrock.converse.request.invalid_types
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
+    providers:
+      synthetic:
+        status: synthetic_only
+  - id: bedrock.converse.streaming.malformed_event
+    scopes:
+      - chat_completions_to_bedrock_converse
+    status: synthetic_only
+    scenarios:
+      - bedrock/basic-nonstream
     providers:
       synthetic:
         status: synthetic_only
