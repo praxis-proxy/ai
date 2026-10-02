@@ -3698,6 +3698,7 @@ dependencies = [
  "percent-encoding",
  "praxis-ai-store",
  "praxis-ai-store-lifecycle",
+ "praxis-proxy-core",
  "praxis-proxy-filter",
  "secrecy",
  "serde",

@@ -90,7 +90,7 @@ fn config_rejects_ambiguous_or_invalid_urls() {
 }
 
 #[test]
-fn config_defers_private_targets_to_the_connect_time_ssrf_gate() {
+fn config_defers_permitted_private_targets_to_the_connect_time_ssrf_gate() {
     // Private/loopback literals and DNS names all pass config-time structural
     // validation. SSRF is decided at connect time by `prepare_url_target`, which
     // honours `insecure_options.allow_private_upstreams`; startup cannot see that
@@ -100,7 +100,7 @@ fn config_defers_private_targets_to_the_connect_time_ssrf_gate() {
         "http://localhost:8001",
         "http://127.0.0.1:8001",
         "http://10.0.0.1:8001",
-        "http://169.254.169.254:8001",
+        "http://169.254.1.1:8001",
         "http://100.64.0.1:8001",
         "http://0.7.8.9:8001",
         "http://[::1]:8001",
@@ -112,6 +112,14 @@ fn config_defers_private_targets_to_the_connect_time_ssrf_gate() {
             "private-address gating is deferred to the runtime hook: {url}"
         );
     }
+}
+
+#[test]
+fn config_rejects_cloud_metadata_before_runtime() {
+    assert!(
+        parse_config("vector_store_url: 'http://169.254.169.254:8001'\n").is_err(),
+        "cloud metadata must remain blocked independently of the runtime private-target opt-in"
+    );
 }
 
 #[tokio::test]

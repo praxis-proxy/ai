@@ -330,6 +330,14 @@ mod tests {
     }
 
     #[test]
+    fn ssrf_rejects_cloud_metadata_with_private_override() {
+        assert!(
+            validate_base_url("test", "http://169.254.169.254", true).is_err(),
+            "cloud metadata must remain blocked with allow_private"
+        );
+    }
+
+    #[test]
     fn ssrf_allows_dns_with_override() {
         assert!(
             validate_base_url("test", "http://ogx:8321", true).is_ok(),

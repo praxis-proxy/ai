@@ -243,7 +243,9 @@ keeps password cryptography off the connection path.
 SSRF protections reject DNS hostnames, localhost,
 loopback, private, link-local, and unspecified
 addresses by default. `allow_private_database_url`
-opts in for development. Host validation is re-run
+opts in for development, but cloud metadata,
+unspecified, and multicast addresses remain blocked.
+Host validation is re-run
 on every connection attempt to guard against DNS
 rebinding.
 

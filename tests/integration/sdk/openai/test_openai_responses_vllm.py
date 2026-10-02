@@ -39,7 +39,13 @@ from urllib.parse import urlparse
 
 import httpx
 import pytest
-from openai import APIConnectionError, BadRequestError, NotFoundError, OpenAI
+from openai import (
+    APIConnectionError,
+    BadRequestError,
+    NotFoundError,
+    OpenAI,
+    PermissionDeniedError,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -8647,6 +8653,34 @@ class TestFileResolveOutboundChain:
         assert _FileUrlStubHandler.requests == 1, (
             "repeated file_url parts should share one fetch"
         )
+
+    def test_file_url_rejects_cloud_metadata(self, file_resolve_stub_env):
+        """Private-origin opt-ins must not grant access to metadata services."""
+        client, _, backend, _ = file_resolve_stub_env
+
+        with pytest.raises(PermissionDeniedError) as exc_info:
+            client.responses.create(
+                model="gpt-4.1",
+                input=[
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_file",
+                                "file_url": (
+                                    "http://169.254.169.254/latest/meta-data/"
+                                ),
+                            }
+                        ],
+                    }
+                ],
+                store=False,
+            )
+
+        assert exc_info.value.status_code == 403
+        assert "blocked by security policy" in str(exc_info.value)
+        assert backend.captured == []
 
 
 # ---------------------------------------------------------------------------

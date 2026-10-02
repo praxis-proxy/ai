@@ -18,7 +18,7 @@ use bytes::Bytes;
 use http::HeaderValue;
 use praxis_ai_apis::{
     callout_target::AddressPolicy,
-    subrequest::{SubRequest, SubRequestClient},
+    subrequest::{SubRequest, SubRequestClient, execute_url},
 };
 use praxis_filter::FilterError;
 use serde::Deserialize;
@@ -151,10 +151,9 @@ async fn fetch_metadata_token_url(
         body: Bytes::new(),
     };
 
-    let response =
-        praxis_ai_apis::subrequest::execute_url(client, url, request, 65_536, timeout, AddressPolicy::AllowPrivate)
-            .await
-            .map_err(|e| FilterError::from(format!("gcp_adc: metadata token request failed: {e}")))?;
+    let response = execute_url(client, url, request, 65_536, timeout, AddressPolicy::AllowCloudMetadata)
+        .await
+        .map_err(|e| FilterError::from(format!("gcp_adc: metadata token request failed: {e}")))?;
 
     let status = http::StatusCode::from_u16(response.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
     if !status.is_success() {
