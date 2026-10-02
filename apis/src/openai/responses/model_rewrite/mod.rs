@@ -74,7 +74,7 @@ use crate::{
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_responses_model_rewrite
+/// filter: openai_model_rewrite
 /// default_model: "llama-3.3-70b"
 /// model_aliases:
 ///   "codex-mini-latest": "llama-3.3-70b"
@@ -85,7 +85,7 @@ use crate::{
 /// # Full YAML
 ///
 /// ```yaml
-/// filter: openai_responses_model_rewrite
+/// filter: openai_model_rewrite
 /// default_model: "llama-3.3-70b"
 /// model_aliases:
 ///   "codex-mini-latest": "llama-3.3-70b"
@@ -119,7 +119,7 @@ impl ModelRewriteFilter {
     ///
     /// [`FilterError`]: praxis_filter::FilterError
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: ModelRewriteConfig = parse_filter_config("openai_responses_model_rewrite", config)?;
+        let cfg: ModelRewriteConfig = parse_filter_config("openai_model_rewrite", config)?;
         validate_config(&cfg)?;
         Ok(Box::new(Self {
             default_model: cfg.default_model,
@@ -162,7 +162,7 @@ impl ModelRewriteFilter {
 #[async_trait]
 impl HttpFilter for ModelRewriteFilter {
     fn name(&self) -> &'static str {
-        "openai_responses_model_rewrite"
+        "openai_model_rewrite"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -402,19 +402,16 @@ fn write_metadata(ctx: &mut HttpFilterContext<'_>, result: &RewriteResult) {
     if let Some(orig) = &result.original_model
         && is_promotable_value(orig)
     {
-        ctx.set_metadata("openai_responses_model_rewrite.original_model", orig.clone());
+        ctx.set_metadata("openai_model_rewrite.original_model", orig.clone());
     }
     if !result.effective_model.is_empty() && is_promotable_value(&result.effective_model) {
-        ctx.set_metadata(
-            "openai_responses_model_rewrite.effective_model",
-            result.effective_model.clone(),
-        );
+        ctx.set_metadata("openai_model_rewrite.effective_model", result.effective_model.clone());
     }
     if result.rewritten {
-        ctx.set_metadata("openai_responses_model_rewrite.rewritten", "true");
+        ctx.set_metadata("openai_model_rewrite.rewritten", "true");
     }
     if result.default_injected {
-        ctx.set_metadata("openai_responses_model_rewrite.default_injected", "true");
+        ctx.set_metadata("openai_model_rewrite.default_injected", "true");
     }
 }
 
@@ -439,7 +436,7 @@ fn promote_headers(ctx: &mut HttpFilterContext<'_>, result: &RewriteResult, head
 
 /// Set filter results from a [`RewriteResult`] (body pre-read phase).
 fn set_filter_results_from_result(ctx: &mut HttpFilterContext<'_>, result: &RewriteResult) {
-    let results = ctx.filter_results.entry("openai_responses_model_rewrite").or_default();
+    let results = ctx.filter_results.entry("openai_model_rewrite").or_default();
 
     if !result.effective_model.is_empty() && is_promotable_value(&result.effective_model) {
         set_filter_result(results, "effective_model", result.effective_model.clone());
@@ -461,16 +458,16 @@ fn set_filter_results_from_result(ctx: &mut HttpFilterContext<'_>, result: &Rewr
 /// body pre-read so branches on this filter work correctly.
 fn repopulate_filter_results(ctx: &mut HttpFilterContext<'_>) {
     let effective = ctx
-        .get_metadata("openai_responses_model_rewrite.effective_model")
+        .get_metadata("openai_model_rewrite.effective_model")
         .map(str::to_owned);
-    let rewritten = ctx.get_metadata("openai_responses_model_rewrite.rewritten") == Some("true");
-    let default_injected = ctx.get_metadata("openai_responses_model_rewrite.default_injected") == Some("true");
+    let rewritten = ctx.get_metadata("openai_model_rewrite.rewritten") == Some("true");
+    let default_injected = ctx.get_metadata("openai_model_rewrite.default_injected") == Some("true");
 
     if effective.is_none() && !rewritten && !default_injected {
         return;
     }
 
-    let results = ctx.filter_results.entry("openai_responses_model_rewrite").or_default();
+    let results = ctx.filter_results.entry("openai_model_rewrite").or_default();
     if let Some(eff) = effective {
         set_filter_result(results, "effective_model", eff);
     }

@@ -180,7 +180,7 @@ listeners:
 filter_chains:
   - name: classify
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
       - filter: router
         routes:

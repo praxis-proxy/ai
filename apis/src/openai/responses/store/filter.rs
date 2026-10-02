@@ -118,7 +118,7 @@ const NO_REPLAY_LOG_MESSAGE: &str = "This response has no replayable event strea
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_response_store
+/// filter: openai_store
 /// backend: postgres
 /// database_url: postgres://praxis:password@db.example.com/praxis
 /// responses_table: openai_responses
@@ -161,7 +161,7 @@ impl ResponseStoreFilter {
     ///
     /// Returns [`FilterError`] if the YAML config is invalid.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let cfg: ResponseStoreConfig = parse_filter_config("openai_response_store", config)?;
+        let cfg: ResponseStoreConfig = parse_filter_config("openai_store", config)?;
         validate_config(&cfg)?;
         Ok(Box::new(Self::with_bounds(cfg.max_event_count, cfg.max_event_bytes)))
     }
@@ -180,7 +180,7 @@ impl ResponseStoreFilter {
         let deleted = store
             .delete_response(id)
             .await
-            .map_err(|e| FilterError::from(format!("openai_response_store: delete failed: {e}")))?;
+            .map_err(|e| FilterError::from(format!("openai_store: delete failed: {e}")))?;
 
         if deleted {
             debug!(id, "response deleted");
@@ -653,7 +653,7 @@ pub(super) fn extract_response_id(path: &str) -> Option<&str> {
 /// store filter that is absent, request-conditioned out, or ordered after
 /// dispatch.
 ///
-/// It is written from `on_request_body` because `openai_responses_validate`
+/// It is written from `on_request_body` because `openai_validate`
 /// creates `ResponsesState` in its own `on_request_body`, which runs earlier in
 /// the same body phase, so `ResponsesState` is not yet present during
 /// `on_request`.
@@ -676,7 +676,7 @@ fn delete_success_rejection(id: &str) -> Result<Rejection, FilterError> {
         "object": "response.deleted",
         "deleted": true,
     }))
-    .map_err(|e| FilterError::from(format!("openai_response_store: serialize failed: {e}")))?;
+    .map_err(|e| FilterError::from(format!("openai_store: serialize failed: {e}")))?;
 
     Ok(Rejection::status(200)
         .with_header("content-type", "application/json")
@@ -725,7 +725,7 @@ fn request_needs_rehydrate_store(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request references a conversation.
 fn has_conversation(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.has_conversation") == Some("true")
+    ctx.get_metadata("openai_format.has_conversation") == Some("true")
 }
 
 /// Return whether the request method is not persistable.
@@ -739,7 +739,7 @@ fn is_non_post_request(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request is not a Responses API request.
 fn is_non_responses_format(ctx: &HttpFilterContext<'_>) -> bool {
-    let format = ctx.get_metadata("openai_responses_format.format");
+    let format = ctx.get_metadata("openai_format.format");
     let skip = !is_responses_format(ctx);
     if skip {
         trace!(format = ?format, "skipping non-responses format");
@@ -749,12 +749,12 @@ fn is_non_responses_format(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request is classified as a Responses API request.
 fn is_responses_format(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.format") == Some("openai_responses")
+    ctx.get_metadata("openai_format.format") == Some("openai_responses")
 }
 
 /// Return whether the request explicitly disabled persistence.
 fn is_store_disabled(ctx: &HttpFilterContext<'_>) -> bool {
-    let skip = ctx.get_metadata("openai_responses_format.store") == Some("false");
+    let skip = ctx.get_metadata("openai_format.store") == Some("false");
     if skip {
         trace!("skipping persistence (store=false)");
     }
@@ -763,7 +763,7 @@ fn is_store_disabled(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request uses streaming responses.
 fn is_streaming_request(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.stream") == Some("true")
+    ctx.get_metadata("openai_format.stream") == Some("true")
 }
 
 /// Return whether this is a streaming replay retrieval
@@ -798,7 +798,7 @@ fn streaming_terminal_emitted(ctx: &HttpFilterContext<'_>) -> bool {
 
 /// Return whether the request references a previous response.
 fn has_previous_response_id(ctx: &HttpFilterContext<'_>) -> bool {
-    ctx.get_metadata("openai_responses_format.has_previous_response_id") == Some("true")
+    ctx.get_metadata("openai_format.has_previous_response_id") == Some("true")
 }
 
 /// Check whether persistence was skipped during the response phase.
@@ -972,7 +972,7 @@ fn pending_approvals_from_ctx(ctx: &HttpFilterContext<'_>) -> Vec<PendingApprova
 #[async_trait]
 impl HttpFilter for ResponseStoreFilter {
     fn name(&self) -> &'static str {
-        "openai_response_store"
+        "openai_store"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -1165,7 +1165,7 @@ impl ResponseStoreFilter {
     /// GETs fall through to normal retrieval, and unrelated paths continue.
     async fn handle_get_request(&self, ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
         // A replay GET returns a streaming SSE response. Force streaming
-        // response mode first: a legacy `openai_responses_format` pipeline
+        // response mode first: a legacy `openai_format` pipeline
         // classifies the GET as Responses-format with `stream=false` (the flag
         // is read from a POST body it never sees), which would otherwise select
         // the buffered override in `on_request` and make the runtime reject the
@@ -1718,7 +1718,7 @@ impl StreamingResponseBody for ReplayStreamBody {
                 return Ok(None);
             }
             return Err(FilterError::from(format!(
-                "openai_response_store: replay log for {} was truncated before its terminal event",
+                "openai_store: replay log for {} was truncated before its terminal event",
                 self.response_id
             )));
         }

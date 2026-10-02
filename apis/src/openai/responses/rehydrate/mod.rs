@@ -84,12 +84,12 @@ const PREV_USAGE_TOTAL_KEY: &str = "responses.previous_usage_total_tokens";
 /// # YAML
 ///
 /// ```yaml
-/// filter: openai_responses_rehydrate
+/// filter: openai_rehydrate
 /// ```
 #[derive(Default)]
 pub struct RehydrateFilter;
 
-/// Configuration for `openai_responses_rehydrate`.
+/// Configuration for `openai_rehydrate`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[expect(
@@ -106,7 +106,7 @@ impl RehydrateFilter {
     /// Returns [`FilterError`] if the YAML config contains unknown
     /// fields.
     pub fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
-        let _: RehydrateConfig = parse_filter_config("openai_responses_rehydrate", config)?;
+        let _: RehydrateConfig = parse_filter_config("openai_rehydrate", config)?;
         Ok(Box::new(Self))
     }
 
@@ -114,7 +114,7 @@ impl RehydrateFilter {
     /// `conversation`), and populate [`ResponsesState`] with the full
     /// conversation history.
     ///
-    /// The upstream `openai_responses_validate` filter rejects requests that
+    /// The upstream `openai_validate` filter rejects requests that
     /// supply both selectors; the resolution order here is a silent fallback.
     async fn rehydrate(
         &self,
@@ -190,7 +190,7 @@ impl RehydrateFilter {
 #[async_trait]
 impl HttpFilter for RehydrateFilter {
     fn name(&self) -> &'static str {
-        "openai_responses_rehydrate"
+        "openai_rehydrate"
     }
 
     fn request_body_access(&self) -> BodyAccess {
@@ -244,7 +244,7 @@ impl HttpFilter for RehydrateFilter {
             return Ok(FilterAction::Release);
         }
 
-        if ctx.get_metadata("openai_responses_format.format") != Some("openai_responses") {
+        if ctx.get_metadata("openai_format.format") != Some("openai_responses") {
             return Ok(FilterAction::Release);
         }
 
@@ -1415,7 +1415,7 @@ fn mcp_tool_names(tools: &[Value]) -> Vec<String> {
 /// [`build_state`] reconstructs [`ResponsesState`] from the request body, so
 /// markers not derivable from the body alone must be carried across the
 /// replacement. Currently that is the store filter's
-/// [`ResponsesState::store_persist_armed`] flag, which `openai_response_store`
+/// [`ResponsesState::store_persist_armed`] flag, which `openai_store`
 /// sets before rehydrate runs. Dropping it here would make `mcp_dispatch`
 /// falsely reject a continuation-turn `mcp_approval_request` as unresumable,
 /// even though the store is configured and will persist the response.

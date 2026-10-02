@@ -65,7 +65,7 @@ fn raw_base64(text: &str) -> String {
 }
 
 fn set_responses_metadata(ctx: &mut HttpFilterContext<'_>) {
-    ctx.set_metadata("openai_responses_format.format", "openai_responses");
+    ctx.set_metadata("openai_format.format", "openai_responses");
 }
 
 // -- Config tests -------------------------------------------------------------

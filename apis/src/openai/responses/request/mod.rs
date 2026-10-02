@@ -13,12 +13,12 @@
 //! Create requests with `background=true` are rejected, because Praxis does not
 //! implement the asynchronous Responses lifecycle.
 //!
-//! This replaces the pair of `openai_responses_format` and
-//! `openai_responses_validate`. Those two each parsed the
+//! This replaces the pair of `openai_format` and
+//! `openai_validate`. Those two each parsed the
 //! same body independently, so routing facts, proxy-owned defaults, and state
 //! could be derived from different parses of one request.
 //!
-//! Metadata keeps the `openai_responses_format` namespace, because twelve
+//! Metadata keeps the `openai_format` namespace, because twelve
 //! downstream filters read those keys and renaming them is a separate change
 //! rather than a side effect of consolidating the parse. Filter results are
 //! published under this filter's own name, since a branch condition must name
@@ -64,8 +64,8 @@ const FILTER_NAME: &str = "openai_responses_request";
 
 /// Processes a Responses request body once and initializes state.
 ///
-/// Replaces the `openai_responses_format` and `openai_responses_validate` pair.
-/// Configuration is unchanged from `openai_responses_format`, so a chain that
+/// Replaces the `openai_format` and `openai_validate` pair.
+/// Configuration is unchanged from `openai_format`, so a chain that
 /// ran both swaps them for this one filter and keeps the same `on_invalid` and
 /// `headers` settings.
 ///
@@ -75,10 +75,10 @@ const FILTER_NAME: &str = "openai_responses_request";
 /// and the `WebSocket` handshake — are released untouched, as is Conversations
 /// API traffic. `on_invalid` governs only bodies that fail to parse.
 ///
-/// Rejects `background=true` with a 400, matching `openai_responses_format`,
+/// Rejects `background=true` with a 400, matching `openai_format`,
 /// because Praxis does not implement the asynchronous Responses lifecycle.
 ///
-/// Promotes `openai_responses_format.*` metadata, publishes filter results
+/// Promotes `openai_format.*` metadata, publishes filter results
 /// under `openai_responses_request`, and generates
 /// `responses.response_id` (`resp_` + 32 hex chars, CSPRNG),
 /// `responses.conversation_id`, `responses.store`, `responses.background`, and

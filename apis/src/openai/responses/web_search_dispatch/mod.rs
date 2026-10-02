@@ -1,0 +1,1064 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Praxis Contributors
+
+//! Web search filter for the Responses API agentic loop.
+//!
+//! Executes calls prepared by `openai_agentic_loop` during the request-body
+//! phase of the next `iterative_request_router` iteration. The owner performs
+//! response classification, admission, and the sole loop transition; this
+//! dispatcher only executes the admitted searches via [`SearchClient`] and
+//! appends their results to request-scoped state.
+//!
+//! # Pipeline dependencies
+//!
+//! - **`openai_agentic_loop`** must run after this filter in request order, so response order is `openai_agentic_loop`
+//!   then `openai_web_search_dispatch`.
+//! - The IRR transition must match `openai_agentic_loop.action = "loop"` and target the same inference step.
+//!
+//! [`ResponsesState::web_search_calls`]: super::state::ResponsesState
+//! [`SearchClient`]: crate::web_search::SearchClient
+
+#[cfg(test)]
+#[expect(clippy::allow_attributes, reason = "blanket test suppressions")]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::needless_raw_strings,
+    clippy::needless_raw_string_hashes,
+    clippy::too_many_lines,
+    reason = "tests"
+)]
+mod tests;
+
+use std::{mem, sync::Arc};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use praxis_filter::{
+    BodyAccess, BodyMode, ChainBindingContext, FilterAction, FilterError, FilterPipeline, HttpFilter,
+    HttpFilterContext, IterationState, Rejection, body::MAX_JSON_BODY_BYTES, parse_filter_config,
+};
+use serde_json::Value;
+use tracing::{debug, warn};
+
+use super::{
+    error::responses_error_rejection,
+    state::{
+        DispatchFailure, ResponsesState, consumed_builtin_tool_calls_before_current_round,
+        current_round_tool_call_admissions,
+    },
+};
+use crate::{
+    callout_identity::{CalloutContextMissing, CalloutIdentity, stage_callout_identity},
+    callout_policy::MISSING_CALLOUT_CONTEXT,
+    web_search::{
+        CalloutContext, OpenAiWebSearchConfig, SEARCH_UNAVAILABLE, SearchClient, SearchContextSize, SearchOutcome,
+        SearchResult, build_config, config::MAX_CALLS_PER_ROUND, format_search_results, is_web_search_tool_type,
+    },
+};
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// Step-local metadata carrying the configured response fan-out cap to the owner.
+const MAX_CALLS_METADATA: &str = "responses.web_search_max_calls_per_round";
+
+/// Include value that gates `action.sources` in the output item.
+const INCLUDE_ACTION_SOURCES: &str = "web_search_call.action.sources";
+
+/// Server-side hard cap on search queries dispatched in one continuation.
+///
+/// Bounds the number of (potentially paid) provider requests issued per
+/// re-entry even when the client omits `max_tool_calls`. One
+/// `web_search_call` may carry several queries, so this caps the
+/// query fan-out rather than the number of tool calls. The tool-call allowance
+/// is bounded separately by the client's `max_tool_calls` and by the configured
+/// `max_calls_per_round`.
+const MAX_WEB_SEARCH_QUERIES_PER_CONTINUATION: usize = 64;
+
+/// Model-facing result for a malformed call without `action.query`.
+const MISSING_QUERY_OUTPUT: &str = "Web search could not run because the query was missing.";
+
+/// Model-facing result when the response-wide tool budget is exhausted.
+const TOOL_LIMIT_OUTPUT: &str = "Web search was not executed because max_tool_calls was exhausted.";
+
+/// Model-facing result for a call a budget left undispatched.
+const NOT_PERFORMED_OUTPUT: &str = "Web search not performed.";
+
+/// Model-facing result when the search service returned no results.
+const NO_RESULTS_OUTPUT: &str = "No search results found.";
+
+/// Model-facing result when the search service became unavailable before the call was completed.
+const PARTIAL_UNAVAILABLE_OUTPUT: &str = "Web search was performed partially before search service became unavailable.";
+
+/// Model-facing result when the call was clipped by the maximum query cap.
+const PARTIAL_CLIPPED_OUTPUT: &str = "Web search was performed partially before reaching the maximum query cap.";
+
+// -----------------------------------------------------------------------------
+// WebSearchDispatchFilter
+// -----------------------------------------------------------------------------
+
+/// Web search filter for model-driven `web_search_call` dispatch.
+///
+/// Detects pending web search calls in the response phase and
+/// executes them on re-entry via the `iterative_request_router`
+/// agentic loop.
+///
+/// Each provider request is executed through the shared filtered-subrequest
+/// executor, which enforces destination authority, DNS/SSRF, TLS/SNI, and
+/// `Host` centrally. An optional `outbound_chain` runs operator-managed
+/// cross-cutting filters (headers, credentials, logging) on the callout; when
+/// omitted it defaults to an empty inline chain (pure passthrough), so the
+/// central protections still apply.
+///
+/// # YAML
+///
+/// ```yaml
+/// filter: openai_web_search_dispatch
+/// provider: brave
+/// api_key: ${WEB_SEARCH_API_KEY}
+/// ```
+///
+/// # Full YAML
+///
+/// ```yaml
+/// filter: openai_web_search_dispatch
+/// provider: brave
+/// api_key: ${WEB_SEARCH_API_KEY}
+/// outbound_chain: web_search_outbound
+/// default_context_size: medium
+/// timeout_ms: 10000
+/// max_calls_per_round: 32
+/// ```
+pub struct WebSearchDispatchFilter {
+    /// The search client for executing queries.
+    search_client: SearchClient,
+    /// Default search context size.
+    default_context_size: SearchContextSize,
+    /// Maximum calls accepted from one model response.
+    max_calls_per_round: usize,
+    /// Prebuilt outbound filter chain each provider request executes through.
+    outbound: Arc<FilterPipeline>,
+    /// Configured callout-credential slot id (non-secret). When set, each provider
+    /// request uses the caller's per-user secret from this slot instead of the
+    /// shared `api_key`; a missing/empty slot value fails the response closed.
+    user_credential_slot: Option<String>,
+}
+
+impl WebSearchDispatchFilter {
+    /// Create a filter, binding its configured outbound chain through `ctx`.
+    ///
+    /// Uses an isolated [`SubRequestClient`] with a default pool size of 4.
+    /// Prefer [`from_chain_binding_with_client`] when a shared client is
+    /// available.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the YAML config is invalid, the outbound
+    /// chain cannot be bound, or the search client cannot be constructed.
+    ///
+    /// [`FilterError`]: praxis_filter::FilterError
+    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
+    /// [`from_chain_binding_with_client`]: Self::from_chain_binding_with_client
+    pub fn from_chain_binding(
+        config: &serde_yaml::Value,
+        ctx: &ChainBindingContext<'_>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client = crate::subrequest::isolated_client(4);
+        Self::build(config, client, ctx)
+    }
+
+    /// Create a filter using the shared [`SubRequestClient`], binding its
+    /// configured outbound chain through `ctx`.
+    ///
+    /// The shared client inherits the server-level pool size and connection
+    /// limits from the runtime configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FilterError`] if the YAML config is invalid, the outbound
+    /// chain cannot be bound, or the search client cannot be constructed.
+    ///
+    /// [`FilterError`]: praxis_filter::FilterError
+    /// [`SubRequestClient`]: praxis_core::subrequest::SubRequestClient
+    pub fn from_chain_binding_with_client(
+        config: &serde_yaml::Value,
+        client: crate::subrequest::SubRequestClient,
+        ctx: &ChainBindingContext<'_>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        Self::build(config, client, ctx)
+    }
+
+    /// Shared constructor body: parse config, bind the outbound chain, and
+    /// assemble the filter.
+    ///
+    /// The outbound chain is bound once here via
+    /// [`ChainBindingContext::bind_chain`], so a chain that cannot be resolved
+    /// or built fails the pipeline build rather than a request.
+    fn build(
+        config: &serde_yaml::Value,
+        subrequest_client: crate::subrequest::SubRequestClient,
+        ctx: &ChainBindingContext<'_>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search_dispatch", config)?;
+        // Bind the operator-configured outbound chain before `into_shared`
+        // consumes `cfg`. A `Named` reference resolves against the top-level
+        // `filter_chains` map; an `Inline` reference embeds directly. The
+        // executor seeds and re-pins `filter_ctx.upstream` from the
+        // `StagedUpstream` the search client stages, so the chain needs no
+        // upstream-selecting filter of its own.
+        let outbound = Arc::new(ctx.bind_chain(&cfg.outbound_chain)?);
+        Self::assemble(cfg, subrequest_client, outbound)
+    }
+
+    /// Validate the parsed config and assemble the filter around an
+    /// already-bound outbound pipeline.
+    fn assemble(
+        cfg: OpenAiWebSearchConfig,
+        subrequest_client: crate::subrequest::SubRequestClient,
+        outbound: Arc<FilterPipeline>,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        if cfg.max_calls_per_round == 0 || cfg.max_calls_per_round > MAX_CALLS_PER_ROUND {
+            return Err(format!(
+                "openai_web_search_dispatch: max_calls_per_round must be between 1 and {MAX_CALLS_PER_ROUND}"
+            )
+            .into());
+        }
+        let max_calls_per_round = cfg.max_calls_per_round;
+        let validated = build_config("openai_web_search_dispatch", &cfg.into_shared())?;
+        let search_client = SearchClient::from_config("openai_web_search_dispatch", &validated, subrequest_client)?;
+        Ok(Box::new(Self {
+            search_client,
+            default_context_size: validated.default_context_size,
+            max_calls_per_round,
+            outbound,
+            user_credential_slot: validated.user_credential,
+        }))
+    }
+
+    /// Test-only convenience constructor binding a minimal outbound chain.
+    ///
+    /// Production registers `openai_web_search_dispatch` as a chain-binding filter and
+    /// supplies the operator-configured outbound chain (see
+    /// [`from_chain_binding`](Self::from_chain_binding)); unit tests that only
+    /// exercise dispatch logic bind a minimal builtin-only chain, since the
+    /// [`FilteredSubrequestExecutor`] seeds the upstream from the search
+    /// client's `StagedUpstream` and still enforces destination authority,
+    /// DNS/SSRF, TLS/SNI, and `Host` centrally.
+    ///
+    /// [`FilteredSubrequestExecutor`]: praxis_filter::FilteredSubrequestExecutor
+    #[cfg(test)]
+    fn from_config(config: &serde_yaml::Value) -> Result<Box<dyn HttpFilter>, FilterError> {
+        let client = crate::subrequest::isolated_client(4);
+        Self::from_config_with_client(config, client)
+    }
+
+    /// Test-only convenience constructor (shared client, minimal outbound chain).
+    ///
+    /// See [`from_config`](Self::from_config).
+    #[cfg(test)]
+    fn from_config_with_client(
+        config: &serde_yaml::Value,
+        client: crate::subrequest::SubRequestClient,
+    ) -> Result<Box<dyn HttpFilter>, FilterError> {
+        // `outbound_chain` is optional, so fixtures that omit it parse via the
+        // default. Bind a minimal builtin-only pipeline for tests (the executor
+        // still enforces SSRF/TLS/Host regardless of chain contents); private
+        // upstreams are permitted so tests can dial loopback mocks.
+        let cfg: OpenAiWebSearchConfig = parse_filter_config("openai_web_search_dispatch", config)?;
+        let outbound = crate::web_search::test_outbound_pipeline()?;
+        Self::assemble(cfg, client, Arc::new(outbound))
+    }
+
+    /// Execute a single web search call and append its outcome to state.
+    ///
+    /// A provider failure never rejects the Response. The model instead
+    /// receives a truthful `failed` `web_search_call` plus a bounded failure
+    /// message — bridged as a backend-valid `function_call`/`function_call_output`
+    /// pair — so the agentic loop can continue. Uses the batch-resolved caller
+    /// identity for provider credential staging and owner attribution.
+    ///
+    /// The call's identities carry its position within the pending queue, which
+    /// keeps the synthetic bridge `call_id` unique even when the hosted source
+    /// ids collide or are absent (issue #808).
+    ///
+    /// Returns how many queries were dispatched.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "threads the batch-resolved caller identity into the provider search"
+    )]
+    async fn execute_single_search(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        prepared: PreparedCall<'_>,
+        context_size: SearchContextSize,
+        identity: &CalloutIdentity,
+        query_cap: usize,
+    ) -> usize {
+        let PreparedCall { ids, queries, action } = prepared;
+        let mut results = Vec::new();
+        let mut dispatched = 0_usize;
+        let mut successful = 0_usize;
+        for query in queries.iter().take(query_cap) {
+            dispatched = dispatched.saturating_add(1);
+            // Capture the originating client's attributes and current outbound depth
+            // so the callout's outbound chain sees the real caller and the executor
+            // continues this request's depth accounting instead of resetting to zero.
+            let callout = CalloutContext::from_filter_context(ctx);
+            match self
+                .search_client
+                .search(&self.outbound, callout, query, Some(context_size), identity)
+                .await
+            {
+                SearchOutcome::Results(mut query_results) => results.append(&mut query_results),
+                SearchOutcome::Failed => {
+                    warn!(
+                        call_id = ids.public,
+                        "web search provider failed; continuing with a failed tool result"
+                    );
+                    let (status, notice) = status_and_notice(successful, queries.len(), query_cap);
+                    append_search_turn(ctx, &ids, status, action, &results, notice);
+                    return dispatched;
+                },
+            }
+            successful = successful.saturating_add(1);
+        }
+        let (status, notice) = status_and_notice(successful, queries.len(), query_cap);
+        append_search_turn(ctx, &ids, status, action, &results, notice);
+        dispatched
+    }
+
+    /// Fail closed with a 401 when the initial request declares an eligible hosted
+    /// web-search tool but the required per-user credential is absent, before the
+    /// first inference round runs.
+    ///
+    /// The re-entry check in [`Self::resolve_batch_identity`] runs only after the
+    /// model emits a `web_search` call; under terminal streaming that is after HTTP
+    /// 200 has committed — too late to fail closed, and it leaks the first round's
+    /// output. This round-0 preflight closes that gap for both streaming and
+    /// buffered transports. The identity is re-derived at re-entry from the same
+    /// context, so this only proves presence and discards its result.
+    fn preflight_managed_credential(&self, ctx: &HttpFilterContext<'_>) -> Result<(), Rejection> {
+        match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
+            Ok(_identity) => Ok(()),
+            Err(CalloutContextMissing::Credential { slot }) => Err(responses_error_rejection(
+                401,
+                MISSING_CALLOUT_CONTEXT,
+                &format!("web search requires the '{slot}' per-user credential, which was not provided"),
+            )),
+        }
+    }
+
+    /// Resolve the caller's identity once for the whole batch, recording a fail-closed
+    /// 401 security failure and returning `None` when a required per-user credential is absent.
+    fn resolve_batch_identity(&self, ctx: &mut HttpFilterContext<'_>) -> Option<CalloutIdentity> {
+        match stage_callout_identity(ctx, self.user_credential_slot.as_deref()) {
+            Ok(identity) => Some(identity),
+            Err(CalloutContextMissing::Credential { slot }) => {
+                if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+                    state.record_security_failure(DispatchFailure {
+                        status: 401,
+                        code: MISSING_CALLOUT_CONTEXT,
+                        message: format!(
+                            "web search requires the '{slot}' per-user credential, which was not provided"
+                        ),
+                    });
+                }
+                None
+            },
+        }
+    }
+
+    /// Update cumulative execution count and clear the pending queue after dispatch.
+    fn finalize_pending_searches(ctx: &mut HttpFilterContext<'_>, dispatched: usize) {
+        if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.web_search_calls_executed = state
+                .web_search_calls_executed
+                .saturating_add(u32::try_from(dispatched).unwrap_or(u32::MAX));
+            state.web_search_calls.clear();
+        }
+    }
+
+    /// Execute admitted web search `calls` within the batch budgets, then
+    /// update the cumulative execution count and clear the pending queue.
+    ///
+    /// [`admit_call`] resolves every call the batch budgets exclude, so only
+    /// admitted calls reach the provider here. A call that gets only part of
+    /// its queries is dispatched and reported incomplete with the results it
+    /// obtained. Returns whether any call was rejected by the response-wide
+    /// ordered admission pass, which forces local completion without another
+    /// model round.
+    async fn execute_pending_searches(&self, ctx: &mut HttpFilterContext<'_>, batch: PendingSearchBatch<'_>) -> bool {
+        // A missing per-user credential recorded a write-once security failure in
+        // `resolve_batch_identity`. The agentic loop consults `security_failure.take()`
+        // before any pending-queue logic, so it 401s before this queue is read again;
+        // leaving `web_search_calls` un-cleared here is intentional, not a leak.
+        let Some(identity) = self.resolve_batch_identity(ctx) else {
+            return false;
+        };
+        let mut calls_dispatched = 0_usize;
+        let mut queries_dispatched = 0_usize;
+        let mut tool_limit_exceeded = false;
+        for prepared in batch.calls {
+            let rejected = rejected(batch.admissions, prepared.ids.index);
+            tool_limit_exceeded |= rejected;
+            let query_cap = batch.query_budget.saturating_sub(queries_dispatched);
+            let over_budget = calls_dispatched >= batch.call_budget || query_cap == 0;
+            let Some(prepared) = admit_call(ctx, prepared, rejected, over_budget) else {
+                continue;
+            };
+            let dispatched = self
+                .execute_single_search(ctx, prepared, batch.context_size, &identity, query_cap)
+                .await;
+            if dispatched > 0 {
+                calls_dispatched = calls_dispatched.saturating_add(1);
+                queries_dispatched = queries_dispatched.saturating_add(dispatched);
+            }
+        }
+
+        Self::finalize_pending_searches(ctx, calls_dispatched);
+        tool_limit_exceeded
+    }
+}
+
+#[async_trait]
+impl HttpFilter for WebSearchDispatchFilter {
+    fn name(&self) -> &'static str {
+        "openai_web_search_dispatch"
+    }
+
+    fn visit_nested_pipelines(&mut self, visitor: &mut dyn FnMut(&mut FilterPipeline)) {
+        if let Some(pipeline) = Arc::get_mut(&mut self.outbound) {
+            visitor(pipeline);
+        } else {
+            debug_assert!(
+                false,
+                "openai_web_search_dispatch outbound pipeline must be uniquely owned during configuration"
+            );
+        }
+    }
+
+    fn referenced_files(&self) -> Vec<std::path::PathBuf> {
+        self.outbound.referenced_files()
+    }
+
+    fn apply_insecure_options(&self, options: &praxis_core::config::InsecureOptions) {
+        self.outbound.apply_insecure_options(options);
+    }
+
+    fn request_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    fn request_body_mode(&self) -> BodyMode {
+        // Buffer up to the absolute JSON ceiling; the pipeline's body_limits
+        // governs the real raw-request cap (merged across sibling filters and
+        // clamped to the transport ceiling by praxis core).
+        BodyMode::StreamBuffer {
+            max_bytes: Some(MAX_JSON_BODY_BYTES),
+        }
+    }
+
+    fn response_body_access(&self) -> BodyAccess {
+        BodyAccess::ReadOnly
+    }
+
+    fn response_body_mode(&self) -> BodyMode {
+        BodyMode::Stream
+    }
+
+    async fn on_request(&self, _ctx: &mut HttpFilterContext<'_>) -> Result<FilterAction, FilterError> {
+        Ok(FilterAction::Continue)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "budgeted dispatch and local terminal response form one lifecycle"
+    )]
+    async fn on_request_body(
+        &self,
+        ctx: &mut HttpFilterContext<'_>,
+        _body: &mut Option<Bytes>,
+        end_of_stream: bool,
+    ) -> Result<FilterAction, FilterError> {
+        if !end_of_stream {
+            return Ok(FilterAction::Continue);
+        }
+        ctx.set_metadata(MAX_CALLS_METADATA, self.max_calls_per_round.to_string());
+
+        let Some(state) = ctx.extensions.get::<ResponsesState>() else {
+            return Ok(FilterAction::Continue);
+        };
+
+        // Round-0 credential preflight. When the initial request declares a hosted
+        // web-search tool that could run under the effective `tool_choice` and a
+        // per-user credential slot is configured, resolve it now so a missing
+        // credential fails closed BEFORE any inference round runs — the re-entry
+        // check would otherwise fire only after streaming has committed HTTP 200.
+        if self.user_credential_slot.is_some()
+            && is_initial_request(ctx)
+            && request_declares_eligible_web_search(state)
+            && let Err(rejection) = self.preflight_managed_credential(ctx)
+        {
+            return Ok(FilterAction::Reject(rejection));
+        }
+
+        if state.web_search_calls.is_empty() {
+            return Ok(FilterAction::Continue);
+        }
+
+        let admissions = state
+            .max_tool_calls
+            .map(|_| current_round_tool_call_admissions(state, &state.web_search_calls));
+        let context_size = ctx
+            .get_metadata("tool_parse.search_context_size")
+            .or_else(|| web_search_context_size_from_state(state))
+            .map_or(self.default_context_size, SearchContextSize::from_str_or_default);
+
+        // Compute the remaining budget while the shared immutable borrow is
+        // still live, then move the web search calls out instead of cloning
+        // and then removing them from state.
+        let call_budget = remaining_web_search_budget(state);
+        let calls: Vec<Value> = ctx
+            .extensions
+            .get_mut::<ResponsesState>()
+            .map(|state| mem::take(&mut state.web_search_calls))
+            .unwrap_or_default();
+
+        // Parse each pending action once here; every dispatch branch below
+        // reuses the same parse instead of re-reading the raw call.
+        let prepared = prepare_calls(&calls);
+
+        let execute_count = admissions.as_ref().map_or(prepared.len(), |values| {
+            values.iter().filter(|admitted| **admitted).count()
+        });
+        let rejected_count = prepared.len().saturating_sub(execute_count);
+        debug!(
+            count = execute_count,
+            rejected = rejected_count,
+            "executing pending web search calls"
+        );
+
+        let tool_limit_exceeded = self
+            .execute_pending_searches(
+                ctx,
+                PendingSearchBatch {
+                    calls: prepared,
+                    admissions: admissions.as_deref(),
+                    call_budget,
+                    query_budget: MAX_WEB_SEARCH_QUERIES_PER_CONTINUATION,
+                    context_size,
+                },
+            )
+            .await;
+        if tool_limit_exceeded && let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+            state.deferred_tool_limit_completion = true;
+        }
+        Ok(FilterAction::Continue)
+    }
+}
+
+/// Return the response fan-out cap this dispatcher published for the owner.
+pub(crate) fn configured_max_calls_per_round(ctx: &HttpFilterContext<'_>) -> Option<usize> {
+    ctx.get_metadata(MAX_CALLS_METADATA)?.parse().ok()
+}
+
+/// Whether this is the initial client request (model round 0), not an IRR re-entry.
+///
+/// The credential preflight applies only to the fresh request: on re-entry the
+/// pending-queue path already resolves and fail-closes the credential.
+fn is_initial_request(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<IterationState>()
+        .is_none_or(|state| state.iteration() == 0)
+}
+
+/// Whether the initial request declares a hosted web-search tool that could run
+/// under the effective `tool_choice`, so a per-user credential preflight applies.
+fn request_declares_eligible_web_search(state: &ResponsesState) -> bool {
+    let declares = state.tools.iter().any(|tool| {
+        tool.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(is_web_search_tool_type)
+    });
+    declares && tool_choice_permits_web_search(&state.tool_choice)
+}
+
+/// Whether `tool_choice` leaves a hosted web-search tool eligible to run this turn.
+///
+/// `"none"` forbids all tools; an object forcing a single non-web-search tool
+/// (e.g. `{"type": "function", ...}`) also excludes it. Every other shape —
+/// `"auto"`, `"required"`, an object forcing a web-search tool, `allowed_tools`,
+/// or an absent/unknown choice — keeps web search eligible. Being conservatively
+/// eligible is safe: the re-entry check still fails closed if the callout runs.
+fn tool_choice_permits_web_search(tool_choice: &Value) -> bool {
+    match tool_choice {
+        Value::String(keyword) => keyword != "none",
+        Value::Object(choice) => match choice.get("type").and_then(Value::as_str) {
+            Some(kind) if is_web_search_tool_type(kind) => true,
+            Some("allowed_tools") | None => true,
+            Some(_) => false,
+        },
+        _ => true,
+    }
+}
+
+/// Borrowed inputs for one request-side web-search dispatch batch.
+struct PendingSearchBatch<'a> {
+    /// Calls retained from the current model round, parsed once.
+    calls: Vec<PreparedCall<'a>>,
+    /// Ordered response-wide budget decisions, when the client set a limit.
+    admissions: Option<&'a [bool]>,
+    /// Remaining built-in tool calls allowed by the client's `max_tool_calls`.
+    call_budget: usize,
+    /// Remaining provider requests (queries) allowed by the server-side fan-out cap.
+    query_budget: usize,
+    /// Search result size requested for this response.
+    context_size: SearchContextSize,
+}
+
+/// Public and bridge identifiers for one appended web-search result.
+///
+/// `public` is the hosted, client-facing `web_search_call.id` retained on the
+/// public output item. `bridge` is the bounded, deterministic id used for the
+/// backend-valid `function_call`/`function_call_output` pair, since the raw
+/// hosted id can exceed the `OpenResponses` 64-character `call_id` limit (issue
+/// #808).
+///
+/// Owned by the [`PreparedCall`] it identifies, so both derive from one parse.
+struct SearchCallIds<'a> {
+    /// Client-facing `web_search_call.id` for the public output item.
+    public: &'a str,
+    /// Bounded, backend-valid id for the synthetic bridge pair.
+    bridge: String,
+    /// Position within the current model round.
+    index: usize,
+}
+
+impl<'a> SearchCallIds<'a> {
+    /// Derive the bounded bridge ID for one provider-facing ID and round position.
+    fn new(public: &'a str, queries: &[&str], index: usize) -> Self {
+        Self {
+            public,
+            bridge: bridge_call_id(public, queries, index),
+            index,
+        }
+    }
+}
+
+/// One pending call, with its hosted action parsed once for the whole batch.
+struct PreparedCall<'a> {
+    /// Identities derived from this call's id, queries, and round position.
+    ids: SearchCallIds<'a>,
+    /// Queries in provider-supplied order; empty when the call is malformed.
+    queries: Vec<&'a str>,
+    /// Canonical client-visible search action; `Null` when the call is malformed.
+    action: Value,
+}
+
+impl<'a> PreparedCall<'a> {
+    /// Pair a parsed action with the identities its queries and position derive.
+    fn new(call_id: &'a str, index: usize, queries: Vec<&'a str>, action: Value) -> Self {
+        Self {
+            ids: SearchCallIds::new(call_id, &queries, index),
+            queries,
+            action,
+        }
+    }
+
+    /// Placeholder for a call carrying no usable `action.queries` or `action.query`.
+    fn malformed(call_id: &'a str, index: usize) -> Self {
+        Self::new(call_id, index, Vec::new(), Value::Null)
+    }
+}
+
+/// Parse each pending call once, preserving pending-queue order.
+fn prepare_calls(calls: &[Value]) -> Vec<PreparedCall<'_>> {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let call_id = call.get("id").and_then(Value::as_str).unwrap_or("ws_unknown");
+            parse_search_request(call, call_id, index).unwrap_or_else(|| PreparedCall::malformed(call_id, index))
+        })
+        .collect()
+}
+
+/// Whether the response-wide ordered admission pass refused the call at
+/// `index`. Absent admissions mean the client set no `max_tool_calls`.
+fn rejected(admissions: Option<&[bool]>, index: usize) -> bool {
+    admissions
+        .and_then(|values| values.get(index))
+        .is_some_and(|admitted| !admitted)
+}
+
+/// Decide whether one pending call may reach the provider, appending its
+/// terminal turn when it may not.
+///
+/// A call without a usable query is surfaced as incomplete on every path, since
+/// neither rejection nor a budget has anything to dispatch. A call `rejected` by
+/// the response-wide ordered admission pass fails locally and forces completion
+/// without another model round. An `over_budget` call — one that can spend
+/// neither a tool-call unit nor a single provider request — is surfaced as
+/// incomplete without reaching the provider.
+fn admit_call<'a>(
+    ctx: &mut HttpFilterContext<'_>,
+    prepared: PreparedCall<'a>,
+    rejected: bool,
+    over_budget: bool,
+) -> Option<PreparedCall<'a>> {
+    if prepared.queries.is_empty() {
+        warn!(
+            call_id = prepared.ids.public,
+            "web_search_call missing valid action.queries or action.query, skipping"
+        );
+        append_incomplete(ctx, &prepared.ids);
+        return None;
+    }
+    let (status, notice) = if rejected {
+        ("failed", TOOL_LIMIT_OUTPUT)
+    } else if over_budget {
+        ("incomplete", NOT_PERFORMED_OUTPUT)
+    } else {
+        return Some(prepared);
+    };
+    append_search_turn(ctx, &prepared.ids, status, prepared.action, &[], Some(notice));
+    None
+}
+
+/// Resolve one dispatched call's terminal status and its model-facing notice.
+fn status_and_notice(successful: usize, n_queries: usize, query_cap: usize) -> (&'static str, Option<&'static str>) {
+    if successful == 0 {
+        return ("failed", Some(SEARCH_UNAVAILABLE));
+    }
+
+    if successful < n_queries && successful < query_cap {
+        return ("incomplete", Some(PARTIAL_UNAVAILABLE_OUTPUT));
+    }
+
+    if successful == query_cap && successful < n_queries {
+        return ("incomplete", Some(PARTIAL_CLIPPED_OUTPUT));
+    }
+
+    ("completed", None)
+}
+
+/// Recover per-request search context after IRR resets step-local metadata.
+fn web_search_context_size_from_state(state: &ResponsesState) -> Option<&str> {
+    state.tools.iter().find_map(|tool| {
+        let tool_type = tool.get("type").and_then(Value::as_str)?;
+        if is_web_search_tool_type(tool_type) {
+            tool.get("search_context_size").and_then(Value::as_str)
+        } else {
+            None
+        }
+    })
+}
+
+/// Parse a hosted search action while preserving legacy compatibility. A valid,
+/// non-empty `queries` array is authoritative, with (deprecated) `query` as a fallback.
+fn parse_search_request<'a>(call: &'a Value, call_id: &'a str, index: usize) -> Option<PreparedCall<'a>> {
+    let action = call.get("action")?;
+    let legacy_query = action.get("query").and_then(Value::as_str);
+    match action.get("queries") {
+        Some(Value::Array(values)) if !values.is_empty() => {
+            let queries = values.iter().map(Value::as_str).collect::<Option<Vec<_>>>()?;
+            if legacy_query.is_some() {
+                warn!(
+                    call_id,
+                    "web_search_call contains deprecated action.query and action.queries; using action.queries"
+                );
+            }
+            let action = serde_json::json!({"type": "search", "queries": queries});
+            Some(PreparedCall::new(call_id, index, queries, action))
+        },
+        Some(Value::Array(_)) | None => legacy_query.map(|query| {
+            let action = serde_json::json!({"type": "search", "query": query});
+            PreparedCall::new(call_id, index, vec![query], action)
+        }),
+        Some(_) => None,
+    }
+}
+
+/// Remaining web searches this continuation may dispatch.
+///
+/// This is only the tool-call dimension: it counts logical built-in tool calls,
+/// so a three-query `web_search_call` costs one unit. The (potentially paid)
+/// provider requests such a call issues are bounded separately by
+/// [`MAX_WEB_SEARCH_QUERIES_PER_CONTINUATION`]. When the client omits
+/// `max_tool_calls`, only that server cap constrains the dispatch.
+///
+/// `max_tool_calls` is a single budget shared across *every* built-in tool
+/// type, so the allowance is the declared maximum minus all built-in calls
+/// already admitted in prior model rounds. Calls are reconstructed from retained
+/// output occurrences rather than provider execution counts, so incomplete
+/// calls remain charged and a current-round web execution cannot be counted
+/// again when a sibling dispatcher evaluates ordered admission. Matching calls
+/// copied between state owners are reconciled by occurrence multiplicity,
+/// mirroring
+/// the owner-side ordered admission applied to file-search assignments.
+fn remaining_web_search_budget(state: &ResponsesState) -> usize {
+    let used = consumed_builtin_tool_calls_before_current_round(state);
+    state.max_tool_calls.map_or(usize::MAX, |max| {
+        usize::try_from(max).unwrap_or(usize::MAX).saturating_sub(used)
+    })
+}
+
+/// Append a completed search turn to [`ResponsesState`].
+///
+/// An empty `results` slice is a successful zero-result search: the model
+/// receives `No search results found.` and the public item stays `completed`.
+/// A non-`completed` status with no results (an over-budget call that was never
+/// dispatched, or one whose every provider request failed) threads through a
+/// truthful `failure_output` bridge, so the model-facing history never
+/// contradicts the client-visible output item or pollutes durable rehydration
+/// history. A partially dispatched call bridges the results it did gather. A
+/// missing-query call uses the more specific [`append_incomplete`] instead.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one search turn's identities, status, action, results, and failure text"
+)]
+fn append_search_turn(
+    ctx: &mut HttpFilterContext<'_>,
+    ids: &SearchCallIds<'_>,
+    status: &str,
+    action: Value,
+    results: &[SearchResult],
+    notice: Option<&'static str>,
+) {
+    let include_sources = include_action_sources(ctx);
+    let bridge = build_tool_result_messages(&ids.bridge, &action, results, notice);
+    let output_item = build_output_item(ids.public, status, action, results, include_sources);
+    push_search_turn(ctx, output_item, bridge, ids.index);
+}
+
+/// Append a malformed search turn to [`ResponsesState`].
+///
+/// The public item remains `incomplete`, while the backend-valid bridge carries
+/// the missing arguments and an explicit failure message. This prevents the
+/// next inference iteration and persisted replay from treating a missing query
+/// as a successful search with zero results.
+fn append_incomplete(ctx: &mut HttpFilterContext<'_>, ids: &SearchCallIds<'_>) {
+    let include_sources = include_action_sources(ctx);
+    let output_item = build_output_item(
+        ids.public,
+        "incomplete",
+        serde_json::json!({"type": "search", "query": ""}),
+        &[],
+        include_sources,
+    );
+    let bridge = build_incomplete_tool_result_messages(&ids.bridge);
+    push_search_turn(ctx, output_item, bridge, ids.index);
+}
+
+/// Whether `action.sources` should be included in output items, per the
+/// `web_search_call.action.sources` include gate.
+fn include_action_sources(ctx: &HttpFilterContext<'_>) -> bool {
+    ctx.extensions
+        .get::<ResponsesState>()
+        .is_some_and(|s| s.include.iter().any(|v| v == INCLUDE_ACTION_SOURCES))
+}
+
+/// Push a search turn — public output item plus the model-facing bridge pair —
+/// into state.
+///
+/// `bridge` is the backend-valid `function_call`/`function_call_output` pair.
+/// The per-element clone is required: `messages` and `persisted_messages` are
+/// distinct owners of the bridge messages. The public `output_item` is upserted
+/// so the placeholder accumulated during the response phase is replaced in
+/// place, never duplicated.
+fn push_search_turn(ctx: &mut HttpFilterContext<'_>, output_item: Value, bridge: [Value; 2], index: usize) {
+    if let Some(state) = ctx.extensions.get_mut::<ResponsesState>() {
+        state.messages.extend(bridge.iter().cloned());
+        state.persisted_messages.extend(bridge);
+        // Record execution provenance keyed on the item id `stream_events` reads:
+        // this replaces the model's placeholder with an executed result, so only
+        // now may the search's lifecycle be synthesized. A placeholder copied into
+        // `accumulated_output` by a failed round never reaches here.
+        if let Some(id) = output_item.get("id").and_then(Value::as_str) {
+            state.locally_executed_output_items.insert(id.to_owned());
+        }
+        let round_start = state
+            .current_round_output_start
+            .unwrap_or(state.accumulated_output.len());
+        upsert_output_item(&mut state.accumulated_output, round_start, index, output_item);
+    }
+}
+
+/// Replace one current-round `web_search_call` by model position, or append it.
+///
+/// The response phase (`agentic_loop::collect_output_items`) already
+/// accumulated each model placeholder in output order. Updating the indexed
+/// placeholder keeps duplicate and absent provider IDs distinct. When no
+/// current-round placeholder exists (isolated unit contexts), append instead.
+fn upsert_output_item(accumulated: &mut Vec<Value>, round_start: usize, index: usize, output_item: Value) {
+    if let Some(slot) = accumulated.get_mut(round_start..).and_then(|items| {
+        items
+            .iter_mut()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
+            .nth(index)
+    }) {
+        *slot = output_item;
+        return;
+    }
+    accumulated.push(output_item);
+}
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// Emit a `web_search_call` status update via filter results.
+#[cfg_attr(not(test), expect(dead_code, reason = "reserved for per-call status tracking"))]
+pub(crate) fn emit_status(ctx: &mut HttpFilterContext<'_>, call_id: &str, status: &str) {
+    let key = format!("web_search_call_{call_id}");
+    let results = ctx.filter_results.entry("openai_web_search_dispatch").or_default();
+    if results.set(key, status.to_owned()).is_ok() {
+        debug!(call_id, status, "emitted web_search_call status");
+    }
+}
+
+/// Build a `web_search_call` output item for the response.
+///
+/// `action.sources` is only included when `include_sources` is true,
+/// matching the `web_search_call.action.sources` include gate.
+pub(crate) fn build_output_item(
+    call_id: &str,
+    status: &str,
+    mut action: Value,
+    results: &[SearchResult],
+    include_sources: bool,
+) -> Value {
+    if include_sources {
+        let sources: Vec<Value> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "type": "url",
+                    "url": r.url,
+                })
+            })
+            .collect();
+        if let Some(obj) = action.as_object_mut() {
+            obj.insert("sources".to_owned(), Value::Array(sources));
+        }
+    }
+
+    serde_json::json!({
+        "type": "web_search_call",
+        "id": call_id,
+        "status": status,
+        "action": action,
+    })
+}
+
+/// Build the backend-valid continuation for a search.
+///
+/// A hosted `web_search_call` item is not a valid `OpenResponses` `input`
+/// type (see issue #808), so the model-facing history bridges the result
+/// through a synthetic `function_call` + `function_call_output` pair —
+/// mirroring [`file_search_dispatch`](super::file_search_dispatch). The
+/// public `web_search_call` output item is emitted separately by
+/// [`build_output_item`] and only reaches `accumulated_output`.
+///
+/// `call_id` must be a bounded, backend-valid identifier from
+/// [`bridge_call_id`]: the raw hosted id can exceed the `OpenResponses`
+/// 64-character `call_id` limit.
+pub(crate) fn build_tool_result_messages(
+    call_id: &str,
+    action: &Value,
+    results: &[SearchResult],
+    notice: Option<&'static str>,
+) -> [Value; 2] {
+    let content = match (results.is_empty(), notice) {
+        // Completed with zero rows: a successful search that found nothing.
+        (true, None) => NO_RESULTS_OUTPUT.to_owned(),
+        // Never dispatched, every query failed, or no results: the notice is the only content.
+        (true, Some(notice)) => notice.to_owned(),
+        // Search successful without failure / partial: return the results.
+        (false, None) => format_search_results(results),
+        // Partial: keep the rows the call did gather and append the notice.
+        (false, Some(notice)) => {
+            let mut content = format_search_results(results);
+            content.push_str("\n\n");
+            content.push_str(notice);
+            content
+        },
+    };
+    let arguments = search_arguments(action).to_string();
+    [
+        serde_json::json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "web_search",
+            "arguments": arguments,
+            "status": "completed",
+        }),
+        serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": content,
+        }),
+    ]
+}
+
+/// Derive the private function arguments from the client-visible action.
+fn search_arguments(action: &Value) -> Value {
+    match action.get("queries") {
+        Some(queries) => serde_json::json!({"queries": queries}),
+        None => serde_json::json!({"query": action.get("query").and_then(Value::as_str).unwrap_or_default()}),
+    }
+}
+
+/// Build the backend-valid continuation for a call missing `action.query`.
+///
+/// The synthetic function call is fully generated, so its status is
+/// `completed`; the empty arguments and explicit output truthfully describe
+/// the incomplete hosted-tool execution.
+pub(crate) fn build_incomplete_tool_result_messages(call_id: &str) -> [Value; 2] {
+    [
+        serde_json::json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "web_search",
+            "arguments": "{}",
+            "status": "completed",
+        }),
+        serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": MISSING_QUERY_OUTPUT,
+        }),
+    ]
+}
+
+/// FNV-1a offset basis for deterministic bridge identities.
+const FNV_OFFSET_BASIS: u64 = 0xCBF2_9CE4_8422_2325;
+
+/// Derive a deterministic, bounded `call_id` for the synthetic bridge.
+///
+/// A hosted `web_search_call.id` is unbounded, but the synthetic
+/// `function_call` `call_id` must stay within the `OpenResponses`
+/// 64-character limit or a conforming backend rejects the continuation
+/// (issue #808) — mirroring the bounded ids in
+/// [`file_search_dispatch`](super::file_search_dispatch).
+///
+/// `index` is the call's position in the pending queue, guaranteeing distinct
+/// ids even when `source_id` values collide or are absent — otherwise multiple
+/// bridges would share one `call_id` and their `function_call_output` pairing
+/// would be ambiguous. The `ws_{index}_{hash:016x}` form is at most 40 bytes.
+pub(crate) fn bridge_call_id(source_id: &str, queries: &[&str], index: usize) -> String {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for part in std::iter::once(source_id).chain(queries.iter().copied()) {
+        for byte in part.as_bytes().iter().copied().chain(std::iter::once(0xFF)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+    }
+    format!("ws_{index}_{hash:016x}")
+}

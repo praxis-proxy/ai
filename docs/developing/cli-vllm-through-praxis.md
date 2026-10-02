@@ -254,7 +254,7 @@ not include `store-sqlite` (it selects `store-postgres` as the store backend).
 cannot run on the stock image; `--validate` rejects it up front:
 
 ```text
-invalid configuration: openai_response_store: backend 'sqlite' is unavailable; rebuild with the 'store-sqlite' feature
+invalid configuration: openai_store: backend 'sqlite' is unavailable; rebuild with the 'store-sqlite' feature
 ```
 
 The other three examples in this section have no store filter and run on the
@@ -275,7 +275,7 @@ and the first `/v1/responses` request fails with HTTP 500 and
 container user can write instead:
 
 ```yaml
-- filter: openai_response_store
+- filter: openai_store
   backend: sqlite
   database_url: "sqlite:///data/responses.db?mode=rwc"
 ```

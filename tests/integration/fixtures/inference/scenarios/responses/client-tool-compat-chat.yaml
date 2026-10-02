@@ -1,6 +1,6 @@
 version: 1
 id: responses/client-tool-compat-chat
-description: Rich Codex custom client tool lowered to a private Chat function on a function-only Chat Completions backend, translated by responses_to_chat_completions, then restored to a custom_tool_call (GitHub issue #1206).
+description: Rich Codex custom client tool lowered to a private Chat function on a function-only Chat Completions backend, translated by openai_responses_to_chat_completions, then restored to a custom_tool_call (GitHub issue #1206).
 protocol: openai_responses
 example_config: openai/responses/client-tool-compat-chat-completions.yaml
 upstream_authority: 127.0.0.1:3001

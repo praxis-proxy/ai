@@ -85,7 +85,7 @@ pub(crate) fn lint(_args: LintArgs) {
 }
 
 /// The curated one-line description of every discoverable filter, keyed by the
-/// filter's registered `name()` (e.g. `"openai_responses_proxy"`).
+/// filter's registered `name()` (e.g. `"openai_proxy"`).
 ///
 /// This is the authoritative "known filter" catalog: it is derived from the same
 /// `syn`-parsed source metadata that drives `docs/filters/`, so a filter is
@@ -2728,7 +2728,7 @@ mod tests {
         let shared_items = parse_shared_config_items(&root);
         let filters = discover_all_filters(&root, &shared_items);
 
-        for filter_name in ["anthropic_web_search", "openai_web_search"] {
+        for filter_name in ["anthropic_web_search", "openai_web_search_dispatch"] {
             let filter = filters
                 .iter()
                 .find(|entry| entry.filter.name == filter_name)

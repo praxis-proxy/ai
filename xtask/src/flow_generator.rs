@@ -751,7 +751,7 @@ filter_chains:
                 clusters:
                   - name: inference-backend
                     endpoints: ["127.0.0.1:3001"]
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
             on_result:
               - filter: openai_agentic_loop
                 key: action

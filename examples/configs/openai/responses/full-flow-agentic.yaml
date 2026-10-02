@@ -55,7 +55,7 @@
 #      canonical terminal state before releasing response.completed, including
 #      when the Response itself has store:false.
 #
-#   2. openai_responses_format classifies the request and promotes
+#   2. openai_format classifies the request and promotes
 #      format, model, stream, and mode to internal routing headers.
 #      on_invalid is left at the default (passthrough) so that
 #      Conversations API traffic is not rejected before the conversations
@@ -65,10 +65,10 @@
 #      This order is required: it binds the logical provider/protocol before
 #      their `unless application_provider=openai` conditions are evaluated.
 #      The filters then run once against the buffered request. The OpenAI route
-#      is true passthrough; on managed routes openai_responses_validate checks
+#      is true passthrough; on managed routes openai_validate checks
 #      JSON, initializes ResponsesState, and rejects gateway-unsupported fields
 #      such as background=true. Prompt-template compatibility is checked later,
-#      after load-balancer selection, by openai_responses_proxy.
+#      after load-balancer selection, by openai_proxy.
 #
 #   4. On managed routes, openai_tool_parse parses the tools array and
 #      tool_choice from Responses API requests and promotes summary facts
@@ -76,7 +76,7 @@
 #      metadata and filter results. It does not mutate the request body and is
 #      skipped with the other gateway-owned body work on direct OpenAI routes.
 #
-#   5. openai_response_store persists responses to SQLite and registers
+#   5. openai_store persists responses to SQLite and registers
 #      the store backend so downstream filters (rehydrate, compact) can
 #      read from it. It runs once at the post-binding body barrier before
 #      the iterative_request_router, so on the response path — which runs in reverse config
@@ -85,7 +85,7 @@
 #      reads the accumulated response object that openai_stream_events
 #      builds inside the IRR.
 #
-#   6. openai_responses_rehydrate loads conversation context from
+#   6. openai_rehydrate loads conversation context from
 #      previous_response_id or conversation field by fetching stored
 #      responses/conversations and prepending their message history to the
 #      current request. previous_response_id takes precedence when both
@@ -120,11 +120,11 @@
 #
 #   11. The iterative_request_router owns the agentic loop for classified
 #      openai_responses create requests. For a native Responses upstream,
-#      openai_responses_proxy rebuilds the outbound body from ResponsesState
+#      openai_proxy rebuilds the outbound body from ResponsesState
 #      and automatically selects the typed streaming transport for an
 #      effective `stream: true` request, so each backend SSE chunk reaches
 #      openai_stream_events incrementally; for a Chat Completions upstream,
-#      responses_to_chat_completions does the equivalent build and translates
+#      openai_responses_to_chat_completions does the equivalent build and translates
 #      Chat responses back to Responses. Both now run AFTER the step load
 #      balancer, each gated on the selected upstream's protocol (see the
 #      "Protocol-adaptive translation" note below).
@@ -138,14 +138,14 @@
 # IRR inference filter chain (canonical #1046 order with
 # protocol-adaptive translation):
 #   Request phase (forward):
-#     openai_stream_events → openai_web_search → openai_mcp_dispatch
-#       → openai_file_search_callout → openai_agentic_loop
+#     openai_stream_events → openai_web_search_dispatch → openai_mcp_dispatch
+#       → openai_file_search_dispatch → openai_agentic_loop
 #       → headers → load_balancer(cluster_source=bound_upstream)
-#       → openai_responses_proxy         (when selected upstream = Responses)
-#       → responses_to_chat_completions  (when selected upstream = Chat)
+#       → openai_proxy         (when selected upstream = Responses)
+#       → openai_responses_to_chat_completions  (when selected upstream = Chat)
 #       → path_rewrite                   (when selected upstream = Chat)
 #   Response phase (reverse):
-#     path_rewrite → responses_to_chat_completions → openai_responses_proxy
+#     path_rewrite → openai_responses_to_chat_completions → openai_proxy
 #       → load_balancer → headers → openai_agentic_loop
 #       → (dispatchers have no response phase) → openai_stream_events
 #   The protocol-adaptive body builders run AFTER the load balancer because
@@ -156,8 +156,8 @@
 #   openai_stream_events observe it. Exactly one body builder fires per
 #   request, keyed to the selected cluster's declared application_protocol;
 #   the match fails closed when the cluster declares none.
-#   The three dispatchers (openai_web_search, openai_mcp_dispatch,
-#   openai_file_search_callout) have no response phase: each executes the
+#   The three dispatchers (openai_web_search_dispatch, openai_mcp_dispatch,
+#   openai_file_search_dispatch) have no response phase: each executes the
 #   loop owner's assigned calls at request-body EOS on the next iteration,
 #   reconciling results in place inside ResponsesState.accumulated_output.
 #   Each is inert unless the model emits the matching hosted tool call.
@@ -176,11 +176,11 @@
 #                    7 + 1 = 8.
 #
 # Streaming persistence:
-#   Removing openai_stream_events (or moving openai_response_store after
+#   Removing openai_stream_events (or moving openai_store after
 #   the IRR) silently breaks streaming persistence: the store persists
 #   ResponsesState.response_object, and only openai_stream_events
 #   populates it for `stream: true` responses. openai_stream_events is
-#   also REQUIRED for loop correctness — openai_responses_proxy selects
+#   also REQUIRED for loop correctness — openai_proxy selects
 #   typed streaming automatically for `stream: true`, which commits
 #   `response.completed` to the client as it arrives, so a loop-terminal
 #   error detected by openai_agentic_loop can only reach the client
@@ -189,7 +189,7 @@
 #   any backend request. Keep the store before the IRR and openai_stream_events
 #   INSIDE the IRR step so both buffered and streaming responses are
 #   persisted and retrievable via GET /v1/responses/{id} (served before the IRR
-#   by openai_response_store).
+#   by openai_store).
 #
 # Protocol-adaptive translation:
 #   This config serves ONE Responses gateway pipeline regardless of whether
@@ -198,8 +198,8 @@
 #   cluster's typed application metadata (http.application_protocol /
 #   http.application_provider), and three filters carry selected_upstream
 #   conditions that read it:
-#     - openai_responses_proxy         when application_protocol=openai_responses
-#     - responses_to_chat_completions  when application_protocol=openai_chat_completions
+#     - openai_proxy         when application_protocol=openai_responses
+#     - openai_responses_to_chat_completions  when application_protocol=openai_chat_completions
 #     - path_rewrite                   when application_protocol=openai_chat_completions
 #   The load balancer declares both supported protocol variants because core
 #   validates selected_upstream matcher values against the clusters that can be
@@ -280,7 +280,7 @@
 # WEB_SEARCH_API_KEY field remains required by the provider configuration, so
 # set it before starting the proxy; when `user_credential: brave_search` is
 # configured, a missing per-user slot fails closed instead of falling back to
-# that shared key. openai_web_search stays inert until the model emits a
+# that shared key. openai_web_search_dispatch stays inert until the model emits a
 # web_search_call.
 #
 # Listener and cluster transport timeouts are intentionally omitted.
@@ -354,7 +354,7 @@ filter_chains:
       # Publishes the typed operation consumed by openai_conversations.
       - filter: openai_operation
 
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
         headers:
           format: x-praxis-ai-format
@@ -494,7 +494,7 @@ filter_chains:
       # The filters below participate in the once-per-request bound-body phase.
       # OpenAI owns these capabilities on its direct path, so the condition
       # suppresses their request, response, and response-body lifecycle hooks.
-      - filter: openai_responses_validate
+      - filter: openai_validate
         conditions:
           - unless:
               bound_upstream:
@@ -516,7 +516,7 @@ filter_chains:
               bound_upstream:
                 application_provider: openai
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         # In-memory:
         #   database_url: "sqlite::memory:"
@@ -529,7 +529,7 @@ filter_chains:
               bound_upstream:
                 application_provider: openai
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
         conditions:
           - unless:
               bound_upstream:
@@ -612,7 +612,7 @@ filter_chains:
       # streams through openai_stream_events, the three request-phase
       # dispatchers execute the loop owner's assigned hosted-tool calls, and
       # openai_agentic_loop parses each response and publishes the single
-      # loop/done transition. The bound-body openai_response_store persists the
+      # loop/done transition. The bound-body openai_store persists the
       # composed object on the response path (reverse order). The inference
       # step consumes the frozen logical binding directly; it must not route
       # again or attempt to replace the request-level provider decision.
@@ -651,7 +651,7 @@ filter_chains:
               # fails closed with a 500 on an effective stream:true request
               # when it is absent.
               #
-              # Its limits are set at or above responses_to_chat_completions'
+              # Its limits are set at or above openai_responses_to_chat_completions'
               # converter bounds below so no frame the client receives is ever
               # rejected here and dropped from the store (the accumulator must
               # never be tighter than the converter): max_events (200000) >=
@@ -667,7 +667,7 @@ filter_chains:
               # Request-phase dispatcher: runs first on re-entry to execute
               # web_search_call assignments prepared by the loop owner. Inert
               # until the model emits a web_search_call.
-              - filter: openai_web_search
+              - filter: openai_web_search_dispatch
                 provider: brave
                 api_key: ${WEB_SEARCH_API_KEY}
                 # Require the per-user key captured by the outer
@@ -694,7 +694,7 @@ filter_chains:
               # inside ResponsesState.accumulated_output. It never parses the
               # response body and never decides whether another round runs,
               # so it is inert unless the model emits a hosted file_search_call.
-              - filter: openai_file_search_callout
+              - filter: openai_file_search_dispatch
                 vector_store_url: http://127.0.0.1:3002
                 user_credential: ogx_files
                 # Every vector-store sub-request runs through the filtered
@@ -756,7 +756,7 @@ filter_chains:
               # Native Responses upstream: enforce provider-aware prompt
               # support, rebuild the outbound body from ResponsesState, and
               # select the typed streaming transport for `stream: true`.
-              - filter: openai_responses_proxy
+              - filter: openai_proxy
                 conditions:
                   - when:
                       selected_upstream:
@@ -775,7 +775,7 @@ filter_chains:
               # openai_stream_events'
               # limits so no frame the client receives is dropped from the store
               # (cf. responses-to-chat-completions.yaml).
-              - filter: responses_to_chat_completions
+              - filter: openai_responses_to_chat_completions
                 max_rewritten_body_bytes: 33554432
                 max_emitted_sse_frame_bytes: 50331648
                 max_stream_events: 100000
@@ -804,7 +804,7 @@ filter_chains:
               # openai_agentic_loop is the sole loop authority (issue #1046):
               # it parses each model response, records assignments for the
               # request-phase dispatchers (web_search, mcp_dispatch,
-              # file_search_callout), and publishes the single continuation
+              # file_search_dispatch), and publishes the single continuation
               # signal. The IRR transitions only on the owner's action, never
               # on a dispatcher's.
               - filter: openai_agentic_loop

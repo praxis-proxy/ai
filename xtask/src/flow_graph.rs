@@ -422,7 +422,7 @@ mod tests {
         assert_eq!(nodes[19].irr_step.as_deref(), Some("inference"));
         assert_eq!(nodes[19].filter_type, "project_state_owner_headers");
         assert_eq!(
-            nodes[27].filter_type, "openai_responses_proxy",
+            nodes[27].filter_type, "openai_proxy",
             "proxy after the step load balancer"
         );
         assert_eq!(nodes[29].filter_type, "path_rewrite", "last step filter");

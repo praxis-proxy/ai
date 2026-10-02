@@ -370,17 +370,17 @@ filter_chains:
         conversations_table: test_conversations
         items_table: test_conversation_items
 
-      - filter: openai_responses_format
+      - filter: openai_format
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "{db_url}"
         responses_table: test_responses
         conversations_table: test_conversations
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
       - filter: router
         routes:
@@ -396,7 +396,7 @@ filter_chains:
             endpoints:
               - "127.0.0.1:{backend_port}"
 
-      - filter: openai_responses_proxy
+      - filter: openai_proxy
 insecure_options:
   allow_private_endpoints: true
 "#

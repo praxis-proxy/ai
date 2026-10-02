@@ -581,10 +581,10 @@ fn spawn_health_check_tasks(
 ///
 /// - `policy`: the Praxis Policy Engine's JWT verification runs on aws-lc-rs (through jsonwebtoken) and its OAuth and
 ///   Valkey plugins use the pure-Rust `hmac` and `sha2` crates.
-/// - `openai_response_store`: registered exactly when the `store` feature is compiled in, whose sqlx brings `sha2`
-///   (and, with `PostgreSQL`, SCRAM's `md-5` and `hmac`). Every store-backed group (conversations, compact, MCP tools)
-///   implies `store`, so this one name covers them all.
-const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_response_store"];
+/// - `openai_store`: registered exactly when the `store` feature is compiled in, whose sqlx brings `sha2` (and, with
+///   `PostgreSQL`, SCRAM's `md-5` and `hmac`). Every store-backed group (conversations, compact, MCP tools) implies
+///   `store`, so this one name covers them all.
+const NON_FIPS_FILTERS: &[&str] = &["policy", "openai_store"];
 
 /// Why this binary cannot honor `PRAXIS_REQUIRE_FIPS`, if it cannot.
 ///
@@ -770,7 +770,7 @@ mod tests {
                 assert!(reason.contains("`policy` filter"), "{reason}");
             }
             if cfg!(feature = "store") {
-                assert!(reason.contains("`openai_response_store` filter"), "{reason}");
+                assert!(reason.contains("`openai_store` filter"), "{reason}");
             }
         } else {
             assert_eq!(blocker, None, "the FIPS feature set registers no blocked filter");

@@ -65,7 +65,7 @@ fn assert_fips_host_outcome(ok: bool, stderr: &str) {
         }
         if cfg!(feature = "store") {
             assert!(
-                stderr.contains("`openai_response_store` filter"),
+                stderr.contains("`openai_store` filter"),
                 "the refusal must name the store filter, got: {stderr}"
             );
         }

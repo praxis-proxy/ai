@@ -337,7 +337,7 @@ mod tests {
         let descriptions = filter_docs::filter_descriptions(&workspace_root());
         let model = build_model("full-flow", &graph, &descriptions);
 
-        let known = find_filter(&model, PIPELINE_CHAIN, "openai_responses_proxy").expect("proxy present");
+        let known = find_filter(&model, PIPELINE_CHAIN, "openai_proxy").expect("proxy present");
         assert_eq!(
             known.get("known").and_then(Json::as_bool),
             Some(true),

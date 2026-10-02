@@ -28,8 +28,8 @@ mod credential_injection;
 mod external_metering;
 #[cfg(target_os = "linux")]
 mod file_descriptor_limits;
-mod file_search_callout;
 mod file_search_chat_completions;
+mod file_search_dispatch;
 mod file_search_streaming;
 #[cfg(feature = "store-sqlite")]
 mod full_flow_agentic;
@@ -62,6 +62,7 @@ mod openai_doc_extract;
 mod openai_embeddings_routing;
 #[cfg(feature = "openai-file-resolve-filter")]
 mod openai_file_resolve;
+mod openai_format;
 #[cfg(feature = "openai-mcp-tools")]
 mod openai_mcp_dispatch;
 #[cfg(feature = "openai-mcp-tools")]
@@ -70,20 +71,25 @@ mod openai_mcp_outbound_chain;
 mod openai_mcp_streaming;
 #[cfg(feature = "openai-mcp-tools")]
 mod openai_mcp_tool_resolve;
+mod openai_model_rewrite;
 mod openai_prompts_routing;
-#[cfg(feature = "store-sqlite")]
-mod openai_response_store;
-#[cfg(feature = "store-postgres")]
-mod openai_response_store_postgres;
-#[cfg(feature = "store-postgres")]
-mod openai_response_store_postgres_mtls;
+mod openai_proxy;
 #[cfg(all(feature = "openai-file-resolve-filter", feature = "openai-mcp-tools"))]
 mod openai_responses_body_size_limits;
-mod openai_responses_format;
-mod openai_responses_model_rewrite;
-mod openai_responses_proxy;
-mod openai_responses_validate;
+#[cfg(feature = "store-sqlite")]
+mod openai_store;
+#[cfg(feature = "store-postgres")]
+mod openai_store_postgres;
+#[cfg(feature = "store-postgres")]
+mod openai_store_postgres_mtls;
+mod openai_validate;
 // The state-ownership example selects the SQLite store backend.
+#[cfg(feature = "store-sqlite")]
+mod openai_responses_to_chat_completions;
+#[cfg(feature = "store-sqlite")]
+mod openai_responses_to_chat_completions_conformance;
+#[cfg(feature = "store-sqlite")]
+mod openai_responses_to_chat_completions_reasoning;
 #[cfg(feature = "store-sqlite")]
 mod openai_state_ownership;
 #[cfg(feature = "store-sqlite")]
@@ -95,12 +101,6 @@ mod provider_route;
 #[cfg(feature = "store-sqlite")]
 mod rehydrate;
 mod responses_routing;
-#[cfg(feature = "store-sqlite")]
-mod responses_to_chat_completions;
-#[cfg(feature = "store-sqlite")]
-mod responses_to_chat_completions_conformance;
-#[cfg(feature = "store-sqlite")]
-mod responses_to_chat_completions_reasoning;
 #[cfg(feature = "store-sqlite")]
 mod session_replay;
 mod stream_usage_inject;

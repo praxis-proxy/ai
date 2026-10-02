@@ -60,7 +60,7 @@ pub(crate) struct FileResolveConfig {
     /// bound outbound pipeline; this chain only adds filters along the
     /// way. When omitted it defaults to an empty inline chain (pure
     /// passthrough) via `default_outbound_chain`, so registration never
-    /// fails for a missing chain — matching `openai_file_search_callout`.
+    /// fails for a missing chain — matching `openai_file_search_dispatch`.
     /// Provide it only to attach cross-cutting concerns such as
     /// credential injection, tracing, or request tagging.
     ///
@@ -323,7 +323,7 @@ allow_pre_security_callout: true
     fn config_defaults_omitted_outbound_chain_to_empty_inline() {
         // `outbound_chain` is optional: omitting it yields an empty inline chain
         // (pure passthrough) rather than a config error, matching
-        // `openai_file_search_callout`. Registration binds this empty chain, so a
+        // `openai_file_search_dispatch`. Registration binds this empty chain, so a
         // missing `outbound_chain` never fails the build.
         let cfg: FileResolveConfig = serde_yaml::from_str(MINIMAL_YAML).unwrap();
         assert!(

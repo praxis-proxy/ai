@@ -2,7 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["httpx>=0.27", "pytest>=8.0", "pyyaml>=6.0"]
 # ///
-"""OpenResponses conformance runner for the responses_to_chat_completions filter.
+"""OpenResponses conformance runner for the openai_responses_to_chat_completions filter.
 
 Boots a Praxis listener that translates POST /v1/responses -> POST
 /v1/chat/completions, fronts a vLLM CPU backend with a translation-witness

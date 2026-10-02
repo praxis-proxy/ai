@@ -16,7 +16,7 @@
 #   Authorization: Bearer <provider credential>
 #   OpenAI Chat Completions JSON and SSE
 #
-# `openai_stream_events` and `responses_to_chat_completions` live in the same
+# `openai_stream_events` and `openai_responses_to_chat_completions` live in the same
 # iterative-router step. Response filters run in reverse order, so translated
 # Responses SSE is accumulated as it streams rather than buffered until the
 # Chat response completes.
@@ -29,14 +29,14 @@ listeners:
 filter_chains:
   - name: codex-chat-provider
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       - filter: iterative_request_router
         initial_step: selected-provider
@@ -51,7 +51,7 @@ filter_chains:
                 max_events: 1000
                 timeout_secs: 30
 
-              - filter: responses_to_chat_completions
+              - filter: openai_responses_to_chat_completions
                 max_rewritten_body_bytes: 1048576
                 max_emitted_sse_frame_bytes: 2097152
                 max_stream_events: 500

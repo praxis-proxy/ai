@@ -553,8 +553,8 @@ async fn stream_events_replays_stored_event_log() {
     cleanup_sqlite_files(&db_path);
 }
 
-/// A legacy `openai_responses_format` classifier pipeline promotes
-/// `openai_responses_format.format=openai_responses` for a replay GET (a GET to
+/// A legacy `openai_format` classifier pipeline promotes
+/// `openai_format.format=openai_responses` for a replay GET (a GET to
 /// /v1/responses/{id} is a Responses endpoint) with `stream=false` (no request
 /// body). The store filter must force streaming mode for the replay GET instead
 /// of selecting the buffered Responses-format response mode, which the runtime
@@ -578,11 +578,11 @@ async fn stream_events_replay_streams_under_legacy_classifier_pipeline() {
     let (db_url, db_path) = temp_sqlite_url("stream_events_replay_legacy");
     let yaml = std::fs::read_to_string(example_config_path("openai/responses/stream-events.yaml"))
         .expect("example config should exist");
-    // Add the legacy `openai_responses_format` classifier alongside the modern
+    // Add the legacy `openai_format` classifier alongside the modern
     // header-promoting classifier (both run before the store filter). The modern
     // classifier still drives create-time persistence via `responses.*` metadata
     // and `x-praxis-*` headers, while the legacy classifier promotes
-    // `openai_responses_format.format=openai_responses` (with `stream=false` for
+    // `openai_format.format=openai_responses` (with `stream=false` for
     // the body-less replay GET) that `is_responses_format` reads -- reproducing
     // the buffered-mode trap the fix targets without disabling persistence.
     let modern_classifier = concat!(
@@ -594,10 +594,10 @@ async fn stream_events_replay_streams_under_legacy_classifier_pipeline() {
         "          stream: x-praxis-ai-stream\n",
         "          mode: x-praxis-responses-mode\n",
     );
-    let legacy_classifier = "      - filter: openai_responses_format\n";
+    let legacy_classifier = "      - filter: openai_format\n";
     let yaml = yaml.replace(modern_classifier, &format!("{modern_classifier}\n{legacy_classifier}"));
     assert!(
-        yaml.contains("filter: openai_responses_format") && yaml.contains("filter: openai_responses_request"),
+        yaml.contains("filter: openai_format") && yaml.contains("filter: openai_responses_request"),
         "both classifiers must be present so create persists and the replay GET is trapped"
     );
     let patched = patch_yaml(

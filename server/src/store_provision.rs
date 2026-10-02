@@ -1429,7 +1429,7 @@ filter_chains:
             chains:
               - name: first-store
                 filters:
-                  - filter: openai_response_store
+                  - filter: openai_store
                     backend: {backend}
                     database_url: "{first_url}"
                     responses_table: responses
@@ -1438,7 +1438,7 @@ filter_chains:
             chains:
               - name: second-store
                 filters:
-                  - filter: openai_response_store
+                  - filter: openai_store
                     backend: {backend}
                     database_url: "{second_url}"
                     responses_table: responses
@@ -1458,7 +1458,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_response_store
+      - filter: openai_store
         backend: {backend}
         database_url: "{database_url}"
         responses_table: responses
@@ -1479,7 +1479,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite::memory:"
         responses_table: responses
@@ -1502,7 +1502,7 @@ listeners:
 filter_chains:
   - name: main
     filters:
-      - filter: openai_response_store
+      - filter: openai_store
         backend: postgres
         database_url: "postgresql://user:password@8.8.8.8/store"
         responses_table: responses
@@ -1528,7 +1528,7 @@ listeners:
 filter_chains:
   - name: responses
     filters:
-      - filter: openai_response_store
+      - filter: openai_store
         backend: {backend}
         database_url: "{database_url}"
         responses_table: responses
@@ -1576,14 +1576,14 @@ listeners:
 filter_chains:
   - name: responses-a
     filters:
-      - filter: openai_response_store
+      - filter: openai_store
         backend: {backend}
         database_url: "{database_url}"
         responses_table: responses_a
         conversations_table: conversations
   - name: responses-b
     filters:
-      - filter: openai_response_store
+      - filter: openai_store
         backend: {backend}
         database_url: "{database_url}"
         responses_table: responses_b
@@ -1614,7 +1614,7 @@ listeners:
 filter_chains:
   - name: store
     filters:
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite::memory:"
         responses_table: responses
@@ -2038,7 +2038,7 @@ listeners:
 filter_chains:
   - name: responses
     filters:
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "{database_url}"
         responses_table: responses
@@ -2052,7 +2052,7 @@ filter_chains:
         items_table: items
   - name: other-responses
     filters:
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "{database_url}"
         responses_table: conversations_unused_responses_pending_approvals

@@ -4,7 +4,7 @@
 # Lets a rich Codex-style Responses client (POST /v1/responses with custom,
 # namespace, local shell, and client-executed tool_search tools) reach a
 # function-only Chat Completions backend (POST /v1/chat/completions) by composing
-# openai_client_tool_compat with responses_to_chat_completions in one
+# openai_client_tool_compat with openai_responses_to_chat_completions in one
 # iterative-router step (GitHub issue #1206).
 #
 # Client boundary:
@@ -25,13 +25,13 @@
 #                             in request_body ONLY (canonical state.tools stays
 #                             rich for restore); fails closed on a client tool
 #                             named a reserved hosted call (file_search/web_search)
-#   responses_to_chat_completions  translates the lowered Responses request into a
+#   openai_responses_to_chat_completions  translates the lowered Responses request into a
 #                             Chat Completions request (reads the lowered
 #                             request_body tools via request_tools/request_tool_choice)
 #   path_rewrite              /v1/responses -> /v1/chat/completions
 #   router / credential_injection / load_balancer
 #
-# Response filters run in reverse, so responses_to_chat_completions rebuilds the
+# Response filters run in reverse, so openai_responses_to_chat_completions rebuilds the
 # Responses object first, then openai_client_tool_compat restores the private
 # function_call items to their canonical typed items BEFORE openai_agentic_loop
 # observes them (this ordering keeps a client tool lowered to a private function
@@ -47,14 +47,14 @@ listeners:
 filter_chains:
   - name: client-tool-compat-chat
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: reject
         headers:
           format: x-praxis-ai-format
           model: x-praxis-ai-model
           stream: x-praxis-ai-stream
 
-      - filter: openai_responses_validate
+      - filter: openai_validate
 
       # Persisted Responses/Conversations state is scoped to an immutable owner.
       # This single-tenant demo installs a fixed owner directly (no auth gateway
@@ -64,13 +64,13 @@ filter_chains:
         mode: single_tenant
         tenant_id: default
 
-      - filter: openai_response_store
+      - filter: openai_store
         backend: sqlite
         database_url: "sqlite://responses.db?mode=rwc"
         responses_table: openai_responses
         conversations_table: openai_conversations
 
-      - filter: openai_responses_rehydrate
+      - filter: openai_rehydrate
 
       - filter: iterative_request_router
         initial_step: inference
@@ -92,7 +92,7 @@ filter_chains:
                 max_rewritten_body_bytes: 67108864
                 max_client_tools: 512
 
-              - filter: responses_to_chat_completions
+              - filter: openai_responses_to_chat_completions
                 max_rewritten_body_bytes: 1048576
                 max_emitted_sse_frame_bytes: 2097152
                 max_stream_events: 500

@@ -90,7 +90,7 @@ listeners:
 filter_chains:
   - name: classify_refused
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
       - filter: anthropic_messages_format
         on_invalid: continue
@@ -106,7 +106,7 @@ filter_chains:
 
   - name: classify_timeout
     filters:
-      - filter: openai_responses_format
+      - filter: openai_format
         on_invalid: continue
       - filter: anthropic_messages_format
         on_invalid: continue
