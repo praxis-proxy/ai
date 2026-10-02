@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "openai>=2.0",
+#     "openai>=2.0,<4",
 #     "pytest>=8.0",
 # ]
 # ///

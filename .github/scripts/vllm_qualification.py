@@ -366,7 +366,8 @@ def render(report, detailed=False):
                 lines += ["", f"{suite_name.replace('_', ' ').title()} case reasons (complete list in `qualification.json`):"]
                 for case in notable[:20]:
                     reason = (str(case.get("reason", "")).splitlines() or [""])[0][:240]
-                    lines.append(f"- `{case['id']}`: {case.get('outcome')} | {reason}")
+                    sdk_info = f" [SDK {case['sdk_version']}]" if case.get("sdk_version") else f" [SDK {case['sdk_lane']}]" if case.get("sdk_lane") else ""
+                    lines.append(f"- `{case['id']}`{sdk_info}: {case.get('outcome')} | {reason}")
                 if len(notable) > 20:
                     lines.append(f"- {len(notable) - 20} further cases in the artifact")
         for suite_name in ("claude_acceptance", "codex_acceptance"):

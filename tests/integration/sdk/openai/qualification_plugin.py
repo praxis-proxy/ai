@@ -108,14 +108,19 @@ def pytest_sessionfinish(session, exitstatus):
     destination = os.environ.get("PRAXIS_QUALIFICATION_RESULTS")
     if not destination:
         return
+    sdk_version = getattr(session.config, "_openai_sdk_version", installed_version("openai"))
+    sdk_lane = getattr(session.config, "_openai_sdk_lane", "unknown")
     cases = [{**_cases.get(nodeid, {"id": nodeid, "outcome": "unexecuted", "reason": "test did not run"}),
-              "profile": _profiles[nodeid]} for nodeid in _selected]
+              "profile": _profiles[nodeid],
+              "sdk_version": sdk_version,
+              "sdk_lane": sdk_lane} for nodeid in _selected]
+    deselected = [{**item, "sdk_version": sdk_version, "sdk_lane": sdk_lane} for item in _deselected]
     data = {
         "exit_code": int(exitstatus),
         "started_at": _started_at,
         "finished_at": timestamp(),
         "selected": cases,
-        "deselected": _deselected,
+        "deselected": deselected,
         "dependencies": {
             name: installed_version(name)
             for name in ("openai", "anthropic", "pytest", "httpx")

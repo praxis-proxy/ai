@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27,<1",
-#     "openai>=2.0,<3",
+#     "openai>=2.0,<4",
 #     "pytest>=8.0,<9",
 # ]
 # ///
@@ -38,6 +38,7 @@ from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 import httpx
+import openai
 import pytest
 from openai import (
     APIConnectionError,
@@ -1389,12 +1390,12 @@ def backend_endpoint():
 
 
 @pytest.fixture(scope="session")
-def praxis_proxy(tmp_path_factory, request):
+def praxis_proxy(tmp_path_factory, request, backend_endpoint):
     """Start a Praxis proxy backed by vLLM for the test session."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_full_flow_config(port, db_path)
+    config_path = _write_full_flow_config(port, db_path, backend_endpoint=backend_endpoint)
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1428,12 +1429,12 @@ def praxis_proxy(tmp_path_factory, request):
 
 
 @pytest.fixture(scope="session")
-def compression_proxy(tmp_path_factory, request):
+def compression_proxy(tmp_path_factory, request, backend_endpoint):
     """Start a Praxis proxy whose response store has zstd compression enabled."""
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-compression")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_full_flow_config(port, db_path, compression=True)
+    config_path = _write_full_flow_config(port, db_path, compression=True, backend_endpoint=backend_endpoint)
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
