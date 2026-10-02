@@ -1286,7 +1286,7 @@ def _write_agentic_config(
     real_web_search: bool = False,
 ) -> str:
     """Patch agentic-loop.yaml for mocked or credentialed agentic tests."""
-    config = _load_example_config(AGENTIC_CONFIG_PATH, praxis_port, db_path=db_path)
+    config = _load_example_config(AGENTIC_CONFIG_PATH, praxis_port)
     vllm = backend_endpoint if translate_to_chat else _vllm_endpoint()
     if vllm is None:
         raise ValueError("translated agentic config requires a backend endpoint")
@@ -1302,6 +1302,7 @@ def _write_agentic_config(
     # file-search vector store at OGX so the file-search dispatcher is live here
     # too; it stays inert for web/mcp-only tests that emit no file_search_call.
     config = config.replace("http://127.0.0.1:8001", f"http://{_ogx_endpoint()}")
+    config = _patch_store_backend(config, db_path)
     # The loopback MCP callout's SSRF posture is governed by
     # ``insecure_options.allow_private_upstreams`` (no per-filter opt-in), which
     # agentic-loop.yaml already enables -- so no injection is needed here.
