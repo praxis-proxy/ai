@@ -6830,8 +6830,14 @@ class TestStreamingMcpDiscoveryFailureVLLM:
         assert failed_response["error"]["code"] == "server_error", (
             failed_response
         )
-        assert failed_response["instructions"] == "Be concise", failed_response
-        assert failed_response["metadata"] == {"trace": "sdk-mcp-failure"}, failed_response
+        assert failed_response["instructions"] == "Be concise", (
+            "streamed failure response must echo the request instructions; "
+            f"got: {failed_response}"
+        )
+        assert failed_response["metadata"] == {"trace": "sdk-mcp-failure"}, (
+            "streamed failure response must echo the request metadata; "
+            f"got: {failed_response}"
+        )
 
         mcp_items = [
             item
@@ -6855,8 +6861,14 @@ class TestStreamingMcpDiscoveryFailureVLLM:
         rd = retrieved.model_dump()
         assert rd["status"] == "failed", rd
         assert rd["error"]["code"] == "server_error", rd
-        assert rd["instructions"] == "Be concise", rd
-        assert rd["metadata"] == {"trace": "sdk-mcp-failure"}, rd
+        assert rd["instructions"] == "Be concise", (
+            "retrieved failure response must echo the request instructions; "
+            f"got: {rd}"
+        )
+        assert rd["metadata"] == {"trace": "sdk-mcp-failure"}, (
+            "retrieved failure response must echo the request metadata; "
+            f"got: {rd}"
+        )
         assert any(
             it.get("type") == "mcp_list_tools" for it in rd.get("output", [])
         ), rd
