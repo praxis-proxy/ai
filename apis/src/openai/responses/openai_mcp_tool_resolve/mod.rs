@@ -1227,23 +1227,23 @@ const MAX_ECHOED_OPTIONS_BYTES: usize = 256 * 1024;
 /// Extract the size-bounded, credential-free subset of request options echoed
 /// into a streaming discovery-failure snapshot.
 ///
-/// Only [`ECHOED_REQUEST_FIELDS`] are copied (never `input`/`tools`), and a field
+/// Only [`ECHOED_REQUEST_FIELDS`] are captured (never `input`/`tools`), and a field
 /// is skipped once including it would push the aggregate past
 /// [`MAX_ECHOED_OPTIONS_BYTES`], so a large `instructions`/`metadata` cannot be
 /// amplified across the synthesized snapshots. Returns `None` when the body is
 /// unparseable or no whitelisted field survives, in which case the snapshot falls
 /// back to API defaults for every echoed field.
 fn capture_echoed_options(body: &[u8]) -> Option<serde_json::Value> {
-    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let obj = parsed.as_object()?;
+    let mut parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let obj = parsed.as_object_mut()?;
     let mut total = 0_usize;
     let mut captured = serde_json::Map::new();
     for &field in ECHOED_REQUEST_FIELDS {
         let Some(value) = obj.get(field) else {
             continue;
         };
-        // Measure before cloning so an oversized field is never copied into the
-        // capture, and skip (rather than truncate) any field that would exceed
+        // Measure before moving so an oversized field is never removed from the
+        // parsed object, and skip (rather than truncate) any field that would exceed
         // the aggregate bound so the retained JSON stays well-formed.
         // Serializing an in-memory `Value` into the counting sink should not
         // fail. If it does, treat the field as maximally large so it is skipped
@@ -1252,8 +1252,11 @@ fn capture_echoed_options(body: &[u8]) -> Option<serde_json::Value> {
         if total.saturating_add(len) > MAX_ECHOED_OPTIONS_BYTES {
             continue;
         }
+        let Some(value) = obj.remove(field) else {
+            continue;
+        };
         total += len;
-        captured.insert(field.to_owned(), value.clone());
+        captured.insert(field.to_owned(), value);
     }
     (!captured.is_empty()).then_some(serde_json::Value::Object(captured))
 }

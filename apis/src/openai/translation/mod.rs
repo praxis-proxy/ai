@@ -1959,16 +1959,80 @@ mod tests {
     }
 
     #[test]
-    fn function_call_output_with_non_string_output_serializes() {
+    fn function_call_output_string_passes_through() {
         let mapped = map(&json!({
             "model": "m",
             "input": [
                 {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
-                {"type": "function_call_output", "call_id": "c1", "output": 42}
+                {"type": "function_call_output", "call_id": "c1", "output": "result"}
             ]
         }));
 
-        assert_eq!(mapped["messages"][1]["content"], "42");
+        assert_eq!(mapped["messages"][1]["content"], "result");
+    }
+
+    #[test]
+    fn function_call_output_text_parts_become_tool_text() {
+        let mapped = map(&json!({
+            "model": "m",
+            "input": [
+                {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": [
+                    {"type": "input_text", "text": "first "},
+                    {"type": "input_text", "text": "result"}
+                ]}
+            ]
+        }));
+
+        assert_eq!(
+            mapped["messages"][1],
+            json!({
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": "first result"
+            })
+        );
+    }
+
+    #[test]
+    fn function_call_output_unsupported_shapes_fail_closed() {
+        for output in [json!(42), json!({"result": 42}), json!(true), Value::Null] {
+            let error = map_error(&json!({
+                "model": "m",
+                "input": [{"type": "function_call_output", "call_id": "c1", "output": output}]
+            }));
+            assert_eq!(
+                error,
+                "Responses function_call_output input item field `output` must be a string or array of input_text parts"
+            );
+        }
+
+        for (output, reason) in [
+            (
+                json!([{"type": "input_image", "image_url": "data:image/png;base64,AA=="}]),
+                "input_image",
+            ),
+            (json!([{"type": "input_file", "file_id": "file_123"}]), "input_file"),
+            (
+                json!([{"type": "input_text"}]),
+                "input_text requires a string `text` field",
+            ),
+            (
+                json!([{"type": "input_text", "text": 42}]),
+                "input_text requires a string `text` field",
+            ),
+            (json!([{"type": "output_text", "text": "result"}]), "output_text"),
+            (json!([null]), "unknown"),
+        ] {
+            let error = map_error(&json!({
+                "model": "m",
+                "input": [{"type": "function_call_output", "call_id": "c1", "output": output}]
+            }));
+            assert_eq!(
+                error,
+                format!("unsupported Responses function_call_output part for Chat Completions translation: {reason}")
+            );
+        }
     }
 
     #[test]
