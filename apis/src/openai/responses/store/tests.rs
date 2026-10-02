@@ -2909,7 +2909,7 @@ fn postgres_config_allows_private_with_private_database_url_opt_in() {
 }
 
 #[test]
-fn postgres_config_allows_unspecified_with_private_database_url_opt_in() {
+fn postgres_config_rejects_unspecified_with_private_database_url_opt_in() {
     let yaml: serde_yaml::Value = serde_yaml::from_str(
         r#"
 backend: postgres
@@ -2922,8 +2922,8 @@ allow_private_database_url: true
     .unwrap();
     let result = ResponseStoreFilter::from_config(&yaml);
     assert!(
-        result.is_ok(),
-        "explicit private database URL opt-in should allow unspecified hosts"
+        result.is_err(),
+        "unspecified database hosts must remain blocked after the private-target opt-in"
     );
 }
 

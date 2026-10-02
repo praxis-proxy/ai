@@ -15,7 +15,7 @@ use std::{
 };
 
 use percent_encoding::percent_decode_str;
-use praxis_ai_store::url_security::is_non_public_ip;
+use praxis_core::connectivity::classify_ip;
 use praxis_filter::{FilterError, has_dot_dot_traversal};
 
 // -----------------------------------------------------------------------------
@@ -26,7 +26,8 @@ use praxis_filter::{FilterError, has_dot_dot_traversal};
 ///
 /// Checks the URL scheme, authority host, `host` and `hostaddr` query
 /// parameters, and rejects local-sensitive targets unless `allow_private`
-/// is set.
+/// is set. Cloud metadata, unspecified, and multicast destinations remain
+/// blocked after that opt-in.
 ///
 /// `filter_name` is used as a prefix in error messages so each
 /// consuming filter reports its own name.
@@ -34,8 +35,8 @@ use praxis_filter::{FilterError, has_dot_dot_traversal};
 /// # Errors
 ///
 /// Returns an error if the URL scheme is not `postgres`/`postgresql`, if a
-/// `host` or `hostaddr` targets an SSRF-sensitive address (unless
-/// `allow_private`), or if no explicit host is present.
+/// `host` or `hostaddr` targets an SSRF-sensitive address forbidden by the
+/// selected policy, or if no explicit host is present.
 pub fn validate_postgres_database_url(
     filter_name: &str,
     database_url: &str,
@@ -272,7 +273,14 @@ fn validate_postgres_ip_target(
     ip: IpAddr,
     allow_private: bool,
 ) -> Result<(), FilterError> {
-    if !allow_private && is_non_public_ip(&ip) {
+    let class = classify_ip(&ip);
+    if class.is_cloud_metadata() || class.is_unspecified() || class.is_multicast() {
+        return Err(format!(
+            "{filter_name}: database_url {kind} targets a local-sensitive address that cannot be enabled by allow_private_database_url"
+        )
+        .into());
+    }
+    if !allow_private && class.is_non_public() {
         return Err(format!(
             "{filter_name}: database_url {kind} targets a local-sensitive address; \
              set allow_private_database_url: true to allow"
@@ -476,7 +484,7 @@ mod tests {
         validate_postgres_database_url(FILTER, "postgres://user:pass@1.2.3.4:5432/db", false).unwrap();
     }
 
-    // -- IP classification (shared is_non_public_ip policy) --------------------
+    // -- Shared Praxis IP classification policy --------------------------------
 
     #[test]
     fn rejects_loopback_ipv4() {
@@ -749,6 +757,25 @@ mod tests {
     #[test]
     fn allows_cgnat_with_opt_in() {
         validate_postgres_database_url(FILTER, "postgres://100.64.0.1:5432/db", true).unwrap();
+    }
+
+    #[test]
+    fn rejects_cloud_metadata_with_opt_in() {
+        let err = validate_postgres_database_url(FILTER, "postgres://169.254.169.254:5432/db", true).unwrap_err();
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "cloud metadata must remain blocked with allow_private_database_url"
+        );
+    }
+
+    #[test]
+    fn rejects_mapped_cloud_metadata_with_opt_in() {
+        let err =
+            validate_postgres_database_url(FILTER, "postgres://[::ffff:169.254.169.254]:5432/db", true).unwrap_err();
+        assert!(
+            err.to_string().contains("local-sensitive"),
+            "mapped cloud metadata must remain blocked with allow_private_database_url"
+        );
     }
 
     #[test]

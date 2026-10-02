@@ -1419,7 +1419,7 @@ const PIPELINE = {
       "name": "openai_responses_validate",
       "group": "classification",
       "order": 10,
-      "phase": "request-phase; JSON syntax + ID generation; gated unless bound_upstream.application_provider=openai",
+      "phase": "request-phase; JSON syntax + ID generation + managed-provider background/prompt policy; gated unless bound_upstream.application_provider=openai",
       "config": {
         "conditions": [
           "unless bound_upstream.application_provider: openai"
@@ -2707,7 +2707,7 @@ const PIPELINE = {
           "when selected_upstream.application_protocol: openai_responses"
         ]
       },
-      "promotes": "on a native-Responses upstream rebuilds the outbound Responses body from ResponsesState; auto-selects typed streaming when the effective body has stream:true; enforces provider-aware prompt-template support; inert when the selected upstream speaks Chat Completions",
+      "promotes": "on a native-Responses upstream rebuilds the outbound Responses body from ResponsesState; auto-selects typed streaming when the effective body has stream:true; inert when the selected upstream speaks Chat Completions",
       "scenarios": {
         "S1": {
           "state": "active",
@@ -2778,7 +2778,7 @@ const PIPELINE = {
           "when selected_upstream.application_protocol: openai_chat_completions"
         ]
       },
-      "promotes": "when the selected upstream speaks Chat Completions, translates the canonical Responses request into a Chat Completions request and (because response filters run in reverse) converts the Chat response - finite JSON or streamed SSE - back into a Responses resource / Responses SSE before openai_agentic_loop and openai_stream_events observe it; also rejects OpenAI prompt templates (no Chat representation); inert when the selected upstream speaks Responses natively",
+      "promotes": "when the selected upstream speaks Chat Completions, translates the canonical Responses request into a Chat Completions request and (because response filters run in reverse) converts the Chat response - finite JSON or streamed SSE - back into a Responses resource / Responses SSE before openai_agentic_loop and openai_stream_events observe it; inert when the selected upstream speaks Responses natively",
       "scenarios": {
         "S1": {
           "state": "inert",

@@ -41,6 +41,31 @@ async fn run(filter: &dyn HttpFilter, request: &Request, body: &serde_json::Valu
     filter.on_request_body(&mut ctx, &mut bytes, true).await.unwrap()
 }
 
+/// Assert that managed prompt templates fail with the canonical error response.
+fn assert_prompt_template_rejection(action: FilterAction) {
+    assert!(
+        matches!(&action, FilterAction::Reject(_)),
+        "managed prompt templates must be rejected before upstream contact"
+    );
+    if let FilterAction::Reject(rejection) = action {
+        assert_eq!(
+            rejection.status, 400,
+            "prompt template rejection must be a client error"
+        );
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body.pointer("/error/type").and_then(serde_json::Value::as_str),
+            Some("invalid_request_error"),
+            "prompt template rejection must use the OpenAI invalid-request error type"
+        );
+        assert_eq!(
+            body.pointer("/error/message").and_then(serde_json::Value::as_str),
+            Some("prompt templates are supported only for OpenAI-owned upstreams"),
+            "prompt template rejection must explain the provider-binding requirement"
+        );
+    }
+}
+
 /// Drive one streaming create request and return its context.
 async fn run_streaming_create<'a>(filter: &dyn HttpFilter, request: &'a Request) -> HttpFilterContext<'a> {
     let mut ctx = make_filter_context(request);
@@ -428,6 +453,48 @@ async fn background_mode_is_rejected_before_upstream_contact() {
     assert!(
         matches!(action, FilterAction::Reject(_)),
         "Praxis does not implement the asynchronous Responses lifecycle"
+    );
+}
+
+#[tokio::test]
+async fn prompt_template_is_rejected_before_state_initialization() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({
+            "model": "gpt-4.1",
+            "prompt": {"id": "pmpt_123", "variables": {"name": "Ada"}}
+        }))
+        .unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+    assert_prompt_template_rejection(action);
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_none(),
+        "rejected prompt templates must not initialize gateway-owned state"
+    );
+}
+
+#[tokio::test]
+async fn null_prompt_is_allowed() {
+    let filter = default_filter();
+    let request = create_request();
+    let mut ctx = make_filter_context(&request);
+    let mut body = Some(Bytes::from(
+        serde_json::to_vec(&json!({"model": "gpt-4.1", "input": "hi", "prompt": null})).unwrap(),
+    ));
+
+    let action = filter.on_request_body(&mut ctx, &mut body, true).await.unwrap();
+
+    assert!(
+        matches!(action, FilterAction::Release),
+        "a null prompt must not trigger prompt-template rejection"
+    );
+    assert!(
+        ctx.extensions.get::<ResponsesState>().is_some(),
+        "a null prompt is semantically absent and must pass validation"
     );
 }
 

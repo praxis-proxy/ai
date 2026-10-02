@@ -297,8 +297,8 @@ class TestAzureChatCompletionsSdk:
                 messages=messages,
             )
 
-        assert exc_info.value.status_code == 404
-        assert "does not exist" in str(exc_info.value)
+        assert exc_info.value.status_code == 404, "missing deployment must return 404"
+        assert "does not exist" in str(exc_info.value), "upstream deployment-not-found text must reach the client"
         path, body = _last_post()
         _assert_azure_upstream(path, body, messages=messages)
 

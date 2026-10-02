@@ -25,7 +25,7 @@ Praxis runs `StreamBuffer` body hooks before header-phase request filters. This 
 |-------|------|---------|-------------|
 | `allow_pre_security_callout` | bool | no | Allow summarization callouts from the `StreamBuffer` pre-read phase, before header-phase security filters execute. This must be explicitly enabled only when an outer trust boundary authenticates and authorizes requests before they reach this listener. |
 | `inference_url` | string | yes | URL of the inference backend for summarization calls. E.g., `"http://localhost:11434/v1/chat/completions"` |
-| `allow_private_inference_url` | bool | no | Allow the inference target to resolve to non-public addresses. |
+| `allow_private_inference_url` | bool | no | Allow the inference target to resolve to non-public addresses. Cloud metadata, unspecified, and multicast addresses remain blocked. |
 | `default_model` | string | no | Default model for summarization when not overridden in the request's `context_management`. |
 | `tiktoken_encoding` | string | no | Tiktoken encoding name for local token estimation of the conversation text. |
 | `summary_prefix` | string | no | Prefix prepended to the summary when translating compaction items to backend messages. Defaults to `"[Previous conversation summary]\n\n"`. |

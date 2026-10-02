@@ -65,12 +65,9 @@ pub(super) struct GcpAdcConfig {
     #[serde(default)]
     pub credentials_file: Option<String>,
 
-    /// GCE/GKE metadata server host. Defaults to the real metadata
-    /// server; the only other accepted value is a `127.0.0.1` loopback
-    /// address, to point tests at a local mock. The metadata endpoint is
-    /// only safe to reach over plain HTTP because it never leaves the
-    /// VM/host, so nothing else is accepted (not even `localhost`, which
-    /// is a resolvable hostname rather than a fixed address).
+    /// GCE/GKE metadata server host. Must be the real metadata hostname.
+    /// The metadata endpoint is only safe to reach over plain HTTP because it
+    /// never leaves the VM/host, so nothing else is accepted.
     #[serde(default = "default_metadata_host")]
     pub metadata_host: String,
 }
@@ -131,27 +128,23 @@ pub(super) fn validate_url_component(field: &str, value: &str) -> Result<(), Fil
     Ok(())
 }
 
-/// Reject a `metadata_host` that isn't the real GCE/GKE metadata server or
-/// the `127.0.0.1` loopback address (used only to point tests at a local
-/// mock).
-///
-/// `localhost` is deliberately not accepted: unlike a literal loopback
-/// IP, it is a hostname resolved via DNS/`/etc/hosts` and could be
-/// remapped to point anywhere, which would defeat this check entirely.
+/// Reject a `metadata_host` that isn't the real GCE/GKE metadata server.
+/// Unit-test builds additionally accept literal IPv4 loopback so token and
+/// cache behavior can be exercised against an in-process mock.
 ///
 /// The metadata endpoint is safe to reach over plain HTTP specifically
 /// because it is link-local and never routable off the VM/host. Any other
 /// host configured here would send the same plaintext request -- and
 /// receive the access token in the response -- over a real network path.
 fn validate_metadata_host(value: &str) -> Result<(), FilterError> {
-    let host = value.split(':').next().unwrap_or(value);
-    let is_safe = value == "metadata.google.internal" || host == "127.0.0.1";
+    let is_safe = value == "metadata.google.internal";
+    #[cfg(test)]
+    let is_safe = is_safe || value.split(':').next().unwrap_or(value) == "127.0.0.1";
     if !is_safe {
         return Err(format!(
-            "gcp_adc: metadata_host '{value}' must be 'metadata.google.internal' or a loopback \
-             IP address (127.0.0.1, for tests) -- the metadata endpoint is only safe over \
-             plain HTTP because it never leaves the VM; anything else would send the access \
-             token over a real network in cleartext"
+            "gcp_adc: metadata_host '{value}' must be 'metadata.google.internal' -- the metadata \
+             endpoint is only safe over plain HTTP because it never leaves the VM; anything else \
+             would send the access token over a real network in cleartext"
         )
         .into());
     }

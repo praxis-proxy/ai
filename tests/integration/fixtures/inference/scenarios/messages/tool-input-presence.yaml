@@ -1,0 +1,47 @@
+version: 1
+id: messages/tool-input-presence
+description: Missing tool input becomes an empty object while explicitly present JSON input keeps its serialized value.
+protocol: anthropic_messages
+example_config: anthropic/messages-to-openai.yaml
+upstream_authority: 127.0.0.1:8000
+features:
+  - messages.request.tool_input_presence
+turns:
+  - name: initial
+    request:
+      method: POST
+      path: /v1/messages
+      headers:
+        content-type:
+          - application/json
+      body:
+        kind: json
+        value:
+          model: ${MODEL}
+          max_tokens: 64
+          stream: false
+          messages:
+            - role: assistant
+              content:
+                - type: tool_use
+                  id: call_missing
+                  name: f
+                - type: tool_use
+                  id: call_null
+                  name: g
+                  input: null
+                - type: tool_use
+                  id: call_object
+                  name: h
+                  input: {}
+                - type: tool_use
+                  id: call_array
+                  name: i
+                  input: [1, 2]
+    expect:
+      client_status: 200
+      client_body_kind: json
+      upstream_path: /v1/chat/completions
+      upstream_body_kind: json
+      client_sse_events: []
+      upstream_sse_events: []

@@ -51,7 +51,7 @@ use rmcp::{
 use sse_stream::{Error as SseError, Sse};
 
 use super::{McpClientError, McpDisplayUrl};
-use crate::StateOwner;
+use crate::{StateOwner, callout_target::AddressPolicy};
 
 /// Wire byte ceiling for a control-plane MCP response.
 ///
@@ -1609,19 +1609,17 @@ fn prepare_error_signal(error: &UrlTargetError) -> Option<TransportSignal> {
 
 /// SSRF policy hook applied to the resolved MCP addresses.
 ///
-/// Delegates to [`super::is_ssrf_blocked_ip`] so this hook enforces exactly the
-/// policy the literal-IP and DNS-resolution paths do: link-local, unspecified,
-/// cloud-metadata, and IPv6 unique-local addresses are always rejected, while
-/// loopback and the RFC1918/CGNAT/`0.0.0.0/8` private ranges are rejected unless
-/// `allow_private` is set. Sharing the helper closes the gap where an RFC1918
-/// address slipped past this hook with private upstreams disabled.
+/// Uses the shared AI address policy for both literal-IP and DNS-resolution
+/// paths. Metadata, unspecified, and multicast destinations remain forbidden;
+/// other non-public destinations follow the explicit private-target opt-in.
 ///
 /// # Errors
 ///
 /// Returns an opaque, credential-free error when any address is SSRF-sensitive.
 fn ssrf_validate(addrs: &[SocketAddr], allow_private: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let policy = AddressPolicy::from_allow_private(allow_private);
     for addr in addrs {
-        if super::is_ssrf_blocked_ip(&addr.ip(), allow_private) {
+        if policy.blocks(&addr.ip()) {
             return Err(super::SSRF_BLOCK_REASON.into());
         }
     }
@@ -1987,9 +1985,9 @@ mod tests {
     }
 
     #[test]
-    fn ssrf_validate_always_blocks_metadata_and_link_local_even_when_private_allowed() {
+    fn ssrf_validate_always_blocks_metadata_but_allows_other_link_local_with_private_opt_in() {
         assert!(ssrf_validate(&[addr("169.254.169.254:80")], true).is_err());
-        assert!(ssrf_validate(&[addr("169.254.1.1:80")], true).is_err());
+        assert!(ssrf_validate(&[addr("169.254.1.1:80")], true).is_ok());
     }
 
     #[test]
@@ -2024,7 +2022,7 @@ mod tests {
     #[test]
     fn ssrf_validate_gates_cgnat_and_zero_net_on_allow_private() {
         // CGNAT (100.64.0.0/10) and the 0.0.0.0/8 block are private ranges under
-        // praxis_core::connectivity::is_private_ip, so they follow the same gate.
+        // shared Praxis address classification, so they follow the same gate.
         for private in ["100.64.0.1:443", "0.1.2.3:443"] {
             assert!(
                 ssrf_validate(&[addr(private)], false).is_err(),
