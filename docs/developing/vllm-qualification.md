@@ -115,27 +115,3 @@ settings may reject an update, which is surfaced as a workflow error.
 A synthetic, reviewable notes fixture lives in
 `tests/qualification/release-notes.fixture.md`. It demonstrates the rendered
 section and idempotent composition; it is not real GPU qualification evidence.
-
-## GPU runner registration timeouts
-
-The `vLLM Integration` workflow runs a failure-only diagnostic step when EC2
-starts but the runner does not register. It reports EC2 system and instance
-checks, fixed markers from the console output, and whether the same PAT can
-list the new runner label. The raw console output is withheld because the
-instance's user data contains a short-lived registration token.
-
-If `runner version rejected: yes`, the runner binary fetched during boot is
-too old for GitHub registration. Update the pinned EC2 runner action or the
-preinstalled runner in the AMI before retrying. Healthy EC2 status checks and
-a working PAT do not rule out this bootstrap failure.
-
-A PAT runner-list error can otherwise appear as a registration timeout: the
-pinned upstream action suppresses errors from that API while polling. If the
-PAT can list runners but the label is absent, check the instance privately for
-`/var/log/cloud-init-output.log` and the runner's `_diag/Runner_*.log`. Those
-logs distinguish boot, runner download/update, network, and registration
-failures. `ec2:GetConsoleOutput` is needed to read the console from CI. If the
-console is unavailable or inconclusive, arrange private log capture through
-AWS during a dedicated diagnostic run; the stop job still terminates the
-instance. Increase the five-minute timeout only after the logs show that
-startup is merely slow.

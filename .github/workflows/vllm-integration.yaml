@@ -1510,14 +1510,6 @@ jobs:
           instance-type: ${{ inputs.gpu_instance_type || env.GPU_INSTANCE_TYPE }}
           github-token: ${{ secrets.PRAXIS_RUNNER_PAT }}
 
-      - name: Diagnose runner registration failure
-        if: ${{ failure() && steps.start.outputs.ec2-instance-id != '' }}
-        env:
-          INSTANCE_ID: ${{ steps.start.outputs.ec2-instance-id }}
-          RUNNER_LABEL: ${{ steps.start.outputs.label }}
-          GH_TOKEN: ${{ secrets.PRAXIS_RUNNER_PAT }}
-        run: bash .github/scripts/diagnose_ec2_runner.sh
-
   vllm-gpu-full-suite:
     name: Run complete live vLLM Responses suite (GPU)
     needs: [gpu-start-runner]
