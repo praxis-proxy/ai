@@ -42,8 +42,8 @@ loopback test stubs) only after its authority has been independently restricted.
 The request-derived `file_url` and MCP transports retain stricter policies:
 they resolve once per attempt, validate every address against `AddressPolicy`,
 do not follow redirects, and allow private access only through their narrow
-origin/loopback controls. GCP metadata intentionally allows its protocol-owned
-private destination via `AddressPolicy::AllowCloudMetadata`.
+origin/loopback controls. GCP metadata intentionally allows only Google's two
+protocol-owned metadata addresses via `AddressPolicy::AllowGoogleMetadata`.
 
 `external_metering` calls out twice per request, so it resolves its configured
 host through the upstream DNS cache rather than on every call. Every cached

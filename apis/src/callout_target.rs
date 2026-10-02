@@ -8,7 +8,7 @@
 //! before the validated socket addresses are handed to the transport.  This
 //! closes the DNS-rebinding gap left by startup-only URL validation.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use praxis_core::connectivity::{classify_ip, normalize_mapped_ipv4};
 use praxis_filter::FilterError;
@@ -22,12 +22,12 @@ pub enum AddressPolicy {
     /// Private, loopback, link-local, and other non-public addresses are
     /// accepted because the operator explicitly opted in.
     AllowPrivate,
-    /// Known cloud metadata endpoints are accepted for a dedicated credential
+    /// Google's metadata endpoints are accepted for the GCP credential
     /// provider whose target authority is independently restricted.
     ///
     /// This is not exposed as a generic configuration opt-in. Unspecified and
     /// multicast destinations remain forbidden.
-    AllowCloudMetadata,
+    AllowGoogleMetadata,
 }
 
 impl AddressPolicy {
@@ -47,10 +47,10 @@ impl AddressPolicy {
         matches!(self, Self::AllowPrivate)
     }
 
-    /// Return whether known cloud metadata endpoints are allowed.
+    /// Return whether Google's metadata endpoints are allowed.
     #[must_use]
-    pub const fn allows_cloud_metadata(self) -> bool {
-        matches!(self, Self::AllowCloudMetadata)
+    pub const fn allows_google_metadata(self) -> bool {
+        matches!(self, Self::AllowGoogleMetadata)
     }
 
     /// Return whether this policy blocks an outbound address.
@@ -60,11 +60,15 @@ impl AddressPolicy {
     /// non-public destinations follow the private-target opt-in.
     #[must_use]
     pub fn blocks(self, ip: &IpAddr) -> bool {
-        let class = classify_ip(ip);
-        if self.allows_cloud_metadata() {
-            return !class.is_cloud_metadata();
+        let ip = normalize_mapped_ipv4(*ip);
+        let class = classify_ip(&ip);
+        if self.allows_google_metadata() {
+            const GOOGLE_METADATA_IPV4: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
+            const GOOGLE_METADATA_IPV6: Ipv6Addr = Ipv6Addr::new(0xFD20, 0xCE, 0, 0, 0, 0, 0, 0x254);
+            return !matches!(ip, IpAddr::V4(ip) if ip == GOOGLE_METADATA_IPV4)
+                && !matches!(ip, IpAddr::V6(ip) if ip == GOOGLE_METADATA_IPV6);
         }
-        (class.is_cloud_metadata() && !self.allows_cloud_metadata())
+        class.is_cloud_metadata()
             || class.is_unspecified()
             || class.is_multicast()
             || (!self.allows_private() && class.is_non_public())
@@ -234,7 +238,7 @@ pub fn validate_ip(filter_name: &str, ip: IpAddr, policy: AddressPolicy) -> Resu
     let ip = normalize_mapped_ipv4(ip);
     let class = classify_ip(&ip);
     if policy.blocks(&ip) {
-        if policy.allows_cloud_metadata() {
+        if policy.allows_google_metadata() {
             return Err(format!("{filter_name}: dedicated metadata target resolved to disallowed address {ip}").into());
         }
         if !class.is_cloud_metadata() && !class.is_unspecified() && !class.is_multicast() {
@@ -345,23 +349,31 @@ mod tests {
     }
 
     #[test]
-    fn dedicated_metadata_policy_allows_metadata_but_not_invalid_destinations() {
-        assert!(
-            validate_ip(
-                "test",
-                "169.254.169.254".parse().unwrap(),
-                AddressPolicy::AllowCloudMetadata,
-            )
-            .is_ok(),
-            "the dedicated credential-provider policy should permit cloud metadata"
-        );
-        assert!(
-            validate_ip("test", "127.0.0.1".parse().unwrap(), AddressPolicy::AllowCloudMetadata).is_err(),
-            "the dedicated policy must not permit a production loopback target"
-        );
-        for address in ["8.8.8.8", "10.0.0.1", "0.0.0.0", "::", "224.0.0.1", "ff02::1"] {
+    fn dedicated_metadata_policy_allows_google_metadata() {
+        for address in ["169.254.169.254", "fd20:ce::254"] {
             assert!(
-                validate_ip("test", address.parse().unwrap(), AddressPolicy::AllowCloudMetadata).is_err(),
+                validate_ip("test", address.parse().unwrap(), AddressPolicy::AllowGoogleMetadata).is_ok(),
+                "Google metadata address {address} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn dedicated_metadata_policy_rejects_other_destinations() {
+        for address in [
+            "8.8.8.8",
+            "10.0.0.1",
+            "127.0.0.1",
+            "169.254.170.2",
+            "100.100.100.200",
+            "fd00:ec2::254",
+            "0.0.0.0",
+            "::",
+            "224.0.0.1",
+            "ff02::1",
+        ] {
+            assert!(
+                validate_ip("test", address.parse().unwrap(), AddressPolicy::AllowGoogleMetadata).is_err(),
                 "{address} must remain blocked under the dedicated metadata policy"
             );
         }

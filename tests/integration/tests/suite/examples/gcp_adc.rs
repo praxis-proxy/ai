@@ -11,6 +11,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use praxis_core::config::Config;
+use praxis_test_utils::{free_port, http_send, parse_status, start_header_echo_backend};
 
 /// Resolve the complete AI pipeline so filter construction errors are visible.
 fn resolve(yaml: &str) -> Result<(), String> {
@@ -48,5 +49,47 @@ fn gcp_adc_rejects_loopback_metadata_host() {
     assert!(
         error.contains("metadata_host"),
         "validation error should identify metadata_host: {error}"
+    );
+}
+
+#[test]
+fn gcp_adc_key_file_failure_returns_service_unavailable() {
+    let credentials = tempfile::tempdir().expect("create credential directory");
+    let credentials_file = credentials.path().join("service-account.json");
+    std::fs::write(
+        &credentials_file,
+        r#"{"type":"service_account","client_email":"sa@example.com"}"#,
+    )
+    .expect("write service-account credentials");
+
+    let backend = start_header_echo_backend();
+    let proxy_port = free_port();
+    let path = praxis_test_utils::example_config_path("gcp-adc.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("read {path}: {error}"));
+    let patched =
+        praxis_test_utils::patch_yaml(&yaml, proxy_port, &HashMap::from([("127.0.0.1:3000", backend.port())]));
+    let patched = patched.replace(
+        "      - filter: gcp_adc",
+        &format!(
+            "      - filter: gcp_adc\n        source: key_file\n        credentials_file: {}",
+            credentials_file.display()
+        ),
+    );
+    let config = Config::from_yaml(&patched).unwrap_or_else(|error| panic!("parse gcp-adc.yaml: {error}"));
+
+    let proxy = praxis_test_utils::start_proxy(&config);
+    let raw = http_send(
+        proxy.addr(),
+        "POST /v1/models HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Content-Length: 15\r\n\
+         Connection: close\r\n\r\n\
+         {\"prompt\":\"hi\"}",
+    );
+
+    assert_eq!(
+        parse_status(&raw),
+        503,
+        "an unavailable key-file token must fail closed with 503: {raw}"
     );
 }

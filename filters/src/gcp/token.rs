@@ -118,13 +118,13 @@ fn metadata_address_policy(metadata_host: &str) -> AddressPolicy {
     if metadata_host.split(':').next().unwrap_or(metadata_host) == "127.0.0.1" {
         return AddressPolicy::AllowPrivate;
     }
-    AddressPolicy::AllowCloudMetadata
+    AddressPolicy::AllowGoogleMetadata
 }
 
 /// Use the metadata-only policy in every production build.
 #[cfg(not(test))]
 fn metadata_address_policy(_metadata_host: &str) -> AddressPolicy {
-    AddressPolicy::AllowCloudMetadata
+    AddressPolicy::AllowGoogleMetadata
 }
 
 /// Acquire a token from the GCE/GKE metadata server.
