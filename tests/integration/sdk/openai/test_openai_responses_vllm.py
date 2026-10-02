@@ -17,7 +17,7 @@ gateway, persistence, tool-loop, and SDK protocol coverage. Tests marked
 ``real_inference`` or ``vllm_compat`` are skipped in simulator mode.
 
 Usage:
-    cargo build -p praxis-ai-proxy --features full
+    cargo build -p praxis-ai-proxy --features full,store-sqlite
     uv run tests/integration/sdk/openai/test_openai_responses_vllm.py -s
 """
 
@@ -158,6 +158,25 @@ def _ogx_endpoint() -> str:
     return f"{host}:{port}"
 
 
+def _make_openai_client(
+    praxis_port: int,
+    *,
+    default_headers: dict[str, str] | None = None,
+    timeout: float = 300,
+) -> OpenAI:
+    """Point an SDK client at a test proxy with the shared client settings."""
+    options: dict[str, Any] = {}
+    if default_headers is not None:
+        options["default_headers"] = default_headers
+    return OpenAI(
+        base_url=f"http://127.0.0.1:{praxis_port}/v1",
+        api_key="test",
+        max_retries=0,
+        timeout=timeout,
+        **options,
+    )
+
+
 def _patch_store_backend(config: str, db_path: str) -> str:
     if DATABASE_URL.startswith("postgres"):
         config = config.replace(
@@ -217,24 +236,84 @@ def _persist_config(config: str) -> str:
     return path
 
 
-def _write_config(praxis_port: int, db_path: str, compression: bool = False) -> str:
-    with open(CONFIG_PATH) as f:
+def _load_example_config(
+    example_path: str,
+    praxis_port: int,
+    *,
+    backend_endpoint: str | None = None,
+    db_path: str | None = None,
+) -> str:
+    """Load a shipped example and substitute its routine test endpoints."""
+    with open(example_path) as f:
         config = f.read()
 
     config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
+    if backend_endpoint is not None:
+        config = config.replace("127.0.0.1:3001", backend_endpoint)
+    if db_path is not None:
+        config = _patch_store_backend(config, db_path)
+    return config
+
+
+def _write_example_config(
+    example_path: str,
+    praxis_port: int,
+    *,
+    backend_endpoint: str | None = None,
+    db_path: str | None = None,
+) -> str:
+    return _persist_config(
+        _load_example_config(
+            example_path,
+            praxis_port,
+            backend_endpoint=backend_endpoint,
+            db_path=db_path,
+        )
+    )
+
+
+def _write_full_flow_config(
+    praxis_port: int,
+    db_path: str,
+    compression: bool = False,
+    *,
+    backend_endpoint: str | None = None,
+    search_port: int | None = None,
+    max_event_bytes: int | None = None,
+) -> str:
+    """Patch the shared full-flow example for live or recording backends."""
+    config = _load_example_config(
+        CONFIG_PATH,
+        praxis_port,
+        backend_endpoint=backend_endpoint or _vllm_endpoint(),
+        db_path=db_path,
+    )
     config = config.replace("127.0.0.1:9999", _ogx_endpoint())
     # The unified gateway wires openai_web_search into the IRR; its config
     # resolves ${WEB_SEARCH_API_KEY} at startup and fails closed when unset.
     # These vLLM turns never emit a web_search_call, so a literal placeholder
     # key keeps the dispatcher inert while letting the binary start.
     config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
-    config = _patch_store_backend(config, db_path)
+    if search_port is not None:
+        search_anchor = "api_key: test-key\n                # Require the per-user key"
+        assert config.count(search_anchor) == 1
+        config = config.replace(
+            search_anchor,
+            "api_key: test-key\n"
+            f"                base_url: http://127.0.0.1:{search_port}\n"
+            "                # Require the per-user key",
+        )
+    if max_event_bytes is not None:
+        anchor = (
+            "        responses_table: openai_responses\n"
+            "        conversations_table: openai_conversations\n"
+        )
+        assert config.count(anchor) == 1
+        config = config.replace(anchor, anchor + f"        max_event_bytes: {max_event_bytes}\n")
     if compression:
         config = _enable_response_store_compression(config)
 
-    path = _persist_config(config)
-    return path
+    return _persist_config(config)
 
 
 def _read_log_tail(log_path: str, max_lines: int = 50) -> str:
@@ -307,80 +386,6 @@ def _assert_stream_contract(
     return terminal
 
 
-def _write_irr_streaming_config(praxis_port: int) -> str:
-    with open(IRR_STREAMING_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
-
-    path = _persist_config(config)
-    return path
-
-
-def _write_chat_streaming_config(
-    praxis_port: int, db_path: str, backend_endpoint: str
-) -> str:
-    """Patch the shipped Responses-to-Chat example for the selected backend."""
-    with open(CHAT_STREAMING_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", backend_endpoint)
-    config = _patch_store_backend(config, db_path)
-
-    path = _persist_config(config)
-    return path
-
-
-def _write_client_tool_compat_config(praxis_port: int, db_path: str) -> str:
-    """Patch the client-tool-compat example for live vLLM.
-
-    The compat config only references the proxy listener, a single
-    inference-backend cluster endpoint, and the SQLite store, so patching is
-    limited to those three (no OGX, no mock side-servers).
-    """
-    with open(CLIENT_TOOL_COMPAT_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
-    config = _patch_store_backend(config, db_path)
-
-    return _persist_config(config)
-
-
-def _write_client_tool_compat_chat_config(praxis_port: int, db_path: str) -> str:
-    """Patch the composed client-tool-compat + Chat Completions example (#1206).
-
-    The composed config points at the proxy listener, a single Chat Completions
-    backend endpoint, and the SQLite store, so patching is limited to those three
-    (no OGX, no mock side-servers). Unlike ``_write_client_tool_compat_config`` the
-    backend receives ``POST /v1/chat/completions`` because
-    ``responses_to_chat_completions`` translates the lowered Responses request.
-    """
-    with open(CLIENT_TOOL_COMPAT_CHAT_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
-    config = _patch_store_backend(config, db_path)
-
-    return _persist_config(config)
-
-
-def _write_reasoning_config(praxis_port: int, db_path: str) -> str:
-    """Patch the shipped reasoning-dialect example for live vLLM."""
-    with open(REASONING_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", _vllm_endpoint())
-    config = _patch_store_backend(config, db_path)
-
-    return _persist_config(config)
-
-
 def _write_reasoning_backend_config(
     praxis_port: int,
     db_path: str,
@@ -389,19 +394,18 @@ def _write_reasoning_backend_config(
 ) -> str:
     """Patch the reasoning example to target a specific Chat backend port.
 
-    Identical to :func:`_write_reasoning_config` except the ``127.0.0.1:3001``
-    backend is pointed at ``backend_port`` (a capturing mock) so a test can
-    observe the exact Chat Completions request body the backend receives after
-    the proxy replays reasoning in the assistant reasoning field.
+    The ``127.0.0.1:3001`` backend is pointed at ``backend_port`` (a capturing
+    mock) so a test can observe the exact Chat Completions request body the
+    backend receives after the proxy replays reasoning in the assistant
+    reasoning field.
     """
-    with open(REASONING_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
+    config = _load_example_config(
+        REASONING_CONFIG_PATH,
+        praxis_port,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+        db_path=db_path,
+    )
     config = config.replace("dialect: vllm", f"dialect: {dialect}")
-    config = _patch_store_backend(config, db_path)
-
     return _persist_config(config)
 
 
@@ -411,7 +415,12 @@ def test_reasoning_config_writers_inherit_root_override(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     db_path = str(tmp_path / "responses.db")
     paths = [
-        _write_reasoning_config(18_080, db_path),
+        _write_example_config(
+            REASONING_CONFIG_PATH,
+            18_080,
+            backend_endpoint=_vllm_endpoint(),
+            db_path=db_path,
+        ),
         _write_reasoning_backend_config(18_081, db_path, 18_082),
     ]
     try:
@@ -430,10 +439,7 @@ def _write_compact_config(
     compaction_port: int,
 ) -> str:
     """Patch the compact example for inference and a deterministic summary."""
-    with open(COMPACT_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = _load_example_config(COMPACT_CONFIG_PATH, praxis_port, db_path=db_path)
     config = config.replace("127.0.0.1:9999", _ogx_endpoint())
     config = config.replace(
         "http://localhost:11434/v1/chat/completions",
@@ -444,10 +450,7 @@ def _write_compact_config(
     )
     config = config.replace("timeout_ms: 60000", "timeout_ms: 300000")
     config = config.replace("127.0.0.1:11434", _vllm_endpoint())
-    config = _patch_store_backend(config, db_path)
-
-    path = _persist_config(config)
-    return path
+    return _persist_config(config)
 
 
 def _write_web_search_chat_streaming_config(
@@ -458,10 +461,7 @@ def _write_web_search_chat_streaming_config(
     Points the loop at the selected Chat backend and swaps the Brave provider's
     ``${WEB_SEARCH_API_KEY}`` placeholder for the in-process mock search server.
     """
-    with open(WEB_SEARCH_CHAT_STREAMING_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = _load_example_config(WEB_SEARCH_CHAT_STREAMING_CONFIG_PATH, praxis_port)
     config = config.replace(
         '- "127.0.0.1:3001"',
         f'- "{backend_endpoint}"\n'
@@ -1254,48 +1254,6 @@ def _assert_simulator_auto_tool_round(
 
 
 
-def _write_witness_config(
-    praxis_port: int,
-    db_path: str,
-    backend_port: int,
-    search_port: int | None = None,
-    max_event_bytes: int | None = None,
-) -> str:
-    """Patch full-flow-agentic.yaml to route the native backend through the shim.
-
-    Identical to :func:`_write_config` except the ``127.0.0.1:3001`` backend is
-    pointed at the recording shim (which forwards to vLLM) instead of vLLM
-    directly, so a test can observe the exact request bodies the backend sees.
-    """
-    with open(CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
-    config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
-    config = config.replace("127.0.0.1:9999", _ogx_endpoint())
-    config = config.replace("api_key: ${WEB_SEARCH_API_KEY}", "api_key: test-key")
-    if search_port is not None:
-        search_anchor = "api_key: test-key\n                # Require the per-user key"
-        assert config.count(search_anchor) == 1
-        config = config.replace(
-            search_anchor,
-            "api_key: test-key\n"
-            f"                base_url: http://127.0.0.1:{search_port}\n"
-            "                # Require the per-user key",
-        )
-    config = _patch_store_backend(config, db_path)
-    if max_event_bytes is not None:
-        anchor = (
-            "        responses_table: openai_responses\n"
-            "        conversations_table: openai_conversations\n"
-        )
-        assert config.count(anchor) == 1
-        config = config.replace(anchor, anchor + f"        max_event_bytes: {max_event_bytes}\n")
-
-    path = _persist_config(config)
-    return path
-
-
 def _write_agentic_config(
     praxis_port: int,
     db_path: str,
@@ -1307,10 +1265,7 @@ def _write_agentic_config(
     real_web_search: bool = False,
 ) -> str:
     """Patch agentic-loop.yaml for mocked or credentialed agentic tests."""
-    with open(AGENTIC_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = _load_example_config(AGENTIC_CONFIG_PATH, praxis_port, db_path=db_path)
     vllm = backend_endpoint if translate_to_chat else _vllm_endpoint()
     if vllm is None:
         raise ValueError("translated agentic config requires a backend endpoint")
@@ -1326,7 +1281,6 @@ def _write_agentic_config(
     # file-search vector store at OGX so the file-search dispatcher is live here
     # too; it stays inert for web/mcp-only tests that emit no file_search_call.
     config = config.replace("http://127.0.0.1:8001", f"http://{_ogx_endpoint()}")
-    config = _patch_store_backend(config, db_path)
     # The loopback MCP callout's SSRF posture is governed by
     # ``insecure_options.allow_private_upstreams`` (no per-filter opt-in), which
     # agentic-loop.yaml already enables -- so no injection is needed here.
@@ -1411,7 +1365,7 @@ def praxis_proxy(tmp_path_factory, request):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_config(port, db_path)
+    config_path = _write_full_flow_config(port, db_path)
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1450,7 +1404,7 @@ def compression_proxy(tmp_path_factory, request):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-compression")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_config(port, db_path, compression=True)
+    config_path = _write_full_flow_config(port, db_path, compression=True)
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1487,7 +1441,9 @@ def compression_proxy(tmp_path_factory, request):
 def irr_streaming_proxy(tmp_path_factory, request):
     """Start a Praxis proxy with terminal Responses streaming through IRR."""
     port = _free_port()
-    config_path = _write_irr_streaming_config(port)
+    config_path = _write_example_config(
+        IRR_STREAMING_CONFIG_PATH, port, backend_endpoint=_vllm_endpoint()
+    )
     binary = _find_binary()
 
     log_dir = tmp_path_factory.mktemp("irr-terminal-streaming")
@@ -1527,8 +1483,11 @@ def chat_streaming_proxy(tmp_path_factory, request, backend_endpoint):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-chat-streaming")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_chat_streaming_config(
-        port, db_path, backend_endpoint
+    config_path = _write_example_config(
+        CHAT_STREAMING_CONFIG_PATH,
+        port,
+        backend_endpoint=backend_endpoint,
+        db_path=db_path,
     )
     binary = _find_binary()
 
@@ -1568,7 +1527,12 @@ def reasoning_proxy(tmp_path_factory, request):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-reasoning")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_reasoning_config(port, db_path)
+    config_path = _write_example_config(
+        REASONING_CONFIG_PATH,
+        port,
+        backend_endpoint=_vllm_endpoint(),
+        db_path=db_path,
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1607,7 +1571,12 @@ def client_tool_compat_proxy(tmp_path_factory, request):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("client-tool-compat")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_client_tool_compat_config(port, db_path)
+    config_path = _write_example_config(
+        CLIENT_TOOL_COMPAT_CONFIG_PATH,
+        port,
+        backend_endpoint=_vllm_endpoint(),
+        db_path=db_path,
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1643,12 +1612,7 @@ def client_tool_compat_proxy(tmp_path_factory, request):
 @pytest.fixture(scope="session")
 def client_tool_compat_client(client_tool_compat_proxy):
     """Return an SDK client using the client-tool-compat pipeline."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{client_tool_compat_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(client_tool_compat_proxy)
 
 
 @pytest.fixture(scope="session")
@@ -1657,7 +1621,12 @@ def client_tool_compat_chat_proxy(tmp_path_factory, request):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("client-tool-compat-chat")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_client_tool_compat_chat_config(port, db_path)
+    config_path = _write_example_config(
+        CLIENT_TOOL_COMPAT_CHAT_CONFIG_PATH,
+        port,
+        backend_endpoint=_vllm_endpoint(),
+        db_path=db_path,
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1693,12 +1662,7 @@ def client_tool_compat_chat_proxy(tmp_path_factory, request):
 @pytest.fixture(scope="session")
 def client_tool_compat_chat_client(client_tool_compat_chat_proxy):
     """Return an SDK client using the composed compat + Chat Completions pipeline."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{client_tool_compat_chat_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(client_tool_compat_chat_proxy)
 
 
 @pytest.fixture(scope="session")
@@ -1775,8 +1739,12 @@ def _witness_proxy_session(
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-witness")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_witness_config(
-        port, db_path, backend_port, search_port, max_event_bytes
+    config_path = _write_full_flow_config(
+        port,
+        db_path,
+        backend_endpoint=f"127.0.0.1:{backend_port}",
+        search_port=search_port,
+        max_event_bytes=max_event_bytes,
     )
     binary = _find_binary()
 
@@ -1791,13 +1759,7 @@ def _witness_proxy_session(
     try:
         _wait_for_proxy(port, proc, log_path)
         started = True
-        client = OpenAI(
-            base_url=f"http://127.0.0.1:{port}/v1",
-            api_key="test",
-            default_headers=TRUSTED_OWNER_HEADERS,
-            max_retries=0,
-            timeout=300,
-        )
+        client = _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS)
         yield client, forwarded
     finally:
         proc.send_signal(signal.SIGINT)
@@ -1852,7 +1814,9 @@ def provider_compaction_client(tmp_path_factory, request):
     port = _free_port()
     db_dir = tmp_path_factory.mktemp("responses-provider-compaction")
     db_path = str(db_dir / "responses.db")
-    config_path = _write_witness_config(port, db_path, backend_port)
+    config_path = _write_full_flow_config(
+        port, db_path, backend_endpoint=f"127.0.0.1:{backend_port}"
+    )
     binary = _find_binary()
 
     log_path = str(db_dir / "praxis.log")
@@ -1866,13 +1830,7 @@ def provider_compaction_client(tmp_path_factory, request):
     try:
         _wait_for_proxy(port, proc, log_path)
         started = True
-        client = OpenAI(
-            base_url=f"http://127.0.0.1:{port}/v1",
-            api_key="test",
-            default_headers=TRUSTED_OWNER_HEADERS,
-            max_retries=0,
-            timeout=300,
-        )
+        client = _make_openai_client(port, default_headers=TRUSTED_OWNER_HEADERS)
         yield client, requests
     finally:
         proc.send_signal(signal.SIGINT)
@@ -1926,12 +1884,7 @@ def _reasoning_capture_session(tmp_path_factory, request):
     try:
         _wait_for_proxy(port, proc, log_path)
         started = True
-        client = OpenAI(
-            base_url=f"http://127.0.0.1:{port}/v1",
-            api_key="test",
-            max_retries=0,
-            timeout=300,
-        )
+        client = _make_openai_client(port)
         yield client, captured
     finally:
         proc.send_signal(signal.SIGINT)
@@ -1960,84 +1913,54 @@ def reasoning_capture_client(tmp_path_factory, request):
 @pytest.fixture(scope="session")
 def openai_client(praxis_proxy):
     """Return an OpenAI client pointed at the local Praxis proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
-        api_key="test",
+    return _make_openai_client(
+        praxis_proxy,
         default_headers={
             **TRUSTED_OWNER_HEADERS,
             "x-user-ogx-key": "Bearer test",
         },
-        max_retries=0,
-        timeout=300,
     )
 
 
 @pytest.fixture(scope="session")
 def other_owner_openai_client(praxis_proxy):
     """Return a same-tenant Responses client with another subject."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{praxis_proxy}/v1",
-        api_key="test",
+    return _make_openai_client(
+        praxis_proxy,
         default_headers={**TRUSTED_OWNER_HEADERS, "x-auth-user": "other-test-user"},
-        max_retries=0,
-        timeout=300,
     )
 
 
 @pytest.fixture(scope="session")
 def compression_openai_client(compression_proxy):
     """Return an OpenAI client pointed at the compression-enabled proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{compression_proxy}/v1",
-        api_key="test",
-        default_headers=TRUSTED_OWNER_HEADERS,
-        max_retries=0,
-        timeout=300,
+    return _make_openai_client(
+        compression_proxy, default_headers=TRUSTED_OWNER_HEADERS
     )
 
 
 @pytest.fixture(scope="session")
 def irr_streaming_client(irr_streaming_proxy):
     """Return an OpenAI client using the terminal-streaming IRR proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{irr_streaming_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(irr_streaming_proxy)
 
 
 @pytest.fixture(scope="session")
 def chat_streaming_client(chat_streaming_proxy):
     """Return an SDK client using Responses-to-Chat stream translation."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{chat_streaming_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(chat_streaming_proxy)
 
 
 @pytest.fixture(scope="session")
 def reasoning_client(reasoning_proxy):
     """Return an SDK client using the reasoning-dialect example."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{reasoning_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(reasoning_proxy)
 
 
 @pytest.fixture(scope="session")
 def compact_client(compact_proxy):
     """Return an SDK client using the compact filter example."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{compact_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(compact_proxy)
 
 
 @pytest.fixture(scope="session")
@@ -2086,12 +2009,7 @@ def web_search_chat_streaming_proxy(
 def web_search_chat_streaming_client(web_search_chat_streaming_proxy):
     """Return an SDK client using streaming web-search-through-Chat translation."""
     proxy_port, _ = web_search_chat_streaming_proxy
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{proxy_port}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(proxy_port)
 
 
 # ---------------------------------------------------------------------------
@@ -4475,12 +4393,7 @@ def agentic_proxy(tmp_path_factory, request, mcp_server, search_server):
 def agentic_client(agentic_proxy):
     """Return an OpenAI client pointed at the agentic Praxis proxy."""
     proxy_port, _, _ = agentic_proxy
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{proxy_port}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(proxy_port)
 
 
 @pytest.fixture(scope="session")
@@ -4537,12 +4450,7 @@ def translated_agentic_proxy(
 @pytest.fixture(scope="session")
 def translated_agentic_client(translated_agentic_proxy):
     """Return an SDK client using translated agentic inference."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{translated_agentic_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(translated_agentic_proxy)
 
 
 @pytest.fixture(scope="session")
@@ -4574,12 +4482,7 @@ def live_tavily_client(tmp_path_factory, request, backend_endpoint):
     log_path = str(db_dir / "praxis.log")
     log_file = open(log_path, "w")
     started = False
-    client = OpenAI(
-        base_url=f"http://127.0.0.1:{port}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    client = _make_openai_client(port)
     proc = subprocess.Popen(
         [binary, "-c", config_path],
         stdout=log_file,
@@ -7157,12 +7060,7 @@ def file_search_proxy(tmp_path_factory, request, file_search_backend):
 @pytest.fixture(scope="session")
 def file_search_client(file_search_proxy):
     """Return an OpenAI client pointed at the file-search Praxis proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{file_search_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(file_search_proxy)
 
 
 class TestFileSearchVLLM:
@@ -7272,10 +7170,7 @@ def _write_file_search_chat_config(
     the postgres store job co-locates those containers, and a 60s step
     budget can expire before vLLM returns.
     """
-    with open(FILE_SEARCH_CHAT_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = _load_example_config(FILE_SEARCH_CHAT_CONFIG_PATH, praxis_port)
     config = config.replace("127.0.0.1:8001", _ogx_endpoint())
     config = config.replace(
         '                  - name: "chat-completions-backend"\n'
@@ -7342,12 +7237,7 @@ def file_search_chat_proxy(
 @pytest.fixture(scope="session")
 def file_search_chat_client(file_search_chat_proxy):
     """Return an OpenAI client pointed at the file-search chat proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{file_search_chat_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(file_search_chat_proxy)
 
 
 class TestFileSearchChatCompletionsVLLM:
@@ -7479,10 +7369,7 @@ def _write_file_search_streaming_config(
     under co-located CI load (postgres + vLLM + OGX) needs the wider budgets
     already used by the agentic and non-streaming file-search fixtures.
     """
-    with open(FILE_SEARCH_STREAMING_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = _load_example_config(FILE_SEARCH_STREAMING_CONFIG_PATH, praxis_port)
     config = config.replace("127.0.0.1:8001", _ogx_endpoint())
     # Retarget the model backend and give it a generous read timeout, matching
     # _write_agentic_config. This is also the only occurrence of :3001.
@@ -7545,12 +7432,7 @@ def file_search_streaming_proxy(
 @pytest.fixture(scope="session")
 def file_search_streaming_client(file_search_streaming_proxy):
     """Return an OpenAI client pointed at the streaming file-search proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{file_search_streaming_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(file_search_streaming_proxy)
 
 
 def _drain_response_stream(stream):
@@ -8551,10 +8433,7 @@ def _write_file_resolve_config(
     file_url_port: int,
 ) -> str:
     """Patch the shipped file-resolve example for stubbed upstreams."""
-    with open(FILE_RESOLVE_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = _load_example_config(FILE_RESOLVE_CONFIG_PATH, praxis_port)
     # files_api_url and the files-api cluster endpoint both use :9999.
     config = config.replace("127.0.0.1:9999", f"127.0.0.1:{files_port}")
     config = config.replace("127.0.0.1:3001", f"127.0.0.1:{backend_port}")
@@ -8612,12 +8491,7 @@ def file_resolve_stub_env(tmp_path_factory, request):
     try:
         _wait_for_proxy(port, proc, log_path)
         started = True
-        client = OpenAI(
-            base_url=f"http://127.0.0.1:{port}/v1",
-            api_key="test",
-            max_retries=0,
-            timeout=60,
-        )
+        client = _make_openai_client(port, timeout=60)
         yield (
             client,
             _FilesApiStubHandler,
@@ -8755,10 +8629,7 @@ def _write_model_rewrite_config(praxis_port: int, backend_endpoint: str) -> str:
     is both what the backend receives and what selects the cluster. All
     three example clusters point at the one backend under test.
     """
-    with open(MODEL_REWRITE_CONFIG_PATH) as f:
-        config = f.read()
-
-    config = config.replace("127.0.0.1:8080", f"127.0.0.1:{praxis_port}")
+    config = _load_example_config(MODEL_REWRITE_CONFIG_PATH, praxis_port)
     for placeholder in ("127.0.0.1:3001", "127.0.0.1:3002", "127.0.0.1:3003"):
         config = config.replace(placeholder, backend_endpoint)
     config = config.replace("llama-3.3-70b", VLLM_MODEL)
@@ -8807,12 +8678,7 @@ def model_rewrite_proxy(tmp_path_factory, request, backend_endpoint):
 @pytest.fixture(scope="session")
 def model_rewrite_client(model_rewrite_proxy):
     """Return an OpenAI client pointed at the model-rewrite proxy."""
-    return OpenAI(
-        base_url=f"http://127.0.0.1:{model_rewrite_proxy}/v1",
-        api_key="test",
-        max_retries=0,
-        timeout=300,
-    )
+    return _make_openai_client(model_rewrite_proxy)
 
 
 class TestModelRewriteChatCompletionsVLLM:
