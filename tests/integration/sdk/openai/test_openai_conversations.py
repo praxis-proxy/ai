@@ -850,7 +850,9 @@ class TestOpenAIConversations:
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.conversations.items.create(conversation.id, items=[])
-        assert exc_info.value.status_code == 404
+        assert exc_info.value.status_code == 404, (
+            "an empty item batch must not bypass the missing-parent check"
+        )
 
         with pytest.raises(NotFoundError) as exc_info:
             openai_client.conversations.items.delete(
@@ -905,11 +907,13 @@ class TestOpenAIConversations:
         )
 
         page = openai_client.conversations.items.create(conversation.id, items=[])
-        assert page.object == "list"
-        assert page.data == []
+        assert page.object == "list", "an empty batch must return the list envelope"
+        assert page.data == [], "an empty batch must not create items"
 
         remaining = openai_client.conversations.items.list(conversation.id)
-        assert [item.id for item in remaining.data] == ["item_empty_keep"]
+        assert [item.id for item in remaining.data] == [
+            "item_empty_keep"
+        ], "an empty batch must leave existing items untouched"
 
     def test_empty_item_list_is_sdk_compatible(self, openai_client):
         conversation = openai_client.conversations.create()
