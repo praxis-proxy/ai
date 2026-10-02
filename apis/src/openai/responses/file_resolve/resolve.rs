@@ -35,13 +35,45 @@ use crate::{
 const FILES_PATH_PREFIX: &str = "v1/files";
 
 /// Identifies the source of a file reference for dispatch and caching.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum ReferenceSource {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReferenceSource<'a> {
     /// Files API `file_id` reference.
-    FileId(String),
+    FileId(&'a str),
     /// Remote `file_url` reference.
-    FileUrl(String),
+    FileUrl(&'a str),
 }
+
+/// Keep file IDs and URLs in separate cache namespaces, even when their text matches.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ReferenceKind {
+    /// Files API reference.
+    FileId,
+    /// Remote URL reference.
+    FileUrl,
+}
+
+impl<'a> ReferenceSource<'a> {
+    /// Cache namespace for this source.
+    fn kind(self) -> ReferenceKind {
+        match self {
+            Self::FileId(_) => ReferenceKind::FileId,
+            Self::FileUrl(_) => ReferenceKind::FileUrl,
+        }
+    }
+
+    /// Borrow the reference value without copying it.
+    fn value(self) -> &'a str {
+        match self {
+            Self::FileId(value) | Self::FileUrl(value) => value,
+        }
+    }
+}
+
+/// Owned outcomes keyed by retained reference values and looked up by `&str`.
+type CacheEntries = HashMap<String, Result<ResolvedFile, ResolveError>>;
+
+/// A separate cache map for each content part and source kind.
+type ResolutionCache = HashMap<(&'static str, ReferenceKind), CacheEntries>;
 
 /// Return whether a Responses request body contains a valid `file_id` reference that
 /// will dispatch to the configured Files API.
@@ -89,7 +121,7 @@ fn has_resolvable_file_id(part: &serde_json::Value) -> bool {
     }
 }
 
-impl std::fmt::Display for ReferenceSource {
+impl std::fmt::Display for ReferenceSource<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FileId(id) => write!(f, "{id}"),
@@ -213,7 +245,7 @@ pub(crate) struct FilesApiClient {
 /// Request-scoped limits and cached resolution outcomes.
 pub(crate) struct ResolutionBudget {
     /// Resolutions cached by content part type and reference source.
-    cache: HashMap<(String, ReferenceSource), Result<ResolvedFile, ResolveError>>,
+    cache: ResolutionCache,
     /// Deadline shared by every Files API callout in the request.
     deadline: tokio::time::Instant,
     /// Maximum file references allowed for this request.
@@ -254,11 +286,11 @@ struct ResolutionRequest<'a> {
     /// Files API client.
     client: &'a FilesApiClient,
     /// Reference source (file ID or file URL).
-    source: &'a ReferenceSource,
+    source: ReferenceSource<'a>,
     /// Maximum resolved bytes remaining for this item collection.
     max_resolved_bytes: usize,
     /// Responses content part type.
-    part_type: &'a str,
+    part_type: &'static str,
     /// Original request headers available for forwarding.
     request_headers: &'a http::HeaderMap,
     /// URL resolver for `file_url` references.
@@ -280,6 +312,17 @@ struct ContentResolver<'a> {
 }
 
 impl ResolutionBudget {
+    /// Look up a resolution without constructing an owned cache key.
+    fn cached(
+        &self,
+        part_type: &'static str,
+        source: ReferenceSource<'_>,
+    ) -> Option<&Result<ResolvedFile, ResolveError>> {
+        self.cache
+            .get(&(part_type, source.kind()))
+            .and_then(|entries| entries.get(source.value()))
+    }
+
     /// Start fresh count and byte accounting for a mirrored state
     /// representation while retaining the shared cache and deadline.
     pub(crate) fn begin_independent_accounting(&mut self) -> ResolutionAccounting {
@@ -309,8 +352,8 @@ impl ResolutionBudget {
             request_headers,
             url_resolver,
         } = request;
-        let key = (part_type.to_owned(), source.clone());
-        if let Some(cached) = self.cache.get(&key) {
+        let cache_kind = (part_type, source.kind());
+        if let Some(cached) = self.cached(part_type, source) {
             return cached.clone();
         }
 
@@ -340,7 +383,10 @@ impl ResolutionBudget {
 
         // Retain one owned outcome for repeated references while
         // returning an independently owned value to the JSON part.
-        self.cache.insert(key, resolution.clone());
+        self.cache
+            .entry(cache_kind)
+            .or_default()
+            .insert(source.value().to_owned(), resolution.clone());
         resolution
     }
 
@@ -369,10 +415,10 @@ impl ResolutionBudget {
 }
 
 /// Build the stable error returned when the request-wide deadline expires.
-fn overall_timeout_error_for_source(source: &ReferenceSource) -> Result<ResolvedFile, ResolveError> {
+fn overall_timeout_error_for_source(source: ReferenceSource<'_>) -> Result<ResolvedFile, ResolveError> {
     match source {
         ReferenceSource::FileId(file_id) => Err(ResolveError::CalloutFailed {
-            file_id: file_id.clone(),
+            file_id: file_id.to_owned(),
             detail: "overall file resolution deadline exceeded".to_owned(),
         }),
         ReferenceSource::FileUrl(url) => Err(ResolveError::FileUrlFailed {
@@ -700,21 +746,21 @@ async fn resolve_content_part(
         return Ok(None);
     }
 
-    let (source, part_type) = (source, part_type.to_owned());
     debug!(source = %source, part_type = %part_type, "resolving file reference");
 
     let max_resolved_bytes = resolver.budget.remaining_resolved_bytes;
-    let Some(resolved) = resolve_reference(&source, &part_type, max_resolved_bytes, resolver).await? else {
+    let Some(resolved) = resolve_reference(source, part_type, max_resolved_bytes, resolver).await? else {
         return Ok(None);
     };
-    let len = output_len_for_part(&part_type, &source, &resolved);
+    let len = output_len_for_part(part_type, source, &resolved);
     if len > max_resolved_bytes {
         return Err(ResolveError::TooLarge {
             reference: source.to_string(),
             limit: resolver.client.max_resolved_bytes,
         });
     }
-    rewrite_part(part, &part_type, &source, resolved);
+    let source_kind = source.kind();
+    rewrite_part(part, part_type, source_kind, resolved);
     Ok(Some(len))
 }
 
@@ -728,8 +774,8 @@ async fn resolve_content_part(
 /// hands the original URL to a backend that might fetch it itself
 /// without the same protections.
 async fn resolve_reference(
-    source: &ReferenceSource,
-    part_type: &str,
+    source: ReferenceSource<'_>,
+    part_type: &'static str,
     remaining_resolved_bytes: usize,
     resolver: &mut ContentResolver<'_>,
 ) -> Result<Option<ResolvedFile>, ResolveError> {
@@ -765,8 +811,8 @@ async fn resolve_reference(
 ///
 /// `input_image` parts continue to resolve only via `file_id`.
 #[expect(clippy::too_many_lines, reason = "explicit field validation logic")]
-fn resolvable_reference(part: &serde_json::Value) -> Option<(&str, ReferenceSource)> {
-    let part_type @ "input_file" = part.get("type")?.as_str()? else {
+fn resolvable_reference(part: &serde_json::Value) -> Option<(&'static str, ReferenceSource<'_>)> {
+    let "input_file" = part.get("type")?.as_str()? else {
         // input_image file_id resolution is unchanged — keep the
         // existing has_inline_content/file_id path for it.
         if part.get("type")?.as_str()? == "input_image" {
@@ -806,26 +852,26 @@ fn resolvable_reference(part: &serde_json::Value) -> Option<(&str, ReferenceSour
     }
 
     if let Some(url) = file_url_str {
-        return Some((part_type, ReferenceSource::FileUrl(url.to_owned())));
+        return Some(("input_file", ReferenceSource::FileUrl(url)));
     }
     if let Some(id) = file_id {
-        return Some((part_type, ReferenceSource::FileId(id.to_owned())));
+        return Some(("input_file", ReferenceSource::FileId(id)));
     }
     None
 }
 
 /// Existing `input_image` `file_id` resolution (unchanged behavior).
-fn resolvable_image_reference(part: &serde_json::Value) -> Option<(&'static str, ReferenceSource)> {
+fn resolvable_image_reference(part: &serde_json::Value) -> Option<(&'static str, ReferenceSource<'_>)> {
     if part.get("image_url").and_then(serde_json::Value::as_str).is_some() {
         return None;
     }
     let file_id = part.get("file_id")?.as_str()?;
-    Some(("input_image", ReferenceSource::FileId(file_id.to_owned())))
+    Some(("input_image", ReferenceSource::FileId(file_id)))
 }
 
 /// Compute the JSON string length of the resolved value for a
 /// given content part type and source.
-fn output_len_for_part(part_type: &str, source: &ReferenceSource, resolved: &ResolvedFile) -> usize {
+fn output_len_for_part(part_type: &str, source: ReferenceSource<'_>, resolved: &ResolvedFile) -> usize {
     match (part_type, source) {
         ("input_file", ReferenceSource::FileId(_)) => resolved.base64.len(),
         ("input_file", ReferenceSource::FileUrl(_)) => {
@@ -843,7 +889,7 @@ fn output_len_for_part(part_type: &str, source: &ReferenceSource, resolved: &Res
 /// For `input_image`, writes a `data:` URL to `image_url`.
 /// Populates `filename` from metadata when not already user-provided.
 #[expect(clippy::too_many_lines, reason = "explicit branching per part type and source")]
-fn rewrite_part(part: &mut serde_json::Value, part_type: &str, source: &ReferenceSource, resolved: ResolvedFile) {
+fn rewrite_part(part: &mut serde_json::Value, part_type: &str, source: ReferenceKind, resolved: ResolvedFile) {
     let Some(obj) = part.as_object_mut() else {
         return;
     };
@@ -854,16 +900,16 @@ fn rewrite_part(part: &mut serde_json::Value, part_type: &str, source: &Referenc
     } = resolved;
 
     match source {
-        ReferenceSource::FileId(_) => {
+        ReferenceKind::FileId => {
             obj.remove("file_id");
         },
-        ReferenceSource::FileUrl(_) => {
+        ReferenceKind::FileUrl => {
             obj.remove("file_url");
         },
     }
 
     match (part_type, source) {
-        ("input_file", ReferenceSource::FileId(_)) => {
+        ("input_file", ReferenceKind::FileId) => {
             obj.insert("file_data".to_owned(), serde_json::Value::String(base64));
             if !obj.contains_key("filename")
                 && let Some(filename) = filename
@@ -871,7 +917,7 @@ fn rewrite_part(part: &mut serde_json::Value, part_type: &str, source: &Referenc
                 obj.insert("filename".to_owned(), serde_json::Value::String(filename));
             }
         },
-        ("input_file", ReferenceSource::FileUrl(_)) => {
+        ("input_file", ReferenceKind::FileUrl) => {
             let data_uri = format!("data:{content_type};base64,{base64}");
             obj.insert("file_data".to_owned(), serde_json::Value::String(data_uri));
             if !obj.contains_key("filename")
@@ -1338,17 +1384,18 @@ mod tests {
     async fn cached_successes_share_request_wide_byte_budget() {
         let client = test_client_with_limits("http://files-api:8321", 8, 1_000);
         let mut budget = client.resolution_budget(None);
-        budget.cache.insert(
-            (
-                "input_file".to_owned(),
-                ReferenceSource::FileId("file-cached".to_owned()),
-            ),
-            Ok(ResolvedFile {
-                base64: "ZGF0".to_owned(),
-                content_type: "text/plain".to_owned(),
-                filename: Some("data.txt".to_owned()),
-            }),
-        );
+        budget
+            .cache
+            .entry(("input_file", ReferenceKind::FileId))
+            .or_default()
+            .insert(
+                "file-cached".to_owned(),
+                Ok(ResolvedFile {
+                    base64: "ZGF0".to_owned(),
+                    content_type: "text/plain".to_owned(),
+                    filename: Some("data.txt".to_owned()),
+                }),
+            );
 
         for _ in 0..2 {
             let count = resolve_cached_items(&client, &mut budget).await.unwrap();
@@ -1520,12 +1567,7 @@ mod tests {
             content_type: "image/png".to_owned(),
             filename: None,
         };
-        rewrite_part(
-            &mut part,
-            "input_image",
-            &ReferenceSource::FileId("img-456".to_owned()),
-            resolved,
-        );
+        rewrite_part(&mut part, "input_image", ReferenceKind::FileId, resolved);
 
         assert!(part.get("file_id").is_none(), "file_id should be removed");
         assert_eq!(part["detail"].as_str().unwrap(), "high", "detail should be preserved");
@@ -1550,12 +1592,7 @@ mod tests {
             content_type: "application/pdf".to_owned(),
             filename: Some("api-filename.pdf".to_owned()),
         };
-        rewrite_part(
-            &mut part,
-            "input_file",
-            &ReferenceSource::FileId("file-abc".to_owned()),
-            resolved,
-        );
+        rewrite_part(&mut part, "input_file", ReferenceKind::FileId, resolved);
 
         assert_eq!(
             part["filename"].as_str().unwrap(),
@@ -1575,12 +1612,7 @@ mod tests {
             content_type: "text/plain".to_owned(),
             filename: Some("test.txt".to_owned()),
         };
-        rewrite_part(
-            &mut part,
-            "input_file",
-            &ReferenceSource::FileId("file-abc".to_owned()),
-            resolved,
-        );
+        rewrite_part(&mut part, "input_file", ReferenceKind::FileId, resolved);
 
         assert_eq!(
             part["filename"].as_str().unwrap(),
@@ -1591,20 +1623,64 @@ mod tests {
 
     #[test]
     fn reference_source_file_id_and_file_url_are_distinct_cache_keys() {
-        use std::collections::HashMap;
+        let client = test_client("http://files-api:8321");
+        let mut budget = client.resolution_budget(None);
+        for (part_type, kind, label) in [
+            ("input_file", ReferenceKind::FileId, "file id"),
+            ("input_file", ReferenceKind::FileUrl, "file url"),
+            ("input_image", ReferenceKind::FileId, "image id"),
+        ] {
+            budget.cache.entry((part_type, kind)).or_default().insert(
+                "abc".to_owned(),
+                Err(ResolveError::InvalidFileId {
+                    file_id: label.to_owned(),
+                    detail: String::new(),
+                }),
+            );
+        }
 
-        let mut cache = HashMap::new();
-        let key_id = ("input_file".to_owned(), ReferenceSource::FileId("abc".to_owned()));
-        let key_url = ("input_file".to_owned(), ReferenceSource::FileUrl("abc".to_owned()));
-        cache.insert(key_id.clone(), "from_id");
-        cache.insert(key_url.clone(), "from_url");
+        for (part_type, source, expected) in [
+            ("input_file", ReferenceSource::FileId("abc"), "file id"),
+            ("input_file", ReferenceSource::FileUrl("abc"), "file url"),
+            ("input_image", ReferenceSource::FileId("abc"), "image id"),
+        ] {
+            assert!(
+                matches!(budget.cached(part_type, source), Some(Err(ResolveError::InvalidFileId { file_id, .. })) if file_id == expected),
+                "cache must distinguish source kind and content part type"
+            );
+        }
+    }
 
-        assert_eq!(cache[&key_id], "from_id", "FileId key should be distinct from FileUrl");
-        assert_eq!(
-            cache[&key_url], "from_url",
-            "FileUrl key should be distinct from FileId"
+    #[test]
+    fn classification_and_cache_hit_allocate_no_lookup_key() {
+        let client = test_client("http://files-api:8321");
+        let mut budget = client.resolution_budget(None);
+        budget
+            .cache
+            .entry(("input_file", ReferenceKind::FileId))
+            .or_default()
+            .insert("file-hit".to_owned(), Err(ResolveError::TooManyReferences { limit: 1 }));
+        let hit_part = serde_json::json!({"type": "input_file", "file_id": "file-hit"});
+        let miss_part = serde_json::json!({"type": "input_file", "file_id": "file-miss"});
+
+        let hit = allocation_counter::measure(|| {
+            let (part_type, source) = resolvable_reference(&hit_part).unwrap();
+            std::hint::black_box(budget.cached(part_type, source));
+        });
+        assert_eq!(hit.count_total, 0, "classification and cache lookup allocated: {hit:?}");
+
+        let miss = allocation_counter::measure(|| {
+            let (part_type, source) = resolvable_reference(&miss_part).unwrap();
+            assert!(budget.cached(part_type, source).is_none());
+            budget.cache.entry((part_type, source.kind())).or_default().insert(
+                source.value().to_owned(),
+                Err(ResolveError::TooManyReferences { limit: 1 }),
+            );
+        });
+        assert!(
+            miss.count_total > hit.count_total,
+            "cache miss must retain an owned key: {miss:?}"
         );
-        assert_eq!(cache.len(), 2, "two distinct keys should produce two entries");
     }
 
     // -------------------------------------------------------------------------
