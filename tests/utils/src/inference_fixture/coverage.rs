@@ -1337,9 +1337,9 @@ mod tests {
                 CoverageStatus::SyntheticOnly,
             ]
         );
-        assert_eq!(report.features_total, 50);
-        assert_eq!(report.scenarios_total, 45);
-        assert_eq!(report.recordings_total, 50);
+        assert_eq!(report.features_total, 50, "manifest feature inventory count");
+        assert_eq!(report.scenarios_total, 45, "manifest scenario inventory count");
+        assert_eq!(report.recordings_total, 50, "manifest recording inventory count");
         assert_eq!(
             scenarios.keys().collect::<Vec<_>>(),
             vec![
@@ -1390,7 +1390,7 @@ mod tests {
                 "responses/native-tool-call",
             ]
         );
-        assert_eq!(manifest.features.len(), 50);
+        assert_eq!(manifest.features.len(), 50, "manifest must declare every feature");
         assert_eq!(manifest.version, 1);
         assert_eq!(
             manifest
@@ -2061,21 +2061,39 @@ mod tests {
         );
         assert_eq!(
             value["input"][0]["content"][0]["prompt_cache_breakpoint"],
-            serde_json::json!({"mode": "explicit"})
+            serde_json::json!({"mode": "explicit"}),
+            "explicit cache breakpoint must survive content conversion"
         );
         assert_eq!(value["store"], true);
         assert_eq!(value["stream"], false);
         assert_eq!(value["tool_choice"], "auto");
-        assert_eq!(value["safety_identifier"], "tenant-user");
-        assert_eq!(value["user"], "legacy-user");
-        assert_eq!(value["prompt_cache_key"], "cache-key");
-        assert_eq!(value["prompt_cache_retention"], "24h");
+        assert_eq!(
+            value["safety_identifier"], "tenant-user",
+            "safety_identifier must reach the Chat backend"
+        );
+        assert_eq!(value["user"], "legacy-user", "user must reach the Chat backend");
+        assert_eq!(
+            value["prompt_cache_key"], "cache-key",
+            "prompt_cache_key must reach the Chat backend"
+        );
+        assert_eq!(
+            value["prompt_cache_retention"], "24h",
+            "prompt_cache_retention must reach the Chat backend"
+        );
         assert_eq!(
             value["prompt_cache_options"],
-            serde_json::json!({"ttl": "30m", "mode": "explicit"})
+            serde_json::json!({"ttl": "30m", "mode": "explicit"}),
+            "prompt_cache_options must reach the Chat backend"
         );
-        assert_eq!(value["text"]["verbosity"], "high");
-        assert_eq!(value.as_object().map(serde_json::Map::len), Some(11));
+        assert_eq!(
+            value["text"]["verbosity"], "high",
+            "text.verbosity must map to Chat verbosity"
+        );
+        assert_eq!(
+            value.as_object().map(serde_json::Map::len),
+            Some(11),
+            "translated request must carry exactly the expected keys"
+        );
         assert!(
             turn.expect.client_sse_events.is_empty(),
             "non-streaming initial turn must have no client SSE events"

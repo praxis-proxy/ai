@@ -3984,9 +3984,11 @@ class TestResponsesToChatCompletionsVLLM:
         )
 
         assert response.status == "completed"
-        assert response.safety_identifier == "tenant-user"
-        assert response.prompt_cache_key == "cache-key"
-        assert response.text.verbosity == "high"
+        assert (
+            response.safety_identifier == "tenant-user"
+        ), "safety_identifier echoed back"
+        assert response.prompt_cache_key == "cache-key", "prompt_cache_key echoed back"
+        assert response.text.verbosity == "high", "text.verbosity echoed back"
         assert len(forwarded) == 1, forwarded
         chat = forwarded[0]
         assert chat["messages"][0]["content"] == [
@@ -3996,13 +3998,22 @@ class TestResponsesToChatCompletionsVLLM:
                 "prompt_cache_breakpoint": {"mode": "explicit"},
             },
             {"type": "text", "text": "world"},
-        ]
-        assert chat["safety_identifier"] == "tenant-user"
-        assert chat["user"] == "legacy-user"
-        assert chat["prompt_cache_key"] == "cache-key"
-        assert chat["prompt_cache_retention"] == "24h"
-        assert chat["prompt_cache_options"] == {"ttl": "30m", "mode": "explicit"}
-        assert chat["verbosity"] == "high"
+        ], "explicit cache breakpoint must survive content conversion"
+        assert (
+            chat["safety_identifier"] == "tenant-user"
+        ), "safety_identifier must reach the Chat backend"
+        assert chat["user"] == "legacy-user", "user must reach the Chat backend"
+        assert (
+            chat["prompt_cache_key"] == "cache-key"
+        ), "prompt_cache_key must reach the Chat backend"
+        assert (
+            chat["prompt_cache_retention"] == "24h"
+        ), "prompt_cache_retention must reach the Chat backend"
+        assert chat["prompt_cache_options"] == {
+            "ttl": "30m",
+            "mode": "explicit",
+        }, "prompt_cache_options must reach the Chat backend"
+        assert chat["verbosity"] == "high", "text.verbosity must map to Chat verbosity"
 
     def test_moderation_is_rejected_before_chat_backend(self, reasoning_capture_client):
         client, forwarded = reasoning_capture_client
@@ -4015,11 +4026,15 @@ class TestResponsesToChatCompletionsVLLM:
                 extra_body={"moderation": {"model": "omni-moderation-latest"}},
             )
 
-        assert exc_info.value.status_code == 400
+        assert (
+            exc_info.value.status_code == 400
+        ), "moderation must be rejected with 400"
         assert "`moderation` has no Chat Completions representation" in str(
             exc_info.value
-        )
-        assert not forwarded
+        ), "rejection must explain moderation is unrepresentable"
+        assert (
+            not forwarded
+        ), "rejected moderation request must not reach the Chat backend"
 
     def test_streaming_moderation_is_rejected(self, chat_streaming_client):
         with pytest.raises(BadRequestError) as exc_info:
@@ -4031,10 +4046,12 @@ class TestResponsesToChatCompletionsVLLM:
                 extra_body={"moderation": {"model": "omni-moderation-latest"}},
             )
 
-        assert exc_info.value.status_code == 400
+        assert (
+            exc_info.value.status_code == 400
+        ), "streaming moderation must be rejected with 400"
         assert "`moderation` has no Chat Completions representation" in str(
             exc_info.value
-        )
+        ), "rejection must explain moderation is unrepresentable"
 
     def test_function_call_output_text_reaches_chat_backend(
         self, reasoning_capture_client
