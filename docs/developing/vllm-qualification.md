@@ -124,6 +124,11 @@ checks, fixed markers from the console output, and whether the same PAT can
 list the new runner label. The raw console output is withheld because the
 instance's user data contains a short-lived registration token.
 
+If `runner version rejected: yes`, the runner binary fetched during boot is
+too old for GitHub registration. Update the pinned EC2 runner action or the
+preinstalled runner in the AMI before retrying. Healthy EC2 status checks and
+a working PAT do not rule out this bootstrap failure.
+
 A PAT runner-list error can otherwise appear as a registration timeout: the
 pinned upstream action suppresses errors from that API while polling. If the
 PAT can list runners but the label is absent, check the instance privately for

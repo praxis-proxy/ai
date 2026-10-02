@@ -30,6 +30,7 @@ else:
     markers = {
         "cloud-init completed": r"Cloud-init[^\n]*finished",
         "network or download error": r"curl: \(\d+\)|Could not resolve host|Connection timed out|SSL connection error",
+        "runner version rejected": r"runner version is out of date",
         "runner connected": r"Connected to GitHub",
     }
     for name, pattern in markers.items():

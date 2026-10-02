@@ -74,6 +74,7 @@ class RunnerDiagnosticsTests(unittest.TestCase):
             MOCK_CONSOLE=(
                 "Cloud-init v. 24 finished\n"
                 "curl: (6) Could not resolve host: github.com\n"
+                "ERROR: Your runner version is out of date and can no longer register with GitHub.\n"
                 "config.sh --token registration-token-secret"
             ),
             MOCK_RUNNERS=json.dumps(
@@ -91,6 +92,7 @@ class RunnerDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("cloud-init completed: yes", result.stdout)
         self.assertIn("network or download error: yes", result.stdout)
+        self.assertIn("runner version rejected: yes", result.stdout)
         self.assertIn("Runner label is present in GitHub with status: offline", result.stdout)
         self.assertNotIn("registration-token-secret", result.stdout + result.stderr)
 
