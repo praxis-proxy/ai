@@ -12,9 +12,9 @@ use super::{
     PersistedStateBackend, PgTlsConfig, PostgresResponseStore, ResponseRecord, ResponseStore, ResponseStoreRegistry,
     SqliteResponseStore, SslMode, StoreCompressionConfig, StoreError,
 };
-use crate::openai::{
-    include::IncludeFields,
-    responses::store::{ListParams, Order, list_input_items},
+use crate::{
+    openai::include::IncludeFields,
+    service::responses::{ListParams, Order, list_input_items},
 };
 
 /// Default issuing-response scope for pending-approval tests that do not

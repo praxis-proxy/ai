@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Guard provider trait, result types, and provider implementations
-//! for external AI guardrails.
+//! Result types and the `NeMo` provider for external AI guardrails.
 
 pub(super) mod nemo;
 
 use std::{fmt, sync::Arc, time::Instant};
 
-use async_trait::async_trait;
-use praxis_filter::{FilterError, SubrequestRuntime};
+use praxis_filter::SubrequestRuntime;
 
 // -----------------------------------------------------------------------------
 // GuardPhase
@@ -94,34 +92,6 @@ pub(crate) struct GuardCalloutRuntime<'a> {
     pub deadline: Instant,
     /// Outbound filter chain bound to the guardrails filter.
     pub outbound: &'a Arc<praxis_filter::FilterPipeline>,
-}
-
-// -----------------------------------------------------------------------------
-// GuardProvider trait
-// -----------------------------------------------------------------------------
-
-/// Trait every external guard provider must implement.
-///
-/// The provider receives pre-extracted messages from the filter
-/// (the filter handles bytes → JSON parsing and message extraction).
-///
-/// Each provider is responsible for:
-/// 1. Building the provider-specific HTTP payload
-/// 2. Calling the external service
-/// 3. Mapping the response to [`GuardResult`]
-///
-/// On failure (network error, timeout, bad response), return
-/// `Err(FilterError)`. The pipeline's per-filter `failure_mode`
-/// (open/closed) handles what happens next.
-#[async_trait]
-pub trait GuardProvider: Send + Sync {
-    /// Evaluate the extracted messages against the external guard service.
-    async fn evaluate(
-        &self,
-        messages: Vec<serde_json::Value>,
-        phase: GuardPhase,
-        runtime: &GuardCalloutRuntime<'_>,
-    ) -> Result<GuardResult, FilterError>;
 }
 
 // -----------------------------------------------------------------------------

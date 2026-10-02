@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Persistence service layer for the `OpenAI`-compatible APIs.
+//! Persistence helpers for the `OpenAI`-compatible APIs.
 //!
-//! The service owns the persistence business logic (record assembly, listing,
-//! CRUD, and pending-approval coordination) over an owner-scoped store handle.
-//! It receives the store through the persisted-state interface, constructs no
-//! backend, and holds no connection pool, so its logic runs against the
-//! in-memory backend with no request pipeline and no database.
+//! Record assembly and input-item listing live here. CRUD and pending-approval
+//! operations use the owner-scoped store handle resolved by each caller.
 //!
 //! Internal and unstable: a first-party workspace layer, not an external API.
 

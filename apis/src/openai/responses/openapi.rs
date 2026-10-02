@@ -14,8 +14,8 @@ use crate::openai::operation;
 ///
 /// Returns an error if generated schemas cannot be assembled or serialized.
 pub fn implementation_openapi_json() -> Result<String, String> {
-    let document = implementation_openapi_value()?;
-    serde_json::to_string_pretty(&document).map_err(|error| format!("failed to serialize Responses OpenAPI: {error}"))
+    serde_json::to_string_pretty(&implementation_openapi())
+        .map_err(|error| format!("failed to serialize Responses OpenAPI: {error}"))
 }
 
 /// Build the local Responses implementation document from the operation
@@ -27,10 +27,4 @@ fn implementation_openapi() -> OpenApi {
         "Responses",
         operation_specs().iter().map(|spec| &spec.definition),
     )
-}
-
-/// Convert the generated `OpenAPI` document to JSON value.
-fn implementation_openapi_value() -> Result<serde_json::Value, String> {
-    serde_json::to_value(implementation_openapi())
-        .map_err(|error| format!("failed to serialize Responses OpenAPI: {error}"))
 }
