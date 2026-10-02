@@ -467,11 +467,12 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 
 /// Reject request parameters this adapter cannot represent.
 ///
-/// `background`, `truncation`, `prompt`, and `moderation` describe behaviors the Chat
+/// `background`, `truncation`, and `moderation` describe behaviors the Chat
 /// Completions translation does not implement. Accepting an unsupported value
 /// would silently change the request semantics, so the request fails closed
 /// instead. Rejecting `background` and `truncation` here is what lets
-/// [`response_resource`] state their defaults truthfully.
+/// [`response_resource`] state their defaults truthfully. Managed-provider
+/// `prompt` policy belongs to request validation, before protocol translation.
 ///
 /// Unlike parameters this translator forwards, these fields are dropped rather
 /// than sent upstream, so the backend never sees them and cannot validate them
@@ -479,9 +480,7 @@ fn map_request_parameters(obj: &Map<String, Value>, chat: &mut Map<String, Value
 /// not demonstrably the default would otherwise be silently discarded and then
 /// reported back as the default.
 fn validate_representable_parameters(obj: &Map<String, Value>) -> Result<(), TranslationError> {
-    validate_prompt_parameter(obj)?;
     validate_moderation_parameter(obj)?;
-
     if let Some(background) = obj.get("background").filter(|value| !value.is_null())
         && background.as_bool() != Some(false)
     {
@@ -526,18 +525,6 @@ fn validate_moderation_parameter(obj: &Map<String, Value>) -> Result<(), Transla
         });
     }
     Ok(())
-}
-
-/// Reject a non-null prompt because Chat Completions cannot resolve it.
-fn validate_prompt_parameter(obj: &Map<String, Value>) -> Result<(), TranslationError> {
-    let Some(prompt) = obj.get("prompt").filter(|value| !value.is_null()) else {
-        return Ok(());
-    };
-    Err(TranslationError::UnrepresentableRequestParameter {
-        parameter: "prompt",
-        value: json_type_name(prompt),
-        supported: "`prompt` null",
-    })
 }
 
 /// Copy a field into the owned Chat request while borrowing the Responses source.

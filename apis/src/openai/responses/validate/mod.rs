@@ -11,13 +11,19 @@
 //!
 //! This filter validates that the body is JSON, then does targeted field
 //! extraction for `conversation.id` and mutually exclusive history
-//! selectors. It does **not** deserialize the full body into a typed
-//! struct or validate provider-owned parameter combinations.
+//! selectors. On managed-provider routes it also rejects gateway-unsupported
+//! `background=true` and non-null `prompt` requests. It does **not** deserialize
+//! the full body into a typed struct or validate other provider-owned parameter
+//! combinations.
 //!
 //! # YAML
 //!
 //! ```yaml
 //! filter: openai_responses_validate
+//! conditions:
+//!   - unless:
+//!       bound_upstream:
+//!         application_provider: openai
 //! ```
 
 use async_trait::async_trait;
@@ -55,8 +61,10 @@ struct OpenaiResponsesValidateConfig {}
 /// Parses the body as [`serde_json::Value`] for targeted field extraction.
 /// Does not deserialize the full body into a typed struct or validate other
 /// provider-owned parameter combinations. It rejects unsupported
-/// `background=true` only after logical provider binding, so an OpenAI-owned
-/// passthrough request can preserve that provider-owned field.
+/// `background=true` and non-null `prompt` requests only after logical provider
+/// binding. Configure it with an `unless application_provider: openai`
+/// condition so OpenAI-owned passthrough requests preserve those provider-owned
+/// fields.
 ///
 /// Must be placed after `openai_responses_format` in the filter chain.
 /// Skips non-Responses API requests (those not classified as
@@ -129,6 +137,9 @@ impl HttpFilter for OpenaiResponsesValidateFilter {
             Err(action) => return Ok(action),
         };
         if let Some(action) = reject_conflicting_history_selectors(&parsed) {
+            return Ok(action);
+        }
+        if let Some(action) = reject_prompt_template(&parsed) {
             return Ok(action);
         }
 
@@ -242,6 +253,17 @@ fn reject_conflicting_history_selectors(body: &serde_json::Value) -> Option<Filt
             "invalid_request_error",
             "mutually_exclusive_parameters",
             "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+        ))
+    })
+}
+
+/// Reject OpenAI-managed prompt templates on gateway-managed routes.
+fn reject_prompt_template(body: &serde_json::Value) -> Option<FilterAction> {
+    body.get("prompt").is_some_and(|prompt| !prompt.is_null()).then(|| {
+        FilterAction::Reject(responses_error_rejection(
+            400,
+            "invalid_request_error",
+            "prompt templates are supported only for OpenAI-owned upstreams",
         ))
     })
 }
@@ -472,6 +494,35 @@ mod tests {
     async fn rejects_background_from_classifier_metadata() {
         let action = run_filter_raw(r#"{"input": "Hi"}"#, &[("openai_responses_format.background", "true")]).await;
         assert_background_unsupported(action);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_null_prompt_template() {
+        let action = run_filter_raw(
+            r#"{"model":"gpt-4.1","prompt":{"id":"pmpt_123","variables":{"name":"Ada"}}}"#,
+            &[],
+        )
+        .await;
+        let FilterAction::Reject(rejection) = action else {
+            panic!("managed-provider validation must reject prompt templates");
+        };
+        assert_eq!(rejection.status, 400);
+        let body: serde_json::Value = serde_json::from_slice(rejection.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            body["error"]["message"],
+            "prompt templates are supported only for OpenAI-owned upstreams"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_null_prompt() {
+        let ctx = run_filter(r#"{"model":"gpt-4.1","input":"Hello","prompt":null}"#, &[]).await;
+
+        assert!(
+            ctx.extensions.get::<ResponsesState>().is_some(),
+            "a null prompt is semantically absent and must pass validation"
+        );
     }
 
     #[tokio::test]

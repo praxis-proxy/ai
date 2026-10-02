@@ -7,7 +7,7 @@ Validates and enriches Responses API requests.
 
 ## Configuration Notes
 
-Parses the body as [`serde_json::Value`] for targeted field extraction. Does not deserialize the full body into a typed struct or validate other provider-owned parameter combinations. It rejects unsupported `background=true` only after logical provider binding, so an OpenAI-owned passthrough request can preserve that provider-owned field.
+Parses the body as [`serde_json::Value`] for targeted field extraction. Does not deserialize the full body into a typed struct or validate other provider-owned parameter combinations. It rejects unsupported `background=true` and non-null `prompt` requests only after logical provider binding. Configure it with an `unless application_provider: openai` condition so OpenAI-owned passthrough requests preserve those provider-owned fields.
 
 Must be placed after `openai_responses_format` in the filter chain. Skips non-Responses API requests (those not classified as `openai_responses`).
 
@@ -17,4 +17,8 @@ Generates metadata: `responses.response_id` (format: `resp_` + 32 hex chars, CSP
 
 ```yaml
 filter: openai_responses_validate
+conditions:
+  - unless:
+      bound_upstream:
+        application_provider: openai
 ```
