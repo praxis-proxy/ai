@@ -1569,12 +1569,9 @@ async fn on_response_body_modified_rewrites_assistant_content() {
     assert_redacted_assistant_content(&ctx, &replaced, original_len, "My SSN is [REDACTED]");
 }
 
-/// `"x"` → `"[REDACTED]"` grows the chat completion past the committed
-/// `Content-Length`. The client must get a parseable error, not a truncated
-/// completion with HTTP 200.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn on_response_body_expanded_redaction_fails_closed() {
-    let filter = AiGuardrailsFilter::with_verdict(
+/// Response-phase filter that masks choice 0 as `[REDACTED]`.
+fn response_redact_filter() -> AiGuardrailsFilter {
+    AiGuardrailsFilter::with_verdict(
         GuardResult::redact_message(0, "[REDACTED]".into(), "pii".into()),
         PhaseConfig {
             request: false,
@@ -1582,33 +1579,94 @@ async fn on_response_body_expanded_redaction_fails_closed() {
             tool_results: false,
         },
     )
-    .expect("test filter");
+    .expect("test filter")
+}
+
+/// Run response redaction and require a same-length continuation.
+fn rewritten_response(filter: &AiGuardrailsFilter, original: bytes::Bytes) -> bytes::Bytes {
     let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
     let mut ctx = crate::test_utils::make_filter_context(&req);
     ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
-    let original = chat_completion_response("x");
     let original_len = original.len();
     let mut body = Some(original);
-
     let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    assert!(matches!(action, praxis_filter::FilterAction::Continue));
+    assert!(
+        matches!(action, praxis_filter::FilterAction::Continue),
+        "response redaction should continue"
+    );
     let replaced = body.expect("body should be replaced, not cleared");
     assert_eq!(replaced.len(), original_len, "must match original Content-Length");
+    replaced
+}
+
+/// The fail-closed body parses as `evaluation_failed` and omits `absent` text.
+fn assert_evaluation_failed(replaced: &bytes::Bytes, absent: &[&str]) {
     let json: serde_json::Value =
         serde_json::from_slice(replaced.trim_ascii_end()).expect("fail-closed body must be valid JSON");
     assert_eq!(
         json.pointer("/error/code").and_then(serde_json::Value::as_str),
-        Some("evaluation_failed")
+        Some("evaluation_failed"),
+        "failed redaction should be an evaluation_failed error"
     );
-    let rendered = String::from_utf8_lossy(&replaced);
-    assert!(
-        !rendered.contains("[REDACTED]"),
-        "expanded mask must not be copied into the client body"
-    );
-    assert!(
-        !rendered.contains("chatcmpl-test"),
-        "original completion must not be partially forwarded"
-    );
+    let rendered = String::from_utf8_lossy(replaced);
+    for secret in absent {
+        assert!(
+            !rendered.contains(secret),
+            "upstream text must not reach the client: {secret}"
+        );
+    }
+}
+
+/// Completion whose `logprobs` repeat the digits in `message.content`.
+fn completion_with_digit_logprobs() -> bytes::Bytes {
+    bytes::Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "123-45-6789"},
+                "logprobs": {"content": [
+                    {"token": "123", "logprob": -0.1, "bytes": [49, 50, 51]},
+                    {"token": "-45-", "logprob": -0.2, "bytes": [45, 52, 53, 45]},
+                    {"token": "6789", "logprob": -0.3, "bytes": [54, 55, 56, 57]}
+                ]},
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap(),
+    )
+}
+
+/// Assistant message whose `content` is text plus an image part.
+fn completion_with_array_content() -> bytes::Bytes {
+    bytes::Bytes::from(
+        serde_json::to_vec(&serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "ssn 123-45-6789"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                    ]
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap(),
+    )
+}
+
+/// `"x"` → `"[REDACTED]"` grows the chat completion past the committed
+/// `Content-Length`. The client must get a parseable error, not a truncated
+/// completion with HTTP 200.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_response_body_expanded_redaction_fails_closed() {
+    let replaced = rewritten_response(&response_redact_filter(), chat_completion_response("x"));
+    assert_evaluation_failed(&replaced, &["[REDACTED]", "chatcmpl-test"]);
 }
 
 /// A short completion cannot hold the full error text. The replacement must
@@ -1651,54 +1709,19 @@ async fn on_response_body_expanded_redaction_fits_error_into_short_body() {
 /// original completion tokens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_modified_clears_logprobs() {
-    let filter = AiGuardrailsFilter::with_verdict(
-        GuardResult::redact_message(0, "[REDACTED]".into(), "pii".into()),
-        PhaseConfig {
-            request: false,
-            response: true,
-            tool_results: false,
-        },
-    )
-    .expect("test filter");
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
-    let original = bytes::Bytes::from(
-        serde_json::to_vec(&serde_json::json!({
-            "id": "chatcmpl-test",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "123-45-6789"},
-                "logprobs": {
-                    "content": [
-                        {"token": "123", "logprob": -0.1, "bytes": [49, 50, 51]},
-                        {"token": "-45-", "logprob": -0.2, "bytes": [45, 52, 53, 45]},
-                        {"token": "6789", "logprob": -0.3, "bytes": [54, 55, 56, 57]}
-                    ]
-                },
-                "finish_reason": "stop"
-            }]
-        }))
-        .unwrap(),
-    );
-    let original_len = original.len();
-    let mut body = Some(original);
-
-    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    assert!(matches!(action, praxis_filter::FilterAction::Continue));
-    let replaced = body.expect("body should be rewritten, not cleared");
-    assert_eq!(replaced.len(), original_len, "must match original Content-Length");
+    let replaced = rewritten_response(&response_redact_filter(), completion_with_digit_logprobs());
     let json: serde_json::Value =
         serde_json::from_slice(replaced.trim_ascii_end()).expect("redacted body must be valid JSON");
     assert_eq!(
         json.pointer("/choices/0/message/content")
             .and_then(serde_json::Value::as_str),
-        Some("[REDACTED]")
+        Some("[REDACTED]"),
+        "assistant content should be the mask"
     );
     assert!(
         json.pointer("/choices/0/logprobs")
-            .is_some_and(serde_json::Value::is_null)
+            .is_some_and(serde_json::Value::is_null),
+        "redacted choice logprobs should be null"
     );
     let rendered = String::from_utf8_lossy(&replaced);
     assert!(
@@ -1712,56 +1735,6 @@ async fn on_response_body_modified_clears_logprobs() {
 /// with an `evaluation_failed` document and must not forward the original text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_body_redaction_failure_replaces_body() {
-    let filter = AiGuardrailsFilter::with_verdict(
-        GuardResult::redact_message(0, "[REDACTED]".into(), "pii".into()),
-        PhaseConfig {
-            request: false,
-            response: true,
-            tool_results: false,
-        },
-    )
-    .expect("test filter");
-    let req = crate::test_utils::make_request(http::Method::POST, "/v1/chat");
-    let mut ctx = crate::test_utils::make_filter_context(&req);
-    ctx.response_body_mode = praxis_filter::BodyMode::StreamBuffer { max_bytes: None };
-    let original = bytes::Bytes::from(
-        serde_json::to_vec(&serde_json::json!({
-            "id": "chatcmpl-test",
-            "object": "chat.completion",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "text", "text": "ssn 123-45-6789"},
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
-                    ]
-                },
-                "finish_reason": "stop"
-            }]
-        }))
-        .unwrap(),
-    );
-    let original_len = original.len();
-    let mut body = Some(original);
-
-    let action = filter.on_response_body(&mut ctx, &mut body, true).unwrap();
-    assert!(matches!(action, praxis_filter::FilterAction::Continue));
-    let replaced = body.expect("body should be replaced, not cleared");
-    assert_eq!(replaced.len(), original_len, "must match original Content-Length");
-    let json: serde_json::Value =
-        serde_json::from_slice(replaced.trim_ascii_end()).expect("fail-closed body must be valid JSON");
-    assert_eq!(
-        json.pointer("/error/code").and_then(serde_json::Value::as_str),
-        Some("evaluation_failed")
-    );
-    let rendered = String::from_utf8_lossy(&replaced);
-    assert!(
-        !rendered.contains("123-45-6789"),
-        "original digits must not reach the client"
-    );
-    assert!(
-        !rendered.contains("image_url"),
-        "original content parts must not reach the client"
-    );
+    let replaced = rewritten_response(&response_redact_filter(), completion_with_array_content());
+    assert_evaluation_failed(&replaced, &["123-45-6789", "image_url"]);
 }

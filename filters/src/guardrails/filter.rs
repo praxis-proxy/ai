@@ -577,29 +577,11 @@ fn apply_response_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageR
         return Err("ai_guardrails: response body does not contain recognizable choices".into());
     };
     for replacement in replacements {
-        let Some(choice) = choices.get_mut(replacement.index) else {
-            return Err(format!(
-                "ai_guardrails: cannot redact: choice index {} has no message",
-                replacement.index
-            )
-            .into());
+        let index = replacement.index;
+        let Some(choice) = choices.get_mut(index) else {
+            return Err(format!("ai_guardrails: cannot redact: choice index {index} has no message").into());
         };
-        let Some(message) = choice.get_mut("message") else {
-            return Err(format!(
-                "ai_guardrails: cannot redact: choice index {} has no message",
-                replacement.index
-            )
-            .into());
-        };
-        set_message_content(message, replacement.modified_text)?;
-        let Some(choice) = choice.as_object_mut() else {
-            return Err("ai_guardrails: choice is not a JSON object".into());
-        };
-        // Token logprobs repeat the original completion. Clear an existing
-        // field only: inserting one would grow the committed response.
-        if choice.contains_key("logprobs") {
-            choice.insert("logprobs".to_owned(), serde_json::Value::Null);
-        }
+        redact_choice(choice, replacement)?;
     }
     let serialized = serde_json::to_string(&value)
         .map_err(|e| -> FilterError { format!("ai_guardrails: failed to serialize redacted body: {e}").into() })?;
@@ -608,6 +590,27 @@ fn apply_response_redaction(body: &mut Option<Bytes>, replacements: Vec<MessageR
         return Err("ai_guardrails: redacted response exceeds committed Content-Length".into());
     }
     *body = Some(fit_to_committed_length(serialized, body));
+    Ok(())
+}
+
+/// Rewrite one choice message and drop `logprobs` that still quote the original tokens.
+///
+/// An absent `logprobs` field is left absent. Inserting it would grow the body past the committed `Content-Length`.
+fn redact_choice(choice: &mut serde_json::Value, replacement: MessageRedaction) -> Result<(), FilterError> {
+    let Some(message) = choice.get_mut("message") else {
+        return Err(format!(
+            "ai_guardrails: cannot redact: choice index {} has no message",
+            replacement.index
+        )
+        .into());
+    };
+    set_message_content(message, replacement.modified_text)?;
+    let Some(choice) = choice.as_object_mut() else {
+        return Err("ai_guardrails: choice is not a JSON object".into());
+    };
+    if choice.contains_key("logprobs") {
+        choice.insert("logprobs".to_owned(), serde_json::Value::Null);
+    }
     Ok(())
 }
 
@@ -794,7 +797,10 @@ fn fallback_error_documents(code: &str) -> [String; 2] {
 /// Pad `text` with trailing spaces out to `len`.
 fn pad_to_len(text: String, len: usize) -> Bytes {
     let mut bytes = text.into_bytes();
-    debug_assert!(bytes.len() <= len);
+    debug_assert!(
+        bytes.len() <= len,
+        "pad_to_len must not truncate; a longer document would no longer be valid JSON"
+    );
     bytes.resize(len, b' ');
     Bytes::from(bytes)
 }

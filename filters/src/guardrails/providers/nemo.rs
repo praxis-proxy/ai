@@ -399,6 +399,7 @@ fn target_message_indices(messages: &[serde_json::Value], phase: GuardPhase) -> 
     }
 }
 
+/// Only a string `role` can select a target turn. A missing or non-string role is skipped.
 fn message_role(message: &serde_json::Value) -> Option<&str> {
     message.get("role").and_then(serde_json::Value::as_str)
 }
