@@ -19,7 +19,7 @@ use praxis_filter::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{GuardCalloutRuntime, GuardPhase, GuardResult, MessageRedaction};
+use super::{GuardCalloutRuntime, GuardPhase, GuardResult};
 
 /// Default timeout for `NeMo` HTTP calls (10 seconds).
 const DEFAULT_TIMEOUT_MS: u64 = 10_000;
@@ -348,32 +348,33 @@ fn apply_slice_result(
         NemoVerdict::Block { reason } => Err(GuardResult::Block { reason }),
         NemoVerdict::Modified { content, reason } => Ok(Some(merge_redact(
             pending_redact,
-            vec![MessageRedaction {
-                index: message_index,
-                modified_text: content,
-            }],
-            reason,
+            GuardResult::redact_message(message_index, content, reason),
         ))),
     }
 }
 
-/// Append `extra` replacements onto any pending `modified` verdict.
-fn merge_redact(pending: Option<GuardResult>, extra: Vec<MessageRedaction>, reason: String) -> GuardResult {
-    match pending {
-        Some(GuardResult::Redact {
-            replacements: mut existing,
-            ..
-        }) => {
-            existing.extend(extra);
-            GuardResult::Redact {
-                replacements: existing,
-                reason,
-            }
-        },
-        None | Some(GuardResult::Pass | GuardResult::Block { .. }) => GuardResult::Redact {
-            replacements: extra,
-            reason,
-        },
+/// Append one `modified` verdict onto any pending redaction.
+///
+/// A later `modified` slice replaces the reason and keeps every earlier replacement.
+fn merge_redact(pending: Option<GuardResult>, extra: GuardResult) -> GuardResult {
+    let Some(GuardResult::Redact {
+        replacements: mut existing,
+        ..
+    }) = pending
+    else {
+        return extra;
+    };
+    let GuardResult::Redact {
+        replacements: extra_replacements,
+        reason,
+    } = extra
+    else {
+        return extra;
+    };
+    existing.extend(extra_replacements);
+    GuardResult::Redact {
+        replacements: existing,
+        reason,
     }
 }
 
@@ -527,7 +528,7 @@ fn map_nemo_response(nemo: NemoResponse) -> Result<NemoVerdict, FilterError> {
     reason = "tests"
 )]
 mod tests {
-    use super::*;
+    use super::{super::MessageRedaction, *};
 
     #[test]
     fn request_serializes_configured_guardrails() {
