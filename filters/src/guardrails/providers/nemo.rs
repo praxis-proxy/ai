@@ -401,7 +401,6 @@ fn target_message_indices(messages: &[serde_json::Value], phase: GuardPhase) -> 
     }
 }
 
-/// Role string of a chat message, when the field is present.
 fn message_role(message: &serde_json::Value) -> Option<&str> {
     message.get("role").and_then(serde_json::Value::as_str)
 }
@@ -595,7 +594,11 @@ guardrails:
             serde_json::json!({"role": "assistant", "content": "b"}),
         ];
 
-        assert_eq!(target_message_indices(&messages, GuardPhase::Response), vec![0]);
+        assert_eq!(
+            target_message_indices(&messages, GuardPhase::Response),
+            vec![0],
+            "response phase should check only the first choice"
+        );
     }
 
     #[test]
@@ -605,7 +608,10 @@ guardrails:
             serde_json::json!({"role": "assistant", "content": "later"}),
         ];
 
-        assert!(target_message_indices(&messages, GuardPhase::Response).is_empty());
+        assert!(
+            target_message_indices(&messages, GuardPhase::Response).is_empty(),
+            "response phase should skip when the first choice is not an assistant message"
+        );
     }
 
     #[test]
@@ -692,7 +698,7 @@ guardrails:
             rail: None,
         };
         let result = map_nemo_response(resp).unwrap();
-        assert!(matches!(result, NemoVerdict::Pass));
+        assert!(matches!(result, NemoVerdict::Pass), "passed status should map to Pass");
     }
 
     #[test]
@@ -717,7 +723,10 @@ guardrails:
             rail: None,
         };
         let result = map_nemo_response(resp).unwrap();
-        assert!(matches!(result, NemoVerdict::Block { reason } if reason.is_empty()));
+        assert!(
+            matches!(result, NemoVerdict::Block { reason } if reason.is_empty()),
+            "blocked status without a rail should use an empty reason"
+        );
     }
 
     #[test]
@@ -732,7 +741,8 @@ guardrails:
             NemoVerdict::Modified {
                 content: "masked text".to_string(),
                 reason: "pii".to_string(),
-            }
+            },
+            "modified status should return the masked content and rail name"
         );
     }
 
