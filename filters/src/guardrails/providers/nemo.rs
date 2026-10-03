@@ -232,7 +232,7 @@ impl NemoProvider {
         messages: &[serde_json::Value],
         phase: GuardPhase,
         runtime: &GuardCalloutRuntime<'_>,
-    ) -> Result<GuardResult, FilterError> {
+    ) -> Result<NemoVerdict, FilterError> {
         let request = build_request(&self.model, messages, phase, self.guardrails.as_ref())?;
         let response = Box::pin(self.execute_callout(request, runtime)).await?;
         ensure_success_status(&response)?;
@@ -339,24 +339,24 @@ fn ensure_deadline_remaining(deadline: Instant) -> Result<(), FilterError> {
 ///
 /// `blocked` fails fast. `modified` replacements are accumulated so every
 /// redacted turn is rewritten. Later slices are still checked so a subsequent
-/// `blocked` verdict is not missed.
+/// `blocked` verdict is not missed. The replacement index is the conversation
+/// index of this slice; `/v1/checks` does not report one.
 fn apply_slice_result(
     pending_redact: Option<GuardResult>,
-    result: GuardResult,
+    result: NemoVerdict,
     message_index: usize,
 ) -> Result<Option<GuardResult>, GuardResult> {
     match result {
-        GuardResult::Pass => Ok(pending_redact),
-        block @ GuardResult::Block { .. } => Err(block),
-        GuardResult::Redact {
-            mut replacements,
+        NemoVerdict::Pass => Ok(pending_redact),
+        NemoVerdict::Block { reason } => Err(GuardResult::Block { reason }),
+        NemoVerdict::Modified { content, reason } => Ok(Some(merge_redact(
+            pending_redact,
+            vec![MessageRedaction {
+                index: message_index,
+                modified_text: content,
+            }],
             reason,
-        } => {
-            for replacement in &mut replacements {
-                replacement.index = message_index;
-            }
-            Ok(Some(merge_redact(pending_redact, replacements, reason)))
-        },
+        ))),
     }
 }
 
@@ -469,24 +469,45 @@ fn ensure_success_status(response: &SubResponse) -> Result<(), FilterError> {
     Ok(())
 }
 
-/// Map a deserialized [`NemoResponse`] to a [`GuardResult`].
+/// One `/v1/checks` verdict before it is attached to a conversation index.
+///
+/// `modified` carries the masked text and rail name only. The message index
+/// belongs to the slice the caller selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NemoVerdict {
+    /// All rails passed.
+    Pass,
+    /// At least one rail blocked the content.
+    Block {
+        /// Human-readable block reason from the provider.
+        reason: String,
+    },
+    /// Content was transformed, for example by PII masking.
+    Modified {
+        /// Masked text returned in the `content` field.
+        content: String,
+        /// Human-readable redaction reason from the provider.
+        reason: String,
+    },
+}
+
+/// Map a deserialized [`NemoResponse`] to a [`NemoVerdict`].
 ///
 /// The `/v1/checks` endpoint returns three statuses:
 /// - `"passed"` - all rails passed
 /// - `"blocked"` - at least one rail blocked the content
 /// - `"modified"` - content was transformed (for example, PII masking)
-fn map_nemo_response(nemo: NemoResponse) -> Result<GuardResult, FilterError> {
+fn map_nemo_response(nemo: NemoResponse) -> Result<NemoVerdict, FilterError> {
     let NemoResponse { status, content, rail } = nemo;
     match status.as_str() {
-        "passed" => Ok(GuardResult::Pass),
-        "blocked" => Ok(GuardResult::Block {
+        "passed" => Ok(NemoVerdict::Pass),
+        "blocked" => Ok(NemoVerdict::Block {
             reason: rail.unwrap_or_default(),
         }),
-        "modified" => Ok(GuardResult::redact_message(
-            0,
+        "modified" => Ok(NemoVerdict::Modified {
             content,
-            rail.unwrap_or_else(|| "modified".to_owned()),
-        )),
+            reason: rail.unwrap_or_else(|| "modified".to_owned()),
+        }),
         other => Err(format!("ai_guardrails (nemo): unknown status '{other}'").into()),
     }
 }
@@ -595,8 +616,11 @@ guardrails:
 
     #[test]
     fn apply_slice_result_modified_then_blocked_fails_fast_on_blocked() {
-        let modified = GuardResult::redact_message(1, "masked".into(), "pii".into());
-        let blocked = GuardResult::Block {
+        let modified = NemoVerdict::Modified {
+            content: "masked".into(),
+            reason: "pii".into(),
+        };
+        let blocked = NemoVerdict::Block {
             reason: "toxicity".into(),
         };
 
@@ -605,16 +629,27 @@ guardrails:
             pending,
             Some(GuardResult::redact_message(1, "masked".into(), "pii".into()))
         );
-        assert_eq!(apply_slice_result(pending, blocked.clone(), 3).unwrap_err(), blocked);
+        assert_eq!(
+            apply_slice_result(pending, blocked, 3).unwrap_err(),
+            GuardResult::Block {
+                reason: "toxicity".into(),
+            }
+        );
     }
 
     #[test]
     fn apply_slice_result_accumulates_modified_replacements() {
-        let first = GuardResult::redact_message(0, "first".into(), "pii".into());
-        let second = GuardResult::redact_message(0, "second".into(), "pii".into());
+        let first = NemoVerdict::Modified {
+            content: "first".into(),
+            reason: "pii".into(),
+        };
+        let second = NemoVerdict::Modified {
+            content: "second".into(),
+            reason: "pii".into(),
+        };
 
         let pending = apply_slice_result(None, first, 1).unwrap();
-        let pending = apply_slice_result(pending, GuardResult::Pass, 2).unwrap();
+        let pending = apply_slice_result(pending, NemoVerdict::Pass, 2).unwrap();
         assert_eq!(
             apply_slice_result(pending, second, 3).unwrap(),
             Some(GuardResult::Redact {
@@ -641,7 +676,7 @@ guardrails:
             rail: None,
         };
         let result = map_nemo_response(resp).unwrap();
-        assert!(matches!(result, GuardResult::Pass));
+        assert!(matches!(result, NemoVerdict::Pass));
     }
 
     #[test]
@@ -653,8 +688,8 @@ guardrails:
         };
         let result = map_nemo_response(resp).unwrap();
         assert!(
-            matches!(result, GuardResult::Block { reason } if reason == "toxicity"),
-            "blocked response should produce GuardResult::Block with rail name as reason"
+            matches!(result, NemoVerdict::Block { reason } if reason == "toxicity"),
+            "blocked response should produce a block verdict with the rail name as reason"
         );
     }
 
@@ -666,11 +701,11 @@ guardrails:
             rail: None,
         };
         let result = map_nemo_response(resp).unwrap();
-        assert!(matches!(result, GuardResult::Block { reason } if reason.is_empty()));
+        assert!(matches!(result, NemoVerdict::Block { reason } if reason.is_empty()));
     }
 
     #[test]
-    fn map_nemo_response_modified_returns_redact() {
+    fn map_nemo_response_modified_returns_content_and_reason() {
         let resp = NemoResponse {
             status: "modified".to_string(),
             content: "masked text".to_string(),
@@ -678,7 +713,10 @@ guardrails:
         };
         assert_eq!(
             map_nemo_response(resp).unwrap(),
-            GuardResult::redact_message(0, "masked text".to_string(), "pii".to_string())
+            NemoVerdict::Modified {
+                content: "masked text".to_string(),
+                reason: "pii".to_string(),
+            }
         );
     }
 
